@@ -390,13 +390,9 @@ class Settings(BaseSettings):
     # 429 is no verdict. Two failed pulls in a row (timeout, DNS error, unreachable, manifest unknown) are
     # the finding: logged as REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail
     # (REGISTRY_PULL_FAILED, score 0). A failed pull counts only if the validator itself reaches Docker
-    # Hub. The second one also counts only if at most FLEET_SHARE of the latest `required` scheduled
-    # pulls of other providers' idle nodes failed (outside the node's own miner and the other miner with
-    # the most failed pulls; `required` is FLEET_MIN_PULLS, or 10% of the idle nodes seen if more), and,
-    # on a validator seeing 30 or more idle nodes (FLEET_MIN_PULLS x 6 h of phases), only once those
-    # pulls all landed after the streak began; on a smaller one the 30-minute retry confirms.
-    # Enforcement is off by default: it goes on after a 48 h log-only window with the OBSERVED rows
-    # reviewed. Decider: taiberium; backup jam6099 (Muhammad) from 28 Sep 2026.
+    # Hub. Nothing guards an outage only the nodes see (a CDN region, a shared mirror), so enforcement
+    # is off by default: it goes on after a 48 h log-only window with the OBSERVED rows reviewed
+    # (count, outcomes, mirrors, fleet-wide pattern). Decider: taiberium; backup jam6099 (Muhammad).
     REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
     REGISTRY_PULL_ENFORCEMENT_ENABLED: bool = Field(env="REGISTRY_PULL_ENFORCEMENT_ENABLED", default=False)
     REGISTRY_PULL_PROBE_INTERVAL_HOURS: float = Field(
@@ -405,8 +401,6 @@ class Settings(BaseSettings):
     REGISTRY_PULL_PROBE_RETRY_MINUTES: float = Field(
         env="REGISTRY_PULL_PROBE_RETRY_MINUTES", default=30.0, gt=0
     )
-    REGISTRY_PULL_FLEET_SHARE: float = Field(env="REGISTRY_PULL_FLEET_SHARE", default=0.3, gt=0, le=1)
-    REGISTRY_PULL_FLEET_MIN_PULLS: int = Field(env="REGISTRY_PULL_FLEET_MIN_PULLS", default=5, ge=1)
     # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
     # wave writes nothing about it: no report row, no availability error, no evidence for the
     # backend's staleness sweep. On, the wave writes one failed result per rented executor of that

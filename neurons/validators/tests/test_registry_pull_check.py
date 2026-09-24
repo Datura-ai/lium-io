@@ -8,7 +8,6 @@ node passed every one.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -117,12 +116,10 @@ class FakeRunner:
 
 
 class FakeRedis:
-    def __init__(self, *, unreadable: bool = False, hashes_unreadable: bool = False):
+    def __init__(self, *, unreadable: bool = False):
         self.store: dict[str, str] = {}
         self.ttl: dict[str, int | None] = {}
-        self.hashes: dict[str, dict[str, str]] = {}
         self.unreadable = unreadable
-        self.hashes_unreadable = hashes_unreadable
 
     async def get(self, key):
         if self.unreadable:
@@ -135,18 +132,6 @@ class FakeRedis:
 
     async def delete(self, key):
         self.store.pop(key, None)
-
-    async def hset(self, key, field, value):
-        self.hashes.setdefault(key, {})[field] = value
-
-    async def hgetall(self, key):
-        if self.hashes_unreadable:
-            raise ConnectionError("redis down")
-        return {k.encode(): v.encode() for k, v in self.hashes.get(key, {}).items()}
-
-    async def hdel(self, key, *fields):
-        for f in fields:
-            self.hashes.get(key, {}).pop(f, None)
 
 
 class FakeHub:
@@ -206,8 +191,6 @@ def flags(
     enforced: bool = True,
     interval_hours: float = 6.0,
     retry_minutes: float = 30.0,
-    fleet_share: float = 0.3,
-    fleet_min_pulls: int = 5,
     hub: FakeHub | None = None,
     phase_at_start: bool = True,
 ):
@@ -218,8 +201,6 @@ def flags(
         REGISTRY_PULL_ENFORCEMENT_ENABLED=enforced,
         REGISTRY_PULL_PROBE_INTERVAL_HOURS=interval_hours,
         REGISTRY_PULL_PROBE_RETRY_MINUTES=retry_minutes,
-        REGISTRY_PULL_FLEET_SHARE=fleet_share,
-        REGISTRY_PULL_FLEET_MIN_PULLS=fleet_min_pulls,
     )
     clock = Clock()
     phases: dict[str, float] = {}
@@ -244,8 +225,7 @@ def test_defaults_log_only_and_bounded():
     assert fields["REGISTRY_PULL_ENFORCEMENT_ENABLED"].default is False
     assert fields["REGISTRY_PULL_PROBE_INTERVAL_HOURS"].default == 6.0
     assert fields["REGISTRY_PULL_PROBE_RETRY_MINUTES"].default == 30.0
-    assert fields["REGISTRY_PULL_FLEET_SHARE"].default == 0.3
-    assert fields["REGISTRY_PULL_FLEET_MIN_PULLS"].default == 5
+    assert not [name for name in fields if name.startswith("REGISTRY_PULL_FLEET")]
 
 
 def test_the_image_is_a_tiny_official_image_pinned_by_digest():
@@ -717,7 +697,7 @@ async def test_an_open_streak_is_re_pulled_on_the_retry_after_a_429():
     assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_OK.reason
 
 
-# ------------------------------------------------------------------ the Docker Hub control and the fleet reading
+# ------------------------------------------------------------------ the Docker Hub control
 
 HUB_TLS_TIMEOUT = (
     "lium_pull driver=overlayfs mirrors=[]\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=10\n"
@@ -727,17 +707,6 @@ HUB_TLS_TIMEOUT = (
 
 def _logged(caplog, reason: str) -> int:
     return sum(reason in record.getMessage() for record in caplog.records)
-
-
-def _seed_fleet(
-    redis: FakeRedis, now: float, *, ok: int, failed: int, age: float = 0, tag: str = ""
-) -> None:
-    """Scheduled pulls of other nodes, each of a miner of its own (an entry without a hotkey)."""
-    fleet = redis.hashes.setdefault("registry_pull_fleet", {})
-    for i in range(ok):
-        fleet[f"seed{tag}-ok-{i}"] = json.dumps({"at": now - age, "failed": False})
-    for i in range(failed):
-        fleet[f"seed{tag}-failed-{i}"] = json.dumps({"at": now - age, "failed": True})
 
 
 async def _confirming(check, ctx, clock: Clock):
@@ -796,19 +765,9 @@ async def test_with_docker_hub_up_a_node_whose_mirror_fails_still_counts():
     with flags(hub=hub) as clock:
         first, second = await _confirming(check, ctx, clock)
     assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
-    # the first failure of a streak is not judged on the fleet: only the one that fails the node is
-    assert "fleet" not in first.event.what_we_saw["guard"]
     assert second.passed is False and second.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
     guard = second.event.what_we_saw["guard"]
-    assert guard["docker_hub_control"] == {"at": clock.now, "reachable": True, "seen": "HTTP 401"}
-    assert guard["fleet"] == {
-        "idle_nodes_seen": 1,
-        "required_pulls": 5,
-        "pulls": 0,
-        "failed": 0,
-        "share": 0.0,
-        "excluded_miner": None,
-    }
+    assert guard == {"docker_hub_control": {"at": clock.now, "reachable": True, "seen": "HTTP 401"}}
     assert "no_verdict" not in second.event.what_we_saw
     # 30 minutes apart: each failed pull has a control reading of its own
     assert hub.calls == 2
@@ -862,293 +821,24 @@ async def test_the_control_reads_a_refused_connection_as_unreachable():
 
 
 @pytest.mark.asyncio
-async def test_a_confirming_failure_while_other_providers_pulls_fail_is_no_verdict(caplog):
-    """Regression (r4 M2): a Docker Hub incident the validator does not see (one region's CDN) failed the fleet.
-    The streak stays open and is retried; the fleet event is logged at most once an hour."""
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    results = []
-    with flags() as clock, caplog.at_level(logging.WARNING):
-        _seed_fleet(redis, clock.now, ok=10, failed=0, age=3600)
-        _seed_fleet(redis, clock.now, ok=0, failed=6)
-        for i in range(3):
-            ctx, _, _ = make_ctx(
-                *(result(HUB_TLS_TIMEOUT) for _ in range(2)), redis=redis, uuid=f"node-{i}"
-            )
-            results.append(await _confirming(check, ctx, clock))
-            clock.now -= 29 * 60
-        assert _logged(caplog, "REGISTRY_PULL_FLEET_FAILING") == 1
-        clock.now += module.FLEET_LOG_INTERVAL_SECONDS
-        ctx, _, _ = make_ctx(
-            *(result(HUB_TLS_TIMEOUT) for _ in range(2)), redis=redis, uuid="node-late"
-        )
-        results.append(await _confirming(check, ctx, clock))
-    for first, confirming in results:
-        assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
-        assert (
-            confirming.passed
-            and confirming.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_FLEET.reason
-        )
-        what = confirming.event.what_we_saw
-        assert what["failures_in_a_row"] == 1 and what["no_verdict"] == "fleet_failing"
-        assert what["streak_started_at"] == first.event.what_we_saw["streak_started_at"]
-        assert what["guard"]["docker_hub_control"]["reachable"] is True
-    assert results[0][1].event.what_we_saw["guard"]["fleet"] == {
-        "idle_nodes_seen": 17,
-        "required_pulls": 5,
-        "pulls": 5,
-        "failed": 5,
-        "share": 1.0,
-        # each seeded entry is a miner of its own; one failing one is left out
-        "excluded_miner": "executor:seed-failed-0",
-    }
-    assert _logged(caplog, "REGISTRY_PULL_FLEET_FAILING") == 2
-    assert redis.ttl["registry_pull_fleet_logged"] == module.FLEET_LOG_INTERVAL_SECONDS == 3600
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failed,reason",
-    [
-        (3, Msg.REGISTRY_PULL_FAILED.reason),  # 3 of 10 is 30%, not past it
-        (4, Msg.REGISTRY_PULL_NO_VERDICT_FLEET.reason),
-    ],
-)
-async def test_the_confirming_failure_counts_while_at_most_the_share_of_the_latest_pulls_failed(
-    failed, reason
-):
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    with flags(fleet_min_pulls=10) as clock:
-        # the miner left out: the one with the most failed pulls
-        fleet = redis.hashes.setdefault("registry_pull_fleet", {})
-        for i in range(3):
-            fleet[f"worst-{i}"] = json.dumps({"at": clock.now, "failed": True, "miner": "worst"})
-        _seed_fleet(redis, clock.now, ok=10 - failed, failed=failed)
-        _seed_fleet(redis, clock.now, ok=0, failed=5, age=3600, tag="-older")
-        ctx, _, _ = make_ctx(
-            *(result(MIRROR_DNS_TIMEOUT) for _ in range(2)), redis=redis, uuid="node-x"
-        )
-        _, confirming = await _confirming(check, ctx, clock)
-    assert confirming.event.reason_code == reason
-    fleet_guard = confirming.event.what_we_saw["guard"]["fleet"]
-    assert (fleet_guard["pulls"], fleet_guard["failed"], fleet_guard["excluded_miner"]) == (
-        10,
-        failed,
-        "worst",
-    )
-
-
-@pytest.mark.asyncio
-async def test_the_nodes_own_provider_and_the_other_provider_failing_most_are_left_out():
-    """r6 L4: one provider's broken nodes (ticket-0361: 27 behind one broken mirror) plus a few stragglers must not
-    make any of their failures look like the fleet's; nor may the node's own provider shelter it."""
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    fleet = redis.hashes.setdefault("registry_pull_fleet", {})
-    with flags() as clock:
-        for i in range(8):
-            fleet[f"own-{i}"] = json.dumps(
-                {"at": clock.now, "failed": True, "miner": "miner-hotkey"}
-            )
-            fleet[f"broken-{i}"] = json.dumps(
-                {"at": clock.now, "failed": True, "miner": "provider-b"}
-            )
-        fleet["straggler"] = json.dumps({"at": clock.now, "failed": True, "miner": "straggler"})
-        for i in range(6):
-            fleet[f"healthy-{i}"] = json.dumps(
-                {"at": clock.now - 60, "failed": False, "miner": f"m-{i}"}
-            )
-        ctx, _, _ = make_ctx(
-            *(result(MIRROR_DNS_TIMEOUT) for _ in range(2)), redis=redis, uuid="node-x"
-        )
-        _, confirming = await _confirming(check, ctx, clock)
-    assert (
-        confirming.passed is False
-        and confirming.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
-    )
-    fleet_guard = confirming.event.what_we_saw["guard"]["fleet"]
-    assert fleet_guard["excluded_miner"] == "provider-b"
-    assert (fleet_guard["pulls"], fleet_guard["failed"]) == (5, 1)
-
-
-@pytest.mark.asyncio
-async def test_a_pull_older_than_an_interval_and_an_hour_leaves_the_fleet_window():
-    redis = FakeRedis()
-    with flags() as clock:
-        _seed_fleet(redis, clock.now, ok=0, failed=30, age=7 * 3600 - 1)
-        fleet = redis.hashes["registry_pull_fleet"]
-        fleet["gone"] = json.dumps({"at": clock.now - 7 * 3600 - 1, "failed": True})
-        ctx, _, _ = make_ctx(result(PULL_OK), redis=redis, uuid="node-x")
-        res = await RegistryPullCheck().run(ctx)
-    assert res.event.reason_code == Msg.REGISTRY_PULL_OK.reason
-    # a scheduled pull prunes the window, even on a fleet whose pulls never fail
-    assert "gone" not in fleet and len(fleet) == 31
-
-
-@pytest.mark.asyncio
-async def test_the_retry_of_an_open_streak_is_not_a_fleet_pull():
-    """A broken node re-pulls every 30 minutes; counting each retry would let a few broken nodes weigh on the
-    fleet reading as much as a healthy fleet that pulls once per 6 h."""
-    redis = FakeRedis()
-    ctx, runner, _ = make_ctx(*(result(MIRROR_DNS_TIMEOUT) for _ in range(4)), redis=redis)
-    check = RegistryPullCheck()
-    with flags(enforced=False) as clock:
-        first_at = clock.now
-        for _ in range(4):
-            await check.run(ctx)
-            clock.now += 30 * 60
-    assert len(runner.commands) == 4
-    entry = json.loads(redis.hashes["registry_pull_fleet"][EXECUTOR.uuid])
-    assert entry == {"at": first_at, "failed": True, "miner": "miner-hotkey"}
-
-
-@pytest.mark.asyncio
-async def test_a_scheduled_pull_that_works_is_a_fleet_pull():
-    redis = FakeRedis()
-    ctx, _, _ = make_ctx(result(PULL_OK), redis=redis)
-    with flags() as clock:
-        await RegistryPullCheck().run(ctx)
-    assert json.loads(redis.hashes["registry_pull_fleet"][EXECUTOR.uuid]) == {
-        "at": clock.now,
-        "failed": False,
-        "miner": "miner-hotkey",
-    }
-
-
-@pytest.mark.asyncio
-async def test_an_unreadable_fleet_window_leaves_the_confirming_failure_no_verdict():
-    redis = FakeRedis()
-    ctx, _, _ = make_ctx(*(result(MIRROR_DNS_TIMEOUT) for _ in range(2)), redis=redis)
-    check = RegistryPullCheck()
-    with flags() as clock:
-        first = await check.run(ctx)
-        redis.hashes_unreadable = True
-        clock.now += 30 * 60
-        res = await check.run(ctx)
-    assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
-    assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_UNMEASURED.reason
-    assert res.event.what_we_saw["no_verdict"] == "fleet_state_unreadable"
-    assert res.event.what_we_saw["failures_in_a_row"] == 1
-
-
-@pytest.mark.asyncio
-async def test_docker_hub_down_wins_over_the_fleet():
-    redis = FakeRedis()
+async def test_docker_hub_down_in_the_middle_of_a_streak_neither_counts_nor_resets_it():
+    ctx, _, _ = make_ctx(*(result(HUB_TLS_TIMEOUT) for _ in range(3)))
     hub = FakeHub(HUB_UP)
     check = RegistryPullCheck()
     with flags(hub=hub) as clock:
-        _seed_fleet(redis, clock.now, ok=0, failed=30)
-        ctx, _, _ = make_ctx(
-            *(result(HUB_TLS_TIMEOUT) for _ in range(2)), redis=redis, uuid="node-x"
-        )
         first = await check.run(ctx)
         hub.answer = HUB_DOWN
         clock.now += 30 * 60
-        res = await check.run(ctx)
-    assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
-    assert res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason
-    assert "fleet" not in res.event.what_we_saw["guard"]
-
-
-@pytest.mark.asyncio
-async def test_a_streak_counted_just_before_an_incident_is_not_confirmed_by_it():
-    """r5 M1: a node counted once just before an incident the control does not see retries every 30 minutes;
-    its confirming failure is judged on the pulls taken since, which fail with it, so it waits the incident
-    out. Once the fleet pulls cleanly again, a failure it still has confirms it."""
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    fleet = redis.hashes.setdefault("registry_pull_fleet", {})
-    with flags() as clock:
-        t0 = clock.now
-        for i in range(30):
-            fleet[f"before-{i}"] = json.dumps(
-                {"at": t0 - 3600, "failed": False, "miner": f"m-{i % 6}"}
-            )
-        ctx, _, _ = make_ctx(
-            *(result(HUB_TLS_TIMEOUT) for _ in range(3)), redis=redis, uuid="node-x"
-        )
-        first = await check.run(ctx)
-        clock.now += 10 * 60
-        for i in range(15):
-            fleet[f"incident-{i}"] = json.dumps(
-                {"at": clock.now, "failed": True, "miner": f"m-{i % 6}"}
-            )
-        clock.now = t0 + 30 * 60
-        during = await check.run(ctx)
-        clock.now = t0 + 3 * 3600
-        for i in range(15):
-            fleet[f"incident-{i}"] = json.dumps(
-                {"at": clock.now, "failed": False, "miner": f"m-{i % 6}"}
-            )
-        clock.now += 60
+        down = await check.run(ctx)
+        hub.answer = HUB_UP
+        clock.now += 30 * 60
         confirmed = await check.run(ctx)
     assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
-    assert during.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_FLEET.reason
-    assert during.event.what_we_saw["failures_in_a_row"] == 1
-    assert during.event.what_we_saw["guard"]["fleet"]["pulls_since_streak_began"] == 15 - 3
+    assert down.passed and down.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason
+    assert down.event.what_we_saw["failures_in_a_row"] == 1
     assert (
         confirmed.passed is False and confirmed.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
     )
-    assert confirmed.event.what_we_saw["streak_started_at"] == t0
-
-
-@pytest.mark.asyncio
-async def test_on_30_idle_nodes_or_more_a_confirming_failure_waits_for_pulls_since_the_streak_began():
-    """The retry 30 minutes on comes before the fleet has pulled much since; it waits for `required` pulls."""
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    fleet = redis.hashes.setdefault("registry_pull_fleet", {})
-    with flags() as clock:
-        assert module.fleet_wait_min_nodes() == 30
-        for i in range(29):
-            fleet[f"seen-{i}"] = json.dumps(
-                {"at": clock.now - 2 * 3600, "failed": False, "miner": f"m-{i % 6}"}
-            )
-        ctx, _, _ = make_ctx(
-            *(result(MIRROR_DNS_TIMEOUT) for _ in range(3)), redis=redis, uuid="node-x"
-        )
-        await check.run(ctx)
-        clock.now += 30 * 60
-        waiting = await check.run(ctx)
-        for i in range(5):
-            fleet[f"seen-{i}"] = json.dumps(
-                {"at": clock.now, "failed": False, "miner": f"m-{i % 6}"}
-            )
-        clock.now += 30 * 60
-        confirmed = await check.run(ctx)
-    assert waiting.passed and waiting.event.reason_code == Msg.REGISTRY_PULL_UNMEASURED.reason
-    what = waiting.event.what_we_saw
-    assert what["no_verdict"] == "awaiting_fleet" and what["failures_in_a_row"] == 1
-    fleet_guard = what["guard"]["fleet"]
-    assert (fleet_guard["pulls_since_streak_began"], fleet_guard["needed"]) == (0, 5)
-    assert (
-        confirmed.passed is False and confirmed.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
-    )
-
-
-@pytest.mark.asyncio
-async def test_under_30_idle_nodes_the_retry_confirms_without_waiting():
-    """r6 L3: on a fleet whose pulls come in at under 5 an hour, waiting for 5 since the streak began would hold a
-    broken node's verdict for hours."""
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    fleet = redis.hashes.setdefault("registry_pull_fleet", {})
-    with flags() as clock:
-        for i in range(28):
-            fleet[f"seen-{i}"] = json.dumps(
-                {"at": clock.now - 2 * 3600, "failed": False, "miner": f"m-{i % 6}"}
-            )
-        ctx, _, _ = make_ctx(
-            *(result(MIRROR_DNS_TIMEOUT) for _ in range(2)), redis=redis, uuid="node-x"
-        )
-        _, confirming = await _confirming(check, ctx, clock)
-    assert (
-        confirming.passed is False
-        and confirming.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
-    )
-    fleet_guard = confirming.event.what_we_saw["guard"]["fleet"]
-    assert fleet_guard["idle_nodes_seen"] == 29 and "needed" not in fleet_guard
 
 
 # ------------------------------------------------------------------ fleets over many cycles
@@ -1224,103 +914,73 @@ def _zeroed(seen) -> dict[str, float]:
     }
 
 
+def _synchronise(redis: FakeRedis, nodes, at: float) -> None:
+    """Every node's last pull at `at`, as after a deploy that pulled them all in one cycle."""
+    for ctx in nodes:
+        redis.store[f"registry_pull_probe:{ctx.executor.uuid}"] = json.dumps(
+            {"at": at, "outcome": "ok"}
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("start", ["synchronised", "fresh"])
-async def test_a_two_hour_outage_only_the_nodes_see_zeroes_nobody_in_a_60_node_cohort(
-    start, caplog
+async def test_log_only_an_outage_only_the_nodes_see_zeroes_nobody_and_shows_in_the_observed_rows(
+    start,
 ):
-    """Regression (r5 M1): 60 idle nodes that pulled together after deploy; six hours later a Docker Hub CDN
-    incident only the nodes see (the control is up) lasts 2 h. 17 healthy nodes scored 0 from 75 minutes in.
-    `fresh`: the same fleet first seen at deploy."""
+    """60 idle nodes of 6 miners; six hours in, a Docker Hub CDN incident only the nodes see (the control is up)
+    lasts 2 h. With enforcement off, as it ships, nobody scores 0 and the nodes that pulled twice in it are
+    REGISTRY_PULL_FAILED_OBSERVED: the fleet-wide pattern the review before enforcement reads."""
     redis = FakeRedis()
     check = RegistryPullCheck()
-    with flags(phase_at_start=False) as clock, caplog.at_level(logging.WARNING):
+    with flags(enforced=False, phase_at_start=False) as clock:
         t0 = clock.now
         miners = [f"miner-{i % 6}" for i in range(60)]
         nodes = _fleet(clock, redis, miners=miners, start=t0 + 6 * 3600, end=t0 + 8 * 3600)
         if start == "synchronised":
-            for ctx in nodes:
-                uuid = ctx.executor.uuid
-                redis.store[f"registry_pull_probe:{uuid}"] = json.dumps({"at": t0, "outcome": "ok"})
-                redis.hashes.setdefault("registry_pull_fleet", {})[uuid] = json.dumps(
-                    {"at": t0, "failed": False, "miner": ctx.miner_hotkey}
-                )
+            _synchronise(redis, nodes, t0)
         seen = await _cycles(check, nodes, clock, hours=14)
-    assert _zeroed(seen) == {}
-    assert _logged(caplog, "REGISTRY_PULL_FLEET_FAILING") >= 1
-    during = {
-        reason
-        for rows in seen.values()
-        for at, reason in rows
-        if t0 + 6.5 * 3600 <= at < t0 + 8 * 3600
+    reasons = {reason for rows in seen.values() for _, reason in rows}
+    assert Msg.REGISTRY_PULL_FAILED.reason not in reasons
+    observed = {
+        uuid
+        for uuid, rows in seen.items()
+        if any(reason == Msg.REGISTRY_PULL_FAILED_OBSERVED.reason for _, reason in rows)
     }
-    assert Msg.REGISTRY_PULL_NO_VERDICT_FLEET.reason in during
+    assert len(observed) >= 10
     # the pulls spread: no node pulls more than its schedule plus the retries of one streak
     assert max(ctx.runner.pulls for ctx in nodes) <= 8
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seed", range(6))
-@pytest.mark.parametrize("hours", [6, 3])
-async def test_an_outage_only_the_nodes_see_zeroes_nobody_in_a_skewed_fleet(seed, hours):
-    """Regression (r6 M1): 40 idle nodes of miners holding 20/10/5/3/2 of them. The breaker's spread rule missed
-    the outage (too few miners failing in one hour) or closed in the middle of it, and up to 30 healthy nodes
-    scored 0 in 8 of 20 runs. `seed` changes every uuid, so every node's phase."""
+async def test_enforced_an_outage_only_the_nodes_see_zeroes_nodes_until_their_first_pull_after_it():
+    """The accepted risk, with no fleet guard: enforced, a 2 h outage only the nodes see scores 0 every node that
+    pulls twice in it; each is back on its first pull after it ends. The review before enforcement is the guard."""
     redis = FakeRedis()
     check = RegistryPullCheck()
     with flags(phase_at_start=False) as clock:
         t0 = clock.now
-        miners = [f"miner-{m}" for m, size in enumerate((20, 10, 5, 3, 2)) for _ in range(size)]
-        nodes = _fleet(
-            clock,
-            redis,
-            miners=miners,
-            start=t0 + 12 * 3600,
-            end=t0 + (12 + hours) * 3600,
-            tag=f"-s{seed}",
-        )
-        seen = await _cycles(check, nodes, clock, hours=12 + hours + 4)
-    assert _zeroed(seen) == {}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("seed", range(6))
-async def test_a_fleet_that_shrinks_after_an_outage_cannot_hold_off_a_broken_nodes_verdict(seed):
-    """Regression (r6 M2): 40 idle nodes, a 2 h outage, then 28 of them rented. The breaker needed `required`
-    pulls in an hour to close and the 12 left could not bring them, so it stayed open and a node that broke
-    afterwards never failed in 8 of 20 runs."""
-    redis = FakeRedis()
-    check = RegistryPullCheck()
-    with flags(phase_at_start=False) as clock:
-        t0 = clock.now
-        miners = [f"miner-{i % 5}" for i in range(40)]
-        nodes = _fleet(
-            clock, redis, miners=miners, start=t0 + 12 * 3600, end=t0 + 14 * 3600, tag=f"-s{seed}"
-        )
-        rented = {ctx.executor.uuid for ctx in nodes[:28]}
-        broken = nodes[30]
-        broken.runner.broken_from = t0 + 16 * 3600
-
-        def active(ctx):
-            return ctx.executor.uuid not in rented or clock.now < t0 + 13 * 3600
-
-        seen = await _cycles(check, nodes, clock, hours=40, active=active)
+        start, end = t0 + 6 * 3600, t0 + 8 * 3600
+        miners = [f"miner-{i % 6}" for i in range(60)]
+        nodes = _fleet(clock, redis, miners=miners, start=start, end=end)
+        seen = await _cycles(check, nodes, clock, hours=14)
     zeroed = _zeroed(seen)
-    assert set(zeroed) == {broken.executor.uuid}
-    # its first failed pull is at its phase, 0-6 h after it broke; the verdict comes within 7 h of that
-    assert zeroed[broken.executor.uuid] - (t0 + 16 * 3600) <= 13 * 3600
+    assert zeroed and all(start <= at < end for at in zeroed.values())
+    for uuid in zeroed:
+        # the retry comes 30 minutes after the last failed pull, in the next 15-minute cycle
+        late = [reason for at, reason in seen[uuid] if at >= end + 45 * 60]
+        assert late and Msg.REGISTRY_PULL_FAILED.reason not in late, uuid
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seed", range(6))
 @pytest.mark.parametrize("stragglers", [0, 2])
-async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(stragglers, seed, caplog):
-    """Regression (r5 L1, r6 L4): ticket-0361's shape, 27 nodes of one provider behind a mirror whose DNS times
-    out, in a 60-node fleet, plus a couple of broken nodes of other providers. The 27 opened the fleet-wide
-    breaker alone, and with two stragglers again, sheltering every other provider's failures."""
+async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(stragglers, seed):
+    """ticket-0361's shape: 27 nodes of one provider behind a mirror whose DNS times out, in a 60-node fleet, plus
+    a couple of broken nodes of other providers. Every broken node fails on its retry after its first pull at its
+    phase; no healthy one does."""
     redis = FakeRedis()
     check = RegistryPullCheck()
-    with flags(phase_at_start=False) as clock, caplog.at_level(logging.WARNING):
+    with flags(phase_at_start=False) as clock:
         t0 = clock.now
         broken = [
             _node(
@@ -1346,41 +1006,11 @@ async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(straggler
         seen = await _cycles(check, broken + healthy, clock, hours=10)
     zeroed = _zeroed(seen)
     assert set(zeroed) == {ctx.executor.uuid for ctx in broken}
-    assert _logged(caplog, "REGISTRY_PULL_FLEET_FAILING") == 0
-    # each once `required` pulls of the healthy providers landed since its streak began (the broken ones'
-    # retries are not scheduled pulls): within 2.5 h of its first pull at its phase
     for ctx in broken:
         uuid = ctx.executor.uuid
         first = next(at for at, reason in seen[uuid] if reason != Msg.SKIPPED.reason)
-        assert zeroed[uuid] - first <= 2.5 * 3600, uuid
-    assert max(zeroed.values()) - t0 <= 9 * 3600
-
-
-class _YieldingRedis(FakeRedis):
-    """hgetall hands the loop to other nodes between the read and whatever the caller does next."""
-
-    async def hgetall(self, key):
-        snapshot = await super().hgetall(key)
-        for _ in range(5):
-            await asyncio.sleep(0)
-        return snapshot
-
-
-@pytest.mark.asyncio
-async def test_a_pull_recorded_while_the_window_is_pruned_is_kept():
-    """Regression (r5 L2): the record ran outside the lock, so another node's hset between the prune's hgetall
-    and its hdel was deleted, and the window under-counted that pull for an hour."""
-    redis = _YieldingRedis()
-    check = RegistryPullCheck()
-    with flags() as clock:
-        redis.hashes["registry_pull_fleet"] = {
-            "node-b": json.dumps({"at": clock.now - 8 * 3600, "failed": False, "miner": "m-b"})
-        }
-        ctx_a, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), redis=redis, uuid="node-a")
-        ctx_b, _, _ = make_ctx(result(PULL_OK), redis=redis, uuid="node-b")
-        await asyncio.gather(check.run(ctx_a), check.run(ctx_b))
-    entry = json.loads(redis.hashes["registry_pull_fleet"]["node-b"])
-    assert entry["at"] == clock.now and entry["failed"] is False
+        assert zeroed[uuid] - first <= 45 * 60, uuid
+    assert max(zeroed.values()) - t0 <= 7 * 3600
 
 
 def test_the_phase_is_stable_per_node_and_spreads_the_fleet_over_the_interval():

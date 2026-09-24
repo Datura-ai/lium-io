@@ -1084,18 +1084,8 @@ class RegistryPullMessages:
         category="runtime",
         impact="Proceed",
     )
-    # the pull failed while more than REGISTRY_PULL_FLEET_SHARE of the latest scheduled pulls of other
-    # providers' idle nodes failed too (RegistryPullCheck, fleet_reading)
-    REGISTRY_PULL_NO_VERDICT_FLEET = MessageTemplate(
-        event="Docker Hub image pull failed while pulls fail across the fleet; no verdict",
-        reason="REGISTRY_PULL_NO_VERDICT_FLEET",
-        severity="info",
-        category="runtime",
-        impact="Proceed",
-    )
     # the pull ran but says nothing about the path: Docker Hub's 429, an auth or unclassified error, or
-    # the probe itself did not run; or a streak's confirming failure waits for the fleet's pulls
-    # (what.no_verdict = awaiting_fleet)
+    # the probe itself did not run
     REGISTRY_PULL_UNMEASURED = MessageTemplate(
         event="Docker Hub image pull reached no verdict",
         reason="REGISTRY_PULL_UNMEASURED",

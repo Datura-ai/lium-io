@@ -8,7 +8,6 @@ import math
 import re
 import shlex
 import time
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -50,22 +49,11 @@ _HUB_REACHABLE_STATUSES = frozenset({200, 401})
 _HUB_CONTROL_TIMEOUT_SECONDS = 10
 _HUB_CONTROL_KEY = "registry_pull_hub_control"
 HUB_CONTROL_TTL_SECONDS = 5 * 60
-# this validator's last scheduled pull of each node: {"at": ..., "failed": ..., "miner": <hotkey>}. Entries
-# older than one interval plus FLEET_HORIZON_SLACK_SECONDS are pruned; the ones younger are the idle fleet
-# this validator has seen
-_FLEET_KEY = "registry_pull_fleet"
-FLEET_HORIZON_SLACK_SECONDS = 3600
-# `required`: this share of the idle nodes seen, or REGISTRY_PULL_FLEET_MIN_PULLS if more
-FLEET_MIN_PULLS_SHARE_OF_SEEN = 0.1
-# REGISTRY_PULL_FLEET_FAILING is logged at most once per this long
-FLEET_LOG_INTERVAL_SECONDS = 3600
-_FLEET_LOGGED_KEY = "registry_pull_fleet_logged"
-# every Redis read and write of the fleet window and the control runs under this lock, so one fetch comes
-# out per window, and a pull recorded while the window is pruned is kept
-_FLEET_LOCK = asyncio.Lock()
+# the control's Redis read, fetch and write run under this lock, so one fetch comes out per window
+_HUB_CONTROL_LOCK = asyncio.Lock()
 
 # why a failed pull did not count
-NoVerdict = Literal["docker_hub_down", "fleet_failing", "fleet_state_unreadable", "awaiting_fleet"]
+NoVerdict = Literal["docker_hub_down"]
 
 # POSIX sh, run by the executor container's docker CLI against the host's dockerd, so the pull takes the
 # node's configured registry path (registry-mirrors, then registry-1.docker.io) exactly as a rental's pull
@@ -286,8 +274,8 @@ _SCHEDULED = "scheduled"
 def pull_phase_seconds(uuid: str) -> float:
     """Where in each REGISTRY_PULL_PROBE_INTERVAL_HOURS the node's scheduled pull falls, stable per executor.
 
-    Without it every idle node pulls in the first cycle after deploy and every interval after, so the fleet's
-    pulls bunch into one hour in six and an incident in the other five has no fleet pulls to show it.
+    Without it every idle node pulls in the first cycle after deploy and every interval after, so the pulls
+    bunch into one cycle in each interval, and a provider's nodes behind one IP spend its Docker Hub quota at once.
     """
     interval = settings.REGISTRY_PULL_PROBE_INTERVAL_HOURS * 3600
     fraction = int(hashlib.sha256(uuid.encode()).hexdigest()[:12], 16) / 16**12
@@ -311,8 +299,6 @@ class _ProbeState:
     reading: dict[str, Any] = field(default_factory=dict)
     no_verdict: str | None = None
     guard: dict[str, Any] | None = None
-    # when the open streak's first counted failure was pulled; None while no streak is open
-    streak_started_at: float | None = None
 
     @property
     def standing_failure(self) -> bool:
@@ -340,7 +326,6 @@ class _ProbeState:
                 "reading": self.reading,
                 "no_verdict": self.no_verdict,
                 "guard": self.guard,
-                "streak_started_at": self.streak_started_at,
             }
         )
 
@@ -348,68 +333,16 @@ class _ProbeState:
     def from_raw(cls, raw: Any) -> _ProbeState | None:
         try:
             data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            failures = int(data.get("failures_in_a_row", 0))
-            started = data.get("streak_started_at")
             return cls(
                 at=float(data["at"]),
                 outcome=str(data["outcome"]),
-                failures_in_a_row=failures,
+                failures_in_a_row=int(data.get("failures_in_a_row", 0)),
                 reading=dict(data.get("reading") or {}),
                 no_verdict=data.get("no_verdict"),
                 guard=data.get("guard"),
-                # a streak recorded before the field: its last pull is the latest its first failure can be
-                streak_started_at=float(started)
-                if started is not None
-                else (float(data["at"]) if failures > 0 else None),
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
-
-
-@dataclass(frozen=True)
-class _FleetEntry:
-    uuid: str
-    at: float
-    failed: bool
-    miner: str
-
-
-def fleet_wait_min_nodes() -> int:
-    """The fewest idle nodes whose phases bring REGISTRY_PULL_FLEET_MIN_PULLS scheduled pulls an hour (30 at the
-    defaults). On a smaller fleet a confirming failure does not wait for the fleet: the wait would run for hours."""
-    interval = settings.REGISTRY_PULL_PROBE_INTERVAL_HOURS * 3600
-    return math.ceil(settings.REGISTRY_PULL_FLEET_MIN_PULLS * interval / 3600)
-
-
-def fleet_reading(
-    seen: list[_FleetEntry], *, uuid: str, miner: str, required: int, since: float | None
-) -> dict[str, Any]:
-    """The latest `required` scheduled pulls of other providers' idle nodes, as one node's confirming failure
-    reads them.
-
-    Other providers: outside the node's own miner, and outside the other miner with the most failed pulls, so
-    neither the node's own provider nor one other broken provider (ticket-0361: 27 nodes behind one broken
-    mirror) can make its failure look like the fleet's. With `since` (the streak's start), also how many of
-    those pulls landed after it and how many must.
-    """
-    others = [entry for entry in seen if entry.uuid != uuid and entry.miner != miner]
-    failed_by_miner = Counter(entry.miner for entry in others if entry.failed)
-    excluded = failed_by_miner.most_common(1)[0][0] if failed_by_miner else None
-    pool = [entry for entry in others if entry.miner != excluded]
-    latest = sorted(pool, key=lambda entry: entry.at, reverse=True)[:required]
-    failed = sum(entry.failed for entry in latest)
-    reading: dict[str, Any] = {
-        "idle_nodes_seen": len(seen),
-        "required_pulls": required,
-        "pulls": len(latest),
-        "failed": failed,
-        "share": round(failed / len(latest), 3) if latest else 0.0,
-        "excluded_miner": excluded,
-    }
-    if since is not None:
-        reading["pulls_since_streak_began"] = sum(entry.at > since for entry in pool)
-        reading["needed"] = min(required, len(pool))
-    return reading
 
 
 class _RedisUnreadable(Exception):
@@ -449,25 +382,10 @@ class RegistryPullCheck:
     REGISTRY_PULL_ENFORCEMENT_ENABLED; without it the finding is logged as REGISTRY_PULL_FAILED_OBSERVED
     and the node passes.
 
-    The guards, in three rules:
-    1. A failed pull counts only if the validator's own GET of DOCKER_HUB_CONTROL_URL answers 200 or 401
-       (cached for HUB_CONTROL_TTL_SECONDS); else it is REGISTRY_PULL_NO_VERDICT_HUB_DOWN.
-    2. The second failure in a row, the one that fails the node, counts only if at most
-       REGISTRY_PULL_FLEET_SHARE of the latest `required` scheduled pulls of other providers' idle nodes
-       failed (fleet_reading); else it is REGISTRY_PULL_NO_VERDICT_FLEET, the streak stays open and is
-       retried, and REGISTRY_PULL_FLEET_FAILING is logged at most hourly. `required` is
-       REGISTRY_PULL_FLEET_MIN_PULLS, or FLEET_MIN_PULLS_SHARE_OF_SEEN of the idle nodes seen (last
-       scheduled pull within one interval plus an hour) if more. On a validator seeing
-       fleet_wait_min_nodes() idle nodes or more (30 at the defaults), those pulls must also all have landed
-       after the streak's first failure (or all the other providers' nodes pulled since, if fewer), so it is
-       judged on pulls taken since the node started failing; until then it is no verdict (awaiting_fleet).
-       On a smaller fleet the 30-minute retry confirms.
-    3. A scheduled pull is a node's regular one at its phase (pull_phase_seconds), never the retry of an
-       open streak, so a few broken nodes re-pulling every 30 minutes weigh no more than healthy ones.
-    The control sees an outage from where the validator stands, at once and on a fleet of any size; the
-    fleet reading catches what the validator cannot see (an outage of Docker Hub's CDN in one region, a
-    mirror many providers share, an error text a new Docker release words differently). Nothing but each
-    node's streak is kept between pulls: a confirming failure is judged on the fleet's latest pulls alone.
+    A failed pull counts only if the validator's own GET of DOCKER_HUB_CONTROL_URL answers 200 or 401
+    (cached for HUB_CONTROL_TTL_SECONDS); else it is REGISTRY_PULL_NO_VERDICT_HUB_DOWN, neither counting nor
+    resetting the streak. An outage the validator cannot see (Docker Hub's CDN in one region, a mirror many
+    providers share) is not guarded here: enforcement stays off until the OBSERVED rows have been reviewed.
     """
 
     check_id = "executor.validate.registry_pull"
@@ -495,21 +413,18 @@ class RegistryPullCheck:
 
         reading = await self._pull(ctx)
         failures = last.failures_in_a_row
-        started = last.streak_started_at
         no_verdict: NoVerdict | None = None
         guard: dict[str, Any] | None = None
-        if reading.outcome == "ok" or reading.failed:
-            async with _FLEET_LOCK:
-                if failures == 0:
-                    await self._record_fleet_pull(ctx, now, failed=reading.failed)
-                    # reading the window prunes it, which a fleet that never fails would otherwise never do
-                    await self._fleet_window(ctx, now)
-                if reading.failed:
-                    no_verdict, guard, failures, started = await self._guard(
-                        ctx, now, failures, started
-                    )
-        if reading.outcome == "ok":
-            failures, started = 0, None
+        if reading.failed:
+            async with _HUB_CONTROL_LOCK:
+                control = await self._hub_control(ctx, now)
+            guard = {"docker_hub_control": control}
+            if control["reachable"]:
+                failures += 1
+            else:
+                no_verdict = "docker_hub_down"
+        elif reading.outcome == "ok":
+            failures = 0
         state = _ProbeState(
             at=now,
             outcome=reading.outcome,
@@ -517,43 +432,12 @@ class RegistryPullCheck:
             reading=reading.as_record(),
             no_verdict=no_verdict,
             guard=guard,
-            streak_started_at=started,
         )
         await self._save(ctx, state)
         return self._verdict(ctx, state, probed=True)
 
-    async def _guard(
-        self, ctx: Context, now: float, failures: int, started: float | None
-    ) -> tuple[NoVerdict | None, dict[str, Any], int, float | None]:
-        """Whether this failed pull counts (no_verdict None) and what the guards saw, with the streak it leaves:
-        (no_verdict, guard, failures_in_a_row, streak_started_at). Runs under _FLEET_LOCK."""
-        control = await self._hub_control(ctx, now)
-        guard: dict[str, Any] = {"docker_hub_control": control}
-        if not control["reachable"]:
-            return "docker_hub_down", guard, failures, started
-        if not 0 < failures < REGISTRY_PULL_FAILURES_BEFORE_VERDICT:
-            return None, guard, failures + 1, started if failures > 0 else now
-        fleet = await self._fleet_window(ctx, now)
-        if fleet is None:
-            return "fleet_state_unreadable", guard, failures, started
-        seen, required = fleet
-        waits = len(seen) >= fleet_wait_min_nodes()
-        fleet_guard = fleet_reading(
-            seen,
-            uuid=ctx.executor.uuid,
-            miner=ctx.miner_hotkey or f"executor:{ctx.executor.uuid}",
-            required=required,
-            since=started if waits else None,
-        )
-        guard["fleet"] = fleet_guard
-        if fleet_guard["failed"] > settings.REGISTRY_PULL_FLEET_SHARE * fleet_guard["pulls"]:
-            await self._log_fleet_failing(ctx, now, fleet_guard)
-            return "fleet_failing", guard, failures, started
-        if waits and fleet_guard["pulls_since_streak_began"] < fleet_guard["needed"]:
-            return "awaiting_fleet", guard, failures, started
-        return None, guard, failures + 1, started if failures > 0 else now
-
     async def _hub_control(self, ctx: Context, now: float) -> dict[str, Any]:
+        """The validator's cached reading of Docker Hub, fetched again once stale. Runs under _HUB_CONTROL_LOCK."""
         redis = ctx.services.redis
         try:
             raw = await redis.get(_HUB_CONTROL_KEY)
@@ -583,83 +467,6 @@ class RegistryPullCheck:
             )
         return control
 
-    async def _record_fleet_pull(self, ctx: Context, now: float, *, failed: bool) -> None:
-        """Runs under _FLEET_LOCK, so a prune in _fleet_window never deletes the entry written here."""
-        entry = {"at": now, "failed": failed, "miner": ctx.miner_hotkey}
-        try:
-            await ctx.services.redis.hset(_FLEET_KEY, ctx.executor.uuid, json.dumps(entry))
-        except Exception:
-            logger.warning(
-                _m(
-                    "Registry pull: could not record the pull in the fleet window",
-                    extra=get_extra_info(ctx.default_extra),
-                ),
-                exc_info=True,
-            )
-
-    async def _fleet_window(self, ctx: Context, now: float) -> tuple[list[_FleetEntry], int] | None:
-        """The idle nodes seen (their last scheduled pull within one interval plus an hour) and `required`.
-        Prunes older entries; runs under _FLEET_LOCK."""
-        redis = ctx.services.redis
-        try:
-            raw = await redis.hgetall(_FLEET_KEY) or {}
-        except Exception:
-            logger.warning(_m("Registry pull: the fleet window is unreadable"), exc_info=True)
-            return None
-        horizon = settings.REGISTRY_PULL_PROBE_INTERVAL_HOURS * 3600 + FLEET_HORIZON_SLACK_SECONDS
-        seen: list[_FleetEntry] = []
-        expired: list[str] = []
-        for key, value in raw.items():
-            uuid = _decode(key)
-            try:
-                data = json.loads(_decode(value))
-                entry = _FleetEntry(
-                    uuid=uuid,
-                    at=float(data["at"]),
-                    failed=bool(data.get("failed")),
-                    # an entry without a hotkey stands for a miner of its own
-                    miner=str(data.get("miner") or f"executor:{uuid}"),
-                )
-            except (TypeError, ValueError, KeyError, AttributeError):
-                expired.append(uuid)
-                continue
-            if now - entry.at <= horizon:
-                seen.append(entry)
-            else:
-                expired.append(uuid)
-        if expired:
-            try:
-                await redis.hdel(_FLEET_KEY, *expired)
-            except Exception:
-                logger.warning(_m("Registry pull: could not prune the fleet window"), exc_info=True)
-        required = max(
-            settings.REGISTRY_PULL_FLEET_MIN_PULLS,
-            math.ceil(FLEET_MIN_PULLS_SHARE_OF_SEEN * len(seen)),
-        )
-        return seen, required
-
-    async def _log_fleet_failing(self, ctx: Context, now: float, fleet: dict[str, Any]) -> None:
-        """REGISTRY_PULL_FLEET_FAILING, at most once per FLEET_LOG_INTERVAL_SECONDS. Runs under _FLEET_LOCK."""
-        redis = ctx.services.redis
-        try:
-            raw = await redis.get(_FLEET_LOGGED_KEY)
-            if (
-                raw is not None
-                and now - float(json.loads(_decode(raw))) < FLEET_LOG_INTERVAL_SECONDS
-            ):
-                return
-            await redis.set(_FLEET_LOGGED_KEY, json.dumps(now), ex=FLEET_LOG_INTERVAL_SECONDS)
-        except Exception:
-            logger.warning(_m("Registry pull: the fleet log marker is unreadable"), exc_info=True)
-        logger.warning(
-            _m(
-                f"REGISTRY_PULL_FLEET_FAILING: {fleet['failed']} of the latest {fleet['pulls']} scheduled pulls "
-                "of other providers' idle nodes failed; a node's second failed pull in a row is no verdict while "
-                f"more than {settings.REGISTRY_PULL_FLEET_SHARE:.0%} of them fail",
-                extra=get_extra_info({**fleet, "threshold": settings.REGISTRY_PULL_FLEET_SHARE}),
-            )
-        )
-
     def _verdict(self, ctx: Context, state: _ProbeState, *, probed: bool) -> CheckResult:
         what: dict[str, Any] = {
             "pull": state.reading,
@@ -667,8 +474,6 @@ class RegistryPullCheck:
             "failures_in_a_row": state.failures_in_a_row,
             "enforced": settings.REGISTRY_PULL_ENFORCEMENT_ENABLED,
         }
-        if state.streak_started_at is not None:
-            what["streak_started_at"] = state.streak_started_at
         if not probed:
             what["read_at"] = state.at
             what["next_pull_at"] = state.next_due_at(ctx.executor.uuid)
@@ -688,10 +493,6 @@ class RegistryPullCheck:
             return self._skipped(ctx, "not due", last=what)
         if state.no_verdict == "docker_hub_down":
             template = Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN
-        elif state.no_verdict == "fleet_failing":
-            template = Msg.REGISTRY_PULL_NO_VERDICT_FLEET
-        elif state.no_verdict is not None:
-            template = Msg.REGISTRY_PULL_UNMEASURED
         elif state.outcome in FAILING_OUTCOMES:
             template = Msg.REGISTRY_PULL_FAILED_ONCE
         elif state.outcome == "ok":
