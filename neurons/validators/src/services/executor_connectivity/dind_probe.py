@@ -62,6 +62,54 @@ DIND_SSHD_NOT_READY_MESSAGE = (
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
 
+# DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
+# except `mount error`: that is sysbox's shiftfs fallback (nvidia_docker_sysbox_setup.sh --check)
+# and keeps SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
+# for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
+_HOOK_LINE_START = "nvidia-container-cli:"
+_SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
+DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
+    (
+        "nvml error: driver/library version mismatch",
+        DindLogCause(
+            "NVIDIA_RUNTIME_MISMATCH",
+            "the NVIDIA container hook cannot start a GPU container: the kernel driver and the user-space "
+            "NVIDIA library are different versions (a driver update without a reboot)",
+        ),
+    ),
+    (
+        _HOOK_LINE_START,
+        DindLogCause(
+            "NVIDIA_CONTAINER_HOOK_FAILED",
+            "the NVIDIA container hook cannot start a GPU container on the host",
+        ),
+    ),
+)
+DOCKER_RUN_ERROR_LINE_MAX_CHARS = 400
+
+
+def diagnose_docker_run_error(stderr: str | None) -> DindLogCause | None:
+    """Name the cause when the NVIDIA container hook refused `docker run` of the DinD container;
+    None for anything else (a bound host port, a name conflict, a sysbox mount error).
+
+    The message quotes the hook's own line (from `nvidia-container-cli:` on, capped), so the
+    provider sees the hook's error in the event and not only the validator's reading of it.
+    """
+    hook_lines = [
+        line[line.find(_HOOK_LINE_START) :].strip()
+        for line in (stderr or "").splitlines()
+        if _HOOK_LINE_START in line and _SYSBOX_HOOK_ERROR not in line
+    ]
+    for pattern, cause in DOCKER_RUN_CAUSES:
+        line = next((ln for ln in hook_lines if pattern in ln), None)
+        if line is not None:
+            return DindLogCause(
+                cause.code,
+                f"{cause.message}. docker said: {line[:DOCKER_RUN_ERROR_LINE_MAX_CHARS]}",
+            )
+    return None
+
+
 def diagnose_dind_log(log_text: str | None) -> DindLogCause:
     """Name the cause for a DinD container whose sshd never answered.
 
@@ -111,13 +159,20 @@ class DindVerifier:
             result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+                # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
+                # self-report (machine_scrape.check_sysbox_gpu_compatibility) runs the same hook on the
+                # same host, so a refusal without sysbox-runc has the same cause
+                cause = diagnose_docker_run_error(error_msg)
+                cause_code = cause.code if cause else None
+                failure_extra = get_extra_info({**log_ctx, "error": error_msg, "cause": cause_code})
+                logger.error(_m("DinD creation failed", extra=failure_extra))
                 await ssh_client.run(DockerCommand.remove_with_volumes(name))
                 return DindProbeResult(
                     success=False,
                     log_text=f"dind: check failed port={port.internal}",
                     sysbox_runtime=sysbox,
                     port=port,
+                    error=cause,
                 )
 
             logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
