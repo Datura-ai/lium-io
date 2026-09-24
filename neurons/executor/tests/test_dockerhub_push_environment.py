@@ -3,10 +3,10 @@ release tags the publish workflows react to are the ones the ``release-tags`` ru
 
 A repository secret is readable by any workflow file on any branch; an environment secret only by a
 job that names the environment, from a ref the environment's deployment policy allows. These tests
-keep a new or edited publish job — one that reads the token or logs in to Docker Hub, by ``docker
-login`` or ``docker/login-action`` — outside that environment, keep the shell trace off around the
-``docker login`` line in scripts that run with ``set -x``, and keep the tag ruleset payload in step
-with the workflows' tag triggers. The discriminator is the login, not the secret's name, so the
+fail when a publish job — one that reads the token or logs in to Docker Hub, by ``docker login`` or
+``docker/login-action`` — runs outside that environment, when a script that runs with ``set -x``
+traces the ``docker login`` line, or when the tag ruleset payload drifts from the workflows' tag
+triggers. The discriminator is the login, not the secret's name, so the
 tests hold once the login moves to OIDC and no workflow names the secret any more.
 """
 
