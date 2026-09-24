@@ -583,3 +583,19 @@ def test_declared_port_mappings_are_named_without_the_mappings_themselves():
     assert what["port_mappings_declared"] is True
     assert what["port_range"] is None
     assert "port_mappings" not in what
+
+
+def test_declared_port_mappings_drop_a_declared_range_too():
+    """The mappings are what the node forwards; a range left in the specs next to them is not reported."""
+    mappings = "[[40000, 50000], [40001, 50001]]"
+    both = SimpleNamespace(
+        specs={"port_range": DECLARED_RANGE, "port_mappings": mappings},
+        probed_port_count=2,
+        declared_port_count=2,
+    )
+    range_only = SimpleNamespace(specs={"port_range": DECLARED_RANGE}, probed_port_count=2, declared_port_count=2)
+
+    assert port_floor_what(both, 1)["port_range"] is None
+    assert port_floor_what(both, 1)["port_mappings_declared"] is True
+    assert port_floor_what(range_only, 1)["port_range"] == DECLARED_RANGE
+    assert port_floor_what(range_only, 1)["port_mappings_declared"] is False
