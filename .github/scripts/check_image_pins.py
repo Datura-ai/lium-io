@@ -42,6 +42,9 @@ YAML_KEY_RE = re.compile(
     r"^(?P<indent>\s*)(?:-\s+)?(?P<key>[A-Za-z0-9_.-]+)\s*:\s*(?P<value>.*?)\s*$"
 )
 IMAGE_KEY_RE = re.compile(r"^(?:image|[A-Z0-9_]*IMAGE(?:_REF)?)$")
+# `|` / `>` plus the optional chomp / indent marks YAML accepts (`|-`, `>+`, `|2`)
+BLOCK_SCALAR_RE = re.compile(r"^[|>][0-9+-]*$")
+YAML_ANCHOR_PREFIX_RE = re.compile(r"^&\S+\s+")
 FROM_RE = re.compile(
     r"^\s*FROM\s+(?:--platform=\S+\s+)?(?P<image>\S+)(?:\s+AS\s+(?P<stage>\S+))?", re.I
 )
@@ -82,6 +85,10 @@ def is_content(line: str) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
+def is_block_scalar(value: str) -> bool:
+    return bool(BLOCK_SCALAR_RE.fullmatch(value))
+
+
 def parent_key(lines: list[str], idx: int) -> str | None:
     indent = indent_of(lines[idx])
     for i in range(idx - 1, -1, -1):
@@ -120,15 +127,26 @@ def scan_yaml(path: str, text: str) -> tuple[list[tuple[Pin, str | None]], set[s
     pins: list[tuple[Pin, str | None]] = []
     built: set[str] = set()
     contexts: set[str] = set()
+    # the column of the key; for `- run: |` it is past the `- `, so a sibling key of the step ends the block
+    block_scalar_key_column: int | None = None
     for idx, line in enumerate(lines):
+        if block_scalar_key_column is not None:
+            if not is_content(line) or indent_of(line) > block_scalar_key_column:
+                continue
+            block_scalar_key_column = None
         m = YAML_KEY_RE.match(line)
         if not m or line.lstrip().startswith("#"):
             continue
-        key, value = m.group("key"), strip_value(m.group("value"))
+        key = m.group("key")
+        value = strip_value(YAML_ANCHOR_PREFIX_RE.sub("", m.group("value")))
+        if is_block_scalar(value):
+            block_scalar_key_column = m.start("key")
         if key == "build" and (service := parent_key(lines, idx)):
             built.add(service)
             continue
         if key == "additional_contexts":
+            if is_block_scalar(value):
+                continue
             indent = indent_of(line)
             for nxt in lines[idx + 1 :]:
                 if not is_content(nxt):
@@ -138,7 +156,7 @@ def scan_yaml(path: str, text: str) -> tuple[list[tuple[Pin, str | None]], set[s
                 item = nxt.strip().lstrip("- ").strip()
                 contexts.add(re.split(r"[:=]", item, maxsplit=1)[0].strip())
             continue
-        if not IMAGE_KEY_RE.match(key) or not value or value in ("|", ">"):
+        if not IMAGE_KEY_RE.match(key) or not value or is_block_scalar(value):
             continue
         pins.append((Pin(path, idx + 1, value), parent_key(lines, idx) if key == "image" else None))
     return pins, built, contexts

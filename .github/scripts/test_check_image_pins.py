@@ -112,6 +112,47 @@ class ComposeTest(unittest.TestCase):
         refs, _ = refs_and_skips({"a.yml": "# image: nope:1\nimage: |\n  multi\n"})
         self.assertEqual(refs, set())
 
+    def test_image_key_inside_a_block_scalar_is_not_a_pin(self):
+        # a workflow `run: |` (or `>`) can contain `image: <ref>` / `FOO_IMAGE: <ref>` as shell text
+        refs, _ = refs_and_skips(
+            {
+                ".github/workflows/ci.yml": (
+                    "jobs:\n"
+                    "  x:\n"
+                    "    steps:\n"
+                    "      - run: |\n"
+                    "          echo image: daturaai/app:1.2.3\n"
+                    "          FOO_IMAGE: daturaai/missing:9\n"
+                    "      - run: >-\n"
+                    "          image: daturaai/folded:1\n"
+                    "    services:\n"
+                    "      helper:\n"
+                    "        image: redis:7.4.2\n"
+                )
+            }
+        )
+        self.assertEqual(refs, {"redis:7.4.2"})
+
+    def test_yaml_anchor_before_the_value_is_not_part_of_the_ref(self):
+        refs, _ = refs_and_skips({"a.yml": "x:\n  image: &app daturaai/app:1\n"})
+        self.assertEqual(refs, {"daturaai/app:1"})
+
+    def test_key_after_a_block_scalar_in_the_same_step_is_a_pin(self):
+        refs, _ = refs_and_skips(
+            {
+                ".github/workflows/ci.yml": (
+                    "jobs:\n"
+                    "  x:\n"
+                    "    steps:\n"
+                    "      - run: |\n"
+                    "          echo hi\n"
+                    "        env:\n"
+                    "          FOO_IMAGE: daturaai/app:9\n"
+                )
+            }
+        )
+        self.assertEqual(refs, {"daturaai/app:9"})
+
 
 class DockerfileTest(unittest.TestCase):
     def test_from_forms(self):
