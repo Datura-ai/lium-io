@@ -43,7 +43,7 @@ def publishes_to_docker_hub(job: dict[str, object]) -> bool:
     return False
 
 
-def jobs_reading_the_token_outside_the_environment(workflow_text: str) -> list[str]:
+def docker_hub_publish_jobs_outside_the_environment(workflow_text: str) -> list[str]:
     """Job ids that publish to Docker Hub without ``environment: dockerhub-push``."""
     workflow = yaml.safe_load(workflow_text)
     return [
@@ -66,9 +66,9 @@ def test_the_checker_flags_a_job_that_reads_the_token_without_the_environment() 
         "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n"
         "    env:\n      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}\n    steps: []\n"
     )
-    assert jobs_reading_the_token_outside_the_environment(workflow_yaml) == ["deploy"]
+    assert docker_hub_publish_jobs_outside_the_environment(workflow_yaml) == ["deploy"]
     assert (
-        jobs_reading_the_token_outside_the_environment(
+        docker_hub_publish_jobs_outside_the_environment(
             workflow_yaml.replace("    env:", f"    environment: {ENVIRONMENT}\n    env:")
         )
         == []
@@ -81,13 +81,13 @@ def test_the_checker_flags_a_docker_hub_login_step_without_the_environment() -> 
         "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
         "      - uses: docker/login-action@v4\n        with:\n          username: daturaai\n"
     )
-    assert jobs_reading_the_token_outside_the_environment(workflow_yaml) == ["deploy"]
+    assert docker_hub_publish_jobs_outside_the_environment(workflow_yaml) == ["deploy"]
     other_registry = workflow_yaml.replace(
         "          username: daturaai\n", "          registry: ghcr.io\n"
     )
-    assert jobs_reading_the_token_outside_the_environment(other_registry) == []
+    assert docker_hub_publish_jobs_outside_the_environment(other_registry) == []
     assert (
-        jobs_reading_the_token_outside_the_environment(
+        docker_hub_publish_jobs_outside_the_environment(
             workflow_yaml.replace("    steps:", f"    environment: {ENVIRONMENT}\n    steps:")
         )
         == []
@@ -95,8 +95,8 @@ def test_the_checker_flags_a_docker_hub_login_step_without_the_environment() -> 
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)
-def test_every_job_that_reads_the_docker_hub_token_runs_in_the_environment(workflow: Path) -> None:
-    assert jobs_reading_the_token_outside_the_environment(workflow.read_text()) == []
+def test_every_job_that_publishes_to_docker_hub_runs_in_the_environment(workflow: Path) -> None:
+    assert docker_hub_publish_jobs_outside_the_environment(workflow.read_text()) == []
 
 
 def test_the_checker_flags_a_traced_login() -> None:
@@ -105,8 +105,10 @@ def test_the_checker_flags_a_traced_login() -> None:
     assert login_traced(traced)
     assert not login_traced(traced.replace(LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\n{LOGIN_LINE}"))
     assert not login_traced(traced.replace("set -eux", "set -eu"))
-    retraced = traced.replace(LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\nset -x\n{LOGIN_LINE}")
-    assert login_traced(retraced)
+    trace_back_on_before_login = traced.replace(
+        LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\nset -x\n{LOGIN_LINE}"
+    )
+    assert login_traced(trace_back_on_before_login)
 
 
 @pytest.mark.parametrize("script", PUBLISH_SCRIPTS, ids=lambda p: f"{p.parent.name}/{p.name}")
