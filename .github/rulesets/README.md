@@ -9,7 +9,8 @@ refs allowed to use them: `main` and the release tags `executor-v*`, `miner-v*`,
 with "Branch … is not allowed to deploy to dockerhub-push" and never sees the secrets.
 
 The tag ruleset `release-tags` (`release-tags.json`) restricts who may create, move or delete
-those four tag patterns, so only the release role can start a production image push.
+those four tag patterns, so only the release role can start a tag-triggered production image
+push. A manual run of `watchtower_image.yml` from `main` still publishes without a tag.
 
 Both settings are repository administration. The workflow files reference the environment;
 configuring it and applying the ruleset is done once by a repository admin with the commands
