@@ -361,9 +361,18 @@ class ExpressLane:
             executor_id = str(request.get("executor_id"))
             if not _free_for_recheck(in_flight.get(executor_id)):
                 continue
-            await self.redis_service.drop_recheck_requests([executor_id])
+            # claimed before the drop's await: a wave that reaches the node meanwhile then waits on the recheck
+            cycle_done_at = self.miner_service.claim_for_recheck(executor_id)
+            outcome = asyncio.get_running_loop().create_future()
+            self.miner_service.recheck_outcomes[executor_id] = outcome
             miner = miners.get(str(request.get("miner_hotkey")))
+            try:
+                await self.redis_service.drop_recheck_requests([executor_id])
+            except BaseException:
+                self._unclaim_recheck(executor_id, outcome, cycle_done_at)
+                raise
             if miner is None:
+                self._unclaim_recheck(executor_id, outcome, cycle_done_at)
                 logger.warning(
                     _m(
                         "[recheck] Miner is not among the serving opted-in miners; dropped",
@@ -371,10 +380,6 @@ class ExpressLane:
                     )
                 )
                 continue
-            cycle_done_at = self.miner_service.claim_for_recheck(executor_id)
-            self.miner_service.recheck_outcomes[executor_id] = (
-                asyncio.get_running_loop().create_future()
-            )
             self._directories_in_use[directory] += 1
             task = asyncio.create_task(
                 self._recheck(request, miner, inputs, rented_data, now, cycle_done_at)
@@ -383,6 +388,11 @@ class ExpressLane:
             task.add_done_callback(self._tasks.discard)
             launched += 1
         return launched
+
+    def _unclaim_recheck(self, executor_id: str, outcome: asyncio.Future, cycle_done_at: int | None) -> None:
+        self.miner_service.recheck_outcomes.pop(executor_id, None)
+        outcome.set_result(None)
+        self.miner_service.release_recheck_claim(executor_id, cycle_done_at)
 
     @staticmethod
     def _recheck_extra(request: dict) -> dict[str, object]:

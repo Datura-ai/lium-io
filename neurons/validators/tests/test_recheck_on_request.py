@@ -286,6 +286,49 @@ async def test_a_recheck_that_outlives_the_cycle_hands_back_nothing(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_the_wave_claiming_during_the_queue_drop_waits_on_the_recheck(monkeypatch, wallet):
+    """The lane claims the node before it awaits the Redis drop: a wave that reaches the node in that
+    await keeps the recheck's claim and takes its result, so one pipeline runs on the node."""
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch)
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+    parked, resume = asyncio.Event(), asyncio.Event()
+    drop = harness.redis_service.drop_recheck_requests
+
+    async def parked_drop(executor_ids):
+        parked.set()
+        await resume.wait()
+        await drop(executor_ids)
+
+    harness.redis_service.drop_recheck_requests = parked_drop
+    tick = asyncio.create_task(harness.lane.tick())
+    await asyncio.wait_for(parked.wait(), timeout=5)
+
+    claimed = harness.miner_service._claim_for_cycle([SimpleNamespace(uuid=node)], {})
+    assert [e.uuid for e in claimed] == [node]
+    assert harness.miner_service.in_flight == {node: RECHECK_LANE}
+    assert node in harness.miner_service.recheck_outcomes
+    resume.set()
+    assert await tick == 1
+    await asyncio.gather(*harness.lane._tasks)
+    harness.miner_service.request_job_to_miner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_queue_drop_releases_the_claim(monkeypatch, wallet):
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch)
+    harness.miner_service.in_flight[node] = CYCLE_DONE
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+    harness.redis_service.drop_recheck_requests = AsyncMock(side_effect=ConnectionError("redis gone"))
+
+    assert await harness.lane.tick() == 0  # the tick logs the failure
+
+    assert harness.miner_service.in_flight == {node: CYCLE_DONE}
+    assert harness.miner_service.recheck_outcomes == {}
+
+
+@pytest.mark.asyncio
 async def test_an_expired_request_and_one_for_an_unknown_miner_are_dropped(
     monkeypatch, wallet, caplog
 ):
