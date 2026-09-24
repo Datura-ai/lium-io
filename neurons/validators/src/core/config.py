@@ -4,6 +4,12 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
+from datura.chain import (
+    DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
+    PUBLIC_NODE_SOURCE,
+    ChainEndpoint,
+    chain_endpoint_candidates,
+)
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -58,7 +64,23 @@ class VerifyXSettings(BaseSettings):
     )
     NETWORK_MIN_DOWNLOAD_SPEED_MBPS: float = Field(
         default=50.0,
-        description="Minimum required network download speed in Mbps"
+        description="Minimum Cloudflare capacity download speed in Mbps",
+    )
+    NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS: float = Field(
+        default=50.0,
+        description="Minimum package (integrity object) download speed in Mbps; also the Cloudflare fallback floor",
+    )
+    # When LIBRARY_REFRESH_ENABLED is on and the executor's libverifyx.so hash does not
+    # match, curl this URL once, install, check the hash, and retry. The validator's own
+    # file is the source of truth if the fetch hash differs. Off by default: a mismatch
+    # does not write /usr/lib on the provider host.
+    LIBRARY_REFRESH_ENABLED: bool = Field(
+        default=False,
+        description="If true, a libverifyx.so hash mismatch may replace /usr/lib/libverifyx.so on the executor",
+    )
+    LIBRARY_FETCH_URL: str = Field(
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libverifyx.so",
+        description="Raw GitHub URL the executor curls when library refresh is on and the hash does not match",
     )
     ENABLE_XET_CHALLENGE: bool = Field(
         default=True,
@@ -97,6 +119,12 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID", default=51)
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
+    # Ordered, comma-separated: our proxy first, the public node is always appended last.
+    BITTENSOR_CHAIN_ENDPOINTS: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINTS", default=None)
+    # A failed endpoint is not dialled again for this long; the next ones in the list serve meanwhile.
+    BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS: int = Field(
+        env="BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS", default=DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS
+    )
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
@@ -273,6 +301,14 @@ class Settings(BaseSettings):
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
     # services. On by default: a fabric nobody measured is one nobody should be selling.
     ROCE_LINK_PROBE_ENABLED: bool = Field(env="ROCE_LINK_PROBE_ENABLED", default=True)
+    # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
+    # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
+    # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
+    # backend accepts the message (lium-platform#312); a backend without it logs and drops each
+    # report. Off: the spec is the only carrier, with a floor of REAPED_POD_STATES_FLOOR slots for
+    # reaped ids; on a node with more than 224 rented pods the last rented pods' states are cut
+    # until the queue drains.
+    POD_STATES_REPORT_ENABLED: bool = Field(env="POD_STATES_REPORT_ENABLED", default=False)
     # ISSUE-050 filler liveness. CHECK_ENABLED is the master switch: shadow mode runs the SSH
     # probe + backend re-check and logs the verdict, but never withholds incentive; switching it
     # off disables the probe entirely. ENFORCEMENT (only effective while CHECK_ENABLED is on)
@@ -320,6 +356,44 @@ class Settings(BaseSettings):
     # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2870 — a RUNNING rented pod whose SSH port refuses, or whose authorized_keys cannot be
+    # read, after this validator saw it healthy once. Judged from outside the container every cycle;
+    # CYCLES consecutive unhealthy cycles (2 ≈ 30 min) raise RENTED_POD_SSH_UNREACHABLE and one
+    # report to the backend per outage. Observation only: the score is not changed here.
+    RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
+    # CYCLES 0 would report on the first unhealthy cycle and a timeout of 0 would time every connect
+    # out: both are refused at startup, like the TTL below.
+    RENTED_POD_SSH_PROBE_CYCLES: int = Field(env="RENTED_POD_SSH_PROBE_CYCLES", default=2, ge=1)
+    RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0, gt=0)
+    # Off: the mapped port is judged by the TCP connect alone (refused / timeout). On: the port must
+    # also greet with an `SSH-2.0-` identification line, and a port that accepts without one is the
+    # `ssh_banner_missing` fault. The backend learns that fault name in lium-platform#429; a validator
+    # that sends it to an older backend gets a 422 and the outage is never recorded. Turn on only
+    # after lium-platform#429 is deployed.
+    RENTED_POD_SSH_BANNER_FAULT_ENABLED: bool = Field(env="RENTED_POD_SSH_BANNER_FAULT_ENABLED", default=False)
+    # Both per-pod Redis marks expire this long after the last cycle that probed the pod (every probe
+    # renews them) and are deleted when the backend says the rental closed, so a pod that left the
+    # rented list leaves no key behind. 24 h ≈ 96 cycles of margin for a validator that was down.
+    RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS: int = Field(env="RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", default=86400, gt=0)
+    # The cycle-end fleet gate: when more than this share of the cycle's probed pods fail the
+    # mapped-port check, the validator's own network is the suspect and the cycle's reports are held
+    # back (logged, not posted). 0.5 is the DAH-2748 executor-SSH threshold: half the fleet losing
+    # SSH in one cycle is our side, not theirs. Fleets under SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+    # pods are gated by the executor-SSH verdict alone.
+    RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX: float = Field(env="RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", default=0.5, ge=0.0, le=1.0)
+    # DAH-2255 — the enforcement half of the probe above. Off (the default): RENTED_POD_SSH_UNREACHABLE
+    # is recorded and reported and the rented score stands (DAH-2870's behaviour). On: a pod whose
+    # streak reaches ENFORCE_AFTER_CYCLES and whose outage the backend has accepted makes the
+    # rented-state check FAIL for the cycle — score 0, verified job cleared — the way the rental
+    # probe fails an unreachable unrented node; the next healthy cycle scores as rented again.
+    # ENFORCE_AFTER_CYCLES unset means RENTED_POD_SSH_PROBE_CYCLES (the notify threshold); a value
+    # below it is refused at startup, so a provider is never zeroed for an outage the backend did
+    # not accept. With the defaults (notify at 2, then wait for the backend accept) enforcement
+    # starts at streak 3, not 2: the notify cycle queues the report, and the next cycle can fail
+    # the check. One blip (a streak of 1) never costs a cycle. Enforcement adds no report: the
+    # one POST per outage stays the probe's.
+    RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
+    RENTED_POD_SSH_ENFORCE_AFTER_CYCLES: int | None = Field(env="RENTED_POD_SSH_ENFORCE_AFTER_CYCLES", default=None, ge=1)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -611,8 +685,22 @@ class Settings(BaseSettings):
         description="--memory limit for the throwaway DinD build container.",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
-        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60,
-        description="Max seconds to wait for the inner DinD dockerd to become ready.",
+        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
+        description=(
+            "Readiness budget for the inner DinD dockerd: this many one-second probes; each probe is "
+            "bounded by min(this value, 10) s (a `docker info` that hangs counts as one not-ready "
+            "probe). Zero or negative would cancel the only probe, so the setting refuses them at "
+            "load time."
+        ),
+    )
+    CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180, gt=0,
+        description=(
+            "Max seconds for each setup command before a custom build (sysbox preflight, DinD "
+            "start including its image pull, IP and resolver reads, the egress firewall helper, "
+            "the Dockerfile write; the readiness loop keeps CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS). "
+            "A command over the bound fails the build at its own step instead of leaving the pod PENDING."
+        ),
     )
     CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS: str = Field(
         env="CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS",
@@ -649,6 +737,18 @@ class Settings(BaseSettings):
                     "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
                     "of at least 32 characters"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_rented_pod_ssh_enforce_threshold(self) -> "Settings":
+        # DAH-2255: enforcing before notifying would zero a provider for an outage no renter was
+        # told about; the enforce threshold is the notify threshold or later.
+        after = self.RENTED_POD_SSH_ENFORCE_AFTER_CYCLES
+        if after is not None and after < self.RENTED_POD_SSH_PROBE_CYCLES:
+            raise ValueError(
+                f"RENTED_POD_SSH_ENFORCE_AFTER_CYCLES ({after}) must not be below "
+                f"RENTED_POD_SSH_PROBE_CYCLES ({self.RENTED_POD_SSH_PROBE_CYCLES})"
+            )
         return self
 
     def get_bittensor_wallet(self) -> "Wallet":
@@ -692,10 +792,22 @@ class Settings(BaseSettings):
         if self.BITTENSOR_NETWORK:
             config.subtensor.network = self.BITTENSOR_NETWORK
 
-        if self.BITTENSOR_CHAIN_ENDPOINT:
-            config.subtensor.chain_endpoint = self.BITTENSOR_CHAIN_ENDPOINT
+        first_endpoint = self.get_chain_endpoints()[0]
+        if first_endpoint.source != PUBLIC_NODE_SOURCE:
+            config.subtensor.chain_endpoint = first_endpoint.value
 
         return config
+
+    def get_chain_endpoints(self) -> list[ChainEndpoint]:
+        """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
+        `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or
+        read failure moves the client to the next entry; the failed entry is dialled again only
+        after `BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS`."""
+        return chain_endpoint_candidates(
+            chain_endpoints=self.BITTENSOR_CHAIN_ENDPOINTS,
+            chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
+            network=self.BITTENSOR_NETWORK,
+        )
 
     def get_debug_miner(self) -> dict:
         if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:
