@@ -647,8 +647,22 @@ class Settings(BaseSettings):
         description="--memory limit for the throwaway DinD build container.",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
-        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60,
-        description="Max seconds to wait for the inner DinD dockerd to become ready.",
+        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
+        description=(
+            "Readiness budget for the inner DinD dockerd: this many one-second probes; each probe is "
+            "bounded by min(this value, 10) s (a `docker info` that hangs counts as one not-ready "
+            "probe). Zero or negative would cancel the only probe, so the setting refuses them at "
+            "load time."
+        ),
+    )
+    CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180, gt=0,
+        description=(
+            "Max seconds for each setup command before a custom build (sysbox preflight, DinD "
+            "start including its image pull, IP and resolver reads, the egress firewall helper, "
+            "the Dockerfile write; the readiness loop keeps CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS). "
+            "A command over the bound fails the build at its own step instead of leaving the pod PENDING."
+        ),
     )
     CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS: str = Field(
         env="CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS",
