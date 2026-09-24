@@ -617,8 +617,8 @@ class Settings(BaseSettings):
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
 
-    # Express-lane first pass of a node under DESIGNATED_MINER_HOTKEYS skips collateral and VerifyX
-    # and runs a budgeted matmul; scored cycles are unchanged. Dedicated hotkeys only: a shared pool
+    # Express-lane first pass of a node under DESIGNATED_MINER_HOTKEYS runs a budgeted matmul;
+    # collateral and VerifyX still run, and scored cycles are unchanged. Dedicated hotkeys only: a shared pool
     # hotkey would give the profile to every custodied provider, so config load refuses the overlap.
     DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED: bool = Field(
         env="DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED", default=False
@@ -715,7 +715,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_designated_hotkeys(self) -> "Settings":
         """Refuse a designated hotkey that is also a pool hotkey, flag on or off, and refuse the flag
-        on with a designated list but an empty pool mirror, where that overlap cannot be checked."""
+        on with an empty pool mirror, where that overlap cannot be checked."""
         designated = self.designated_miner_hotkeys()
         pool = self.lium_pool_hotkeys()
         shared = designated & pool
@@ -725,11 +725,11 @@ class Settings(BaseSettings):
                 "LIUM_POOL_HOTKEYS; the designated list needs a dedicated hotkey — a pool hotkey is shared "
                 "by every custodied provider account"
             )
-        if self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED and designated and not pool:
+        if self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED and not pool:
             raise ValueError(
-                "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on with DESIGNATED_MINER_HOTKEYS set and "
-                "LIUM_POOL_HOTKEYS empty; set LIUM_POOL_HOTKEYS to the portal's pool hotkeys so the "
-                "dedicated-hotkey rule can be checked"
+                "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on with LIUM_POOL_HOTKEYS empty; set "
+                "LIUM_POOL_HOTKEYS to the portal's pool hotkeys so the dedicated-hotkey rule can be "
+                "checked"
             )
         return self
 

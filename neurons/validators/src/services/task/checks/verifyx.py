@@ -64,21 +64,6 @@ class VerifyXCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        if ctx.config.designated_hotkey_first_pass:
-            # Deferred to the first scored cycle, which measures it and enforces the gate.
-            event = render_message(
-                Msg.DESIGNATED_HOTKEY_SKIPPED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "skipped": True,
-                    "reason": "designated_hotkey_first_pass",
-                    "network": specs.get("network") or {},
-                    "bandwidth_gate": "deferred_to_first_scored_cycle",
-                },
-            )
-            return CheckResult(passed=True, event=event)
-
         filler_container = _get_filler_only_container(ctx)
         if filler_container:
             updated_specs = _with_last_known_verifyx_ema(ctx)

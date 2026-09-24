@@ -109,8 +109,7 @@ def _matmul_ssh_reason(ctx: Context) -> str | None:
 
 
 def _should_run_verifyx(ctx: Context) -> bool:
-    """VerifyXCheck skips a designated-hotkey first pass, so the call must not carry VerifyX either."""
-    return ctx.config.verifyx_enabled and not ctx.config.designated_hotkey_first_pass
+    return ctx.config.verifyx_enabled
 
 
 class _NothingToSend(Exception):

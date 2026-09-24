@@ -99,13 +99,6 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Provider-side access to a rented pod detected by the Inspector")
 
-    # VerifyX and collateral did not run on this pass; the first scored cycle enforces both gates.
-    if ctx.config.designated_hotkey_first_pass:
-        warning_messages.append(
-            "Designated hotkey, first pass: VerifyX and collateral deferred to the first scored cycle"
-        )
-        return _format_return(actual_score, job_score, warning_messages, rented)
-
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"

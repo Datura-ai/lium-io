@@ -118,7 +118,7 @@ class ContextConfig:
     # scored cycle; every other check is the same.
     first_pass: bool = False
     # The express lane's first pass of a node under a DESIGNATED_MINER_HOTKEYS hotkey, flag on.
-    # Skips collateral and VerifyX; independent of FIRST_PASS_FAST_PATH_ENABLED.
+    # Collateral and VerifyX still run; independent of FIRST_PASS_FAST_PATH_ENABLED.
     designated_hotkey_first_pass: bool = False
 
     @property

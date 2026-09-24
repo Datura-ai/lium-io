@@ -20,24 +20,6 @@ class CollateralCheck:
         enable_no_collateral = ctx.config.enable_no_collateral
         self.fatal = not enable_no_collateral
 
-        if ctx.config.designated_hotkey_first_pass:
-            # Deferred to the first scored cycle; calculate_scores waives the gate on this pass only.
-            event = render_message(
-                Msg.DESIGNATED_HOTKEY_SKIPPED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"collateral_deposited": False, "skipped": True, "reason": "designated_hotkey_first_pass"},
-            )
-            return CheckResult(
-                passed=True,
-                event=event,
-                updates={
-                    "collateral_deposited": False,
-                    "collateral_error_message": None,
-                    "contract_version": None,
-                },
-            )
-
         specs = ctx.state.specs
         gpu_count = ctx.state.gpu_count
         if gpu_count is None:

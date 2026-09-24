@@ -122,7 +122,9 @@ def test_config_load_accepts_dedicated_hotkeys_beside_a_filled_pool_mirror():
     assert s.designated_hotkey_startup_warnings() == []
 
 
-def test_config_load_refuses_the_flag_on_with_an_empty_pool_mirror():
+@pytest.mark.parametrize("designated", [DESIGNATED_HOTKEY, ""])
+@pytest.mark.parametrize("pool", ["", " , "])
+def test_config_load_refuses_the_flag_on_with_an_empty_pool_mirror(designated, pool):
     from pydantic import ValidationError
 
     from core.config import Settings
@@ -131,25 +133,18 @@ def test_config_load_refuses_the_flag_on_with_an_empty_pool_mirror():
         Settings(
             _env_file=None,
             DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True,
-            DESIGNATED_MINER_HOTKEYS=DESIGNATED_HOTKEY,
-            LIUM_POOL_HOTKEYS=" , ",
+            DESIGNATED_MINER_HOTKEYS=designated,
+            LIUM_POOL_HOTKEYS=pool,
         )
 
 
-@pytest.mark.parametrize(
-    ("flag", "designated"),
-    [
-        (False, DESIGNATED_HOTKEY),  # flag off: the profile is never applied
-        (True, ""),  # flag on, selects nobody
-    ],
-)
-def test_config_load_accepts_an_empty_pool_mirror_when_nobody_takes_the_profile(flag, designated):
+def test_config_load_accepts_an_empty_pool_mirror_with_the_flag_off():
     from core.config import Settings
 
     s = Settings(
         _env_file=None,
-        DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
-        DESIGNATED_MINER_HOTKEYS=designated,
+        DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=False,
+        DESIGNATED_MINER_HOTKEYS=DESIGNATED_HOTKEY,
         LIUM_POOL_HOTKEYS="",
     )
     assert s.lium_pool_hotkeys() == frozenset()
@@ -159,7 +154,7 @@ def test_config_load_accepts_an_empty_pool_mirror_when_nobody_takes_the_profile(
     ("flag", "designated", "pool", "expected_fragment"),
     [
         (False, DESIGNATED_HOTKEY, "", None),  # flag off: nothing to say
-        (True, "", "", "empty DESIGNATED_MINER_HOTKEYS"),  # on, selects nobody
+        (True, "", POOL_HOTKEY, "empty DESIGNATED_MINER_HOTKEYS"),  # on, selects nobody
         (True, DESIGNATED_HOTKEY, POOL_HOTKEY, None),  # on, rule checked at load
     ],
 )
@@ -340,7 +335,7 @@ def test_the_check_list_is_the_same_for_every_node():
         assert kept in ids
 
 
-# --- skipped step: collateral ------------------------------------------------------------------
+# --- kept step: collateral --------------------------------------------------------------------
 
 
 def _collateral_ctx(
@@ -358,22 +353,15 @@ def _collateral_ctx(
 
 
 @pytest.mark.asyncio
-async def test_designated_hotkey_first_pass_skips_the_collateral_read(context_factory):
+async def test_designated_hotkey_first_pass_still_reads_collateral(context_factory):
     service = DummyCollateralService(deposited=False, error="no bond", contract_version="1.0.2")
     result = await CollateralCheck().run(
         _collateral_ctx(context_factory, designated=True, service=service)
     )
 
-    assert result.passed is True
-    assert result.event.reason_code == ColMsg.DESIGNATED_HOTKEY_SKIPPED.reason
-    assert result.event.what_we_saw["skipped"] is True
-    assert service.called_with is None  # no on-chain read
-    # the published row says what is true
-    assert result.updates == {
-        "collateral_deposited": False,
-        "collateral_error_message": None,
-        "contract_version": None,
-    }
+    assert result.passed is False
+    assert result.event.reason_code == ColMsg.MISSING.reason
+    assert service.called_with is not None
 
 
 @pytest.mark.asyncio
@@ -388,7 +376,7 @@ async def test_provider_node_still_pays_the_collateral_read(context_factory):
     assert service.called_with is not None
 
 
-# --- skipped step: VerifyX ---------------------------------------------------------------------
+# --- kept step: VerifyX -----------------------------------------------------------------------
 
 
 def _verifyx_ctx(context_factory, designated: bool, service: DummyVerifyXService):
@@ -407,22 +395,12 @@ def _verifyx_ctx(context_factory, designated: bool, service: DummyVerifyXService
 
 
 @pytest.mark.asyncio
-async def test_designated_hotkey_first_pass_skips_verifyx_and_publishes_the_scrape_readings(
-    context_factory,
-):
-    service = DummyVerifyXService(success=True, updated_specs={"ram": {"total": 1}})
-    ctx = _verifyx_ctx(context_factory, designated=True, service=service)
-    result = await VerifyXCheck().run(ctx)
+async def test_designated_hotkey_first_pass_still_runs_verifyx(context_factory):
+    service = DummyVerifyXService(success=False, error_msg="probe failed")
+    result = await VerifyXCheck().run(_verifyx_ctx(context_factory, designated=True, service=service))
 
-    assert result.passed is True
-    assert result.event.reason_code == VxMsg.DESIGNATED_HOTKEY_SKIPPED.reason
-    assert result.event.what_we_saw["bandwidth_gate"] == "deferred_to_first_scored_cycle"
-    assert result.event.what_we_saw["network"] == {"download_speed": 812.5, "upload_speed": 640.0}
-    assert service.called_with is None  # the probe never ran
-    # state untouched: the scrape's readings are what the backend gets, and no VerifyX EMA is seeded,
-    # so the first scored cycle bootstraps from its own sample as on any never-measured node
-    assert result.updates == {}
-    assert "ema_verifyx_download_speed" not in ctx.state.specs["network"]
+    assert result.passed is False
+    assert service.called_with is not None
 
 
 @pytest.mark.asyncio
@@ -613,16 +591,22 @@ def _score_ctx(
     )
 
 
-def test_designated_hotkey_first_pass_scores_positive_without_verifyx_ema_or_collateral(
-    monkeypatch,
+@pytest.mark.parametrize("designated", [True, False])
+@pytest.mark.parametrize(
+    "specs,collateral_deposited,fragment",
+    [
+        ({"network": {"download_speed": 812.5}}, True, "unavailable"),
+        ({"network": {"ema_verifyx_download_speed": 500.0}}, False, "Collateral required"),
+    ],
+)
+def test_designated_hotkey_first_pass_keeps_the_verifyx_and_collateral_gates(
+    monkeypatch, designated, specs, collateral_deposited, fragment
 ):
-    monkeypatch.setattr(
-        settings, "ENABLE_NO_COLLATERAL", False
-    )  # the strict setting: collateral fatal for providers
-    ctx = _score_ctx(True, {"network": {"download_speed": 812.5}}, collateral_deposited=False)
+    monkeypatch.setattr(settings, "ENABLE_NO_COLLATERAL", False)
+    ctx = _score_ctx(designated, specs, collateral_deposited=collateral_deposited)
     actual, job, warning = calculate_scores(ctx, rented=False)
-    assert (actual, job) == (1.0, 1.0)
-    assert "deferred to the first scored cycle" in warning
+    assert (actual, job) == (0.0, 0.0)
+    assert fragment in warning
 
 
 def test_provider_node_without_verifyx_ema_scores_zero(monkeypatch):

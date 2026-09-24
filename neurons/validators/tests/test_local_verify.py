@@ -1485,15 +1485,11 @@ async def test_a_scored_cycle_with_verifyx_off_sends_the_matmul_alone(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("first_pass", [True, False])
-async def test_designated_hotkey_first_pass_sends_the_budgeted_matmul_alone(
-    keypair, monkeypatch, local_verify_on, verifyx_service, first_pass
+async def test_designated_hotkey_first_pass_sends_verifyx_with_the_budgeted_matmul(
+    keypair, monkeypatch, local_verify_on, verifyx_service
 ):
-    """Designated-hotkey profile: VerifyXCheck skips its run on a designated-hotkey node's first
-    pass, so the one call carries no VerifyX challenge (a full-size run there would cost the very
-    80–149 s the profile removes) and the matmul rides alone at the first-pass VRAM budget — with
-    or without DAH-3011's `first_pass` (its flag is off in prod). `scored_ssh` does not fire: the
-    round trip is the matmul's own."""
+    """Designated-hotkey profile: VerifyX still rides in the one call beside the matmul, which
+    keeps the first-pass VRAM budget."""
     validation = matmul_service(monkeypatch)
     prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
     validation.prepare_matmul_challenge = prepare_matmul
@@ -1508,20 +1504,19 @@ async def test_designated_hotkey_first_pass_sends_the_budgeted_matmul_alone(
             ),
             config=build_context_config(
                 validator_keypair=keypair,
-                first_pass=first_pass,
+                first_pass=True,
                 verifyx_enabled=True,
                 designated_hotkey_first_pass=True,
             ),
             state=build_state(specs=SPECS),
         )
         local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
-    assert executor.intents[0]["steps"]["verifyx"] is None
+    assert executor.intents[0]["steps"]["verifyx"]["cipher_text"]
     assert executor.intents[0]["steps"]["matmul"]["cipher_text"]
     assert (
         prepare_matmul.call_args.kwargs["vram_budget_mb"] == settings.FIRST_PASS_MATMUL_VRAM_MB
     )
-    assert local.event.what_we_saw["consumed"] == ["matmul"]
-    assert local.event.what_we_saw["fallbacks"] == {}
+    assert sorted(local.event.what_we_saw["consumed"]) == ["matmul", "verifyx"]
 
 
 @pytest.mark.asyncio
