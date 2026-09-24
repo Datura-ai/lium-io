@@ -261,9 +261,28 @@ class MinerService:
         # this one process, so a plain dict is the whole coordination: each lane skips what the
         # other holds. Stays empty with the flag off.
         self.in_flight: dict[str, str] = {}
+        # miner hotkey -> job_batch_id of the wave that has not received that miner's executor
+        # list yet. The express lane publishes under the cycle's job_batch_id; it waits for the
+        # wave's list of the node's miner, or the wave could verify and publish the node again
+        # under the same id once the lane let go of it. Stays empty with the flag off.
+        self.miners_awaiting_wave_list: dict[str, str] = {}
+
+    def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
+        """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
+        if settings.EXPRESS_LANE_ENABLED:
+            self.miners_awaiting_wave_list = {hotkey: job_batch_id for hotkey in miner_hotkeys}
+
+    def _stop_awaiting_wave_list(self, payload: MinerJobRequestPayload) -> None:
+        """The wave has this miner's list, or its request ended without one. An older wave's
+        request that outlived its cycle leaves the current wave's entry alone."""
+        if self.miners_awaiting_wave_list.get(payload.miner_hotkey) == payload.job_batch_id:
+            del self.miners_awaiting_wave_list[payload.miner_hotkey]
 
     def _claim_for_cycle(
-        self, executors: list[ExecutorSSHInfo], default_extra: dict
+        self,
+        payload: MinerJobRequestPayload,
+        executors: list[ExecutorSSHInfo],
+        default_extra: dict,
     ) -> list[ExecutorSSHInfo]:
         """The wave takes every executor the miner returned, minus those the express lane is
         verifying at this moment, so a new node's hardware tests never run twice concurrently
@@ -271,6 +290,7 @@ class MinerService:
         that no cycle has published yet, so a long-known executor's scoring is untouched.
         Flag off: list returned as is.
         """
+        self._stop_awaiting_wave_list(payload)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -344,6 +364,32 @@ class MinerService:
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
 
     async def request_job_to_miner(
+        self,
+        payload: MinerJobRequestPayload,
+        encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
+        default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
+        executor_id: str | None = None,
+        first_pass: bool = False,
+    ):
+        """See _route_job_to_miner. A wave request that ends before the miner's list arrived
+        (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
+        try:
+            return await self._route_job_to_miner(
+                payload,
+                encrypted_files,
+                rented_data,
+                default_docker_image_digests,
+                executor_image_snapshot,
+                executor_id=executor_id,
+                first_pass=first_pass,
+            )
+        finally:
+            if executor_id is None:
+                self._stop_awaiting_wave_list(payload)
+
+    async def _route_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
@@ -503,7 +549,7 @@ class MinerService:
                             "Miner returned zero executors in AcceptSSHKeyRequest",
                         )
                     executors = (
-                        self._claim_for_cycle(msg.executors, default_extra)
+                        self._claim_for_cycle(payload, msg.executors, default_extra)
                         if executor_id is None
                         else self._only_requested(msg.executors, executor_id, default_extra)
                     )
@@ -1074,9 +1120,20 @@ class MinerService:
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
     async def publish_machine_specs(
-        self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str
+        self,
+        results: list[JobResult],
+        miner_hotkey: str,
+        miner_coldkey: str,
+        *,
+        is_whole_miner_batch: bool = True,
     ):
-        """Publish machine specs to compute app connector process"""
+        """Publish machine specs to compute app connector process.
+
+        `is_whole_miner_batch` False leaves `batch_total` unset: the backend's delivery metrics
+        (DAH-2792) take a miner's expected spec count from the first spec per (validator,
+        job_batch_id, miner), so a spec that is not the miner's whole batch for that id must not
+        set it.
+        """
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
@@ -1098,7 +1155,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
-        batch_total = len(results)
+        batch_total = len(results) if is_whole_miner_batch else None
         for result in results:
             try:
                 await self.redis_service.publish(
@@ -2370,7 +2427,7 @@ class MinerService:
                         "Miner returned zero executors in AcceptSSHKeyRequest",
                     )
                 executors = (
-                    self._claim_for_cycle(msg.executors, default_extra)
+                    self._claim_for_cycle(payload, msg.executors, default_extra)
                     if executor_id is None
                     else self._only_requested(msg.executors, executor_id, default_extra)
                 )

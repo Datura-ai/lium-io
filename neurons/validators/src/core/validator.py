@@ -46,8 +46,9 @@ from services.task.checks.rented_pod_ssh import (
     flush_rented_pod_ssh_reports,
     silence_rented_pod_ssh_reports_on_our_own_outage,
 )
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
 from core.express_lane import CycleInputs, ExpressLane
@@ -382,7 +383,11 @@ class Validator:
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
                 )
 
                 task_info = {}
@@ -530,6 +535,10 @@ class Validator:
                                 }
                             ),
                         ),
+                    )
+                    NETWORK_GATE_TALLY.log_and_reset(
+                        MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
                     )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
