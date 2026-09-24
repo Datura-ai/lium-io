@@ -248,6 +248,9 @@ class MinerService:
         # as the node's own: one pipeline per node at a time, and the node keeps its scored cycle.
         self.recheck_outcomes: dict[str, asyncio.Future] = {}
 
+    # forget_cycle_done calls so far; a recheck that took a CYCLE_DONE node restores it only within the same cycle
+    cycles_closed: int = 0
+
     def _claim_for_cycle(
         self, executors: list[ExecutorSSHInfo], default_extra: dict
     ) -> list[ExecutorSSHInfo]:
@@ -349,6 +352,23 @@ class MinerService:
     def forget_cycle_done(self) -> None:
         """Called by the cycle right after it recorded its published executors as validated."""
         for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
+            del self.in_flight[executor_id]
+        self.cycles_closed += 1
+
+    def claim_for_recheck(self, executor_id: str) -> int | None:
+        """Take the node for a recheck: free, or done for this cycle (CYCLE_DONE lasts until the whole cycle
+        ends, longer than a request may wait). Returns the cycle count to restore CYCLE_DONE against, if held."""
+        held_cycle_done = self.in_flight.get(executor_id) == CYCLE_DONE
+        self.in_flight[executor_id] = RECHECK_LANE
+        return self.cycles_closed if held_cycle_done else None
+
+    def release_recheck_claim(self, executor_id: str, cycle_done_at: int | None) -> None:
+        """Hand back CYCLE_DONE when the recheck took it and the cycle has not closed since."""
+        if self.in_flight.get(executor_id) != RECHECK_LANE:
+            return
+        if cycle_done_at is not None and cycle_done_at == self.cycles_closed:
+            self.in_flight[executor_id] = CYCLE_DONE
+        else:
             del self.in_flight[executor_id]
 
     @staticmethod

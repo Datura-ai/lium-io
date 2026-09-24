@@ -233,7 +233,7 @@ async def test_rechecks_are_bounded_and_the_rest_wait_their_turn(monkeypatch, wa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("holder", [CYCLE_LANE, CYCLE_DONE, EXPRESS_LANE, RECHECK_LANE])
+@pytest.mark.parametrize("holder", [CYCLE_LANE, EXPRESS_LANE, RECHECK_LANE])
 async def test_a_node_another_run_holds_waits_in_the_queue(monkeypatch, wallet, holder):
     node = str(uuid4())
     harness = _recheck_harness(monkeypatch)
@@ -247,6 +247,42 @@ async def test_a_node_another_run_holds_waits_in_the_queue(monkeypatch, wallet, 
     del harness.miner_service.in_flight[node]  # that run ended and was published
     assert await harness.tick_and_settle() == 1
     harness.miner_service.publish_machine_specs.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_node_the_wave_is_done_with_is_rechecked_now_and_handed_back(monkeypatch, wallet):
+    """CYCLE_DONE lasts until the whole cycle ends, longer than a request may wait: the recheck runs now
+    and hands CYCLE_DONE back, so the express lane still skips the node until the cycle drops it."""
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch, express=True)
+    harness.miner_service.in_flight[node] = CYCLE_DONE
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+
+    assert await harness.tick_and_settle() == 1
+
+    assert harness.miner_service.request_job_to_miner.await_args.kwargs["executor_id"] == node
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert harness.miner_service.in_flight == {node: CYCLE_DONE}
+    assert harness.miner_service.recheck_outcomes == {}
+    assert await harness.redis_service.get_recheck_requests() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_that_outlives_the_cycle_hands_back_nothing(monkeypatch, wallet):
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch, express=True)
+    harness.miner_service.in_flight[node] = CYCLE_DONE
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+    harness.release.clear()
+
+    assert await harness.lane.tick() == 1
+    assert harness.miner_service.in_flight == {node: RECHECK_LANE}
+    await _validator(harness).release_cycle_claims([node])  # the cycle closes during the recheck
+    assert harness.miner_service.in_flight == {node: RECHECK_LANE}
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+
+    assert harness.miner_service.in_flight == {}
 
 
 @pytest.mark.asyncio
@@ -348,24 +384,19 @@ def _validator(harness: _Harness) -> Validator:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("express", [False, True])
-async def test_the_cycle_frees_the_waves_nodes_for_a_queued_recheck(monkeypatch, wallet, express):
+async def test_the_cycle_frees_the_waves_nodes_under_either_flag(monkeypatch, wallet, express):
     """Recheck on, express lane off is the config the recheck flag gives on its own: the wave still
-    leaves its nodes CYCLE_DONE, so the cycle must drop them or every queued recheck waits until it
-    expires and in_flight keeps every node the wave ever verified."""
+    leaves its nodes CYCLE_DONE, so the cycle must drop them or in_flight keeps every node the wave
+    ever verified."""
     node = str(uuid4())
     harness = _recheck_harness(monkeypatch, express=express)
     harness.miner_service.in_flight[node] = CYCLE_DONE
-    await harness.redis_service.queue_recheck_request(_request_for(node))
-    assert await harness.tick_and_settle() == 0
 
     await _validator(harness).release_cycle_claims([node])
 
     assert harness.miner_service.in_flight == {}
     # only the express lane reads the validated set
     assert await harness.redis_service.get_validated_executors() == ({node} if express else set())
-    assert await harness.tick_and_settle() == 1
-    assert harness.miner_service.request_job_to_miner.await_args.kwargs["executor_id"] == node
-    assert await harness.redis_service.get_recheck_requests() == {}
 
 
 @pytest.mark.asyncio

@@ -34,7 +34,7 @@ from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
-from services.miner_service import EXPRESS_LANE, RECHECK_LANE, MinerService
+from services.miner_service import CYCLE_DONE, EXPRESS_LANE, RECHECK_LANE, MinerService
 from services.task.checks.rental_probe import forget_last_pass
 from services.task_service import JobResult
 
@@ -53,6 +53,10 @@ MAX_ATTEMPTS = 3
 RETRY_SECONDS = 120
 # job_batch_id format the backend parses into the prod_executors row's time.
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _free_for_recheck(lane: str | None) -> bool:
+    return lane is None or lane == CYCLE_DONE
 
 
 @dataclass
@@ -301,8 +305,9 @@ class ExpressLane:
 
     async def _recheck_tick(self) -> int:
         """Launch the queued rechecks under RECHECK_MAX_IN_FLIGHT, oldest first. A node another lane
-        or the wave holds waits in the queue; a request older than RECHECK_REQUEST_MAX_AGE_SECONDS
-        is dropped (the backend has lifted its hold by then)."""
+        or the wave is running waits in the queue; one the wave is done with (CYCLE_DONE) is rechecked
+        now. A request older than RECHECK_REQUEST_MAX_AGE_SECONDS is dropped (the backend has lifted
+        its hold by then)."""
         requests = await self.redis_service.get_recheck_requests()
         if not requests:
             return 0
@@ -337,7 +342,7 @@ class ExpressLane:
             (
                 request
                 for executor_id, request in requests.items()
-                if executor_id not in stale and executor_id not in in_flight
+                if executor_id not in stale and _free_for_recheck(in_flight.get(executor_id))
             ),
             key=requested_at,
         )
@@ -354,7 +359,7 @@ class ExpressLane:
         launched = 0
         for request in chosen:
             executor_id = str(request.get("executor_id"))
-            if executor_id in in_flight:
+            if not _free_for_recheck(in_flight.get(executor_id)):
                 continue
             await self.redis_service.drop_recheck_requests([executor_id])
             miner = miners.get(str(request.get("miner_hotkey")))
@@ -366,12 +371,14 @@ class ExpressLane:
                     )
                 )
                 continue
-            in_flight[executor_id] = RECHECK_LANE
+            cycle_done_at = self.miner_service.claim_for_recheck(executor_id)
             self.miner_service.recheck_outcomes[executor_id] = (
                 asyncio.get_running_loop().create_future()
             )
             self._directories_in_use[directory] += 1
-            task = asyncio.create_task(self._recheck(request, miner, inputs, rented_data, now))
+            task = asyncio.create_task(
+                self._recheck(request, miner, inputs, rented_data, now, cycle_done_at)
+            )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             launched += 1
@@ -393,6 +400,7 @@ class ExpressLane:
         inputs: CycleInputs,
         rented_data: RentedExecutorsResponse,
         launched_at: float,
+        cycle_done_at: int | None = None,
     ) -> None:
         """Run one requested node's full pipeline now and publish its result spec-only.
 
@@ -490,8 +498,7 @@ class ExpressLane:
                 exc_info=True,
             )
         finally:
-            if self.miner_service.in_flight.get(executor_id) == RECHECK_LANE:
-                del self.miner_service.in_flight[executor_id]
+            self.miner_service.release_recheck_claim(executor_id, cycle_done_at)
             self.miner_service.recheck_outcomes.pop(executor_id, None)
             if not outcome.done():
                 outcome.set_result(result_for_cycle)
