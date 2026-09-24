@@ -767,6 +767,39 @@ async def test_grace_flag_off_logs_nothing_for_a_node_past_its_grace(
 
 
 @pytest.mark.asyncio
+async def test_pending_without_a_prefetch_document_says_only_the_time_bound_applies(
+    context_factory, monkeypatch
+):
+    ctx = _uncached_ctx(context_factory, monkeypatch, _fake_redis_service(), "")
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.PENDING.reason
+    assert result.event.what_we_saw["fresh_node_grace"]["first_sweep_completed"] is None
+    assert "may still be fetching" in result.event.remediation
+    assert "does not report its pre-pull state" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_not_cached_with_no_named_cause_names_the_image_to_pull(context_factory, monkeypatch):
+    doc = _prefetch_doc(
+        first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=None, last_outcome="sweep_ok"
+    )
+    ctx = _uncached_ctx(context_factory, monkeypatch, _fake_redis_service(), doc)
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert f"docker pull {_IMAGE_REF}`" in result.event.remediation
+    assert "<image>" not in result.event.remediation
+
+
+def test_cached_template_messages_carry_no_placeholder():
+    for template in (Msg.NOT_CACHED, Msg.PENDING, Msg.DIGEST_MISMATCH):
+        assert "<" not in (template.remediation or ""), template.reason
+
+
+@pytest.mark.asyncio
 async def test_digest_mismatch_gets_no_fresh_node_grace(context_factory, monkeypatch):
     redis = _fake_redis_service()
     _set_cutoff(monkeypatch, active=True)

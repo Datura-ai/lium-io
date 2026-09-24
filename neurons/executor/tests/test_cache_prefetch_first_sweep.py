@@ -9,7 +9,7 @@ checking the node for that image.
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import docker
 import pytest
@@ -176,3 +176,24 @@ def test_first_sweep_ok_at_is_set_once(monkeypatch):
     assert first is not None
     assert state.as_dict()["first_sweep_ok_at"] == first
     assert state.as_dict()["last_outcome_at"] != first
+
+
+def test_retry_delay_never_exceeds_a_short_error_interval():
+    # A short refresh interval makes the error interval the bound, jitter included.
+    for attempt in range(cache_template_service.FIRST_SWEEP_FAST_RETRIES):
+        with patch.object(cache_template_service.random, "uniform", return_value=15.0):
+            assert cache_template_service._first_sweep_retry_delay(attempt, 20) == 20
+    with patch.object(cache_template_service.random, "uniform", return_value=0.0):
+        assert cache_template_service._first_sweep_retry_delay(0, 20) == 15
+
+
+def test_the_detailed_stream_error_is_preferred():
+    event = {"error": "pull failed", "errorDetail": {"message": REGISTRY_ERROR}}
+    client = _client([event])
+
+    with pytest.raises(PullStreamError) as raised:
+        asyncio.run(
+            cache_template_service._ensure_template(client, TEMPLATE, CachePrefetchState(path=None))
+        )
+
+    assert str(raised.value) == REGISTRY_ERROR

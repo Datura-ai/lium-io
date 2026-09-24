@@ -1564,7 +1564,7 @@ class CachedTemplateMessages:
             "until the executor pre-pull catches up"
         ),
         remediation=(
-            "Pull the recommended image on the host (docker pull <image>) to see why the "
+            "Pull the recommended image named in this event on the host to see why the "
             "executor's pre-pull could not fetch it; the executor retries on its own."
         ),
     )
@@ -1578,8 +1578,10 @@ class CachedTemplateMessages:
             "pre-pull sweep completes or the grace window ends"
         ),
         remediation=(
-            "No action needed yet: the executor's pre-pull is still fetching the image. If it is "
-            "still missing when the grace ends, this check fails and quotes the pull's own error."
+            "No action needed yet: the executor's pre-pull may still be fetching the image, or "
+            "the executor does not report its pre-pull state and the node gets the time bound "
+            "only. If the image is still missing when the grace ends, this check fails and "
+            "quotes the executor's pull error when it reported one."
         ),
     )
     SKIPPED = MessageTemplate(

@@ -31,6 +31,11 @@ _PREFETCH_ERROR_CHARS = 200
 _FIRST_UNCACHED_TTL_SECONDS = 30 * 24 * 3600
 # The executor's own error, quoted to the provider; the writer already caps it at 500.
 _QUOTED_ERROR_CHARS = 300
+# A failing NOT_CACHED whose prefetch document names no cause.
+_NOT_CACHED_NEXT_STEP = (
+    "Run `docker pull {ref}` on the host to see why the executor's pre-pull could not fetch it; "
+    "the executor retries on its own."
+)
 
 # First match wins, so the "No such image" of an executor that predates the stream-error capture
 # is read before the "404"/"not found" it also contains.
@@ -434,6 +439,8 @@ class CachedTemplateVerificationCheck:
             if should_fail:
                 pull_ref = f"{docker_image}@{backend_digest}" if backend_digest else image_ref
                 remediation = _remediation(prefetch_state, image_ref, pull_ref, cached)
+                if remediation is None and template == Msg.NOT_CACHED:
+                    remediation = _NOT_CACHED_NEXT_STEP.format(ref=pull_ref)
 
         event = render_message(
             template,
