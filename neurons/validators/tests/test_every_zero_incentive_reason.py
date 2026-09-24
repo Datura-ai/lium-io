@@ -16,6 +16,7 @@ from incentive.default import DefaultIncentive
 from incentive.miner_incentive_log import UNCLASSIFIED_VALIDATION_FAILURE, ZeroIncentiveReason
 from incentive.rental_price import RentalPriceIncentive
 from services.miner_service import MinerService
+from services.task.messages import ExecutorImageMessages, FinalizeMessages, TenantEnforcementMessages
 from services.task.models import build_msg
 from services.task_service import JobResult
 
@@ -277,3 +278,73 @@ async def test_a_full_cycle_publishes_the_failed_node_reason_once(monkeypatch):
     assert [reason["reason"] for reason in payload["incentive_reasons"]] == ["validation_failed"]
     assert payload["incentive_reasons"][0]["context"]["reason_code"] == "RECOMMENDED_IMAGE_NOT_CACHED"
     assert payload["incentive"] == 0.0
+
+
+# ── a run that passed every check but scored 0 is not a failed check ─────────
+
+
+def _passed_but_zero(event_reason: str, remediation: str, **overrides) -> JobResult:
+    # the score gate zeroed a run whose checks all passed: failure_reason_code is the code of the
+    # event that ended it, the finalize event or the rented halt (services/task/service.py)
+    event = build_msg(
+        event="Validation task completed",
+        reason=event_reason,
+        severity="warning",
+        impact="Job score=0, actual score=0",
+        remediation=remediation,
+        check_id="pipeline.finalize",
+    )
+    return _idle_flagship(
+        score=0, job_score=0, log_status="warning", validation_event=event, failure_reason_code=event_reason, **overrides
+    )
+
+
+PASSED_BUT_ZERO = [
+    (FinalizeMessages.COMPLETED.reason, "Address issues: WARNING: Collateral required but not deposited", {}),
+    (
+        TenantEnforcementMessages.ALREADY_RENTED.reason,
+        "No action needed. WARNING: Collateral required but not deposited",
+        {"is_rented": True},
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
+@pytest.mark.parametrize(("event_reason", "remediation", "overrides"), PASSED_BUT_ZERO, ids=["finalize", "rented"])
+async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, event_reason, remediation, overrides):
+    result = _passed_but_zero(event_reason, remediation, **overrides)
+    incentive = engine(IncentiveConfig(), AsyncMock(), {"hk": [result]}, {})
+
+    await incentive._pre_process_job_result("hk", result)
+
+    # no "fix the failed check" for a node that failed none; nothing new is recorded for it
+    assert _codes(result) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
+@pytest.mark.parametrize(
+    ("failure_reason_code", "overrides"),
+    [
+        (TenantEnforcementMessages.ALREADY_RENTED.reason, {"is_rented": True}),
+        (ExecutorImageMessages.OUTDATED.reason, {}),
+    ],
+    ids=["rented-halt", "image-check-failed"],
+)
+async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine, failure_reason_code, overrides):
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
+    result = _idle_flagship(
+        score=0,
+        job_score=0,
+        log_status="error",
+        failure_reason_code=failure_reason_code,
+        executor_image_report={"status": "OUTDATED", "expected_ref": "daturaai/compute-subnet-executor:latest"},
+        **overrides,
+    )
+    incentive = engine(IncentiveConfig(), AsyncMock(), {"hk": [result]}, {})
+
+    await incentive._pre_process_job_result("hk", result)
+
+    assert _codes(result) == ["outdated_executor_image"]
+

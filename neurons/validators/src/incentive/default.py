@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import bittensor
 from clients.referral_feed_client import ReferralFeedClient
+from services.task.messages import ExecutorImageMessages, FinalizeMessages, TenantEnforcementMessages
 from services.task_service import JobResult
 
 from core.config import get_total_burn_emission, settings
@@ -16,6 +17,12 @@ from incentive.base import BaseIncentive
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 
 logger = get_logger(__name__)
+
+# The two ways a run ends without a failed check (the same pair executor_rollout keeps): finalize
+# of a run the score gate zeroed, and the rented node's halt. Neither code names a check to fix.
+RUN_ENDED_WITHOUT_FAILING: frozenset[str] = frozenset(
+    {FinalizeMessages.COMPLETED.reason, TenantEnforcementMessages.ALREADY_RENTED.reason}
+)
 
 
 def _parse_driver_version(value: str) -> tuple[int, ...] | None:
@@ -127,13 +134,21 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_validation_failed_reason(result: JobResult) -> None:
-        """A result whose validation did not pass earns 0; record the failing check's code once."""
+        """A result whose run stopped at a failed check earns 0; record that check's code.
+
+        A run that passed every check and still scored 0 (collateral, CPU truth, an outdated
+        image, a rented node's halt) records nothing here: it names no check to fix.
+        """
         if result.is_successful:
             return
-        if any(
-            reason.reason == ZeroIncentiveReason.VALIDATION_FAILED.value
+        reason_code: str = MinerLogLine.validation_failure_code(result)
+        if reason_code in RUN_ENDED_WITHOUT_FAILING:
+            return
+        if reason_code == ExecutorImageMessages.OUTDATED.reason and any(
+            reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
             for reason in result.zero_incentive_reasons
         ):
+            # the image check failed on the outdated image: outdated_executor_image already says so
             return
         result.record_incentive_log(MinerLogLine.no_payout_because_validation_failed(result))
 

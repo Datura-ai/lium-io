@@ -31,9 +31,11 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
-   Group C — validation did not pass this cycle: the failing check's reason code
+   Group C — a check failed this cycle: the failing check's reason code
      (`validation_failed`, context.reason_code), so a zero from a failed check is never
-     reported without a reason
+     reported without a reason. A run that passed every check and still scored 0 (the
+     score gate: collateral, CPU truth, an outdated image, a rented node's halt) is not a
+     failed check and gets no Group C reason
    Every reason that applies is recorded, in the order above: a node blocked by Discord
    still learns that its 8x flagship gate blocks it too. The first entry is the one the
    old first-match evaluation reported.
@@ -456,13 +458,19 @@ class MinerLogLine(BaseModel):
     # ── Group C: the validation run did not pass ─────────────────────────────
 
     @staticmethod
-    def no_payout_because_validation_failed(result: JobResult) -> MinerLogLine:
+    def validation_failure_code(result: JobResult) -> str:
+        """The reason code of the event that ended the run; the fallback when there is none."""
         event = result.validation_event
-        reason_code: str = (
+        return (
             result.failure_reason_code
             or (event.reason_code if event is not None else None)
             or UNCLASSIFIED_VALIDATION_FAILURE
         )
+
+    @staticmethod
+    def no_payout_because_validation_failed(result: JobResult) -> MinerLogLine:
+        event = result.validation_event
+        reason_code: str = MinerLogLine.validation_failure_code(result)
         # the event's check_id/remediation belong to it only when it is the one that ended the run
         same_event: bool = event is not None and event.reason_code == reason_code
         return MinerLogLine._no_payout(
