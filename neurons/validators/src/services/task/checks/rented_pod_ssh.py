@@ -192,13 +192,13 @@ def _cycle_id(ctx: Context) -> str:
 def _decode_hash(raw: object) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, str] = {}
+    decoded: dict[str, str] = {}
     for key, value in raw.items():
         key = key.decode() if isinstance(key, bytes) else key
         value = value.decode() if isinstance(value, bytes) else value
         if isinstance(key, str) and isinstance(value, str):
-            out[key] = value
-    return out
+            decoded[key] = value
+    return decoded
 
 
 def _decode(raw: object) -> dict[str, object] | None:
@@ -594,6 +594,20 @@ def judge_fleet_gate(
     return gate
 
 
+async def _take_cycle_hashes(
+    redis: RedisService, job_batch_id: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Read and delete the cycle's fleet marks and queued reports; raises the Redis error."""
+    fleet_key, due_key = _fleet_key(job_batch_id), _due_key(job_batch_id)
+    fleet = _decode_hash(await redis.hgetall(fleet_key))
+    due = _decode_hash(await redis.hgetall(due_key))
+    # Deleted before posting: a crash after this costs one cycle (the streaks re-queue), a crash
+    # after a post would otherwise post the same outage twice.
+    await redis.delete(fleet_key)
+    await redis.delete(due_key)
+    return fleet, due
+
+
 async def flush_rented_pod_ssh_reports(
     redis: RedisService,
     backend: BackendClient,
@@ -618,15 +632,9 @@ async def flush_rented_pod_ssh_reports(
     """
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
         return None
-    fleet_key, due_key = _fleet_key(job_batch_id), _due_key(job_batch_id)
     extra = {"job_batch_id": job_batch_id}
     try:
-        fleet = _decode_hash(await redis.hgetall(fleet_key))
-        due = _decode_hash(await redis.hgetall(due_key))
-        # Deleted before posting: a crash below costs one cycle (the streaks re-queue), a crash
-        # after a post would otherwise post the same outage twice.
-        await redis.delete(fleet_key)
-        await redis.delete(due_key)
+        fleet, due = await _take_cycle_hashes(redis, job_batch_id)
     except REDIS_ERRORS:
         logger.warning(
             _m(
@@ -754,12 +762,12 @@ def _event_without_held_pods(
                 },
             }
         )
-    rented = TenantEnforcementMessages.ALREADY_RENTED
+    already_rented_template = TenantEnforcementMessages.ALREADY_RENTED
     return build_msg(
-        event=rented.event,
-        reason=rented.reason,
-        severity=rented.severity,
-        category=rented.category,
+        event=already_rented_template.event,
+        reason=already_rented_template.reason,
+        severity=already_rented_template.severity,
+        category=already_rented_template.category,
         impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
         remediation="No action needed.",
         what={**what, PROBE_SUPPRESSED_FLEET: gate_verdict},

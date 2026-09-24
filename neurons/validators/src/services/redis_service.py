@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import NamedTuple
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
@@ -115,6 +116,14 @@ class _PassThroughLock:
         return False
 
 
+class RedisWrite(NamedTuple):
+    """One queued write of a `RedisWrites` batch."""
+
+    command: str
+    args: tuple
+    kwargs: dict
+
+
 class RedisWrites:
     """Writes that apply together or not at all: `RedisService.write_atomically` runs them as one
     MULTI/EXEC. A state kept in several keys (a mark and a streak, a hash and its TTL) is moved in one
@@ -123,22 +132,22 @@ class RedisWrites:
     Only the write commands the validator uses are offered; the methods chain."""
 
     def __init__(self):
-        self.ops: list[tuple[str, tuple, dict]] = []
+        self.ops: list[RedisWrite] = []
 
     def set(self, key: str, value: str, ex: int | None = None) -> "RedisWrites":
-        self.ops.append(("set", (key, value), {"ex": ex}))
+        self.ops.append(RedisWrite("set", (key, value), {"ex": ex}))
         return self
 
     def delete(self, key: str) -> "RedisWrites":
-        self.ops.append(("delete", (key,), {}))
+        self.ops.append(RedisWrite("delete", (key,), {}))
         return self
 
     def hset(self, key: str, field: str, value: str) -> "RedisWrites":
-        self.ops.append(("hset", (key, field, value), {}))
+        self.ops.append(RedisWrite("hset", (key, field, value), {}))
         return self
 
     def expire(self, key: str, seconds: int) -> "RedisWrites":
-        self.ops.append(("expire", (key, seconds), {}))
+        self.ops.append(RedisWrite("expire", (key, seconds), {}))
         return self
 
     def __len__(self) -> int:
@@ -402,10 +411,6 @@ class RedisService:
         async with self.lock:
             await self.redis.hdel(key, *fields)
 
-    async def expire(self, key: str, seconds: int):
-        async with self.lock:
-            await self.redis.expire(key, seconds)
-
     async def write_atomically(self, writes: RedisWrites) -> None:
         """Apply every write in `writes` as one MULTI/EXEC, or none of them.
 
@@ -418,8 +423,8 @@ class RedisService:
             return
         async with self.lock:
             async with self.redis.pipeline(transaction=True) as pipe:
-                for name, args, kwargs in writes.ops:
-                    getattr(pipe, name)(*args, **kwargs)
+                for write in writes.ops:
+                    getattr(pipe, write.command)(*write.args, **write.kwargs)
                 await pipe.execute()
 
     async def clear_by_pattern(self, pattern: str):
