@@ -356,7 +356,7 @@ class PrePuller:
 
         The clock starts at the first sweep that no longer lists it and resets if it comes back,
         so a template that drifts in and out at the edge of the top-N is not pulled and removed
-        in turn. Only images this puller pulled are candidates, and only on an idle node: a rental
+        in turn. Only images this puller tracks are candidates, and only on an idle node: a rental
         may be starting on the image. An image docker refuses to remove stays tracked for the next sweep."""
         after = settings.PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS
         now = time.time()
