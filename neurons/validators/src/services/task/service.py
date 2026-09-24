@@ -202,8 +202,9 @@ class TaskService:
                         checks = self.pipeline_factory.build_checks(fast_path=True)
                     else:
                         checks = self.pipeline_factory.build_checks()
-                pipeline = self.pipeline_factory.build_pipeline(checks)
-                pipeline.progress = PipelineProgress(validation_progress)
+                pipeline = self.pipeline_factory.build_pipeline(
+                    checks, progress=PipelineProgress(validation_progress)
+                )
                 ok, events, last_context = await pipeline.run(base_ctx)
 
                 # Determine log_text and success based on ok status

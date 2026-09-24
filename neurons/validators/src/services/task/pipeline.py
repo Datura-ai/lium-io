@@ -24,7 +24,7 @@ from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from .models import ValidationEvent
+from .models import CollateralPrefetch, ValidationEvent
 from .runner import SSHCommandRunner
 
 @runtime_checkable
@@ -176,7 +176,7 @@ class ContextState:
     # Validation fast path: the collateral read CollateralPrefetchCheck started under the GPU
     # spec checks, for CollateralCheck to await instead of calling the contract itself. None =
     # no prefetch (the flag is off, or the scrape left no GPU to read for).
-    collateral_prefetch: Any = None
+    collateral_prefetch: CollateralPrefetch | None = None
 
 
 class CheckResult(BaseModel):
@@ -401,11 +401,10 @@ def _stops_run(chk: Check, res: CheckResult) -> bool:
 def cancel_pending_collateral_prefetch(ctx: Context) -> bool:
     """Cancel a collateral read the fast path started that no check consumed (the run ended
     before CollateralCheck). Returns whether one was cancelled."""
-    prefetch = getattr(ctx.state, "collateral_prefetch", None)
-    task = getattr(prefetch, "task", None)
-    if task is None or task.done():
+    prefetch = ctx.state.collateral_prefetch
+    if prefetch is None or prefetch.task.done():
         return False
-    task.cancel()
+    prefetch.task.cancel()
     return True
 
 
@@ -492,15 +491,17 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
-        latest = [ctx]
+        latest_ctx_holder: list[Context] = [ctx]
         try:
-            return await self._run(ctx, latest)
+            return await self._run(ctx, latest_ctx_holder)
         except BaseException:
             # A run that raises leaves no check to consume the early collateral read.
-            cancel_pending_collateral_prefetch(latest[0])
+            cancel_pending_collateral_prefetch(latest_ctx_holder[0])
             raise
 
-    async def _run(self, ctx: Context, latest: list[Context]) -> Tuple[bool, list[ValidationEvent], Context]:
+    async def _run(
+        self, ctx: Context, latest_ctx_holder: list[Context]
+    ) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
@@ -537,7 +538,7 @@ class Pipeline:
                     self.progress.step_finished(current_ctx, chk.check_id, res.event, res.passed)
 
                 current_ctx = self._apply(current_ctx, ran, parallel)
-                latest[0] = current_ctx
+                latest_ctx_holder[0] = current_ctx
 
                 if failed:
                     cancel_pending_collateral_prefetch(current_ctx)

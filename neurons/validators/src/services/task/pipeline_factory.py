@@ -75,6 +75,7 @@ from .pipeline import (
     LoggerSink,
     ParallelStage,
     Pipeline,
+    ProgressSink,
     PodRecoverer,
 )
 from .runner import SSHCommandRunner
@@ -410,7 +411,8 @@ class PipelineFactory:
           starts.
         - The rental probe, score and finalize follow as today.
         The list differs from build_checks only in where these checks sit; a node that would fail
-        there fails here on the same check.
+        there fails here too. A node that would fail two checks can report the other one first:
+        the port checks now run after VerifyX, and a lane that stops first wins.
         """
         return cast(
             list[Check],
@@ -529,13 +531,14 @@ class PipelineFactory:
             ],
         )
 
-    def build_pipeline(self, checks: list[Check]) -> Pipeline:
+    def build_pipeline(self, checks: list[Check], progress: ProgressSink | None = None) -> Pipeline:
         """Build a pipeline with the given checks.
 
         Args:
             checks: List of validation checks
+            progress: Where the pipeline reports each check's start and end (the support view)
 
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger))
+        return Pipeline(checks, sink=LoggerSink(logger), progress=progress)

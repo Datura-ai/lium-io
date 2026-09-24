@@ -11,20 +11,12 @@ from what `CollateralCheck` computes is discarded there and the read runs again.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
-from typing import Any
+from dataclasses import replace
 
 from ..messages import CollateralPrefetchMessages as Msg
 from ..messages import render_message
+from ..models import CollateralPrefetch, CollateralReadArgs
 from ..pipeline import CheckResult, Context
-
-
-@dataclass(frozen=True)
-class CollateralReadArgs:
-    miner_hotkey: str
-    executor_uuid: str
-    gpu_model: str | None
-    gpu_count: int
 
 
 def collateral_read_args(ctx: Context) -> CollateralReadArgs:
@@ -43,12 +35,6 @@ def collateral_read_args(ctx: Context) -> CollateralReadArgs:
         gpu_model=gpu_model,
         gpu_count=gpu_count,
     )
-
-
-@dataclass(frozen=True)
-class CollateralPrefetch:
-    args: CollateralReadArgs
-    task: Any  # asyncio.Task[tuple[bool, str | None, str | None]]
 
 
 class CollateralPrefetchCheck:
