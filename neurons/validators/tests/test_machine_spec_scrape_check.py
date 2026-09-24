@@ -677,6 +677,11 @@ async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation
             id="no-gpu-report-without-data",
         ),
         pytest.param(
+            make_command_result(success=False, exit_code=1, stdout=f"{DRIVER_REPORT}\natexit hook says bye"),
+            Msg.SCRAPE_FAILED_DRIVER.reason,
+            id="image-prints-after-the-report",
+        ),
+        pytest.param(
             make_command_result(success=False, exit_code=127, stderr="scrape.sh: No such file or directory"),
             Msg.SCRAPE_FAILED_ON_HOST.reason,
             id="script-missing",

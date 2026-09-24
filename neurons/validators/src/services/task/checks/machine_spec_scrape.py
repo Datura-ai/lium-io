@@ -105,16 +105,20 @@ def _decrypt_payload(ctx: Context, stdout: str) -> str:
 
 
 def _scrape_error_report(stdout: str) -> dict[str, Any] | None:
-    # the scrape prints {"error": ...} as its last line and exits non-zero when it ran but found
-    # nothing to report; a source the interpreter could not run prints nothing of ours at all
-    last_line = next((line for line in _lines_from_the_end(stdout) if line.strip()), None)
-    if last_line is None:
-        return None
-    try:
-        report = json.loads(last_line)
-    except ValueError:
-        return None
-    return report if isinstance(report, dict) and "error" in report else None
+    # the scrape prints {"error": ...} and exits non-zero when it ran but found nothing to report;
+    # a source the interpreter could not run prints nothing of ours at all. Searched newest-first
+    # like the token, since an atexit handler in the image may print after it.
+    for line in _lines_from_the_end(stdout):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            report = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(report, dict) and "error" in report:
+            return report
+    return None
 
 
 def _scrape_reported_its_own_failure(stdout: str) -> bool:
