@@ -3,11 +3,31 @@ from __future__ import annotations
 from dataclasses import replace
 
 from core.config import settings
-from services.executor_connectivity.models import SECOND_PASS_SKIPPED_BATCH_FAILED, PortVerificationResult
+from services.executor_connectivity.models import (
+    SECOND_PASS_DISCARDED_CONTAINER_FAILED,
+    SECOND_PASS_SKIPPED_BATCH_FAILED,
+    SECOND_PASS_SKIPPED_CONTAINER_FAILED,
+    PortVerificationResult,
+)
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+SECOND_PASS_NOTES = {
+    SECOND_PASS_SKIPPED_BATCH_FAILED: (
+        "second port pass skipped: the first pass's batch container didn't complete "
+        "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
+    ),
+    SECOND_PASS_SKIPPED_CONTAINER_FAILED: (
+        "second port pass skipped: the container (DinD) check failed, so the second pass "
+        "cannot add ports and the host keeps the first pass's result"
+    ),
+    SECOND_PASS_DISCARDED_CONTAINER_FAILED: (
+        "second port pass not counted: the container (DinD) check on one of its ports failed, "
+        "so none of its answers count (tallied with counted=False)"
+    ),
+}
 
 
 class PortConnectivityCheck:
@@ -67,11 +87,8 @@ class PortConnectivityCheck:
         # event-only: kept out of default_extra so later checks' log lines stay small
         port_ranges = [r.as_dict() for r in result.port_ranges]
         event_extra: dict[str, object] = {"port_ranges": port_ranges, "second_pass": result.second_pass}
-        if result.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED:
-            event_extra["second_pass_note"] = (
-                "second port pass skipped: the first pass's batch container didn't complete "
-                "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
-            )
+        if result.second_pass in SECOND_PASS_NOTES:
+            event_extra["second_pass_note"] = SECOND_PASS_NOTES[result.second_pass]
         updated_state = replace(
             ctx.state,
             specs={

@@ -8,10 +8,12 @@ from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import (
     SECOND_PASS_BATCH_FAILED,
+    SECOND_PASS_DISCARDED_CONTAINER_FAILED,
     SECOND_PASS_NO_PORTS_LEFT,
     SECOND_PASS_NOT_NEEDED,
     SECOND_PASS_RAN,
     SECOND_PASS_SKIPPED_BATCH_FAILED,
+    SECOND_PASS_SKIPPED_CONTAINER_FAILED,
     DindProbeResult,
     PortPair,
     PortVerificationResult,
@@ -92,17 +94,22 @@ class ConnectivityOrchestrator:
             "log_ctx": log_ctx,
         }
 
-        # The container check takes one answered port and gives it back only if it passes, so when pass
-        # one alone may be enough it runs first, on a pass-one port, and pass two is decided on what is
-        # left. Below MIN_PORT_COUNT pass two runs whatever the check says, so the check waits and can
-        # take a pass-two port.
+        # Pass two restores the port count only; it never overrides a failed container check. With a
+        # pass-one answer the check runs first, on that port, as the one-pass check did, and a
+        # failure publishes that check's result with no pass two. With none (the one-pass check would
+        # have run on a port that did not answer) the check waits for pass two and runs on one of its
+        # answers; if it fails, none of pass two's answers count: 0 verified, DinD failed.
         dind = None
-        if len(successful) >= MIN_PORT_COUNT:
+        if successful:
             dind = await self._check_container(successful, failed, ports, **container_check)
 
         spread: list[PortPair] = []
+        spread_answers: list[PortPair] = []
+        spread_failed: list[PortPair] = []
         if len(successful) >= MIN_PORT_COUNT:
             second_pass = SECOND_PASS_NOT_NEEDED
+        elif dind is not None and not dind[1].success:
+            second_pass = SECOND_PASS_SKIPPED_CONTAINER_FAILED
         elif not probe_result.batch_ran:
             second_pass = SECOND_PASS_SKIPPED_BATCH_FAILED
         else:
@@ -121,8 +128,23 @@ class ConnectivityOrchestrator:
                 second_pass = (
                     SECOND_PASS_RAN if spread_result.batch_ran else SECOND_PASS_BATCH_FAILED
                 )
-                successful += spread_result.successful
-                failed += spread_result.failed
+                spread_answers = list(spread_result.successful)
+                spread_failed = list(spread_result.failed)
+
+        if dind is None and spread_answers:
+            dind_port = spread_answers[0]
+            dind_result = await self.dind_probe.verify(dind_port, **container_check)
+            dind = dind_port, dind_result
+            if not dind_result.success:
+                second_pass = SECOND_PASS_DISCARDED_CONTAINER_FAILED
+                failed.append(dind_port)
+        if second_pass != SECOND_PASS_DISCARDED_CONTAINER_FAILED:
+            successful += spread_answers
+            failed += spread_failed
+        if dind is None:
+            dind = await self._check_container(successful, failed, ports, **container_check)
+        dind_port, dind_result = dind
+        sysbox_runtime = dind_result.sysbox_runtime if dind_result.success else False
         if second_pass != SECOND_PASS_NOT_NEEDED:
             logger.info(
                 _m(
@@ -131,15 +153,16 @@ class ConnectivityOrchestrator:
                 )
             )
 
-        if dind is None:
-            dind = await self._check_container(successful, failed, ports, **container_check)
-        dind_port, dind_result = dind
-        sysbox_runtime = dind_result.sysbox_runtime if dind_result.success else False
-
         status = "ok" if successful else "no_working_ports"
         port_ranges = tally_port_ranges(declared, ports, successful)
         if spread:
-            port_ranges += tally_port_ranges(declared, spread, successful, pass_number=2)
+            port_ranges += tally_port_ranges(
+                declared,
+                spread,
+                spread_answers,
+                pass_number=2,
+                counted=second_pass != SECOND_PASS_DISCARDED_CONTAINER_FAILED,
+            )
         return PortVerificationResult(
             selected_ports=tuple(ports) + tuple(spread),
             successful_ports=tuple(successful),

@@ -489,7 +489,14 @@ async def test_port_connectivity_event_carries_the_per_range_tallies(context_fac
 
 @pytest.mark.parametrize(
     "second_pass, noted",
-    [("not_needed", False), ("ran", False), ("batch_failed", False), ("skipped_batch_failed", True)],
+    [
+        ("not_needed", False),
+        ("ran", False),
+        ("batch_failed", False),
+        ("skipped_batch_failed", "batch container didn't complete"),
+        ("skipped_container_failed", "container (DinD) check failed"),
+        ("discarded_container_failed", "none of its answers count"),
+    ],
 )
 @pytest.mark.parametrize("success", [True, False])
 @pytest.mark.asyncio
@@ -508,10 +515,10 @@ async def test_port_connectivity_event_says_whether_the_second_pass_ran(context_
     result = await PortConnectivityCheck().run(ctx)
 
     assert result.event.context["second_pass"] == second_pass
-    assert ("second_pass_note" in result.event.context) is noted
+    assert ("second_pass_note" in result.event.context) is bool(noted)
     if noted:
-        assert "batch container didn't complete" in result.event.context["second_pass_note"]
+        assert noted in result.event.context["second_pass_note"]
     assert "second_pass" not in result.updates["default_extra"]
     if not success:
         assert result.event.what_we_saw["second_pass"] == second_pass
-        assert ("second_pass_note" in result.event.what_we_saw) is noted
+        assert ("second_pass_note" in result.event.what_we_saw) is bool(noted)

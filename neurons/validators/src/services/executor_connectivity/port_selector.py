@@ -25,6 +25,7 @@ def tally_port_ranges(
     probed: Iterable[PortPair],
     answered: Iterable[PortPair],
     pass_number: int = 1,
+    counted: bool = True,
 ) -> tuple[PortRangeResult, ...]:
     """Declared, probed and answered counts per declared range for one pass, ascending.
 
@@ -54,6 +55,7 @@ def tally_port_ranges(
             answered=sum(e in answered_ext for e in ports),
             other=other,
             pass_number=pass_number,
+            counted=counted,
         )
 
     return tuple(tally(ports) for ports in kept) + (
@@ -81,13 +83,12 @@ class PortSelector:
 
     Pass one (`select`) is the lowest `size` free declared ports, the check every host gets. Pass
     two (`select_spread`) runs only when pass one verified fewer than MIN_PORT_COUNT, counted after
-    the DinD probe has taken its port: up to `size`
+    the DinD probe has taken its port, and never after a failed DinD probe: up to `size`
     ports spread evenly over the free declared ports pass one did not test, always including the
     highest. On 40000-65535 pass two probes every 84th or 85th port from 40300 up, so a block
-    forwarded at the top verifies 3 ports when it is 170 ports or wider (255 when the DinD probe on
-    one of them fails), and a block anywhere above pass one's ports when it is 254 ports or wider
-    (338). For the same declaration and rental set both passes probe the same ports every cycle, so
-    a node does not flap.
+    forwarded at the top verifies 3 ports when it is 170 ports or wider, and a block anywhere above
+    pass one's ports when it is 254 ports or wider. For the same declaration and rental set both
+    passes probe the same ports every cycle, so a node does not flap.
     """
 
     def select(

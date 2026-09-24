@@ -6,6 +6,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PortPair:
     """Immutable port mapping."""
+
     internal: int
     external: int
 
@@ -77,25 +78,38 @@ class PortRangeResult:
     other: bool = False
     # 1: the lowest-300 pass every host gets; 2: the spread pass run only when pass one verified < 3
     pass_number: int = 1
+    # False: probed and tallied, but none of these answers is a verified port (the container check
+    # on one of them failed)
+    counted: bool = True
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
         if self.other:
             label = f"other {label}"
-        return {
+        entry: dict[str, object] = {
             "pass": self.pass_number,
             "range": label,
             "declared": self.declared,
             "probed": self.probed,
             "answered": self.answered,
         }
+        if not self.counted:
+            entry["counted"] = False
+        return entry
 
 
+# Pass two restores the port count only: after a failed container (DinD) check the result is the
+# one-pass check's, so pass two never lists a host whose container check failed.
 SECOND_PASS_NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more after DinD
+# the container check failed on a pass-one port, so pass two did not run
+SECOND_PASS_SKIPPED_CONTAINER_FAILED = "skipped_container_failed"
 SECOND_PASS_SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
 SECOND_PASS_NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
 SECOND_PASS_RAN = "ran"
 SECOND_PASS_BATCH_FAILED = "batch_failed"  # pass two's own batch container didn't complete
+# pass one had no answer, pass two had some, and the container check on one of them failed, so
+# none of pass two's answers count (tallied with counted=False)
+SECOND_PASS_DISCARDED_CONTAINER_FAILED = "discarded_container_failed"
 
 
 @dataclass(frozen=True)
