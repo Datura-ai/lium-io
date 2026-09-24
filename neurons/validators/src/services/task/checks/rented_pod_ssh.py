@@ -62,7 +62,7 @@ import json
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import redis.exceptions
 from protocol.vc_protocol.compute_requests import (
@@ -594,9 +594,12 @@ def judge_fleet_gate(
     return gate
 
 
-async def _take_cycle_hashes(
-    redis: RedisService, job_batch_id: str
-) -> tuple[dict[str, str], dict[str, str]]:
+class CycleGateHashes(NamedTuple):
+    fleet: dict[str, str]  # pod_id -> mapped-port mark
+    due: dict[str, str]  # pod_id -> queued DueReport JSON
+
+
+async def _take_cycle_hashes(redis: RedisService, job_batch_id: str) -> CycleGateHashes:
     """Read and delete the cycle's fleet marks and queued reports; raises the Redis error."""
     fleet_key, due_key = _fleet_key(job_batch_id), _due_key(job_batch_id)
     fleet = _decode_hash(await redis.hgetall(fleet_key))
@@ -605,7 +608,7 @@ async def _take_cycle_hashes(
     # after a post would otherwise post the same outage twice.
     await redis.delete(fleet_key)
     await redis.delete(due_key)
-    return fleet, due
+    return CycleGateHashes(fleet, due)
 
 
 async def flush_rented_pod_ssh_reports(
@@ -672,7 +675,18 @@ async def flush_rented_pod_ssh_reports(
             )
         )
         return gate
+    return await _post_due_reports(redis, backend, gate, due, gate_log_fields)
 
+
+async def _post_due_reports(
+    redis: RedisService,
+    backend: BackendClient,
+    gate: FleetGate,
+    due: dict[str, str],
+    gate_log_fields: dict[str, object],
+) -> FleetGate:
+    """POST every report the gate let through; the gate comes back with the pods the backend answered for."""
+    extra = {"job_batch_id": gate.job_batch_id}
     # Side by side, as the executor tasks posted them before this gate: this runs on the sync loop
     # ahead of the specs publish, and a backend that is down would otherwise cost one timeout per pod.
     outcomes = await asyncio.gather(

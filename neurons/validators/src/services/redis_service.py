@@ -120,8 +120,8 @@ class RedisWrite(NamedTuple):
     """One queued write of a `RedisWrites` batch."""
 
     command: str
-    args: tuple
-    kwargs: dict
+    args: tuple[str | int, ...]
+    kwargs: dict[str, int | None]
 
 
 class RedisWrites:
