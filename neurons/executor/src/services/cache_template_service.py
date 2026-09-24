@@ -39,8 +39,8 @@ MIN_DISK_SPACE_MULTIPLIER = 3.0
 # Backoff used after errors / empty responses (never longer than the refresh).
 ERROR_INTERVAL_SECONDS = 5 * 60
 # Until the first sweep completes, a sweep that fails (the mandatory pull raising, most often) is
-# retried after 15, 30, 60 and 120 s, each plus up to 15 s of jitter so a fleet that boots together
-# does not retry in step, before the loop falls back to ERROR_INTERVAL_SECONDS: a new node is
+# retried after 15, 30, 60 and 120 s, each plus up to 15 s of jitter so executors that boot together
+# do not retry in step, before the loop falls back to ERROR_INTERVAL_SECONDS: a new node is
 # verified within minutes of being added, and the default image is what that verification looks
 # for. An unknown GPU or an empty backend answer keeps ERROR_INTERVAL_SECONDS and uses none of them.
 FIRST_SWEEP_RETRY_BASE_SECONDS = 15

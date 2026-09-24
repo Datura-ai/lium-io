@@ -30,7 +30,7 @@ TEMPLATE = {
     "docker_image_size": 0,
     "docker_image_digest": DIGEST,
 }
-REGISTRY_ERROR = "read tcp 10.0.0.2:51234->104.16.100.207:443: read: connection reset by peer"
+REGISTRY_ERROR = "read tcp 10.0.0.2:51234->203.0.113.7:443: read: connection reset by peer"
 
 
 def _client(stream: list) -> MagicMock:
