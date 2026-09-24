@@ -131,7 +131,7 @@ def _stream_error(event: object) -> str | None:
     return message or event.get("error") or None
 
 
-def _pull(client: "docker.DockerClient", repository: str, tag: str):
+def _pull(client: "docker.DockerClient", repository: str, tag: str) -> "docker.models.images.Image":
     """Blocking pull that raises the daemon's own error; returns the pulled image.
 
     ``images.pull`` drains the same stream and ignores an ``error`` event in it, so a failed
@@ -355,7 +355,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
     first_sweep_done = False
     fast_retries_used = 0
 
-    def error_backoff() -> float:
+    def next_error_sleep_seconds() -> float:
         nonlocal fast_retries_used
         delay = (
             None
@@ -488,10 +488,10 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                 state.note_loop_error(e)
                 state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                 state.flush()
-                await asyncio.sleep(error_backoff())
+                await asyncio.sleep(next_error_sleep_seconds())
             except Exception as e:
                 logger.error(f"Unexpected error during cache pre-pull: {e}")
                 state.note_loop_error(e)
                 state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                 state.flush()
-                await asyncio.sleep(error_backoff())
+                await asyncio.sleep(next_error_sleep_seconds())

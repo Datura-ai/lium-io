@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import time
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
@@ -100,6 +101,21 @@ def _repo_digest(stdout: str | None, repo: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class FreshNodeGrace:
+    """Whether a node found without its image is still inside its fresh-node grace.
+
+    Attached to the event with `asdict`, so it serializes like the rest of `what_we_saw`.
+    """
+
+    pending: bool
+    first_uncached_at: str | None = None
+    seconds_since_first_uncached: int | None = None
+    grace_seconds: int | None = None
+    first_sweep_completed: bool | None = None
+    redis_error: str | None = None
+
+
 def _first_sweep_completed(state: dict | None) -> bool | None:
     """Whether the executor's prefetch loop has finished a sweep; None when its document can't say.
 
@@ -123,10 +139,17 @@ def _quote(value: object) -> str:
     return f'"{text}"'
 
 
+def _error_mentions(lowered_error: str, needle: str) -> bool:
+    # A status code must stand alone: a digest's hex can hold "403" or "404".
+    if needle.isdigit():
+        return re.search(rf"\b{needle}\b", lowered_error) is not None
+    return needle in lowered_error
+
+
 def _pull_error_next_step(error: str, ref: str) -> str:
     lowered = error.lower()
     for needles, step in _PULL_ERROR_NEXT_STEPS:
-        if any(needle in lowered for needle in needles):
+        if any(_error_mentions(lowered, needle) for needle in needles):
             return step.format(ref=ref)
     return f"Run `docker pull {ref}` on the host to reproduce it."
 
@@ -135,7 +158,9 @@ def _gib(value: object) -> str:
     return f"{value / 1024**3:.0f} GiB" if isinstance(value, int | float) else "unknown"
 
 
-def _remediation(state: dict | None, image_ref: str, pull_ref: str, cached: bool) -> str | None:
+def _remediation_from_prefetch_state(
+    state: dict | None, image_ref: str, pull_ref: str, cached: bool
+) -> str | None:
     """The provider's next step, from what the executor's own prefetch loop recorded.
 
     None when the document names no specific cause; the template's generic text is used then.
@@ -278,7 +303,7 @@ class CachedTemplateVerificationCheck:
             return {"unavailable": "unparseable", "raw_prefix": raw[:_PREFETCH_ERROR_CHARS]}
         return state
 
-    async def _fresh_node_grace(self, ctx: Context, prefetch_state: dict) -> dict | None:
+    async def _fresh_node_grace(self, ctx: Context, prefetch_state: dict) -> FreshNodeGrace | None:
         """Whether a node found without its image is still inside its fresh-node grace.
 
         The window opens at this validator's first sighting of the node without the image (kept
@@ -296,16 +321,36 @@ class CachedTemplateVerificationCheck:
                 ctx.executor.uuid, now, _FIRST_UNCACHED_TTL_SECONDS
             )
         except Exception as exc:
-            return {"pending": False, "error": str(exc)[:_PREFETCH_ERROR_CHARS]}
+            return FreshNodeGrace(pending=False, redis_error=str(exc)[:_PREFETCH_ERROR_CHARS])
         first_sweep_completed = _first_sweep_completed(prefetch_state)
         elapsed = max(0.0, now - first_uncached)
-        return {
-            "pending": elapsed < grace_seconds and first_sweep_completed is not True,
-            "first_uncached_at": datetime.fromtimestamp(first_uncached, UTC).isoformat(),
-            "seconds_since_first_uncached": round(elapsed),
-            "grace_seconds": grace_seconds,
-            "first_sweep_completed": first_sweep_completed,
-        }
+        return FreshNodeGrace(
+            pending=elapsed < grace_seconds and first_sweep_completed is not True,
+            first_uncached_at=datetime.fromtimestamp(first_uncached, UTC).isoformat(),
+            seconds_since_first_uncached=round(elapsed),
+            grace_seconds=grace_seconds,
+            first_sweep_completed=first_sweep_completed,
+        )
+
+    async def _apply_fresh_node_grace(self, ctx: Context, prefetch_state: dict, what: dict) -> bool:
+        """True when the grace holds this NOT_CACHED node as pending.
+
+        Flag on, the grace is added to ``what``. Flag off, a would-be hold is only logged.
+        """
+        grace = await self._fresh_node_grace(ctx, prefetch_state)
+        if grace is None:
+            return False
+        if settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED:
+            what["fresh_node_grace"] = asdict(grace)
+            return grace.pending
+        if grace.pending:
+            logger.info(
+                _m(
+                    "Fresh-node grace is off: this node would have been held as pending",
+                    extra=get_extra_info({**ctx.default_extra, "fresh_node_grace": asdict(grace)}),
+                )
+            )
+        return False
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model
@@ -423,23 +468,16 @@ class CachedTemplateVerificationCheck:
         if should_fail:
             prefetch_state = await self._read_prefetch_state(ctx)
             what["prefetch_state"] = prefetch_state
-            if template == Msg.NOT_CACHED:
-                grace = await self._fresh_node_grace(ctx, prefetch_state)
-                if grace is not None and settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED:
-                    what["fresh_node_grace"] = grace
-                    if grace["pending"]:
-                        template = Msg.PENDING
-                        should_fail = False
-                elif grace is not None and grace["pending"]:
-                    logger.info(
-                        _m(
-                            "Fresh-node grace is off: this node would have been held as pending",
-                            extra=get_extra_info({**ctx.default_extra, "fresh_node_grace": grace}),
-                        )
-                    )
+            if template == Msg.NOT_CACHED and await self._apply_fresh_node_grace(
+                ctx, prefetch_state, what
+            ):
+                template = Msg.PENDING
+                should_fail = False
             if should_fail:
                 pull_ref = f"{docker_image}@{backend_digest}" if backend_digest else image_ref
-                remediation = _remediation(prefetch_state, image_ref, pull_ref, cached)
+                remediation = _remediation_from_prefetch_state(
+                    prefetch_state, image_ref, pull_ref, cached
+                )
                 if remediation is None and template == Msg.NOT_CACHED:
                     remediation = _NOT_CACHED_NEXT_STEP.format(ref=pull_ref)
 

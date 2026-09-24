@@ -24,7 +24,7 @@ from fakeredis.aioredis import FakeRedis
 from core.config import Settings, settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
-    _remediation,
+    _remediation_from_prefetch_state,
 )
 from services.redis_service import RedisService
 from neurons.validators.src.services.task.messages import CachedTemplateMessages as Msg
@@ -704,7 +704,7 @@ async def test_redis_error_means_no_grace(context_factory, monkeypatch):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.NOT_CACHED.reason
-    assert "redis down" in result.event.what_we_saw["fresh_node_grace"]["error"]
+    assert "redis down" in result.event.what_we_saw["fresh_node_grace"]["redis_error"]
 
 
 @pytest.mark.asyncio
@@ -826,7 +826,7 @@ def _mismatch_ctx(context_factory, monkeypatch, prefetch_read):
 
 
 @pytest.mark.asyncio
-async def test_digest_mismatch_with_no_named_cause_keeps_its_own_remediation(
+async def test_digest_mismatch_with_no_named_cause_keeps_its_own_remediation_from_prefetch_state(
     context_factory, monkeypatch
 ):
     doc = _prefetch_doc(
@@ -905,13 +905,20 @@ async def test_remediation_quotes_the_executors_pull_error(context_factory, monk
         ("write /var/lib/docker/tmp/x: no space left on device", "free disk"),
         ("manifest for daturaai/torch@sha256:aaa not found: manifest unknown", "registry mirror"),
         ("unauthorized: authentication required", "Docker login"),
+        # A status code inside a digest is not the registry's answer.
+        (
+            "Get https://registry-1.docker.io/v2/daturaai/torch/manifests/sha256:ab403f: "
+            "net/http: TLS handshake timeout",
+            "outbound connection",
+        ),
+        ("pull daturaai/torch@sha256:c404e failed: connection reset by peer", "outbound connection"),
         ("something new", "docker pull daturaai/torch@sha256:aaa"),
     ],
 )
 def test_remediation_names_the_next_step_for_the_error(error, expected):
     state = json.loads(_prefetch_doc(pull_error=error))
 
-    text = _remediation(state, _IMAGE_REF, "daturaai/torch@sha256:aaa", cached=False)
+    text = _remediation_from_prefetch_state(state, _IMAGE_REF, "daturaai/torch@sha256:aaa", cached=False)
 
     assert error[:40] in text
     assert expected in text
@@ -922,7 +929,7 @@ def test_remediation_does_not_quote_an_error_a_later_sweep_moved_past():
         "last_outcome": "up_to_date", "last_pull_error": _PULL_ERROR,
     }}}
 
-    assert _remediation(state, _IMAGE_REF, _IMAGE_REF, cached=False) is None
+    assert _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False) is None
 
 
 @pytest.mark.parametrize(
@@ -950,12 +957,12 @@ def test_remediation_does_not_quote_an_error_a_later_sweep_moved_past():
     ],
 )
 def test_remediation_reads_the_loop_and_disk_outcomes(state, expected):
-    assert expected in _remediation(state, _IMAGE_REF, _IMAGE_REF, cached=False)
+    assert expected in _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False)
 
 
 def test_remediation_without_a_prefetch_document_says_why_the_image_fails():
-    missing = _remediation({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=False)
-    stale = _remediation({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=True)
+    missing = _remediation_from_prefetch_state({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=False)
+    stale = _remediation_from_prefetch_state({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=True)
 
     assert missing.endswith("to see why the image is missing.")
     assert stale.endswith("to see why the image on the host is stale.")
