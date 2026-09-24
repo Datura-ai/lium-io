@@ -9,8 +9,7 @@ listens inside the container, so a TCP accept proves nothing; only the RFC 4253 
 structured line (the measurement mode, never fails and never delays a rent); `enforce` probes before
 ContainerCreated and fails the create at `current_step = "ssh_ready"`.
 
-lium-io#1372 (the rented-pod SSH probe) carries its own identification reader; once it merges, one of
-the two helpers goes.
+The banner rule is the one the rented-pod probe and the rental probe use (task/checks/ssh_identification.py).
 """
 
 from __future__ import annotations
@@ -22,12 +21,12 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-SSH_ID_PREFIX = b"SSH-2.0-"
-SSH_ID_ANY_VERSION_PREFIX = b"SSH-"
-# RFC 4253 §4.2: the identification line is at most 255 bytes including CR LF, and a server may send
-# other lines before it. Both bounds keep a peer that is not sshd from holding the probe or its memory.
-SSH_ID_LINE_MAX = 255
-SSH_PRE_BANNER_LINES_MAX = 64
+from services.task.checks.ssh_identification import (
+    SSH_ID_LINE_MAX,
+    is_ssh2_identification,
+    read_ssh_identification,
+)
+
 SSH_READY_ATTEMPT_TIMEOUT_SECONDS = 5.0
 
 
@@ -74,24 +73,6 @@ class SshNotReady(Exception):
         )
 
 
-def is_ssh2_identification(line: bytes) -> bool:
-    if not line.endswith(b"\n") or len(line) > SSH_ID_LINE_MAX:
-        return False
-    body = line.rstrip(b"\r\n")
-    return body.startswith(SSH_ID_PREFIX) and len(body) > len(SSH_ID_PREFIX)
-
-
-async def _read_identification(reader: asyncio.StreamReader) -> bytes:
-    for _ in range(SSH_PRE_BANNER_LINES_MAX + 1):
-        try:
-            line = await reader.readuntil(b"\n")
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
-            return b""
-        if line.startswith(SSH_ID_ANY_VERSION_PREFIX):
-            return line
-    return b""
-
-
 async def probe_ssh_banner(host: str, port: int, timeout: float) -> SshReadyOutcome:
     """One dial: READY when the peer sends an SSH-2.0 identification line within `timeout`."""
     try:
@@ -106,7 +87,7 @@ async def probe_ssh_banner(host: str, port: int, timeout: float) -> SshReadyOutc
         return SshReadyOutcome.UNREACHABLE
     try:
         try:
-            line = await asyncio.wait_for(_read_identification(reader), timeout)
+            line = await asyncio.wait_for(read_ssh_identification(reader), timeout)
         except asyncio.TimeoutError:
             return SshReadyOutcome.NO_BANNER
         return SshReadyOutcome.READY if is_ssh2_identification(line) else SshReadyOutcome.NO_BANNER
