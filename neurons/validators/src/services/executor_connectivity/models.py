@@ -14,6 +14,16 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
+    # whether the batch tier started its container and tested the ports in at least one attempt;
+    # False when every attempt failed to start or timed out, so the forwarding test never ran
+    batch_ran: bool = False
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    successful: list[PortPair]
+    failed: list[PortPair]
+    ran: bool
 
 
 @dataclass(frozen=True)
@@ -64,12 +74,27 @@ class PortRangeResult:
     answered: int
     # the buckets past PORT_RANGE_MAX_ENTRIES, summed into one
     other: bool = False
+    # 1: the lowest-300 pass every host gets; 2: the spread pass run only when pass one verified < 3
+    pass_number: int = 1
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
         if self.other:
             label = f"other {label}"
-        return {"range": label, "declared": self.declared, "probed": self.probed, "answered": self.answered}
+        return {
+            "pass": self.pass_number,
+            "range": label,
+            "declared": self.declared,
+            "probed": self.probed,
+            "answered": self.answered,
+        }
+
+
+SECOND_PASS_NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more
+SECOND_PASS_SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never ran
+SECOND_PASS_NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
+SECOND_PASS_RAN = "ran"
+SECOND_PASS_BATCH_FAILED = "batch_failed"  # pass two's own batch container never ran
 
 
 @dataclass(frozen=True)
@@ -85,8 +110,11 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
-    # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending.
+    # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending: pass
+    # one's tallies, then pass two's when it ran.
     port_ranges: tuple[PortRangeResult, ...] = ()
+    # Why the spread pass did or did not run: one of the SECOND_PASS_* values.
+    second_pass: str | None = None
 
 
 @dataclass(frozen=True)

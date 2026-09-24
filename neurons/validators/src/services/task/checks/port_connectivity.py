@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from core.config import settings
-from services.executor_connectivity.models import PortVerificationResult
+from services.executor_connectivity.models import SECOND_PASS_SKIPPED_BATCH_FAILED, PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
@@ -66,6 +66,12 @@ class PortConnectivityCheck:
             extra_info["dind_error"] = result.dind_error.text
         # event-only: kept out of default_extra so later checks' log lines stay small
         port_ranges = [r.as_dict() for r in result.port_ranges]
+        event_extra: dict[str, object] = {"port_ranges": port_ranges, "second_pass": result.second_pass}
+        if result.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED:
+            event_extra["second_pass_note"] = (
+                "second port pass skipped: the first pass's batch container never ran, "
+                "so the forwarding test could not run"
+            )
         updated_state = replace(
             ctx.state,
             specs={
@@ -156,9 +162,10 @@ class PortConnectivityCheck:
                     "successful_ports": len(result.successful_ports),
                     "failed_ports": len(result.failed_ports),
                     "port_ranges": port_ranges,
+                    **{k: v for k, v in event_extra.items() if k != "port_ranges"},
                     **rental_info,
                 },
-                extra={**extra_info, "port_ranges": port_ranges},
+                extra={**extra_info, **event_extra},
             )
             return CheckResult(
                 passed=False,
@@ -171,7 +178,7 @@ class PortConnectivityCheck:
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
-            extra={**extra_info, "port_ranges": port_ranges},
+            extra={**extra_info, **event_extra},
         )
         return CheckResult(
             passed=True,

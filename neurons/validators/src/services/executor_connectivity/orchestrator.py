@@ -1,11 +1,20 @@
 import random
 import logging
 
+from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
-from services.executor_connectivity.models import PortVerificationResult
+from services.executor_connectivity.models import (
+    SECOND_PASS_BATCH_FAILED,
+    SECOND_PASS_NO_PORTS_LEFT,
+    SECOND_PASS_NOT_NEEDED,
+    SECOND_PASS_RAN,
+    SECOND_PASS_SKIPPED_BATCH_FAILED,
+    PortPair,
+    PortVerificationResult,
+)
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import (
     PortSelector,
@@ -45,10 +54,11 @@ class ConnectivityOrchestrator:
             "executor_ip": executor_info.address,
         }
         declared = declared_ports(executor_info)
+        unavailable = set(unavailable_ports or [])
         ports = self.port_selector.select(
             executor_info,
             BATCH_PORT_VERIFICATION_SIZE,
-            set(unavailable_ports or []),
+            unavailable,
             declared=declared,
         )
 
@@ -74,6 +84,37 @@ class ConnectivityOrchestrator:
         successful = list(probe_result.successful)
         failed = list(probe_result.failed)
 
+        spread: list[PortPair] = []
+        if len(successful) >= MIN_PORT_COUNT:
+            second_pass = SECOND_PASS_NOT_NEEDED
+        elif not probe_result.batch_ran:
+            second_pass = SECOND_PASS_SKIPPED_BATCH_FAILED
+        else:
+            spread = self.port_selector.select_spread(
+                declared, BATCH_PORT_VERIFICATION_SIZE, unavailable, tested=ports
+            )
+            if not spread:
+                second_pass = SECOND_PASS_NO_PORTS_LEFT
+            else:
+                spread_result = await self.port_probe.probe_spread(
+                    spread,
+                    ssh_client=ssh_client,
+                    host=executor_info.address,
+                    log_ctx=log_ctx,
+                )
+                second_pass = (
+                    SECOND_PASS_RAN if spread_result.batch_ran else SECOND_PASS_BATCH_FAILED
+                )
+                successful += spread_result.successful
+                failed += spread_result.failed
+        if second_pass != SECOND_PASS_NOT_NEEDED:
+            logger.info(
+                _m(
+                    f"second port pass: {second_pass}, {len(spread)} ports",
+                    extra=get_extra_info(log_ctx),
+                )
+            )
+
         dind_port = successful.pop(0) if successful else random.choice(ports)
         dind_result = await self.dind_probe.verify(
             dind_port,
@@ -92,8 +133,11 @@ class ConnectivityOrchestrator:
             sysbox_runtime = False
 
         status = "ok" if successful else "no_working_ports"
+        port_ranges = tally_port_ranges(declared, ports, successful)
+        if spread:
+            port_ranges += tally_port_ranges(declared, spread, successful, pass_number=2)
         return PortVerificationResult(
-            selected_ports=tuple(ports),
+            selected_ports=tuple(ports) + tuple(spread),
             successful_ports=tuple(successful),
             failed_ports=tuple(failed),
             dind_port=dind_port,
@@ -101,5 +145,6 @@ class ConnectivityOrchestrator:
             sysbox_runtime=sysbox_runtime,
             status=status,
             dind_error=dind_result.error,
-            port_ranges=tally_port_ranges(declared, ports, successful),
+            port_ranges=port_ranges,
+            second_pass=second_pass,
         )

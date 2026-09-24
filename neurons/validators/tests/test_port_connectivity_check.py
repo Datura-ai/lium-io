@@ -59,6 +59,7 @@ class DummyConnectivityService:
         dind_ok: bool | None = None,
         dind_error: DindLogCause | None = None,
         port_ranges: tuple[PortRangeResult, ...] = (),
+        second_pass: str | None = None,
     ):
         """
         Args:
@@ -71,6 +72,7 @@ class DummyConnectivityService:
         """
         self.dind_error = dind_error
         self.port_ranges = port_ranges
+        self.second_pass = second_pass
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
@@ -128,6 +130,7 @@ class DummyConnectivityService:
             elapsed_sec=1.0,
             dind_error=self.dind_error,
             port_ranges=self.port_ranges,
+            second_pass=self.second_pass,
         )
 
 
@@ -459,7 +462,7 @@ async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context
 async def test_port_connectivity_event_carries_the_per_range_tallies(context_factory, success):
     ranges = (
         PortRangeResult(first=40000, last=44999, declared=5000, probed=209, answered=0),
-        PortRangeResult(first=60000, last=64999, declared=5000, probed=30, answered=30),
+        PortRangeResult(first=60000, last=64999, declared=5000, probed=30, answered=30, pass_number=2),
     )
     services = build_services(
         redis=DummyRedis(renting_in_progress=False),
@@ -475,10 +478,40 @@ async def test_port_connectivity_event_carries_the_per_range_tallies(context_fac
     result = await PortConnectivityCheck().run(ctx)
 
     expected = [
-        {"range": "40000-44999", "declared": 5000, "probed": 209, "answered": 0},
-        {"range": "60000-64999", "declared": 5000, "probed": 30, "answered": 30},
+        {"pass": 1, "range": "40000-44999", "declared": 5000, "probed": 209, "answered": 0},
+        {"pass": 2, "range": "60000-64999", "declared": 5000, "probed": 30, "answered": 30},
     ]
     assert result.event.context["port_ranges"] == expected
     assert "port_ranges" not in result.updates["default_extra"]
     if not success:
         assert result.event.what_we_saw["port_ranges"] == expected
+
+
+@pytest.mark.parametrize(
+    "second_pass, noted",
+    [("not_needed", False), ("ran", False), ("batch_failed", False), ("skipped_batch_failed", True)],
+)
+@pytest.mark.parametrize("success", [True, False])
+@pytest.mark.asyncio
+async def test_port_connectivity_event_says_whether_the_second_pass_ran(context_factory, success, second_pass, noted):
+    services = build_services(
+        redis=DummyRedis(renting_in_progress=False),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=success, verified_port_count=3 if success else 0, second_pass=second_pass
+        ),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.event.context["second_pass"] == second_pass
+    assert ("second_pass_note" in result.event.context) is noted
+    if noted:
+        assert "batch container never ran" in result.event.context["second_pass_note"]
+    assert "second_pass" not in result.updates["default_extra"]
+    if not success:
+        assert result.event.what_we_saw["second_pass"] == second_pass
+        assert ("second_pass_note" in result.event.what_we_saw) is noted
