@@ -1,8 +1,20 @@
 from lium_core.shared_config.model import SharedConfig
 
+B300_SXM6_AC = "NVIDIA B300 SXM6 AC"
+# Provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300 SXM6 PC, 275040 MiB, all
+# 8 GPUs of the host); not in NVIDIA's public chip list, which has only the AC spelling. Listed as the AC
+# card's alias and never a row of its own: each table below derives it from the AC entry, so a re-price
+# of the AC card moves both names.
+B300_SXM6_PC = "NVIDIA B300 SXM6 PC"
+
+
+def _with_pc_alias(table: dict[str, float]) -> dict[str, float]:
+    return {**table, B300_SXM6_PC: table[B300_SXM6_AC]}
+
+
 DEFAULT_SHARED_CONFIG = SharedConfig(
-    machine_prices={
-        "NVIDIA B300 SXM6 AC": 5.10,
+    machine_prices=_with_pc_alias({
+        "NVIDIA B300 SXM6 AC": 6.4,
         "NVIDIA B200": 4.25,
         "NVIDIA H200": 2.85,
         "NVIDIA H200 NVL": 2.90,
@@ -33,8 +45,8 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
         "NVIDIA A40": 0.12,
         "NVIDIA A30": 0.10,
         "NVIDIA GeForce RTX 3090": 0.16,
-    },
-    required_deposit_amount={
+    }),
+    required_deposit_amount=_with_pc_alias({
         "NVIDIA B300 SXM6 AC": 0.274,
         "NVIDIA B200": 0.223,
         "NVIDIA H200": 0.158,
@@ -61,7 +73,7 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
         "NVIDIA RTX A4500": 0.008,
         "NVIDIA RTX A4000": 0.008,
         "NVIDIA GeForce RTX 3090": 0.008,
-    },
+    }),
     gpu_architectures={
         # Blackwell (sm_100/120)
         "NVIDIA B200": {"arch": "blackwell", "min_cuda": 12.8, "compute_cap": "sm_100"},

@@ -18,6 +18,8 @@ MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 INSPECTOR_EVENT_CHANNEL = "INSPECTOR_EVENT_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
+# DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
+POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
@@ -43,6 +45,8 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 # Written by the connector process, read by the validator process: they share no memory, so
 # this key is how an operator's request for a cycle crosses between them.
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
+# DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
+DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
@@ -293,6 +297,26 @@ class RedisService:
     async def clear_forced_validation_cycle_request(self) -> None:
         await self.delete(FORCED_VALIDATION_CYCLE_KEY)
 
+    @staticmethod
+    def _dind_probe_miss_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{DIND_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def record_dind_probe_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        """Record a DinD probe miss; True when none was on record (the first inside the window).
+
+        SET NX EX records and answers in one call, so two cycles cannot both read "first".
+        """
+        async with self.lock:
+            return bool(
+                await self.redis.set(
+                    self._dind_probe_miss_key(miner_hotkey, executor_id), "1", ex=ttl_seconds, nx=True
+                )
+            )
+
+    async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        """Forget the recorded miss: the probe reached its container again."""
+        await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
+
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
         async with self.lock:
@@ -307,6 +331,11 @@ class RedisService:
         """Remove a key from Redis."""
         async with self.lock:
             await self.redis.delete(key)
+
+    async def expire(self, key: str, seconds: int):
+        """Set (or refresh) a key's time to live."""
+        async with self.lock:
+            await self.redis.expire(key, seconds)
 
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""

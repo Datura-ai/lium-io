@@ -7,6 +7,7 @@ Provider guide for taking a TDX host from bare metal to an attested Lium CVM exe
 | §1–§4 host bring-up (BIOS, kernel, QEMU, key provider) | once per host | ~1–2 h (dominated by BIOS + QEMU build) |
 | §5 executor deployment | once per executor | ~15 min |
 | §6 upgrades | per release | ~10 min |
+| §6.1 key-provider rebuild | only when a release changes `key-provider/` | ~15 min plus the CVM recreation |
 
 ## 1. Hardware and firmware
 
@@ -82,15 +83,17 @@ The launcher handles everything else automatically: it stamps `qemu_version` and
 
 ## 4. Key provider and PCCS
 
-The sealing-key provider must run on the host before any CVM boots (`lium-cvm.sh run` auto-starts it, but starting manually first surfaces build errors early):
+The sealing-key provider must run on the host before any CVM boots (`lium-cvm.sh run` auto-starts it, but starting manually first surfaces build errors early). Start it through the upgrade guard. `key-provider/docker-compose.yaml` has no `build:` section, so `docker compose build` or `docker compose up` in that directory builds nothing; the build definition is `key-provider/docker-compose.build.yaml`, and only the guard passes it to compose:
 
 ```bash
-cd key-provider && docker compose up --build -d
-docker compose logs -f gramine-sealing-key-provider   # watch first start
+sudo ./cvm_upgrade_guard.sh start                     # builds on a host with no CVM disk, else starts the pinned image
+cd key-provider && docker compose logs -f gramine-sealing-key-provider   # watch first start
 curl -k https://localhost:3443                        # endpoint reachable
 ```
 
 Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-sealing-key-provider` (`127.0.0.1:3443`). DCAP collateral comes from the PCCS configured in [`key-provider/sgx_default_qcnl.conf`](../key-provider/sgx_default_qcnl.conf) — the default is Phala's public PCCS and works out of the box; point `pccs_url` at your own PCCS if you run one.
+
+**Why the guard.** The key provider's enclave measurement (MRENCLAVE) seals the key every CVM on the host derives its encrypted data-disk key from. A rebuilt image has a new MRENCLAVE, so every existing CVM data disk on the host, stopped CVMs included, becomes unreadable at its next boot. `cvm_upgrade_guard.sh` records the image id of the key provider in `/var/lib/lium-cvm/key-provider.image` on first start, tags it `lium-key-provider:pinned-<id>`, and every later `start` (also the one inside `lium-cvm.sh run`) runs `docker compose up -d --no-build` on exactly that image. If the pinned image is missing while CVM disks exist, `start` fails with recovery steps and builds nothing. The guard also refuses to run (exit 1) if `docker-compose.yaml` gains a `build:` section again, or if a file compose loads on its own (`docker-compose.yml`, `docker-compose.override.yaml`, `compose.yaml` and their variants) sits in `key-provider/`, because either lets a hand-run `docker compose build` rebuild the enclave. The guard's own compose calls name `docker-compose.yaml` with `-f`, so such a file or a `COMPOSE_FILE` variable never changes what the guard runs. `lium-cvm.sh new`, `lium-cvm.sh run` and the guard share one host lock (`/var/lock/lium-cvm.lock`), so a CVM cannot fetch a key between the guard's inventory check and an image switch. A host that predates the guard adopts the image its `dstack-key-provider` container runs on the first `start`.
 
 ## 5. Per-executor deployment
 
@@ -103,14 +106,17 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
    Required beyond the obvious (`MINER_HOTKEY_SS58_ADDRESS`, ports, `CVM_VCPUS/MEMORY/DISK`, `CVM_GPUS`):
 
    - `ENABLE_TDX_ATTESTATION=true`
-   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the release notes. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
+   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the "CVM attestation" section of the release notes of the tag you checked out. While the notes of your tag do not carry that section yet (no released tag has it before the first release after this change), `python3 scripts/compose_hash.py --release-notes` prints the same section for the checkout: the digest and the expected compose hash. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
 
-2. Create and boot (the OS image downloads once per host, then is reused):
+2. Create, check the measurement, boot (the OS image downloads once per host, then is reused):
 
    ```bash
    sudo ./lium-cvm.sh new my-executor
+   python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json
    sudo ./lium-cvm.sh run my-executor
    ```
+
+   `--check` prints the expected compose hash (the one in the release-notes section) and the hash of the file `new` wrote, and exits 1 when they differ, so there is nothing to compare by eye. `sha256sum run/vms/my-executor/shared/app-compose.json` prints the same actual hash on its own. A mismatch means the digest or a measured file differs from the release and the validator does not know the hash. What that costs depends on the validator's `ENABLE_ATTESTATION_WHITELIST`: on, the CVM scores zero; off (the default, and production today), the validator accepts the unknown hash and scores the node as before. Do not run a CVM that does not match the release either way: fix `.env` or `git checkout` the release tag, `sudo rm -rf run/vms/my-executor`, and run `new` again.
 
    Everything attestation-related inside the guest — sysbox force-install, digest-pinned runner, quote generation — is baked into the measured compose; there is nothing to configure in the guest.
 
@@ -127,9 +133,11 @@ Per release:
 ```bash
 sudo ./lium-cvm.sh stop my-executor
 git pull                                   # the release tag
-# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes
+# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes ("CVM attestation";
+# no section yet → python3 scripts/compose_hash.py --release-notes prints it for the checkout)
 sudo rm -rf run/vms/my-executor            # see warning below
 sudo ./lium-cvm.sh new my-executor
+python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json   # exit 1 = not the release's compose
 sudo ./lium-cvm.sh run my-executor
 ```
 
@@ -137,12 +145,34 @@ sudo ./lium-cvm.sh run my-executor
 
 The host QEMU from §3 is **not** touched by executor releases; leave it alone unless a release note says otherwise.
 
+### 6.1 Key-provider upgrade (only when a release says so)
+
+A release that changes `key-provider/` (its `Cargo.lock`, Dockerfile or upstream commit) needs a rebuilt key provider. The rebuild changes MRENCLAVE and with it the disk key of **every** CVM on the host, so it is refused while any CVM disk exists. The guard lists the disks and never deletes one:
+
+```bash
+sudo ./lium-cvm.sh inventory                         # every CVM disk on this host, all checkouts, stopped CVMs included
+# drain rentals, then per CVM whose data is no longer needed:
+sudo ./lium-cvm.sh stop my-executor
+sudo rm -rf run/vms/my-executor                      # by hand; the guard prints this exact line per running or stopped disk
+sudo ./cvm_upgrade_guard.sh upgrade                  # refused with exit 3 while any disk remains, exit 4 while the inventory is incomplete
+cd key-provider && docker compose logs gramine-sealing-key-provider | grep -m1 mr_enclave   # the new MRENCLAVE
+sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
+```
+
+`upgrade` keeps the previous image as `lium-key-provider:pre-upgrade-<timestamp>` and pins the new image id. It builds with `docker compose -f docker-compose.yaml -f docker-compose.build.yaml build`; that is the only compose line that builds, and it is not a step for you to run by hand. `sudo ./cvm_upgrade_guard.sh upgrade --dry-run` runs the inventory and reports without changing anything. The inventory covers this checkout's `run/vms`, every VM root a `lium-cvm.sh new` or `run` on this host ever registered in `/var/lib/lium-cvm/vm-dirs`, and a sweep of `/home /root /opt /srv /mnt /data` plus every filesystem mounted below them for any other `hda.img`, with or without a `vm-manifest.json` beside it (`LIUM_CVM_SWEEP_ROOTS` widens it). A disk that is not running and whose manifest is gone is listed as `orphan` and blocks the upgrade like any other; the guard prints no `rm` line for it, because nothing proves the CVM stack made that directory, so check it by hand. A registered VM root that is missing (an unmounted disk looks like a removed checkout) or a directory the sweep cannot read makes the inventory incomplete, and the upgrade is refused until it is mounted, readable, or removed from `vm-dirs`.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | QEMU exits during guest boot: `VFIO_MAP_DMA failed: No space left on device` | default `dma_entry_limit` (65 535) exhausted by TDX page conversions | §2 — set `vfio_iommu_type1.dma_entry_limit=16777216` (runtime echo + GRUB persist) |
-| Guest reboot-loops; console shows `Failed to open encrypted data disk` | measurements changed under an existing `hda.img` (QEMU/image/compose changed) | recreate the VM (`stop`, remove `run/vms/<name>`, `new`, `run`) — data on the old disk is unrecoverable by design |
+| Guest reboot-loops; console shows `Failed to open encrypted data disk` | measurements changed under an existing `hda.img` (QEMU/image/compose changed), or the key provider was rebuilt outside `cvm_upgrade_guard.sh` | if a `lium-key-provider:pre-upgrade-*` or `pinned-*` tag holds the old image, `docker tag <that> lium-key-provider:local`, write its id to `/var/lib/lium-cvm/key-provider.image` and `sudo ./cvm_upgrade_guard.sh start`; otherwise recreate the VM (`stop`, remove `run/vms/<name>`, `new`, `run`) |
+| `cvm_upgrade_guard.sh upgrade` exits 3 | CVM disks exist on the host (the list names each `hda.img`, stopped CVMs included) | §6.1 — remove each listed disk by hand once its data is not needed; the guard never deletes |
+| `cvm_upgrade_guard.sh upgrade` exits 4 | a registered VM root is missing (unmounted disk, removed checkout) or a registered root or sweep directory is not readable | mount the disk or fix the permission, or remove the stale line from `/var/lib/lium-cvm/vm-dirs`, then retry |
+| `cvm_upgrade_guard.sh` exits 1 with `declares a 'build:' section` or `<file> exists` | someone put a `build:` back into `key-provider/docker-compose.yaml`, or another compose file (`docker-compose.yml`, `docker-compose.override.yaml`, `compose.yaml`) sits in `key-provider/`; either lets a hand-run `docker compose build` rebuild the enclave past the guard | remove the `build:` section or the extra file (the build definition is `docker-compose.build.yaml`) and run the command again |
+| `cvm_upgrade_guard.sh start` or `lium-cvm.sh run` exits 6 | the pinned key-provider image is not on the host, the container came up on another image, or there is no pin and nothing to adopt while CVM disks exist | with CVM disks: restore the exact image (`docker load` from your backup, or `docker tag <id> lium-key-provider:local`); nothing is built. With no CVM disk: `sudo ./cvm_upgrade_guard.sh upgrade` rebuilds and pins |
+| `cvm_upgrade_guard.sh` exits 1: "docker is not reachable" or "flock (util-linux) is not installed" | the Docker daemon is down, the caller is not root, or util-linux is missing | start Docker, run with `sudo`, or install `util-linux` |
+| `lium-cvm.sh new`/`run` exit 5: "holds /var/lock/lium-cvm.lock" | another `lium-cvm.sh` or an upgrade is running | let it finish, then retry (`LIUM_CVM_LOCK_WAIT` sets the wait, default 60 s) |
 | Attestation fails on RTMR0 / quote not whitelisted, image and compose correct | host running distro QEMU instead of the dstack 9.2.1 build | §3 — install the fork and set `client.conf`; confirm with `--version` |
 | QEMU launch error mentioning `iommufd` / `VFIO_DEVICE_BIND_IOMMUFD` EINVAL | launcher predates the QEMU-version-gated VFIO backend | update to the current release — `dstack.py` now selects type1 automatically for QEMU < 10 |
 | Validation fails `CHECK_SYSBOX_COMPATIBILITY` inside the guest | compose not the released one (pre-launch sysbox force-install missing or altered) | redeploy with the unmodified released compose (§5) |

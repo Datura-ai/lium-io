@@ -5,6 +5,7 @@ from uuid import UUID
 
 import aiohttp
 import bittensor
+import pydantic
 from datura.requests.miner_requests import ExecutorSSHInfo, PodLog
 from fastapi import Depends
 
@@ -33,6 +34,20 @@ from protocol.miner_portal_request import (
 logger = logging.getLogger(__name__)
 
 
+class PubkeyRegistration(pydantic.BaseModel):
+    """DAH-3338: the outcome of register_pubkey, known executors apart from accepting ones.
+
+    The validator used to read "no executor accepted" as "invalid executor id", which is wrong
+    for a node the miner lists but cannot reach — the case behind most of the 7-day count of
+    "Invalid executor id" rent and delete failures.
+    """
+
+    # Every executor the miner lists for the validator (and the executor_id filter, when given).
+    known_executor_ids: list[str]
+    # The subset that accepted the key, with the SSH info the validator connects with.
+    accepted: list[ExecutorSSHInfo]
+
+
 class ExecutorService:
     def __init__(self, executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)], ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)]):
         self.executor_dao = executor_dao
@@ -59,17 +74,13 @@ class ExecutorService:
 
     async def create(self, executor: Executor) -> Union[ExecutorAdded, AddExecutorFailed]:
         try:
-            # Check if executor with same address:port already exists
-            try:
-                existing_executor = self.executor_dao.findOne(executor.address, executor.port)
-                if existing_executor:
-                    return AddExecutorFailed(
-                        executor_id=executor.uuid,
-                        error=f"Executor with address {executor.address}:{executor.port} already exists",
-                    )
-            except Exception:
-                # No existing executor found, proceed with creation
-                pass
+            # no try/except around the lookup: a swallowed database fault leaves the session in an
+            # aborted transaction, and the insert below then fails with InFailedSqlTransaction
+            if self.executor_dao.find_one(executor.address, executor.port):
+                return AddExecutorFailed(
+                    executor_id=executor.uuid,
+                    error=f"Executor with address {executor.address}:{executor.port} already exists",
+                )
 
             # Test executor connectivity before saving to database
             logger.info("Testing executor connectivity at %s:%d...", executor.address, executor.port)
@@ -370,7 +381,7 @@ class ExecutorService:
         validator_signature: str,
         executor_id: Optional[str] = None,
         nonce: str | None = None,
-    ):
+    ) -> PubkeyRegistration:
         """Register pubkeys to executors for given validator.
 
         Args:
@@ -380,7 +391,8 @@ class ExecutorService:
                 each executor untouched (covered by validator_signature).
 
         Return:
-            List[dict/object]: Executors SSH connection infos that accepted validator pubkey.
+            PubkeyRegistration: the executors the miner lists for the validator, and the SSH
+            connection infos of the ones that accepted the pubkey.
         """
         executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
@@ -408,7 +420,10 @@ class ExecutorService:
                 }),
             ),
         )
-        return results
+        return PubkeyRegistration(
+            known_executor_ids=[str(executor.uuid) for executor in executors],
+            accepted=results,
+        )
 
     async def deregister_pubkey(
         self,

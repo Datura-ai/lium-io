@@ -365,7 +365,10 @@ class CliService:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = executor.uuid
             balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
             self.logger.info(f"Miner balance: {balance} TAO for miner hotkey {self.hotkey}")
@@ -456,7 +459,10 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = str(executor.uuid)
 
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
@@ -581,7 +587,10 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = str(executor.uuid)
 
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
