@@ -417,7 +417,7 @@ class RegistryPullCheck:
         guard: dict[str, Any] | None = None
         if reading.failed:
             async with _HUB_CONTROL_LOCK:
-                control = await self._hub_control(ctx, now)
+                control = await self._hub_control(ctx, time.time(), pull_started=now)
             guard = {"docker_hub_control": control}
             if control["reachable"]:
                 failures += 1
@@ -436,13 +436,23 @@ class RegistryPullCheck:
         await self._save(ctx, state)
         return self._verdict(ctx, state, probed=True)
 
-    async def _hub_control(self, ctx: Context, now: float) -> dict[str, Any]:
-        """The validator's cached reading of Docker Hub, fetched again once stale. Runs under _HUB_CONTROL_LOCK."""
+    async def _hub_control(
+        self, ctx: Context, now: float, *, pull_started: float
+    ) -> dict[str, Any]:
+        """The validator's cached reading of Docker Hub, fetched again once stale. Runs under _HUB_CONTROL_LOCK.
+
+        A pull can take REGISTRY_PULL_COMMAND_TIMEOUT_SECONDS, so a cached "reachable" counts the failure only if
+        it was read after the pull began; else Docker Hub may have gone down under the pull, and it is read again.
+        A cached "unreachable" stands for the whole window, so an outage costs one fetch per window."""
         redis = ctx.services.redis
         try:
             raw = await redis.get(_HUB_CONTROL_KEY)
             cached = json.loads(_decode(raw)) if raw is not None else None
-            if cached is not None and now - float(cached["at"]) < HUB_CONTROL_TTL_SECONDS:
+            if (
+                cached is not None
+                and now - float(cached["at"]) < HUB_CONTROL_TTL_SECONDS
+                and (not cached["reachable"] or float(cached["at"]) >= pull_started)
+            ):
                 return cached
         except Exception:
             logger.warning(

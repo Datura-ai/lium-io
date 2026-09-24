@@ -8,6 +8,7 @@ node passed every one.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -137,12 +138,16 @@ class FakeRedis:
 class FakeHub:
     """Stands in for probe_docker_hub: the validator's own GET of registry-1.docker.io/v2/."""
 
-    def __init__(self, answer=HUB_UP):
+    def __init__(self, answer=HUB_UP, *, yields: int = 0):
         self.answer = answer
         self.calls = 0
+        self.yields = yields
 
     async def __call__(self):
         self.calls += 1
+        # hands the loop to other nodes mid-fetch, as a real GET does
+        for _ in range(self.yields):
+            await asyncio.sleep(0)
         return self.answer
 
 
@@ -213,6 +218,8 @@ def flags(
         patch.object(module, "settings", fake),
         patch.object(module, "time", clock),
         patch.object(module, "probe_docker_hub", hub or FakeHub()),
+        # a contended asyncio.Lock binds to its loop, and each test runs in a loop of its own
+        patch.object(module, "_HUB_CONTROL_LOCK", asyncio.Lock()),
         phase if phase_at_start else nullcontext(),
     ):
         yield clock
@@ -771,6 +778,77 @@ async def test_with_docker_hub_up_a_node_whose_mirror_fails_still_counts():
     assert "no_verdict" not in second.event.what_we_saw
     # 30 minutes apart: each failed pull has a control reading of its own
     assert hub.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_zeroed_node_whose_retry_fails_while_docker_hub_is_down_stays_failed():
+    """The no-verdict pull holds the streak at 2, so the node stays REGISTRY_PULL_FAILED; a Docker Hub outage
+    never releases a node that already failed."""
+    ctx, _, _ = make_ctx(*(result(MIRROR_DNS_TIMEOUT) for _ in range(3)))
+    hub = FakeHub(HUB_UP)
+    check = RegistryPullCheck()
+    with flags(hub=hub) as clock:
+        await check.run(ctx)
+        clock.now += 30 * 60
+        zeroed = await check.run(ctx)
+        hub.answer = HUB_DOWN
+        clock.now += 30 * 60
+        res = await check.run(ctx)
+    assert zeroed.passed is False
+    assert res.passed is False and res.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
+    what = res.event.what_we_saw
+    assert what["failures_in_a_row"] == 2 and what["no_verdict"] == "docker_hub_down"
+    assert what["probed_this_cycle"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [HUB_DOWN, HUB_UP])
+async def test_twenty_nodes_failing_at_once_fetch_the_control_once(answer):
+    """The lock: without it every node that failed in the same moment reads an empty cache and fetches."""
+    redis = FakeRedis()
+    hub = FakeHub(answer, yields=5)
+    check = RegistryPullCheck()
+    with flags(hub=hub):
+        nodes = [
+            make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid=f"node-{i}")[0] for i in range(20)
+        ]
+        results = await asyncio.gather(*(check.run(ctx) for ctx in nodes))
+    assert hub.calls == 1
+    expected = (
+        Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN
+        if answer is HUB_DOWN
+        else Msg.REGISTRY_PULL_FAILED_ONCE
+    )
+    assert {r.event.reason_code for r in results} == {expected.reason}
+
+
+@pytest.mark.asyncio
+async def test_a_pull_that_fails_as_docker_hub_goes_down_under_it_is_no_verdict():
+    """A "reachable" cached before a pull that takes up to 150 s began says nothing about Docker Hub when that pull
+    fails: the control is read again, and a Docker Hub that went down under the pull makes the failure no verdict."""
+    redis = FakeRedis()
+    hub = FakeHub(HUB_UP)
+    check = RegistryPullCheck()
+    with flags(hub=hub) as clock:
+        early, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), redis=redis, uuid="node-early")
+        await check.run(early)
+        assert hub.calls == 1
+        clock.now += 60
+        ctx, runner, _ = make_ctx(redis=redis, uuid="node-slow")
+
+        async def slow_pull(cmd, **kwargs):
+            hub.answer = HUB_DOWN
+            clock.now += module.REGISTRY_PULL_COMMAND_TIMEOUT_SECONDS
+            return result(HUB_TLS_TIMEOUT)
+
+        runner.run = slow_pull
+        res = await check.run(ctx)
+    # still inside the 5-minute window of the first reading, which is read again anyway
+    assert 60 + module.REGISTRY_PULL_COMMAND_TIMEOUT_SECONDS < module.HUB_CONTROL_TTL_SECONDS
+    assert hub.calls == 2
+    assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason
+    assert res.event.what_we_saw["failures_in_a_row"] == 0
+    assert res.event.what_we_saw["guard"]["docker_hub_control"]["at"] == clock.now
 
 
 @pytest.mark.asyncio
