@@ -57,8 +57,7 @@ Check: dispatch `executor_cd_dev.yml` from `main`; the login step ends with `Log
 Failures are listed on the connection's Edit page (Failures table).
 
 The other two pushing repositories use the same step with the same variable name and lifetime:
-`Datura-ai/lium-io-deployment` (`staging_executor_publish.yml`, subject
-`repo:Datura-ai/lium-io-deployment:environment:dockerhub-push`) and
+the private staging-deployment repository (its README names its subject) and
 `Datura-ai/dstack-sysbox-installer` (`release.yml`, subject
 `repo:Datura-ai@128653940/dstack-sysbox-installer@1304314680:environment:dockerhub-push`: that
 repository was created after 15 Jul 2026, so GitHub issues immutable-id subjects for it; check with
