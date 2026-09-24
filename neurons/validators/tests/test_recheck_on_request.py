@@ -33,6 +33,11 @@ from services.redis_service import RECHECK_REQUESTS_HASH, RedisService
 from services.task.checks import rental_probe
 import test_express_lane
 from test_express_lane import _cycle_inputs, _Harness, _job_result, _Neuron, _portal_executor, _request
+from test_rented_pod_ssh_probe import EXECUTOR_UUID, FAULT_TCP_REFUSED, KEYS, Msg
+from test_rented_pod_ssh_probe import Harness as SshProbeHarness
+from test_rented_pod_ssh_probe import rented_data as rented_pod_data
+
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "lium_protocol") not in sys.path:
@@ -531,6 +536,105 @@ async def test_the_wave_takes_the_rechecks_result_for_that_node(rest_miner_servi
     assert by_node[under_recheck].job_batch_id == "2026-09-06 16:40:00"  # the wave's batch
     assert rechecked.job_batch_id == "2026-09-06 16:47:12"  # the published copy is untouched
     assert rest_miner_service.in_flight == {under_recheck: RECHECK_LANE, other: CYCLE_DONE}
+
+
+def _listed_without_pods(executor_id: str) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            executor_id: RentedExecutor(
+                miner_hotkey="miner-a", executor_ip_address="192.0.2.10", executor_ip_port="9001", pods=[]
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_node_listed_without_pods_still_takes_the_rechecks_result(rest_miner_service, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "RECHECK_ON_REQUEST_ENABLED", True)
+    node = str(uuid4())
+    outcome = asyncio.get_running_loop().create_future()
+    outcome.set_result(_job_result(node, score=0.0))
+    rest_miner_service.recheck_outcomes = {node: outcome}
+    rest_miner_service.in_flight[node] = RECHECK_LANE
+    rest_miner_service.miner_returns(node)
+
+    job = await _request(rest_miner_service, rented_data=_listed_without_pods(node))
+
+    rest_miner_service.task_service.create_task.assert_not_awaited()
+    assert [r.score for r in job["results"]] == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_a_rented_node_waits_for_the_recheck_then_runs_its_own_pipeline(rest_miner_service, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "RECHECK_ON_REQUEST_ENABLED", True)
+    node = EXECUTOR_UUID
+    outcome = asyncio.get_running_loop().create_future()
+    rest_miner_service.recheck_outcomes = {node: outcome}
+    rest_miner_service.in_flight[node] = RECHECK_LANE
+    rest_miner_service.miner_returns(node)
+    recheck_done_at_start = []
+
+    async def create_task(miner_info, executor_info, **_):
+        recheck_done_at_start.append(outcome.done())
+        assert rest_miner_service.in_flight[executor_info.uuid] == CYCLE_LANE
+        return _job_result(executor_info.uuid)
+
+    rest_miner_service.task_service.create_task = AsyncMock(side_effect=create_task)
+
+    wave = asyncio.create_task(_request(rest_miner_service, rented_data=rented_pod_data()))
+    await asyncio.sleep(0.05)
+    assert not wave.done() and recheck_done_at_start == []
+    rest_miner_service.release_recheck_claim(node, None)
+    outcome.set_result(_job_result(node, score=0.0))
+    job = await wave
+
+    assert recheck_done_at_start == [True]  # one pipeline on the node at a time
+    assert [(r.score, r.job_batch_id) for r in job["results"]] == [(1.0, "2026-09-06 16:40:00")]
+    assert rest_miner_service.in_flight == {node: CYCLE_DONE}
+
+
+@pytest.mark.asyncio
+async def test_a_rented_nodes_wave_run_after_a_recheck_resets_the_ssh_streak(
+    rest_miner_service, monkeypatch, context_factory
+):
+    """Refused, then a wave that arrives during a healthy recheck, then refused: the wave's own run
+    reset the streak, so the last refusal is a first one and no renter notice goes out."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "RECHECK_ON_REQUEST_ENABLED", True)
+    probe = SshProbeHarness(context_factory)
+    await probe.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await probe.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    assert probe.streak()["count"] == 1
+
+    node = EXECUTOR_UUID
+    outcome = asyncio.get_running_loop().create_future()
+    rest_miner_service.recheck_outcomes = {node: outcome}
+    rest_miner_service.in_flight[node] = RECHECK_LANE
+    rest_miner_service.miner_returns(node)
+
+    async def create_task(miner_info, executor_info, **_):
+        await probe.cycle(tcp_fault=None, ssh_keys=KEYS)
+        return _job_result(executor_info.uuid)
+
+    rest_miner_service.task_service.create_task = AsyncMock(side_effect=create_task)
+
+    wave = asyncio.create_task(_request(rest_miner_service, rented_data=rented_pod_data()))
+    await asyncio.sleep(0.05)
+    await probe.cycle(tcp_fault=None, ssh_keys=KEYS, recheck=True)
+    rest_miner_service.release_recheck_claim(node, None)
+    outcome.set_result(_job_result(node))
+    await wave
+    assert probe.streak() is None
+
+    result = await probe.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    assert probe.streak()["count"] == 1
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    probe.backend.report_pod_ssh_unreachable.assert_not_awaited()
 
 
 @pytest.mark.asyncio

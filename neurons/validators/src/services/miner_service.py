@@ -283,8 +283,9 @@ class MinerService:
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched. A node
-        under a recheck stays in the wave with the recheck's claim; its cycle result is the
-        recheck's (`_cycle_result`). Flags off: list returned as is.
+        under a recheck stays in the wave with the recheck's claim; the wave waits for it and takes
+        its result, or runs its own after it on a rented node (`_cycle_result`). Flags off: list
+        returned as is.
         """
         if not settings.express_lane_runs:
             return executors
@@ -340,19 +341,31 @@ class MinerService:
         requested_executor_id: str | None,
         executor_id: str,
         job_batch_id: str,
+        rented_data: RentedExecutorsResponse | None,
         pipeline: Coroutine[Any, Any, JobResult | None],
     ) -> Coroutine[Any, Any, JobResult | None]:
         # the express lane's own run (one requested executor) must never wait on its own recheck
         if requested_executor_id is not None or not settings.RECHECK_ON_REQUEST_ENABLED:
             return pipeline
-        return self._cycle_result(executor_id, job_batch_id, pipeline)
+        rented = rented_data.executors.get(executor_id) if rented_data else None
+        return self._cycle_result(
+            executor_id, job_batch_id, pipeline, reuse_recheck=not (rented and rented.pods)
+        )
 
     async def _cycle_result(
-        self, executor_id: str, job_batch_id: str, pipeline: Coroutine[Any, Any, JobResult | None]
+        self,
+        executor_id: str,
+        job_batch_id: str,
+        pipeline: Coroutine[Any, Any, JobResult | None],
+        reuse_recheck: bool = True,
     ) -> JobResult | None:
         """The wave's result for one executor: the result of the recheck running on it, when there is
         one, stamped with this wave's batch id; otherwise the executor's own pipeline run. The wait is
-        capped so the pipeline still has RECHECK_WAVE_PIPELINE_ROOM_SECONDS of the executor's budget."""
+        capped so the pipeline still has RECHECK_WAVE_PIPELINE_ROOM_SECONDS of the executor's budget.
+
+        A node with rented pods (`reuse_recheck` False) waits for the recheck and then runs its own
+        pipeline: the rented-pod SSH probe counts its streak on cycle runs only.
+        """
         outcome = self.recheck_outcomes.get(executor_id)
         if outcome is not None:
             wait_seconds = max(0, executor_budget_seconds() - settings.RECHECK_WAVE_PIPELINE_ROOM_SECONDS)
@@ -369,9 +382,12 @@ class MinerService:
             except BaseException:
                 pipeline.close()
                 raise
-            if rechecked is not None:
+            if rechecked is not None and reuse_recheck:
                 pipeline.close()
                 return rechecked.model_copy(update={"job_batch_id": job_batch_id}, deep=True)
+            if self.in_flight.get(executor_id) != RECHECK_LANE:
+                # the recheck handed the node back; the wave holds it for its own run
+                self.in_flight[executor_id] = CYCLE_LANE
         return await pipeline
 
     def forget_cycle_done(self) -> None:
@@ -593,6 +609,7 @@ class MinerService:
                                         executor_id,
                                         executor_info.uuid,
                                         payload.job_batch_id,
+                                        rented_data,
                                         self.task_service.create_task(
                                             miner_info=payload,
                                             executor_info=executor_info,
@@ -2469,6 +2486,7 @@ class MinerService:
                                     executor_id,
                                     executor_info.uuid,
                                     payload.job_batch_id,
+                                    rented_data,
                                     self.task_service.create_task(
                                         miner_info=payload,
                                         executor_info=executor_info,

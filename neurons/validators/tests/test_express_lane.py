@@ -192,11 +192,13 @@ def _payload() -> MinerJobRequestPayload:
     )
 
 
-async def _request(service: MinerService, **kwargs):
+async def _request(
+    service: MinerService, rented_data: RentedExecutorsResponse | None = None, **kwargs
+):
     return await service.request_job_to_miner(
         payload=_payload(),
         encrypted_files=_cycle_inputs().encrypted_files,
-        rented_data=RentedExecutorsResponse(executors={}),
+        rented_data=rented_data or RentedExecutorsResponse(executors={}),
         default_docker_image_digests={},
         **kwargs,
     )
