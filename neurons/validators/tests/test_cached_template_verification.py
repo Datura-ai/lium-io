@@ -924,6 +924,18 @@ def test_remediation_names_the_next_step_for_the_error(error, expected):
     assert expected in text
 
 
+def test_a_later_disk_shortage_wins_over_an_older_pull_error():
+    state = {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
+        "last_outcome": "insufficient_disk", "last_pull_error": _PULL_ERROR,
+        "last_disk_required_bytes": 40 * 1024**3, "last_disk_available_bytes": 10 * 1024**3,
+    }}}
+
+    text = _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False)
+
+    assert "lack of disk" in text
+    assert _PULL_ERROR not in text
+
+
 def test_remediation_does_not_quote_an_error_a_later_sweep_moved_past():
     state = {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
         "last_outcome": "up_to_date", "last_pull_error": _PULL_ERROR,

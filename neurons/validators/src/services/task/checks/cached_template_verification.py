@@ -175,18 +175,18 @@ def _remediation_from_prefetch_state(
         )
     record = (state.get("images") or {}).get(image_ref) or {}
     pull_error = record.get("last_pull_error")
-    # A later sweep that found the image current does not clear the error of an earlier pull.
-    if pull_error and record.get("last_outcome") not in ("pull_ok", "up_to_date"):
-        return (
-            f"The executor's last pull of {image_ref} failed: {_quote(pull_error)}. "
-            f"{_pull_error_next_step(str(pull_error), pull_ref)}"
-        )
     if record.get("last_outcome") == "insufficient_disk":
         return (
             f"The executor skipped the pull for lack of disk: it needs "
             f"{_gib(record.get('last_disk_required_bytes'))} free and has "
             f"{_gib(record.get('last_disk_available_bytes'))}. Free space on the Docker root; "
             "the next sweep pulls it."
+        )
+    # A later up-to-date sweep or disk skip does not clear an older pull error.
+    if pull_error and record.get("last_outcome") not in ("pull_ok", "up_to_date"):
+        return (
+            f"The executor's last pull of {image_ref} failed: {_quote(pull_error)}. "
+            f"{_pull_error_next_step(str(pull_error), pull_ref)}"
         )
     loop_outcome = state.get("last_outcome")
     if loop_outcome == "prefetch_disabled_no_backend_url":
