@@ -20,7 +20,7 @@ from services.ssh_ready_gate import (
     ssh_ready_gate_mode,
     wait_for_ssh_banner,
 )
-from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _run, _ssh_client
+from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _run, _ssh_client, _ssh_result
 
 BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
 
@@ -612,3 +612,40 @@ async def test_enforce_still_waits_for_a_customer_rental(svc, monkeypatch):
     (line,) = _gate_lines(mock_logger, "warning")
     assert line.extra["ssh_ready_mode"] == "enforce"
     assert line.extra["workload_kind"] == "CUSTOMER_RENTAL"
+    assert line.extra["recreate"] is False
+
+
+def _ssh_client_with_the_pods_container(payload):
+    """A host where the pod's container already runs, so the create parks it first (a reboot or edit)."""
+    client = _ssh_client()
+    name = ds_module.DockerService.get_container_name(payload)
+
+    def _side(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd and f"--filter name=^{name}$" in cmd:
+            return _ssh_result(stdout=f"{name}\n")
+        return _ssh_result(exit_status=0)
+
+    client.run = AsyncMock(side_effect=_side)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_enforce_logs_instead_for_a_reboot_or_edit(svc, monkeypatch):
+    """A reboot or edit that failed here would end REBOOT_FAILED on the previous container, still billed,
+    where before the gate it reached RUNNING: enforce measures it first and never fails it."""
+    payload = _payload(ships_sshd=True, local_volume="volume_" + "x" * 8)
+    _patch_happy(svc, monkeypatch, _ssh_client_with_the_pods_container(payload))
+    _set_mode(monkeypatch, "enforce")
+    clock = _FakeClock()
+    _patch_wait(monkeypatch, _probe_ready_after(clock, float("inf")), clock)
+    mock_logger = Mock()
+    monkeypatch.setattr(ds_module, "logger", mock_logger)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert ProfilerStepName.SSH_READY not in {p.name for p in result.profilers}
+    await asyncio.gather(*list(ds_module._SSH_READY_LOG_TASKS))
+    (line,) = _gate_lines(mock_logger, "warning")
+    assert line.extra["ssh_ready_mode"] == "log"
+    assert line.extra["recreate"] is True
