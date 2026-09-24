@@ -108,6 +108,9 @@ class _FakeRentalDockerClient:
         self.inspected_images.append(image)
         return image in self.existing_images
 
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        return True
+
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
         if self.pull_error is not None:
