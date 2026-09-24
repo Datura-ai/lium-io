@@ -51,7 +51,7 @@ HOST_UPLOAD_MBPS = 1900.0
 PACKAGE = {"pkg": "distilbert-base-uncased.tar", "size": 268_000_000, "hash": "sha256:abc"}
 
 
-# Capacity is the only gated number. There is no off/shadow/enforce flag.
+# Capacity is the only gated number.
 
 
 def _challenge_data() -> dict:

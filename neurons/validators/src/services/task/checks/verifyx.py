@@ -381,7 +381,7 @@ def _feed_ema(
 
 
 def _ema_if_gated(prev: float | None, reading: object) -> float | None:
-    """The download EMA enforce's `_feed_ema` would store were `reading` the gated one."""
+    """The download EMA `_feed_ema` would store if `reading` were the gated one."""
     if reading is not None and not _is_speed_reading(reading):
         return prev
     return compute_ema(prev, reading if reading is not None else 0.0)

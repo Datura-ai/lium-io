@@ -31,7 +31,7 @@ STDERR_TAIL_BYTES = 2048
 # matrix check, DAH-2365) instead of blocking until the outer JOB_TIME_OUT cancellation.
 VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
 
-# DAH-2774: one library. LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
+# LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
 LIB_PATH = "/usr/lib/libverifyx.so"
 # Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
 # a host that failed the probe for its own reason can mention that URL.
@@ -670,7 +670,7 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
 
 
 def _verify_network_package_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
-    """main's `_verify_network_test`, verbatim: what off and shadow gate and list on."""
+    """The package (integrity object) download check; also the Cloudflare fallback."""
     network_execution = response_data["network_execution"]
 
     if not network_execution["success"]:

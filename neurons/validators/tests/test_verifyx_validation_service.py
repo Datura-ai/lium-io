@@ -193,7 +193,7 @@ def test_is_speed_reading(value, expected):
 
 def test_download_failure_reports_no_download_reading():
     # When the probe fails with no positive download (a package-download or download-direction
-    # failure), the download stays None so the EMA gate keeps its today behaviour (fed 0.0).
+    # failure), the download stays None so the EMA gate is fed 0.0.
     challenge_data, response_data = _network_payload()
     response_data["network_execution"]["success"] = False
     response_data["network_execution"]["speedtest"]["download_mbps"] = 0.0

@@ -1,4 +1,4 @@
-"""DAH-2774: one libverifyx.so. The Cloudflare capacity build is that file.
+"""DAH-2774: libverifyx.so is the Cloudflare capacity build.
 
 Library refresh is off by default. When VERIFYX_LIBRARY_REFRESH_ENABLED is on, a mismatch
 checks that /usr/lib is writable, then curls the raw GitHub URL, installs, and retries

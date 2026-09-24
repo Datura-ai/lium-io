@@ -56,10 +56,6 @@ class VerifyXSettings(BaseSettings):
         default=120,
         description="Timeout for network tests in seconds"
     )
-    # DAH-2774: one library, one number. libverifyx.so's Cloudflare capacity is the gated
-    # and published download (verifyx_download_speed, the 100 Mbps EMA floor in checks/verifyx.py).
-    # There is no off/shadow/enforce flag. A Cloudflare probe failure (429, timeout, outage)
-    # falls back to the package download instead of feeding the EMA a zero.
     NETWORK_MIN_DOWNLOAD_SPEED_MBPS: float = Field(
         default=50.0,
         description="Minimum Cloudflare capacity download speed in Mbps",

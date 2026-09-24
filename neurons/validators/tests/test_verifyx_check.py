@@ -240,12 +240,6 @@ async def test_verifyx_failure_without_diagnostics_falls_back_to_generic_templat
     assert result.event.help_uri == VERIFYX_DEBUG_DOC_URL
 
 
-@pytest.fixture
-def enforce_gate():
-    """Kept so existing usefixtures names still collect. Capacity is the only gated number."""
-    return None
-
-
 def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, upload: float | None = None) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={},
@@ -516,14 +510,13 @@ async def _run_ema_cycle(
     return await VerifyXCheck().run(ctx)
 
 
-@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "download,expected_ema,published",
     [
         # a real reading → compute_ema(2000, 2100) = 2050 and the raw sample is published
         (2100.0, 2050.0, True),
-        # a failed measurement → the pre-existing rule: compute_ema(2000, 0.0) = 1000 decays
+        # a failed measurement → compute_ema(2000, 0.0) = 1000 decays
         (None, 1000.0, False),
         # malformed readings never reach compute_ema: the previous EMA stands, nothing published
         ("fast", 2000.0, False),
@@ -562,7 +555,6 @@ async def test_verifyx_download_reading_feeds_the_ema_only_when_it_is_a_number(
         assert unavailable_logs == []
 
 
-@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 async def test_verifyx_ema_over_a_sequence_of_good_missing_and_malformed_readings(
     context_factory,
@@ -582,7 +574,6 @@ async def test_verifyx_ema_over_a_sequence_of_good_missing_and_malformed_reading
         assert ema == pytest.approx(expected), reading
 
 
-@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 async def test_verifyx_malformed_upload_keeps_the_upload_ema_and_updates_the_download(
     context_factory,
@@ -598,7 +589,6 @@ async def test_verifyx_malformed_upload_keeps_the_upload_ema_and_updates_the_dow
     assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
 
 
-@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 async def test_verifyx_malformed_download_on_a_never_measured_host_leaves_the_ema_unseeded(
     context_factory,
@@ -617,7 +607,6 @@ async def test_verifyx_malformed_download_on_a_never_measured_host_leaves_the_em
     assert result.event.what_we_saw["unavailable_speed_readings"] == ["download"]
 
 
-@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.parametrize("reading", ["fast", True, float("nan"), float("inf"), -1.0])
 def test_download_speed_helper_reads_a_malformed_reading_as_none(reading):
     from neurons.validators.src.services.task.checks.verifyx import _download_speed
