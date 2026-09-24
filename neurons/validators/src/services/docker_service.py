@@ -6152,12 +6152,14 @@ class DockerService:
                         "container_name": container_name,
                         "image_manages_services": image_manages_services,
                         "ssh_bootstrap_ok": ssh_bootstrap_ok,
-                        "recreate": edit_swap.parked_name is not None,
+                        "recreate": bool(payload.local_volume),
                     }
-                    if ssh_ready_mode is SshReadyMode.ENFORCE and edit_swap.parked_name is not None:
-                        # A reboot or edit that fails here ends REBOOT_FAILED on the previous container, still
-                        # billed, and no retry moves it; before the gate it reached RUNNING. Measure these
-                        # first rather than fail a pod whose sshd answers a little after the grace.
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and payload.local_volume:
+                        # A reboot or edit (the payload names the pod's volume, the test that decides parking;
+                        # true whether or not the old container was still there to park) that fails here ends
+                        # REBOOT_FAILED, still billed, and no retry moves it; before the gate it reached
+                        # RUNNING. Measure these first rather than fail a pod whose sshd answers a little
+                        # after the grace.
                         ssh_ready_mode = SshReadyMode.LOG
                     if ssh_ready_mode is SshReadyMode.ENFORCE and not ssh_bootstrap_ok:
                         # The validator's own sshd install is best-effort and such rents reached RUNNING

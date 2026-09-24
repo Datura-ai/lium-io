@@ -642,11 +642,14 @@ def _ssh_client_with_the_pods_container(payload):
 
 
 @pytest.mark.asyncio
-async def test_enforce_logs_instead_for_a_reboot_or_edit(svc, monkeypatch):
-    """A reboot or edit that failed here would end REBOOT_FAILED on the previous container, still billed,
-    where before the gate it reached RUNNING: enforce measures it first and never fails it."""
+@pytest.mark.parametrize("old_container_on_host", [True, False], ids=["parked", "container-gone"])
+async def test_enforce_logs_instead_for_a_reboot_or_edit(svc, monkeypatch, old_container_on_host):
+    """A reboot or edit that failed here would end REBOOT_FAILED, still billed, where before the gate it
+    reached RUNNING: enforce measures it first and never fails it. That holds when the pod's old container
+    is already gone (it vanished, or a host reboot pruned it) and there is nothing to park."""
     payload = _payload(ships_sshd=True, local_volume="volume_" + "x" * 8)
-    _patch_happy(svc, monkeypatch, _ssh_client_with_the_pods_container(payload))
+    ssh = _ssh_client_with_the_pods_container(payload) if old_container_on_host else _ssh_client()
+    _patch_happy(svc, monkeypatch, ssh)
     _set_mode(monkeypatch, "enforce")
     clock = _FakeClock()
     _patch_wait(monkeypatch, _probe_ready_after(clock, float("inf")), clock)
@@ -661,3 +664,5 @@ async def test_enforce_logs_instead_for_a_reboot_or_edit(svc, monkeypatch):
     (line,) = _gate_lines(mock_logger, "warning")
     assert line.extra["ssh_ready_mode"] == "log"
     assert line.extra["recreate"] is True
+    renamed = [c.args[0] for c in ssh.run.call_args_list if c.args and "docker rename" in c.args[0]]
+    assert bool(renamed) is old_container_on_host
