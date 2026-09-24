@@ -14,5 +14,14 @@ class PortSelector:
         available_ports = [
             PortPair(internal, external) for internal, external in all_ports if external not in unavailable_ports
         ]
-        return available_ports[:size]
+        if len(available_ports) <= size:
+            return available_ports
+        # the lowest half stays as before (the semi-batch and sequential tiers probe only the first 50);
+        # the rest is spread evenly up to the highest declared port, so a wide range forwarded only
+        # at its top is still found without probing more ports
+        head = size // 2
+        span, picks = len(available_ports) - 1 - head, size - head
+        return available_ports[:head] + [
+            available_ports[head + i * span // max(picks - 1, 1)] for i in range(picks)
+        ]
 

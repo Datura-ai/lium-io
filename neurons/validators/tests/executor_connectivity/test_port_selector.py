@@ -1,7 +1,11 @@
 
+import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
+from services.executor_connectivity.models import PortPair
 from services.executor_connectivity.port_selector import PortSelector
+from services.port_utils import get_all_ports
 
 
 def _executor_info(*, port_mappings=None, port_range=None, ssh_port=22):
@@ -63,6 +67,49 @@ def test_port_selector_default_range_when_missing():
     for port in result:
         assert 20000 <= port.internal <= 65535
         assert port.external == port.internal
+
+
+def test_port_selector_wide_range_reaches_ports_forwarded_only_at_the_top():
+    info = _executor_info(port_range="40000-65535")
+    open_ports = set(range(60000, 65536))
+
+    result = PortSelector().select(info, size=BATCH_PORT_VERIFICATION_SIZE, unavailable_ports=set())
+
+    all_ports = get_all_ports(info.port_range, info.port_mappings, info.ssh_port)
+    old_selection = all_ports[:BATCH_PORT_VERIFICATION_SIZE]
+    assert sum(internal in open_ports for internal, _ in old_selection) < MIN_PORT_COUNT
+    assert sum(p.internal in open_ports for p in result) >= MIN_PORT_COUNT
+    assert len(result) == BATCH_PORT_VERIFICATION_SIZE
+    assert len({p.internal for p in result}) == BATCH_PORT_VERIFICATION_SIZE
+    assert result[0].internal == 40000
+    assert result[-1].internal == 65535
+    assert [PortPair(p, p) for p in range(40000, 40150)] == result[:150]
+
+
+@pytest.mark.parametrize("port_range", ["9000-9299", "9000-9099", "9000,9005,9010"])
+def test_port_selector_small_range_selects_the_same_ports_as_before(port_range):
+    info = _executor_info(port_range=port_range)
+
+    result = PortSelector().select(
+        info, size=BATCH_PORT_VERIFICATION_SIZE, unavailable_ports={9001}
+    )
+
+    all_ports = get_all_ports(info.port_range, info.port_mappings, info.ssh_port)
+    before = [PortPair(i, e) for i, e in all_ports if e != 9001][:BATCH_PORT_VERIFICATION_SIZE]
+    assert result == before
+
+
+def test_port_selector_wide_mappings_sample_across_all_pairs_after_unavailable():
+    mappings = str([[p, p + 10000] for p in range(20000, 21000)])
+    info = _executor_info(port_mappings=mappings)
+
+    result = PortSelector().select(info, size=300, unavailable_ports={30000})
+
+    assert len(result) == 300
+    assert all(p.external == p.internal + 10000 and p.external != 30000 for p in result)
+    assert result[0] == PortPair(20001, 30001)
+    assert result[-1] == PortPair(20999, 30999)
+    assert [p.internal for p in result] == sorted({p.internal for p in result})
 
 
 def test_port_selector_empty_when_all_rented():
