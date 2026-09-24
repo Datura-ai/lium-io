@@ -67,3 +67,15 @@ If you want you can use different port for `INTERNAL_PORT`, `EXTERNAL_PORT`.
 ```
 cd neurons/validators && docker compose up -d
 ```
+
+## How the port check samples declared ports
+
+Each cycle the validator checks from outside that an executor's declared ports are forwarded. An executor needs at least `MIN_PORT_COUNT` (3) ports that answer to be listed.
+
+- **Budget:** at most `BATCH_PORT_VERIFICATION_SIZE` (300) ports are probed per executor per cycle, whatever the size of the declaration. Ports already held by a rental or a filler are skipped.
+- **Small declarations:** 300 ports or fewer are all probed.
+- **Wide declarations:** the lowest 150 declared ports are probed, and the other 150 probes are spread evenly over the rest of the declaration, always including the highest declared port. A range such as `40000-65535` is probed across its whole span, so ports forwarded only at the top of it are still found.
+- **Deterministic:** an unchanged declaration is probed on the same ports every cycle, so the result does not flip between cycles by chance.
+- **Per-range tally:** the port-connectivity event carries `port_ranges`, a list of `{range, declared, probed, answered}` entries. Declared ports are grouped into buckets of `PORT_RANGE_BUCKET_WIDTH` (5000) ports by external port, so a partial forward shows which part of a wide range answered.
+
+Code: `src/services/executor_connectivity/port_selector.py` (`sample_ports`, `tally_port_ranges`).
