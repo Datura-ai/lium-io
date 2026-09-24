@@ -42,8 +42,13 @@ from services.redis_service import (
     RedisService,
 )
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.rented_pod_ssh import (
+    flush_rented_pod_ssh_reports,
+    silence_rented_pod_ssh_reports_on_our_own_outage,
+)
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
 from core.express_lane import CycleInputs, ExpressLane
@@ -376,7 +381,11 @@ class Validator:
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
                 )
 
                 task_info = {}
@@ -525,6 +534,10 @@ class Validator:
                             ),
                         ),
                     )
+                    NETWORK_GATE_TALLY.log_and_reset(
+                        MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
+                    )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window
@@ -635,6 +648,45 @@ class Validator:
                                 "[sync] Most of the cycle could not be reached; reporting no availability errors",
                                 extra={"silenced_results": silenced_count},
                             )
+                        )
+
+                    # DAH-2870: the rented-pod SSH reports queued this cycle go to the backend only
+                    # when the fleet says the pods are at fault; a validator-side outage (the share
+                    # above, or most mapped ports refusing at once) notifies no renter. The results
+                    # whose reports the gate held were rendered as RENTED_POD_SSH_UNREACHABLE before
+                    # the gate ran and name a pod outage that was ours: they are rewritten to RENTED
+                    # here, before the publish, so the stored event says what happened.
+                    try:
+                        rented_pod_ssh_gate = await flush_rented_pod_ssh_reports(
+                            self.redis_service,
+                            self.backend_client,
+                            job_batch_id,
+                            validator_outage=silenced_count > 0,
+                        )
+                        results_rewritten_to_rented = silence_rented_pod_ssh_reports_on_our_own_outage(
+                            cycle_results, rented_pod_ssh_gate
+                        )
+                        if results_rewritten_to_rented:
+                            logger.warning(
+                                _m(
+                                    "[sync] rented-pod SSH reports held back this cycle; their events publish as RENTED",
+                                    extra=get_extra_info(
+                                        {
+                                            **self.default_extra,
+                                            "rewritten_results": results_rewritten_to_rented,
+                                            "suppressed_by": rented_pod_ssh_gate.suppressed_by,
+                                            "held_pods": rented_pod_ssh_gate.due,
+                                        }
+                                    ),
+                                )
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[sync] rented-pod SSH report flush failed; the streaks queue again next cycle",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                            exc_info=True,
                         )
 
                     # Publish machine specs

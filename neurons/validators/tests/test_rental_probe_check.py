@@ -307,10 +307,14 @@ SSH_BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
 
 
 class FakeReader:
+    """docker-proxy's accept-then-close (b"": EOF before any line) or sshd's identification line."""
+
     def __init__(self, first_line: bytes):
         self.first_line = first_line
 
-    async def readline(self):
+    async def readuntil(self, separator: bytes = b"\n"):
+        if not self.first_line:
+            raise asyncio.IncompleteReadError(b"", None)
         return self.first_line
 
 
@@ -338,7 +342,7 @@ def renter_path(
     def sshd_up() -> bool:
         return sshd_up_after is not None and seen["tcp_connects"] > sshd_up_after
 
-    async def open_connection(host, port):
+    async def open_connection(host, port, **_kwargs):
         seen["tcp"] = (host, port)
         if not sshd_listens:
             raise ConnectionRefusedError(111, "Connection refused")
@@ -1428,3 +1432,34 @@ async def test_the_real_redis_service_accepts_the_stamps_lifetime(monkeypatch):
         ("rental_probe_ok:x", "1.0", module._REDIS_STAMP_TTL_SECONDS),
         ("plain", "v", None),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "greeting,sshd_up",
+    [
+        pytest.param(b"Welcome\r\n" + SSH_BANNER, True, id="pre_banner_line_skipped"),
+        pytest.param(SSH_BANNER, True, id="identification_line"),
+        pytest.param(b"SSH-1.99-OpenSSH_3.9p1\r\n", False, id="ssh_1_99"),
+        pytest.param(b"SSH-2.0-OpenSSH_9.6p1", False, id="closed_before_the_line_ended"),
+    ],
+)
+async def test_wait_for_sshd_uses_the_rented_probes_identification_rule(greeting, sshd_up):
+    """Regression: the wait read one line with `readline()` and checked a `SSH-2.0` prefix, a looser
+    rule than the rented-pod probe's; both now go through ssh_identification.py."""
+
+    def handler(_reader, writer):
+        writer.write(greeting)
+        writer.close()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        error = await module._wait_for_sshd(
+            "127.0.0.1", port, deadline_at=time.monotonic(), deadline_seconds=0.0
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert (error is None) is sshd_up, error
