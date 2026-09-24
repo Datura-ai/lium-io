@@ -229,13 +229,11 @@ This will display the total TAO collateral that miner has deposited.
 To deposit additional collateral for an existing executor, use the following command:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py deposit-collateral --address <executor-ip-address> --port <executor-port> --gpu-type <gpu-type> --gpu-count <gpu-count> --deposit-amount <deposit-amount> --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py deposit-collateral --address <executor-ip-address> --port <executor-port> --deposit_amount <deposit-amount> --private-key <ethereum-private-key>
 ```
 
 - `<executor-ip-address>`: The IP address of the executor machine.
 - `<executor-port>`: The port number used for the executor.
-- `<gpu-type>`: Type of GPU on the executor.
-- `<gpu-count>`: Number of GPUs on the executor.
 - `<deposit-amount>`: The amount of TAO to deposit as additional collateral for this executor.
 - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
 
