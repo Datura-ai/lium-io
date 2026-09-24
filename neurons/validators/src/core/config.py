@@ -359,8 +359,8 @@ class Settings(BaseSettings):
     # rented-state check FAIL for the cycle — score 0, verified job cleared — the way the rental
     # probe fails an unreachable unrented node; the next healthy cycle scores as rented again.
     # ENFORCE_AFTER_CYCLES unset means RENTED_POD_SSH_PROBE_CYCLES (the notify threshold); a value
-    # below it is refused at startup, so a provider is never zeroed for an outage no renter was
-    # told about. With the defaults (notify at 2, then wait for the backend accept) enforcement
+    # below it is refused at startup, so a provider is never zeroed for an outage the backend did
+    # not accept. With the defaults (notify at 2, then wait for the backend accept) enforcement
     # starts at streak 3, not 2: the notify cycle queues the report, and the next cycle can fail
     # the check. One blip (a streak of 1) never costs a cycle. Enforcement adds no report: the
     # one POST per outage stays the probe's.

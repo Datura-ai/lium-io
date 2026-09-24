@@ -195,22 +195,7 @@ def enforce_after_cycles() -> int:
 
 
 def is_enforced(verdict: RentedPodSshVerdict) -> bool:
-    """True when this verdict fails the rented-state check for the cycle (DAH-2255).
-
-    Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, only once its
-    streak has reached ``enforce_after_cycles()``, only after the backend accepted the outage report
-    (``verdict.backend_accepted``), and not while the last cycle-end gate held the reports as our
-    own outage (``verdict.last_gate_suppressed``). Mail delivery is separate: a ``notify_failed``
-    200 still accepts, and a cycle that only queued the notice — including a validator-side outage
-    the fleet gate holds — does not zero the node. A port-fault accept enforces; a keys-only accept
-    enforces only a keys-only cycle, never a later port fault the backend did not accept; a streak
-    with no stored accept faults enforces nothing. A renter who deletes ``authorized_keys`` (that
-    fault alone, host ``boot_id`` unchanged) is not enforced, whether that is the accepted report's
-    fault or this cycle's after a port-fault accept: the provider cannot restore the keys. A pod
-    never seen healthy carries no streak (``consecutive_cycles`` 0), a Redis outage yields no
-    verdict at all, and the flag off leaves the check with DAH-2870's record-and-report behaviour:
-    none of those is enforced.
-    """
+    """True when this verdict fails the rented-state check for the cycle (DAH-2255)."""
     if not settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED or verdict.healthy:
         return False
     if verdict.consecutive_cycles < enforce_after_cycles():
