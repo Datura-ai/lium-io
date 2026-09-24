@@ -424,6 +424,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        out_of_cycle: bool = False,
     ):
         """Request job to miner - uses REST API if configured, otherwise WebSocket.
 
@@ -433,6 +434,8 @@ class MinerService:
         first_pass (DAH-3011): this is the executor's first, unscored verification; handed to
         TaskService.create_task, where FIRST_PASS_FAST_PATH_ENABLED decides whether the probes
         shrink. The cycle never sets it.
+        out_of_cycle: a recheck the backend asked for between cycles, handed to create_task the
+        same way; the cycle never sets it.
         """
         if settings.USE_REST_API:
             logger.info(
@@ -452,6 +455,7 @@ class MinerService:
                 executor_image_snapshot,
                 executor_id=executor_id,
                 first_pass=first_pass,
+                out_of_cycle=out_of_cycle,
             )
         else:
             logger.info(
@@ -601,6 +605,7 @@ class MinerService:
                                             executor_image_snapshot=executor_image_snapshot,
                                             attestation_nonce=attestation_nonce,
                                             first_pass=first_pass,
+                                            out_of_cycle=out_of_cycle,
                                         ),
                                     ),
                                     timeout=executor_budget_seconds(),
@@ -2364,6 +2369,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        out_of_cycle: bool = False,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
@@ -2475,6 +2481,7 @@ class MinerService:
                                         executor_image_snapshot=executor_image_snapshot,
                                         attestation_nonce=attestation_nonce,
                                         first_pass=first_pass,
+                                        out_of_cycle=out_of_cycle,
                                     ),
                                 ),
                                 timeout=executor_budget_seconds(),

@@ -169,6 +169,7 @@ async def test_a_requested_node_is_rechecked_now_and_published_spec_only(
     request = harness.miner_service.request_job_to_miner.await_args.kwargs
     assert request["executor_id"] == node
     assert "first_pass" not in request  # a known node: the full pipeline
+    assert request["out_of_cycle"] is True
     assert request["encrypted_files"] is harness.inputs.encrypted_files
     # the probe runs inside its interval: the pass on record predates the failure
     assert await harness.redis_service.redis.get(f"rental_probe_ok:{node}") is None

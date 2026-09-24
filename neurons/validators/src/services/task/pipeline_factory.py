@@ -149,6 +149,7 @@ class PipelineFactory:
         gpu_attestation_passed: bool | None = None,
         first_pass: bool = False,
         encrypted_private_key: str | None = None,
+        out_of_cycle: bool = False,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -166,6 +167,7 @@ class PipelineFactory:
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
             first_pass: the executor's first, unscored verification (DAH-3011); takes effect
                 only with settings.FIRST_PASS_FAST_PATH_ENABLED
+            out_of_cycle: a recheck run between cycles; per-cycle streaks are read, not advanced
 
         Returns:
             Configured Context ready for pipeline execution
@@ -255,6 +257,7 @@ class PipelineFactory:
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
                 first_pass=first_pass and settings.FIRST_PASS_FAST_PATH_ENABLED,
+                out_of_cycle=out_of_cycle,
             ),
             state=ContextState(
                 upload_local_dir=encrypted_files.tmp_directory,

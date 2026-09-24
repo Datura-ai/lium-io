@@ -88,8 +88,10 @@ class Harness:
         validator_outage: bool = False,
         status: str | None = None,
         ssh: DummySSHClient | None = None,
+        recheck: bool = False,
     ):
-        """One cycle as the validator runs it: the rented check, then the cycle-end fleet gate."""
+        """One cycle as the validator runs it: the rented check, then the cycle-end fleet gate.
+        With `recheck` the check runs out of cycle, as the recheck lane runs it, with no gate."""
         services = build_services(
             redis=self.redis,
             backend=self.backend,
@@ -98,7 +100,7 @@ class Harness:
         )
         ctx = self.context_factory(
             services=services,
-            config=build_context_config(),
+            config=build_context_config(out_of_cycle=recheck),
             state=build_state(
                 rented_data=rented_data(self.ssh_port, status), specs={"boot_id": boot_id}
             ),
@@ -108,6 +110,8 @@ class Harness:
         with patch(TCP_PATH, new=AsyncMock(return_value=tcp_fault)) as tcp:
             result = await TenantEnforcementCheck().run(ctx)
         self.tcp_calls = tcp.await_args_list
+        if ctx.config.out_of_cycle:
+            return result
         self.gate = await rented_pod_ssh.flush_rented_pod_ssh_reports(
             self.redis, self.backend, "batch-1", validator_outage=validator_outage
         )
@@ -1489,3 +1493,53 @@ async def test_boot_ids_are_strings_cut_to_the_backends_64_chars(context_factory
     assert long_mark.boot_id == "c" * 64
     assert rented_pod_ssh.bounded_boot_id("") is None
     assert rented_pod_ssh.bounded_boot_id(b"bytes") is None
+
+
+def _redis_snapshot(h: Harness) -> tuple[dict, dict]:
+    return dict(h.redis.store), {key: dict(value) for key, value in h.redis.hashes.items()}
+
+
+@pytest.mark.asyncio
+async def test_a_failing_recheck_probe_leaves_the_streak_and_the_next_cycle_still_counts(
+    context_factory,
+):
+    # The streak counts cycles; a recheck between two of them must not bring the notice forward.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    assert h.streak()["count"] == 1
+    before = _redis_snapshot(h)
+
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, recheck=True)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert _redis_snapshot(h) == before
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    assert h.streak()["count"] == 2
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_writes_no_probe_state_healthy_or_past_the_threshold(context_factory):
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    before = _redis_snapshot(h)
+
+    # A healthy recheck neither renews the ok mark nor ends the cycles' streak.
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS, recheck=True)
+    assert _redis_snapshot(h) == before
+
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+    before = _redis_snapshot(h)
+
+    # Past the threshold the recheck names the pod at the cycles' count and queues nothing.
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, recheck=True)
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["consecutive_cycles"] == 2 and pod["report_queued"] is False
+    assert _redis_snapshot(h) == before
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()

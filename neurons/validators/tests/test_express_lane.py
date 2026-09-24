@@ -34,7 +34,7 @@ from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.file_encrypt_service import FileEncryptService
-from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, MinerService
+from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, RECHECK_LANE, MinerService
 from services.redis_service import EXPRESS_LANE_VALIDATED_SET, RedisService
 from services.task.models import JobResult
 
@@ -280,6 +280,25 @@ async def test_first_pass_reaches_the_task_only_when_the_caller_asks_for_it(rest
     rest_miner_service.miner_returns(known)
     await _request(rest_miner_service)
     assert create_task.await_args.kwargs["first_pass"] is False
+
+
+@pytest.mark.asyncio
+async def test_out_of_cycle_reaches_the_task_only_from_the_recheck(rest_miner_service, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    rechecked, known = str(uuid4()), str(uuid4())
+    create_task = rest_miner_service.task_service.create_task
+
+    rest_miner_service.in_flight[rechecked] = RECHECK_LANE
+    rest_miner_service.miner_returns(rechecked)
+    await _request(rest_miner_service, executor_id=rechecked, out_of_cycle=True)
+    assert create_task.await_args.kwargs["out_of_cycle"] is True
+
+    rest_miner_service.in_flight.clear()
+    rest_miner_service.miner_returns(known)
+    await _request(rest_miner_service)
+    assert create_task.await_args.kwargs["out_of_cycle"] is False
 
 
 @pytest.mark.asyncio

@@ -435,6 +435,9 @@ async def probe_rented_pod_ssh(
 ) -> RentedPodSshVerdict | None:
     """Judge one RUNNING rented pod from the renter's side and keep the per-pod streak.
 
+    An out-of-cycle run (``ctx.config.out_of_cycle``, a recheck) judges at the stored streak and
+    writes nothing: no ok mark, no streak, no fleet mark, no queued report.
+
     Returns None when the probe is off, and when Redis fails: this is a signal inside a fatal check,
     so a Redis outage skips the signal for the cycle (logged at WARNING) and never reaches the
     verdict. The caller (TenantEnforcementCheck) has already confirmed the container is running
@@ -511,7 +514,12 @@ async def _judge_with_streak(
     # move together or not at all. A connection lost mid-way leaves the previous state whole and
     # the probe skips the cycle (REDIS_UNAVAILABLE, below) instead of leaving a fresh ok mark next
     # to the old streak, or a counted streak next to a stale ok mark.
+    out_of_cycle = ctx.config.out_of_cycle
     if not faults:
+        if out_of_cycle:
+            return RentedPodSshVerdict(
+                pod_id=pod.pod_id, container_name=pod.container_name, ssh_port=pod.ssh_port, healthy=True
+            )
         return await _record_healthy_cycle(ctx, pod, boot_id_now, now_iso)
 
     ok_mark = OkMark.load(await store.get(_ok_key(pod.pod_id)))
@@ -529,9 +537,10 @@ async def _judge_with_streak(
             faults=faults,
         )
 
-    streak = FailStreak.load(
-        await store.get(_fail_key(pod.pod_id)), now_iso=now_iso
-    ).plus_one_cycle()
+    streak = FailStreak.load(await store.get(_fail_key(pod.pod_id)), now_iso=now_iso)
+    if not out_of_cycle:
+        # The streak counts cycles; a recheck between two of them is judged at the count they left.
+        streak = streak.plus_one_cycle()
     consecutive = streak.count
     first_failed_at = streak.first_failed_at
     unhealthy_writes = RedisWrites()
@@ -565,6 +574,8 @@ async def _judge_with_streak(
             and bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY))
         ),
     )
+    if out_of_cycle:
+        return verdict
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
         # without publishing: the event is logged, the backend is not told, and `reported` stays

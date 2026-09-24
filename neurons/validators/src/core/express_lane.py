@@ -450,6 +450,7 @@ class ExpressLane:
                     default_docker_image_digests=inputs.default_image_digests,
                     executor_image_snapshot=inputs.executor_image_snapshot,
                     executor_id=executor_id,
+                    out_of_cycle=True,
                 ),
                 timeout=settings.JOB_TIME_OUT,
             )
