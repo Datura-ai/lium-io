@@ -258,6 +258,11 @@ async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(co
     teardown = events[-1]
     assert teardown.severity == "info"
     assert teardown.impact == "GPU usage re-checked next cycle; job score=1.0, actual score=1.0"
+    assert teardown.remediation == (
+        "No action needed. A rental on this node has just ended and Lium is stopping its container; "
+        "do not stop it yourself."
+    )
+    assert final_ctx.log_status == "info"
     assert teardown.what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_DURING_RUN
     assert ok is True
     assert final_ctx.rented is False
@@ -290,19 +295,13 @@ async def test_with_the_deferral_off_the_renter_ending_mid_run_scores_0_as_befor
 
 
 @pytest.mark.parametrize(
-    "pod_rental,gpu_processes",
-    [
-        (_closed(minutes_ago=10), None),
-        (PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), None),
-        (_closed(minutes_ago=1), [_pod_process(), {"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}]),
-    ],
-    ids=["ended-10-min-ago", "started-mid-run", "beside-a-foreign-process"],
+    "pod_rental",
+    [_closed(minutes_ago=10), PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)],
+    ids=["ended-10-min-ago", "started-mid-run"],
 )
 @pytest.mark.asyncio
-async def test_with_the_deferral_off_every_pod_container_is_the_orphan_zero(context_factory, pod_rental, gpu_processes):
-    ctx = _unrented_ctx(
-        context_factory, pod_rental=pod_rental, rented_data=_snapshot_with_pod(), gpu_processes=gpu_processes
-    )
+async def test_with_the_deferral_off_every_pod_container_is_the_orphan_zero(context_factory, pod_rental):
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental, rented_data=_snapshot_with_pod())
 
     result = await GpuUsageCheck().run(ctx)
 
@@ -325,6 +324,38 @@ async def test_teardown_on_a_node_with_no_download_speed_on_record_still_scores_
     assert result.updates["success"] is False
     assert result.event.impact == "GPU usage re-checked next cycle; job score=0.0, actual score=0.0"
     assert "EMA verifyx download speed unavailable" in result.updates["score_warning"]
+    assert result.event.severity == "warning"
+    assert result.updates["log_status"] == "warning"
+    assert result.event.remediation == (
+        f"Address issues:{result.updates['score_warning']} {Msg.TEARDOWN_IN_PROGRESS.remediation}"
+    )
+    assert "No action needed" not in result.event.remediation
+
+
+@pytest.mark.parametrize(
+    "last_download_speed,score,warning",
+    [
+        (50.0, 0.0, " WARNING: Last VerifyX download speed 50.0 Mbps is under the 100.0 Mbps minimum"),
+        (100.0, 1.0, None),
+    ],
+    ids=["under-the-floor", "at-the-floor"],
+)
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
+async def test_a_deferral_holds_the_carried_download_speed_to_verifyxs_floor(
+    context_factory, last_download_speed, score, warning
+):
+    ctx = _scored_ctx(
+        context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=last_download_speed)
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.updates["score"] == score
+    assert result.updates["job_score"] == score
+    assert result.updates["success"] is (score > 0)
+    assert result.updates["score_warning"] == warning
 
 
 @pytest.mark.asyncio
@@ -457,7 +488,8 @@ async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("teardown_deferral_on")
 async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_factory):
-    orphan_pod_id = "0b7c2f6e-9d41-4c8a-8e3f-5a6b7c8d9e0f"
+    orphan_pod_id = "f7c2e6b0-9d41-4c8a-8e3f-5a6b7c8d9e0f"
+    assert orphan_pod_id > TEARDOWN_POD_ID, "the orphan must not be the first container in sorted order"
     ctx = _unrented_ctx(
         context_factory,
         pod_rental=None,
@@ -472,6 +504,7 @@ async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_fa
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw["rental_status"] == "Lium has no rental for it"
+    assert result.event.what_we_saw["orphaned_container"] == f"{POD_CONTAINER_PREFIX}{orphan_pod_id}"
     assert f"(pod {orphan_pod_id})" in result.event.remediation
 
 
@@ -519,20 +552,44 @@ async def test_a_rental_that_started_mid_run_is_not_an_orphan(context_factory):
     assert result.event.reason_code == Msg.RENTAL_STARTED_DURING_RUN.reason
 
 
+@pytest.mark.parametrize("deferral_enabled", [True, False], ids=["flag-on", "flag-off"])
+@pytest.mark.parametrize(
+    "pod_rental",
+    [_closed(minutes_ago=1), PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)],
+    ids=["ending", "started-mid-run"],
+)
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_a_foreign_process_beside_a_tearing_down_pod_is_still_usage(context_factory):
+async def test_a_foreign_process_beside_a_renters_pod_never_gets_advice_to_stop_the_pod(
+    context_factory, deferral_enabled, pod_rental
+):
+    foreign = {"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}
     ctx = _unrented_ctx(
         context_factory,
-        pod_rental=_closed(minutes_ago=1),
+        pod_rental=pod_rental,
         rented_data=_snapshot_with_pod(),
-        gpu_processes=[_pod_process(), {"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+        gpu_processes=[_pod_process(), foreign],
     )
 
-    result = await GpuUsageCheck().run(ctx)
+    with patch.object(gpu_usage.settings, "RENTAL_TEARDOWN_DEFERRAL_ENABLED", deferral_enabled):
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
-    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.halt is False
+    remediation = result.event.remediation
+    assert "Stop all GPU processes" not in remediation
+    assert "docker" not in remediation
+    if deferral_enabled:
+        assert result.event.reason_code == Msg.USAGE_HIGH.reason
+        assert remediation == (
+            "Stop the GPU processes outside Lium's containers and re-run your node: "
+            "nodexo-rental-1cd1ba2b (pid 4242). Do not stop the pod container of the rental on this node "
+            f"({TEARDOWN_POD}): Lium stops or starts it itself."
+        )
+        assert result.event.what_we_saw["gpu_processes"] == [foreign]
+        assert result.event.what_we_saw["process_count"] == 1
+    else:
+        assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+        assert "do not stop or remove it" in remediation
 
 
 @pytest.mark.asyncio

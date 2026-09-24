@@ -874,6 +874,11 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
+        "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
+        "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "
+        "starts it itself."
+    )
     ORPHANED_CONTAINER = MessageTemplate(
         event="Orphaned rental container detected",
         reason="ORPHANED_RENTAL_CONTAINER",
@@ -906,8 +911,7 @@ class GpuUsageMessages:
         category="runtime",
         impact="GPU usage re-checked next cycle",
         remediation=(
-            "No action needed. A rental on this node has just ended and Lium is stopping its "
-            "container; do not stop it yourself."
+            "A rental on this node has just ended and Lium is stopping its container; do not stop it yourself."
         ),
     )
     RENTAL_STARTED_DURING_RUN = MessageTemplate(
@@ -916,7 +920,7 @@ class GpuUsageMessages:
         severity="info",
         category="runtime",
         impact="GPU usage re-checked next cycle",
-        remediation="No action needed. The GPU is held by a rental that started while this run was in progress.",
+        remediation="The GPU is held by a rental that started while this run was in progress.",
     )
     FOREIGN_PROCESS = MessageTemplate(
         event="Foreign GPU process on idle executor",

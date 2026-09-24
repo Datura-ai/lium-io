@@ -37,7 +37,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context, ContextState
-from .verifyx import with_last_known_verifyx_ema
+from .verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS, with_last_known_verifyx_ema
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +253,9 @@ class GpuUsageCheck:
             }
         )
         if pod_containers and not ctx.rented:
-            pod_result = await self._judge_pod_containers_outside_a_rental(
+            return await self._judge_pod_containers_outside_a_rental(
                 ctx, violation, gpu_processes, pod_containers, filler_containers
             )
-            if pod_result is not None:
-                return pod_result
 
         event = render_message(
             Msg.USAGE_HIGH,
@@ -274,7 +272,7 @@ class GpuUsageCheck:
         gpu_processes: list[dict],
         pod_containers: list[str],
         filler_containers: set[str],
-    ) -> CheckResult | None:
+    ) -> CheckResult:
         """A pod container on the GPU of a node this run judges as not rented.
 
         The GPU processes are read at the start of the run and `ctx.rented` is settled later, from
@@ -282,9 +280,9 @@ class GpuUsageCheck:
         rental in between leaves the scrape holding a pod container that the unrent flow is still
         stopping. That container, and one whose rental closed within RENTAL_TEARDOWN_GRACE_MINUTES,
         is teardown: the run ends without a GPU verdict and the next cycle looks again. Only a
-        container with no rental, or whose rental closed longer ago, is an orphan. Returns None
-        when a process outside those containers and the node's fillers holds the GPU, leaving the
-        legacy verdict to the caller.
+        container with no rental, or whose rental closed longer ago, is an orphan. A process outside
+        those containers and the node's fillers still fails the usage check, with advice that names
+        only the outside processes: the pod container belongs to a renter.
 
         With RENTAL_TEARDOWN_DEFERRAL_ENABLED off, every pod container here is scored as an orphan,
         as before; the rental read still picks the remediation, so a provider is never told to
@@ -325,8 +323,26 @@ class GpuUsageCheck:
             return CheckResult(passed=False, event=event)
 
         expected_containers: set[str] = {rental.container_name for rental in rentals} | filler_containers
-        if any(process.get("container_name") not in expected_containers for process in gpu_processes):
-            return None
+        outside_processes: list[dict] = [
+            process for process in gpu_processes if process.get("container_name") not in expected_containers
+        ]
+        if outside_processes:
+            event = render_message(
+                Msg.USAGE_HIGH,
+                ctx=ctx,
+                check_id=self.check_id,
+                remediation=Msg.USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION.format(
+                    outside_processes=", ".join(_describe_process(process) for process in outside_processes),
+                    pod_containers=", ".join(rental.container_name for rental in rentals),
+                ),
+                what={
+                    **violation,
+                    "process_count": len(outside_processes),
+                    "gpu_processes": outside_processes,
+                    "pod_containers": rentals,
+                },
+            )
+            return CheckResult(passed=False, event=event)
 
         ended = any(rental.state is not PodRentalState.LIVE for rental in rentals)
         template = Msg.TEARDOWN_IN_PROGRESS if ended else Msg.RENTAL_STARTED_DURING_RUN
@@ -336,11 +352,29 @@ class GpuUsageCheck:
         actual_score, job_score, warning_message = ctx.services.score_calculator(
             ctx.model_copy(update={"state": state}), ctx.rented
         )
+        last_download_speed: float | None = (state.specs.get("network") or {}).get("ema_verifyx_download_speed")
+        if last_download_speed is not None and last_download_speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+            # VerifyXCheck fails a node under its download-speed floor; the halt skips it, so apply it here.
+            actual_score, job_score = 0.0, 0.0
+            too_slow = (
+                f"Last VerifyX download speed {last_download_speed} Mbps is under the "
+                f"{MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS} Mbps minimum"
+            )
+            warning_message = f"{warning_message} | {too_slow}" if warning_message else f" WARNING: {too_slow}"
+        success: bool = actual_score > 0
+        # The halt skips FinalizeCheck, which would word the outcome from the score the same way.
+        severity: str = "info" if success else "warning"
+        if warning_message:
+            outcome: str = ("No action needed." if success else "Address issues:") + warning_message
+        else:
+            outcome = "No action needed." if success else "Address issues."
         event = render_message(
             template,
             ctx=ctx,
             check_id=self.check_id,
+            severity=severity,
             impact=f"{template.impact}; job score={job_score}, actual score={actual_score}",
+            remediation=f"{outcome} {template.remediation}",
             what={
                 **violation,
                 "pod_containers": rentals,
@@ -357,8 +391,8 @@ class GpuUsageCheck:
                 "score": actual_score,
                 "job_score": job_score,
                 "score_warning": warning_message or None,
-                "success": actual_score > 0,
-                "log_status": "info",
+                "success": success,
+                "log_status": severity,
                 "log_text": event.event,
             },
             halt=True,
@@ -570,6 +604,11 @@ def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
     if closed_at.tzinfo is None:
         closed_at = closed_at.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - closed_at
+
+
+def _describe_process(process: dict) -> str:
+    owner: str = process.get("container_name") or process.get("name") or "a host process"
+    return f"{owner} (pid {process.get('pid')})"
 
 
 def _in_minutes(elapsed: timedelta) -> str:
