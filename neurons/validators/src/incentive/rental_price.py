@@ -299,9 +299,10 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _insufficient_disk(self, result: JobResult) -> InsufficientDisk | None:
+    def _insufficient_disk(self, result: JobResult, log_unmeasured: bool = True) -> InsufficientDisk | None:
         # machine whose disk is below the required margin over its GPU VRAM; None when it
-        # clears the margin or the scrape is unusable
+        # clears the margin or the scrape is unusable. log_unmeasured is False for a node that
+        # is already excluded: "unrented incentive kept" would be false for it
         spec = result.spec
         if not spec:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
@@ -315,11 +316,13 @@ class RentalPriceIncentive(DefaultIncentive):
         except (AttributeError, TypeError, ValueError) as exc:
             # the scrape is produced on the miner's machine, and calculate_mining_scores has no
             # per-result guard: raising here would cost EVERY miner this cycle's weights
-            self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
+            if log_unmeasured:
+                self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
             return None
         if vram_gb <= 0 or disk_gb <= 0:
             # either number missing or zeroed: fail open, nobody loses incentive over telemetry
-            self._log_insufficient_disk_unmeasured(result, "vram or disk missing from the scrape")
+            if log_unmeasured:
+                self._log_insufficient_disk_unmeasured(result, "vram or disk missing from the scrape")
             return None
         # round before comparing, so the numbers the miner is shown are the ones that were compared
         vram_gb = round(vram_gb, 1)
@@ -430,10 +433,10 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _power_cap_incapable(self, result: JobResult) -> PowerCapIncapable | None:
+    def _power_cap_incapable(self, result: JobResult, log_unmeasured: bool = True) -> PowerCapIncapable | None:
         # None whenever the scrape does not PROVE the container cannot cap: a missing or
         # unreadable probe (validator older than DAH-2705, probe error) must never cost a
-        # miner the incentive, so every unknown fails open
+        # miner the incentive, so every unknown fails open. log_unmeasured as in _insufficient_disk
         if result.spec is None:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
             return None
@@ -443,12 +446,14 @@ class RentalPriceIncentive(DefaultIncentive):
         # reading, not a breach. bool is excluded explicitly - it passes isinstance(int)
         # and would otherwise read as uid 1, i.e. "not root", i.e. a penalty.
         if not isinstance(cap_eff, str) or not isinstance(owner_uid, int) or isinstance(owner_uid, bool):
-            self._log_power_cap_unmeasured(result, "cap_eff or nvidiactl owner missing from the scrape")
+            if log_unmeasured:
+                self._log_power_cap_unmeasured(result, "cap_eff or nvidiactl owner missing from the scrape")
             return None
         try:
             capability_mask: int = int(cap_eff, 16)
         except ValueError:
-            self._log_power_cap_unmeasured(result, f"unreadable capability mask: {cap_eff!r}")
+            if log_unmeasured:
+                self._log_power_cap_unmeasured(result, f"unreadable capability mask: {cap_eff!r}")
             return None
         has_sys_admin: bool = bool(capability_mask >> CAP_SYS_ADMIN_BIT & 1)
         if has_sys_admin and owner_uid == NVIDIACTL_ROOT_UID:
@@ -997,9 +1002,10 @@ class RentalPriceIncentive(DefaultIncentive):
         )
         eligible_for_rental_share: bool = idle_pool_candidate and not excluded_from_both_pools
 
-        # Each gate below logs its structured line only while the node is still eligible, so the
-        # shadow numbers read as before: against the flags that were on that cycle. An enforced
-        # gate also runs on a node something else already blocks, to record its reason too.
+        # Each gate below logs its structured line, and its "cannot measure" line, only while the
+        # node is still eligible, so the shadow numbers read as before: against the flags that were
+        # on that cycle. An enforced gate also runs on a node something else already blocks, to
+        # record its reason too.
 
         # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
         # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
@@ -1040,7 +1046,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # stays active). While the flag is off we only log the would-be exclusion (shadow).
         disk_enforced: bool = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
         insufficient_disk = (
-            self._insufficient_disk(job_result)
+            self._insufficient_disk(job_result, log_unmeasured=eligible_for_rental_share)
             if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, disk_enforced)
             else None
         )
@@ -1075,10 +1081,10 @@ class RentalPriceIncentive(DefaultIncentive):
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
         # Last in the chain, so a node already excluded by an ENFORCED gate above is not
-        # measured here - read the shadow numbers against the flags that were on that cycle.
+        # logged here - read the shadow numbers against the flags that were on that cycle.
         power_cap_enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_LIMIT
         power_cap_incapable: PowerCapIncapable | None = (
-            self._power_cap_incapable(job_result)
+            self._power_cap_incapable(job_result, log_unmeasured=eligible_for_rental_share)
             if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, power_cap_enforced)
             else None
         )

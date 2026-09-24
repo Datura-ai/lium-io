@@ -125,24 +125,49 @@ async def test_two_idle_pool_gates_are_both_recorded(monkeypatch):
     assert result.eligible_for_rental_share is False
 
 
+def _logged(caplog, reason: str) -> int:
+    return sum(1 for record in caplog.records if getattr(record.msg, "extra", {}).get("reason") == reason)
+
+
+# (the gate's flag, the node, the reason it records when enforced, the reason its log line carries).
+# The last two are the probes' "cannot measure ...; unrented incentive kept" lines: no reason, and
+# the sentence is false for a node that is already excluded.
+GATE_LOG_CASES = [
+    ("ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", {}, "flagship_without_ncu_or_split", "flagship_without_ncu_or_split"),
+    ("ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", {"gpu_count": 4}, "insufficient_disk_for_vram", "insufficient_disk_for_vram"),
+    (
+        "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT",
+        {"gpu_count": 4, "spec": {"gpu": {"details": []}}},
+        None,
+        "insufficient_disk_unmeasured",
+    ),
+    ("ENABLE_UNRENTED_POWER_CAP_LIMIT", {"gpu_count": 4}, None, "power_cap_capability_unmeasured"),
+]
+
+
 @pytest.mark.asyncio
-async def test_a_shadow_gate_is_not_a_reason_and_logs_nothing_on_a_blocked_node(
-    monkeypatch, caplog, discord_cutoff_passed
+@pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforced"])
+@pytest.mark.parametrize(("flag", "node", "reason", "log_reason"), GATE_LOG_CASES, ids=lambda v: v if isinstance(v, str) else None)
+async def test_a_gate_logs_only_while_the_node_is_still_eligible(
+    monkeypatch, caplog, discord_cutoff_passed, enforced, flag, node, reason, log_reason
 ):
-    # flag off: not a blocking reason; its shadow line keeps counting eligible nodes only
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", False)
+    # the gate lines count eligible nodes only, as before every reason was recorded; an enforced
+    # gate still records its reason on the blocked node
+    monkeypatch.setattr(settings, flag, enforced)
 
     with caplog.at_level(logging.INFO):
-        result = await _incentive().calculate_executor_score(
-            _idle_flagship(provider_discord_connected=False)
+        blocked = await _incentive().calculate_executor_score(
+            _idle_flagship(provider_discord_connected=False, **node)
         )
 
-    assert _codes(result) == ["provider_discord_not_connected"]
-    assert not [
-        record
-        for record in caplog.records
-        if getattr(record.msg, "extra", {}).get("reason") == "flagship_without_ncu_or_split"
-    ]
+    assert _logged(caplog, log_reason) == 0
+    assert _codes(blocked) == ["provider_discord_not_connected"] + ([reason] if enforced and reason else [])
+
+    # the same node, not blocked: the line is there, so the zero above is not a blind caplog
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await _incentive().calculate_executor_score(_idle_flagship(**node))
+    assert _logged(caplog, log_reason) == 1
 
 
 @pytest.mark.asyncio
