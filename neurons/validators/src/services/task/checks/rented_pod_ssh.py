@@ -219,14 +219,17 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
         return False
     backend_accepted_faults = set(verdict.backend_accepted_faults)
     current_faults = set(verdict.faults)
-    keys_only_now = FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (
+    only_keys_unreadable_this_cycle = FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (
         _PORT_FAULTS & current_faults
     )
     if _PORT_FAULTS & backend_accepted_faults:
         # The boot rule reads this cycle's faults too: keys alone and no reboot is the renter's doing.
-        return verdict.boot_id_changed is True if keys_only_now else True
+        return verdict.boot_id_changed is True if only_keys_unreadable_this_cycle else True
     # A keys-only accept covers a keys-only outage, never a later port fault.
-    if FAULT_AUTHORIZED_KEYS_UNREADABLE in backend_accepted_faults and keys_only_now:
+    if (
+        FAULT_AUTHORIZED_KEYS_UNREADABLE in backend_accepted_faults
+        and only_keys_unreadable_this_cycle
+    ):
         return verdict.boot_id_changed is True
     return False
 
