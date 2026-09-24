@@ -86,7 +86,8 @@ def test_hotkey_list_is_parsed_trimmed_and_ignores_blanks(profile_on, monkeypatc
 # --- the dedicated-hotkey rule ----------------------------------------------------------------
 # A miner hotkey names an account, not a person: custodied (wallet-free) provider accounts all list
 # under one shared pool hotkey. That hotkey in the designated list would give every such provider's
-# first pass the profile, so config load refuses the overlap and startup names the unchecked gap.
+# first pass the profile, so config load refuses the overlap, and with the flag on it refuses an
+# empty pool mirror, where the overlap cannot be checked.
 
 POOL_HOTKEY = "lium-pool-hotkey-fixture"
 
@@ -121,16 +122,48 @@ def test_config_load_accepts_dedicated_hotkeys_beside_a_filled_pool_mirror():
     assert s.designated_hotkey_startup_warnings() == []
 
 
+def test_config_load_refuses_the_flag_on_with_an_empty_pool_mirror():
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError, match="LIUM_POOL_HOTKEYS empty"):
+        Settings(
+            _env_file=None,
+            DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True,
+            DESIGNATED_MINER_HOTKEYS=DESIGNATED_HOTKEY,
+            LIUM_POOL_HOTKEYS=" , ",
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "designated"),
+    [
+        (False, DESIGNATED_HOTKEY),  # flag off: the profile is never applied
+        (True, ""),  # flag on, selects nobody
+    ],
+)
+def test_config_load_accepts_an_empty_pool_mirror_when_nobody_takes_the_profile(flag, designated):
+    from core.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
+        DESIGNATED_MINER_HOTKEYS=designated,
+        LIUM_POOL_HOTKEYS="",
+    )
+    assert s.lium_pool_hotkeys() == frozenset()
+
+
 @pytest.mark.parametrize(
     ("flag", "designated", "pool", "expected_fragment"),
     [
         (False, DESIGNATED_HOTKEY, "", None),  # flag off: nothing to say
         (True, "", "", "empty DESIGNATED_MINER_HOTKEYS"),  # on, selects nobody
-        (True, DESIGNATED_HOTKEY, "", "LIUM_POOL_HOTKEYS is empty"),  # on, rule unchecked
         (True, DESIGNATED_HOTKEY, POOL_HOTKEY, None),  # on, rule checked at load
     ],
 )
-def test_startup_warning_names_the_unchecked_dedicated_hotkey_rule(
+def test_startup_warning_names_a_flag_that_selects_nobody(
     monkeypatch, flag, designated, pool, expected_fragment
 ):
     monkeypatch.setattr(settings, "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED", flag)

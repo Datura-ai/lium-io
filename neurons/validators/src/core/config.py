@@ -714,33 +714,33 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_designated_hotkeys(self) -> "Settings":
-        """Refuse a designated hotkey that is also a pool hotkey, flag on or off."""
-        shared = self.designated_miner_hotkeys() & self.lium_pool_hotkeys()
+        """Refuse a designated hotkey that is also a pool hotkey, flag on or off, and refuse the flag
+        on with a designated list but an empty pool mirror, where that overlap cannot be checked."""
+        designated = self.designated_miner_hotkeys()
+        pool = self.lium_pool_hotkeys()
+        shared = designated & pool
         if shared:
             raise ValueError(
                 f"DESIGNATED_MINER_HOTKEYS names {len(shared)} hotkey(s) that are also in "
                 "LIUM_POOL_HOTKEYS; the designated list needs a dedicated hotkey — a pool hotkey is shared "
                 "by every custodied provider account"
             )
+        if self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED and designated and not pool:
+            raise ValueError(
+                "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on with DESIGNATED_MINER_HOTKEYS set and "
+                "LIUM_POOL_HOTKEYS empty; set LIUM_POOL_HOTKEYS to the portal's pool hotkeys so the "
+                "dedicated-hotkey rule can be checked"
+            )
         return self
 
     def designated_hotkey_startup_warnings(self) -> list[str]:
-        """Warnings for a flag that selects nobody, or an empty pool mirror that cannot check the overlap."""
-        if not self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED:
-            return []
-        warnings: list[str] = []
-        if not self.designated_miner_hotkeys():
-            warnings.append(
+        """Warning for a flag that selects nobody."""
+        if self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED and not self.designated_miner_hotkeys():
+            return [
                 "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on with an empty DESIGNATED_MINER_HOTKEYS: "
                 "no node takes the profile"
-            )
-        elif not self.lium_pool_hotkeys():
-            warnings.append(
-                "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on and LIUM_POOL_HOTKEYS is empty: the "
-                "dedicated-hotkey rule is not checked — confirm no designated hotkey is a pool hotkey "
-                "custodied provider accounts list under"
-            )
-        return warnings
+            ]
+        return []
 
     @model_validator(mode="after")
     def validate_rented_pod_ssh_enforce_threshold(self) -> "Settings":
