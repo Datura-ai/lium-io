@@ -1091,9 +1091,10 @@ class MinerService:
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
     async def publish_machine_specs(
-        self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str
+        self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str, *, recheck: bool = False
     ):
-        """Publish machine specs to compute app connector process"""
+        """Publish machine specs to compute app connector process. `recheck` marks the answer to the
+        backend's recheck request, run out of cycle; the backend credits no uptime for it."""
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
@@ -1160,6 +1161,7 @@ class MinerService:
                         "sent_at": time.time(),
                         "batch_total": batch_total,
                         "availability_errors": result.availability_errors,
+                        "recheck": recheck,
                     },
                 )
             except Exception as e:

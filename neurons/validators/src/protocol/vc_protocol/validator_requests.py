@@ -130,6 +130,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # what we saw. The backend keeps the node off the market while the list is not empty and
     # clears it on an empty one. None means the cycle never got to check.
     availability_errors: list[dict[str, Any]] | None = None
+    # The answer to the backend's recheck request, run out of cycle: the backend lifts its hold on a
+    # passing one and credits no uptime for it, since the cycle's own report does that.
+    recheck: bool = False
 
 
 class RentedMachineRequest(BaseValidatorRequest):

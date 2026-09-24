@@ -456,7 +456,7 @@ class ExpressLane:
                     )
                 )
                 return
-            await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
+            await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey, recheck=True)
             result_for_cycle = results[0]
             requested = request.get("requested_at")
             logger.info(

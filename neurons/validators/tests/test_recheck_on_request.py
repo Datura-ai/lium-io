@@ -172,8 +172,10 @@ async def test_a_requested_node_is_rechecked_now_and_published_spec_only(
     assert request["encrypted_files"] is harness.inputs.encrypted_files
     # the probe runs inside its interval: the pass on record predates the failure
     assert await harness.redis_service.redis.get(f"rental_probe_ok:{node}") is None
-    (results, miner_hotkey, _), _ = harness.miner_service.publish_machine_specs.await_args
+    (results, miner_hotkey, _), publish_kwargs = harness.miner_service.publish_machine_specs.await_args
     assert miner_hotkey == MINER and [r.executor_info.uuid for r in results] == [node]
+    # the platform credits no uptime for a recheck: the cycle's own report does
+    assert publish_kwargs == {"recheck": True}
     assert results[0].scored_at is None and results[0].incentive is None
     # a known node: the lane's new-node bookkeeping is untouched, and the portal is not read
     assert await harness.redis_service.get_validated_executors() == set()
@@ -328,6 +330,12 @@ async def test_rechecks_and_new_nodes_share_a_tick_under_their_own_caps(monkeypa
     }
     assert asked == {rechecked: None, new_node: True}
     assert await harness.redis_service.get_validated_executors() == {new_node}
+    # a new node's first report is credited as before; only the recheck carries the marker
+    marked = {
+        c.args[0][0].executor_info.uuid: c.kwargs.get("recheck", False)
+        for c in harness.miner_service.publish_machine_specs.await_args_list
+    }
+    assert marked == {rechecked: True, new_node: False}
 
 
 def _validator(harness: _Harness) -> Validator:

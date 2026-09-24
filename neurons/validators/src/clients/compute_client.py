@@ -352,6 +352,7 @@ class ComputeClient:
                             sent_at=data.get("sent_at"),
                             batch_total=data.get("batch_total"),
                             availability_errors=data.get("availability_errors"),
+                            recheck=bool(data.get("recheck")),
                         )
 
                         async with self.lock:

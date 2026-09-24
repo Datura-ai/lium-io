@@ -48,7 +48,7 @@ async def _bridge_machine_spec(payload: dict[str, Any]) -> ExecutorSpecRequest:
     return client.message_queue[0]
 
 
-async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
+async def _published_payloads(jobs: list[Any], **publish_kwargs: Any) -> list[dict[str, Any]]:
     redis_service = MagicMock()
     redis_service.publish = AsyncMock()
     service = MinerService(
@@ -57,7 +57,7 @@ async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
         redis_service=redis_service,
         attestation_service=MagicMock(),
     )
-    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck")
+    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck", **publish_kwargs)
     return [call.args[1] for call in redis_service.publish.await_args_list]
 
 
@@ -100,6 +100,29 @@ async def test_bridge_tolerates_payload_without_stamps(create_job_result, mock_s
     # Assert
     assert spec.sent_at is None
     assert spec.batch_total is None
+
+
+@pytest.mark.asyncio
+async def test_only_a_recheck_publish_carries_the_recheck_marker(create_job_result, mock_settings) -> None:
+    [cycle_payload] = await _published_payloads([create_job_result()])
+    [recheck_payload] = await _published_payloads([create_job_result()], recheck=True)
+
+    cycle_spec = await _bridge_machine_spec(cycle_payload)
+    recheck_spec = await _bridge_machine_spec(recheck_payload)
+
+    assert cycle_payload["recheck"] is False and cycle_spec.recheck is False
+    assert recheck_payload["recheck"] is True and recheck_spec.recheck is True
+    assert json.loads(recheck_spec.model_dump_json())["recheck"] is True
+
+
+@pytest.mark.asyncio
+async def test_bridge_tolerates_payload_without_recheck_marker(create_job_result, mock_settings) -> None:
+    [payload] = await _published_payloads([create_job_result()])
+    del payload["recheck"]
+
+    spec = await _bridge_machine_spec(payload)
+
+    assert spec.recheck is False
 
 
 @pytest.mark.asyncio
