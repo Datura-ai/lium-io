@@ -5510,6 +5510,32 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "error": str(exc)}),
                             )
                         )
+                    # DAH-3873: a mutable tag (`:prod`) on the host can be an old build. Pull when the
+                    # registry tag moved. When the registry does not answer, use the local image.
+                    if image_present:
+                        auth_config = (
+                            {"username": payload.docker_username, "password": payload.docker_password}
+                            if has_credentials
+                            else None
+                        )
+                        try:
+                            image_present = await docker_client.local_image_is_current(
+                                image=payload.docker_image, auth_config=auth_config
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                _m(
+                                    "Registry digest check failed; using the local image",
+                                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                                )
+                            )
+                        if not image_present:
+                            logger.info(
+                                _m(
+                                    "Local image is older than the registry tag; pulling",
+                                    extra=get_extra_info(default_extra),
+                                )
+                            )
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_IMAGE_INSPECT, prev_timestamp))
                     prev_timestamp = now_ms()
 
