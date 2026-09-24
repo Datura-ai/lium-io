@@ -211,7 +211,8 @@
         "CancelStorageOperationRequest",
         "InstallJupyterServer",
         "ForcedValidationCycleRequest",
-        "GetEstimateRequest"
+        "GetEstimateRequest",
+        "RecheckExecutorRequest"
       ],
       "title": "BackendMessageType",
       "type": "string"
@@ -4158,6 +4159,70 @@
       "title": "PodRentalActiveResponse",
       "type": "object"
     },
+    "RecheckExecutorRequest": {
+      "description": "1.2.0: a rent on this executor just failed for the host's reasons and the backend has closed it\nto new rentals; run its checks now. There is no reply message: the\nvalidator publishes the result as an ordinary spec report, and a passing one lifts the hold. A\nvalidator that does not know the type drops it, and the backend lifts the hold on its own.",
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "RecheckExecutorRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod Id"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id"
+      ],
+      "title": "RecheckExecutorRequest",
+      "type": "object"
+    },
     "RemoveSshPublicKeysRequest": {
       "properties": {
         "container_name": {
@@ -5264,6 +5329,9 @@
     "InstallJupyterServer": {
       "$ref": "#/$defs/InstallJupyterServerRequest"
     },
+    "RecheckExecutorRequest": {
+      "$ref": "#/$defs/RecheckExecutorRequest"
+    },
     "RemoveSshPublicKeysRequest": {
       "$ref": "#/$defs/RemoveSshPublicKeysRequest"
     },
@@ -5300,7 +5368,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.1.0",
+  "protocol_version": "1.2.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
