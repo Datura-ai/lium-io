@@ -143,9 +143,10 @@ def _remediation(state: dict | None, image_ref: str, pull_ref: str, cached: bool
     if not isinstance(state, dict):
         return None
     if "unavailable" in state:
+        why = "the image on the host is stale" if cached else "the image is missing"
         return (
             f"The executor published no pre-pull state ({state['unavailable']}): update the "
-            f"executor, then run `docker pull {pull_ref}` on the host to see why the image is missing."
+            f"executor, then run `docker pull {pull_ref}` on the host to see why {why}."
         )
     record = (state.get("images") or {}).get(image_ref) or {}
     pull_error = record.get("last_pull_error")

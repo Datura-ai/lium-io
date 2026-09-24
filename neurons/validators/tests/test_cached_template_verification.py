@@ -794,6 +794,66 @@ async def test_not_cached_with_no_named_cause_names_the_image_to_pull(context_fa
     assert "<image>" not in result.event.remediation
 
 
+@pytest.mark.asyncio
+async def test_not_cached_with_no_named_cause_names_the_pinned_image_to_pull(
+    context_factory, monkeypatch
+):
+    doc = _prefetch_doc(
+        first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=None, last_outcome="sweep_ok"
+    )
+    ctx = _uncached_ctx(
+        context_factory,
+        monkeypatch,
+        _fake_redis_service(),
+        doc,
+        digests={_IMAGE_REF: _IMAGE_DIGEST},
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert "docker pull daturaai/torch@sha256:aaa`" in result.event.remediation
+
+
+def _mismatch_ctx(context_factory, monkeypatch, prefetch_read):
+    _set_cutoff(monkeypatch, active=True)
+    return context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE]), redis=_fake_redis_service()),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh_seq(_result(stdout=_LOCAL_MISMATCH), prefetch_read),
+    )
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_with_no_named_cause_keeps_its_own_remediation(
+    context_factory, monkeypatch
+):
+    doc = _prefetch_doc(
+        first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=None, last_outcome="sweep_ok"
+    )
+    ctx = _mismatch_ctx(context_factory, monkeypatch, _result(stdout=doc))
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert result.event.remediation == Msg.DIGEST_MISMATCH.remediation
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_without_a_prefetch_document_calls_the_image_stale(
+    context_factory, monkeypatch
+):
+    ctx = _mismatch_ctx(context_factory, monkeypatch, _result(exit_status=1))
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert "to see why the image on the host is stale." in result.event.remediation
+    assert "why the image is missing" not in result.event.remediation
+
+
 def test_cached_template_messages_carry_no_placeholder():
     for template in (Msg.NOT_CACHED, Msg.PENDING, Msg.DIGEST_MISMATCH):
         assert "<" not in (template.remediation or ""), template.reason
@@ -891,3 +951,11 @@ def test_remediation_does_not_quote_an_error_a_later_sweep_moved_past():
 )
 def test_remediation_reads_the_loop_and_disk_outcomes(state, expected):
     assert expected in _remediation(state, _IMAGE_REF, _IMAGE_REF, cached=False)
+
+
+def test_remediation_without_a_prefetch_document_says_why_the_image_fails():
+    missing = _remediation({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=False)
+    stale = _remediation({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=True)
+
+    assert missing.endswith("to see why the image is missing.")
+    assert stale.endswith("to see why the image on the host is stale.")
