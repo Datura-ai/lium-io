@@ -103,13 +103,9 @@ def _matmul_ssh_reason(ctx: Context) -> str | None:
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    if _should_run_verifyx(ctx) and not ctx.config.first_pass:
+    if ctx.config.verifyx_enabled and not ctx.config.first_pass:
         return "scored_ssh"
     return None
-
-
-def _should_run_verifyx(ctx: Context) -> bool:
-    return ctx.config.verifyx_enabled
 
 
 class _NothingToSend(Exception):
@@ -160,7 +156,7 @@ class LocalVerifyCheck:
             )
 
         matmul_ssh_reason = _matmul_ssh_reason(ctx)
-        if matmul_ssh_reason is not None and not _should_run_verifyx(ctx):
+        if matmul_ssh_reason is not None and not ctx.config.verifyx_enabled:
             return self._fallback(
                 ctx, "call", matmul_ssh_reason, "matmul on SSH and VerifyX off: nothing to run"
             )
@@ -221,7 +217,7 @@ class LocalVerifyCheck:
                     if ctx.config.uses_first_pass_matmul_budget
                     else None,
                 )
-            if _should_run_verifyx(ctx):
+            if ctx.config.verifyx_enabled:
                 verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
                     specs,
                     ctx.default_extra,

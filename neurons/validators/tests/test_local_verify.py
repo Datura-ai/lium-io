@@ -1520,6 +1520,41 @@ async def test_designated_hotkey_first_pass_sends_verifyx_with_the_budgeted_matm
 
 
 @pytest.mark.asyncio
+async def test_designated_hotkey_first_pass_budgets_the_matmul_without_the_fast_path(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """With FIRST_PASS_FAST_PATH_ENABLED off, `first_pass` is False and only the profile sizes the
+    matmul; VerifyX off keeps the matmul in the call, so the budget reaches the one-call path."""
+    validation = matmul_service(monkeypatch)
+    prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
+    validation.prepare_matmul_challenge = prepare_matmul
+    async with FakeExecutor(keypair) as executor:
+        ctx = make_context(
+            executor=executor.executor_info,
+            ssh=FakeSSH(),
+            services=build_services(
+                validation=validation,
+                verifyx=verifyx_service,
+                redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
+            ),
+            config=build_context_config(
+                validator_keypair=keypair,
+                first_pass=False,
+                verifyx_enabled=False,
+                designated_hotkey_first_pass=True,
+            ),
+            state=build_state(specs=SPECS),
+        )
+        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert executor.intents[0]["steps"]["verifyx"] is None
+    assert executor.intents[0]["steps"]["matmul"]["cipher_text"]
+    assert (
+        prepare_matmul.call_args.kwargs["vram_budget_mb"] == settings.FIRST_PASS_MATMUL_VRAM_MB
+    )
+    assert local.event.what_we_saw["consumed"] == ["matmul"]
+
+
+@pytest.mark.asyncio
 async def test_provider_node_first_pass_still_sends_verifyx_in_the_one_call(
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):

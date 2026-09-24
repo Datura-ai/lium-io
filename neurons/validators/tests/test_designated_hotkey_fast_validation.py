@@ -2,10 +2,10 @@
 
 Applied ONLY to the FIRST, unscored verification (the express lane's `first_pass=True` call) of an
 executor whose miner hotkey is in DESIGNATED_MINER_HOTKEYS, and only with
-DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED on. Skipped: the collateral read and VerifyX (both deferred
-to the first scored cycle). Resized: the capability matmul (kept, at the first-pass VRAM
-budget). Kept whole: every check that catches a broken node. A provider node — whatever it reports
-about itself — takes today's full pipeline; so does every scored cycle of the designated-hotkey node.
+DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED on. The profile only resizes the capability matmul (kept,
+at the first-pass VRAM budget). The collateral read, VerifyX and every check that catches a broken
+node run and gate as on every pass. A provider node — whatever it reports about itself — takes
+today's full pipeline; so does every scored cycle of the designated-hotkey node.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import Executo
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task import pipeline_factory as pipeline_factory_module
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
-from neurons.validators.src.services.task.checks.collateral import CollateralCheck
 from neurons.validators.src.services.task.checks.gpu_count import GpuCountCheck
 from neurons.validators.src.services.task.checks.gpu_vram_precheck import GpuVramPrecheck
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
@@ -26,7 +25,6 @@ from neurons.validators.src.services.task.checks.rental_verification import Rent
 from neurons.validators.src.services.task.checks.sysbox_required import SysboxRequiredCheck
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import CapabilityMessages as CapMsg
-from neurons.validators.src.services.task.messages import CollateralMessages as ColMsg
 from neurons.validators.src.services.task.messages import GpuCountMessages as GpuCountMsg
 from neurons.validators.src.services.task.messages import PortCountMessages as PortMsg
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as RentMsg
@@ -46,9 +44,22 @@ from tests.helpers import (
     make_context,
 )
 from tests.test_capability_check import DummyValidationService
-from tests.test_collateral_check import DummyCollateralService
 from tests.test_rental_verification_check import DummyBackendClient
 from tests.test_verifyx_check import DummyVerifyXService
+
+# lium-io#1440 removes the validator collateral check; these tests then skip instead of failing.
+try:
+    from neurons.validators.src.services.task.checks.collateral import CollateralCheck
+    from neurons.validators.src.services.task.messages import CollateralMessages as ColMsg
+    from tests.test_collateral_check import DummyCollateralService
+
+    HAS_COLLATERAL = True
+except ImportError:
+    HAS_COLLATERAL = False
+
+needs_collateral = pytest.mark.skipif(
+    not HAS_COLLATERAL, reason="the validator collateral check is removed"
+)
 
 # fixture names, not keys: the profile compares the authenticated miner hotkey string as-is
 DESIGNATED_HOTKEY = "designated-hotkey-fixture-1"
@@ -265,7 +276,7 @@ async def test_build_context_marks_the_designated_hotkey_first_pass(profile_on, 
     monkeypatch.setattr(pipeline_factory_module, "Context", lambda **kw: SimpleNamespace(**kw))
     ctx = await _build_context(DESIGNATED_HOTKEY, first_pass=True)
     assert ctx.config.designated_hotkey_first_pass is True
-    # independent of DAH-3011's flag: FIRST_PASS_FAST_PATH_ENABLED is off here and the profile is whole
+    # independent of FIRST_PASS_FAST_PATH_ENABLED: it is off here and the profile is whole
     assert ctx.config.first_pass is False
 
 
@@ -329,8 +340,8 @@ def test_the_check_list_is_the_same_for_every_node():
         "GpuUsageCheck",
         "CapabilityCheck",
         "RentalVerificationCheck",
-        "CollateralCheck",
         "VerifyXCheck",
+        *(("CollateralCheck",) if HAS_COLLATERAL else ()),
     ):
         assert kept in ids
 
@@ -338,9 +349,7 @@ def test_the_check_list_is_the_same_for_every_node():
 # --- kept step: collateral --------------------------------------------------------------------
 
 
-def _collateral_ctx(
-    context_factory, designated: bool, service: DummyCollateralService, enable_no_collateral=False
-):
+def _collateral_ctx(context_factory, designated: bool, service, enable_no_collateral=False):
     specs = {"gpu": {"count": 8, "details": [{"name": "NVIDIA B300 SXM6 AC"}]}}
     return context_factory(
         services=build_services(collateral=service),
@@ -352,6 +361,7 @@ def _collateral_ctx(
     )
 
 
+@needs_collateral
 @pytest.mark.asyncio
 async def test_designated_hotkey_first_pass_still_reads_collateral(context_factory):
     service = DummyCollateralService(deposited=False, error="no bond", contract_version="1.0.2")
@@ -364,6 +374,7 @@ async def test_designated_hotkey_first_pass_still_reads_collateral(context_facto
     assert service.called_with is not None
 
 
+@needs_collateral
 @pytest.mark.asyncio
 async def test_provider_node_still_pays_the_collateral_read(context_factory):
     service = DummyCollateralService(deposited=False, error="no bond", contract_version="1.0.2")
@@ -416,7 +427,7 @@ async def test_provider_node_still_runs_verifyx(context_factory):
 
 @pytest.mark.asyncio
 async def test_verifyx_disabled_wins_over_the_profile(context_factory):
-    """Nothing new is run when VerifyX is off fleet-wide; the profile only ever removes work."""
+    """VerifyX off fleet-wide stays off on the profile."""
     service = DummyVerifyXService(success=True)
     ctx = context_factory(
         services=build_services(verifyx=service),
@@ -458,7 +469,7 @@ async def test_designated_hotkey_first_pass_keeps_the_matmul_at_the_first_pass_b
 ):
     monkeypatch.setattr(
         settings, "FIRST_PASS_FAST_PATH_ENABLED", False
-    )  # the profile does not need DAH-3011's flag
+    )  # the profile does not need FIRST_PASS_FAST_PATH_ENABLED
     service = _SizingAwareValidationService(success=True)
     result = await CapabilityCheck().run(
         _capability_ctx(context_factory, designated=True, service=service)
@@ -591,34 +602,45 @@ def _score_ctx(
     )
 
 
+@pytest.fixture
+def collateral_required(monkeypatch):
+    if HAS_COLLATERAL:
+        monkeypatch.setattr(settings, "ENABLE_NO_COLLATERAL", False)
+
+
 @pytest.mark.parametrize("designated", [True, False])
 @pytest.mark.parametrize(
     "specs,collateral_deposited,fragment",
     [
         ({"network": {"download_speed": 812.5}}, True, "unavailable"),
-        ({"network": {"ema_verifyx_download_speed": 500.0}}, False, "Collateral required"),
+        pytest.param(
+            {"network": {"ema_verifyx_download_speed": 500.0}},
+            False,
+            "Collateral required",
+            marks=needs_collateral,
+        ),
     ],
 )
 def test_designated_hotkey_first_pass_keeps_the_verifyx_and_collateral_gates(
-    monkeypatch, designated, specs, collateral_deposited, fragment
+    collateral_required, designated, specs, collateral_deposited, fragment
 ):
-    monkeypatch.setattr(settings, "ENABLE_NO_COLLATERAL", False)
     ctx = _score_ctx(designated, specs, collateral_deposited=collateral_deposited)
     actual, job, warning = calculate_scores(ctx, rented=False)
     assert (actual, job) == (0.0, 0.0)
     assert fragment in warning
 
 
-def test_provider_node_without_verifyx_ema_scores_zero(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_NO_COLLATERAL", False)
+def test_provider_node_without_verifyx_ema_scores_zero(collateral_required):
     ctx = _score_ctx(False, {"network": {"download_speed": 812.5}}, collateral_deposited=False)
     actual, job, warning = calculate_scores(ctx, rented=False)
     assert (actual, job) == (0.0, 0.0)
     assert "unavailable" in warning
 
 
-def test_provider_node_without_collateral_scores_zero_when_collateral_is_required(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_NO_COLLATERAL", False)
+@needs_collateral
+def test_provider_node_without_collateral_scores_zero_when_collateral_is_required(
+    collateral_required,
+):
     ctx = _score_ctx(
         False, {"network": {"ema_verifyx_download_speed": 500.0}}, collateral_deposited=False
     )
