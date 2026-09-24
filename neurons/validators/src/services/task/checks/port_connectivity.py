@@ -62,6 +62,8 @@ class PortConnectivityCheck:
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
         }
+        if result.dind_error:
+            extra_info["dind_error"] = result.dind_error.text
         updated_state = replace(
             ctx.state,
             specs={
@@ -72,6 +74,7 @@ class PortConnectivityCheck:
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
+            dind_probe_error=result.dind_error,
         )
 
         if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
