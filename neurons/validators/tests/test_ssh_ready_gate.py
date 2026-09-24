@@ -420,8 +420,8 @@ async def test_enforce_fails_when_port_accepts_but_sends_no_banner(svc, monkeypa
 
 @pytest.mark.asyncio
 async def test_a_delete_during_the_grace_ends_the_create_as_cancelled_by_delete(svc, monkeypatch):
-    """Review (lium-io#1467): a renter's delete mid-grace must end the create as the renter's cancel, within
-    one poll, not as an `ssh_ready` failure the platform would count against the node."""
+    """A renter's delete mid-grace must end the create as the renter's cancel, within one poll, not as an
+    `ssh_ready` failure the platform would count against the node."""
     _patch_happy(svc, monkeypatch, _ssh_client())
     _set_mode(monkeypatch, "enforce")
     clock = _FakeClock()

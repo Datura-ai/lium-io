@@ -744,8 +744,8 @@ async def test_create_payload_is_what_a_renter_gets():
 
 @pytest.mark.asyncio
 async def test_the_probes_create_is_not_ssh_ready_gated(monkeypatch):
-    """Review (lium-io#1467): with RENTAL_PROBE_ENABLED and SSH_READY_GATE_MODE=enforce both on, the gate would
-    cut the probe's sshd allowance from RENTAL_PROBE_SSH_DEADLINE_SECONDS to its own grace, hold the create
+    """With RENTAL_PROBE_ENABLED and SSH_READY_GATE_MODE=enforce both on, the gate would cut the probe's
+    sshd allowance from RENTAL_PROBE_SSH_DEADLINE_SECONDS to its own grace, hold the create
     lock through the wait, and record a silent sshd as a container_start failure. The probe waits itself."""
     monkeypatch.setattr(core_settings, "SSH_READY_GATE_MODE", "enforce")
     ctx, docker, _ = make_probe_context()
