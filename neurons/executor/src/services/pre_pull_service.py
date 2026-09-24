@@ -368,10 +368,11 @@ class PrePuller:
             since = record.setdefault("unlisted_since", now)
             if after > 0 and now - since >= after:
                 due.append(image_ref)
-        if not due or await asyncio.to_thread(rental_activity, self.client):
-            return
         for image_ref in due:
-            # Re-read per image: the loop may have made it mandatory while docker was busy.
+            # Both re-checked per image: a rental may start, or the loop may make the image
+            # mandatory, while docker removes the previous one.
+            if await asyncio.to_thread(rental_activity, self.client):
+                return
             if image_ref in self.protected:
                 continue
             record = self.state.images[image_ref]

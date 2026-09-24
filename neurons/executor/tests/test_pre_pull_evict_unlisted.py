@@ -188,6 +188,24 @@ def test_busy_node_keeps_the_image_until_idle(tmp_path, clock):
     assert client.removed == [OLD_REF, f"{REPO}@{DIGEST_OLD}"]
 
 
+def test_rental_starting_mid_eviction_stops_it(tmp_path, clock):
+    client = _client()
+    puller = _puller(tmp_path, client, {OLD_REF: DIGEST_OLD, CUDA_REF: DIGEST_CUDA})
+    rental = MagicMock(status="created")
+    rental.name = "pod_abc"
+    _sweep(puller, [])
+    clock.now += DAY
+
+    def remove_then_rental_starts(ref):
+        client.removed.append(ref)
+        client.containers.list.return_value = [rental]
+
+    client.images.remove.side_effect = remove_then_rental_starts
+    _sweep(puller, [])
+
+    assert len(puller.state.images) == 1
+
+
 def test_image_made_mandatory_during_eviction_is_kept(tmp_path, clock, monkeypatch):
     """The loop may publish a new mandatory set while eviction waits on docker."""
     client = _client()
