@@ -374,9 +374,17 @@ class FileEncryptService:
             'dh_write_probe': "",
         }
 
-        # Generate dictionary key mapping on validator side
-        for key, value in all_keys.items():
-            all_keys[key] = self.generate_random_name()
+        # Generate dictionary key mapping on validator side. Names must be unique: the validator
+        # reverses this map to read the scrape, and a shared name keeps only one of its keys.
+        # A later str.replace can never match inside a name ("_" + letters) because every key has
+        # a character other than a letter after its first one.
+        used_names: set[str] = set()
+        for key in all_keys:
+            name = self.generate_random_name()
+            while name in used_names:
+                name = self.generate_random_name()
+            used_names.add(name)
+            all_keys[key] = name
 
         encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
