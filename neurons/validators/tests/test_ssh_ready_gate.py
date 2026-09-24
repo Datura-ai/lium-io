@@ -446,7 +446,8 @@ async def test_a_delete_during_the_grace_ends_the_create_as_cancelled_by_delete(
 
 @pytest.mark.asyncio
 async def test_enforce_gates_the_validator_bootstrap_path_too(svc, monkeypatch):
-    """Every create is gated, not only images that start their own sshd."""
+    """Every create is gated, not only images that start their own sshd: a renter image whose sshd the
+    validator installed and started must answer too."""
     _patch_happy(svc, monkeypatch, _ssh_client())
     _set_mode(monkeypatch, "enforce")
     clock = _FakeClock()
@@ -502,6 +503,32 @@ async def test_log_mode_probe_error_never_escapes(svc, monkeypatch):
         for c in mock_logger.warning.call_args_list
         if c.args
     )
+
+
+@pytest.mark.asyncio
+async def test_enforce_logs_instead_when_the_validators_sshd_install_failed(svc, monkeypatch):
+    """The validator's sshd install into a renter image is best-effort (no package manager, a Jupyter- or
+    HTTP-only image); such rents reached RUNNING before the gate, so enforce measures them and never fails them."""
+    _patch_happy(svc, monkeypatch, _ssh_client())
+    monkeypatch.setattr(
+        svc,
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
+        AsyncMock(return_value=False),
+    )
+    _set_mode(monkeypatch, "enforce")
+    clock = _FakeClock()
+    _patch_wait(monkeypatch, _probe_ready_after(clock, float("inf")), clock)
+    mock_logger = Mock()
+    monkeypatch.setattr(ds_module, "logger", mock_logger)
+
+    result = await _run(svc, _payload(ships_sshd=None))
+
+    assert isinstance(result, ContainerCreated)
+    assert ProfilerStepName.SSH_READY not in {p.name for p in result.profilers}
+    await asyncio.gather(*list(ds_module._SSH_READY_LOG_TASKS))
+    (line,) = _gate_lines(mock_logger, "warning")
+    assert line.extra["ssh_ready_mode"] == "log"
+    assert line.extra["ssh_bootstrap_ok"] is False
 
 
 @pytest.mark.asyncio

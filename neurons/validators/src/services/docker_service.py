@@ -6066,6 +6066,7 @@ class DockerService:
                         raise explained from keys_exc
 
                     current_step = "ssh_bootstrap"
+                    ssh_bootstrap_ok = True
                     if image_manages_services:
                         # DAH-2265: the default image / cached template ships and
                         # starts sshd itself (its start.sh runs `service ssh start`
@@ -6084,11 +6085,13 @@ class DockerService:
                             )
                         )
                     else:
-                        await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
+                        ssh_bootstrap_ok = bool(
+                            await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                                docker_client=docker_client,
+                                container_name=container_name,
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                            )
                         )
 
                     jupyter_url = None
@@ -6148,7 +6151,12 @@ class DockerService:
                         **default_extra,
                         "container_name": container_name,
                         "image_manages_services": image_manages_services,
+                        "ssh_bootstrap_ok": ssh_bootstrap_ok,
                     }
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and not ssh_bootstrap_ok:
+                        # The validator's own sshd install is best-effort and such rents reached RUNNING
+                        # before the gate (Jupyter- or HTTP-only use): measure them, never fail them.
+                        ssh_ready_mode = SshReadyMode.LOG
                     if ssh_ready_mode is not SshReadyMode.OFF and ssh_external_port is None:
                         logger.warning(
                             _m("SSH ready gate skipped: no port maps to 22", extra=get_extra_info(ssh_ready_extra))
