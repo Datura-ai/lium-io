@@ -81,7 +81,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 4000 Ada Generation": {},
     "RTX 6000 Ada Generation": {1: 10, 8: 64},
     "RTX PRO 6000": {1: 10, 8: 64},
-    "L4": {},
+    "L4": {1: 10, 8: 64},  # TEST ONLY (DAH-2329 temp-dev e2e): let the copy L4 node earn idle pay
     "L40S": {1: 10, 8: 64},
     "L40": {1: 10, 8: 64},
     "RTX 2000 Ada Generation": {},
