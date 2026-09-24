@@ -334,13 +334,13 @@ def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | 
     """Why this cycle's VerifyX sample must not move the published EMA, or None.
 
     A cycle that a check other than VerifyX failed, or that ran while the node's recommended image
-    was not on disk yet, measured the link while the node was not in service: the executor's
-    mandatory pre-pull of that image, tens of GB, is the usual cause of both and shares the link.
+    was not on disk yet, measured the link of a node that is not in service; the executor's
+    mandatory pre-pull of that image, tens of GB, is a likely cause of both and shares the link.
     With alpha 0.5 one such sample weighs half of the next cycle's verdict: a node seeded by a cycle
     that failed the cached-image check read 86.7 against the 100 gate one batch later, and passed
-    the cycle after that. Holding the EMA leaves a never-measured node never-measured, so its next cycle gets the
-    DAH-2959 cold-sample retry and bootstraps from a sample taken in service. A cycle that VerifyX
-    itself failed still moves the EMA: that is the gate working.
+    the cycle after that. Holding the EMA leaves a never-measured node never-measured, so its next
+    cycle gets the DAH-2959 cold-sample retry and bootstraps from a sample taken in service. A cycle
+    that VerifyX itself failed still moves the EMA: that is the gate working.
     """
     if failed_check_id and failed_check_id != VerifyXCheck.check_id:
         return f"cycle failed {failed_check_id}"
