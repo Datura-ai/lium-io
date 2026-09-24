@@ -47,7 +47,7 @@ RETRY_SECONDS = 120
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def _publishable_batch_id(cycle_batch_id: str) -> str:
+def _cycle_batch_id_or_clock(cycle_batch_id: str) -> str:
     """The cycle's id, or the clock when the cycle could not read its block time
     (SubtensorClient.get_time_from_block gives "Unknown"): the backend's write of a spec whose id
     does not parse fails before it lists the node, and a node checked ahead of the cycle must
@@ -204,8 +204,8 @@ class ExpressLane:
                 if executor.id in in_flight or pending.not_before > now:
                     continue
                 # The wave has not received this miner's list yet (a cycle started seconds ago):
-                # wait a tick, no attempt spent. See MinerService.awaiting_wave_list.
-                if miner_hotkey in self.miner_service.awaiting_wave_list:
+                # wait a tick, no attempt spent. See MinerService.miners_awaiting_wave_list.
+                if miner_hotkey in self.miner_service.miners_awaiting_wave_list:
                     continue
                 candidates.append(pending)
 
@@ -273,7 +273,7 @@ class ExpressLane:
             if pending.executor.id in in_flight:
                 # The wave accepted it during the awaits above; it publishes it at the wave's end.
                 continue
-            if pending.miner_hotkey in self.miner_service.awaiting_wave_list:
+            if pending.miner_hotkey in self.miner_service.miners_awaiting_wave_list:
                 # A cycle started during the awaits above and its wave has not listed this miner.
                 continue
             miner = miners.get(pending.miner_hotkey)
@@ -311,7 +311,7 @@ class ExpressLane:
             payload = MinerJobRequestPayload(
                 # The cycle whose job files this run uses, even when the next cycle starts
                 # before it publishes: that cycle's wave may publish the node under its own id.
-                job_batch_id=_publishable_batch_id(inputs.job_batch_id),
+                job_batch_id=_cycle_batch_id_or_clock(inputs.job_batch_id),
                 miner_hotkey=miner.hotkey,
                 miner_coldkey=miner.coldkey,
                 miner_address=miner.axon_info.ip,
@@ -390,7 +390,7 @@ class ExpressLane:
         executor_id = pending.executor.id
         # One node under the cycle's id: never the miner's batch for that id, the wave's is.
         await self.miner_service.publish_machine_specs(
-            results, miner.hotkey, miner.coldkey, miner_batch=False
+            results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
         )
         try:
             await self.redis_service.mark_executors_validated([executor_id])

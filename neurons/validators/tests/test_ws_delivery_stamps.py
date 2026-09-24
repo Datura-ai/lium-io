@@ -80,7 +80,7 @@ async def test_a_spec_that_is_not_the_miners_batch_sets_no_batch_total(
 ) -> None:
     # The backend takes the expected count once per (validator, job_batch_id, miner), from the
     # first spec: an express spec under the cycle's id arrives before the wave's.
-    payloads = await _published_payloads([create_job_result()], miner_batch=False)
+    payloads = await _published_payloads([create_job_result()], is_whole_miner_batch=False)
 
     assert [payload["batch_total"] for payload in payloads] == [None]
 

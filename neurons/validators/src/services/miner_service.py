@@ -240,18 +240,18 @@ class MinerService:
         # list yet. The express lane publishes under the cycle's job_batch_id; it waits for the
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it. Stays empty with the flag off.
-        self.awaiting_wave_list: dict[str, str] = {}
+        self.miners_awaiting_wave_list: dict[str, str] = {}
 
-    def expect_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
+    def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
         if settings.EXPRESS_LANE_ENABLED:
-            self.awaiting_wave_list = {hotkey: job_batch_id for hotkey in miner_hotkeys}
+            self.miners_awaiting_wave_list = {hotkey: job_batch_id for hotkey in miner_hotkeys}
 
-    def _wave_list_settled(self, payload: MinerJobRequestPayload) -> None:
+    def _stop_awaiting_wave_list(self, payload: MinerJobRequestPayload) -> None:
         """The wave has this miner's list, or its request ended without one. An older wave's
         request that outlived its cycle leaves the current wave's entry alone."""
-        if self.awaiting_wave_list.get(payload.miner_hotkey) == payload.job_batch_id:
-            del self.awaiting_wave_list[payload.miner_hotkey]
+        if self.miners_awaiting_wave_list.get(payload.miner_hotkey) == payload.job_batch_id:
+            del self.miners_awaiting_wave_list[payload.miner_hotkey]
 
     def _claim_for_cycle(
         self,
@@ -265,7 +265,7 @@ class MinerService:
         that no cycle has published yet, so a long-known executor's scoring is untouched.
         Flag off: list returned as is.
         """
-        self._wave_list_settled(payload)
+        self._stop_awaiting_wave_list(payload)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -349,7 +349,7 @@ class MinerService:
         first_pass: bool = False,
     ):
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
-        (unreachable, refused, timed out) settles its awaiting_wave_list entry too."""
+        (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
         try:
             return await self._route_job_to_miner(
                 payload,
@@ -362,7 +362,7 @@ class MinerService:
             )
         finally:
             if executor_id is None:
-                self._wave_list_settled(payload)
+                self._stop_awaiting_wave_list(payload)
 
     async def _route_job_to_miner(
         self,
@@ -1100,13 +1100,14 @@ class MinerService:
         miner_hotkey: str,
         miner_coldkey: str,
         *,
-        miner_batch: bool = True,
+        is_whole_miner_batch: bool = True,
     ):
         """Publish machine specs to compute app connector process.
 
-        `miner_batch` False leaves `batch_total` unset: the backend's delivery metrics (DAH-2792)
-        take a miner's expected spec count from the first spec per (validator, job_batch_id,
-        miner), so a spec that is not the miner's whole batch for that id must not set it.
+        `is_whole_miner_batch` False leaves `batch_total` unset: the backend's delivery metrics
+        (DAH-2792) take a miner's expected spec count from the first spec per (validator,
+        job_batch_id, miner), so a spec that is not the miner's whole batch for that id must not
+        set it.
         """
         default_extra = {
             "miner_hotkey": miner_hotkey,
@@ -1129,7 +1130,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
-        batch_total = len(results) if miner_batch else None
+        batch_total = len(results) if is_whole_miner_batch else None
         for result in results:
             try:
                 await self.redis_service.publish(
