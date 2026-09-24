@@ -28,6 +28,7 @@ from services.task.checks import registry_pull as module
 from services.task.checks.registry_pull import (
     REGISTRY_PULL_IMAGE,
     REGISTRY_PULL_SCRIPT,
+    DockerHubAnswer,
     RegistryPullCheck,
     classify_pull_error,
     parse_pull_probe,
@@ -81,8 +82,10 @@ REJECTED = (
     f"lium_pull driver=overlayfs mirrors=[]\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=0\n"
     f"{REJECTED_TEXTS['tcp-reset']}\n"
 )
-HUB_UP = (True, "HTTP 401")
-HUB_DOWN = (False, "ClientConnectorError: Cannot connect to host registry-1.docker.io:443")
+HUB_UP = DockerHubAnswer(True, "HTTP 401")
+HUB_DOWN = DockerHubAnswer(
+    False, "ClientConnectorError: Cannot connect to host registry-1.docker.io:443"
+)
 
 
 def result(
@@ -211,7 +214,7 @@ def flags(
     phases: dict[str, float] = {}
     phase = patch.object(
         module,
-        "pull_phase_seconds",
+        "scheduled_pull_offset_seconds",
         lambda uuid: phases.setdefault(uuid, clock.now % (interval_hours * 3600)),
     )
     with (
@@ -679,10 +682,10 @@ async def test_the_command_is_the_script_under_sh():
     assert REGISTRY_PULL_IMAGE in runner.commands[0]
 
 
-def test_pipeline_runs_the_check_after_the_scrape_rule_and_before_the_rented_halt():
+def test_pipeline_runs_the_check_after_the_port_checks_and_before_the_rented_halt():
     ids = [check.check_id for check in PipelineFactory.build_checks()]
     index = ids.index(RegistryPullCheck.check_id)
-    assert ids[index - 1] == "executor.validate.outbound_internet"
+    assert ids[index - 1] == "executor.validate.port_count"
     assert index < ids.index("executor.validate.rented_state")
     dry = [c.check_id for c in PipelineFactory.build_dry_run_checks()]
     assert RegistryPullCheck.check_id not in dry
@@ -739,7 +742,7 @@ async def test_a_failed_pull_while_docker_hub_is_down_from_the_validator_is_no_v
         what = res.event.what_we_saw
         assert what["failures_in_a_row"] == 0 and what["no_verdict"] == "docker_hub_down"
         assert what["pull"]["outcome"] == "timeout"
-        assert what["guard"]["docker_hub_control"]["reachable"] is False
+        assert what["docker_hub_control"]["reachable"] is False
     assert hub.calls == 2
 
 
@@ -773,11 +776,28 @@ async def test_with_docker_hub_up_a_node_whose_mirror_fails_still_counts():
         first, second = await _confirming(check, ctx, clock)
     assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
     assert second.passed is False and second.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
-    guard = second.event.what_we_saw["guard"]
-    assert guard == {"docker_hub_control": {"at": clock.now, "reachable": True, "seen": "HTTP 401"}}
+    hub_control = second.event.what_we_saw["docker_hub_control"]
+    assert hub_control == {"at": clock.now, "reachable": True, "seen": "HTTP 401"}
     assert "no_verdict" not in second.event.what_we_saw
     # 30 minutes apart: each failed pull has a control reading of its own
     assert hub.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_the_docker_hub_control_survives_the_redis_round_trip_to_a_cycle_that_does_not_pull():
+    ctx, runner, _ = make_ctx(result(MIRROR_DNS_TIMEOUT))
+    check = RegistryPullCheck()
+    with flags(hub=FakeHub(HUB_UP)) as clock:
+        await check.run(ctx)
+        pulled_at = clock.now
+        clock.now += 60
+        not_due = await check.run(ctx)
+    assert len(runner.commands) == 1
+    assert not_due.event.what_we_saw["last"]["docker_hub_control"] == {
+        "at": pulled_at,
+        "reachable": True,
+        "seen": "HTTP 401",
+    }
 
 
 @pytest.mark.asyncio
@@ -848,7 +868,7 @@ async def test_a_pull_that_fails_as_docker_hub_goes_down_under_it_is_no_verdict(
     assert hub.calls == 2
     assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason
     assert res.event.what_we_saw["failures_in_a_row"] == 0
-    assert res.event.what_we_saw["guard"]["docker_hub_control"]["at"] == clock.now
+    assert res.event.what_we_saw["docker_hub_control"]["at"] == clock.now
 
 
 @pytest.mark.asyncio
@@ -1094,10 +1114,12 @@ async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(straggler
 def test_the_phase_is_stable_per_node_and_spreads_the_fleet_over_the_interval():
     with flags(phase_at_start=False):
         interval = 6 * 3600
-        phase = module.pull_phase_seconds("00000000-0000-4000-8000-000000000001")
-        assert phase == module.pull_phase_seconds("00000000-0000-4000-8000-000000000001")
+        phase = module.scheduled_pull_offset_seconds("00000000-0000-4000-8000-000000000001")
+        assert phase == module.scheduled_pull_offset_seconds("00000000-0000-4000-8000-000000000001")
         assert 0 <= phase < interval
-        hours = Counter(int(module.pull_phase_seconds(f"exec-{i}") // 3600) for i in range(600))
+        hours = Counter(
+            int(module.scheduled_pull_offset_seconds(f"exec-{i}") // 3600) for i in range(600)
+        )
     assert sorted(hours) == [0, 1, 2, 3, 4, 5]
     assert all(70 <= count <= 130 for count in hours.values()), hours
 

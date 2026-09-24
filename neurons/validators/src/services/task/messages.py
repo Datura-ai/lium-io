@@ -1034,37 +1034,6 @@ class OutboundInternetMessages:
         impact="Score set to 0",
         remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
     )
-    # the scrape's speed tests measured neither direction: a signal, never a fail (a Cloudflare 429 reads
-    # the same); the registry pull and the rental probe's egress step decide
-    OUTBOUND_INTERNET_NO_SPEED = MessageTemplate(
-        event="The scrape's speed tests measured neither download nor upload",
-        reason="OUTBOUND_INTERNET_NO_SPEED",
-        severity="info",
-        category="runtime",
-        impact="Proceed",
-    )
-    OUTBOUND_INTERNET_OK = MessageTemplate(
-        event="Outbound internet verified",
-        reason="OUTBOUND_INTERNET_OK",
-        severity="info",
-        category="runtime",
-        impact="Proceed",
-    )
-    # the scrape ran no speed test (lium-io#1419's `network: {}`): neither verified nor a finding
-    OUTBOUND_INTERNET_UNMEASURED = MessageTemplate(
-        event="Outbound internet not measured: the scrape ran no speed test",
-        reason="OUTBOUND_INTERNET_UNMEASURED",
-        severity="info",
-        category="runtime",
-        impact="Proceed",
-    )
-    SKIPPED = MessageTemplate(
-        event="Outbound internet check skipped",
-        reason="OUTBOUND_INTERNET_SKIPPED",
-        severity="info",
-        category="runtime",
-        impact="Proceed",
-    )
 
 
 REGISTRY_PULL_REMEDIATION = (

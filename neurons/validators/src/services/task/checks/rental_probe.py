@@ -1203,7 +1203,7 @@ class _Login:
     command_seconds: float = 0.0
     egress_attempted: bool = False
     egress_error: str | None = None
-    egress_result: Any = None
+    egress_result: asyncssh.SSHCompletedProcess | None = None
     egress_seconds: float = 0.0
     # the no_egress reading the re-run replaced
     egress_first_reading: str | None = None
@@ -1272,18 +1272,7 @@ async def _login_and_list_gpus(
             )
             login.command_seconds = time.perf_counter() - command_started
             if egress:
-                login.egress_attempted = True
-                egress_started = time.perf_counter()
-                try:
-                    login.egress_result = await _run_egress_script(conn)
-                    first = parse_egress_probe(login.egress_result.stdout or "")
-                    if first.verdict == "no_egress":
-                        # one transient miss is not a verdict: the second run decides
-                        login.egress_first_reading = first.summary()
-                        login.egress_result = await _run_egress_script(conn)
-                except (TimeoutError, asyncssh.Error, OSError) as exc:
-                    login.egress_error = repr(exc)
-                login.egress_seconds = time.perf_counter() - egress_started
+                await _run_egress_script_rerun_once_on_no_egress(conn, login)
     except (TimeoutError, asyncssh.Error, OSError) as exc:
         if not login.egress_attempted:
             login.command_error = repr(exc)
@@ -1294,7 +1283,24 @@ async def _login_and_list_gpus(
     return login
 
 
-async def _run_egress_script(conn: Any) -> Any:
+async def _run_egress_script_rerun_once_on_no_egress(
+    conn: asyncssh.SSHClientConnection, login: _Login
+) -> None:
+    """Fill the login's egress fields; one transient miss is not a verdict, so a no_egress run is re-run."""
+    login.egress_attempted = True
+    egress_started = time.perf_counter()
+    try:
+        login.egress_result = await _run_egress_script(conn)
+        first = parse_egress_probe(login.egress_result.stdout or "")
+        if first.verdict == "no_egress":
+            login.egress_first_reading = first.summary()
+            login.egress_result = await _run_egress_script(conn)
+    except (TimeoutError, asyncssh.Error, OSError) as exc:
+        login.egress_error = repr(exc)
+    login.egress_seconds = time.perf_counter() - egress_started
+
+
+async def _run_egress_script(conn: asyncssh.SSHClientConnection) -> asyncssh.SSHCompletedProcess:
     return await conn.run(
         f"sh -c {shlex.quote(EGRESS_PROBE_SCRIPT)}",
         check=False,

@@ -8,8 +8,8 @@ import math
 import re
 import shlex
 import time
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal, NamedTuple
 
 import aiohttp
 
@@ -19,7 +19,6 @@ from core.utils import _m, get_extra_info
 from ..messages import RegistryPullMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .outbound_internet import _is_rented
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,7 @@ NoVerdict = Literal["docker_hub_down"]
 # 30 s is the verdict's bound. Exit 0 always: the marker lines are the answer.
 # The first line carries the image store next to the mirrors: `.Driver` is overlayfs on the containerd store
 # (Docker 29's default for a new install) and overlay2 on the classic store a host upgraded from 28 keeps.
-# The two pay a mirror's DNS wait differently (see REGISTRY_PULL_TIMEOUT_SECONDS and _IMAGE_STORES).
+# The two pay a mirror's DNS wait differently (see REGISTRY_PULL_TIMEOUT_SECONDS and _IMAGE_STORE_BY_DRIVER).
 REGISTRY_PULL_SCRIPT = (
     f"img={REGISTRY_PULL_IMAGE}; d=/usr/bin/docker; "
     'bounded() { s=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout -k 5 "$s" "$@"; '
@@ -137,7 +136,7 @@ _TIMEOUT_MARKERS = (
 # time out costs 10-20 s per registry request (72 s for hello-world unbounded), so the 30 s bound fails it;
 # on the classic store it costs about 20 s once per pull, so the probe passes at about 20 s, and that is
 # right: a template pulls in about 22 s there too
-_IMAGE_STORES = {"overlayfs": "containerd", "overlay2": "classic"}
+_IMAGE_STORE_BY_DRIVER = {"overlayfs": "containerd", "overlay2": "classic"}
 
 
 @dataclass(frozen=True)
@@ -158,7 +157,7 @@ class PullReading:
 
     @property
     def image_store(self) -> str | None:
-        return _IMAGE_STORES.get(self.driver or "")
+        return _IMAGE_STORE_BY_DRIVER.get(self.driver or "")
 
     def as_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {"outcome": self.outcome, "image": REGISTRY_PULL_IMAGE}
@@ -271,7 +270,7 @@ def registry_pull_command() -> str:
 _SCHEDULED = "scheduled"
 
 
-def pull_phase_seconds(uuid: str) -> float:
+def scheduled_pull_offset_seconds(uuid: str) -> float:
     """Where in each REGISTRY_PULL_PROBE_INTERVAL_HOURS the node's scheduled pull falls, stable per executor.
 
     Without it every idle node pulls in the first cycle after deploy and every interval after, so the pulls
@@ -285,8 +284,27 @@ def pull_phase_seconds(uuid: str) -> float:
 def next_scheduled_pull(uuid: str, not_before: float) -> float:
     """The first of the node's phase slots at or after `not_before`."""
     interval = settings.REGISTRY_PULL_PROBE_INTERVAL_HOURS * 3600
-    phase = pull_phase_seconds(uuid)
-    return phase + math.ceil((not_before - phase) / interval) * interval
+    offset = scheduled_pull_offset_seconds(uuid)
+    return offset + math.ceil((not_before - offset) / interval) * interval
+
+
+class DockerHubAnswer(NamedTuple):
+    reachable: bool
+    seen: str
+
+
+@dataclass(frozen=True)
+class DockerHubControl:
+    """The validator's own reading of Docker Hub at `at`, shared by every node for HUB_CONTROL_TTL_SECONDS."""
+
+    at: float
+    reachable: bool
+    seen: str
+
+    @classmethod
+    def from_json(cls, raw: Any) -> DockerHubControl:
+        data = json.loads(_decode(raw))
+        return cls(at=float(data["at"]), reachable=bool(data["reachable"]), seen=str(data["seen"]))
 
 
 @dataclass
@@ -298,7 +316,7 @@ class _ProbeState:
     failures_in_a_row: int = 0
     reading: dict[str, Any] = field(default_factory=dict)
     no_verdict: str | None = None
-    guard: dict[str, Any] | None = None
+    hub_control: DockerHubControl | None = None
 
     @property
     def standing_failure(self) -> bool:
@@ -325,7 +343,7 @@ class _ProbeState:
                 "failures_in_a_row": self.failures_in_a_row,
                 "reading": self.reading,
                 "no_verdict": self.no_verdict,
-                "guard": self.guard,
+                "hub_control": asdict(self.hub_control) if self.hub_control else None,
             }
         )
 
@@ -333,13 +351,14 @@ class _ProbeState:
     def from_raw(cls, raw: Any) -> _ProbeState | None:
         try:
             data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            hub_control = data.get("hub_control")
             return cls(
                 at=float(data["at"]),
                 outcome=str(data["outcome"]),
                 failures_in_a_row=int(data.get("failures_in_a_row", 0)),
                 reading=dict(data.get("reading") or {}),
                 no_verdict=data.get("no_verdict"),
-                guard=data.get("guard"),
+                hub_control=DockerHubControl(**hub_control) if hub_control else None,
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
@@ -353,15 +372,17 @@ def _decode(raw: Any) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
-async def probe_docker_hub() -> tuple[bool, str]:
-    """The validator's own GET of Docker Hub's registry root: (reachable, what it saw)."""
+async def probe_docker_hub() -> DockerHubAnswer:
+    """The validator's own GET of Docker Hub's registry root."""
     try:
         timeout = aiohttp.ClientTimeout(total=_HUB_CONTROL_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(DOCKER_HUB_CONTROL_URL, allow_redirects=False) as response:
-                return response.status in _HUB_REACHABLE_STATUSES, f"HTTP {response.status}"
+                return DockerHubAnswer(
+                    response.status in _HUB_REACHABLE_STATUSES, f"HTTP {response.status}"
+                )
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-        return False, f"{type(exc).__name__}: {exc}"[:200]
+        return DockerHubAnswer(False, f"{type(exc).__name__}: {exc}"[:200])
 
 
 class RegistryPullCheck:
@@ -383,7 +404,7 @@ class RegistryPullCheck:
     and the node passes.
 
     A failed pull counts only if the validator's own GET of DOCKER_HUB_CONTROL_URL answers 200 or 401
-    (cached for HUB_CONTROL_TTL_SECONDS); else it is REGISTRY_PULL_NO_VERDICT_HUB_DOWN, neither counting nor
+    (cached for HUB_CONTROL_TTL_SECONDS; a cached answer counts only if read after the pull began); else it is REGISTRY_PULL_NO_VERDICT_HUB_DOWN, neither counting nor
     resetting the streak. An outage the validator cannot see (Docker Hub's CDN in one region, a mirror many
     providers share) is not guarded here: enforcement stays off until the OBSERVED rows have been reviewed.
     """
@@ -397,29 +418,30 @@ class RegistryPullCheck:
         if _is_rented(ctx):
             return self._skipped(ctx, "rented")
         try:
-            last = await self._load(ctx)
+            last_state = await self._load(ctx)
         except _RedisUnreadable:
             # without the last reading the interval cannot be honoured; pulling every cycle would spend
             # the node's Docker Hub quota, so this cycle has no verdict
             return self._skipped(ctx, "last pull reading unreadable in Redis")
 
         now = time.time()
-        if last is None:
+        if last_state is None:
             # first sight: the first pull waits for the node's phase, so a deploy does not pull the fleet at once
-            last = _ProbeState(at=now, outcome=_SCHEDULED)
-            await self._save(ctx, last)
-        if now < last.next_due_at(ctx.executor.uuid):
-            return self._verdict(ctx, last, probed=False)
+            last_state = _ProbeState(at=now, outcome=_SCHEDULED)
+            await self._save(ctx, last_state)
+        if now < last_state.next_due_at(ctx.executor.uuid):
+            return self._verdict(ctx, last_state, probed=False)
 
         reading = await self._pull(ctx)
-        failures = last.failures_in_a_row
+        failures = last_state.failures_in_a_row
         no_verdict: NoVerdict | None = None
-        guard: dict[str, Any] | None = None
+        hub_control: DockerHubControl | None = None
         if reading.failed:
             async with _HUB_CONTROL_LOCK:
-                control = await self._hub_control(ctx, time.time(), pull_started=now)
-            guard = {"docker_hub_control": control}
-            if control["reachable"]:
+                hub_control = await self._read_docker_hub_control(
+                    ctx, time.time(), pull_started=now
+                )
+            if hub_control.reachable:
                 failures += 1
             else:
                 no_verdict = "docker_hub_down"
@@ -431,14 +453,14 @@ class RegistryPullCheck:
             failures_in_a_row=failures,
             reading=reading.as_record(),
             no_verdict=no_verdict,
-            guard=guard,
+            hub_control=hub_control,
         )
         await self._save(ctx, state)
         return self._verdict(ctx, state, probed=True)
 
-    async def _hub_control(
+    async def _read_docker_hub_control(
         self, ctx: Context, now: float, *, pull_started: float
-    ) -> dict[str, Any]:
+    ) -> DockerHubControl:
         """The validator's cached reading of Docker Hub, fetched again once stale. Runs under _HUB_CONTROL_LOCK.
 
         A pull can take REGISTRY_PULL_COMMAND_TIMEOUT_SECONDS, so a cached "reachable" counts the failure only if
@@ -447,11 +469,11 @@ class RegistryPullCheck:
         redis = ctx.services.redis
         try:
             raw = await redis.get(_HUB_CONTROL_KEY)
-            cached = json.loads(_decode(raw)) if raw is not None else None
+            cached = DockerHubControl.from_json(raw) if raw is not None else None
             if (
                 cached is not None
-                and now - float(cached["at"]) < HUB_CONTROL_TTL_SECONDS
-                and (not cached["reachable"] or float(cached["at"]) >= pull_started)
+                and now - cached.at < HUB_CONTROL_TTL_SECONDS
+                and (not cached.reachable or cached.at >= pull_started)
             ):
                 return cached
         except Exception:
@@ -459,20 +481,22 @@ class RegistryPullCheck:
                 _m("Registry pull: the cached Docker Hub control is unreadable; fetching it again"),
                 exc_info=True,
             )
-        reachable, seen = await probe_docker_hub()
-        control = {"at": now, "reachable": reachable, "seen": seen}
+        answer = await probe_docker_hub()
+        control = DockerHubControl(at=now, reachable=answer.reachable, seen=answer.seen)
         try:
-            await redis.set(_HUB_CONTROL_KEY, json.dumps(control), ex=HUB_CONTROL_TTL_SECONDS)
+            await redis.set(
+                _HUB_CONTROL_KEY, json.dumps(asdict(control)), ex=HUB_CONTROL_TTL_SECONDS
+            )
         except Exception:
             logger.warning(
                 _m("Registry pull: could not cache the Docker Hub control"), exc_info=True
             )
-        if not reachable:
+        if not control.reachable:
             logger.warning(
                 _m(
                     "REGISTRY_PULL_NO_VERDICT_HUB_DOWN: the validator cannot reach Docker Hub either; "
                     f"failed pulls are no verdict for the next {HUB_CONTROL_TTL_SECONDS // 60} minutes",
-                    extra=get_extra_info({"url": DOCKER_HUB_CONTROL_URL, "seen": seen}),
+                    extra=get_extra_info({"url": DOCKER_HUB_CONTROL_URL, "seen": control.seen}),
                 )
             )
         return control
@@ -489,8 +513,8 @@ class RegistryPullCheck:
             what["next_pull_at"] = state.next_due_at(ctx.executor.uuid)
         if state.no_verdict is not None:
             what["no_verdict"] = state.no_verdict
-        if state.guard is not None:
-            what["guard"] = state.guard
+        if state.hub_control is not None:
+            what["docker_hub_control"] = asdict(state.hub_control)
         if state.standing_failure:
             template = (
                 Msg.REGISTRY_PULL_FAILED
@@ -566,3 +590,9 @@ class RegistryPullCheck:
             what["last"] = last
         event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
+
+
+def _is_rented(ctx: Context) -> bool:
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    return rented_executor is not None and len(rented_executor.pods) > 0

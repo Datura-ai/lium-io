@@ -1,14 +1,7 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Literal
-
-from core.config import settings
-
-from ..messages import OutboundInternetMessages as Msg
-from ..messages import render_message
-from ..pipeline import CheckResult, Context
 
 EGRESS_PROBE_HOST = "pypi.org"
 # 325 bytes, asked for headers only: https://pypi.org/simple/ is 46 MB, and busybox wget's -T is a read
@@ -92,97 +85,3 @@ def parse_egress_probe(stdout: str) -> EgressProbe:
         # any HTTP answer is egress; how fast it came is the speed rule's business
         return EgressProbe("ok", "http_response", tool=tool, http_code=code)
     return EgressProbe("no_egress", "no_http_response", tool=tool, http_code=code, detail=detail)
-
-
-def _is_positive_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value > 0
-    )
-
-
-def scrape_egress_finding(specs: dict[str, Any] | None) -> dict[str, Any] | None:
-    """What the scrape's speed tests say about egress; None when the scrape ran no speed test.
-
-    benchmark_network_speed keeps the first download and upload any method measured and each method's
-    result under `measurements`; with neither measured, all four methods ran. A finding only when
-    neither direction was measured: a missing download alone is not one (ticket-0361: 24 of one
-    provider's 27 active nodes had no download, most of them a Cloudflare download recorded as 0, and
-    the ticket-0361 node's upload measured 77-105 Mbps), nor is an error from a method a later one measured past.
-    A network block without `measurements` is no reading: lium-io#1419 (DAH-2774) removes the scrape's
-    speed tests and leaves `{}`, which must not read as every node without egress.
-    """
-    network = (specs or {}).get("network")
-    if not isinstance(network, dict):
-        return None
-    if not isinstance(network.get("measurements"), dict) or not network["measurements"]:
-        return None
-    errors: dict[str, str] = {}
-    if network.get("network_speed_error"):
-        errors["network"] = str(network["network_speed_error"])[:_TAIL_CHARS]
-    for method, measurement in network["measurements"].items():
-        if isinstance(measurement, dict) and measurement.get("network_speed_error"):
-            errors[method] = str(measurement["network_speed_error"])[:_TAIL_CHARS]
-    download = network.get("download_speed")
-    upload = network.get("upload_speed")
-    return {
-        "no_egress": not _is_positive_number(download) and not _is_positive_number(upload),
-        "download_speed": download,
-        "upload_speed": upload,
-        "download_source": network.get("download_source"),
-        "upload_source": network.get("upload_source"),
-        "speed_errors": errors,
-    }
-
-
-def _is_rented(ctx: Context) -> bool:
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-    return rented_executor is not None and len(rented_executor.pods) > 0
-
-
-class OutboundInternetCheck:
-    """Log what an idle node's scrape speed tests say about egress; never fail the node for it.
-
-    A scrape that measured neither direction is logged as OUTBOUND_INTERNET_NO_SPEED and passes, under
-    either NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED setting. The speed tests measure third-party endpoints
-    (speedtest.net servers, speed.cloudflare.com), not the node: Cloudflare answering 429 to both directions
-    reads the same as a host that cannot reach out, and the ticket-0361 node, whose renters could not start, measured
-    77-105 Mbps up. The fail signals are the paths a renter takes: RegistryPullCheck's real Docker Hub pull
-    and the rental probe's `egress` step, both under their own enforcement flags.
-
-    A null download alone is no finding (ticket-0361: 24 of one provider's 27 active nodes had one), and a
-    scrape that ran no speed test (lium-io#1419) is logged as OUTBOUND_INTERNET_UNMEASURED. A rented node
-    is left alone like PortCountCheck leaves it.
-    """
-
-    check_id = "executor.validate.outbound_internet"
-    fatal = True
-
-    async def run(self, ctx: Context) -> CheckResult:
-        if not settings.NO_OUTBOUND_INTERNET_CHECK_ENABLED:
-            return self._skipped(ctx, "NO_OUTBOUND_INTERNET_CHECK_ENABLED is off")
-
-        scrape = scrape_egress_finding(ctx.state.specs)
-        if _is_rented(ctx):
-            return self._skipped(ctx, "rented", scrape=scrape)
-
-        if scrape is None:
-            template = Msg.OUTBOUND_INTERNET_UNMEASURED
-        elif scrape["no_egress"]:
-            template = Msg.OUTBOUND_INTERNET_NO_SPEED
-        else:
-            template = Msg.OUTBOUND_INTERNET_OK
-        event = render_message(template, ctx=ctx, check_id=self.check_id, what={"scrape": scrape})
-        return CheckResult(passed=True, event=event)
-
-    def _skipped(
-        self, ctx: Context, reason: str, *, scrape: dict[str, Any] | None = None
-    ) -> CheckResult:
-        what: dict[str, Any] = {"reason": reason}
-        if scrape is not None:
-            what["scrape"] = scrape
-        event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what)
-        return CheckResult(passed=True, event=event)
