@@ -558,10 +558,9 @@ class Settings(BaseSettings):
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
-    # The backend hides a node after a rent failed on it for the host's reasons and sends
-    # RecheckExecutorRequest; with the flag on, the express lane runs that node's full pipeline
-    # (the rental probe included, its interval stamp dropped) and publishes the result spec-only,
-    # so a pass lists the node again within minutes. Off: the request is logged and dropped.
+    # The backend hides a node after a host-side rent failure and sends RecheckExecutorRequest. On, the
+    # express lane runs that node's full pipeline now and publishes it spec-only, so a pass relists it.
+    # Off: the request is logged and dropped.
     RECHECK_ON_REQUEST_ENABLED: bool = Field(env="RECHECK_ON_REQUEST_ENABLED", default=False)
     RECHECK_MAX_IN_FLIGHT: int = Field(env="RECHECK_MAX_IN_FLIGHT", default=4, ge=1)
     # The backend lifts its hold on its own after 10 minutes; a request older than that is moot.

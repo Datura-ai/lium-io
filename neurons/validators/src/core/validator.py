@@ -197,8 +197,8 @@ class Validator:
     async def release_cycle_claims(self, published_executor_ids: list[str]) -> None:
         """The wave left every executor it verified as CYCLE_DONE whenever either lane flag is on
         (`settings.express_lane_runs`); the lanes skip those until the cycle drops them here, so the
-        drop runs under either flag. Only the express lane reads the validated set (DAH-2958):
-        everything a cycle published is "validated", and only what the portal lists beyond it is new.
+        drop runs under either flag. Only the express lane reads the validated set: everything a
+        cycle published is "validated", and only what the portal lists beyond it is new.
         A Redis blip never ends the cycle: the next cycle seeds again, and the CYCLE_DONE claims keep
         the express lane off those executors until then."""
         if not settings.express_lane_runs:
