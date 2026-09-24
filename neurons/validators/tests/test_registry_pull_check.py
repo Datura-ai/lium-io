@@ -1094,8 +1094,8 @@ async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(straggler
 def test_the_phase_is_stable_per_node_and_spreads_the_fleet_over_the_interval():
     with flags(phase_at_start=False):
         interval = 6 * 3600
-        phase = module.pull_phase_seconds("0d6c1a52-3f1e-4b7a-9c2e-5a8f7b1d4e60")
-        assert phase == module.pull_phase_seconds("0d6c1a52-3f1e-4b7a-9c2e-5a8f7b1d4e60")
+        phase = module.pull_phase_seconds("00000000-0000-4000-8000-000000000001")
+        assert phase == module.pull_phase_seconds("00000000-0000-4000-8000-000000000001")
         assert 0 <= phase < interval
         hours = Counter(int(module.pull_phase_seconds(f"exec-{i}") // 3600) for i in range(600))
     assert sorted(hours) == [0, 1, 2, 3, 4, 5]
@@ -1105,7 +1105,7 @@ def test_the_phase_is_stable_per_node_and_spreads_the_fleet_over_the_interval():
 @pytest.mark.asyncio
 async def test_a_node_first_seen_waits_for_its_phase_then_pulls_every_interval():
     """r5: every idle node pulled in the first cycle after deploy and every 6 h after, in the same cycle."""
-    uuid = "0d6c1a52-3f1e-4b7a-9c2e-5a8f7b1d4e60"
+    uuid = "00000000-0000-4000-8000-000000000001"
     ctx, runner, _ = make_ctx(result(PULL_OK), result(PULL_OK), uuid=uuid)
     check = RegistryPullCheck()
     with flags(phase_at_start=False) as clock:
