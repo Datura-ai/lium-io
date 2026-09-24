@@ -96,6 +96,7 @@ class DefaultIncentive(BaseIncentive):
         """
         self.total_executors += 1
         result = await self.calculate_executor_score(result)
+        self._record_validation_failed_reason(result)
         self.total_mining_score += result.mining_score
         if result.job_score == 1.0:
             self.successful_executors += 1
@@ -123,6 +124,18 @@ class DefaultIncentive(BaseIncentive):
                 MinerLogLine.no_payout_because_outdated_executor_image(result)
             )
         return True
+
+    @staticmethod
+    def _record_validation_failed_reason(result: JobResult) -> None:
+        """A result whose validation did not pass earns 0; record the failing check's code once."""
+        if result.is_successful:
+            return
+        if any(
+            reason.reason == ZeroIncentiveReason.VALIDATION_FAILED.value
+            for reason in result.zero_incentive_reasons
+        ):
+            return
+        result.record_incentive_log(MinerLogLine.no_payout_because_validation_failed(result))
 
     async def _post_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Process a job result.

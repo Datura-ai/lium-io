@@ -1,17 +1,22 @@
 """Every reason a node earns 0 is recorded, not only the first one found.
 
 A node blocked by one rule used to hide every later rule: an 8x flagship with no Discord
-learned about the flagship gate only after connecting Discord.
+learned about the flagship gate only after connecting Discord. And a node whose validation
+failed earned 0 with an empty reason list. Both cases now reach the backend as data.
 """
 import logging
-from datetime import datetime
-from unittest.mock import AsyncMock
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from core.config import settings, shared_client
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
+from incentive.default import DefaultIncentive
+from incentive.miner_incentive_log import UNCLASSIFIED_VALIDATION_FAILURE, ZeroIncentiveReason
 from incentive.rental_price import RentalPriceIncentive
+from services.miner_service import MinerService
+from services.task.models import build_msg
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
@@ -190,3 +195,85 @@ async def test_a_healthy_idle_node_has_no_reason():
 
     assert result.zero_incentive_reasons == []
     assert result.eligible_for_rental_share is True
+
+
+# ── a zero caused by a failed validation carries the failing check's code ─────
+
+
+def _failed_check_event(reason: str, check_id: str) -> object:
+    return build_msg(
+        event="Recommended image is not cached on the executor",
+        reason=reason,
+        severity="error",
+        impact="Validation failed",
+        remediation="Pull the recommended image on the host.",
+        check_id=check_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
+async def test_failed_validation_zero_carries_the_check_reason_code(engine):
+    event = _failed_check_event("RECOMMENDED_IMAGE_NOT_CACHED", "recommended_image")
+    result = _failed(validation_event=event, failure_reason_code="RECOMMENDED_IMAGE_NOT_CACHED")
+    incentive = engine(IncentiveConfig(), AsyncMock(), {"hk": [result]}, {})
+
+    await incentive._pre_process_job_result("hk", result)
+
+    assert _codes(result) == [ZeroIncentiveReason.VALIDATION_FAILED]
+    context = result.zero_incentive_reasons[0].context
+    assert context["reason_code"] == "RECOMMENDED_IMAGE_NOT_CACHED"
+    assert context["check_id"] == "recommended_image"
+    assert context["remediation"] == "Pull the recommended image on the host."
+    assert "RECOMMENDED_IMAGE_NOT_CACHED" in result.zero_incentive_reasons[0].message_for_miner
+
+
+@pytest.mark.asyncio
+async def test_failed_validation_code_comes_from_the_run_not_a_later_event():
+    # the check that ended the run wins; an unrelated event's check_id is not borrowed
+    event = _failed_check_event("SOMETHING_ELSE", "other_check")
+    result = _failed(validation_event=event, failure_reason_code="VERIFYX_FAILED_GPU_MISMATCH")
+
+    await _incentive()._pre_process_job_result("hk", result)
+
+    context = result.zero_incentive_reasons[0].context
+    assert context["reason_code"] == "VERIFYX_FAILED_GPU_MISMATCH"
+    assert context["check_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_validation_without_any_code_is_never_empty():
+    # an exception in the pipeline produces no event and no code
+    result = _failed()
+
+    await _incentive()._pre_process_job_result("hk", result)
+
+    assert _codes(result) == [ZeroIncentiveReason.VALIDATION_FAILED]
+    assert result.zero_incentive_reasons[0].context["reason_code"] == UNCLASSIFIED_VALIDATION_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_a_full_cycle_publishes_the_failed_node_reason_once(monkeypatch):
+    failed = _failed(failure_reason_code="RECOMMENDED_IMAGE_NOT_CACHED")
+    healthy = _idle_flagship(
+        gpu_count=4, spec=None, executor_info=failed.executor_info.model_copy(update={"uuid": "exec-2"})
+    )
+    redis = AsyncMock()
+    redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
+    incentive = RentalPriceIncentive(IncentiveConfig(), redis, {"hk": [failed, healthy]}, {H200: 4})
+    incentive.price_provider = AsyncMock(
+        get_tao_price=AsyncMock(return_value=300.0), get_alpha_rate=AsyncMock(return_value=0.001)
+    )
+
+    await incentive.calculate_mining_scores()
+    failed.scored_at = datetime.now(UTC)
+    redis_service = MagicMock(publish=AsyncMock())
+    service = MinerService(
+        ssh_service=MagicMock(), task_service=MagicMock(), redis_service=redis_service, attestation_service=MagicMock()
+    )
+    await service.publish_machine_specs([failed], miner_hotkey="hk", miner_coldkey="ck")
+
+    _, payload = redis_service.publish.await_args.args
+    assert [reason["reason"] for reason in payload["incentive_reasons"]] == ["validation_failed"]
+    assert payload["incentive_reasons"][0]["context"]["reason_code"] == "RECOMMENDED_IMAGE_NOT_CACHED"
+    assert payload["incentive"] == 0.0

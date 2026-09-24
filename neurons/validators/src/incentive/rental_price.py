@@ -685,6 +685,7 @@ class RentalPriceIncentive(DefaultIncentive):
         """
         self._record_outdated_image_reason(result)
         if not result.is_successful:
+            self._record_validation_failed_reason(result)
             return
 
         await super()._pre_process_job_result(hotkey, result)
