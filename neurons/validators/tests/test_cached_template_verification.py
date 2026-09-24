@@ -12,6 +12,7 @@ are wall-clock-independent; cutoff-enforcement tests opt in with ``_set_cutoff(a
 
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock
@@ -20,7 +21,7 @@ import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
-from core.config import settings
+from core.config import Settings, settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
     _remediation,
@@ -606,8 +607,11 @@ def _fake_redis_service():
     return service
 
 
-def _uncached_ctx(context_factory, monkeypatch, redis, prefetch_doc, *, digests=None):
+def _uncached_ctx(
+    context_factory, monkeypatch, redis, prefetch_doc, *, digests=None, grace_enabled=True
+):
     _set_cutoff(monkeypatch, active=True)
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", grace_enabled)
     return context_factory(
         services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
         config=_config_with_digests(digests or {}),
@@ -714,10 +718,59 @@ async def test_grace_disabled_fails_a_fresh_node(context_factory, monkeypatch):
     assert "fresh_node_grace" not in result.event.what_we_saw
 
 
+def test_fresh_node_grace_flag_is_off_by_default():
+    assert Settings.model_fields["CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_grace_flag_off_fails_a_fresh_node_as_before_and_logs_the_hold(
+    context_factory, monkeypatch, caplog
+):
+    ctx = _uncached_ctx(
+        context_factory, monkeypatch, _fake_redis_service(), _prefetch_doc(), grace_enabled=False
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    assert result.event.severity == "error"
+    assert set(result.event.what_we_saw) == {
+        "recommended_image",
+        "cached",
+        "digest_match",
+        "backend_digest",
+        "local_digest",
+        "gpu_model",
+        "driver_version",
+        "after_cutoff",
+        "prefetch_state",
+    }
+    assert any("would have been held as pending" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_grace_flag_off_logs_nothing_for_a_node_past_its_grace(
+    context_factory, monkeypatch, caplog
+):
+    redis = _fake_redis_service()
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc(), grace_enabled=False)
+    first_seen = time.time() - settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS - 60
+    await redis.redis.set(f"cached_template_first_uncached:{ctx.executor.uuid}", repr(first_seen))
+
+    with caplog.at_level(logging.INFO):
+        result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert not any("would have been held" in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_digest_mismatch_gets_no_fresh_node_grace(context_factory, monkeypatch):
     redis = _fake_redis_service()
     _set_cutoff(monkeypatch, active=True)
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", True)
     ctx = context_factory(
         services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),

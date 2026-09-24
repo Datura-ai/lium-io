@@ -159,9 +159,14 @@ class Settings(BaseSettings):
     # tenant short-circuit).
     CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
     # A node this validator has just found without its recommended image is held as pending, not
-    # failed, until the executor's first pre-pull sweep completes or this long after that first
+    # failed, until the executor's first pre-pull sweep completes or GRACE_SECONDS after that first
     # sighting, whichever comes first. The express lane verifies a new node seconds after it is
-    # added, long before a multi-GB pull can finish. 0 disables the grace.
+    # added, long before a multi-GB pull can finish. Off: the check fails the node as it did before
+    # the grace existed, and only logs the nodes the grace would have held. GRACE_SECONDS=0 turns
+    # the log off too.
+    CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED: bool = Field(
+        env="CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", default=False
+    )
     CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS: int = Field(
         env="CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS", default=30 * 60, ge=0
     )

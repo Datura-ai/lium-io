@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import shlex
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 
 from ..messages import CachedTemplateMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+logger = logging.getLogger(__name__)
 
 # DAH-2470 — the executor's cache-prefetch loop publishes its own state here, inside the
 # executor container. The validator's shell lands in that same container (run.sh starts
@@ -220,9 +224,11 @@ class CachedTemplateVerificationCheck:
     holds a stale image is readable in Grafana without SSHing anywhere. The failure's remediation
     quotes that document: the executor's own pull error and the step it points to.
 
-    A node this validator has only just found without the image is held as PENDING (passed, score
-    untouched by this check) while its executor's first pre-pull sweep is still running, for at most
-    ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``).
+    With ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED``, a node this validator has only just
+    found without the image is held as PENDING (passed, score untouched by this check) while its
+    executor's first pre-pull sweep is still running, for at most
+    ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``). With it off
+    the node fails as before and the would-be hold is only logged.
     """
 
     check_id = "executor.validate.cached_template"
@@ -413,11 +419,18 @@ class CachedTemplateVerificationCheck:
             what["prefetch_state"] = prefetch_state
             if template == Msg.NOT_CACHED:
                 grace = await self._fresh_node_grace(ctx, prefetch_state)
-                if grace is not None:
+                if grace is not None and settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED:
                     what["fresh_node_grace"] = grace
                     if grace["pending"]:
                         template = Msg.PENDING
                         should_fail = False
+                elif grace is not None and grace["pending"]:
+                    logger.info(
+                        _m(
+                            "Fresh-node grace is off: this node would have been held as pending",
+                            extra=get_extra_info({**ctx.default_extra, "fresh_node_grace": grace}),
+                        )
+                    )
             if should_fail:
                 pull_ref = f"{docker_image}@{backend_digest}" if backend_digest else image_ref
                 remediation = _remediation(prefetch_state, image_ref, pull_ref, cached)
