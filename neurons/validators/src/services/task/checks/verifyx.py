@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
 
+from protocol.vc_protocol.compute_requests import NetworkEMA
+
 from core.config import settings
 from core.utils import _m, get_extra_info
 
@@ -358,14 +360,18 @@ def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | 
 
 def _is_never_measured(ctx: Context) -> bool:
     """No stored VerifyX EMA, per the backend's answer; False without that answer, as for DAH-2959."""
-    rented_data = ctx.state.rented_data
-    if rented_data is None:
+    if ctx.state.rented_data is None:
         return False
-    prev_ema = rented_data.network_ema.get(ctx.executor.uuid)
+    prev_ema = _stored_network_ema(ctx)
     return prev_ema is None or prev_ema.ema_verifyx_download_speed is None
 
 
-def hold_verifyx_ema(ctx: Context, specs: dict) -> dict:
+def _stored_network_ema(ctx: Context) -> NetworkEMA | None:
+    rented_data = ctx.state.rented_data
+    return rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+
+
+def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
     """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
 
     Only keys this cycle wrote are touched. A never-measured node publishes none, which the backend
@@ -374,13 +380,12 @@ def hold_verifyx_ema(ctx: Context, specs: dict) -> dict:
     network = specs.get("network")
     if not isinstance(network, dict) or not any(key in network for key in _EMA_KEYS):
         return specs
-    rented_data = ctx.state.rented_data
-    prev_ema = rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+    prev_ema = _stored_network_ema(ctx)
     held = dict(network)
     for key in _EMA_KEYS:
         if key not in held:
             continue
-        previous = getattr(prev_ema, key, None) if prev_ema else None
+        previous = getattr(prev_ema, key, None)
         if previous is None:
             del held[key]
         else:
