@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import services.docker_service as ds_module
-from payload_models.payloads import ContainerCreated, FailedContainerRequest, ProfilerStepName, WorkloadKind
+from payload_models.payloads import (
+    ContainerCreated,
+    FailedContainerRequest,
+    ProfilerStepName,
+    WorkloadKind,
+)
 from services.ssh_ready_gate import (
     SshNotReady,
     SshReadyMode,
@@ -20,7 +25,14 @@ from services.ssh_ready_gate import (
     ssh_ready_gate_mode,
     wait_for_ssh_banner,
 )
-from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _run, _ssh_client, _ssh_result
+from test_deploy_optimizations import (
+    _executor_info,
+    _patch_happy,
+    _payload,
+    _run,
+    _ssh_client,
+    _ssh_result,
+)
 
 BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
 
