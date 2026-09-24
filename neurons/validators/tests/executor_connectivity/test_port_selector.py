@@ -3,7 +3,7 @@ import random
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE, PORT_RANGE_MAX_ENTRIES
+from services.const import BATCH_PORT_VERIFICATION_SIZE
 from services.executor_connectivity import port_selector as port_selector_module
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import (
@@ -11,6 +11,7 @@ from services.executor_connectivity.models import (
     PortPair,
     PortProbeResult,
     PortRangeResult,
+    SecondPass,
 )
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
@@ -174,6 +175,7 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
 
     assert result.status == "no_ports"
     assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)
+    assert result.second_pass == SecondPass.NO_PORTS_LEFT
 
 
 @pytest.mark.asyncio
@@ -217,21 +219,6 @@ def test_tally_drops_ports_outside_1_65535():
     assert tally_port_ranges(declared, declared, declared) == (
         PortRangeResult(first=9000, last=9000, declared=1, probed=1, answered=1),
     )
-
-
-def test_tally_caps_entries_with_an_other_bucket(monkeypatch):
-    monkeypatch.setattr(port_selector_module, "PORT_RANGE_BUCKET_WIDTH", 10)
-    declared = [PortPair(p, p) for p in range(10000, 10000 + 10 * 40, 10)]
-
-    tallies = tally_port_ranges(declared, declared[-3:], declared[-1:])
-
-    assert len(tallies) == PORT_RANGE_MAX_ENTRIES
-    assert not any(t.is_overflow for t in tallies[:-1])
-    other = tallies[-1]
-    assert (other.is_overflow, other.first, other.last, other.declared) == (True, 10310, 10390, 9)
-    assert (other.probed, other.answered) == (3, 1)
-    assert other.as_dict()["range"] == "other 10310-10390"
-    assert sum(t.declared for t in tallies) == len(declared)
 
 
 def _main_selection(info, size, unavailable):

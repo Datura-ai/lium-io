@@ -2,7 +2,7 @@ from collections.abc import Iterable
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import PORT_RANGE_BUCKET_WIDTH, PORT_RANGE_MAX_ENTRIES
+from services.const import PORT_RANGE_BUCKET_WIDTH
 from services.executor_connectivity.models import PortPair, PortRangeResult
 from services.port_utils import get_all_ports
 
@@ -34,33 +34,26 @@ def tally_port_ranges(
     `answered <= probed <= declared` holds in every tally. Ports are grouped into
     PORT_RANGE_BUCKET_WIDTH-wide buckets, and each tally names the lowest and highest declared port
     in its bucket: a range narrower than a bucket is one tally, a wide range is split so a forward
-    that covers only part of it shows which part. Past PORT_RANGE_MAX_ENTRIES buckets the rest are
-    summed into one final `other` tally.
+    that covers only part of it shows which part.
     """
     probed_ext = {p.external for p in probed}
     answered_ext = {p.external for p in answered} & probed_ext
     buckets: dict[int, list[int]] = {}
     for external in sorted({p.external for p in declared if MIN_PORT <= p.external <= MAX_PORT}):
         buckets.setdefault(external // PORT_RANGE_BUCKET_WIDTH, []).append(external)
-    groups = [ports for _, ports in sorted(buckets.items())]
-    kept = groups if len(groups) <= PORT_RANGE_MAX_ENTRIES else groups[: PORT_RANGE_MAX_ENTRIES - 1]
-    overflow = [e for ports in groups[len(kept) :] for e in ports]
 
-    def tally(ports: list[int], is_overflow: bool = False) -> PortRangeResult:
+    def tally(ports: list[int]) -> PortRangeResult:
         return PortRangeResult(
             first=ports[0],
             last=ports[-1],
             declared=len(ports),
             probed=sum(e in probed_ext for e in ports),
             answered=sum(e in answered_ext for e in ports),
-            is_overflow=is_overflow,
             pass_number=pass_number,
             answers_counted=answers_counted,
         )
 
-    return tuple(tally(ports) for ports in kept) + (
-        (tally(overflow, is_overflow=True),) if overflow else ()
-    )
+    return tuple(tally(ports) for _, ports in sorted(buckets.items()))
 
 
 def spread_ports(ports: list[PortPair], size: int) -> list[PortPair]:

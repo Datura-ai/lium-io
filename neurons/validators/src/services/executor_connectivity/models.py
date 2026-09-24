@@ -73,8 +73,6 @@ class PortRangeResult:
     declared: int
     probed: int
     answered: int
-    # the buckets past PORT_RANGE_MAX_ENTRIES, summed into one
-    is_overflow: bool = False
     # 1: the lowest-300 pass every host gets; 2: the spread pass run only when pass one verified < 3
     pass_number: int = 1
     # False: the container check on one of these answers failed, so none is a verified port
@@ -82,8 +80,6 @@ class PortRangeResult:
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
-        if self.is_overflow:
-            label = f"other {label}"
         entry: dict[str, object] = {
             "pass": self.pass_number,
             "range": label,

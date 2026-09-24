@@ -71,6 +71,7 @@ class ConnectivityOrchestrator:
                 sysbox_runtime=sysbox_runtime,
                 status="no_ports",
                 port_ranges=tally_port_ranges(declared, (), ()),
+                second_pass=SecondPass.NO_PORTS_LEFT,
             )
 
         probe_result = await self.port_probe.probe(
