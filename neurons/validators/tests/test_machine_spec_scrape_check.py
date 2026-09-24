@@ -697,6 +697,11 @@ async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation
             id="other-scrape-error",
         ),
         pytest.param(
+            make_command_result(success=False, exit_code=1, stdout='{"error": []}'),
+            Msg.SCRAPE_FAILED_ON_HOST.reason,
+            id="unhashable-scrape-error",
+        ),
+        pytest.param(
             make_command_result(success=True, exit_code=0, stdout=""),
             Msg.SCRAPE_FAILED_ON_HOST.reason,
             id="exit-0-without-output",

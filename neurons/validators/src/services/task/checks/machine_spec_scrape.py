@@ -125,7 +125,7 @@ def _is_no_gpu_details_error(error: Any, obfuscation_keys: dict[str, str] | None
     # the key substitution that renames `gpu_details` in the shipped scrape (file_encrypt_service)
     # is a plain text replace, so it renames it inside this string literal too
     obfuscated_gpu_details_key = (obfuscation_keys or {}).get("gpu_details", "gpu_details")
-    return error in {"no_gpu_details", f"no_{obfuscated_gpu_details_key}"}
+    return isinstance(error, str) and error in {"no_gpu_details", f"no_{obfuscated_gpu_details_key}"}
 
 
 @dataclass(frozen=True)
