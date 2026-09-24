@@ -331,12 +331,17 @@ PASSED_BUT_ZERO = [
         "No action needed. WARNING: Collateral required but not deposited",
         {"is_rented": True},
     ),
+    (
+        TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason,
+        "No action needed. WARNING: Collateral required but not deposited",
+        {"is_rented": True},
+    ),
 ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
-@pytest.mark.parametrize(("event_reason", "remediation", "overrides"), PASSED_BUT_ZERO, ids=["finalize", "rented"])
+@pytest.mark.parametrize(("event_reason", "remediation", "overrides"), PASSED_BUT_ZERO, ids=["finalize", "rented", "rented_pod_ssh"])
 async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, event_reason, remediation, overrides):
     result = _passed_but_zero(event_reason, remediation, **overrides)
     incentive = engine(IncentiveConfig(), AsyncMock(), {"hk": [result]}, {})
