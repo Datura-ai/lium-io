@@ -526,6 +526,7 @@ class MinerLogLine(BaseModel):
                 "executor_id": str(result.executor_info.uuid),
                 "gpu_model": result.gpu_model,
                 "gpu_count": result.gpu_count,
+                "idle_payable_gpu_count": result.idle_payable_gpu_count,
                 "hourly_rate": result.hourly_rate,
                 "sysbox_runtime": result.sysbox_runtime,
                 "sysbox_multiplier": result.sysbox_multiplier,

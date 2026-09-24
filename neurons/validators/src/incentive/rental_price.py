@@ -581,17 +581,21 @@ class RentalPriceIncentive(DefaultIncentive):
         if not result.is_split_remainder and min_count >= result.gpu_count:
             return None  # a whole node rented only whole: one pod, MIN_PORT_COUNT covers it
         # a Lium filler does not exempt it: not rentable on Lium means no idle pay
-        available: Any = result.spec.get("available_port_count")
+        available_port_count: Any = result.spec.get("available_port_count")
         # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
-        if not isinstance(available, int) or isinstance(available, bool) or available < 0:
+        if (
+            not isinstance(available_port_count, int)
+            or isinstance(available_port_count, bool)
+            or available_port_count < 0
+        ):
             return None
         free_gpu_count: int = result.gpu_count
-        backed_gpu_count: int = min(free_gpu_count, (available // MIN_PORT_COUNT) * min_count)
+        backed_gpu_count: int = min(free_gpu_count, (available_port_count // MIN_PORT_COUNT) * min_count)
         unbacked_gpu_count: int = free_gpu_count - backed_gpu_count
         if unbacked_gpu_count <= 0:
             return None
         return PortBudgetShortfall(
-            available_port_count=available,
+            available_port_count=available_port_count,
             ports_per_bundle=MIN_PORT_COUNT,
             gpu_splitting_min_count=min_count,
             free_gpu_count=free_gpu_count,

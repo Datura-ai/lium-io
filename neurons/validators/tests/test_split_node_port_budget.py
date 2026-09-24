@@ -381,6 +381,39 @@ async def test_flag_on_whole_idle_split_node_is_paid_for_the_backed_gpus(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_flag_on_calculated_report_names_the_paid_gpu_count(monkeypatch):
+    # Arrange — the formula report must reproduce the payout: 2 paid GPUs, not all 8.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
+
+    # Act
+    await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, _plain_idle_job())))
+
+    # Assert
+    report: str = next(line for line in split_job.incentive_logs if "calculated successfully" in line)
+    assert '"idle_payable_gpu_count": 2' in report
+
+
+@pytest.mark.asyncio
+async def test_flag_on_bucket_summary_counts_the_paid_gpus(monkeypatch, caplog):
+    # Arrange — the monitoring summary must match the pool: the 8-GPU tier holds 2 backed GPUs.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, _plain_idle_job())))
+
+    # Assert
+    summary = next(
+        r.msg for r in caplog.records
+        if hasattr(r.msg, "extra") and r.msg.extra.get("bucket_key") == "H200_8"
+        and "Unrented_bucket_summary" in r.msg.message
+    )
+    assert summary.extra["count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_flag_on_node_with_ports_for_every_gpu_is_paid_as_before(monkeypatch, caplog):
     # Arrange — 4 free GPUs, 12 free ports: DAH-2467 behaviour unchanged, no line at all.
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
