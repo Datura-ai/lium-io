@@ -550,6 +550,21 @@ def test_sysbox_installed_registered_and_running_passes(tmp_path):
     assert "PASS sysbox-runc 0.7.1 runs a container." in out
 
 
+def test_sysbox_older_than_the_pinned_version_is_a_fix(tmp_path):
+    # DAH-3833: 0.6.6 still runs small containers, so without this --check stays green on a node that fails 44+ layer images
+    rc, out, fixes = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_VERSION": "0.6.6"})
+    assert rc == 1
+    assert fixes == 1
+    assert "FIX  sysbox-runc 0.6.6 is older than 0.7.1" in out
+    assert "nvidia_docker_sysbox_setup.sh" in out
+
+
+def test_sysbox_newer_than_the_pinned_version_passes(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_VERSION": "0.7.2"})
+    assert rc == 0
+    assert "PASS sysbox-runc 0.7.2 runs a container." in out
+
+
 def test_sysbox_missing_points_at_the_installer(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_sysbox", without=("sysbox-runc",))
     assert rc == 1

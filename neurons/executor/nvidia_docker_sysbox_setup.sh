@@ -475,7 +475,14 @@ check_sysbox() {
             "$(self_cmd)   # re-applies the Docker 29 settings and re-verifies; then: journalctl -u sysbox-mgr --no-pager -n 20"
         return 1
     fi
-    pf_pass "sysbox-runc $(sysbox_runc_version || echo installed) runs a container."
+    local installed
+    installed=$(sysbox_runc_version || true)
+    if [ -n "$installed" ] && ! version3_ge "$installed" "$SYSBOX_VERSION"; then
+        pf_fix "sysbox-runc $installed is older than $SYSBOX_VERSION, the version this installer pins." \
+            "$(self_cmd)   # upgrades Sysbox; it refuses to run while the node has a rental"
+        return 1
+    fi
+    pf_pass "sysbox-runc ${installed:-installed} runs a container."
 }
 
 preflight_summary() {
