@@ -21,6 +21,7 @@ from services.const import (
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
     POD_CONTAINER_PREFIX,
+    RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
 from services.gpu_wedge import (
@@ -284,20 +285,26 @@ class GpuUsageCheck:
         container with no rental, or whose rental closed longer ago, is an orphan. Returns None
         when a process outside those containers and the node's fillers holds the GPU, leaving the
         legacy verdict to the caller.
+
+        With RENTAL_TEARDOWN_DEFERRAL_ENABLED off, every pod container here is scored as an orphan,
+        as before; the rental read still picks the remediation, so a provider is never told to
+        remove the container of a rental that is ending or starting.
         """
         rentals: list[PodContainerRental] = list(
             await asyncio.gather(*(_pod_container_rental(ctx, name) for name in pod_containers))
         )
         orphans = [rental for rental in rentals if rental.state in _ORPHAN_STATES]
-        if orphans:
-            orphan = orphans[0]
-            # This node's portal page shows no rental for a pod registered elsewhere, so the usual
-            # "confirm, then remove" advice would clear the removal of a live rental's container.
-            remediation_template: str = (
-                Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
-                if orphan.state is PodRentalState.LIVE_ON_ANOTHER_NODE
-                else Msg.ORPHANED_CONTAINER.remediation
-            )
+        if orphans or not settings.RENTAL_TEARDOWN_DEFERRAL_ENABLED:
+            orphan = orphans[0] if orphans else rentals[0]
+            remediation_template: str
+            if orphan.state is PodRentalState.ORPHAN:
+                remediation_template = Msg.ORPHANED_CONTAINER.remediation
+            elif orphan.state is PodRentalState.LIVE_ON_ANOTHER_NODE:
+                # This node's portal page shows no rental for a pod registered elsewhere, so the usual
+                # "confirm, then remove" advice would clear the removal of a live rental's container.
+                remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+            else:
+                remediation_template = Msg.ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION
             event = render_message(
                 Msg.ORPHANED_CONTAINER,
                 ctx=ctx,
@@ -565,6 +572,11 @@ def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
     return datetime.now(timezone.utc) - closed_at
 
 
+def _in_minutes(elapsed: timedelta) -> str:
+    minutes: int = round(elapsed.total_seconds() / 60)
+    return "1 minute" if minutes == 1 else f"{minutes} minutes"
+
+
 async def _pod_container_rental(ctx: Context, container_name: str) -> PodContainerRental:
     """Where the rental behind a pod container stands now, re-read from the backend.
 
@@ -604,9 +616,14 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
     closed_at: datetime | None = pod_rental.rental_closed_at if pod_rental else None
     if closed_at is not None:
         since_closed: timedelta = _time_since_the_rental_closed(closed_at)
-        # A close time ahead of this clock is backend-validator skew on a rental that just ended.
+        if since_closed < -timedelta(minutes=RENTAL_CLOSE_CLOCK_SKEW_MINUTES):
+            status = (
+                f"its rental's close time is {_in_minutes(-since_closed)} ahead of the validator's clock"
+            )
+            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+        # A close time slightly ahead of this clock is backend-validator skew on a rental that just ended.
         status = (
-            f"its rental ended {round(since_closed.total_seconds() / 60)} minutes ago"
+            f"its rental ended {_in_minutes(since_closed)} ago"
             if since_closed >= timedelta(minutes=1)
             else "its rental ended just now"
         )

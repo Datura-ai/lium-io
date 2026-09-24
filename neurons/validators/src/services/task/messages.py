@@ -894,6 +894,11 @@ class GpuUsageMessages:
         "node uses it: {rental_status}. Do not stop or remove it: contact Lium support with the "
         "container name."
     )
+    ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION = (
+        "{orphaned_container} is a Lium pod container{pod} of a rental on this node that is ending "
+        "or starting: {rental_status}. Lium stops or starts it itself, so do not stop or remove it; "
+        "the next cycle checks the node again."
+    )
     TEARDOWN_IN_PROGRESS = MessageTemplate(
         event="Rental teardown in progress",
         reason="TEARDOWN_IN_PROGRESS",

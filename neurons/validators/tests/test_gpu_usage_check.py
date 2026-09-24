@@ -12,6 +12,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
+from neurons.validators.src.services.task.checks import gpu_usage
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck, PodRentalState
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
@@ -226,17 +227,29 @@ class _ListSink:
         self.events.append(event)
 
 
-@pytest.mark.asyncio
-async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(context_factory):
-    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
+@pytest.fixture
+def teardown_deferral_on():
+    with patch.object(gpu_usage.settings, "RENTAL_TEARDOWN_DEFERRAL_ENABLED", True):
+        yield
+
+
+async def _run_the_renter_ending_mid_run(ctx):
     sink = _ListSink()
     rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
-
     with (
         patch(f"{rented_machine}._check_pod_running", AsyncMock(return_value=(False, []))),
         patch(f"{rented_machine}._collect_pod_diagnostics", AsyncMock(return_value={})),
     ):
         ok, events, final_ctx = await Pipeline([TenantEnforcementCheck(), GpuUsageCheck()], sink).run(ctx)
+    return ok, events, final_ctx, sink
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
+async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(context_factory):
+    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
+
+    ok, events, final_ctx, sink = await _run_the_renter_ending_mid_run(ctx)
 
     assert [event.reason_code for event in events] == [
         TenantMsg.STALE_POD_NOT_RUNNING.reason,
@@ -255,6 +268,53 @@ async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(co
 
 
 @pytest.mark.asyncio
+async def test_with_the_deferral_off_the_renter_ending_mid_run_scores_0_as_before(context_factory):
+    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
+
+    ok, events, final_ctx, sink = await _run_the_renter_ending_mid_run(ctx)
+
+    assert [event.reason_code for event in events] == [
+        TenantMsg.STALE_POD_NOT_RUNNING.reason,
+        Msg.ORPHANED_CONTAINER.reason,
+    ]
+    orphan = events[-1]
+    assert orphan.impact == "Validation skipped; score set to 0"
+    assert ok is False
+    assert final_ctx.success is False
+    assert final_ctx.score == 0
+    assert orphan.remediation == (
+        f"{TEARDOWN_POD} is a Lium pod container (pod {TEARDOWN_POD_ID}) of a rental on this node that is "
+        "ending or starting: its rental ended 1 minute ago. Lium stops or starts it itself, so do not stop or "
+        "remove it; the next cycle checks the node again."
+    )
+
+
+@pytest.mark.parametrize(
+    "pod_rental,gpu_processes",
+    [
+        (_closed(minutes_ago=10), None),
+        (PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), None),
+        (_closed(minutes_ago=1), [_pod_process(), {"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}]),
+    ],
+    ids=["ended-10-min-ago", "started-mid-run", "beside-a-foreign-process"],
+)
+@pytest.mark.asyncio
+async def test_with_the_deferral_off_every_pod_container_is_the_orphan_zero(context_factory, pod_rental, gpu_processes):
+    ctx = _unrented_ctx(
+        context_factory, pod_rental=pod_rental, rented_data=_snapshot_with_pod(), gpu_processes=gpu_processes
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.halt is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "docker" not in result.event.remediation
+    assert "do not stop or remove it" in result.event.remediation
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_teardown_on_a_node_with_no_download_speed_on_record_still_scores_0(context_factory):
     ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod())
 
@@ -268,6 +328,7 @@ async def test_teardown_on_a_node_with_no_download_speed_on_record_still_scores_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_teardown_halts_the_run_so_nothing_after_it_loads_the_gpu(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=1), rented_data=_snapshot_with_pod())
 
@@ -280,6 +341,7 @@ async def test_teardown_halts_the_run_so_nothing_after_it_loads_the_gpu(context_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_pod_the_snapshot_listed_is_teardown_even_when_the_backend_is_unreachable(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=None, rented_data=_snapshot_with_pod())
 
@@ -291,6 +353,7 @@ async def test_a_pod_the_snapshot_listed_is_teardown_even_when_the_backend_is_un
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_rental_that_ended_just_before_the_run_is_teardown(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=10))
 
@@ -302,6 +365,7 @@ async def test_a_rental_that_ended_just_before_the_run_is_teardown(context_facto
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=20))
 
@@ -329,6 +393,7 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
     ],
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, pod_rental, rental_status):
     ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
 
@@ -340,6 +405,7 @@ async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, p
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_pod_name_without_a_pod_id_is_an_orphan_without_asking(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=_closed(minutes_ago=1), gpu_processes=[_pod_process("pod_whatever")]
@@ -354,6 +420,7 @@ async def test_a_pod_name_without_a_pod_id_is_an_orphan_without_asking(context_f
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory):
     ctx = _unrented_ctx(
         context_factory,
@@ -372,6 +439,7 @@ async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory)
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_remove(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id="another-executor")
@@ -387,6 +455,7 @@ async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_factory):
     orphan_pod_id = "0b7c2f6e-9d41-4c8a-8e3f-5a6b7c8d9e0f"
     ctx = _unrented_ctx(
@@ -412,9 +481,17 @@ async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_fa
         (14 + 50 / 60, Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended 15 minutes ago"),
         (15 + 10 / 60, Msg.ORPHANED_CONTAINER.reason, "its rental ended 15 minutes ago"),
         (-2, Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended just now"),
+        (-(4 + 50 / 60), Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended just now"),
+        (
+            -(5 + 10 / 60),
+            Msg.ORPHANED_CONTAINER.reason,
+            "its rental's close time is 5 minutes ahead of the validator's clock",
+        ),
+        (-60, Msg.ORPHANED_CONTAINER.reason, "its rental's close time is 60 minutes ahead of the validator's clock"),
     ],
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_the_grace_window_ends_at_15_minutes_after_the_close(
     context_factory, minutes_ago, reason, rental_status
 ):
@@ -429,6 +506,7 @@ async def test_the_grace_window_ends_at_15_minutes_after_the_close(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_rental_that_started_mid_run_is_not_an_orphan(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)
@@ -442,6 +520,7 @@ async def test_a_rental_that_started_mid_run_is_not_an_orphan(context_factory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_foreign_process_beside_a_tearing_down_pod_is_still_usage(context_factory):
     ctx = _unrented_ctx(
         context_factory,
@@ -457,6 +536,7 @@ async def test_a_foreign_process_beside_a_tearing_down_pod_is_still_usage(contex
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_an_edit_parked_pod_container_is_judged_by_its_pod(context_factory):
     ctx = _unrented_ctx(
         context_factory,
@@ -472,6 +552,7 @@ async def test_an_edit_parked_pod_container_is_judged_by_its_pod(context_factory
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_teardown_event_payload_serializes_to_json(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=1), rented_data=_snapshot_with_pod())
 
