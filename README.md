@@ -1,124 +1,193 @@
-# lium.io
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/69550b83-91a9-492a-bd7a-09d35c6106d3" alt="Lium" width="120" height="120" />
+</p>
 
-**[Lium Documentation](https://docs.lium.io)** — providers: <https://docs.lium.io/providers>, validators: <https://docs.lium.io/validators>
+<h1 align="center">Lium</h1>
 
-<img width="469" height="468" alt="image" src="https://github.com/user-attachments/assets/69550b83-91a9-492a-bd7a-09d35c6106d3" />
+<p align="center"><strong>The decentralized GPU cloud on Bittensor Subnet 51.</strong></p>
 
-Welcome to **Lium.io powered by Bittensor Subnet 51**! This project enables a decentralized, peer-to-peer GPU rental marketplace, connecting miners who contribute GPU resources with users who need computational power. Our frontend interface is available at [lium.io](https://lium.io), where you can easily rent machines from the subnet.
+<p align="center">
+  <a href="https://github.com/Datura-ai/lium-io/actions/workflows/test.yml"><img src="https://github.com/Datura-ai/lium-io/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
+  <a href="https://taomarketcap.com/subnets/51"><img src="https://img.shields.io/badge/Bittensor-Subnet%2051-000000" alt="Bittensor Subnet 51" /></a>
+  <a href="https://pypi.org/project/lium.io/"><img src="https://img.shields.io/pypi/v/lium.io?label=lium.io%20CLI" alt="lium.io on PyPI" /></a>
+  <a href="https://discord.gg/lium"><img src="https://img.shields.io/discord/1350984082733142026?label=Discord&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Datura-ai/lium-io" alt="MIT License" /></a>
+</p>
 
-## Table of Contents
+Lium is a GPU rental marketplace. Providers around the world list their NVIDIA GPUs, and renters (people, teams and AI agents) rent them by the hour at [lium.io](https://lium.io), from the web, the `lium` CLI, the Python SDK or the API. Every node is checked by the Subnet 51 validator every 15 minutes: hardware, GPU, network, ports and a Sysbox-isolated container runtime. Only nodes that pass are listed. Providers earn twice: a share of what renters pay, and Bittensor emission for their nodes, including idle pay for eligible GPUs that are not rented. This repository holds the code that runs on providers' machines (the node agent and the miner) and the validator that scores them.
 
-- [Introduction](#introduction)
-- [High-Level Architecture](#high-level-architecture)
-- [Getting Started](#getting-started)
-  - [For Renters](#for-renters)
-  - [For Miners](#for-miners)
-  - [For Validators](#for-validators)
-- [Repository Layout](#repository-layout)
-- [Running the Tests](#running-the-tests)
-- [Releases](#releases)
-- [Contact and Support](#contact-and-support)
+## Quick links
 
-## Introduction
+| | |
+|---|---|
+| Rent a GPU | [lium.io](https://lium.io) |
+| Documentation | [docs.lium.io](https://docs.lium.io) ([providers](https://docs.lium.io/providers), [validators](https://docs.lium.io/validators), [renters](https://docs.lium.io/pod-users), [developers](https://docs.lium.io/developers)) |
+| Provider Portal | [provider.lium.io](https://provider.lium.io) (add nodes, set prices, see earnings) |
+| Rewards calculator | [provider.lium.io/rewards-calculator](https://provider.lium.io/rewards-calculator) |
+| CLI and Python SDK | [Datura-ai/lium](https://github.com/Datura-ai/lium): `pip install lium.io` ([CLI docs](https://docs.lium.io/developers/cli/overview), [SDK docs](https://docs.lium.io/developers/sdk)) |
+| Community and support | [Discord](https://discord.gg/lium), and for account help, a private ticket in [`#tickets`](https://discord.com/channels/1350984082733142026/1547193098969284650) |
 
-The Compute Subnet on Bittensor is a decentralized network that allows miners to contribute their GPU resources to a global pool. Users can rent these resources for computational tasks, such as machine learning, data analysis, and more. The system ensures fair compensation for miners based on the quality and performance of their GPUs.
+## For renters
 
-## High-Level Architecture
-
-- **Miners**: Provide GPU resources to the network, evaluated and scored by validators.
-- **Validators**: Securely connect to miner machines to verify hardware specs and performance. They maintain the network's integrity.
-- **Renters**: Rent computational resources from the network to run their tasks.
-- **Frontend (lium.io)**: The web interface facilitating easy interaction between miners and renters.
-- **Bittensor Network**: The decentralized blockchain in which the compensation is managed and paid out by the validators to the miners through its native token, $TAO.
-
-## Getting Started
-
-### For Renters
-
-If you are looking to rent computational resources, you can easily do so through the Compute Subnet. Renters can:
-
-1. Visit [lium.io](https://lium.io) and sign up.
-2. **Browse** available GPU resources.
-3. **Select** machines based on GPU type, performance, and price.
-4. **Deploy** and monitor your computational tasks using the platform's tools.
-
-To start renting machines, visit [lium.io](https://lium.io) and access the resources you need.
-
-**Command-Line Alternative**: For renters who prefer working from the terminal, you can also use the [Lium CLI](https://github.com/Datura-ai/lium) - a command-line interface that allows you to manage GPU pods, SSH into machines, transfer files, and execute commands directly from your terminal. Install it with `pip install lium.io`.
-
-### For Miners
-
-Miners can contribute their GPU-equipped machines to the network. The machines are scored and validated based on factors like GPU type, number of GPUs, bandwidth, and overall GPU performance. Higher performance results in better compensation for miners.
-
-If you are a miner and want to contribute GPU resources to the subnet, please refer to the [Miner Setup Guide](neurons/miners/README.md) for instructions on how to:
-
-- Set up your environment.
-- Install the miner software.
-- Register your miner and connect to the network.
-- Get compensated for providing GPUs!
-
-### For Validators
-
-Validators play a crucial role in maintaining the integrity of the Compute Subnet by verifying the hardware specifications and performance of miners’ machines. Validators ensure that miners are fairly compensated based on their GPU contributions and prevent fraudulent activities.
-
-For more details, visit the [Validator Setup Guide](neurons/validators/README.md).
-
-## Repository Layout
-
-Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; one shared pdm package (`datura/`, a `pyproject.toml` only); `packages/lium-core/`, the library published to PyPI; and `lium_protocol/`, the validator↔backend wire package (its own `pyproject.toml`). The root `pyproject.toml` (`compute-subnet`, Python 3.11) holds the shared `[tool.ruff]` config and the repo-wide dev tools (`ruff`, `pre-commit`), plus one declared runtime dependency (`aiohttp`):
-
-- `neurons/validators/` — the validator: scores miners, verifies executors over SSH, creates and manages rental containers on them (`src/services/docker_service.py`), sets weights. `src/miner_jobs/` holds the scripts the validator uploads to an executor and runs there (`machine_scrape.py` hardware scrape, `backup_storage.py` / `restore_storage.py`, `workspace_mount.py`); `machine_scrape.py` is obfuscated per job by `src/services/file_encrypt_service.py` before upload, so its key order is load-bearing (see the comment at the top of that file).
-- `neurons/miners/` — the miner: registers executors with the network and answers validator requests; its database schema is Alembic migrations under `migrations/`.
-- `neurons/executor/` — the agent installed on a GPU machine: exposes the machine to its miner's validators, runs the containers. `dstacktee/` runs it inside an Intel TDX confidential VM with attestation (its own README).
-- `datura/` — the protocol shared by the three: request/response models (`datura/requests`), consumers, errors.
-- `packages/lium-core/` — `lium_core.shared_config`, the shared-config client the validator and the miner install from PyPI as `lium-core` (its own README; CI `lium-core-ci.yml`, release by hand through `lium-core-release.yml`).
-- `lium_protocol/` — the validator↔backend wire protocol as one versioned package: every WebSocket message in both directions and every backend HTTP body the validator reads, as pydantic models, with a committed JSON-schema snapshot (`lium_protocol/lium_protocol/snapshots/lium_protocol.v1.json`) that CI compares with the models. Consumers pin it by tag (`lium_protocol/README.md`); `neurons/validators/tests/test_protocol_compat.py` replays the recorded messages through it and through the validator's own models.
-- `watchtower/` — pulls validator-signed image updates and restarts containers (its own README).
-- `e2e/` — the whole loop on one machine without the chain: a real executor on its own dockerd, a real miner, the validator's services as the tester (`e2e/README.md`; `./gate.sh` is what CI runs).
-- `scripts/` — the `install_*_on_ubuntu.sh` installers referenced by the setup guides; `docs/` — operator notes; `contrib/` — contribution and style guides.
-
-## Running the Tests
-
-Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm project; the validator suite is the large one (~1,950 tests, about two minutes, SQLite — no Postgres needed). From the repository root, each service in its own subshell so the block runs top to bottom:
+Sign up at [lium.io](https://lium.io), pick a GPU, and SSH into your pod. From a terminal:
 
 ```bash
-(cd neurons/validators && pdm install && \
- BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
- SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
- ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
- pdm run pytest tests/ -v --tb=short --strict-markers)
-
-(cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -v --tb=short)
-(cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
-(cd lium_protocol && pip install . pytest "pydantic==2.13.*" && python -m lium_protocol.schema --check && python -m pytest tests -v --tb=short)
+pip install lium.io
+lium init   # saves your API key
+lium ls     # GPUs available now, with prices
 ```
 
-These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
+Next steps: the [renter quickstart](https://docs.lium.io/pod-users/quickstart), the [CLI quickstart](https://docs.lium.io/developers/cli/quickstart), or [AI agents](https://docs.lium.io/developers/agents) for the fully headless path.
 
-- `route` reads the changed files (`.github/actions/changed-packages`), after dropping `*.md`, `.gitignore` and the root `docs/` tree — a README-only PR runs no neuron job.
-- Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed; the validators job also runs when `lium_protocol/` changed (its `tests/test_protocol_compat.py` replays the package's recordings).
-- `protocol` (the `lium_protocol` line above, pydantic pinned to `2.13.*` because the snapshot is pydantic's JSON Schema) runs when `lium_protocol/`, `datura/` or `.github/` changed.
-- `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
-- `lint` (`ruff format --check`, report-only, not required) runs per changed neuron.
-- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `lium_protocol/`, `datura/`, `.github/` or `e2e/` changed.
-- `tests-ok` is the one status check to require; it reports on every PR.
+## For providers
 
-Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+Docs and the Provider Portal call a miner a **provider** and an executor a **node**.
 
-## Releases
+**Why list your GPUs on Lium**
 
-Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` workflows from each neuron's `docker_build.sh` / `docker_publish.sh` (and the `*_runner_*` pair for the auto-updating runner image):
+- **Two income streams.** You list each node at your own price per GPU-hour and get a share of what renters pay. On top of that, your hotkey earns Subnet 51 emission for rented nodes. See [How providers earn](https://docs.lium.io/providers/rewards).
+- **Idle pay.** An eligible GPU that is not rented still earns from the unrented pool (see [How incentives work](#how-incentives-work)).
+- **No coordinator server required.** Opt into the Lium.io Central Provider Server and all you run is the node agent on each GPU host.
+- **One-command setup.** `lium mine` installs, configures and checks a node, then prints the values for the portal's **Add Node** form.
 
-| Tag pushed | Workflow | Images |
+### Requirements
+
+Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/providers/nodes/quickstart#requirements)):
+
+- **OS:** Ubuntu 24.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer.
+- **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
+- **Docker Engine**, installed and running.
+- **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.
+- **Hardware:** at least 8 GB RAM and 100 GB free disk. For idle pay, total disk must be at least **1.5× total GPU VRAM**.
+- **A registered hotkey** on Subnet 51 (below). Keep your coldkey off the server.
+
+### Ports
+
+| Port | Default | Who connects | Set in `neurons/executor/.env` |
+|---|---|---|---|
+| Node service (HTTP) | `8080` with `lium mine` (`8001` in the template) | The provider coordinator (yours or the Central Provider Server) | `EXTERNAL_PORT` / `INTERNAL_PORT` |
+| Node SSH | `2200` | The validator | `SSH_PORT`, plus `SSH_PUBLIC_PORT` when NAT forwards a different public port |
+| Renting ports | All ports | Renters' pods | `RENTING_PORT_RANGE` (like `40000-40100`) or, behind NAT, `RENTING_PORT_MAPPINGS`. Set one, never both. **At least 3 must be reachable from the internet.** |
+
+A self-hosted coordinator also needs its own `EXTERNAL_PORT` (default `8000`) open to the validator; see [`neurons/miners/README.md`](neurons/miners/README.md).
+
+### Install
+
+1. **Register a hotkey** on Subnet 51, from your own machine and not the GPU host. The fee is dynamic ([check it here](https://taomarketcap.com/subnets/51/registration)).
+
+   ```bash
+   btcli subnet register --netuid 51 --wallet.name <wallet> --wallet.hotkey <hotkey>
+   ```
+
+2. **Set up the Provider Portal.** Sign in at [provider.lium.io](https://provider.lium.io/signature-login) with that hotkey. In [Profile Settings](https://provider.lium.io/settings), select **Lium.io Central Provider Server** under **Central Provider**, and [connect Discord](https://docs.lium.io/providers/portal/discord). A provider without a connected Discord account earns no incentive. To run the coordinator yourself instead, follow [Self-hosted provider](https://docs.lium.io/providers/self-hosted-provider).
+
+3. **Install Sysbox and the NVIDIA Container Toolkit** on the GPU host. Validators reject a node without the `sysbox-runc` runtime. The installer checks the host first and prints a `PASS`, `FIX` or `SKIP` line per requirement.
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
+   docker run --rm --runtime=sysbox-runc --gpus all daturaai/compute-subnet-executor:latest nvidia-smi
+   ```
+
+4. **Start the node** with your hotkey's SS58 address. It prompts for the ports above. Add `--auto` to accept the defaults.
+
+   ```bash
+   curl -fsSL https://lium.io/mine.sh | bash -s -- -k <your_provider_hotkey_ss58>
+   ```
+
+   The script installs the `lium` CLI and runs `lium mine`, which clones this repository, writes `neurons/executor/.env`, starts the node with `docker compose up -d` and runs the validator's own check against it.
+
+5. **Add the node** in the portal: **Add Node**, then paste the GPU type, GPU count, IP and port that `lium mine` printed, and set your price per GPU-hour.
+
+To set every value by hand, use the [manual setup](neurons/executor/README.md#manual-setup). A running node updates itself; see [`EXECUTOR_UPDATE.md`](neurons/executor/EXECUTOR_UPDATE.md).
+
+### Check that your node is listed
+
+- **Provider Portal:** a new node shows **VALIDATION PENDING**, then **AVAILABLE** once the validator has checked it and published the cycle. The validator runs every 15 minutes. If the node is still pending after an hour, see [Troubleshooting](https://docs.lium.io/providers/troubleshooting#a-newly-added-node-stuck-in-validation_pending).
+- **Public feed:** every node that renters can rent right now is in [`lium.io/api/public/v1/nodes`](https://docs.lium.io/developers/public-nodes-feed). Use the node ID from its portal page (`provider.lium.io/executors/<node-id>`). A fully rented node leaves the feed until a GPU frees up.
+
+  ```bash
+  curl -s https://lium.io/api/public/v1/nodes | jq '.nodes[] | select(.id == "<node-id>")'
+  ```
+
+- **Why it is not earning:** the node's detail page shows the validator's last reason code, and the [Job Logs dashboard](https://grafana.lium.io/d/aejriu31349hcb/job-logs) has every check's full message.
+
+### Common failures
+
+| What you see | Cause | Fix |
 |---|---|---|
-| `executor-v*` | `executor_cd_prod.yml` | `daturaai/compute-subnet-executor`, `daturaai/compute-subnet-executor-runner` |
-| `validator-v*` | `validator_cd_prod.yml` | `daturaai/compute-subnet-validator`, `daturaai/compute-subnet-validator-runner` |
-| `miner-v*` | `miner_cd_prod.yml` | `daturaai/compute-subnet-miner`, `daturaai/compute-subnet-miner-runner` |
+| Stuck at `VALIDATION PENDING`, then `NOT_DETECTED`, with no errors | The account has no coordinator, so no check ever runs | Select the Central Provider Server in [Profile Settings](https://provider.lium.io/settings), or start your self-hosted miner |
+| `INSUFFICIENT_PORTS` | Fewer than 3 renting ports are reachable from the validator | Open `RENTING_PORT_RANGE` on the firewall or NAT, or widen it, then `docker compose up -d` in `neurons/executor` |
+| `PORT_VERIFY_FAILED` | A port the validator mapped is closed, or NAT forwards a different external port | Behind NAT, list the pairs in `RENTING_PORT_MAPPINGS` rather than `RENTING_PORT_RANGE` |
+| SSH errors or `UPLOAD_FAILED` | The node SSH port (`2200`) is not reachable from outside | Open it, or set `SSH_PUBLIC_PORT` to the port your NAT forwards |
+| Job Logs mention `sysbox-runc` | Sysbox is missing or not working | Rerun step 3; see [Sysbox](https://docs.lium.io/providers/nodes/sysbox) |
+| `VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW` | Download speed below 100 Mbps | Reproduce it with the [VerifyX benchmark](https://docs.lium.io/providers/troubleshooting#2-run-the-verifyx-benchmark-to-reproduce-validator-checks), then fix the uplink |
+| No idle pay, and the reason mentions disk | Total disk is below 1.5× total GPU VRAM | Add disk; see [Docker storage](https://docs.lium.io/providers/nodes/docker-storage) |
 
-The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. The deploy of the validator and central miner lives in the private `lium-io-deployment` repository.
+Every reason code and its fix: [Troubleshooting → Validator reason codes](https://docs.lium.io/providers/troubleshooting#6-validator-reason-codes). Still stuck? Open a ticket in [`#tickets`](https://discord.com/channels/1350984082733142026/1547193098969284650). Never share a seed phrase, private key or coldkey with anyone who offers help ([how support scams work](https://docs.lium.io/security/official-support-and-scams)).
 
-## Contact and Support
+## For validators
 
-If you need assistance or have any questions, feel free to reach out:
+Subnet 51 has one validator, operated by the Lium team (hotkey `5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p`). Nodes accept checks only from the validator hotkeys compiled into the node image, so a second copy of `neurons/validators` cannot check nodes on mainnet.
 
-- **Discord Support**: [Dedicated Channel within the Bittensor Discord](https://discord.com/channels/799672011265015819/1291754566957928469)
+To take part in consensus, run the community auditor, [Datura-ai/sn51-auditor](https://github.com/Datura-ai/sn51-auditor). It reads the latest validated results from the lium.io public endpoint, audits them, and sets weights from your hotkey. It needs one CPU core, 256 MB of RAM, Python 3.11+ and a hotkey registered on Subnet 51. Bittensor also requires a validator permit to set weights.
+
+```bash
+git clone https://github.com/Datura-ai/sn51-auditor.git && cd sn51-auditor
+pip install bittensor requests
+python3 auditor.py <wallet_name> <hotkey_name>
+```
+
+The validator code here is open so anyone can read what it checks and how it scores. [`neurons/validators/README.md`](neurons/validators/README.md) covers running it for Lium's own deployments and on testnet. Validator docs: [docs.lium.io/validators](https://docs.lium.io/validators).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    R["Renters<br/>lium.io · CLI · SDK · API"] --> P["Lium platform"]
+    P <-->|"WebSocket<br/>lium_protocol"| V["Validator<br/>neurons/validators"]
+    V <-->|"WebSocket<br/>datura"| M["Provider coordinator<br/>neurons/miners"]
+    M -->|"signed HTTP"| E["Node agent<br/>neurons/executor<br/>on each GPU host"]
+    V -->|"SSH: checks<br/>and rental pods"| E
+    R -.->|"SSH into the pod"| E
+    V -->|"weights"| C[("Bittensor<br/>Subnet 51")]
+    C -.->|"emission to<br/>provider hotkeys"| M
+```
+
+- **Node agent** (`neurons/executor/`) runs on each GPU host. It lets the validator in over SSH with a key the coordinator installs, and runs renters' pods under Sysbox. `dstacktee/` runs it in an Intel TDX confidential VM with attestation.
+- **Provider coordinator**, the miner (`neurons/miners/`), runs on a small CPU server, or as the Central Provider Server that Lium operates for providers who opt in. It holds the provider's hotkey, lists its nodes to the validator, and installs the validator's SSH key on them.
+- **Validator** (`neurons/validators/`): every 15 minutes it asks each coordinator for its nodes, checks each node over SSH (hardware, GPU, network, ports), creates and removes rental pods for the platform, reports results to the platform, and sets weights on chain.
+- **Shared code:** `datura/` (the validator-to-miner messages), `lium_protocol/` (the versioned validator-to-platform protocol), `packages/lium-core/` (the shared-config client, published to PyPI as `lium-core`), `watchtower/` (pulls signed image updates), and `e2e/` (the whole loop on one machine, no chain).
+
+More detail: [provider architecture](https://docs.lium.io/providers/architecture).
+
+## How incentives work
+
+A provider earns in two ways. The rates move with the market, so the [rewards calculator](https://provider.lium.io/rewards-calculator) has the live figures.
+
+1. **Rental fees.** The renter pays per GPU-hour at the price the provider set. The platform pays the provider's share to their coldkey once a day ([Rental fees](https://docs.lium.io/providers/rewards/rental-fees), [Payouts](https://docs.lium.io/providers/rewards/payouts)).
+2. **Subnet emission.** Each cycle the validator scores every node and sets weights on chain, and Bittensor pays alpha to provider hotkeys every tempo. The validator splits the emission three ways:
+   - **Rented pool:** nodes that are rented right now, scored by GPU model and count.
+   - **Unrented pool:** idle nodes of an eligible GPU model, paid by what that GPU earns when rented. Among the conditions: the node passes validation, its price is at or below the market soft limit, its disk is at least 1.5× its VRAM, its container can set a GPU power limit, and its GPU-count tier has capacity this cycle. An 8× H200, B200 or B300 node must also offer GPU splitting, GPU profiling or an attested confidential VM.
+   - **Burn:** the rest. The validator reads the ceiling for the unrented and burn pools from the platform's shared config (`total_burn_emission` at [lium.io/api/v1/shared-config](https://lium.io/api/v1/shared-config)) at the start of every cycle.
+
+A node that fails validation, or runs the provider's own default job, earns nothing that cycle. Every reason a node can earn 0, with the exact message the provider sees, is listed in [`incentive/miner_incentive_log.py`](neurons/validators/src/incentive/miner_incentive_log.py). The pool logic is in [`incentive/rental_price.py`](neurons/validators/src/incentive/rental_price.py). The full explanation is in [Subnet emission](https://docs.lium.io/providers/rewards/emission) and [Penalties](https://docs.lium.io/providers/rewards/penalties).
+
+## Contributing
+
+Issues and pull requests are welcome. Open an [issue](https://github.com/Datura-ai/lium-io/issues) first for anything larger than a small fix. [`contrib/CONTRIBUTING.md`](contrib/CONTRIBUTING.md) covers the workflow, the test command for each service, and how releases are cut. Each service is its own [pdm](https://pdm-project.org) project on Python 3.11. For example, the validator suite:
+
+```bash
+cd neurons/validators && pdm install && \
+BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
+SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
+ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
+pdm run pytest tests/ --tb=short --strict-markers
+```
+
+## Security
+
+Please report vulnerabilities privately through [GitHub Security Advisories](https://github.com/Datura-ai/lium-io/security/advisories/new), not in a public issue or on Discord. Include the affected component (node, miner or validator), steps to reproduce, and the impact.
+
+## License
+
+Released under the [MIT License](LICENSE).
