@@ -322,16 +322,6 @@ def summarize_steps(
     return summary
 
 
-class ProgressSink(Protocol):
-    """Where the pipeline reports which check a run is on (validation fast path, support view)."""
-
-    def step_started(self, ctx: Context, check_id: str) -> None: ...
-
-    def step_finished(self, ctx: Context, check_id: str, event: ValidationEvent, passed: bool) -> None: ...
-
-    def step_aborted(self, ctx: Context, check_id: str, error_class: str) -> None: ...
-
-
 class ParallelStage:
     """Lanes of checks with no data dependency between them, run at once on one Context.
 
@@ -417,22 +407,13 @@ def cancel_pending_collateral_prefetch(ctx: Context) -> bool:
 
 
 class Pipeline:
-    def __init__(self, checks: List[Check], sink: EventSink, progress: ProgressSink | None = None):
+    def __init__(self, checks: List[Check], sink: EventSink):
         self.checks = checks
         self.sink = sink
-        self.progress = progress
 
     async def _run_check(self, chk: Check, ctx: Context) -> _RanCheck:
-        if self.progress is not None:
-            self.progress.step_started(ctx, chk.check_id)
         started = time.perf_counter()
-        try:
-            res = await chk.run(ctx)
-        except BaseException as exc:
-            # The exception class is what support sees; the text stays in the run's own log line.
-            if self.progress is not None:
-                self.progress.step_aborted(ctx, chk.check_id, type(exc).__name__)
-            raise
+        res = await chk.run(ctx)
         finished = time.perf_counter()
         return _RanCheck(check=chk, result=res, before_state=ctx.state, started=started, finished=finished)
 
@@ -542,8 +523,6 @@ class Pipeline:
 
                 await self.sink.emit(res.event)
                 events.append(res.event)
-                if self.progress is not None:
-                    self.progress.step_finished(current_ctx, chk.check_id, res.event, res.passed)
 
                 current_ctx = self._apply(current_ctx, ran, parallel)
                 latest_ctx_holder[0] = current_ctx

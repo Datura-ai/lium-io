@@ -5,8 +5,7 @@ and decides exactly as the serial pipeline does.
   serial list on the same checks;
 - the collateral read started early is the one CollateralCheck awaits, with the gate unchanged;
 - the fast-path check list is the serial list re-ordered — no check added, none dropped;
-- the express lane's shorter waits apply only with the flag on;
-- the validation-progress record walks its phases and is readable over HTTP.
+- the express lane's shorter waits apply only with the flag on.
 """
 
 from __future__ import annotations
@@ -17,9 +16,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
 from neurons.validators.src.core import express_lane as express_lane_module
-from neurons.validators.src.core import validation_progress as vp
 from neurons.validators.src.core.express_lane import (
     MINER_DID_NOT_RETURN_EXECUTOR,
     RETRY_SECONDS,
@@ -31,7 +28,6 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutorsResponse,
     RentedPod,
 )
-from neurons.validators.src.routes import validation_progress as progress_route
 from neurons.validators.src.services.task.checks import (
     CachedTemplateVerificationCheck,
     CapabilityCheck,
@@ -242,13 +238,11 @@ async def test_parallel_stage_cancels_the_sibling_lane_when_a_check_raises(conte
     host = [_StateCheck("ports", seconds=0.05, log=log), _StateCheck("rental_verification", log=log)]
     gpu = [_RaisingCheck("matmul", seconds=0.01, log=log)]
     state, prefetch = _with_prefetch(build_state(specs={"gpu": {"count": 8}}))
-    registry = vp.ValidationProgress()
     ctx = context_factory(state=state)
-    registry.run_started(ctx.executor.uuid, ctx.miner_hotkey, "express")
     tasks_before = len(asyncio.all_tasks())
 
     with pytest.raises(RuntimeError, match="matmul blew up"):
-        await Pipeline([ParallelStage([host, gpu]), _StateCheck("finalize", log=log)], _Sink(), progress=vp.PipelineProgress(registry)).run(ctx)
+        await Pipeline([ParallelStage([host, gpu]), _StateCheck("finalize", log=log)], _Sink()).run(ctx)
 
     kinds = {(c, kind) for c, kind, _ in log}
     assert ("ports", "cancelled") in kinds, "the in-flight sibling check was cancelled"
@@ -256,11 +250,6 @@ async def test_parallel_stage_cancels_the_sibling_lane_when_a_check_raises(conte
     assert ("finalize", "start") not in kinds
     assert len(asyncio.all_tasks()) == tasks_before, "no lane task is left running"
     assert prefetch.cancelled, "the early collateral read nobody will consume is cancelled"
-    record = registry.get(ctx.executor.uuid)
-    by_id = {s["check_id"]: s for s in record["steps"]}
-    assert by_id["matmul"]["reason_code"] == "ABORTED:RuntimeError", "the class, not the text"
-    assert by_id["ports"]["reason_code"] == "ABORTED:CancelledError"
-    assert "blew up" not in str(record)
 
 
 @pytest.mark.asyncio
@@ -478,169 +467,3 @@ def test_express_lane_waits_shorten_only_with_the_flag_on(monkeypatch):
     assert max_attempts_for("verification failed") == 3
     monkeypatch.setattr(settings, "VALIDATION_FAST_PATH_ENABLED", False)
     assert max_attempts_for(MINER_DID_NOT_RETURN_EXECUTOR) == 3
-
-
-# --- (e) validation progress ---------------------------------------------------------------------------
-
-
-def test_progress_record_walks_the_express_lane_phases():
-    registry = vp.ValidationProgress()
-    registry.discovered("exe-1", "miner-a", "express")
-    assert registry.get("exe-1")["phase"] == vp.DISCOVERED
-
-    registry.asking_miner("exe-1", "miner-a", "express", attempt=1)
-    registry.retry_scheduled("exe-1", MINER_DID_NOT_RETURN_EXECUTOR, 35, attempt=1)
-    record = registry.get("exe-1")
-    assert record["phase"] == vp.WAITING_TO_RETRY and record["attempts"] == 1
-    assert record["detail"] == f"retry in 35 s: {MINER_DID_NOT_RETURN_EXECUTOR}"
-    assert record["last_error"] == MINER_DID_NOT_RETURN_EXECUTOR
-
-    registry.asking_miner("exe-1", "miner-a", "express", attempt=2)
-    registry.run_started("exe-1", "miner-a", "express")
-    assert registry.get("exe-1")["phase"] == vp.CONNECTING
-
-    registry.step_started("exe-1", "gpu.scrape.machine_spec")
-    record = registry.get("exe-1")
-    assert record["phase"] == vp.RUNNING and record["current_check_id"] == "gpu.scrape.machine_spec"
-    assert record["current_check_since"] is not None
-    registry.step_finished("exe-1", "gpu.scrape.machine_spec", "SCRAPE_OK", passed=True)
-    registry.step_started("exe-1", "gpu.validate.verifyx")
-    registry.step_finished("exe-1", "gpu.validate.verifyx", "VERIFYX_FAILED", passed=False)
-    record = registry.get("exe-1")
-    assert record["current_check_id"] is None
-    assert record["last_reason_code"] == "VERIFYX_FAILED"
-    assert record["last_error"] == "gpu.validate.verifyx: VERIFYX_FAILED"
-    assert [(s["check_id"], s["passed"]) for s in record["steps"]] == [
-        ("gpu.scrape.machine_spec", True),
-        ("gpu.validate.verifyx", False),
-    ]
-
-    registry.run_finished("exe-1", passed=False, reason_code="VERIFYX_FAILED")
-    assert registry.get("exe-1")["phase"] == vp.FAILED
-    registry.published("exe-1", passed=False)
-    assert registry.get("exe-1")["phase"] == vp.FAILED
-
-    registry.run_started("exe-1", "miner-a", "express")
-    assert registry.get("exe-1")["steps"] == [], "a new run starts a new timeline"
-    registry.step_started("exe-1", "pipeline.finalize")
-    registry.step_finished("exe-1", "pipeline.finalize", "OK", passed=True)
-    registry.run_finished("exe-1", passed=True, reason_code="OK")
-    assert registry.get("exe-1")["phase"] == vp.VERIFIED
-    registry.published("exe-1", passed=True)
-    assert registry.get("exe-1")["phase"] == vp.PUBLISHED
-
-    registry.left_to_cycle("exe-2", MINER_DID_NOT_RETURN_EXECUTOR, attempt=3)
-    assert registry.get("exe-2")["phase"] == vp.LEFT_TO_CYCLE
-
-
-def test_progress_prunes_finished_records_after_retention(monkeypatch):
-    registry = vp.ValidationProgress()
-    registry.run_started("old", "m", "cycle")
-    registry.run_finished("old", passed=True)
-    registry.run_started("live", "m", "cycle")
-    now = [1000.0]
-    monkeypatch.setattr(vp.time, "monotonic", lambda: now[0])
-    for r in registry._records.values():
-        r._touched_monotonic = 0.0
-    now[0] = vp.RETENTION_SECONDS + 1.0
-    uuids = {r["executor_uuid"] for r in registry.snapshot()}
-    assert uuids == {"live"}, "a finished record ages out; a running one stays"
-
-
-@pytest.mark.asyncio
-async def test_pipeline_reports_each_check_to_the_registry(context_factory, monkeypatch):
-    registry = vp.ValidationProgress()
-    sink = _Sink()
-    stage = ParallelStage([[_StateCheck("b")], [_StateCheck("c", passed=False)]])
-    checks = [_StateCheck("a"), stage, _StateCheck("d")]
-    ctx = context_factory()
-    registry.run_started(ctx.executor.uuid, ctx.miner_hotkey, "express")
-    ok, events, _ = await Pipeline(checks, sink, progress=vp.PipelineProgress(registry)).run(ctx)
-    assert ok is False
-    record = registry.get(ctx.executor.uuid)
-    assert [s["check_id"] for s in record["steps"]] == ["a", "b", "c"]
-    assert record["last_error"] == "c: C_FAILED"
-
-
-@pytest.mark.asyncio
-async def test_progress_route_serves_one_and_all_to_the_token_only(monkeypatch):
-    registry = vp.ValidationProgress()
-    monkeypatch.setattr(progress_route, "progress", registry)
-    monkeypatch.setattr(settings, "VALIDATION_PROGRESS_TOKEN", "support-token")
-    registry.run_started("exe-1", "miner-a", "express")
-    registry.step_started("exe-1", "gpu.validate.verifyx")
-    registry.left_to_cycle("exe-2", MINER_DID_NOT_RETURN_EXECUTOR, attempt=3)
-
-    # The route handlers, called as FastAPI would after resolving the header and the query.
-    one = await progress_route.get_validation_progress("exe-1", token="support-token")
-    assert one["phase"] == vp.RUNNING and one["current_check_id"] == "gpu.validate.verifyx"
-    assert "miner_hotkey" not in one, "the payload names the node by uuid only"
-    assert set(one) >= {"executor_uuid", "phase", "phase_since", "steps", "last_error", "updated_at"}
-    with pytest.raises(HTTPException) as missing:
-        await progress_route.get_validation_progress("nope", token="support-token")
-    assert missing.value.status_code == 404
-    everything = await progress_route.list_validation_progress(phase=None, lane=None, token="support-token")
-    assert everything["count"] == 2
-    left = await progress_route.list_validation_progress(phase=vp.LEFT_TO_CYCLE, lane=None, token="support-token")
-    assert left["count"] == 1
-    express = await progress_route.list_validation_progress(phase=None, lane="express", token="support-token")
-    assert express["count"] == 1
-
-    # No token or a wrong one: 401, and nothing of the registry in the response.
-    for bad in (None, "", "support-token-", "SUPPORT-TOKEN"):
-        with pytest.raises(HTTPException) as denied:
-            await progress_route.list_validation_progress(phase=None, lane=None, token=bad)
-        assert denied.value.status_code == 401
-    # No token configured on the validator: the route answers as if it did not exist (and
-    # validator.py does not register it at all).
-    monkeypatch.setattr(settings, "VALIDATION_PROGRESS_TOKEN", None)
-    with pytest.raises(HTTPException) as gone:
-        await progress_route.get_validation_progress("exe-1", token="support-token")
-    assert gone.value.status_code == 404
-
-
-def test_progress_route_is_registered_only_with_a_token(monkeypatch):
-    src = (__import__("pathlib").Path(__file__).resolve().parents[1] / "src" / "validator.py").read_text()
-    assert "if settings.VALIDATION_PROGRESS_TOKEN:" in src
-    assert src.index("if settings.VALIDATION_PROGRESS_TOKEN:") < src.index("app.include_router(validation_progress_router)")
-
-
-def test_progress_payload_carries_an_error_class_not_the_exception_text():
-    registry = vp.ValidationProgress()
-    registry.run_started("exe-1", "miner-a", "express")
-    registry.step_started("exe-1", "gpu.validate.verifyx")
-    registry.step_aborted("exe-1", "gpu.validate.verifyx", "ConnectionRefusedError")
-    record = registry.get("exe-1")
-    assert record["steps"][-1]["reason_code"] == "ABORTED:ConnectionRefusedError"
-    assert record["last_error"] == "gpu.validate.verifyx: ABORTED:ConnectionRefusedError"
-    assert "miner_hotkey" not in record and "miner-a" not in str(record)
-
-
-def test_progress_evicts_finished_records_before_live_ones(monkeypatch):
-    monkeypatch.setattr(vp, "MAX_RECORDS", 4)
-    registry = vp.ValidationProgress()
-    for n in range(4):
-        registry.run_started(f"live-{n}", "m", "cycle")
-    registry.run_started("done", "m", "cycle")
-    registry.run_finished("done", passed=True)
-    for r in registry._records.values():
-        r._touched_monotonic = 0.0
-    registry.run_started("live-4", "m", "cycle")
-    uuids = {r["executor_uuid"] for r in registry.snapshot()}
-    assert "done" not in uuids, "over the cap, a finished record goes before any live one"
-    assert "live-4" in uuids and len(uuids) == 4
-
-
-def test_progress_prunes_on_a_write_after_the_interval(monkeypatch):
-    registry = vp.ValidationProgress()
-    registry.run_started("old", "m", "cycle")
-    registry.run_finished("old", passed=True)
-    registry.run_started("live", "m", "cycle")
-    now = [10_000.0]
-    monkeypatch.setattr(vp.time, "monotonic", lambda: now[0])
-    for r in registry._records.values():
-        r._touched_monotonic = 0.0
-    registry._last_prune = 0.0
-    now[0] = vp.RETENTION_SECONDS + vp.PRUNE_EVERY_SECONDS + 1.0
-    registry.step_started("live", "gpu.validate.verifyx")  # a write on an existing record, not a new one
-    assert set(registry._records) == {"live"}

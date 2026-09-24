@@ -75,7 +75,6 @@ from .pipeline import (
     LoggerSink,
     ParallelStage,
     Pipeline,
-    ProgressSink,
     PodRecoverer,
 )
 from .runner import SSHCommandRunner
@@ -533,14 +532,13 @@ class PipelineFactory:
             ],
         )
 
-    def build_pipeline(self, checks: list[Check], progress: ProgressSink | None = None) -> Pipeline:
+    def build_pipeline(self, checks: list[Check]) -> Pipeline:
         """Build a pipeline with the given checks.
 
         Args:
             checks: List of validation checks
-            progress: Where the pipeline reports each check's start and end (the support view)
 
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger), progress=progress)
+        return Pipeline(checks, sink=LoggerSink(logger))

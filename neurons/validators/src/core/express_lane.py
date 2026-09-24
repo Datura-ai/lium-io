@@ -33,7 +33,6 @@ from services.task_service import JobResult
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from core.validation_progress import progress as validation_progress
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +190,6 @@ class ExpressLane:
                     pending = self._pending[executor.id] = _Pending(
                         executor=executor, miner_hotkey=miner_hotkey, first_seen_at=now_wall
                     )
-                    validation_progress.discovered(executor.id, miner_hotkey, EXPRESS_LANE)
                 if executor.id in in_flight or pending.not_before > now:
                     continue
                 candidates.append(pending)
@@ -293,7 +291,6 @@ class ExpressLane:
             "attempt": attempt,
         }
         try:
-            validation_progress.asking_miner(executor_id, miner.hotkey, EXPRESS_LANE, attempt)
             payload = MinerJobRequestPayload(
                 job_batch_id=started_wall.strftime(JOB_BATCH_ID_FORMAT),
                 miner_hotkey=miner.hotkey,
@@ -348,8 +345,7 @@ class ExpressLane:
                 ),
                 exc_info=True,
             )
-            # The registry (and the route) get the exception's class; the text stays in the log line above.
-            self._defer(pending, str(exc), progress_reason=f"verification raised {type(exc).__name__}")
+            self._defer(pending, str(exc))
         finally:
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
@@ -374,8 +370,6 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
-        result = results[0]
-        validation_progress.published(executor_id, passed=result.score > 0 or result.job_score > 0)
         try:
             await self.redis_service.mark_executors_validated([executor_id])
         except Exception as exc:
@@ -392,6 +386,7 @@ class ExpressLane:
         self._pending.pop(executor_id, None)
 
         published_at = datetime.now(UTC)
+        result = results[0]
         registered_at = pending.executor.created_at
         logger.info(
             _m(
@@ -421,10 +416,9 @@ class ExpressLane:
             )
         )
 
-    def _defer(self, pending: _Pending, reason: str, progress_reason: str | None = None) -> None:
+    def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave
-        the executor to the cycle. `progress_reason`, when given, is what the support view records
-        instead of `reason` (the exception path passes the exception's class, not its text).
+        the executor to the cycle.
 
         The caller has already counted the attempt.
         """
@@ -437,16 +431,12 @@ class ExpressLane:
         if pending.attempts >= max_attempts_for(reason):
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
-            validation_progress.left_to_cycle(pending.executor.id, progress_reason or reason, pending.attempts)
             logger.warning(
                 _m("[express] Executor left to the normal cycle", extra=get_extra_info(extra))
             )
             return
         retry_seconds = retry_seconds_for(reason)
         pending.not_before = time.monotonic() + retry_seconds
-        validation_progress.retry_scheduled(
-            pending.executor.id, progress_reason or reason, retry_seconds, pending.attempts
-        )
         logger.info(
             _m(
                 "[express] Executor not verified yet, will retry",
