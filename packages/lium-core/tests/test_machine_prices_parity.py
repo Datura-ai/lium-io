@@ -13,3 +13,11 @@ def test_rtx_pro_6000_editions_are_anchored_at_parity():
     assert prices[SERVER] == prices[WORKSTATION]
     # the anchor moved the Server Edition up to the Workstation, not the Workstation down
     assert prices[WORKSTATION] > prices["NVIDIA RTX 6000 Ada Generation"]
+
+
+def test_b300_sxm6_pc_matches_the_ac_card():
+    # provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300 SXM6 PC, 275040 MiB, all 8 GPUs);
+    # not in NVIDIA's public chip list — listed as the AC card's alias, derived from the AC entry
+    cfg = DEFAULT_SHARED_CONFIG
+    assert cfg.machine_prices["NVIDIA B300 SXM6 PC"] == cfg.machine_prices["NVIDIA B300 SXM6 AC"]
+    assert cfg.required_deposit_amount["NVIDIA B300 SXM6 PC"] == cfg.required_deposit_amount["NVIDIA B300 SXM6 AC"]

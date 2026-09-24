@@ -533,6 +533,33 @@ class SysboxRequiredMessages:
         impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
         remediation="Install the sysbox runtime; unrented machines without sysbox are not allowed on the network.",
     )
+    # DAH-3634: the probe's `docker run` was refused by the NVIDIA container hook, so no sysbox
+    # verdict was measured and the node cannot start any GPU container. Same impact as
+    # SYSBOX_MISSING (the check still fails, score 0); the reason code and the advice are truthful.
+    # The call site prefixes the remediation with the probe's cause (dind_probe.DOCKER_RUN_CAUSES).
+    # Same code as the executor updater's hold for this host condition (DAH-3481).
+    NVIDIA_RUNTIME_MISMATCH = MessageTemplate(
+        event="NVIDIA driver/library version mismatch on the host",
+        reason="NVIDIA_RUNTIME_MISMATCH",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Reboot the host after the NVIDIA driver update, or reinstall the NVIDIA container toolkit. "
+            "Sysbox was not measured; fix this first and the sysbox check runs again on the next cycle."
+        ),
+    )
+    NVIDIA_CONTAINER_HOOK_FAILED = MessageTemplate(
+        event="NVIDIA container hook refused the GPU container",
+        reason="NVIDIA_CONTAINER_HOOK_FAILED",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Make `nvidia-smi` work on the host (reset or reboot), then reinstall the NVIDIA container "
+            "toolkit; the sysbox check runs again on the next cycle."
+        ),
+    )
     SYSBOX_OK = MessageTemplate(
         event="Sysbox requirement satisfied",
         reason="SYSBOX_REQUIRED_OK",
@@ -694,6 +721,20 @@ class InspectorMessages:
         impact="Inspector result unavailable; score unchanged",
         remediation="Check libinspector installation and executor SSH process logs.",
     )
+    UNREADABLE = MessageTemplate(
+        event="Inspector executor response unreadable",
+        reason="INSPECTOR_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable on this executor; score unchanged; the node is counted as unreadable, not as clean",
+        remediation=(
+            "The inspector_executor.py --interactive stdout line for this command was not one JSON "
+            "object (payload_head / json_error_pos say where it broke; payload_terminated=false "
+            "means the line was cut at EOF or at the size cap). Check the executor container logs "
+            "for what else wrote to its stdout, and the response size against "
+            "INSPECTOR_RESPONSE_MAX_BYTES."
+        ),
+    )
     FAILED_LIB_MISMATCH = MessageTemplate(
         event="Inspector libinspector.so mismatch",
         reason="INSPECTOR_FAILED_LIB_MISMATCH",
@@ -814,6 +855,39 @@ class TenantEnforcementMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # DAH-2870: the container runs but the renter cannot get in (SSH port refuses, or
+    # authorized_keys is unreadable because the volume is not mounted). Detected here, not scored;
+    # the notice to the backend and the renter is the cycle-end flush's, so the impact says
+    # "queued", never "told": this renders before the flush, which can still get no answer or be
+    # suppressed. The check renders the NOT_QUEUED impact instead when
+    # no pod of the event queued one this cycle.
+    RENTED_POD_SSH_UNREACHABLE = MessageTemplate(
+        event="Rented pod refuses its renter over SSH",
+        reason="RENTED_POD_SSH_UNREACHABLE",
+        severity="error",
+        category="runtime",
+        impact=(
+            "Outage detected; the notice to the backend and the renter is queued for the "
+            "cycle-end fleet gate, not yet sent; score unchanged"
+        ),
+        remediation=(
+            "The pod container is running but its SSH port refuses or has no authorized_keys, "
+            "usually after a host reboot restarted the container without its volume. "
+            "The renter can reboot the pod from the pod page; check the host for unplanned reboots."
+        ),
+    )
+    # The same event when this cycle queued no notice for the pods it names: DRY_RUN, a streak the
+    # backend already acknowledged, or (after the fleet gate) only such pods left in the event.
+    RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT = (
+        "Outage detected; no notice queued this cycle (DRY_RUN, or the backend already "
+        "acknowledged this outage); score unchanged"
+    )
+    # DAH-2255: the same event when ``is_enforced`` holds (flag on, streak at the enforce threshold,
+    # outage accepted by the backend) — the check fails the cycle instead of halting on it.
+    RENTED_POD_SSH_UNREACHABLE_ENFORCED_IMPACT = (
+        "Outage past the enforcement threshold: the rented-state check fails this cycle, "
+        "score 0 and the verified job cleared, until a cycle finds the pod reachable again"
     )
 
 

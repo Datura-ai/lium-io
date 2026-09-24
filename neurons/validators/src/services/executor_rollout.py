@@ -68,6 +68,9 @@ MAX_ROLLOUT_GRACE_CYCLES = 2
 ROLLOUT_FAILURE_REASONS = frozenset(
     {
         AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE.value,
+        # DAH-3558: the miner left the restarting executor out of its answer; the validator then
+        # wrote this row for the rented node.
+        AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED.value,
         UploadFilesMessages.UPLOAD_FAILED.reason,
         TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason,
         RentalVerificationMessages.FILLER_TRANSPORT_UNREACHABLE.reason,
@@ -77,11 +80,16 @@ ROLLOUT_FAILURE_REASONS = frozenset(
     }
 )
 _OUTDATED = ExecutorImageMessages.OUTDATED.reason
-# The two ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
+# The ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
-# (RENTED); a run that reaches finalize ends on VALIDATION_COMPLETED.
+# (RENTED, or RENTED_POD_SSH_UNREACHABLE when the renter's SSH is being reported — DAH-2870, the
+# same halt with a different reason); a run that reaches finalize ends on VALIDATION_COMPLETED.
 _RUN_ENDED_WITHOUT_FAILING = frozenset(
-    {FinalizeMessages.COMPLETED.reason, TenantEnforcementMessages.ALREADY_RENTED.reason}
+    {
+        FinalizeMessages.COMPLETED.reason,
+        TenantEnforcementMessages.ALREADY_RENTED.reason,
+        TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason,
+    }
 )
 
 

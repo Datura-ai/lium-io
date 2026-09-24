@@ -24,6 +24,14 @@ INSPECTOR_LIB_PATH = "/usr/lib/libinspector.so"
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 30
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
+# One protocol response is one line. asyncssh's readline() hands back a PARTIAL line once a single
+# line outgrows the channel receive window (2 MiB by default: the session pauses reading and
+# readuntil() returns what it has), so a line is read until its '\n' and this is the ceiling on
+# how much of one response the validator will hold before calling the payload unreadable.
+INSPECTOR_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
+INSPECTOR_PAYLOAD_HEAD_CHARS = 200
+# the `error` text of an `ok: false` reply is the executor's to write; this is how much of it is kept
+INSPECTOR_ERROR_TEXT_MAX_CHARS = 2048
 # the sensor is inside the executor image measured by the CVM's TDX quote
 SENSOR_INTEGRITY_MEASURED = "tdx_measured_image"
 # a sha256sum run through the provider's own shell — unattested
@@ -42,6 +50,57 @@ class InspectorInteractiveError(Exception):
 
 class InspectorExecutorExitError(Exception):
     pass
+
+
+class InspectorUnreadableError(Exception):
+    """A stdout line of the interactive protocol that is not one JSON object.
+
+    Carries what a reader needs to tell the cases apart without the raw payload: which command
+    was answered, how many bytes came back, whether the line ended in '\\n' (False = cut at EOF
+    or at the size cap), the first 200 chars repr-escaped, and the decoder's position.
+    """
+
+    def __init__(
+        self,
+        *,
+        cmd: str,
+        payload: str,
+        terminated: bool,
+        json_error: str,
+        pos: int | None = None,
+        lineno: int | None = None,
+        colno: int | None = None,
+        payload_bytes: int | None = None,
+    ) -> None:
+        self.cmd = cmd
+        # the reader already counted the bytes; only re-encode when nobody did
+        self.payload_bytes = (
+            payload_bytes
+            if payload_bytes is not None
+            else len(payload.encode("utf-8", errors="replace"))
+        )
+        self.payload_head = repr(payload[:INSPECTOR_PAYLOAD_HEAD_CHARS])
+        self.terminated = terminated
+        self.json_error = json_error
+        self.pos = pos
+        self.lineno = lineno
+        self.colno = colno
+        super().__init__(
+            f"inspector executor wrote an unreadable response to {cmd!r}: {json_error}"
+            f" ({self.payload_bytes} bytes, {'newline-terminated' if terminated else 'cut'})"
+        )
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "payload_cmd": self.cmd,
+            "payload_bytes": self.payload_bytes,
+            "payload_head": self.payload_head,
+            "payload_terminated": self.terminated,
+            "json_error": self.json_error,
+            "json_error_pos": self.pos,
+            "json_error_lineno": self.lineno,
+            "json_error_colno": self.colno,
+        }
 
 
 class InspectorValidator:
@@ -123,11 +182,13 @@ class InspectorValidationService:
         command_timeout: int = INSPECTOR_COMMAND_TIMEOUT_SECONDS,
         stderr_capture_timeout: float = INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS,
         stderr_capture_max_bytes: int = INSPECTOR_STDERR_CAPTURE_MAX_BYTES,
+        response_max_bytes: int = INSPECTOR_RESPONSE_MAX_BYTES,
     ) -> None:
         self.lib_path = lib_path
         self.command_timeout = command_timeout
         self.stderr_capture_timeout = stderr_capture_timeout
         self.stderr_capture_max_bytes = stderr_capture_max_bytes
+        self.response_max_bytes = response_max_bytes
         self.local_checksum = sha256_from_path(self.lib_path)
         self.inspector_lib = InspectorValidator.load_library(self.lib_path)
 
@@ -236,6 +297,12 @@ class InspectorValidationService:
         elif isinstance(exc, InspectorInteractiveError):
             error = exc.message
             message = Msg.FAILED_INTERACTIVE
+        elif isinstance(exc, InspectorUnreadableError):
+            # the node is recorded as unreadable — a distinct reason, counted apart from the
+            # generic error and never a silent pass; the other executors' checks are their own
+            error = str(exc)
+            message = Msg.UNREADABLE
+            diagnostics = {**diagnostics, **exc.diagnostics()}
         else:
             error = str(exc)
             message = Msg.FAILED_SSH_TRANSPORT if process is None else Msg.VALIDATION_ERROR
@@ -286,24 +353,76 @@ class InspectorValidationService:
         return f"{shlex.quote(executor.python_path)} {shlex.quote(script)} --interactive"
 
     async def _send_message(self, process, payload: dict[str, Any]) -> str:
+        cmd = str(payload.get("cmd", ""))
         process.stdin.write(json.dumps(payload) + "\n")
-        try:
-            line = await asyncio.wait_for(
-                process.stdout.readline(),
-                timeout=self.command_timeout,
-            )
-        except asyncio.TimeoutError:
-            raise
+        line = await self._read_response_line(process, cmd)
 
         if not line:
             raise InspectorExecutorExitError("inspector executor exited without a response")
 
-        response = json.loads(line)
+        response = self._parse_response(line, cmd)
         if not response.get("ok"):
-            raise InspectorInteractiveError(
-                response.get("error", "inspector executor command failed")
-            )
+            # the executor's text, kept a string and bounded before it reaches the log or the row
+            error_text = str(response.get("error") or "inspector executor command failed")
+            raise InspectorInteractiveError(error_text[:INSPECTOR_ERROR_TEXT_MAX_CHARS])
         return response.get("result", "")
+
+    async def _read_response_line(self, process, cmd: str) -> str:
+        """One protocol line, whole: reassembled across the partial reads asyncssh returns when a
+        line is longer than the channel window, under one deadline for the whole line and the
+        `response_max_bytes` cap. An empty string is EOF before any byte of the response."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.command_timeout
+        chunks: list[str] = []
+        total_bytes = 0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError()
+            chunk = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="replace")
+            if not chunk:
+                break  # EOF: whatever was buffered is the whole payload
+            chunks.append(chunk)
+            total_bytes += len(chunk.encode("utf-8", errors="replace"))
+            if total_bytes >= self.response_max_bytes:
+                # the cap is checked before the newline so no line above it reaches the decoder;
+                # only the head is kept — never a copy of everything that was buffered
+                raise InspectorUnreadableError(
+                    cmd=cmd,
+                    payload=chunks[0][:INSPECTOR_PAYLOAD_HEAD_CHARS],
+                    payload_bytes=total_bytes,
+                    terminated=False,
+                    json_error=f"response line exceeds the {self.response_max_bytes}-byte cap",
+                )
+            if chunk.endswith("\n"):
+                break
+        return "".join(chunks)
+
+    @staticmethod
+    def _parse_response(line: str, cmd: str) -> dict[str, Any]:
+        terminated = line.endswith("\n")
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise InspectorUnreadableError(
+                cmd=cmd,
+                payload=line,
+                terminated=terminated,
+                json_error=exc.msg,
+                pos=exc.pos,
+                lineno=exc.lineno,
+                colno=exc.colno,
+            ) from exc
+        if not isinstance(response, dict):
+            raise InspectorUnreadableError(
+                cmd=cmd,
+                payload=line,
+                terminated=terminated,
+                json_error=f"response is not a JSON object ({type(response).__name__})",
+            )
+        return response
 
     async def _capture_stderr(self, process) -> str | None:
         if process is None:
