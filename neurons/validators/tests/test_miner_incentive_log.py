@@ -38,6 +38,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
+        "provider_email_not_confirmed",
     }
 
 
@@ -85,6 +86,11 @@ def _job(**overrides) -> JobResult:
             lambda job: MinerLogLine.no_payout_because_discord_not_connected(job),
             "provider_discord_not_connected",
             "Discord",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_email_not_confirmed(job),
+            "provider_email_not_confirmed",
+            "confirms an e-mail address",
         ),
         (
             lambda job: MinerLogLine.no_payout_because_paused_for_new_rentals(job),

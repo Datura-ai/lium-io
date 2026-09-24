@@ -558,6 +558,9 @@ class RentalPriceIncentive(DefaultIncentive):
             return MinerLogLine.no_payout_because_banned_network_abuse(job_result)
         if job_result.is_spot:
             return MinerLogLine.no_payout_because_spot_tier(job_result)
+        # A held node has no listing, so it is never in the Discord list either: its own reason goes first.
+        if job_result.is_provider_email_held:
+            return MinerLogLine.no_payout_because_email_not_confirmed(job_result)
         if is_missing_discord_after_cutoff(job_result):
             return MinerLogLine.no_payout_because_discord_not_connected(job_result)
         if job_result.is_new_rentals_paused and not job_result.is_rented:
