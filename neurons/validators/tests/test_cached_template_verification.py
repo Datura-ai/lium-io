@@ -924,6 +924,13 @@ def test_remediation_names_the_next_step_for_the_error(error, expected):
     assert expected in text
 
 
+@pytest.mark.parametrize("images", [["x"], {_IMAGE_REF: "x"}])
+def test_a_malformed_images_map_names_no_cause(images):
+    state = {"last_outcome": "sweep_ok", "images": images}
+
+    assert _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False) is None
+
+
 def test_a_later_disk_shortage_wins_over_an_older_pull_error():
     state = {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
         "last_outcome": "insufficient_disk", "last_pull_error": _PULL_ERROR,

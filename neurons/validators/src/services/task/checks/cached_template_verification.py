@@ -173,7 +173,11 @@ def _remediation_from_prefetch_state(
             f"The executor published no pre-pull state ({state['unavailable']}): update the "
             f"executor, then run `docker pull {pull_ref}` on the host to see why {why}."
         )
-    record = (state.get("images") or {}).get(image_ref) or {}
+    # The document comes from the provider's host: a wrong shape names no cause, never raises.
+    images = state.get("images")
+    record = images.get(image_ref) if isinstance(images, dict) else None
+    if not isinstance(record, dict):
+        record = {}
     pull_error = record.get("last_pull_error")
     if record.get("last_outcome") == "insufficient_disk":
         return (
