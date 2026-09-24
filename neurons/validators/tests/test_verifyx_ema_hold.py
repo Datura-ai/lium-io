@@ -1,0 +1,277 @@
+"""The VerifyX download EMA is not moved by a cycle the node did not pass for another reason.
+
+A node failed VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW (EMA 86.7 < 100) one batch after a cycle that
+failed the cached-image check had still run VerifyX and seeded the EMA (alpha 0.5), most likely
+while the executor's mandatory multi-GB image pull shared the link; it passed the cycle after that.
+Such a cycle, or one that ran while the recommended image was not on disk yet, now publishes the
+EMA the backend held before it, so a never-measured node stays never-measured and its next cycle
+gets the DAH-2959 cold-sample retry.
+"""
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+
+from core.config import settings
+from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
+from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
+from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
+from neurons.validators.src.services.task.result_handler import ResultHandler
+from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
+from protocol.vc_protocol.validator_requests import ValidationEvent
+
+from tests.helpers import build_context_config, build_services, build_state
+from tests.test_verifyx_check import MockVerifyXResponse
+
+EXECUTOR = "executor-123"  # tests.helpers.default_executor().uuid
+IMAGE_CHECK = "executor.validate.cached_template"
+
+
+def _never_measured() -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(executors={}, banned_guids=[], network_ema={})
+
+
+def _known(download: float, upload: float = 50.0) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={},
+        banned_guids=[],
+        network_ema={
+            EXECUTOR: NetworkEMA(ema_verifyx_download_speed=download, ema_verifyx_upload_speed=upload)
+        },
+    )
+
+
+def _event(check_id: str, *, failed: bool) -> ValidationEvent:
+    return ValidationEvent(
+        event="x",
+        reason_code="X",
+        severity="error" if failed else "info",
+        impact="x",
+        when=datetime(2026, 9, 20, tzinfo=UTC),
+        check_id=check_id,
+        what_we_saw={"steps_failed": check_id} if failed else {},
+    )
+
+
+def _measured_specs(download: float, ema_download: float, ema_upload: float) -> dict:
+    return {
+        "gpu": {"count": 1},
+        "network": {
+            "download_speed": 900.0,
+            "verifyx_download_speed": download,
+            "ema_verifyx_download_speed": ema_download,
+            "verifyx_upload_speed": 40.0,
+            "ema_verifyx_upload_speed": ema_upload,
+        },
+    }
+
+
+async def _publish(context_factory, *, specs, rented_data, event, success, image_cached=None):
+    ctx = context_factory(
+        state=build_state(specs=specs, rented_data=rented_data, recommended_image_cached=image_cached),
+        ssh_pub_keys=[],
+    )
+    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
+        context=ctx,
+        miner_info=SimpleNamespace(miner_hotkey="miner-hotkey", job_batch_id="batch-1"),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="x",
+        success=success,
+        validation_event=event,
+    )
+    return result.spec["network"]
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_failed_another_check_does_not_seed_the_ema(context_factory):
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(120.0, 120.0, 40.0),
+        rented_data=_never_measured(),
+        event=_event(IMAGE_CHECK, failed=True),
+        success=False,
+    )
+
+    assert "ema_verifyx_download_speed" not in network
+    assert "ema_verifyx_upload_speed" not in network
+    # The raw samples are still published: only the smoothed value is held.
+    assert network["verifyx_download_speed"] == 120.0
+    assert network["download_speed"] == 900.0
+
+
+@pytest.mark.asyncio
+async def test_a_known_node_keeps_its_previous_ema_on_a_failed_cycle(context_factory):
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(50.0, 125.0, 45.0),
+        rented_data=_known(200.0, 50.0),
+        event=_event(IMAGE_CHECK, failed=True),
+        success=False,
+    )
+
+    assert network["ema_verifyx_download_speed"] == 200.0
+    assert network["ema_verifyx_upload_speed"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_with_the_image_not_cached_yet_holds_the_ema(context_factory):
+    # The cached-image check passed (it holds a fresh node as pending) but the image is not on disk:
+    # the executor's pull may still be sharing the link.
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(120.0, 120.0, 40.0),
+        rented_data=_never_measured(),
+        event=_event("pipeline.finalize", failed=False),
+        success=True,
+        image_cached=False,
+    )
+
+    assert "ema_verifyx_download_speed" not in network
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failing_its_own_gate_still_moves_the_ema(context_factory):
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(60.0, 80.0, 40.0),
+        rented_data=_known(100.0),
+        event=_event(VerifyXCheck.check_id, failed=True),
+        success=False,
+    )
+
+    assert network["ema_verifyx_download_speed"] == 80.0
+
+
+@pytest.mark.asyncio
+async def test_a_passing_cycle_publishes_the_new_ema(context_factory):
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(300.0, 250.0, 45.0),
+        rented_data=_known(200.0),
+        event=_event("pipeline.finalize", failed=False),
+        success=True,
+        image_cached=True,
+    )
+
+    assert network["ema_verifyx_download_speed"] == 250.0
+    assert network["ema_verifyx_upload_speed"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_a_failure_before_verifyx_ran_adds_no_ema(context_factory):
+    network = await _publish(
+        context_factory,
+        specs={"gpu": {"count": 1}, "network": {"download_speed": 900.0}},
+        rented_data=_known(200.0),
+        event=_event("executor.validate.port_count", failed=True),
+        success=False,
+    )
+
+    assert network == {"download_speed": 900.0}
+
+
+# --- the two cycles from the evidence, through the real pipeline and result handler ------------
+
+
+class _ProbeSequence:
+    def __init__(self, *downloads: float):
+        self._downloads = list(downloads)
+        self.calls = 0
+
+    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+        self.calls += 1
+        download = self._downloads.pop(0)
+        return MockVerifyXResponse(
+            data={
+                "success": True,
+                "ram": {"total": 64},
+                "hard_disk": {"total": 1000},
+                "network": {"download_speed": download, "upload_speed": 40.0},
+            }
+        )
+
+
+class _ImageNotCachedCheck:
+    """The fatal cached-image check failing after VerifyX passed, as in the evidence."""
+
+    check_id = IMAGE_CHECK
+    fatal = True
+
+    async def run(self, ctx):
+        return CheckResult(passed=False, event=_event(IMAGE_CHECK, failed=False))
+
+
+class _Sink:
+    async def emit(self, event):
+        pass
+
+
+async def _cycle(context_factory, probes, rented_data, *, image_check: bool):
+    ctx = context_factory(
+        services=build_services(verifyx=probes),
+        config=build_context_config(verifyx_enabled=True),
+        state=build_state(specs={"gpu": {"count": 1}}, rented_data=rented_data),
+        ssh_pub_keys=[],
+    )
+    checks = [VerifyXCheck()] + ([_ImageNotCachedCheck()] if image_check else [])
+    ok, events, last = await Pipeline(checks, _Sink()).run(ctx)
+    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
+        context=last,
+        miner_info=SimpleNamespace(miner_hotkey="miner-hotkey", job_batch_id="batch-1"),
+        executor_info=last.executor,
+        verified_job_info={},
+        log_text="x",
+        success=ok,
+        validation_event=events[-1],
+    )
+    return ok, events[-1], result.spec["network"]
+
+
+def _as_backend_would_store(network: dict) -> RentedExecutorsResponse:
+    ema = network.get("ema_verifyx_download_speed")
+    if ema is None:
+        return _never_measured()
+    return _known(ema, network.get("ema_verifyx_upload_speed") or 0.0)
+
+
+@pytest.mark.asyncio
+async def test_the_next_cycle_of_a_node_seeded_by_a_failed_cycle_gets_the_cold_retry(
+    monkeypatch, context_factory
+):
+    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
+
+    # Cycle 1: VerifyX passes on a sample taken while the image pull shares the link, then the
+    # cached-image check fails the cycle.
+    ok, last_event, network = await _cycle(
+        context_factory, _ProbeSequence(120.0), _never_measured(), image_check=True
+    )
+    assert ok is False
+    assert last_event.what_we_saw["steps_failed"] == IMAGE_CHECK
+    assert "ema_verifyx_download_speed" not in network
+
+    # Cycle 2: the node is still never-measured, so a cold first sample is re-measured and the
+    # better sample seeds the EMA. Seeded from cycle 1 it would have read (53.4 + 120) / 2 = 86.7.
+    probes = _ProbeSequence(53.4, 238.0)
+    ok, last_event, network = await _cycle(
+        context_factory, probes, _as_backend_would_store(network), image_check=False
+    )
+
+    assert probes.calls == 2
+    assert ok is True
+    assert last_event.reason_code == Msg.VERIFY_SUCCESS.reason
+    assert last_event.what_we_saw["cold_sample_retry"]["used"] == "retry"
+    assert network["ema_verifyx_download_speed"] == pytest.approx(238.0)
+
+
+@pytest.mark.asyncio
+async def test_without_the_hold_the_same_two_cycles_fail_on_the_seeded_ema(context_factory):
+    # The regression this guards: cycle 2 judged against the EMA cycle 1 seeded.
+    probes = _ProbeSequence(53.4)
+    ok, last_event, _ = await _cycle(context_factory, probes, _known(120.0), image_check=False)
+
+    assert probes.calls == 1
+    assert ok is False
+    assert last_event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    assert last_event.what_we_saw["ema_verifyx_download_speed"] == pytest.approx(86.7)

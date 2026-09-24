@@ -15,6 +15,7 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+_EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 
 @dataclass(frozen=True)
@@ -327,6 +328,48 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
         return False
     speed = _download_speed(result)
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+
+
+def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
+    """Why this cycle's VerifyX sample must not move the published EMA, or None.
+
+    A cycle that a check other than VerifyX failed, or that ran while the node's recommended image
+    was not on disk yet, measured the link while the node was not in service: the executor's
+    mandatory pre-pull of that image, tens of GB, is the usual cause of both and shares the link.
+    With alpha 0.5 one such sample weighs half of the next cycle's verdict: a node seeded by a cycle
+    that failed the cached-image check read 86.7 against the 100 gate one batch later, and passed
+    the cycle after that. Holding the EMA leaves a never-measured node never-measured, so its next cycle gets the
+    DAH-2959 cold-sample retry and bootstraps from a sample taken in service. A cycle that VerifyX
+    itself failed still moves the EMA: that is the gate working.
+    """
+    if failed_check_id and failed_check_id != VerifyXCheck.check_id:
+        return f"cycle failed {failed_check_id}"
+    if ctx.state.recommended_image_cached is False:
+        return "recommended image not cached yet"
+    return None
+
+
+def hold_verifyx_ema(ctx: Context, specs: dict) -> dict:
+    """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
+
+    Only keys this cycle wrote are touched. A never-measured node publishes none, which the backend
+    already reads as unseeded (the DAH-3011 first-pass deferral relies on it). The raw samples stay.
+    """
+    network = specs.get("network")
+    if not isinstance(network, dict) or not any(key in network for key in _EMA_KEYS):
+        return specs
+    rented_data = ctx.state.rented_data
+    prev_ema = rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+    held = dict(network)
+    for key in _EMA_KEYS:
+        if key not in held:
+            continue
+        previous = getattr(prev_ema, key, None) if prev_ema else None
+        if previous is None:
+            del held[key]
+        else:
+            held[key] = previous
+    return {**specs, "network": held}
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:

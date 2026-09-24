@@ -16,6 +16,7 @@ from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.utils import _m, get_extra_info
 
+from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
 from .models import JobResult
 from .pipeline import Context
 
@@ -154,6 +155,28 @@ class ResultHandler:
                 "is_spot": is_spot,
             }
         )
+        # The pipeline names the fatal check that ended the run in the last event's summary.
+        failed_check_id = (
+            validation_event.what_we_saw.get("steps_failed") if validation_event else None
+        )
+        ema_hold_reason = verifyx_ema_hold_reason(context, failed_check_id)
+        if ema_hold_reason:
+            held_specs = hold_verifyx_ema(context, specs)
+            if held_specs is not specs:
+                logger.info(
+                    _m(
+                        "VerifyX EMA held: this cycle's sample does not move it",
+                        extra=get_extra_info(
+                            {
+                                "executor_id": executor_info.uuid,
+                                "reason": ema_hold_reason,
+                                "measured": specs.get("network"),
+                                "published": held_specs.get("network"),
+                            }
+                        ),
+                    )
+                )
+            specs = held_specs
         # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
         # was actually performed (None → key omitted), mirroring gpu_metrics.
         # Rides executor.specs to the backend like tdx_attestation_passed.
