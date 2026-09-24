@@ -188,6 +188,23 @@ def test_busy_node_keeps_the_image_until_idle(tmp_path, clock):
     assert client.removed == [OLD_REF, f"{REPO}@{DIGEST_OLD}"]
 
 
+def test_image_made_mandatory_during_eviction_is_kept(tmp_path, clock, monkeypatch):
+    """The loop may publish a new mandatory set while eviction waits on docker."""
+    client = _client()
+    puller = _puller(tmp_path, client, {OLD_REF: DIGEST_OLD})
+    _sweep(puller, [])
+    clock.now += DAY
+
+    def idle_but_refreshed(_client):
+        puller.protected = frozenset({OLD_REF})
+        return None
+
+    monkeypatch.setattr(pre_pull_service, "rental_activity", idle_but_refreshed)
+    _sweep(puller, [])
+
+    assert client.removed == []
+
+
 def test_zero_disables_eviction(tmp_path, clock, monkeypatch):
     monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS", 0)
     client = _client()

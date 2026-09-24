@@ -371,6 +371,9 @@ class PrePuller:
         if not due or await asyncio.to_thread(rental_activity, self.client):
             return
         for image_ref in due:
+            # Re-read per image: the loop may have made it mandatory while docker was busy.
+            if image_ref in self.protected:
+                continue
             record = self.state.images[image_ref]
             hours_unlisted = (now - record["unlisted_since"]) / 3600
             if await self._remove_tracked_image(image_ref):
