@@ -85,6 +85,7 @@ from services.redis_service import (
     NORMALIZED_SCORE_CHANNEL,
 )
 from clients.handlers.backup_handler import BackupHandler
+from services.task.checks.rental_probe import forget_last_pass
 
 logger = logging.getLogger(__name__)
 
@@ -827,6 +828,16 @@ class ComputeClient:
                 _m("[recheck] Could not queue the request", extra=get_extra_info({**extra, "error": str(exc)})),
             )
             return
+        # dropped here so whichever run reaches the node next, the recheck or the cycle, probes it
+        try:
+            await forget_last_pass(self.miner_service.redis_service, req.executor_id)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[recheck] Could not drop the rental probe's interval stamp",
+                    extra=get_extra_info({**extra, "error": str(exc)}),
+                ),
+            )
         logger.info(_m("[recheck] Request queued", extra=get_extra_info(extra)))
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:

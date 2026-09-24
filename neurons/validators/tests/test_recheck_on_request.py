@@ -100,11 +100,14 @@ async def test_flag_off_the_connector_queues_nothing(monkeypatch, caplog):
     monkeypatch.setattr(settings, "RECHECK_ON_REQUEST_ENABLED", False)
     redis_service = _redis_service()
     client = _client(redis_service)
+    stamp = f"rental_probe_ok:{_recorded_recheck_message()['executor_id']}"
+    await redis_service.redis.set(stamp, str(time.time()))
 
     with caplog.at_level(logging.INFO):
         await client.handle_message(json.dumps(_recorded_recheck_message()))
 
     assert await redis_service.get_recheck_requests() == {}
+    assert await redis_service.redis.get(stamp) is not None
     assert "[recheck] Request ignored, RECHECK_ON_REQUEST_ENABLED is off" in caplog.text
     assert "Invalid message received from backend" not in caplog.text
 
@@ -118,6 +121,8 @@ async def test_the_backend_message_is_queued_for_the_validator_process(monkeypat
     server = FakeServer()
     client = _client(_redis_service(server))
     message = _recorded_recheck_message()
+    stamp = f"rental_probe_ok:{message['executor_id']}"
+    await _redis_service(server).redis.set(stamp, str(time.time()))
 
     await client.handle_message(json.dumps(message))
     await client.handle_message(json.dumps(message))  # a repeat is one recheck
@@ -132,6 +137,8 @@ async def test_the_backend_message_is_queued_for_the_validator_process(monkeypat
     )
     assert time.time() - request["requested_at"] < 5
     client.miner_service.request_validation_cycle_now.assert_not_awaited()
+    # whichever run reaches the node next, the recheck or the wave, probes it
+    assert await _redis_service(server).redis.get(stamp) is None
 
 
 @pytest.mark.asyncio
