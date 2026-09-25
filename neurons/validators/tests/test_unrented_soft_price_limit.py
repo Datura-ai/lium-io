@@ -97,7 +97,7 @@ def _set_soft_rate(monkeypatch, rate: float) -> None:
 
 
 def test_the_threshold_is_the_served_soft_limit_price_rate(monkeypatch):
-    # compute-app serves 1.5 with PRICE_LIMITS_RAISED_ENABLED on (lium-platform#648): threshold 2.0 * 1.5 = 3.0
+    # the backend serves 1.5 when the raised soft limit is on: threshold 2.0 * 1.5 = 3.0
     _set_p90(monkeypatch, {H200: 2.0})
     _set_soft_rate(monkeypatch, 1.5)
     incentive = _build_incentive()
