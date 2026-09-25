@@ -167,6 +167,63 @@ class PodContainerState(pydantic.BaseModel):
 POD_STATES_MAX_ITEMS = 256
 
 
+class PodSshResult(enum.StrEnum):
+    """What the validator's once-per-cycle SSH probe of one rented pod read, without a key: `banner` is an
+    `SSH-2.0` line; `refused` a connection the host turned away; `no_banner` a connection that closed or
+    sent something else; `timeout` no answer within the probe's timeout (a powered-off machine lands here)."""
+
+    banner = "banner"
+    refused = "refused"
+    no_banner = "no_banner"
+    timeout = "timeout"
+
+
+class PodSshObservation(pydantic.BaseModel):
+    """One rented pod's SSH probe in one cycle. `errno` is the OS error behind a failed connect, None when
+    there was none. `fleet_ok` is False when the cycle's non-banner share says the outage is on the
+    validator's side, so the observation says nothing about this pod."""
+
+    pod_id: str
+    result: PodSshResult
+    errno: int | None = None
+    fleet_ok: bool = True
+
+
+class CouldNotLookCode(enum.StrEnum):
+    """The `ValidationEvent.reason_code` values that mean the validator could not look at the node this
+    cycle, so its pod SSH observations are the only evidence for the rentals on it."""
+
+    EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
+    EXECUTOR_TRANSPORT_UNREACHABLE = "EXECUTOR_TRANSPORT_UNREACHABLE"
+    UPLOAD_FAILED = "UPLOAD_FAILED"
+    SCRAPE_FAILED = "SCRAPE_FAILED"
+    # the miner returned no result for a rented node; the report carries only its pod SSH observations
+    EXECUTOR_RESULT_MISSING = "EXECUTOR_RESULT_MISSING"
+
+
+class ValidationEvent(pydantic.BaseModel):
+    """The validator's structured event for the check that decided the cycle's outcome (or where the
+    pipeline halted). `reason_code` is a plain string: new codes appear on the validator first, and a
+    receiver that does not know one still reads the event. Both peers keep extra keys."""
+
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    event: str
+    reason_code: str
+    severity: str
+    category: str = "runtime"
+    impact: str
+    remediation: str | None = None
+    what_we_saw: dict[str, Any] = pydantic.Field(default_factory=dict)
+    warnings: list[str] = pydantic.Field(default_factory=list)
+    help_uri: str | None = None
+    check_id: str | None = None
+    pipeline_id: str | None = None
+    trace_id: str | None = None
+    when: datetime
+    context: dict[str, Any] = pydantic.Field(default_factory=dict)
+
+
 @VALIDATOR_MESSAGES.register
 class PodStatesReport(ValidatorMessage):
     """DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's
@@ -232,6 +289,12 @@ class ExecutorSpecRequest(ValidatorMessage):
     # (the rest of the cycle's states travel in PodStatesReport chunks). None from a publisher that
     # predates the field.
     pod_states: list[PodContainerState] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # The event behind `log_text`, structured; its `reason_code` is what the backend stores for the cycle.
+    # None from a publisher that sends the event only inside `log_text`.
+    validation_event: ValidationEvent | None = None
+    # This cycle's SSH probe of each RUNNING pod rented on the node, successes included. None = the
+    # publisher does not probe; [] = it probed and the node has no pod to probe.
+    pod_ssh: list[PodSshObservation] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
 
 
 @VALIDATOR_MESSAGES.register
