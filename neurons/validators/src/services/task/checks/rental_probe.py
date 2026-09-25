@@ -57,6 +57,9 @@ _CREATE_STEPS_BEFORE_THE_HOST = frozenset(
     }
 )
 
+# DockerService.create_container's SSH-ready gate (services/ssh_ready_gate.py)
+_CREATE_STEP_SSH_READY = "ssh_ready"
+
 # What the provider is told for each failed step, in plain words. The mapped port is filled in.
 _REMEDIATION_BY_STEP: dict[str, str] = {
     STEP_CONTAINER_START: (
@@ -811,6 +814,8 @@ async def _step_container_start(
                 ctx.executor,
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
+                # step 2 waits for sshd itself, to RENTAL_PROBE_SSH_DEADLINE_SECONDS, after the lock is released
+                ssh_ready_gate=False,
             ),
             timeout=_CREATE_DEADLINE_SECONDS,
         )
@@ -851,6 +856,10 @@ async def _step_container_start(
             outcome.inconclusive_reason = "create returned a result without a failure step"
         elif create_step in _CREATE_STEPS_BEFORE_THE_HOST:
             outcome.inconclusive_reason = f"create failed on the validator's side at {create_step}"
+        elif create_step == _CREATE_STEP_SSH_READY:
+            # the container started and sshd never answered: the SSH-ready gate is skipped for the probe,
+            # so this only happens if that skip is ever lost
+            outcome.failed_step = STEP_SSHD_LISTEN
         else:
             outcome.failed_step = STEP_CONTAINER_START
         return None

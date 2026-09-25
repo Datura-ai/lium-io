@@ -44,6 +44,8 @@ class PodRecoverer(Protocol):
         executor_info: ExecutorSSHInfo,
         keypair: Any,
         private_key: str,
+        *,
+        ssh_ready_gate: bool = True,
     ) -> Any: ...
 
     async def delete_container(

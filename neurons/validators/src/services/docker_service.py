@@ -124,6 +124,13 @@ from services.rental_docker_sdk import (
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
+from services.ssh_ready_gate import (
+    SshNotReady,
+    SshReadyMode,
+    SshReadyResult,
+    ssh_ready_gate_mode,
+    wait_for_ssh_banner,
+)
 from services.storage_operations import (
     start_storage_operation,
     supports_bootstrap_restore,
@@ -1136,6 +1143,10 @@ if ! {mount_check}; then
   gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
 fi
 """
+
+
+# The event loop keeps only weak references to tasks; log-mode SSH-ready probes outlive the create.
+_SSH_READY_LOG_TASKS: set[asyncio.Task] = set()
 
 
 class DockerService:
@@ -5216,13 +5227,77 @@ class DockerService:
             raise docker_outcome
         return ssh_outcome, docker_outcome
 
+    @staticmethod
+    def _ssh_external_port(port_maps: list[tuple[int, int, int]]) -> int | None:
+        """The executor's public port mapped to the pod's port 22 (the one renters dial)."""
+        for docker_port, _, external_port in port_maps:
+            if docker_port == 22:
+                return external_port
+        return None
+
+    async def _wait_ssh_ready(
+        self,
+        *,
+        host: str,
+        port: int,
+        mode: SshReadyMode,
+        log_extra: dict,
+        stop: Callable[[], bool] | None = None,
+    ) -> SshReadyResult:
+        """Wait for the pod's sshd banner and write one `SSH ready gate` line; the caller acts on the result."""
+        result = await wait_for_ssh_banner(
+            host,
+            port,
+            grace_seconds=settings.SSH_READY_GATE_GRACE_SECONDS,
+            poll_seconds=settings.SSH_READY_GATE_POLL_SECONDS,
+            stop=stop,
+        )
+        log = logger.info if result.ready else logger.warning
+        log(
+            _m(
+                "SSH ready gate",
+                extra=get_extra_info({
+                    **log_extra,
+                    "ssh_ready_mode": mode.value,
+                    "ssh_ready_result": result.outcome.value,
+                    "ssh_ready": result.ready,
+                    "ssh_ready_attempts": result.attempts,
+                    "ssh_ready_duration_ms": result.elapsed_ms,
+                    "ssh_ready_grace_seconds": settings.SSH_READY_GATE_GRACE_SECONDS,
+                    "ssh_external_port": port,
+                }),
+            )
+        )
+        return result
+
+    def _start_ssh_ready_log_probe(self, *, host: str, port: int, log_extra: dict) -> asyncio.Task:
+        async def _probe() -> None:
+            try:
+                await self._wait_ssh_ready(host=host, port=port, mode=SshReadyMode.LOG, log_extra=log_extra)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "SSH ready gate probe errored",
+                        extra=get_extra_info({**log_extra, "error": str(exc)}),
+                    )
+                )
+
+        task = asyncio.create_task(_probe())
+        _SSH_READY_LOG_TASKS.add(task)
+        task.add_done_callback(_SSH_READY_LOG_TASKS.discard)
+        return task
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
+        *,
+        ssh_ready_gate: bool = True,
     ):
+        """`ssh_ready_gate=False`: the rental probe's own create, which runs its own banner wait with its own
+        deadline and step; the SSH-ready gate neither waits nor logs for it."""
         warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
@@ -6336,6 +6411,7 @@ class DockerService:
                         raise explained from keys_exc
 
                     current_step = "ssh_bootstrap"
+                    ssh_bootstrap_ok = True
                     if image_manages_services:
                         # DAH-2265: the default image / cached template ships and
                         # starts sshd itself (its start.sh runs `service ssh start`
@@ -6354,11 +6430,13 @@ class DockerService:
                             )
                         )
                     else:
-                        await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
+                        ssh_bootstrap_ok = bool(
+                            await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                                docker_client=docker_client,
+                                container_name=container_name,
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                            )
                         )
 
                     jupyter_url = None
@@ -6406,6 +6484,52 @@ class DockerService:
                     # (DAH-2341), so this step now times the environment setup.
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
+
+                    # A delete that lands during the grace period ends the wait at the next dial or sleep,
+                    # and the checkpoint below turns the create into `cancelled_by_delete`: the renter's
+                    # cancel is never reported as an `ssh_ready` failure.
+                    ssh_ready_mode = (
+                        ssh_ready_gate_mode(settings.SSH_READY_GATE_MODE) if ssh_ready_gate else SshReadyMode.OFF
+                    )
+                    ssh_external_port = self._ssh_external_port(port_maps)
+                    ssh_ready_extra = {
+                        **default_extra,
+                        "container_name": container_name,
+                        "image_manages_services": image_manages_services,
+                        "ssh_bootstrap_ok": ssh_bootstrap_ok,
+                        "recreate": bool(payload.local_volume),
+                    }
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and payload.local_volume:
+                        # A reboot or edit (the payload names the pod's volume, parked or not) that fails here ends
+                        # REBOOT_FAILED, still billed, with no retry; before the gate it reached RUNNING. Measure
+                        # these before failing them.
+                        ssh_ready_mode = SshReadyMode.LOG
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and not ssh_bootstrap_ok:
+                        # The validator's own sshd install is best-effort and such rents reached RUNNING
+                        # before the gate (Jupyter- or HTTP-only use): measure them, never fail them.
+                        ssh_ready_mode = SshReadyMode.LOG
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+                        # No renter logs in to a filler, and a failed one costs the provider its filler
+                        # earnings while holding the create lock ahead of a paying renter: measure only.
+                        ssh_ready_mode = SshReadyMode.LOG
+                    if ssh_ready_mode is not SshReadyMode.OFF and ssh_external_port is None:
+                        logger.warning(
+                            _m("SSH ready gate skipped: no port maps to 22", extra=get_extra_info(ssh_ready_extra))
+                        )
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and ssh_external_port is not None:
+                        current_step = "ssh_ready"
+                        ssh_ready = await self._wait_ssh_ready(
+                            host=executor_info.address,
+                            port=ssh_external_port,
+                            mode=ssh_ready_mode,
+                            log_extra=ssh_ready_extra,
+                            stop=lambda: inflight_creates.is_cancelled(payload.pod_id),
+                        )
+                        if not ssh_ready.ready:
+                            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                            raise SshNotReady(ssh_external_port, settings.SSH_READY_GATE_GRACE_SECONDS, ssh_ready)
+                        profilers.append(ProfilerStep.since(ProfilerStepName.SSH_READY, prev_timestamp))
+                        prev_timestamp = now_ms()
 
                     await self.finish_stream_logs()
 
@@ -6507,6 +6631,13 @@ class DockerService:
                         }),
                     )
                 )
+
+                if ssh_ready_mode is SshReadyMode.LOG and ssh_external_port is not None:
+                    self._start_ssh_ready_log_probe(
+                        host=executor_info.address,
+                        port=ssh_external_port,
+                        log_extra=ssh_ready_extra,
+                    )
 
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
