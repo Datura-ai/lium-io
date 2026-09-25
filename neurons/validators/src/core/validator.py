@@ -41,11 +41,8 @@ from services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
 )
+from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
-from services.task.checks.rented_pod_ssh import (
-    flush_rented_pod_ssh_reports,
-    silence_rented_pod_ssh_reports_on_our_own_outage,
-)
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
@@ -387,6 +384,8 @@ class Validator:
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
+                # every RUNNING rented pod's SSH, probed once while the miners work
+                pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
                 task_info = {}
 
@@ -650,44 +649,18 @@ class Validator:
                             )
                         )
 
-                    # DAH-2870: the rented-pod SSH reports queued this cycle go to the backend only
-                    # when the fleet says the pods are at fault; a validator-side outage (the share
-                    # above, or most mapped ports refusing at once) notifies no renter. The results
-                    # whose reports the gate held were rendered as RENTED_POD_SSH_UNREACHABLE before
-                    # the gate ran and name a pod outage that was ours: they are rewritten to RENTED
-                    # here, before the publish, so the stored event says what happened.
-                    try:
-                        rented_pod_ssh_gate = await flush_rented_pod_ssh_reports(
-                            self.redis_service,
-                            self.backend_client,
-                            job_batch_id,
-                            validator_outage=silenced_count > 0,
-                        )
-                        results_rewritten_to_rented = silence_rented_pod_ssh_reports_on_our_own_outage(
-                            cycle_results, rented_pod_ssh_gate
-                        )
-                        if results_rewritten_to_rented:
-                            logger.warning(
-                                _m(
-                                    "[sync] rented-pod SSH reports held back this cycle; their events publish as RENTED",
-                                    extra=get_extra_info(
-                                        {
-                                            **self.default_extra,
-                                            "rewritten_results": results_rewritten_to_rented,
-                                            "suppressed_by": rented_pod_ssh_gate.suppressed_by,
-                                            "held_pods": rented_pod_ssh_gate.due,
-                                        }
-                                    ),
-                                )
-                            )
-                    except Exception as exc:
-                        logger.error(
-                            _m(
-                                "[sync] rented-pod SSH report flush failed; the streaks queue again next cycle",
-                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                            ),
-                            exc_info=True,
-                        )
+                    # each node's pod SSH observations ride on its result; a probed rented
+                    # node the cycle has no result for gets one carrying only them. A withheld
+                    # executor has a result this cycle, held back, so it gets none.
+                    pod_ssh = await pod_ssh_probe
+                    reported = attach_pod_ssh(incentive.job_results, pod_ssh) | {
+                        str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results
+                    }
+                    result_missing = (
+                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
+                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
+                        else {}
+                    )
 
                     # Publish machine specs
                     published_executor_ids: list[str] = []
@@ -700,6 +673,10 @@ class Validator:
                                 for result in results
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
+
+                    # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
+                    # the express lane below.
+                    await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -807,6 +784,63 @@ class Validator:
                         ),
                     ),
                 )
+
+    async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
+        """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
+        if not settings.RENTED_POD_SSH_PROBE_ENABLED:
+            return {}
+        try:
+            return await probe_rented_pods(
+                rented_executors,
+                timeout=settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS,
+                concurrency=settings.RENTED_POD_SSH_PROBE_CONCURRENCY,
+                job_batch_id=job_batch_id,
+            )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] rented pod SSH probe failed; this cycle reports no observations",
+                    extra=get_extra_info(
+                        {**self.default_extra, "job_batch_id": job_batch_id, "error_type": type(exc).__name__}
+                    ),
+                ),
+                exc_info=True,
+            )
+            return {}
+
+    async def publish_result_missing(
+        self, result_missing: dict[str, list[JobResult]], miners, miner_coldkeys: dict, job_batch_id: str
+    ) -> None:
+        """Publish the observations-only results (EXECUTOR_RESULT_MISSING), one miner at a time.
+
+        The coldkey is the miner's answer's when it answered, else the metagraph's; a hotkey that is
+        in neither is not registered any more and its nodes are skipped.
+        """
+        if not result_missing:
+            return
+        metagraph_coldkeys = {miner.hotkey: miner.coldkey for miner in miners}
+        skipped = []
+        for miner_hotkey, results in result_missing.items():
+            miner_coldkey = miner_coldkeys.get(miner_hotkey) or metagraph_coldkeys.get(miner_hotkey)
+            if not miner_coldkey:
+                skipped.extend(result.executor_info.uuid for result in results)
+                continue
+            await self.miner_service.publish_machine_specs(
+                results, miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
+        logger.info(
+            _m(
+                "[sync] rented nodes without a result reported with their pod SSH observations",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "job_batch_id": job_batch_id,
+                        "executors": sum(len(results) for results in result_missing.values()),
+                        "skipped_unregistered": skipped,
+                    }
+                ),
+            )
+        )
 
     async def fetch_executor_digest_or_none(self) -> str | None:
         """The registry digest of EXECUTOR_IMAGE_REF, or None when it cannot be read.
