@@ -91,6 +91,8 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    # Group A (appended): the backend keeps the node unlisted until the provider confirms an e-mail
+    PROVIDER_EMAIL_NOT_CONFIRMED = "provider_email_not_confirmed"
 
 
 class IncentiveReason(BaseModel):
@@ -217,6 +219,19 @@ class MinerLogLine(BaseModel):
             ),
             internal_message="Executor excluded from both pools - provider Discord not connected",
             internal_extra_fields={"provider_discord_connected": result.provider_discord_connected},
+        )
+
+    @staticmethod
+    def no_payout_because_email_not_confirmed(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PROVIDER_EMAIL_NOT_CONFIRMED,
+            message=(
+                "No subnet incentive: this executor is not listed until the provider account "
+                "confirms an e-mail address. Confirm it under Profile Settings in the provider "
+                "portal to list the executor and start earning."
+            ),
+            internal_message="Executor excluded from both pools - provider e-mail not confirmed, node not listed",
         )
 
     @staticmethod

@@ -313,3 +313,17 @@ async def test_rest_request_job_validates_paused_unrented_executors(monkeypatch)
         for call in service.task_service.create_task.call_args_list
     ]
     assert created_executor_ids == ["paused-executor", "available-executor"]
+
+
+def test_rented_executors_response_defaults_provider_email_held_executor_ids():
+    result = RentedExecutorsResponse.model_validate({"executors": {}})
+
+    assert result.provider_email_held_executor_ids == []
+
+
+def test_rented_executors_response_parses_provider_email_held_executor_ids():
+    result = RentedExecutorsResponse.model_validate(
+        {"executors": {}, "provider_email_held_executor_ids": ["held-executor"]}
+    )
+
+    assert result.provider_email_held_executor_ids == ["held-executor"]

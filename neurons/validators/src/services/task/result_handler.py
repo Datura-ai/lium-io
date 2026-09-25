@@ -138,6 +138,10 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
         )
+        is_provider_email_held = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.provider_email_held_executor_ids
+        )
         default_job_owner = (
             context.state.rented_data.get_default_job_owner(executor_info.uuid)
             if context.state.rented_data
@@ -221,6 +225,7 @@ class ResultHandler:
             is_new_rentals_paused=is_new_rentals_paused,
             is_provider_banned=context.is_provider_banned,
             provider_discord_connected=provider_discord_connected,
+            is_provider_email_held=is_provider_email_held,
             rental_created_at=self._get_rental_created_at(context),
             default_job_owner=default_job_owner,
             tdx_attestation_passed=context.tdx_attestation_passed,

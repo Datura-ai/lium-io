@@ -32,6 +32,7 @@ def _make_job(
     is_spot: bool = False,
     is_new_rentals_paused: bool = False,
     provider_discord_connected: bool = True,
+    is_provider_email_held: bool = False,
     default_job_owner: str | None = None,
 ) -> JobResult:
     return JobResult(
@@ -56,6 +57,7 @@ def _make_job(
         is_spot=is_spot,
         is_new_rentals_paused=is_new_rentals_paused,
         provider_discord_connected=provider_discord_connected,
+        is_provider_email_held=is_provider_email_held,
         default_job_owner=default_job_owner,
         collateral_deposited=True,
         sysbox_runtime=True,
@@ -206,6 +208,7 @@ async def test_shadow_mode_does_not_append_incentive_log(monkeypatch):
         ({"is_spot": True}, ["spot", "spot_tier"]),
         ({"provider_discord_connected": False}, ["Discord", "provider_discord_not_connected"]),
         ({"is_new_rentals_paused": True}, ["paused", "new_rentals_paused"]),
+        ({"is_provider_email_held": True}, ["e-mail", "provider_email_not_confirmed"]),
         ({"default_job_owner": "miner"}, ["default job", "miner_default_job"]),
     ],
 )
@@ -329,3 +332,18 @@ def test_reason_excluded_from_both_pools_returns_first_match_and_none():
     # spot precedes discord when both apply — order is preserved
     both = _make_job(1.0, is_spot=True, provider_discord_connected=False)
     assert incentive._reason_excluded_from_both_pools(both).reason == "spot_tier"
+
+
+@pytest.mark.asyncio
+async def test_a_node_held_for_the_provider_email_gets_that_reason_not_discord():
+    # P227: a held node has no listing, so the backend never puts it in the Discord-connected list either.
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(
+        _make_job(1.0, provider_discord_connected=False, is_provider_email_held=True)
+    )
+
+    assert result.mining_score == 0
+    log = "\n".join(result.incentive_logs)
+    assert "provider_email_not_confirmed" in log
+    assert "provider_discord_not_connected" not in log

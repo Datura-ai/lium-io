@@ -61,6 +61,7 @@ class JobResult(BaseModel):
     is_new_rentals_paused: bool = False
     is_provider_banned: bool = False
     provider_discord_connected: bool = True
+    is_provider_email_held: bool = False
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive
 

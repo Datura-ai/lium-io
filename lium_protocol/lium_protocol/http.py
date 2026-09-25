@@ -76,6 +76,8 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     # DAH-2703: executor_ids whose filler container was destroyed during create
     filler_create_kill_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None
+    # executor_ids the backend keeps unlisted until the provider confirms an e-mail address (P227)
+    provider_email_held_executor_ids: list[str] = []
     default_job_owner_by_executor: dict[str, str] = {}  # executor_id → "miner" | "lium"
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
 
