@@ -31,8 +31,8 @@ shows a *Provenance* link on pypi.org; `https://pypi.org/integrity/lium-core/X.Y
 the signed statement.
 
 Who may tag: the `lium-core-release-tags` ruleset (`.github/rulesets/lium-core-release-tags.json`) lets only its
-bypass list create, move or delete a `lium-core-v*` tag. The list is the release team: 10954604 (taiberium),
-4623096 (arhangel66), 231022467 (jam6099), 248050668 (pixel29913) and the loop's account 114649324 (`surcyf123`).
+bypass list create, move or delete a `lium-core-v*` tag. The list is the release team: 10954604,
+4623096, 231022467, 248050668 and the loop's account 114649324.
 A tag alone publishes nothing: a human reviewer of the `pypi` environment approves each upload. Add a person by appending
 `{ "actor_id": <user-id>, "actor_type": "User", "bypass_mode": "always" }` and re-applying with
 `gh api "repos/$R/rulesets/<id>" --method PUT --input .github/rulesets/lium-core-release-tags.json`. Until an admin
@@ -43,7 +43,7 @@ repository admin applies once:
 ```bash
 R=Datura-ai/lium-io
 # the environment, with self-approval blocked; required reviewers: one or more humans, by GitHub user id
-# (`gh api users/<login> --jq .id`), in place of <human-id>. Never 114649324 (surcyf123, the loop's account): the
+# (`gh api users/<login> --jq .id`), in place of <human-id>. Never 114649324 (the loop's account): the
 # publish job refuses to run while it is listed. The PUT replaces the whole reviewers list. can_admins_bypass false:
 # the publish job refuses to run while admin bypass is on.
 gh api -X PUT "repos/$R/environments/pypi" --input - <<'JSON'
@@ -70,7 +70,7 @@ tag pattern with one more `deployment-branch-policies` call.
 
 Self-approval is blocked (`prevent_self_review: true`): GitHub refuses an approval from the account that started the
 run. That is all it blocks: any one listed required reviewer other than the run's starter can approve. So the list
-holds humans only, at least one, and never 114649324 (`surcyf123`, the loop's account, which never approves a
+holds humans only, at least one, and never 114649324 (the loop's account, which never approves a
 release). List people by user id, not teams: the publish job cannot read team membership, so it refuses a team
 reviewer. Whoever pushes the tag starts the run and so cannot approve it: list at least one reviewer who does
 not push release tags.
