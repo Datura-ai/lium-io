@@ -191,7 +191,12 @@ class TaskService:
                 if settings.DRY_RUN:
                     checks = self.pipeline_factory.build_dry_run_checks()
                 else:
-                    checks = self.pipeline_factory.build_checks()
+                    # Validation fast path: a never-validated idle node's first pass runs the
+                    # same checks arranged to wait less (flag-gated); the wave never does.
+                    if PipelineFactory.takes_fast_path(first_pass, executor_info.uuid, rented_data):
+                        checks = self.pipeline_factory.build_checks(fast_path=True)
+                    else:
+                        checks = self.pipeline_factory.build_checks()
                 pipeline = self.pipeline_factory.build_pipeline(checks)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
