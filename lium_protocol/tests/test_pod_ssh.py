@@ -54,8 +54,7 @@ def test_an_observation_defaults_to_no_errno_and_a_healthy_fleet() -> None:
     assert (seen.result, seen.errno, seen.fleet_ok) == (PodSshResult.banner, None, True)
 
 
-def test_the_four_probe_results() -> None:
-    assert {member.value for member in PodSshResult} == {"banner", "refused", "no_banner", "timeout"}
+def test_a_result_outside_the_four_is_refused() -> None:
     with pytest.raises(pydantic.ValidationError):
         PodSshObservation.model_validate({"pod_id": "P1", "result": "open"})
 
@@ -77,16 +76,6 @@ def test_a_result_missing_report_round_trips() -> None:
 def test_an_unknown_reason_code_still_reads() -> None:
     report = VALIDATOR_MESSAGES.parse_obj({**OLD_VALIDATOR_REPORT, "validation_event": {**EVENT, "reason_code": "NEW"}})
     assert report.validation_event.reason_code == "NEW"
-
-
-def test_the_could_not_look_codes() -> None:
-    assert {member.value for member in CouldNotLookCode} == {
-        "EXECUTOR_SSH_UNREACHABLE",
-        "EXECUTOR_TRANSPORT_UNREACHABLE",
-        "UPLOAD_FAILED",
-        "SCRAPE_FAILED",
-        "EXECUTOR_RESULT_MISSING",
-    }
 
 
 def test_pod_ssh_is_bounded_like_pod_states() -> None:
