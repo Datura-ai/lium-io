@@ -19,9 +19,12 @@ from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
 )
-from ..messages import TenantEnforcementMessages as Msg
+from core.config import settings
+
+from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 from .rented_pod_ssh import (
     RentedPodSshVerdict,
     enforce_after_cycles,
@@ -188,7 +191,7 @@ class TenantEnforcementCheck:
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
-        for pod in rented_pods:
+        for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
             try:
@@ -213,21 +216,55 @@ class TenantEnforcementCheck:
                 if rental_active and not rental_active.active:
                     # DAH-2870: the rental is closed; its SSH-probe marks go with it.
                     await forget_rented_pod_ssh(ctx, pod_id)
+                    stale_what = {
+                        "pod_id": pod_id,
+                        "container_name": pod_container_name,
+                        "executor_uuid": ctx.executor.uuid,
+                        "rental_closed_at": (
+                            rental_active.rental_closed_at.isoformat()
+                            if rental_active.rental_closed_at
+                            else None
+                        ),
+                        "diagnostics": diagnostics,
+                    }
+                    # PortCountCheck exempted this node from the port floor because the batch-start rented
+                    # list named a pod; the node goes on as unrented with a count the backend will not list.
+                    # The floor is enforced only when every listed pod is stale: a live rental on the same
+                    # node is a real exemption, and this loop returns before it would reach later pods.
+                    port_count_below_floor = port_count_below_listing_floor(ctx.state)
+                    if (
+                        port_count_below_floor is not None
+                        and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
+                        and await _every_listed_pod_stale(ctx, rented_pods, pod_index)
+                    ):
+                        event = render_message(
+                            PortCountMessages.INSUFFICIENT_PORTS,
+                            ctx=ctx,
+                            check_id=self.check_id,
+                            what={**port_floor_what(ctx.state, port_count_below_floor), "stale_pod": stale_what},
+                            extra=extra,
+                        )
+                        return with_pod_states(
+                            CheckResult(
+                                passed=False,
+                                event=event,
+                                updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
+                            )
+                        )
+                    impact = None
+                    if port_count_below_floor is not None:
+                        stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
+                        impact = (
+                            f"{hidden_from_renters_text(port_count_below_floor)}; "
+                            "the port floor applied only while the pod was listed"
+                        )
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
                         check_id=self.check_id,
-                        what={
-                            "pod_id": pod_id,
-                            "container_name": pod_container_name,
-                            "executor_uuid": ctx.executor.uuid,
-                            "rental_closed_at": (
-                                rental_active.rental_closed_at.isoformat()
-                                if rental_active.rental_closed_at
-                                else None
-                            ),
-                            "diagnostics": diagnostics,
-                        },
+                        severity="warning" if port_count_below_floor is not None else None,
+                        impact=impact,
+                        what=stale_what,
                         extra=extra,
                     )
                     return with_pod_states(
@@ -665,6 +702,28 @@ async def _recover_pod_after_stale_vloopback_mount(
             )
         )
         return False
+
+
+async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
+    """True only when every listed pod is not running and its rental is closed.
+
+    `rented_pods[stale_pod_index]` is already known stale. The loop only gets past a pod that is running
+    (or was recovered), so any pod before it is live. Anything unknown (no rental record, a dead SSH
+    transport) counts as live, so the floor is never enforced on a guess.
+    """
+    if stale_pod_index > 0:
+        return False
+    for other in rented_pods[1:]:
+        try:
+            other_state = await _check_pod_running_and_read_authorized_keys(ctx.ssh, other.container_name)
+        except (asyncssh.Error, OSError):
+            return False
+        if other_state.running:
+            return False
+        rental_active = await ctx.services.backend.get_pod_rental_active(other.pod_id)
+        if not rental_active or rental_active.active:
+            return False
+    return True
 
 
 _DOCKER_DAEMON_ERROR = "Error response from daemon"

@@ -16,3 +16,7 @@ class PortSelector:
         ]
         return available_ports[:size]
 
+    def declared_count(self, executor_info: ExecutorSSHInfo) -> int:
+        """How many ports the executor declares, before rented, filler and batch-size limits."""
+        return len(get_all_ports(executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port))
+
