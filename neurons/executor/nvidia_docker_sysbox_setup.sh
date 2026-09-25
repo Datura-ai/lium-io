@@ -111,6 +111,14 @@ sysbox_runc_version() {
     sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
 }
 
+sysbox_package_unconfigured() {
+    # true when dpkg knows sysbox-ce but not as "ii": a postinst that failed (no fuse3) leaves
+    # sysbox-runc on disk at the pinned version with the package half-configured
+    local status
+    status=$(dpkg-query -W -f='${db:Status-Abbrev}' sysbox-ce 2>/dev/null) || return 1
+    [ -n "$status" ] && [ "${status:0:2}" != "ii" ]
+}
+
 daemon_feature_state() {
     # features.<$1> in /etc/docker/daemon.json for the diagnostics: true, false, "not set" (key
     # absent or null), "no daemon.json", or "unreadable" when jq cannot parse the file or is not
@@ -131,6 +139,7 @@ failure_diagnostics() {
     echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
     echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo exists || echo MISSING)"
     echo "    sysbox-runc:         $(sysbox_runc_version || echo 'not found')"
+    echo "    fusermount3:         $(command -v fusermount3 || echo 'MISSING (apt-get install -y fuse3)')"
     echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
     echo "    daemon.json cdi:     $(daemon_feature_state cdi)"
     echo "    daemon.json time-ns: $(daemon_feature_state time-namespaces)"
@@ -300,6 +309,18 @@ check_docker_features() {
     pf_fix "Docker $version without features.$missing = false in /etc/docker/daemon.json — sysbox rejects its containers." \
         "$(self_cmd)   # writes the features block and restarts Docker; stop rentals first" \
         "or by hand: add $daemon_features_block to /etc/docker/daemon.json && sudo systemctl restart docker"
+}
+
+check_fuse3() {
+    # sysbox-fs 0.7 mounts its FUSE file systems with fusermount3 (package fuse3), but the sysbox-ce .deb
+    # depends only on fuse (v2): without fuse3 its postinst fails with "failed to pre-register with sysbox-fs"
+    if command -v fusermount3 &>/dev/null; then
+        pf_pass "fusermount3 (fuse3), which sysbox-fs $SYSBOX_VERSION needs."
+        return 0
+    fi
+    pf_fix "fusermount3 is missing — sysbox-fs $SYSBOX_VERSION needs fuse3 and the sysbox-ce package does not install it." \
+        "$(self_cmd)   # installs fuse3 before sysbox" \
+        "or by hand: sudo apt-get install -y fuse3"
 }
 
 check_nvidia_driver() {
@@ -521,6 +542,7 @@ preflight_stack() {
     # what this script installs: reported in --check mode, done in install mode
     check_nvidia_toolkit || true
     check_docker_features || true
+    check_fuse3 || true
     check_sysbox || true
 }
 
@@ -582,6 +604,8 @@ INSTALLED_SYSBOX=$(sysbox_runc_version || true)
 SYSBOX_UP_TO_DATE=false
 if [ -n "$INSTALLED_SYSBOX" ] && ! version3_ge "$INSTALLED_SYSBOX" "$SYSBOX_VERSION"; then
     warn "Sysbox $INSTALLED_SYSBOX is installed; upgrading to $SYSBOX_VERSION."
+elif sysbox_package_unconfigured; then
+    warn "Sysbox${INSTALLED_SYSBOX:+ $INSTALLED_SYSBOX} is on disk but its package did not finish installing; reinstalling."
 elif command -v sysbox-runc &>/dev/null; then
     SYSBOX_UP_TO_DATE=true
 fi
@@ -704,8 +728,9 @@ step 3 7 "Installing packages"
 
 ensure_nvidia_container_toolkit_repo || exit 1
 apt_install update -qq || exit 1
-apt_install install -y -qq nvidia-container-toolkit jq || exit 1
-ok "nvidia-container-toolkit, jq"
+# fuse3 before the .deb: its postinst starts sysbox-fs, which needs fusermount3 (see check_fuse3)
+apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1
+ok "nvidia-container-toolkit, jq, fuse3"
 
 if [ "$SKIP_INSTALL" = false ]; then
     LOCAL_DEB="./${SYSBOX_DEB_NAME}"

@@ -66,6 +66,9 @@ STUBS = {
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
     "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
+    "fusermount3": "#!/bin/bash\nexit 0\n",
+    # dpkg-query -W -f='${db:Status-Abbrev}' sysbox-ce: "ii " when fully installed; unset = dpkg does not know it
+    "dpkg-query": '#!/bin/bash\n[ -n "${STUB_SYSBOX_DPKG_STATUS:-}" ] || exit 1\nprintf "%s" "$STUB_SYSBOX_DPKG_STATUS"\n',
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -591,6 +594,62 @@ def test_sysbox_container_start_failure_is_a_fix(tmp_path):
     assert "docker run --rm --runtime=sysbox-runc alpine echo ok' fails" in out
 
 
+# ── fuse3 ───────────────────────────────────────────────────────────────────
+
+
+def test_fusermount3_present_passes(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_fuse3")
+    assert rc == 0
+    assert "PASS fusermount3 (fuse3), which sysbox-fs 0.7.1 needs." in out
+
+
+def test_fusermount3_missing_is_a_fix_that_names_fuse3(tmp_path):
+    # the sysbox-ce 0.7.1 .deb depends on fuse (v2) only; sysbox-fs calls fusermount3 and the postinst fails
+    rc, out, fixes = run_check(tmp_path, "check_fuse3", without=("fusermount3",))
+    assert rc == 1
+    assert fixes == 1
+    assert "FIX  fusermount3 is missing — sysbox-fs 0.7.1 needs fuse3" in out
+    assert "sudo apt-get install -y fuse3" in out
+
+
+def test_check_mode_reports_a_missing_fusermount3(tmp_path):
+    proc = run_script(tmp_path, "--check", without=("fusermount3",))
+    assert proc.returncode == 1
+    assert "FIX  fusermount3 is missing" in proc.stdout
+    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+
+
+def test_fuse3_is_installed_before_the_sysbox_deb():
+    with open(SCRIPT) as fh:
+        script = fh.read()
+    packages = script.index("apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1")
+    deb = script.index('apt_install install -y -qq "$SYSBOX_DEB" || exit 1')
+    assert packages < deb
+
+
+@pytest.mark.parametrize("status", ["iF ", "iU ", "iH "])
+def test_install_mode_reinstalls_a_half_configured_sysbox(tmp_path, status):
+    # a 0.7.1 install that failed on a missing fuse3 leaves sysbox-runc 0.7.1 on disk; a re-run must reinstall
+    # the package, not take the binary's version as "up to date"
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_DPKG_STATUS": status})
+    assert "Sysbox 0.7.1 is on disk but its package did not finish installing; reinstalling." in proc.stdout
+    assert "Sysbox is already working. Nothing to do." not in proc.stdout
+    assert "Checking running containers" in proc.stdout
+
+
+def test_install_mode_keeps_a_fully_installed_sysbox_package(tmp_path):
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_DPKG_STATUS": "ii "})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert "reinstalling" not in proc.stdout
+
+
+def test_diagnostics_name_a_missing_fusermount3(tmp_path):
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", without=("fusermount3",))
+    assert rc == 0
+    assert "fusermount3:         MISSING (apt-get install -y fuse3)" in out
+
+
 # ── the script as a provider runs it ─────────────────────────────────────────
 
 
@@ -598,7 +657,7 @@ def test_check_mode_on_a_good_host_exits_zero_with_a_summary(tmp_path):
     proc = run_script(tmp_path, "--check")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FIX  " not in proc.stdout
-    assert "Preflight: 12 PASS, 0 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 13 PASS, 0 FIX, 0 SKIP." in proc.stdout
 
 
 def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_path):
@@ -609,7 +668,7 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "FIX  NVIDIA container toolkit is not installed" in proc.stdout
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
-    assert "Preflight: 9 PASS, 2 FIX, 1 SKIP." in proc.stdout
+    assert "Preflight: 10 PASS, 2 FIX, 1 SKIP." in proc.stdout
     assert f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
 
 
@@ -705,7 +764,7 @@ def test_check_mode_still_exits_one_on_an_advisory_fix(tmp_path):
     proc = run_script(tmp_path, "--check", env={"STUB_NV_DRIVER": "575.57.08"})
     assert proc.returncode == 1
     assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in proc.stdout
-    assert "Preflight: 11 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
     assert "do not stop the install" not in proc.stdout
     # the installer never installs a driver: pointing at it is the reinstall loop of ticket-0309
     script = tmp_path / "executor" / "nvidia_docker_sysbox_setup.sh"
