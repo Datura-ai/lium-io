@@ -907,13 +907,53 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
+        "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
+        "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "
+        "starts it itself."
+    )
     ORPHANED_CONTAINER = MessageTemplate(
         event="Orphaned rental container detected",
         reason="ORPHANED_RENTAL_CONTAINER",
         severity="error",
         category="runtime",
         impact="Validation skipped; score set to 0",
-        remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
+        remediation=(
+            "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+            "node uses it: {rental_status}. Lium stops a pod's container when its rental ends and the "
+            "validator removes leftovers, so this one should not be holding the GPU. Before you touch "
+            "it, confirm it is not a live rental: the node's page in the Provider Portal must show no "
+            "active rental. Only then remove it: docker rm -f {orphaned_container}. If the portal "
+            "still shows a rental on the node, leave the container running and contact Lium support."
+        ),
+    )
+    ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
+        "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+        "node uses it: {rental_status}. Do not stop or remove it: contact Lium support with the "
+        "container name."
+    )
+    ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION = (
+        "{orphaned_container} is a Lium pod container{pod} of a rental on this node that is ending "
+        "or starting: {rental_status}. Lium stops or starts it itself, so do not stop or remove it; "
+        "the next cycle checks the node again."
+    )
+    TEARDOWN_IN_PROGRESS = MessageTemplate(
+        event="Rental teardown in progress",
+        reason="TEARDOWN_IN_PROGRESS",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle",
+        remediation=(
+            "A rental on this node has just ended and Lium is stopping its container; do not stop it yourself."
+        ),
+    )
+    RENTAL_STARTED_DURING_RUN = MessageTemplate(
+        event="Rental started during validation",
+        reason="RENTAL_STARTED_DURING_RUN",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle",
+        remediation="The GPU is held by a rental that started while this run was in progress.",
     )
     FOREIGN_PROCESS = MessageTemplate(
         event="Foreign GPU process on idle executor",
