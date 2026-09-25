@@ -7,7 +7,7 @@ from asyncssh import SSHClientConnection
 
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.container_runner import ContainerRunner
-from services.executor_connectivity.models import PortPair
+from services.executor_connectivity.models import BatchResult, PortPair
 from services.executor_connectivity.netcat_script import NetcatScript
 from services.executor_connectivity.port_tester import PortTester
 
@@ -28,11 +28,12 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair]]:
-        """Verify ports with retries."""
+        max_attempts: int = 2,
+    ) -> BatchResult:
+        """Verify ports with retries, and say whether any attempt got as far as testing them."""
         log_ctx = log_ctx or {}
-        max_attempts = 2
         timeout_sec = 60
+        completed = False
 
         for attempt in range(1, max_attempts + 1):
             token = uuid.uuid4().hex
@@ -46,16 +47,20 @@ class BatchVerifier:
             )
 
             try:
-                successful, failed = await asyncio.wait_for(
+                attempt_result = await asyncio.wait_for(
                     self._attempt(ports, token, container_name, ssh_client, host, log_ctx),
                     timeout=timeout_sec
                 )
+                completed = completed or attempt_result.completed
 
-                if successful:
+                if attempt_result.successful:
                     logger.info(
-                        _m(f"complete: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+                        _m(
+                            f"complete: {len(attempt_result.successful)}/{len(ports)} verified",
+                            extra=get_extra_info(log_ctx),
+                        )
                     )
-                    return successful, failed
+                    return BatchResult(attempt_result.successful, attempt_result.failed, completed)
 
                 if attempt < max_attempts:
                     logger.debug(
@@ -84,7 +89,7 @@ class BatchVerifier:
         # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
         # ERROR above: that is the validator's own failure, not the node's ports.
         logger.debug(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
-        return [], ports
+        return BatchResult([], ports, completed)
 
     async def _attempt(
         self,
@@ -94,7 +99,7 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair]]:
+    ) -> BatchResult:
         """Single verification attempt."""
         log_ctx = log_ctx or {}
         script = NetcatScript.batch(ports, token, 0)
@@ -106,7 +111,7 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-            return [], ports
+            return BatchResult([], ports, completed=False)
 
         try:
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
@@ -117,7 +122,7 @@ class BatchVerifier:
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        return successful, failed
+        return BatchResult(successful, failed, completed=True)
 
 
 class FallbackVerifier:
