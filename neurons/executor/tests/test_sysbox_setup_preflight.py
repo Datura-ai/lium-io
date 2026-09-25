@@ -67,8 +67,6 @@ STUBS = {
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
     "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
     "fusermount3": "#!/bin/bash\nexit 0\n",
-    # dpkg-query -W -f='${db:Status-Abbrev}' sysbox-ce: "ii " when fully installed; unset = dpkg does not know it
-    "dpkg-query": '#!/bin/bash\n[ -n "${STUB_SYSBOX_DPKG_STATUS:-}" ] || exit 1\nprintf "%s" "$STUB_SYSBOX_DPKG_STATUS"\n',
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -625,23 +623,6 @@ def test_fuse3_is_installed_before_the_sysbox_deb():
     packages = script.index("apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1")
     deb = script.index('apt_install install -y -qq "$SYSBOX_DEB" || exit 1')
     assert packages < deb
-
-
-@pytest.mark.parametrize("status", ["iF ", "iU ", "iH "])
-def test_install_mode_reinstalls_a_half_configured_sysbox(tmp_path, status):
-    # a 0.7.1 install that failed on a missing fuse3 leaves sysbox-runc 0.7.1 on disk; a re-run must reinstall
-    # the package, not take the binary's version as "up to date"
-    proc = run_script(tmp_path, env={"STUB_SYSBOX_DPKG_STATUS": status})
-    assert "Sysbox 0.7.1 is on disk but its package did not finish installing; reinstalling." in proc.stdout
-    assert "Sysbox is already working. Nothing to do." not in proc.stdout
-    assert "Checking running containers" in proc.stdout
-
-
-def test_install_mode_keeps_a_fully_installed_sysbox_package(tmp_path):
-    proc = run_script(tmp_path, env={"STUB_SYSBOX_DPKG_STATUS": "ii "})
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "Sysbox is already working. Nothing to do." in proc.stdout
-    assert "reinstalling" not in proc.stdout
 
 
 def test_diagnostics_name_a_missing_fusermount3(tmp_path):

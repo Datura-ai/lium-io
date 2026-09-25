@@ -110,15 +110,6 @@ sysbox_runc_version() {
     # version. Prints the number; exit 1 when the binary is missing or prints no version.
     sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
 }
-
-sysbox_package_unconfigured() {
-    # true when dpkg knows sysbox-ce but not as "ii": a postinst that failed (no fuse3) leaves
-    # sysbox-runc on disk at the pinned version with the package half-configured
-    local status
-    status=$(dpkg-query -W -f='${db:Status-Abbrev}' sysbox-ce 2>/dev/null) || return 1
-    [ -n "$status" ] && [ "${status:0:2}" != "ii" ]
-}
-
 daemon_feature_state() {
     # features.<$1> in /etc/docker/daemon.json for the diagnostics: true, false, "not set" (key
     # absent or null), "no daemon.json", or "unreadable" when jq cannot parse the file or is not
@@ -604,8 +595,6 @@ INSTALLED_SYSBOX=$(sysbox_runc_version || true)
 SYSBOX_UP_TO_DATE=false
 if [ -n "$INSTALLED_SYSBOX" ] && ! version3_ge "$INSTALLED_SYSBOX" "$SYSBOX_VERSION"; then
     warn "Sysbox $INSTALLED_SYSBOX is installed; upgrading to $SYSBOX_VERSION."
-elif sysbox_package_unconfigured; then
-    warn "Sysbox${INSTALLED_SYSBOX:+ $INSTALLED_SYSBOX} is on disk but its package did not finish installing; reinstalling."
 elif command -v sysbox-runc &>/dev/null; then
     SYSBOX_UP_TO_DATE=true
 fi
