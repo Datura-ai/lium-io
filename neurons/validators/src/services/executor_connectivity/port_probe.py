@@ -38,7 +38,8 @@ class PortProbe:
         successful, failed = batch.successful, batch.failed
 
         if not successful:
-            logger.warning(
+            # DAH-3593: tier changes are DEBUG; the verdict line carries the outcome.
+            logger.debug(
                 _m("batch verification failed, trying semi-batch", extra=get_extra_info(log_ctx))
             )
             successful, failed = await self.semi_batch_verifier.verify(
@@ -50,7 +51,7 @@ class PortProbe:
             )
 
         if not successful:
-            logger.warning(
+            logger.debug(
                 _m("semi-batch verification failed, trying fallback", extra=get_extra_info(log_ctx))
             )
             successful, failed = await self.fallback_verifier.verify(

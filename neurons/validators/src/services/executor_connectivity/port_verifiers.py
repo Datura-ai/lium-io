@@ -63,13 +63,13 @@ class BatchVerifier:
                     return BatchResult(attempt_result.successful, attempt_result.failed, completed)
 
                 if attempt < max_attempts:
-                    logger.warning(
+                    logger.debug(
                         _m(f"attempt {attempt} failed, retrying in 2s", extra=get_extra_info(log_ctx))
                     )
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
-                logger.error(
+                logger.debug(
                     _m(f"attempt {attempt} timed out after {timeout_sec}s", extra=get_extra_info(log_ctx))
                 )
                 await self.runner.cleanup(ssh_client, container_name)
@@ -85,7 +85,10 @@ class BatchVerifier:
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
 
-        logger.error(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
+        # DAH-3593: the outcome is the PortCountCheck verdict ("Port verification failed"); the
+        # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
+        # ERROR above: that is the validator's own failure, not the node's ports.
+        logger.debug(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
         return BatchResult([], ports, completed)
 
     async def _attempt(
@@ -102,7 +105,7 @@ class BatchVerifier:
         script = NetcatScript.batch(ports, token, 0)
         start_result = await self.runner.run(ssh_client, name, script, "host", 60)
         if not start_result.ok:
-            logger.warning(
+            logger.debug(
                 _m(
                     f"batch start failed: status={start_result.status} logs={start_result.logs}",
                     extra=get_extra_info(log_ctx),
@@ -158,7 +161,7 @@ class FallbackVerifier:
                 try:
                     start_result = await self.runner.run(ssh_client, name, script, network_flag, 10)
                     if not start_result.ok:
-                        logger.warning(
+                        logger.debug(
                             _m(
                                 f"fallback: port {port.internal} failed to start: "
                                 f"status={start_result.status} logs={start_result.logs}",
@@ -285,7 +288,7 @@ class SemiBatchVerifier:
             # port (and its docker-proxy) against the next cycle's verification
             start_result = await self.runner.run(ssh_client, container_name, script, publish_flags, 20)
             if not start_result.ok:
-                logger.warning(
+                logger.debug(
                     _m(
                         f"semi-batch start failed for {len(ports)} ports: "
                         f"status={start_result.status} logs={start_result.logs}",
