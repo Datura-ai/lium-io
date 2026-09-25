@@ -1041,6 +1041,18 @@ def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
 
+def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str) -> str:
+    # the plugin's propagated-mount dir is root-only on the host, so the repair looks at it from a
+    # throwaway helper container that bind-mounts the dir at /mnt. `--mount type=bind` refuses a
+    # source that does not exist (exit 125) where `-v` would create it: a propagated-mount dir
+    # missing under a guessed docker root must read as "helper did not run", not as "volume dir gone".
+    return (
+        "/usr/bin/docker run --rm "
+        f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
+        f"{_VLOOPBACK_REPAIR_IMAGE} {helper_command}"
+    )
+
+
 def _should_repair_stale_mountpoint(
     exc: Exception,
     local_volume: str | None,
@@ -1720,13 +1732,30 @@ class DockerService:
             return False
 
         # Repair by removing only the empty stale mountpoint directory.
-        helper_cmd = (
-            "/usr/bin/docker run --rm "
-            f"-v {shlex.quote(propagated_mount_dir)}:/mnt "
-            f"{_VLOOPBACK_REPAIR_IMAGE} rmdir /mnt/{shlex.quote(local_volume)}"
+        helper_cmd = _vloopback_repair_helper_cmd(
+            propagated_mount_dir, f"rmdir /mnt/{shlex.quote(local_volume)}"
         )
         repair_result = await ssh_client.run(helper_cmd, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
         if getattr(repair_result, "exit_status", 0) != 0:
+            # A directory that is already gone needs no rmdir: the provider removed it by hand, which
+            # is what the ticket replies ask for (DAH-3398 / ticket-0313: the stale dir was gone for
+            # 24 h and every cycle still counted the failed rmdir as a failed repair, so the
+            # container was never started). Only `test -e` exit 1 means absent; a helper that did
+            # not run (125+) stays a skipped repair.
+            absence_check_result = await ssh_client.run(
+                _vloopback_repair_helper_cmd(
+                    propagated_mount_dir, f"test -e /mnt/{shlex.quote(local_volume)}"
+                ),
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            if getattr(absence_check_result, "exit_status", 0) == 1:
+                logger.info(
+                    _m(
+                        "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT",
+                        extra=get_extra_info(log_extra),
+                    )
+                )
+                return True
             logger.warning(
                 _m(
                     "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED",
@@ -7266,7 +7295,7 @@ class DockerService:
         # host instead of guessed from pod_id — a pod created through the edit path carries a
         # backend-supplied volume name that no convention derives. Every mount can be offered
         # blindly: repair_stale_vloopback_mountpoint accepts only a vloopback volume whose stale
-        # mountpoint dir is present and empty.
+        # mountpoint dir is unmounted and either empty (removed here) or already gone.
         inspect_result = await ssh_client.run(
             f"/usr/bin/docker inspect {shlex.quote(container_name)} "
             '--format \'{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}\'',
