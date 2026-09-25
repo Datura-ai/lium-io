@@ -32,6 +32,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.docker_service import (
     DockerService,
+    ImageExitedDuringKeyInjection,
     _best_effort_delete_step,
     _BoundLog,
     _CreateCancelledByDelete,
@@ -165,6 +166,32 @@ async def test_create_on_restarting_workload_container_keeps_the_pod_creation_fa
     assert "is restarting, wait until" in event["extra"]["error"]
     assert "exit_code=1" in event["extra"]["error"]
     assert event["extra"]["failure_step"]
+    assert result.msg == "Failed create_container"
+
+
+@pytest.mark.asyncio
+async def test_create_on_image_exited_during_key_injection_is_one_error_line_without_traceback(caplog):
+    """add_public_keys re-raises the restart error wrapped in ImageExitedDuringKeyInjection (review, 25 Sep)."""
+    cause = RentalDockerContainerRestartingError(
+        "container restarting, exit_code=1; Docker SDK exec failed: 409 Client Error: Conflict "
+        '("Container abc is restarting, wait until the container is running")'
+    )
+    wrapped = ImageExitedDuringKeyInjection(
+        "Failed to add SSH public keys: image 'daturaai/pytorch:1.0.0' has no long-running command — its "
+        "default command exited right after start (exit_code=1) and Docker is restarting it (running) while "
+        f"the SSH keys were being installed; Exec error: {cause}"
+    )
+    wrapped.__cause__ = cause
+    _, result = await _create_failing_with(wrapped, caplog)
+
+    lines = _records(caplog, "Failed create_container")
+    assert len(lines) == 1
+    assert lines[0].levelno == logging.ERROR
+    assert lines[0].exc_info is None, "one line, no traceback"
+    assert _extra(lines[0])["reason"] == "image_exited_during_key_injection"
+    event = json.loads(JSONFormatter(include_validator_hotkey=False).format(lines[0]))
+    assert event["message"] == "Failed create_container"
+    assert "is restarting, wait until" in event["extra"]["error"]
     assert result.msg == "Failed create_container"
 
 

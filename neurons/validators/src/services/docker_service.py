@@ -6236,7 +6236,11 @@ class DockerService:
                         }),
                     )
                 )
-            elif isinstance(_last_attempt_exception(e), RentalDockerContainerRestartingError):
+            elif isinstance(
+                _last_attempt_exception(e),
+                (RentalDockerContainerRestartingError, ImageExitedDuringKeyInjection),
+            ):
+                # add_public_keys re-raises the restart error wrapped in ImageExitedDuringKeyInjection
                 logger.error(
                     _m(
                         "Failed create_container",
@@ -6244,7 +6248,11 @@ class DockerService:
                             **default_extra,
                             "error": "; ".join(_exception_texts(e)),
                             "failure_step": current_step,
-                            "reason": "workload_container_restarting",
+                            "reason": (
+                                "image_exited_during_key_injection"
+                                if isinstance(_last_attempt_exception(e), ImageExitedDuringKeyInjection)
+                                else "workload_container_restarting"
+                            ),
                         }),
                     )
                 )
