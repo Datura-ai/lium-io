@@ -178,10 +178,6 @@ def test_spot_tier_carries_internal_log_message():
 
 
 def test_spot_tier_message_lists_every_cause_of_spot_rating():
-    # The validator only sees the backend's spot list (rented_data.spot_executor_ids); it does not
-    # know whether the node is set to Spot, its account is demoted, or an open rental was
-    # contracted as force_spot (self-rent, untrusted renter). "This executor is on the spot tier"
-    # read as the node's own tier to two Secure-node providers (#providers, 20 Sep 2026).
     message = MinerLogLine.no_payout_because_spot_tier(_job()).message
     assert "this executor is on the spot tier" not in message
     assert message.startswith("No subnet incentive: this executor is rated as spot for this cycle")
