@@ -4,8 +4,8 @@ name: image-pins
 # `docker compose up` on a tag nobody pushed fails for every new install (daturaai/lium-watchtower:1.2.0 on
 # #1432, 404 on Docker Hub). .github/scripts/check_image_pins.sh lets compose list the images and runs
 # `docker manifest inspect` on each, anonymously, the way a provider pulls. A PR checks the refs it adds:
-# Docker Hub gives an anonymous IP a small manifest budget and a runner's IP is shared. main, the nightly
-# run and a manual run check every ref, so a tag removed from Docker Hub shows too. No `paths:` filter:
+# Docker Hub gives an anonymous IP a small manifest budget and a runner's IP is shared. main and a manual
+# run check every ref, so a tag removed from Docker Hub shows too. No `paths:` filter:
 # the job reports on every PR, so it can be required, and a PR that adds no ref passes in seconds.
 on:
   pull_request:
@@ -13,8 +13,6 @@ on:
     branches: [main]
   merge_group:
     branches: [main]
-  schedule:
-    - cron: "30 4 * * *"
   workflow_dispatch:
 
 permissions:
