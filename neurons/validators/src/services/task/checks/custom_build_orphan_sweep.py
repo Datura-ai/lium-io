@@ -47,6 +47,26 @@ BUILD_SCRATCH_PREFIX = "/tmp/lium-build-"
 # Inline teardown removes it; this sweep mops up the validator-crashed-mid-build
 # leftover so a stale container does not pin CPU/mem/disk on the executor host.
 BUILD_DIND_PREFIX = "lium-dind-build-"
+# A build's two iptables helpers are named after its DinD with these suffixes
+# (``docker_service._dind_firewall_helper_names``). ``docker ps --filter name=``
+# lists them with the DinD, so the pod id is read after the suffix is stripped:
+# a helper of an active build belongs to that build and is not an orphan.
+BUILD_DIND_HELPER_SUFFIXES = ("-fw-apply", "-fw-remove")
+
+
+def dind_container_pod_id(name: str) -> str | None:
+    """Pod id of a ``lium-dind-build-*`` container or of one of its firewall helpers.
+
+    ``None`` when the name carries another prefix or no pod id at all.
+    """
+    if not name.startswith(BUILD_DIND_PREFIX):
+        return None
+    pod_id = name[len(BUILD_DIND_PREFIX):]
+    for suffix in BUILD_DIND_HELPER_SUFFIXES:
+        if pod_id.endswith(suffix):
+            pod_id = pod_id[: -len(suffix)]
+            break
+    return pod_id or None
 
 
 class CustomBuildOrphanSweepCheck:
@@ -128,7 +148,11 @@ class CustomBuildOrphanSweepCheck:
         return orphans
 
     async def _list_orphan_dind_containers(self, ssh, active_pod_ids: set[str]) -> list[str]:
-        """Return `lium-dind-build-*` container names whose pod_id is not active."""
+        """Return `lium-dind-build-*` container names whose pod_id is not active.
+
+        The listing includes the build's firewall helpers (`<dind>-fw-apply`,
+        `<dind>-fw-remove`); they go with their pod's verdict.
+        """
         cmd = (
             f'/usr/bin/docker ps -a --filter "name={BUILD_DIND_PREFIX}" '
             f'--format "{{{{.Names}}}}" 2>/dev/null || true'
@@ -141,9 +165,7 @@ class CustomBuildOrphanSweepCheck:
         orphans: list[str] = []
         for raw in (result.stdout or "").splitlines():
             name = raw.strip()
-            if not name.startswith(BUILD_DIND_PREFIX):
-                continue
-            pod_id = name[len(BUILD_DIND_PREFIX):]
+            pod_id = dind_container_pod_id(name)
             if not pod_id or pod_id in active_pod_ids:
                 continue
             orphans.append(name)
