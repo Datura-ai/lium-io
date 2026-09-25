@@ -13,7 +13,7 @@ Two Docker Hub tokens, each an environment secret, so no branch can read the pro
   build and push `:dev` from a feature branch.
 
 In every job the token is set only on the inline "Log in to Docker Hub" step, and the
-`neurons/*/docker*publish.sh` scripts push with that login instead of logging in themselves.
+`neurons/*/docker*publish.sh` scripts only push, using that login.
 That login is saved on the runner, so every later step of the same job, those scripts included,
 can use it. What keeps a branch away from the prod token is the `dockerhub-push` deployment
 policy: a prod job runs only from `main` or a release tag, so the scripts it runs are the
