@@ -26,6 +26,7 @@ class RequestType(enum.Enum):
     ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
     GpuEstimatesRequest = "GpuEstimatesRequest"
     EstimateResponse = "EstimateResponse"
+    PodStatesReport = "PodStatesReport"
 
 
 class BaseValidatorRequest(BaseRequest, DeliveryStamps):
@@ -84,6 +85,71 @@ class ValidationEvent(pydantic.BaseModel):
         return self.category == AVAILABILITY_CATEGORY
 
 
+class ContainerState(str, enum.Enum):
+    """What the validator saw of one rented pod's container this cycle (DAH-3338)."""
+
+    RUNNING = "running"
+    # On the host but not running: docker inspect answered a status other than running.
+    EXITED = "exited"
+    # No container of that name on the host.
+    ABSENT = "absent"
+    # The SSH transport died before the container could be inspected; never read as absent.
+    UNKNOWN = "unknown"
+    # StaleContainerCleanupCheck removed it: an orphan the backend no longer lists as rented.
+    REAPED = "reaped"
+
+
+class PodContainerState(pydantic.BaseModel):
+    pod_id: str
+    container_state: ContainerState
+    observed_at: datetime
+
+
+# The backend bounds ExecutorSpecRequest.pod_states at 256 entries (lium-platform#312,
+# `Field(max_length=256)`); a longer list fails its validation and the WHOLE spec is dropped, node
+# listing included. One PodStatesReport chunk holds the same number. With
+# settings.POD_STATES_REPORT_ENABLED every state of the cycle goes out in report chunks after the
+# spec, and the spec keeps this bounded head as a copy for a backend that does not read the report
+# yet (a copy that is reaped ids only when 256 or more are queued). With the flag off the spec is
+# the only carrier: StaleContainerCleanupCheck hands its queued `reaped` ids at least
+# REAPED_POD_STATES_FLOOR slots (they sit first in the list, so this cut never reaches them) and
+# the last rented pods' observed states are cut every cycle until the queue drains.
+POD_STATES_MAX_ITEMS = 256
+
+
+def bound_pod_states(states: list[PodContainerState]) -> list[PodContainerState]:
+    return states[:POD_STATES_MAX_ITEMS]
+
+
+def chunk_pod_states(states: list[PodContainerState]) -> list[list[PodContainerState]]:
+    """The cycle's states cut into PodStatesReport chunks of at most POD_STATES_MAX_ITEMS, in order.
+
+    An empty list gives no chunk: a cycle that observed nothing sends no report.
+    """
+    return [states[start : start + POD_STATES_MAX_ITEMS] for start in range(0, len(states), POD_STATES_MAX_ITEMS)]
+
+
+class PodStatesReport(BaseValidatorRequest):
+    """DAH-3338: one chunk of the container states one cycle saw on one node.
+
+    Sent after the cycle's ExecutorSpecRequest, one message per chunk, so a node whose states do not
+    fit the spec's bound (256 rented pods plus queued reaped ids) still reports every one of them in
+    the same cycle. The backend (lium-platform#312) writes the states onto the rental rows and
+    nothing else: no cycle row, no validation report, so a second message per cycle changes no
+    accounting. The write is idempotent, so a chunk delivered twice leaves the rows as they were.
+    ``job_batch_id`` is the cycle; ``chunk_index`` counts from 0 up to ``chunk_total - 1``.
+    """
+
+    message_type: RequestType = RequestType.PodStatesReport
+    validator_hotkey: str
+    miner_hotkey: str
+    executor_uuid: str
+    job_batch_id: str
+    chunk_index: int = pydantic.Field(ge=0)
+    chunk_total: int = pydantic.Field(ge=1)
+    pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
+
+
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
@@ -130,6 +196,10 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # what we saw. The backend keeps the node off the market while the list is not empty and
     # clears it on an empty one. None means the cycle never got to check.
     availability_errors: list[dict[str, Any]] | None = None
+    # DAH-3338: the container state of every rented pod this cycle observed, plus the orphans the
+    # stale cleanup reaped. None when the cycle never reached the rented-state check. The backend
+    # writes it onto rental_history; an older backend ignores the key.
+    pod_states: list[PodContainerState] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

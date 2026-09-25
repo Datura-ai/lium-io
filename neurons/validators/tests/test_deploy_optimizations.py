@@ -94,6 +94,9 @@ class _FakeRentalDockerClient:
         self.image_exists_result = image_exists_result
         self.image_exists_error = image_exists_error
         self.image_exists_calls = []
+        self.local_image_current = True
+        self.local_image_current_error = None
+        self.freshness_calls = []
         self.pulled_images = []
         self.run_specs = []
         self.exec_specs = []
@@ -111,6 +114,12 @@ class _FakeRentalDockerClient:
         if self.image_exists_error is not None:
             raise self.image_exists_error
         return self.image_exists_result
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        self.freshness_calls.append({"image": image, "auth_config": auth_config})
+        if self.local_image_current_error is not None:
+            raise self.local_image_current_error
+        return self.local_image_current
 
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
@@ -300,6 +309,34 @@ async def test_probe_error_falls_through_to_pull(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     assert _pulled_images(svc) == ["daturaai/pytorch:9.9.9"]
+
+
+@pytest.mark.asyncio
+async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypatch):
+    """DAH-3873: a mutable tag (`:prod`) on the host is stale once the registry tag moves."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).local_image_current = False
+
+    result = await _run(svc, _payload(docker_image="ghcr.io/org/app:prod", **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    assert _pulled_images(svc) == ["ghcr.io/org/app:prod"]
+    assert _docker_client(svc).freshness_calls == [
+        {"image": "ghcr.io/org/app:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
+    ]
+    assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
+
+
+@pytest.mark.asyncio
+async def test_present_image_is_used_when_the_registry_check_fails(svc, monkeypatch):
+    """DAH-3873: fail open. A registry that does not answer must not block the rental."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).local_image_current_error = RuntimeError("registry down")
+
+    result = await _run(svc, _payload())
+
+    assert isinstance(result, ContainerCreated)
+    assert _pulled_images(svc) == []
 
 
 @pytest.mark.asyncio
@@ -954,7 +991,7 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
     credentials into it is a separate task."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None)))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None, None)))
 
     result = await _run(
         svc,

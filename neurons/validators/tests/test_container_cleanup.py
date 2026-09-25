@@ -94,6 +94,79 @@ async def test_cleanup_removes_stale_running_health_check():
 
 
 @pytest.mark.asyncio
+async def test_cleanup_awaits_on_before_remove_before_each_removal():
+    """DAH-3338: the caller queues the reap for the backend BEFORE the container goes, so a crash
+    between the removal and the report cannot lose it. Fails on a cleanup that removes first."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    order: list[str] = []
+
+    async def on_before_remove(container_name: str) -> None:
+        container_removals = [c for c in rm_calls if "docker rm -f" in c]
+        order.append(f"queued {container_name} with {len(container_removals)} removal(s) so far")
+
+    removed_count, removed_names, _ = await cleanup_with_hook(ssh, on_before_remove)
+
+    assert removed_names == [name]
+    assert order == [f"queued {name} with 0 removal(s) so far"]
+    assert any("docker rm -f" in c and name in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_a_volume_rm_error_after_a_successful_rm_still_counts_the_container_as_removed():
+    """Regression (review of DAH-3338): the volume removal ran inside the same try as `docker rm`,
+    so an SSH error on it returned False for a container that was already gone. The caller then
+    named it unremovable and dropped its `reaped` report. Fails on the old shape."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker volume rm" in cmd:
+            raise OSError("ssh transport closed")
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert (removed_count, removed_names, unremovable) == (1, [name], [])
+    assert any("docker rm -f" in c and name in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
+    """Control for the test above: an SSH error on the `docker rm` itself is a failed removal."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, _ = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker rm -f" in cmd:
+            raise OSError("ssh transport closed")
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert (removed_count, removed_names, unremovable) == (0, [], [name])
+
+
+async def cleanup_with_hook(ssh, on_before_remove):
+    return await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh,
+        rented_data=None,
+        executor_uuid=EXECUTOR_UUID,
+        on_before_remove=on_before_remove,
+    )
+
+
+@pytest.mark.asyncio
 async def test_cleanup_removes_stale_exited_health_check():
     """An exited health_check_* older than threshold is still cleaned up (cosmetic).
 
