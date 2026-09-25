@@ -8,15 +8,27 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dockerhub-push
     env:
       TAG: "latest" 
       TARGET_FILE: "docker-compose.app.yml"
-      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub (OIDC, no stored token)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The exchanged token is the docker password for the rest of the job (default 300 s);
+          # build+push here takes up to ~140 s, so 30 min leaves room for a cold cache or a slow runner.
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
 
       - name: Make scripts executable
         run: |

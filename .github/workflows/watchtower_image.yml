@@ -35,7 +35,11 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: dockerhub-push
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
     env:
       IMAGE_REPOSITORY: daturaai/lium-watchtower
       # The staging backend signs the digest with this hotkey (lium-platform
@@ -74,11 +78,15 @@ jobs:
             echo "overwrite=$OVERWRITE"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Docker Hub
+      - name: Log in to Docker Hub (OIDC, no stored token)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
         env:
-          DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The exchanged token is the docker password for the rest of the job (default 300 s);
+          # build+push here takes up to ~140 s, so 30 min leaves room for a cold cache or a slow runner.
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
 
       # A version tag is pinned by the compose files and must not move: a mirror that cached
       # the first build would serve it for ever. The check reads Docker Hub before anything
