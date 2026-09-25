@@ -23,9 +23,11 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 
 from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
+from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,8 @@ STEP_CONTAINER_START = "container_start"
 STEP_SSHD_LISTEN = "sshd_listen"
 STEP_SSH_LOGIN = "ssh_login"
 STEP_GPU_COUNT = "gpu_count"
+# the renter's `pip install`: resolve and fetch pypi.org from inside the container (NO_OUTBOUND_INTERNET)
+STEP_EGRESS = "egress"
 STEP_TEARDOWN = "teardown"
 
 # create_container's failure_step values that fail before the validator has talked to the host over
@@ -81,6 +85,7 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
         "the {expected} GPU(s) this node advertises. Check the NVIDIA container runtime and "
         "`docker run --gpus all nvidia-smi -L` by hand."
     ),
+    STEP_EGRESS: NO_OUTBOUND_INTERNET_REMEDIATION,
 }
 
 _SSHD_POLL_SECONDS = 2.0
@@ -90,6 +95,8 @@ _SSH_LOGIN_TIMEOUT_SECONDS = 30
 # waits between login attempts; the last value repeats until the deadline
 _SSH_LOGIN_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
 _NVIDIA_SMI_TIMEOUT_SECONDS = 30
+# getent's resolver timeouts plus the script's 10 s fetch
+_EGRESS_TIMEOUT_SECONDS = 45
 # create_container has its own bounded retries (a 90 s port-retry budget, SSH timeouts) but no overall
 # deadline; the image is already on the host, so a create still running after this is a stuck host, and
 # the run's outer timeout (JOB_TIME_OUT) must not be what ends it.
@@ -360,7 +367,9 @@ class RentalProbeCheck:
         self, ctx: Context, failure: _Failure, *, what: dict[str, Any], ssh_port: int | None
     ) -> CheckResult:
         event = render_message(
-            Msg.PROBE_FAILED,
+            OutboundInternetMessages.NO_OUTBOUND_INTERNET
+            if failure.step == STEP_EGRESS
+            else Msg.PROBE_FAILED,
             ctx=ctx,
             check_id=self.check_id,
             what=what,
@@ -613,6 +622,9 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
         return None
     text = raw.decode() if isinstance(raw, bytes) else str(raw)
     step, _, create_step = text.partition(":")
+    if step == STEP_EGRESS and not settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
+        # enforcement switched off after the failure was stamped: the egress step fails nothing any more
+        return None
     return _Failure(step, create_step or None) if step else None
 
 
@@ -741,13 +753,16 @@ def _probe_payload(
 
 
 async def _probe(ctx: Context, image_ref: str, create_lock: _CreateLock) -> _ProbeOutcome:
-    """Run the five steps in order; whatever happens, the node and this validator's Redis are left as found.
+    """Run the six steps in order; whatever happens, the node and this validator's Redis are left as found.
 
     1. `_step_container_start`: create the container the way a renter's create does.
     2. `_step_sshd_listen`: wait for sshd's banner on the mapped port.
-    3. `_step_ssh_login`: log in with the probe's key, retrying until the deadline, and run `nvidia-smi -L`.
+    3. `_step_ssh_login`: log in with the probe's key, retrying until the deadline, and run `nvidia-smi -L`
+       (and EGRESS_PROBE_SCRIPT, under NO_OUTBOUND_INTERNET_CHECK_ENABLED).
     4. `_step_gpu_count`: compare the listed GPUs with what the node advertises.
-    5. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
+    5. `_step_egress`: the container resolved and fetched pypi.org; fails the probe only under
+       NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED.
+    6. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
 
     A step that ends the probe returns None and says why in `outcome` (a failed step, or an inconclusive
     reason). The teardown runs in `finally`, so it also runs after a raise or a cancel.
@@ -777,6 +792,8 @@ async def _probe(ctx: Context, image_ref: str, create_lock: _CreateLock) -> _Pro
         if login is None:
             return outcome
         _step_gpu_count(ctx, outcome, login)
+        if outcome.failed_step is None:
+            _step_egress(ctx, outcome, login)
         return outcome
     finally:
         await _step_teardown(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
@@ -902,7 +919,11 @@ async def _step_ssh_login(
     Returns the login (with the command's result) for the GPU count, or None when the probe ends here.
     """
     login = await _login_and_list_gpus(
-        ctx.executor.address, ssh_port, private_key, deadline_at=deadline_at
+        ctx.executor.address,
+        ssh_port,
+        private_key,
+        deadline_at=deadline_at,
+        egress=bool(settings.NO_OUTBOUND_INTERNET_CHECK_ENABLED),
     )
     outcome.steps.append(
         _Step(STEP_SSH_LOGIN, login.login_seconds, login.login_error is None, login.login_detail())
@@ -932,6 +953,46 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None
     outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
     if not gpu_ok:
         outcome.failed_step = STEP_GPU_COUNT
+
+
+def _step_egress(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
+    """Step 5: the renter container resolved pypi.org and got an HTTP answer from it.
+
+    No step is recorded when the script did not run (NO_OUTBOUND_INTERNET_CHECK_ENABLED off, the
+    session failed, the image has no curl or wget): that is no reading, not a failed one. A no_egress
+    reading was re-run once over the same session, and the re-run is the reading.
+    """
+    if not login.egress_attempted:
+        return
+    if login.egress_error is not None:
+        probe = None
+        reason = f"egress script did not run over the SSH session: {login.egress_error}"
+    else:
+        probe = parse_egress_probe(login.egress_result.stdout or "")
+        reason = probe.summary()
+    if login.egress_first_reading is not None:
+        reason = f"{reason} (first run: {login.egress_first_reading})"
+    if probe is None or probe.verdict == "unmeasured":
+        logger.info(
+            _m(
+                "Rental probe egress step reached no verdict",
+                extra=get_extra_info({**ctx.default_extra, "reason": reason}),
+            )
+        )
+        return
+    ok = probe.verdict == "ok"
+    outcome.steps.append(_Step(STEP_EGRESS, login.egress_seconds, ok, None if ok else reason))
+    if ok:
+        return
+    if settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
+        outcome.failed_step = STEP_EGRESS
+        return
+    logger.warning(
+        _m(
+            "Rental probe container cannot reach the internet (NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off)",
+            extra=get_extra_info({**ctx.default_extra, **probe.as_record()}),
+        )
+    )
 
 
 async def _step_teardown(
@@ -1140,6 +1201,12 @@ class _Login:
     result: Any = None
     login_seconds: float = 0.0
     command_seconds: float = 0.0
+    egress_attempted: bool = False
+    egress_error: str | None = None
+    egress_result: asyncssh.SSHCompletedProcess | None = None
+    egress_seconds: float = 0.0
+    # the no_egress reading the re-run replaced
+    egress_first_reading: str | None = None
 
     def login_detail(self) -> str | None:
         if self.login_error is not None:
@@ -1150,7 +1217,7 @@ class _Login:
 
 
 async def _login_and_list_gpus(
-    host: str, port: int, private_key: str, *, deadline_at: float
+    host: str, port: int, private_key: str, *, deadline_at: float, egress: bool = False
 ) -> _Login:
     """Log in with the probe key the way a renter does and run `nvidia-smi -L` inside the container.
 
@@ -1203,10 +1270,42 @@ async def _login_and_list_gpus(
             login.result = await conn.run(
                 "nvidia-smi -L", check=False, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
             )
+            login.command_seconds = time.perf_counter() - command_started
+            if egress:
+                await _run_egress_script_rerun_once_on_no_egress(conn, login)
     except (TimeoutError, asyncssh.Error, OSError) as exc:
-        login.command_error = repr(exc)
-    login.command_seconds = time.perf_counter() - command_started
+        if not login.egress_attempted:
+            login.command_error = repr(exc)
+        elif login.egress_result is None and login.egress_error is None:
+            login.egress_error = repr(exc)
+    if not login.command_seconds:
+        login.command_seconds = time.perf_counter() - command_started
     return login
+
+
+async def _run_egress_script_rerun_once_on_no_egress(
+    conn: asyncssh.SSHClientConnection, login: _Login
+) -> None:
+    """Fill the login's egress fields; one transient miss is not a verdict, so a no_egress run is re-run."""
+    login.egress_attempted = True
+    egress_started = time.perf_counter()
+    try:
+        login.egress_result = await _run_egress_script(conn)
+        first = parse_egress_probe(login.egress_result.stdout or "")
+        if first.verdict == "no_egress":
+            login.egress_first_reading = first.summary()
+            login.egress_result = await _run_egress_script(conn)
+    except (TimeoutError, asyncssh.Error, OSError) as exc:
+        login.egress_error = repr(exc)
+    login.egress_seconds = time.perf_counter() - egress_started
+
+
+async def _run_egress_script(conn: asyncssh.SSHClientConnection) -> asyncssh.SSHCompletedProcess:
+    return await conn.run(
+        f"sh -c {shlex.quote(EGRESS_PROBE_SCRIPT)}",
+        check=False,
+        timeout=_EGRESS_TIMEOUT_SECONDS,
+    )
 
 
 def _count_gpus(nvidia_smi_output: str) -> int:

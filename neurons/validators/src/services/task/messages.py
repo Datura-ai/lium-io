@@ -1019,6 +1019,91 @@ class PortCountMessages:
     )
 
 
+NO_OUTBOUND_INTERNET_REMEDIATION = (
+    "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
+)
+
+
+class OutboundInternetMessages:
+    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
+    NO_OUTBOUND_INTERNET = MessageTemplate(
+        event="Containers cannot reach the internet",
+        reason="NO_OUTBOUND_INTERNET",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
+    )
+
+
+REGISTRY_PULL_REMEDIATION = (
+    "this node's Docker daemon could not pull a small Docker Hub image, so a renter's template that is not "
+    "cached fails to start; check the registry mirrors in /etc/docker/daemon.json (`docker info`, Registry "
+    "Mirrors) resolve and answer from the host, or remove the broken mirror and restart docker, then "
+    "`docker pull hello-world` on the host must finish"
+)
+
+
+class RegistryPullMessages:
+    REGISTRY_PULL_FAILED = MessageTemplate(
+        event="Docker Hub image pull fails through this node's registry path",
+        reason="REGISTRY_PULL_FAILED",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=REGISTRY_PULL_REMEDIATION,
+    )
+    # the same finding while REGISTRY_PULL_ENFORCEMENT_ENABLED is off: logged, score unchanged
+    REGISTRY_PULL_FAILED_OBSERVED = MessageTemplate(
+        event="Docker Hub image pull fails through this node's registry path (not enforced)",
+        reason="REGISTRY_PULL_FAILED_OBSERVED",
+        severity="warning",
+        category="runtime",
+        impact="None: REGISTRY_PULL_ENFORCEMENT_ENABLED is off",
+        remediation=REGISTRY_PULL_REMEDIATION,
+    )
+    # one failed pull: a finding only once the next pull fails too
+    REGISTRY_PULL_FAILED_ONCE = MessageTemplate(
+        event="Docker Hub image pull failed once; the next pull decides",
+        reason="REGISTRY_PULL_FAILED_ONCE",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+        remediation=REGISTRY_PULL_REMEDIATION,
+    )
+    REGISTRY_PULL_OK = MessageTemplate(
+        event="Docker Hub image pull verified",
+        reason="REGISTRY_PULL_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # the pull failed, but the validator's own GET of Docker Hub failed too: an outage, not this node
+    REGISTRY_PULL_NO_VERDICT_HUB_DOWN = MessageTemplate(
+        event="Docker Hub image pull failed while Docker Hub was unreachable from the validator; no verdict",
+        reason="REGISTRY_PULL_NO_VERDICT_HUB_DOWN",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # the pull ran but says nothing about the path: Docker Hub's 429, an auth or unclassified error, or
+    # the probe itself did not run
+    REGISTRY_PULL_UNMEASURED = MessageTemplate(
+        event="Docker Hub image pull reached no verdict",
+        reason="REGISTRY_PULL_UNMEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Registry pull check skipped",
+        reason="REGISTRY_PULL_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 VERIFYX_DEBUG_DOC_URL = (
     "https://github.com/Datura-ai/lium-io/blob/main/docs/lium-io/verifyx-debug.md"
 )
