@@ -74,7 +74,7 @@ class PortProbe:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair], str]:
+    ) -> PortProbeResult:
         """Re-probe `failed` through the published-port (-p) tiers until MIN_PORT_COUNT answer.
 
         A host-network batch can reach only a few listeners (a ufw INPUT policy drops them, or a
@@ -106,6 +106,6 @@ class PortProbe:
             if recovered:
                 tiers.append(name)
                 recovered_set = set(recovered)
-                successful = successful + [p for p in recovered if p not in successful]
+                successful = successful + recovered
                 failed = [p for p in failed if p not in recovered_set]
-        return successful, failed, "+".join(tiers)
+        return PortProbeResult(tuple(successful), tuple(failed), "+".join(tiers))

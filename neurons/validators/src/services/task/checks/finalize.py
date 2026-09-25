@@ -4,7 +4,7 @@ from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT, UNRENTE
 
 from ..messages import FinalizeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from .port_count import hidden_from_renters_text, listing_port_shortfall, port_floor_what
+from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 
 class FinalizeCheck:
@@ -36,10 +36,10 @@ class FinalizeCheck:
             "sysbox_runtime": ctx.state.sysbox_runtime,
         }
         # Only a run exempted from PortCountCheck by a pod that then proved stale gets here below the floor.
-        shortfall = listing_port_shortfall(ctx.state)
-        if shortfall is not None:
-            impact = f"{hidden_from_renters_text(shortfall)}. {impact}"
-            what["port_floor"] = port_floor_what(ctx.state, shortfall)
+        port_count_below_floor = port_count_below_listing_floor(ctx.state)
+        if port_count_below_floor is not None:
+            impact = f"{hidden_from_renters_text(port_count_below_floor)}. {impact}"
+            what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
             port_floor_fix = (
                 f"Only ports that answer among the lowest {BATCH_PORT_VERIFICATION_SIZE} free ports of the "
                 f"declared range count: allow at least {MIN_PORT_COUNT} of them through the host firewall and "

@@ -227,7 +227,7 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
 
 @pytest.mark.asyncio
 async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_completed(context_factory):
-    """The d9888aff shape: 2 ports, a pod in the batch-start rented list that has since ended."""
+    """A wide-range host shape: 2 ports, a pod in the batch-start rented list that has since ended."""
     batch = HostNetworkBatch(reachable=2)
     ctx = run_context(
         context_factory,
@@ -426,6 +426,49 @@ async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced
         rented_data=rented_with_pods("pod-stale", "pod-down"),
         ssh=PerPodSSHClient(running=set()),
         backend=PerPodBackendClient(active={"pod-down"}),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enforced(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale", "pod-running"),
+        ssh=PerPodSSHClient(running={"container_pod-running"}),
+        backend=PerPodBackendClient(active=set()),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enforced(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+
+    class NoRecordForSecondPod(PerPodBackendClient):
+        async def get_pod_rental_active(self, pod_id: str):
+            return None if pod_id == "pod-unknown" else await super().get_pod_rental_active(pod_id)
+
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale", "pod-unknown"),
+        ssh=PerPodSSHClient(running=set()),
+        backend=NoRecordForSecondPod(active=set()),
     )
 
     _, ctx = await apply(ctx, PortConnectivityCheck())

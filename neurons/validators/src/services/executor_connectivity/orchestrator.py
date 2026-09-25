@@ -88,13 +88,14 @@ class ConnectivityOrchestrator:
         # After DinD, not before: a batch of exactly MIN_PORT_COUNT whose DinD port fails publishes one fewer.
         tier = probe_result.tier
         if tier == "batch" and len(successful) < MIN_PORT_COUNT and settings.PORT_PROBE_TOPUP_BELOW_FLOOR:
-            successful, failed, tier = await self.port_probe.top_up(
+            topped_up = await self.port_probe.top_up(
                 successful,
                 failed,
                 ssh_client=ssh_client,
                 host=executor_info.address,
                 log_ctx=log_ctx,
             )
+            successful, failed, tier = list(topped_up.successful), list(topped_up.failed), topped_up.tier
 
         status = "ok" if successful else "no_working_ports"
         return PortVerificationResult(

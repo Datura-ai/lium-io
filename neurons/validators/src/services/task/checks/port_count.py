@@ -10,7 +10,7 @@ from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
 
 
-def listing_port_shortfall(state: ContextState) -> int | None:
+def port_count_below_listing_floor(state: ContextState) -> int | None:
     """The published `available_port_count` when it is below MIN_PORT_COUNT, else None.
 
     The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
