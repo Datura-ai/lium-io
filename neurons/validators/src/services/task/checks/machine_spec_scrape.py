@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-from ..messages import MachineSpecMessages as Msg, render_message
+from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from services.file_encrypt_service import ORIGINAL_KEYS
@@ -103,17 +103,76 @@ def _decrypt_payload(ctx: Context, stdout: str) -> str:
     raise last_exc or ValueError("No scrape payload on stdout")
 
 
+def _scrape_error_report(stdout: str) -> dict[str, Any] | None:
+    # the scrape prints {"error": ...} and exits non-zero when it ran but found nothing to report;
+    # a source the interpreter could not run prints nothing of ours at all. Searched newest-first
+    # like the token, since an atexit handler in the image may print after it.
+    for line in _lines_from_the_end(stdout):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            report = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(report, dict) and "error" in report:
+            return report
+    return None
+
+
 def _scrape_reported_its_own_failure(stdout: str) -> bool:
-    # the scrape prints {"error": ...} as its last line and exits non-zero when it ran but found
-    # nothing to report; a source the interpreter could not run prints nothing of ours at all
-    last_line = next((line for line in _lines_from_the_end(stdout) if line.strip()), None)
-    if last_line is None:
-        return False
-    try:
-        report = json.loads(last_line)
-    except ValueError:
-        return False
-    return isinstance(report, dict) and "error" in report
+    return _scrape_error_report(stdout) is not None
+
+
+def _is_no_gpu_details_error(error: Any, obfuscation_keys: dict[str, str] | None) -> bool:
+    # the key substitution that renames `gpu_details` in the shipped scrape (file_encrypt_service)
+    # is a plain text replace, so it renames it inside this string literal too
+    obfuscated_gpu_details_key = (obfuscation_keys or {}).get("gpu_details", "gpu_details")
+    return isinstance(error, str) and error in {"no_gpu_details", f"no_{obfuscated_gpu_details_key}"}
+
+
+@dataclass(frozen=True)
+class ScrapeFailure:
+    """The reason code a failed scrape run gets, plus the cause fields its event carries."""
+
+    template: MessageTemplate
+    error_type: str | None = None
+    scrape_error: str | None = None
+    gpu_scrape_error: str | None = None
+
+    def cause_event_fields(self) -> dict[str, str]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name != "template" and getattr(self, field.name) is not None
+        }
+
+
+def _classify_scrape_failure(
+    scrape_run: SSHCommandResult, obfuscation_keys: dict[str, str] | None
+) -> ScrapeFailure:
+    # which side failed, from what came back: the runner sets error_type exactly when no exit status
+    # came back from the host (timed out, raised, or the channel closed without one). Those stay
+    # undetermined; only an exit status the host sent puts the failure on the host.
+    if scrape_run.error_type == "timeout":
+        return ScrapeFailure(Msg.SCRAPE_TIMEOUT, error_type=scrape_run.error_type)
+    if scrape_run.error_type is not None:
+        return ScrapeFailure(Msg.SCRAPE_TRANSPORT_FAILED, error_type=scrape_run.error_type)
+
+    report = _scrape_error_report(scrape_run.stdout)
+    if report is None or not _is_no_gpu_details_error(report.get("error"), obfuscation_keys):
+        return ScrapeFailure(Msg.SCRAPE_FAILED_ON_HOST)
+
+    report_data = report.get("data")
+    report_data = _deobfuscate(report_data, obfuscation_keys) if isinstance(report_data, dict) else {}
+    gpu_scrape_error = report_data.get("gpu_scrape_error")
+    if gpu_scrape_error:
+        return ScrapeFailure(
+            Msg.SCRAPE_FAILED_DRIVER,
+            scrape_error="no_gpu_details",
+            gpu_scrape_error=str(gpu_scrape_error)[:200],
+        )
+    return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
 
 
 @dataclass(frozen=True)
@@ -230,7 +289,7 @@ class MachineSpecScrapeCheck:
             remote_dir = await upload_validation_files_to_fresh_remote_dir(ctx, attempts=FALLBACK_UPLOAD_ATTEMPTS)
         except UploadFailed as exc:
             event = render_message(
-                Msg.SCRAPE_FAILED,
+                Msg.SCRAPE_TRANSPORT_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -289,8 +348,9 @@ class MachineSpecScrapeCheck:
             what["fallback_from"] = fallback_from.as_event_field()
 
         if not scrape_run.success or not scrape_run.stdout.strip():
+            failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
             event = render_message(
-                Msg.SCRAPE_FAILED,
+                failure.template,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -299,6 +359,7 @@ class MachineSpecScrapeCheck:
                     "exit_code": scrape_run.exit_code,
                     "duration_ms": scrape_run.duration_ms,
                     "stderr_tail": scrape_run.stderr[-400:],
+                    **failure.cause_event_fields(),
                 },
             )
             return CheckResult(passed=False, event=event)
