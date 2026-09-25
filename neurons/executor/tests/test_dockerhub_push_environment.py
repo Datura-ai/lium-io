@@ -1,5 +1,5 @@
-"""The prod Docker Hub token is readable only in ``dockerhub-push`` jobs, never by a repository
-script, and the ``dev`` builds keep working from any branch with a separate dev token.
+"""The prod Docker Hub token is readable only in ``dockerhub-push`` jobs, and the ``dev`` builds keep
+working from any branch with a separate dev token.
 
 A repository secret is readable by any workflow file on any branch; an environment secret only by a
 job that names the environment, from a ref the environment's deployment policy allows.
@@ -9,7 +9,9 @@ holds ``DOCKERHUB_DEV_PAT``, so a ``*_cd_dev.yml`` run from a feature branch sti
 A secret in a job-level ``env:`` is in the environment of every step, including the ones that run
 ``neurons/*/docker*publish.sh`` from the checked-out ref. So the token is only ever set on the one
 login step, whose command is inline in the workflow, and the publish scripts only push with the
-login that step already did. These tests fail when a job reads a Docker Hub token outside its
+login that step already did. That login is saved on the runner, so every later step, the scripts
+included, can use it: the fence is the ``dockerhub-push`` branch policy, which runs a prod job only
+from ``main`` or a release tag, so the scripts it runs are the reviewed ones. These tests fail when a job reads a Docker Hub token outside its
 environment, when the token is set anywhere but a login step, when a script logs in or reads a
 token, when a workflow that reads a token can be started by a pull request, or when the tag ruleset
 payload drifts from the prod workflows' tag triggers.
@@ -89,7 +91,7 @@ def token_problems(workflow_text: str) -> list[str]:
     return problems
 
 
-def script_problems(script_text: str) -> bool:
+def script_logs_in_or_reads_a_token(script_text: str) -> bool:
     return bool(re.search(r"docker login|DOCKERHUB_", script_text))
 
 
@@ -163,15 +165,15 @@ def test_dev_builds_use_the_dev_token_from_any_branch(workflow: Path) -> None:
 
 
 def test_the_checker_flags_a_script_that_logs_in() -> None:
-    assert script_problems(f"#!/bin/bash\n{LOGIN_RUN}\ndocker push x\n")
-    assert not script_problems('#!/bin/bash\ndocker push "$IMAGE_NAME"\n')
+    assert script_logs_in_or_reads_a_token(f"#!/bin/bash\n{LOGIN_RUN}\ndocker push x\n")
+    assert not script_logs_in_or_reads_a_token('#!/bin/bash\ndocker push "$IMAGE_NAME"\n')
 
 
 @pytest.mark.parametrize("script", PUBLISH_SCRIPTS, ids=lambda p: f"{p.parent.name}/{p.name}")
 def test_publish_scripts_only_push(script: Path) -> None:
     script_text = script.read_text()
     assert "docker push" in script_text
-    assert not script_problems(script_text)
+    assert not script_logs_in_or_reads_a_token(script_text)
 
 
 def test_release_tag_ruleset_covers_every_tag_trigger_of_the_prod_workflows() -> None:

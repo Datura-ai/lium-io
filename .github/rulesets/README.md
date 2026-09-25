@@ -18,8 +18,8 @@ That login is saved on the runner, so every later step of the same job, those sc
 can use it. What keeps a branch away from the prod token is the `dockerhub-push` deployment
 policy: a prod job runs only from `main` or a release tag, so the scripts it runs are the
 reviewed ones. A run from any other branch gets only the dev token.
-Anything outside this repository that runs these scripts (lium-io-deployment's Staging Branch
-Deploy) has to log in itself with the dev token; it cannot read either environment secret here.
+Anything outside this repository that runs these scripts (an external staging pipeline) has to
+log in itself with the dev token; it cannot read either environment secret here.
 
 The tag ruleset `release-tags` (`release-tags.json`) restricts who may create, move or delete
 the four release tag patterns, so only the release role can start a tag-triggered production
