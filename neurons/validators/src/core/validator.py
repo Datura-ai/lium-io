@@ -423,9 +423,7 @@ class Validator:
                     all_job_results = {}
                     miner_coldkeys = {}
 
-                    # Run all jobs with asyncio.wait and set a timeout. asyncio.wait rejects an
-                    # empty set; a cycle with no miners still writes the incentive snapshot and
-                    # the GPU estimates below.
+                    # asyncio.wait rejects an empty set.
                     if jobs:
                         done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
                     else:
