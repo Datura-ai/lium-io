@@ -31,10 +31,10 @@ shows a *Provenance* link on pypi.org; `https://pypi.org/integrity/lium-core/X.Y
 the signed statement.
 
 Who may tag: the `lium-core-release-tags` ruleset (`.github/rulesets/lium-core-release-tags.json`) lets only its
-bypass list create, move or delete a `lium-core-v*` tag. The list is humans only: 10954604 (taiberium, who ran the last
-release). A human creates each release tag; the loop's account (114649324, `surcyf123`) is not on the list and never
-creates, moves or deletes a release tag. Add a human by appending
-`{ "actor_id": <human-id>, "actor_type": "User", "bypass_mode": "always" }` (never 114649324) and re-applying with
+bypass list create, move or delete a `lium-core-v*` tag. The list is the release team: 10954604 (taiberium),
+4623096 (arhangel66), 231022467 (jam6099), 248050668 (pixel29913) and the loop's account 114649324 (`surcyf123`).
+A tag alone publishes nothing: a human reviewer of the `pypi` environment approves each upload. Add a person by appending
+`{ "actor_id": <user-id>, "actor_type": "User", "bypass_mode": "always" }` and re-applying with
 `gh api "repos/$R/rulesets/<id>" --method PUT --input .github/rulesets/lium-core-release-tags.json`. Until an admin
 applies this file, any account with write access, the loop's account included, can create a `lium-core-v*` tag. Both
 guards are repository settings a
