@@ -186,6 +186,18 @@ class Settings(BaseSettings):
     # live: unrented executors are enforced, rented ones are exempt (the check runs after the
     # tenant short-circuit).
     CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
+    # A node this validator has just found without its recommended image is held as pending, not
+    # failed, until the executor's first pre-pull sweep completes or GRACE_SECONDS after that first
+    # sighting, whichever comes first. The express lane verifies a new node seconds after it is
+    # added, long before a multi-GB pull can finish. Off: the check fails the node as it did before
+    # the grace existed, and only logs the nodes the grace would have held. GRACE_SECONDS=0 turns
+    # the log off too.
+    CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED: bool = Field(
+        env="CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", default=False
+    )
+    CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS: int = Field(
+        env="CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS", default=30 * 60, ge=0
+    )
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that

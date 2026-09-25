@@ -18,6 +18,7 @@ decision: state failures are swallowed inside ``cache_prefetch_state``.
 """
 
 import asyncio
+import random
 import time
 
 import aiohttp
@@ -37,6 +38,15 @@ logger = get_logger(__name__)
 MIN_DISK_SPACE_MULTIPLIER = 3.0
 # Backoff used after errors / empty responses (never longer than the refresh).
 ERROR_INTERVAL_SECONDS = 5 * 60
+# Until the first sweep completes, a sweep that fails (the mandatory pull raising, most often) is
+# retried after 15, 30, 60 and 120 s, each plus up to 15 s of jitter so executors that boot together
+# do not retry in step, and never longer than the error interval itself, before the loop falls
+# back to ERROR_INTERVAL_SECONDS: a new node is
+# verified within minutes of being added, and the default image is what that verification looks
+# for. An unknown GPU or an empty backend answer keeps ERROR_INTERVAL_SECONDS and uses none of them.
+FIRST_SWEEP_RETRY_BASE_SECONDS = 15
+FIRST_SWEEP_RETRY_JITTER_SECONDS = 15
+FIRST_SWEEP_FAST_RETRIES = 4
 # The pre-pull sweep's budget ends this long before the next refresh (DAH-2977): a pull whose
 # stream goes silent at the end of its budget still holds the cross-process pull lock for one
 # read timeout, and the mandatory refresh would otherwise find the lock held and skip its pull.
@@ -107,6 +117,32 @@ async def _local_digests(
         logger.warning(f"Could not read local image {image_ref}: {e}")
         return [], str(e)
     return image.attrs.get("RepoDigests", []) or [], None
+
+
+class PullStreamError(Exception):
+    """The daemon failed the pull inside its progress stream, after answering HTTP 200."""
+
+
+def _stream_error(event: object) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    detail = event.get("errorDetail")
+    message = detail.get("message") if isinstance(detail, dict) else None
+    return message or event.get("error") or None
+
+
+def _pull(client: "docker.DockerClient", repository: str, tag: str) -> "docker.models.images.Image":
+    """Blocking pull that raises the daemon's own error; returns the pulled image.
+
+    ``images.pull`` drains the same stream and ignores an ``error`` event in it, so a failed
+    pull surfaced only as the follow-up lookup's "No such image" and the real cause was lost.
+    """
+    for event in client.api.pull(repository, tag=tag, stream=True, decode=True):
+        error = _stream_error(event)
+        if error:
+            raise PullStreamError(error)
+    separator = "@" if tag.startswith("sha256:") else ":"
+    return client.images.get(f"{repository}{separator}{tag}")
 
 
 async def _cleanup_old_tags(
@@ -228,14 +264,14 @@ async def _ensure_template(
             if expected_digest:
                 pinned_ref = f"{docker_image}@{expected_digest}"
                 logger.info(f"Pulling cache template {pinned_ref} (local={local})")
-                image = await asyncio.to_thread(client.images.pull, pinned_ref)
+                image = await asyncio.to_thread(_pull, client, docker_image, expected_digest)
                 # Re-point the tag at the pinned build: a digest pull alone leaves the
                 # tag (possibly poisoned by a stale mirror) untouched.
                 await asyncio.to_thread(image.tag, docker_image, docker_image_tag)
                 logger.info(f"Successfully pulled {image_ref} at {expected_digest}")
             else:
                 logger.info(f"Pulling cache template {image_ref} (remote={remote}, local={local})")
-                await asyncio.to_thread(client.images.pull, docker_image, docker_image_tag)
+                await asyncio.to_thread(_pull, client, docker_image, docker_image_tag)
                 logger.info(f"Successfully pulled {image_ref}")
         except Exception as e:
             # Record, then re-raise: a failed pull already aborts the sweep and backs
@@ -248,6 +284,14 @@ async def _ensure_template(
 
     cleanup_error = await _cleanup_old_tags(client, docker_image, docker_image_tag, keep_tags)
     state.note_cleanup_error(image_ref, cleanup_error)
+
+
+def _first_sweep_retry_delay(attempt: int, error_interval: float) -> float | None:
+    """Delay before fast retry number ``attempt`` (0-based), or None once they are used up."""
+    if attempt >= FIRST_SWEEP_FAST_RETRIES:
+        return None
+    jitter = random.uniform(0, FIRST_SWEEP_RETRY_JITTER_SECONDS)
+    return min(error_interval, FIRST_SWEEP_RETRY_BASE_SECONDS * 2**attempt + jitter)
 
 
 async def _run_pre_pull_sweep(
@@ -307,6 +351,22 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
     # refresh while the validator checks that digest. One sweep at a time: a refresh that
     # finds the previous one still running skips its own.
     sweep_task: asyncio.Task | None = None
+
+    first_sweep_done = False
+    fast_retries_used = 0
+
+    def next_error_sleep_seconds() -> float:
+        nonlocal fast_retries_used
+        delay = (
+            None
+            if first_sweep_done
+            else _first_sweep_retry_delay(fast_retries_used, error_interval)
+        )
+        if delay is None:
+            return error_interval
+        fast_retries_used += 1
+        logger.info(f"First sweep not completed yet; retrying cache pre-pull in {delay:.0f}s")
+        return delay
 
     gpu_model = "unknown"
     driver_version = "unknown"
@@ -406,6 +466,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                         )
 
                 state.record_loop_outcome(Outcome.SWEEP_OK)
+                first_sweep_done = True
                 # Publish before sleeping, so the document is never a full refresh
                 # interval behind what the loop actually knows.
                 state.flush()
@@ -427,10 +488,10 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                 state.note_loop_error(e)
                 state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                 state.flush()
-                await asyncio.sleep(error_interval)
+                await asyncio.sleep(next_error_sleep_seconds())
             except Exception as e:
                 logger.error(f"Unexpected error during cache pre-pull: {e}")
                 state.note_loop_error(e)
                 state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                 state.flush()
-                await asyncio.sleep(error_interval)
+                await asyncio.sleep(next_error_sleep_seconds())

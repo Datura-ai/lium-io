@@ -48,6 +48,9 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
+# One key per executor: when this validator first found it without its recommended default image
+# (epoch seconds). Opens CachedTemplateVerificationCheck's fresh-node grace.
+CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
@@ -325,6 +328,17 @@ class RedisService:
     async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
         """Forget the recorded miss: the probe reached its container again."""
         await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
+
+    async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
+        """When this validator first found the executor without its recommended image (epoch s).
+
+        SET NX keeps the first sighting, so every later cycle inside the TTL reads the same instant.
+        """
+        key = f"{CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX}:{executor_id}"
+        async with self.lock:
+            await self.redis.set(key, repr(now), ex=ttl_seconds, nx=True)
+            value = await self.redis.get(key)
+        return float(value) if value is not None else now
 
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""

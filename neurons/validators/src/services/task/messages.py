@@ -1597,8 +1597,24 @@ class CachedTemplateMessages:
             "until the executor pre-pull catches up"
         ),
         remediation=(
-            "Executor cache pre-pull keeps the recommended image warm; "
-            "verify cache_template_service is running on the host."
+            "Pull the recommended image named in this event on the host to see why the "
+            "executor's pre-pull could not fetch it; the executor retries on its own."
+        ),
+    )
+    PENDING = MessageTemplate(
+        event="Recommended default image not cached yet on a newly seen executor",
+        reason="RECOMMENDED_IMAGE_PENDING",
+        severity="info",
+        category="runtime",
+        impact=(
+            "None this cycle — a newly seen node is not failed on this check until its first "
+            "pre-pull sweep completes or the grace window ends"
+        ),
+        remediation=(
+            "No action needed yet: the executor's pre-pull may still be fetching the image, or "
+            "the executor does not report its pre-pull state and the node gets the time bound "
+            "only. If the image is still missing when the grace ends, this check fails and "
+            "quotes the executor's pull error when it reported one."
         ),
     )
     SKIPPED = MessageTemplate(
