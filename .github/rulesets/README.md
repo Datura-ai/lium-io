@@ -12,9 +12,12 @@ Two Docker Hub tokens, each an environment secret, so no branch can read the pro
   every branch, so `executor_cd_dev.yml`, `miner_cd_dev.yml` and `validator_cd_dev.yml` still
   build and push `:dev` from a feature branch.
 
-In every job the token is set only on the inline "Log in to Docker Hub" step. The
-`neurons/*/docker*publish.sh` scripts never read a token: they push with the login that step
-already did. A script edited on a branch therefore gets at most the dev token, never the prod one.
+In every job the token is set only on the inline "Log in to Docker Hub" step, and the
+`neurons/*/docker*publish.sh` scripts push with that login instead of logging in themselves.
+That login is saved on the runner, so every later step of the same job, those scripts included,
+can use it. What keeps a branch away from the prod token is the `dockerhub-push` deployment
+policy: a prod job runs only from `main` or a release tag, so the scripts it runs are the
+reviewed ones. A run from any other branch gets only the dev token.
 Anything outside this repository that runs these scripts (lium-io-deployment's Staging Branch
 Deploy) has to log in itself with the dev token; it cannot read either environment secret here.
 
@@ -69,11 +72,11 @@ gh secret set DOCKERHUB_DEV_PAT      -R "$R" --env dockerhub-dev       # paste t
 gh secret set DOCKERHUB_DEV_USERNAME -R "$R" --env dockerhub-dev --body daturaai
 ```
 
-Docker Hub scopes a token per repository, not per tag. While the `dev` images share their
-repositories with `latest` (`daturaai/compute-subnet-executor:dev` next to `:latest`), the dev
-token can push either tag. A dev token that cannot touch prod needs the `dev` images in their
-own repositories, which means changing the dev compose files and the dev hosts too. That is a
-separate change.
+Only the prod token is fenced. Docker Hub scopes a token per repository, not per tag, and the
+`dev` images share their repositories with `latest` (`daturaai/compute-subnet-executor:dev` next
+to `:latest`). So until the `dev` images move to their own repositories, the dev token, which
+any branch can use, can still push `:latest`. Moving them means changing the dev compose files
+and the dev hosts too; that is a separate change.
 
 ## 2. Tag ruleset (admin, once)
 
