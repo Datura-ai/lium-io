@@ -59,6 +59,30 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+class RentalDockerContainerRestartingError(RentalDockerOperationError):
+    """The workload container kept restarting for the whole exec retry budget (DAH-3593).
+
+    Docker answers every exec on a restarting container with the same 409, which says nothing
+    about why the workload keeps exiting. The message here names the container state and its last
+    exit code instead, so the reader sees the cause (a workload image that crashes at start on this
+    node) rather than the daemon's conflict text. The container's own log line is NOT included: the
+    text lands in the create failure the backend's GPU-fault check reads, and a renter image must
+    not be able to print its way into a provider fault (review, taiberium 21 Sep).
+    """
+
+
+def is_docker_not_found_error(exc: BaseException) -> bool:
+    """True when the exception, or any cause under it, is a Docker 404 (no such container/volume)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, Exception) and _is_docker_not_found_error(current):
+            return True
+        current = current.__cause__  # explicit `raise ... from` links only
+    return False
+
+
 def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
     """Return the host key required by rental Docker SDK SSH connections."""
     # ExecutorSSHInfo keeps this optional for non-connectable placeholder/error
@@ -332,9 +356,27 @@ class RentalDockerSdkClient:
                 await asyncio.sleep(delay_seconds)
 
         assert last_restart_error is not None
-        raise RentalDockerOperationError(
-            _wrap_error_message("Docker SDK exec failed", last_restart_error)
+        # DAH-3593: the 409 text hides the cause, so the container's state leads. Docker's own text
+        # stays in the message: the backend recognises a renter image that exits at start by its
+        # `is restarting` (IMAGE_EXITED_MARKERS) and must not blame the provider for it.
+        detail = await _in_docker_thread(
+            self._describe_restarting_container_sync, spec.container_name
+        )
+        raise RentalDockerContainerRestartingError(
+            f"container restarting, {detail}; "
+            f"{_wrap_error_message('Docker SDK exec failed', last_restart_error)}"
         ) from last_restart_error
+
+    def _describe_restarting_container_sync(self, container_name: str) -> str:
+        """`exit_code=N` for a container Docker keeps restarting; best effort. Only the daemon's
+        exit code, never the container's log output: the message reaches the backend's failure
+        detail, which the GPU-fault check reads."""
+        try:
+            state = self._api_client.inspect_container(container_name).get("State") or {}
+            exit_code = state.get("ExitCode")
+        except Exception:
+            exit_code = None
+        return f"exit_code={exit_code}"
 
     async def start(self, *, container_name: str) -> None:
         await self._call_api(
