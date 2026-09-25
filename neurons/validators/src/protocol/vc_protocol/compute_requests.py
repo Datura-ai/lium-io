@@ -145,6 +145,11 @@ class RentedExecutorsResponse(BaseModel):
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).
     default_job_owner_by_executor: dict[str, str] = {}
+    # gpu_uuid → "miner" | "lium" for the GPUs an active default job runs on. The same GPUs can be
+    # reported under more than one executor id, and the job runs under only one of them, so the
+    # power-limit exemption reads this map. Empty for a backend that predates the field: the
+    # executor-keyed map above still applies.
+    default_job_owner_by_gpu: dict[str, str] = {}
     # executor_id → specs to force-pass against. Present only for executors carrying a pod flagged
     # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
     # field force-passes nobody (fail-closed) rather than everybody.
@@ -202,6 +207,9 @@ class RentedExecutorsResponse(BaseModel):
 
     def get_default_job_owner(self, executor_uuid: str) -> str | None:
         return self.default_job_owner_by_executor.get(str(executor_uuid))
+
+    def get_gpu_default_job_owner(self, gpu_uuid: str) -> str | None:
+        return self.default_job_owner_by_gpu.get(str(gpu_uuid))
 
     def get_manual_rental_info(self, executor_uuid: str) -> "ManualRentalInfo | None":
         """Specs to force-pass this executor against, or None if it is not a manual rental."""
