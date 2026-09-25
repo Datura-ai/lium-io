@@ -25,6 +25,8 @@ from services.docker_service import (
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
     _is_docker_container_removal_in_progress_error,
+    _is_docker_read_timeout_error,
+    _is_docker_volume_in_use_error,
     _parse_volume_size_to_bytes,
     _should_encrypt_local_volume,
 )
@@ -97,7 +99,27 @@ class _FakeRentalDockerClient:
         self.stop_error = None
         self.remove_error = None
         self.remove_volume_error = None
+        # per-call answers for remove_volume, consumed in order (None = success); once empty,
+        # remove_volume_error applies
+        self.remove_volume_errors: list[Exception | None] = []
         self.prune_images_error = None
+        # DAH-3467: answers for container_status, consumed in order; the last one repeats.
+        # None = 404 (gone), a str = State.Status, an Exception = the inspect raised it.
+        self.container_statuses: list[str | Exception | None] = []
+        self.inspected_containers = []
+
+    async def container_status(self, *, container_name: str) -> str | None:
+        self.inspected_containers.append(container_name)
+        if not self.container_statuses:
+            raise AssertionError("container_status called without a scripted answer")
+        answer = (
+            self.container_statuses.pop(0)
+            if len(self.container_statuses) > 1
+            else self.container_statuses[0]
+        )
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         self.login_calls.append({"username": username, "password": password, "image": image})
@@ -176,6 +198,11 @@ class _FakeRentalDockerClient:
         self.removed_volumes.append(
             {"volume_name": volume_name, "force": force}
         )
+        if self.remove_volume_errors:
+            error = self.remove_volume_errors.pop(0)
+            if error is not None:
+                raise error
+            return
         if self.remove_volume_error is not None:
             raise self.remove_volume_error
 
@@ -1762,6 +1789,662 @@ async def test_delete_container_remove_container_error_fails_undeploy(
     assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
     assert "500 Server Error: daemon exploded" in result.msg
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+# DAH-3467: the remove's reply outlives the SDK's 60 s read timeout. dockerd has the request; the
+# validator asks it what happened instead of failing the delete.
+_REMOVE_READ_TIMEOUT_TEXT = (
+    "Docker SDK remove container failed: SSHConnectionPool(host='localhost', port=None): "
+    "Read timed out. (read timeout=60)"
+)
+
+
+def _remove_read_timeout_error() -> RentalDockerOperationError:
+    # the shape RentalDockerSdkClient._call_api produces: our error wrapping requests' ReadTimeout
+    from requests.exceptions import ReadTimeout
+
+    cause = ReadTimeout("SSHConnectionPool(host='localhost', port=None): Read timed out. (read timeout=60)")
+    error = RentalDockerOperationError(_wrap_error_message("Docker SDK remove container failed", cause))
+    error.__cause__ = cause
+    return error
+
+
+def _arm_delete_after_remove_read_timeout(docker_service, monkeypatch, retry_ssh_mock, statuses):
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_POLL_SECONDS", 0)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_TIMEOUT_SECONDS", 0.05)
+    client = docker_service.rental_docker_client_factory.client
+    client.remove_error = _remove_read_timeout_error()
+    client.container_statuses = list(statuses)
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_slow_rm",
+        local_volume="volume_slow_rm",
+    )
+    return client, payload, _delete_container_executor_info(payload.executor_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_is_deleted(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.inspected_containers == [payload.container_name]
+    # the teardown after the removal still runs: prune, the local volume, the redis rental record
+    assert client.pruned_images == 1
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}]
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_polls_while_removing_then_gone(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing", "removing", None]
+    )
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_TIMEOUT_SECONDS", 5)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.inspected_containers == [payload.container_name] * 3
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_still_removing_reports_in_progress(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert "Read timed out" in result.msg and "still 'removing'" in result.msg
+    assert len(client.inspected_containers) >= 2  # kept asking until the confirm window ran out
+    # nothing after the removal ran: the container is not known to be gone
+    assert client.pruned_images == 0
+    assert client.removed_volumes == []
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["exited", "running", "dead"])
+async def test_delete_container_remove_read_timeout_with_container_present_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock, status
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[status]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_failing_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service,
+        monkeypatch,
+        retry_ssh_mock,
+        statuses=[RentalDockerOperationError("Docker SDK inspect container failed: 500 Server Error")],
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_hung_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS", 0.01)
+
+    async def hung_inspect(*, container_name: str):
+        client.inspected_containers.append(container_name)
+        await asyncio.sleep(1)
+        return None
+
+    client.container_status = hung_inspect
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_stateless_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # dockerd knows the name but the inspect body carries no State.Status: not proof of anything
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[""]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_connect_timeout_is_not_confirmed(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # a CONNECT timeout never reached dockerd: no inspect, the delete fails as before
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    from requests.exceptions import ConnectTimeout
+
+    cause = ConnectTimeout(
+        "SSHConnectionPool(host='localhost', port=None): Connection to localhost timed out. "
+        "(connect timeout=60)"
+    )
+    client.remove_error = RentalDockerOperationError(
+        _wrap_error_message("Docker SDK remove container failed", cause)
+    )
+    client.remove_error.__cause__ = cause
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert client.inspected_containers == []
+
+
+def _volume_in_use_error(volume_name: str) -> RentalDockerOperationError:
+    # dockerd's 409 on `volume rm`, wrapped the way RentalDockerSdkClient._call_api does
+    cause = APIError(
+        f"409 Client Error for http+docker://ssh/v1.52/volumes/{volume_name}: "
+        f'Conflict ("remove {volume_name}: volume is in use - [9f1c2d3e4a5b]")'
+    )
+    error = RentalDockerOperationError(_wrap_error_message("Docker SDK remove volume failed", cause))
+    error.__cause__ = cause
+    return error
+
+
+def _arm_volume_retry_timing(monkeypatch, attempts: int = 3):
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_VOLUME_ATTEMPTS", attempts)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_VOLUME_RETRY_SECONDS", 0)
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_retries_a_volume_still_in_use(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """Regression: the inspect 404 came before dockerd released the container's named-volume
+    reference, `volume rm` answered "volume is in use", the best-effort step swallowed it and the
+    pod closed on our success with the volume left on the executor. Now that answer is retried on
+    this path and the delete succeeds once the reference is gone."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    _arm_volume_retry_timing(monkeypatch)
+    client.remove_volume_errors = [
+        _volume_in_use_error(payload.local_volume),
+        _volume_in_use_error(payload.local_volume),
+        None,
+    ]
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 3
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_with_volume_still_in_use_stays_best_effort_once_retries_run_out(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """Regression (review round 4): the retries run out while dockerd still holds the volume. The
+    delete used to answer DeletionInProgress here; the backend counts that answer against its three
+    delete attempts (POD_DELETE_MAX_ATTEMPTS) and, still held on the third, gives up into the penalty
+    path for a node whose container was gone. The exhausted volume is now the best-effort failure any
+    other volume error is: logged, the volume left on the host, ContainerDeleted, the redis rental
+    record removed, no marker left for a re-ask that is not coming."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert client.pruned_images == 1
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_with_external_volume_still_in_use_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # the external volume takes the same retry; its s3fs plugin is removed only after a successful
+    # `volume rm`, so a volume given up leaves the plugin as the pre-DAH-3467 best-effort step did,
+    # and the delete completes
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    payload.local_volume = None
+    payload.external_volume = "volume_slow_rm_ext"
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client.remove_volume_error = _volume_in_use_error(payload.external_volume)
+    plugin_removal = AsyncMock()
+    monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_removal)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.removed_volumes == [{"volume_name": payload.external_volume, "force": False}] * 2
+    plugin_removal.assert_not_awaited()
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_volume_in_use_after_a_plain_remove_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """The retry belongs to the confirmed-by-inspect path only: after a remove that answered in
+    time, "volume is in use" is the best-effort failure it always was (one attempt, ContainerDeleted)."""
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    _arm_volume_retry_timing(monkeypatch)
+    client = docker_service.rental_docker_client_factory.client
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_plain_rm",
+        local_volume="volume_plain_rm",
+    )
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+    executor_info = _delete_container_executor_info(payload.executor_id)
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_then_gone_other_volume_error_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # on the confirmed-by-inspect path too, only "volume is in use" is retried: a 404 on the volume
+    # is one attempt and the delete succeeds as before
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+    )
+    _arm_volume_retry_timing(monkeypatch)
+    client.remove_volume_error = Exception(
+        'Docker SDK remove volume failed: 404 Client Error: Not Found ("No such volume: volume_slow_rm")'
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+
+
+def _container_absent_error(container_name: str) -> Exception:
+    return Exception(
+        "Docker SDK remove container failed: 404 Client Error: Not Found "
+        f'("No such container: {container_name}")'
+    )
+
+
+async def _delete(docker_service, payload, executor_info):
+    return await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+
+async def _delete_answered_in_progress(docker_service, monkeypatch, retry_ssh_mock):
+    """Round 1 of a delete that answers DeletionInProgress: the container is still 'removing' after
+    the read timeout (the one path that answers it since review round 4). Returns the fake client,
+    the payload and the executor for the backend's re-ask."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
+    )
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+
+    first = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(first, FailedContainerRequest)
+    assert first.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    # the re-ask: dockerd has finished with the container, only the volume may still be held
+    client.remove_error = _container_absent_error(payload.container_name)
+    client.remove_volume_error = None
+    client.container_statuses = []
+    client.inspected_containers.clear()
+    client.removed_volumes.clear()
+    return client, payload, executor_info
+
+
+@pytest.mark.asyncio
+async def test_delete_re_asked_after_in_progress_retries_a_volume_still_in_use_then_gives_it_up(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    """Regression (review round 3): the backend's re-ask after DeletionInProgress finds the
+    container already absent, which is not the inspect-confirmed path, so "volume is in use" got the
+    one best-effort attempt and the pod closed over a volume dockerd was about to release. The pod's
+    marker keeps the volume cleanup on the retried path across delete requests; a volume still held
+    after the retries is given up (round 4), the delete completes and the marker is cleared."""
+    client, payload, executor_info = await _delete_answered_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock
+    )
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(result, ContainerDeleted)
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert client.inspected_containers == []  # an absent container needs no inspect
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_re_asked_after_in_progress_completes_once_the_volume_is_gone(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # the re-ask finds the container absent and the volume released on the second try:
+    # ContainerDeleted, the redis rental record goes, and the marker is cleared
+    client, payload, executor_info = await _delete_answered_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock
+    )
+    client.remove_volume_errors = [_volume_in_use_error(payload.local_volume), None]
+
+    result = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_absent_container_without_a_pending_deletion_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # no earlier DeletionInProgress for this pod (DAH-2345: the container was removed by failed-create
+    # cleanup): an absent container plus "volume is in use" is the one-attempt best-effort it always was
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client = docker_service.rental_docker_client_factory.client
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_absent",
+        local_volume="volume_absent",
+    )
+    client.remove_error = _container_absent_error(payload.container_name)
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await _delete(docker_service, payload, _delete_container_executor_info(payload.executor_id))
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+
+
+def test_pending_deletions_expire_after_the_ttl_and_a_new_mark_restarts_it():
+    """Regression (review round 4): the marker set never evicted, so a pod the backend gave up on, or
+    a rental-probe pod (a fresh id per run, never re-asked), stayed in it for the life of the process.
+    A marker is gone PENDING_DELETION_TTL_SECONDS after it was set; marking again restarts the clock."""
+    now = [1000.0]
+    registry = docker_service_module._PendingDeletionRegistry(clock=lambda: now[0])
+    ttl = docker_service_module.PENDING_DELETION_TTL_SECONDS
+
+    registry.mark("pod-a")
+    now[0] += ttl - 1
+    assert registry.is_pending("pod-a")
+    registry.mark("pod-a")  # the re-ask answered in progress again: a fresh marker
+    now[0] += ttl - 1
+    assert registry.is_pending("pod-a")
+    now[0] += 2
+    assert not registry.is_pending("pod-a")
+    assert len(registry) == 0
+
+
+def test_pending_deletions_do_not_accumulate_probe_pods():
+    # sixty probe runs, each answering in progress once and never re-asked: after the TTL none is left,
+    # and a clear on an expired or unknown id is a no-op
+    now = [0.0]
+    registry = docker_service_module._PendingDeletionRegistry(clock=lambda: now[0])
+    for i in range(60):
+        registry.mark(f"probe-{i}")
+        now[0] += 360.0  # one probe every 6 min
+    # 3600 s TTL over 360 s steps: only the last ten marks are younger than the TTL
+    assert len(registry) == 10
+    now[0] += docker_service_module.PENDING_DELETION_TTL_SECONDS
+    assert len(registry) == 0
+    registry.clear("probe-0")
+    assert not registry.is_pending("probe-0")
+
+
+def _arm_filler_delete_in_progress(
+    docker_service, monkeypatch, retry_ssh_mock, how: str, kind: WorkloadKind = WorkloadKind.FILLER
+):
+    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_POLL_SECONDS", 0)
+    monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_TIMEOUT_SECONDS", 0.05)
+    client = docker_service.rental_docker_client_factory.client
+    if how == "read_timeout_still_removing":
+        client.remove_error = _remove_read_timeout_error()
+        client.container_statuses = ["removing"]
+    else:  # dockerd's 409 "removal already in progress"
+        client.remove_error = APIError(
+            "409 Client Error for http+docker://ssh/v1.52/containers/filler_slow: "
+            'Conflict ("removal of container filler_slow is already in progress")'
+        )
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=kind,
+        container_name="filler_slow",
+    )
+    sweep = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "_sweep_wedged_gpus_after_teardown", sweep)
+    return ssh_client, sweep, payload, _delete_container_executor_info(payload.executor_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["read_timeout_still_removing", "removal_already_in_progress"])
+async def test_delete_filler_answering_deletion_in_progress_sweeps_wedged_gpus_first(
+    docker_service, monkeypatch, retry_ssh_mock, how
+):
+    """Regression: a filler's read-timed-out remove used to raise, and the failed-remove path swept
+    the wedged GPUs before propagating (DAH-2427). Answering DeletionInProgress instead returned
+    without the sweep, so a wedged card outlived the answer while the backend kept retrying. The
+    sweep now runs before either in-progress answer."""
+    ssh_client, sweep, payload, executor_info = _arm_filler_delete_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock, how
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    sweep.assert_awaited_once()
+    assert sweep.await_args.args[0] is ssh_client
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_customer_rental_answering_deletion_in_progress_does_not_sweep(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # the sweep is the filler teardown's (DAH-2427); a customer rental's in-progress answer stays as it was
+    _, sweep, payload, executor_info = _arm_filler_delete_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock, "read_timeout_still_removing",
+        kind=WorkloadKind.CUSTOMER_RENTAL,
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    sweep.assert_not_awaited()
+
+
+def test_docker_volume_in_use_detection():
+    assert _is_docker_volume_in_use_error(_volume_in_use_error("volume_x"))
+    assert _is_docker_volume_in_use_error(_make_retry_error(_volume_in_use_error("volume_x")))
+    assert not _is_docker_volume_in_use_error(
+        Exception('Docker SDK remove volume failed: 404 Client Error: Not Found ("No such volume: v")')
+    )
+    assert not _is_docker_volume_in_use_error(Exception(_REMOVE_READ_TIMEOUT_TEXT))
+
+
+def test_docker_read_timeout_detection_matches_the_wrapped_sdk_error_and_the_prod_text():
+    assert _is_docker_read_timeout_error(_remove_read_timeout_error())
+    assert _is_docker_read_timeout_error(Exception(_REMOVE_READ_TIMEOUT_TEXT))
+    assert _is_docker_read_timeout_error(_make_retry_error(Exception(_REMOVE_READ_TIMEOUT_TEXT)))
+    assert not _is_docker_read_timeout_error(
+        Exception("Docker SDK remove container failed: Connection to localhost timed out. (connect timeout=60)")
+    )
+    from requests.exceptions import ConnectTimeout
+
+    connect_timeout = RentalDockerOperationError("Docker SDK remove container failed: connect")
+    connect_timeout.__cause__ = ConnectTimeout("Connection to localhost timed out. (connect timeout=60)")
+    assert not _is_docker_read_timeout_error(connect_timeout)
+    assert not _is_docker_read_timeout_error(
+        Exception("Docker SDK remove container failed: 500 Server Error: daemon exploded")
+    )
 
 
 @pytest.mark.asyncio
