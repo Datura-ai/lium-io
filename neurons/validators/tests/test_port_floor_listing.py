@@ -599,3 +599,15 @@ def test_declared_port_mappings_drop_a_declared_range_too():
     assert port_floor_what(both, 1)["port_mappings_declared"] is True
     assert port_floor_what(range_only, 1)["port_range"] == DECLARED_RANGE
     assert port_floor_what(range_only, 1)["port_mappings_declared"] is False
+
+
+@pytest.mark.parametrize("declared_range", [None, ""])
+def test_no_declared_range_or_mappings_reports_the_default_probed_range(declared_range):
+    state = SimpleNamespace(
+        specs={"port_range": declared_range, "port_mappings": None}, probed_port_count=2, declared_port_count=2
+    )
+
+    what = port_floor_what(state, 1)
+
+    assert what["port_range"] == "20000-65535"
+    assert what["port_mappings_declared"] is False

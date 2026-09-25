@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from services.const import MIN_PORT_COUNT
+from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
@@ -40,8 +41,7 @@ def port_floor_what(state: ContextState, available_port_count: int) -> dict[str,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
         "listing_check": LISTING_PORT_CHECK_CODE,
-        # the range the provider declared (None when port mappings are declared instead)
-        "port_range": None if port_mappings_declared else state.specs.get("port_range"),
+        "port_range": None if port_mappings_declared else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
         "port_mappings_declared": port_mappings_declared,
         "probed_port_count": state.probed_port_count,
         "declared_port_count": state.declared_port_count,
