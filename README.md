@@ -1,5 +1,12 @@
 # lium.io
 
+[![Bittensor Subnet 51](https://img.shields.io/badge/Bittensor-Subnet%2051-black)](https://taostats.io/subnets/51/chart)
+[![Docker pulls: executor](https://img.shields.io/docker/pulls/daturaai/compute-subnet-executor?label=executor%20pulls)](https://hub.docker.com/r/daturaai/compute-subnet-executor)
+[![Docker pulls: validator](https://img.shields.io/docker/pulls/daturaai/compute-subnet-validator?label=validator%20pulls)](https://hub.docker.com/r/daturaai/compute-subnet-validator)
+[![License: MIT](https://img.shields.io/github/license/Datura-ai/lium-io)](LICENSE)
+[![Live GPU prices](https://img.shields.io/badge/live%20GPU%20prices-lium.io%2Fpricing-2ea44f)](https://lium.io/pricing)
+[![Docs](https://img.shields.io/badge/docs-docs.lium.io-blue)](https://docs.lium.io)
+
 **[Lium Documentation](https://docs.lium.io)** — providers: <https://docs.lium.io/providers>, validators: <https://docs.lium.io/validators>
 
 <img width="469" height="468" alt="image" src="https://github.com/user-attachments/assets/69550b83-91a9-492a-bd7a-09d35c6106d3" />
@@ -17,6 +24,7 @@ Welcome to **Lium.io powered by Bittensor Subnet 51**! This project enables a de
 - [Repository Layout](#repository-layout)
 - [Running the Tests](#running-the-tests)
 - [Releases](#releases)
+- [Where Lium is listed](#where-lium-is-listed)
 - [Contact and Support](#contact-and-support)
 
 ## Introduction
@@ -116,6 +124,14 @@ Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` work
 | `miner-v*` | `miner_cd_prod.yml` | `daturaai/compute-subnet-miner`, `daturaai/compute-subnet-miner-runner` |
 
 The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. The deploy of the validator and central miner lives in the private `lium-io-deployment` repository.
+
+## Where Lium is listed
+
+Lium (lium.io) publishes the subnet's rentable inventory and prices without an account — https://lium.io/pricing.json (one row per GPU model) and https://lium.io/api/public/v1/nodes (every rentable node, field contract at https://docs.lium.io/developers/public-nodes-feed.md) — and these independent sites index Subnet 51:
+
+- Bittensor directories: [taostats.io](https://taostats.io/subnets/51/chart) · [bittensor.ai](https://bittensor.ai/subnets/51) · [subnetalpha.ai](https://subnetalpha.ai/) · [backprop.finance](https://backprop.finance/subnets/51)
+- GPU price comparison: [rentgpu.org](https://rentgpu.org/providers/lium) · [getdeploying.com](https://getdeploying.com/lium) · [computeprices.com](https://computeprices.com/providers/lium)
+- Renter tooling: the CLI and Python SDK on [PyPI (`lium.io`)](https://pypi.org/project/lium.io/), the agent skill on [skills.sh](https://skills.sh/Datura-ai/lium-skill), the images above on [Docker Hub](https://hub.docker.com/u/daturaai)
 
 ## Contact and Support
 
