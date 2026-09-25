@@ -49,8 +49,8 @@ def test_no_key_can_be_found_inside_a_generated_name() -> None:
     all_keys = dict_literal_keys(service_module, "all_keys")
 
     # Act
-    offenders = [key for key in all_keys if re.fullmatch(r"_?[A-Za-z]+", key)]
+    keys_that_fit_inside_a_name = [key for key in all_keys if re.fullmatch(r"_?[A-Za-z]+", key)]
 
     # Assert
     assert all_keys
-    assert offenders == []
+    assert keys_that_fit_inside_a_name == []
