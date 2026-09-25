@@ -101,11 +101,11 @@ class _FakeRentalDockerClient:
         self.remove_volume_error = None
         # per-call answers for remove_volume, consumed in order (None = success); once empty,
         # remove_volume_error applies
-        self.remove_volume_errors: list = []
+        self.remove_volume_errors: list[Exception | None] = []
         self.prune_images_error = None
         # DAH-3467: answers for container_status, consumed in order; the last one repeats.
         # None = 404 (gone), a str = State.Status, an Exception = the inspect raised it.
-        self.container_statuses: list = []
+        self.container_statuses: list[str | Exception | None] = []
         self.inspected_containers = []
 
     async def container_status(self, *, container_name: str) -> str | None:
