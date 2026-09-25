@@ -88,6 +88,10 @@ class FakeApiClient:
         self.inspected_images = []
         self.missing_images = set()
         self.inspect_image_error = None
+        self.repo_digests = []
+        self.remote_digest = "sha256:remote"
+        self.inspect_distribution_error = None
+        self.distribution_calls = []
         self.host_config_kwargs = None
         self.created_container = None
         self.started = []
@@ -140,7 +144,13 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id"}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+
+    def inspect_distribution(self, image, auth_config=None):
+        self.distribution_calls.append({"image": image, "auth_config": auth_config})
+        if self.inspect_distribution_error is not None:
+            raise self.inspect_distribution_error
+        return {"Descriptor": {"digest": self.remote_digest}}
 
     def create_container(self, **kwargs):
         self.events.append("create_container")
@@ -496,6 +506,47 @@ async def test_image_exists_returns_false_for_missing_image():
     assert await client.image_exists(image="registry.example/missing:tag") is False
 
     assert api_client.inspected_images == ["registry.example/missing:tag"]
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_when_a_repo_digest_matches_the_registry():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["ghcr.io/org/app@sha256:old", "ghcr.io/org/app@sha256:remote"]
+    client = RentalDockerSdkClient(api_client)
+    auth_config = {"username": "renter", "password": "secret"}
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app:prod", auth_config=auth_config) is True
+
+    assert api_client.distribution_calls == [{"image": "ghcr.io/org/app:prod", "auth_config": auth_config}]
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_stale_when_the_registry_tag_moved():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["ghcr.io/org/app@sha256:old"]
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app:prod") is False
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_raises_when_the_registry_check_fails():
+    api_client = FakeApiClient()
+    api_client.inspect_distribution_error = APIError("toomanyrequests")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="toomanyrequests"):
+        await client.local_image_is_current(image="ghcr.io/org/app:prod")
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_skips_the_registry_for_a_digest_reference():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app@sha256:pinned") is True
+
+    assert api_client.distribution_calls == []
 
 
 @pytest.mark.asyncio
