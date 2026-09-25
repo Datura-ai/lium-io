@@ -800,7 +800,9 @@ class Validator:
             logger.error(
                 _m(
                     "[sync] rented pod SSH probe failed; this cycle reports no observations",
-                    extra=get_extra_info({**self.default_extra, "job_batch_id": job_batch_id, "error": str(exc)}),
+                    extra=get_extra_info(
+                        {**self.default_extra, "job_batch_id": job_batch_id, "error_type": type(exc).__name__}
+                    ),
                 ),
                 exc_info=True,
             )
