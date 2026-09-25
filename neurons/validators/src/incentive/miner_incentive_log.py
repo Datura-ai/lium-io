@@ -199,9 +199,12 @@ class MinerLogLine(BaseModel):
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.SPOT_TIER,
+            # The spot list does not say why, so name every cause.
             message=(
-                "No subnet incentive: this executor is on the spot tier, and spot-tier "
-                "executors do not earn subnet incentive."
+                "No subnet incentive: this executor is rated as spot for this cycle (the node "
+                "is set to Spot, its account is demoted or banned, Lium pinned the machine as "
+                "spot, or an open rental on it was contracted under the spot tier), and "
+                "spot-rated executors do not earn subnet incentive."
             ),
             internal_message="Executor excluded from both pools - spot tier",
         )

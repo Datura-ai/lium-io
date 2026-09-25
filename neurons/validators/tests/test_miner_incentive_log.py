@@ -186,6 +186,21 @@ def test_spot_tier_carries_internal_log_message():
     assert line.internal_message == "Executor excluded from both pools - spot tier"
 
 
+def test_spot_tier_message_lists_every_cause_of_spot_rating():
+    message = MinerLogLine.no_payout_because_spot_tier(_job()).message
+    assert "this executor is on the spot tier" not in message
+    assert message.startswith("No subnet incentive: this executor is rated as spot for this cycle")
+    for cause in (
+        "set to Spot",
+        "demoted",
+        "Lium pinned the machine as spot",
+        "open rental",
+        "contracted under the spot tier",
+    ):
+        assert cause in message
+    assert message.endswith("spot-rated executors do not earn subnet incentive.")
+
+
 def test_discord_reason_carries_connected_flag_for_internal_log():
     job = _job()
     job.provider_discord_connected = False
