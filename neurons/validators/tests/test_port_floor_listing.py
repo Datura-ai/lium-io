@@ -7,6 +7,7 @@ probe cascade and checks to show where the 2 comes from and what each run now re
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,7 +16,11 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.checks.finalize import FinalizeCheck
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
-from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+from neurons.validators.src.services.task.checks.port_count import (
+    LISTING_PORT_CHECK_CODE,
+    PortCountCheck,
+    port_floor_what,
+)
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import (
     FinalizeMessages,
@@ -253,6 +258,9 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
         "available_port_count": 2,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
+        "listing_check": "INSUFFICIENT_VERIFIED_PORTS",
+        "port_range": "40000-65535",
+        "port_mappings_declared": False,
         "probed_port_count": BATCH_PORT_VERIFICATION_SIZE,
         "declared_port_count": 25536,
     }
@@ -567,3 +575,97 @@ async def test_finalize_keeps_the_score_warning_and_adds_the_port_floor_fix(cont
     assert remediation.startswith("No action needed.GPU runtime NVML driver/library mismatch ")
     assert f"lowest {BATCH_PORT_VERIFICATION_SIZE} free ports of the declared range" in remediation
     assert f"allow at least {MIN_PORT_COUNT} of them through the host firewall" in remediation
+
+
+@pytest.mark.asyncio
+async def test_the_scored_zero_failure_names_the_listing_check_and_the_declared_range(context_factory):
+    ctx = run_context(context_factory, connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()))
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
+
+    # the run's own verdict is unchanged: INSUFFICIENT_PORTS, score 0
+    assert count_result.passed is False
+    assert count_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+    what = count_result.event.what_we_saw
+    assert what["listing_check"] == LISTING_PORT_CHECK_CODE == "INSUFFICIENT_VERIFIED_PORTS"
+    assert (what["available_port_count"], what["required"]) == (2, MIN_PORT_COUNT)
+    assert what["port_range"] == DECLARED_RANGE and what["port_mappings_declared"] is False
+    assert what["held_by_orphaned_containers"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_rented_exemption_still_passes_and_names_the_listing_check(context_factory):
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_one_pod(),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
+
+    assert count_result.passed is True
+    assert count_result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
+    assert count_result.event.severity == "warning"
+    what = count_result.event.what_we_saw
+    assert what["listing_check"] == "INSUFFICIENT_VERIFIED_PORTS"
+    assert what["port_range"] == DECLARED_RANGE
+    assert what["exempt_because_rented"] is True
+
+
+def test_declared_port_mappings_are_named_without_the_mappings_themselves():
+    state = SimpleNamespace(
+        specs={"port_range": None, "port_mappings": "[[40000, 50000], [40001, 50001]]"},
+        probed_port_count=2,
+        declared_port_count=2,
+    )
+
+    what = port_floor_what(state, 1)
+
+    assert what["port_mappings_declared"] is True
+    assert what["port_range"] is None
+    assert "port_mappings" not in what
+
+
+def test_declared_port_mappings_drop_a_declared_range_too():
+    """The mappings are what the node forwards; a range left in the specs next to them is not reported."""
+    mappings = "[[40000, 50000], [40001, 50001]]"
+    both = SimpleNamespace(
+        specs={"port_range": DECLARED_RANGE, "port_mappings": mappings},
+        probed_port_count=2,
+        declared_port_count=2,
+    )
+    range_only = SimpleNamespace(specs={"port_range": DECLARED_RANGE}, probed_port_count=2, declared_port_count=2)
+
+    assert port_floor_what(both, 1)["port_range"] is None
+    assert port_floor_what(both, 1)["port_mappings_declared"] is True
+    assert port_floor_what(range_only, 1)["port_range"] == DECLARED_RANGE
+    assert port_floor_what(range_only, 1)["port_mappings_declared"] is False
+
+
+@pytest.mark.parametrize("declared_range", [None, ""])
+def test_no_declared_range_or_mappings_reports_the_default_probed_range(declared_range):
+    state = SimpleNamespace(
+        specs={"port_range": declared_range, "port_mappings": None}, probed_port_count=2, declared_port_count=2
+    )
+
+    what = port_floor_what(state, 1)
+
+    assert what["port_range"] == "20000-65535"
+    assert what["port_mappings_declared"] is False
+
+
+@pytest.mark.parametrize("empty_mappings", [[], "[]", "{}", "not json", "[[40000]]"])
+def test_empty_or_unparsable_port_mappings_are_not_declared_and_the_range_is_named(empty_mappings):
+    """Same parse as the platform check: no [internal, external] pair means no mappings, so the range is reported."""
+    state = SimpleNamespace(
+        specs={"port_range": DECLARED_RANGE, "port_mappings": empty_mappings},
+        probed_port_count=2,
+        declared_port_count=2,
+    )
+
+    what = port_floor_what(state, 1)
+
+    assert what["port_mappings_declared"] is False
+    assert what["port_range"] == DECLARED_RANGE

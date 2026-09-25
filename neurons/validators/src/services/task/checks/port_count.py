@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Any
 
 from services.const import MIN_PORT_COUNT
+from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
@@ -28,11 +30,38 @@ def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
 
+# The platform's code for "the listing hides this node for too few verified ports" (lium-platform
+# services/node_verification.py). Not INSUFFICIENT_PORTS: that one means this run failed and scored 0.
+LISTING_PORT_CHECK_CODE = "INSUFFICIENT_VERIFIED_PORTS"
+
+
+def declares_port_mappings(raw: Any) -> bool:
+    """True when `raw` holds at least one [internal, external] pair.
+
+    Mirrors lium-platform `_parse_nat_mapping` (utils/prepare_ports_data.py): `[]`, `"[]"`, `"{}"` and
+    unparsable text declare no mappings, so the platform check names the port range instead.
+    """
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(raw, list):
+        return False
+    return any(isinstance(m, (list, tuple)) and len(m) >= 2 for m in raw)
+
+
 def port_floor_what(state: ContextState, available_port_count: int) -> dict[str, Any]:
+    port_mappings_declared = declares_port_mappings(state.specs.get("port_mappings"))
     return {
         "available_port_count": available_port_count,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
+        "listing_check": LISTING_PORT_CHECK_CODE,
+        "port_range": None if port_mappings_declared else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
+        "port_mappings_declared": port_mappings_declared,
         "probed_port_count": state.probed_port_count,
         "declared_port_count": state.declared_port_count,
     }
@@ -75,11 +104,8 @@ class PortCountCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
-                    "available_port_count": port_count,
-                    "required": MIN_PORT_COUNT,
+                    **port_floor_what(updated_state, port_count),
                     "held_by_orphaned_containers": orphaned,
-                    "probed_port_count": ctx.state.probed_port_count,
-                    "declared_port_count": ctx.state.declared_port_count,
                 },
                 remediation=(
                     f"Ports are held by orphaned rental container(s) {', '.join(orphaned)} that the validator "
@@ -103,7 +129,7 @@ class PortCountCheck:
                 check_id=self.check_id,
                 severity="warning",
                 impact=f"{hidden_from_renters_text(port_count)}; the rented portion is scored as rented",
-                what={**port_floor_what(ctx.state, port_count), "exempt_because_rented": True},
+                what={**port_floor_what(updated_state, port_count), "exempt_because_rented": True},
             )
         else:
             event = render_message(
