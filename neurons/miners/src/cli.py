@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import click
+from eth_account import Account
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from services.cli_service import CliService
 from core.config import settings
+from core.utils import versions_holding_collateral, versions_with_open_reclaim
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,6 +84,28 @@ def display_contract_versions_table(title: str = "Available Contract Versions", 
     console.print(table)
 
 
+contract_option = click.option(
+    "--contract",
+    "contract_version",
+    type=click.Choice(list(settings.CONTRACT_VERSIONS)),
+    default=None,
+    help="Collateral contract version (see show-contract-versions).",
+)
+
+
+def resolve_contract_version(
+    contract_version: str | None, prompt_title: str, detected: list[str] | None = None
+) -> str:
+    """--contract when given, else the single detected version, else the interactive choice."""
+    if contract_version:
+        return contract_version
+    if detected and len(detected) == 1:
+        address = settings.CONTRACT_VERSIONS[detected[0]]["address"]
+        logger.info("Using contract version %s (%s)", detected[0], address)
+        return detected[0]
+    return select_contract_version(prompt_title)
+
+
 @click.group()
 def cli():
     pass
@@ -149,40 +173,19 @@ def get_balance_of_eth_address(private_key: str):
 @click.option(
     "--validator", required=False, help="Validator hotkey that executor opens to."
 )
-@click.option(
-    "--gpu-type", help="Type of GPU", required=False
-)
-@click.option(
-    "--gpu-count", type=int, help="Number of GPUs", required=False
-)
-@click.option(
-    "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"
-)
-@click.option("--private-key", required=False, hide_input=True, help="Ethereum private key")
 def add_executor(
     address: str,
     port: int,
     price: float,
     validator: str | None = None,
-    gpu_type: str | None = None,
-    gpu_count: int | None = None,
-    private_key: str | None = None,
-    deposit_amount: float | None = None,
 ):
     """Add executor machine to the database"""
-    if gpu_type is not None or gpu_count is not None or deposit_amount is not None:
-        if not private_key:
-            logger.error("Private key is required to deposit collateral.")
-            return
-
-    cli_service = CliService(private_key=private_key, with_executor_db=True)
-    success = asyncio.run(
-        cli_service.add_executor(address, port, price, validator, deposit_amount, gpu_type, gpu_count)
-    )
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.add_executor(address, port, price, validator))
     if success:
-        logger.info("✅ Added executor and deposited collateral successfully.")
+        logger.info("✅ Added executor successfully.")
     else:
-        logger.error("❌ Failed to add executor or deposit collateral.")
+        logger.error("❌ Failed to add executor.")
 
 
 @cli.command()
@@ -204,37 +207,10 @@ def current_contract_version():
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option(
-    "--gpu-type", prompt="GPU Type", help="Type of GPU"
-)
-@click.option(
-    "--gpu-count", type=int, prompt="GPU Count", help="Number of GPUs"
-)
-@click.option(
-    "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"
-)
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def deposit_collateral(address: str, port: int, gpu_type: str, gpu_count: int, private_key: str, deposit_amount: float = None):
-    """You can deposit collateral for an existing executor on database"""
-    cli_service = CliService(private_key=private_key, with_executor_db=True)
-    success = asyncio.run(
-        cli_service.deposit_collateral(address, port, deposit_amount, gpu_type, gpu_count)
-    )
-    if success:
-        logger.info("✅ Deposited collateral successfully.")
-    else:
-        logger.error("❌ Failed to deposit collateral.")
-
-
-@cli.command()
-@click.option("--address", prompt="IP Address", help="IP address of executor")
-@click.option("--port", type=int, prompt="Port", help="Port of executor")
 def remove_executor(address: str, port: int):
-    """Remove executor machine to the database"""
+    """Remove executor machine to the database (once it holds no collateral on any contract version)"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
-        # Use the reusable version selection function
-        selected_version = select_contract_version("Contract Version Selection for Executor Removal")
-        cli_service = CliService(with_executor_db=True, version=selected_version)
+        cli_service = CliService(with_executor_db=True)
         success = asyncio.run(cli_service.remove_executor(address, port))
         if success:
             logger.info(f"✅ Removed executor ({address}:{port})")
@@ -247,12 +223,19 @@ def remove_executor(address: str, port: int):
 @cli.command()
 @click.option("--executor_uuid", prompt="Executor UUID", help="UUID of the executor to reclaim collateral from")
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def reclaim_collateral(executor_uuid: str, private_key: str):
-    """Reclaim collateral for a specific executor from the contract"""
-    
-    # Use the reusable version selection function
-    selected_version = select_contract_version("Contract Version Selection for Reclaim Collateral")
-    
+@contract_option
+def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: str | None):
+    """Reclaim collateral for a specific executor from the contract that holds it"""
+    detected = None
+    if not contract_version:
+        detected = asyncio.run(versions_holding_collateral(executor_uuid))
+        if not detected:
+            logger.error("❌ Executor %s holds no collateral on any contract version.", executor_uuid)
+            return
+    selected_version = resolve_contract_version(
+        contract_version, "Contract Version Selection for Reclaim Collateral", detected
+    )
+
     cli_service = CliService(private_key=private_key, version=selected_version)
     success = asyncio.run(
         cli_service.reclaim_collateral(executor_uuid)
@@ -307,11 +290,11 @@ def update_executor_price(address: str, port: int, price: float):
 
 
 @cli.command()
-def get_miner_collateral():
+@contract_option
+def get_miner_collateral(contract_version: str | None):
     """Get miner collateral by summing up collateral from all registered executors"""
     
-    # Use the reusable version selection function
-    selected_version = select_contract_version("Contract Version Selection for Miner Collateral")
+    selected_version = resolve_contract_version(contract_version, "Contract Version Selection for Miner Collateral")
     
     cli_service = CliService(with_executor_db=True, version=selected_version)
     success = asyncio.run(cli_service.get_miner_collateral())
@@ -322,11 +305,11 @@ def get_miner_collateral():
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-def get_executor_collateral(address: str, port: int):
+@contract_option
+def get_executor_collateral(address: str, port: int, contract_version: str | None):
     """Get collateral amount for a specific executor by address and port"""
     
-    # Use the reusable version selection function
-    selected_version = select_contract_version("Contract Version Selection for Executor Collateral")
+    selected_version = resolve_contract_version(contract_version, "Contract Version Selection for Executor Collateral")
     
     cli_service = CliService(with_executor_db=True, version=selected_version)
     success = asyncio.run(cli_service.get_executor_collateral(address, port))
@@ -335,11 +318,11 @@ def get_executor_collateral(address: str, port: int):
 
 
 @cli.command()
-def get_reclaim_requests():
+@contract_option
+def get_reclaim_requests(contract_version: str | None):
     """Get reclaim requests for the current miner from the collateral contract"""
     
-    # Use the reusable version selection function
-    selected_version = select_contract_version("Contract Version Selection for Reclaim Requests")
+    selected_version = resolve_contract_version(contract_version, "Contract Version Selection for Reclaim Requests")
     
     cli_service = CliService(with_executor_db=True, version=selected_version)
     success = asyncio.run(cli_service.get_reclaim_requests())
@@ -350,12 +333,20 @@ def get_reclaim_requests():
 @cli.command()
 @click.option("--reclaim-request-id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
-    """Finalize a reclaim request by its ID"""
-    
-    # Use the reusable version selection function
-    selected_version = select_contract_version("Contract Version Selection for Finalizing Reclaim Request")
-    
+@contract_option
+def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract_version: str | None):
+    """Finalize a reclaim request by its ID on the contract that holds it"""
+    detected = None
+    if not contract_version:
+        miner_address = Account.from_key(private_key).address
+        detected = asyncio.run(versions_with_open_reclaim(reclaim_request_id, miner_address))
+        if not detected:
+            logger.error("❌ No open reclaim request %d for this key on any contract version.", reclaim_request_id)
+            return
+    selected_version = resolve_contract_version(
+        contract_version, "Contract Version Selection for Finalizing Reclaim Request", detected
+    )
+
     cli_service = CliService(private_key=private_key, version=selected_version)
     success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
     if not success:

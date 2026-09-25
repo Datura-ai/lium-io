@@ -687,9 +687,6 @@ def test_score_gate_zeroes_on_a_failed_inspector_verdict():
     def ctx(inspector_passed: bool):
         return SimpleNamespace(
             state=SimpleNamespace(gpu_model="", specs={"network": {"ema_verifyx_download_speed": 500.0}}),
-            collateral_deposited=True,
-            collateral_error_message=None,
-            contract_version=None,
             executor=SimpleNamespace(price_per_gpu=None, tdx_quote=None),
             tdx_attestation_passed=False,
             cpu_truth_passed=True,

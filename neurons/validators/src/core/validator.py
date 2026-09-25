@@ -11,7 +11,6 @@ from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
-from services.collateral_contract_service import CollateralContractService
 from services.default_docker_image_digest_service import (
     fetch_default_image_digests,
     fetch_executor_image_digest,
@@ -97,7 +96,6 @@ class Validator:
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
-        self.collateral_contract_service = CollateralContractService()
         self.attestation_service = AttestationService(redis_service=self.redis_service)
         # DAH-3405: remembers the authorized executor digest and when it last changed.
         self.rollout_tracker = ExecutorRolloutTracker(redis_service=self.redis_service)
@@ -132,7 +130,6 @@ class Validator:
             redis_service=self.redis_service,
             validation_service=self.validation_service,
             verifyx_validation_service=self.verifyx_validation_service,
-            collateral_contract_service=self.collateral_contract_service,
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,

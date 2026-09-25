@@ -13,7 +13,6 @@ from neurons.validators.src.services.task.pipeline import Pipeline, LoggerSink
 from neurons.validators.src.services.task.checks import (
     BannedGpuCheck,
     CapabilityCheck,
-    CollateralCheck,
     DuplicateExecutorCheck,
     FinalizeCheck,
     GpuCountCheck,
@@ -217,13 +216,6 @@ class DummyRedisService:
             await getattr(self, name)(*args, **kwargs)
 
 
-class DummyCollateralService:
-    """Mock collateral contract service."""
-
-    async def is_eligible_executor(self, miner_hotkey: str, executor_uuid: str, gpu_model: str, gpu_count: int):
-        return True, None, "v1.0.0"  # collateral_deposited, error_message, contract_version
-
-
 class DummyValidationService:
     """Mock validation service for GPU capability checks."""
 
@@ -329,7 +321,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     ssh_client = DummySSHClient()
     ssh_service = DummySSHService()
     redis_service = DummyRedisService()
-    collateral_service = DummyCollateralService()
     validation_service = DummyValidationService()
     verifyx_service = DummyVerifyXService()
     connectivity_service = DummyConnectivityService()
@@ -338,7 +329,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     services = build_services(
         ssh=ssh_service,
         redis=redis_service,
-        collateral=collateral_service,
         validation=validation_service,
         verifyx=verifyx_service,
         connectivity=connectivity_service,
@@ -357,7 +347,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         max_gpu_count=8,
         gpu_model_rates={"NVIDIA RTX 4090": 1.0},
         nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
-        enable_no_collateral=False,
         verifyx_enabled=True,
         port_private_key="private_key",
         port_public_key="public_key",
@@ -400,7 +389,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         SpecChangeCheck(),
         BannedGpuCheck(),
         DuplicateExecutorCheck(),
-        CollateralCheck(),
         TenantEnforcementCheck(),
         GpuUsageCheck(),
         PortConnectivityCheck(),
@@ -417,7 +405,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     # Verify pipeline succeeded
     assert ok is True, "Pipeline should complete successfully"
-    assert len(events) == 19, "Should have events from all 19 checks"
+    assert len(events) == 18, "Should have events from all 18 checks"
 
     # Verify final context state
     assert final_ctx.success is True
@@ -429,7 +417,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     assert final_ctx.state.gpu_model_count == "NVIDIA RTX 4090:2"
     assert final_ctx.state.gpu_uuids == "GPU-abc123,GPU-def456"
     assert final_ctx.state.sysbox_runtime is True
-    assert final_ctx.collateral_deposited is True
+    assert final_ctx.collateral_deposited is False
 
     # Verify all checks emitted events
     assert all(event.reason_code is not None for event in events)
@@ -521,13 +509,11 @@ async def test_successful_rented_pipeline_flow(context_factory):
     # Create runner and other services
     runner = DummySSHCommandRunner()
     redis_service = DummyRedisService()
-    collateral_service = DummyCollateralService()
 
     # Setup services
     services = build_services(
         ssh=ssh_service,
         redis=redis_service,
-        collateral=collateral_service,
         score_calculator=dummy_score_calculator,
         container_cleanup=MockContainerCleanup(),
     )
@@ -586,7 +572,6 @@ async def test_successful_rented_pipeline_flow(context_factory):
         SpecChangeCheck(),
         BannedGpuCheck(),
         DuplicateExecutorCheck(),
-        CollateralCheck(),
         TenantEnforcementCheck(),
         # These checks below should NOT run because pipeline halts
         GpuUsageCheck(),
@@ -611,7 +596,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     # Verify pipeline succeeded but halted early
     assert ok is True, f"Pipeline should complete successfully (halted), but failed at {events[-1].check_id if events else 'unknown'}"
-    assert len(events) == 12, "Should only have events up to TenantEnforcementCheck (12 checks)"
+    assert len(events) == 11, "Should only have events up to TenantEnforcementCheck (11 checks)"
 
     # Verify final context state
     assert final_ctx.success is True

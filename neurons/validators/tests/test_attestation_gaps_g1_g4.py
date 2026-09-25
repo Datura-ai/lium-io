@@ -19,7 +19,6 @@ import base64
 import json
 import sys
 import time
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,15 +31,6 @@ if str(VALIDATOR_SRC) not in sys.path:
     sys.path.insert(0, str(VALIDATOR_SRC))
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-
-if "celium_collateral_contracts" not in sys.modules:
-    module = types.ModuleType("celium_collateral_contracts")
-
-    class CollateralContract:  # type: ignore
-        ...
-
-    module.CollateralContract = CollateralContract
-    sys.modules["celium_collateral_contracts"] = module
 
 from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
 from datura.requests.validator_requests import ssh_pubkey_signing_blob  # noqa: E402
@@ -520,9 +510,6 @@ def _score_ctx(tdx_quote, attestation_passed):
     )
     return SimpleNamespace(
         state=state,
-        collateral_deposited=True,
-        collateral_error_message=None,
-        contract_version=None,
         executor=executor,
         tdx_attestation_passed=attestation_passed,
         cpu_truth_passed=True,
