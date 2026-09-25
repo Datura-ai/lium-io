@@ -6,6 +6,10 @@ timed out (60 s)`, `create volume failed: 'NoneType' object has no attribute 'se
 last one is docker-py/urllib3 dereferencing a channel that is `None`.
 """
 
+import http.client
+import socket
+import struct
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
@@ -15,10 +19,12 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from docker.errors import APIError, NotFound
 from payload_models.payloads import FailedContainerRequest
 from services.docker_service import DockerService
+from urllib3.util import Timeout
 from services.rental_docker_sdk import (
     TRANSPORT_ERROR_CLASS,
     ContainerExecSpec,
     ContainerRunSpec,
+    RentalDockerConnectionError,
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
@@ -669,3 +675,150 @@ async def test_create_failure_event_has_no_class_for_a_daemon_answer(
 
     assert result.failure_step == "docker_run"
     assert "error_class" not in result.detail
+
+
+# ---------------------------------------------------------------------------
+# a real dropped link: a loopback socket stands in for the SSH channel and its far end goes away
+# ---------------------------------------------------------------------------
+
+
+class _SocketChannel(socket.socket):
+    """A TCP socket with the one paramiko Channel method `connect()` calls besides settimeout."""
+
+    def exec_command(self, command):
+        self.command = command
+
+
+def _drop_mid_call(tmp_path, *, reset: bool) -> Exception:
+    """Send GET /version through the rental adapter's own pool; the far end reads the request and
+    closes (no answer) or resets. Returns what urllib3 raised."""
+    server = socket.create_server(("127.0.0.1", 0))
+    channel = _SocketChannel(socket.AF_INET, socket.SOCK_STREAM)
+    channel.connect(server.getsockname())
+    far_end, _ = server.accept()
+
+    def far_side():
+        received = b""
+        while b"\r\n\r\n" not in received:
+            chunk = far_end.recv(4096)
+            if not chunk:
+                break
+            received += chunk
+        if reset:
+            far_end.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        far_end.close()
+
+    peer = threading.Thread(target=far_side)
+    peer.start()
+    transport = Mock()
+    transport.is_active.return_value = True
+    transport.open_session.return_value = channel
+    adapter = _adapter(tmp_path, transport=transport)
+    pool = adapter.get_connection("http+docker://ssh/v1.45/version")
+    pool.ssh_transport = transport
+    try:
+        # as requests calls it: docker-py's pool keeps its timeout as a bare int
+        pool.urlopen("GET", "/v1.45/version", retries=False, timeout=Timeout(connect=5, read=5))
+    except Exception as exc:  # noqa: BLE001 - the test inspects whatever the drop produced
+        return exc
+    finally:
+        peer.join(5)
+        channel.close()
+        server.close()
+    raise AssertionError("the call answered although the link dropped")
+
+
+@pytest.mark.parametrize(
+    ("reset", "cause"), [(False, http.client.RemoteDisconnected), (True, ConnectionResetError)]
+)
+def test_a_link_dropped_mid_call_is_the_transport_class(tmp_path, reset, cause):
+    dropped = _drop_mid_call(tmp_path, reset=reset)
+
+    assert any(isinstance(arg, cause) for arg in dropped.args), repr(dropped)
+    assert is_rental_docker_transport_error(dropped)
+    # as the SDK client wraps it: with the cause kept, and as text alone
+    try:
+        raise RentalDockerOperationError(f"Docker SDK inspect image failed: {dropped}") from dropped
+    except RentalDockerOperationError as wrapped:
+        assert rental_docker_error_class(wrapped) == TRANSPORT_ERROR_CLASS
+    assert is_rental_docker_transport_error(
+        RentalDockerOperationError(f"Docker SDK inspect image failed: {dropped}")
+    )
+
+
+def test_broken_pipe_in_container_output_is_not_the_class():
+    exc = RentalDockerOperationError(
+        "Docker SDK exec failed: exit_status=141; stderr=yes: Broken pipe; Connection reset by peer; stdout="
+    )
+    assert not is_rental_docker_transport_error(exc)
+
+
+@pytest.mark.asyncio
+async def test_a_real_drop_mid_call_is_retried_once_after_reopening(tmp_path):
+    adapter = _FakeAdapter()
+    api = _FakeApiClient(adapter=adapter)
+    api.create_container_errors = [_drop_mid_call(tmp_path, reset=False)]
+
+    await _client(api).run_container(_run_spec())
+
+    assert adapter.reopen_calls == 1
+    assert api.calls.count("create_container") == 2
+
+
+def _connect_info():
+    return SimpleNamespace(
+        address="203.0.113.10",
+        ssh_port=2222,
+        ssh_username="root",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_drop_on_the_first_connect_connects_once_more(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "services.rental_docker_sdk._validate_paramiko_known_hosts", lambda path: None
+    )
+    api = _FakeApiClient()
+    api_client_factory = Mock(side_effect=[_drop_mid_call(tmp_path, reset=False), api])
+    factory = RentalDockerSdkClientFactory(
+        api_client_factory=api_client_factory, transport_retry_enabled=True
+    )
+
+    async with factory.connect(executor_info=_connect_info(), private_key="PRIVATE KEY") as client:
+        assert client._api_client is api
+    assert api_client_factory.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_drop_on_the_first_connect_with_the_flag_off_is_the_transport_class(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "services.rental_docker_sdk._validate_paramiko_known_hosts", lambda path: None
+    )
+    api_client_factory = Mock(side_effect=[_drop_mid_call(tmp_path, reset=True)])
+    factory = RentalDockerSdkClientFactory(api_client_factory=api_client_factory)
+
+    with pytest.raises(RentalDockerConnectionError) as failed:
+        async with factory.connect(executor_info=_connect_info(), private_key="PRIVATE KEY"):
+            pass
+    assert api_client_factory.call_count == 1
+    assert rental_docker_error_class(failed.value) == TRANSPORT_ERROR_CLASS
+
+
+@pytest.mark.asyncio
+async def test_two_drops_on_connect_fail_the_connect_without_a_third(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "services.rental_docker_sdk._validate_paramiko_known_hosts", lambda path: None
+    )
+    drops = [_drop_mid_call(tmp_path, reset=False), _drop_mid_call(tmp_path, reset=True)]
+    api_client_factory = Mock(side_effect=drops)
+    factory = RentalDockerSdkClientFactory(
+        api_client_factory=api_client_factory, transport_retry_enabled=True
+    )
+
+    with pytest.raises(RentalDockerConnectionError):
+        async with factory.connect(executor_info=_connect_info(), private_key="PRIVATE KEY"):
+            pass
+    assert api_client_factory.call_count == 2

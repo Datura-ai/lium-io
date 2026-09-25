@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import logging
 import socket as socket_module
 import tempfile
@@ -35,6 +36,17 @@ _TRANSPORT_ERROR_TEXTS = (
     "SSH session not active",
     "SSH transport dropped",
     "Socket is closed",  # paramiko: a send over a channel whose transport is gone
+    # http.client/urllib3 when the link drops mid-call. "Broken pipe" and "Connection reset by
+    # peer" are not here: a container's own stderr says them; they count by type, below
+    "Remote end closed connection without response",
+    "('Connection aborted.',",
+)
+_TRANSPORT_ERROR_TYPES = (
+    EOFError,
+    ConnectionResetError,  # RemoteDisconnected is one too
+    ConnectionAbortedError,
+    BrokenPipeError,
+    http.client.IncompleteRead,
 )
 # paramiko's EOFError has no text; the SDK client wraps it as "<operation> failed: EOFError".
 _TRANSPORT_EOF_SUFFIX = ": EOFError"
@@ -114,13 +126,14 @@ def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
 def is_rental_docker_transport_error(exc: BaseException) -> bool:
     """True when `exc` (or anything in its cause chain) is a dropped-SSH-transport failure.
 
-    Membership is by type (`RentalDockerTransportDropped`, paramiko's `EOFError`, a urllib3 read
-    timeout) and by the exact texts those errors carry once wrapped into a string by the SDK
+    Membership is by type (`RentalDockerTransportDropped`, paramiko's `EOFError`, http.client's
+    `RemoteDisconnected`, a reset or broken pipe, a cut-off body, a urllib3 read timeout) and by
+    the exact texts those errors carry once wrapped into a string by the SDK
     client, so a `RentalDockerOperationError("Docker SDK run container failed: EOFError")` counts
     too. A Docker daemon answer (409, 500, no such image) is never a transport error.
     """
     for item in _iter_exception_chain(exc):
-        if isinstance(item, RentalDockerTransportDropped | EOFError):
+        if isinstance(item, (RentalDockerTransportDropped, *_TRANSPORT_ERROR_TYPES)):
             return True
         if item.__class__.__name__ in {"ReadTimeoutError", "ReadTimeout"}:
             return True
@@ -985,13 +998,34 @@ class RentalDockerSdkClientFactory:
             known_hosts_path.chmod(0o600)
             _validate_paramiko_known_hosts(known_hosts_path)
 
+            create = partial(
+                _in_docker_thread,
+                self._create_api_client,
+                _build_docker_ssh_base_url(executor_info),
+                key_path,
+                known_hosts_path,
+            )
             try:
-                api_client = await _in_docker_thread(
-                    self._create_api_client,
-                    _build_docker_ssh_base_url(executor_info),
-                    key_path,
-                    known_hosts_path,
-                )
+                try:
+                    api_client = await create()
+                except Exception as exc:
+                    # the client asks the daemon for its version: a drop there costs one more
+                    # connect (nothing on the host has changed yet), never a third
+                    if not transport_retry_enabled or not is_rental_docker_transport_error(exc):
+                        raise
+                    logger.warning(
+                        _m(
+                            "Docker SDK connect retried once after the SSH transport dropped",
+                            extra=get_extra_info(
+                                {
+                                    "docker_operation": "connect",
+                                    "error_class": TRANSPORT_ERROR_CLASS,
+                                    "first_error": str(exc),
+                                }
+                            ),
+                        )
+                    )
+                    api_client = await create()
             except Exception as exc:
                 raise RentalDockerConnectionError(
                     _wrap_error_message("Docker SDK client construction failed", exc)
