@@ -319,13 +319,17 @@ async def test_eligible_no_sysbox_appends_reason():
     assert "sysbox" in log.lower()
 
 
-def test_reason_excluded_from_both_pools_returns_first_match_and_none():
-    # The evaluator is the single source of truth: first matching reason wins,
-    # None for a clean executor.
+def test_reasons_excluded_from_both_pools_lists_every_match_in_order():
+    # The evaluator is the single source of truth: every matching reason, in catalog order,
+    # and an empty list for a clean executor.
     incentive = _build_incentive()
 
-    assert incentive._reason_excluded_from_both_pools(_make_job(1.0)) is None
-    assert incentive._reason_excluded_from_both_pools(_make_job(1.0, is_spot=True)).reason == "spot_tier"
-    # spot precedes discord when both apply — order is preserved
+    assert incentive._reasons_excluded_from_both_pools(_make_job(1.0)) == []
+    spot = incentive._reasons_excluded_from_both_pools(_make_job(1.0, is_spot=True))
+    assert [line.reason for line in spot] == ["spot_tier"]
+    # spot precedes discord when both apply: both are listed, the old first match first
     both = _make_job(1.0, is_spot=True, provider_discord_connected=False)
-    assert incentive._reason_excluded_from_both_pools(both).reason == "spot_tier"
+    assert [line.reason for line in incentive._reasons_excluded_from_both_pools(both)] == [
+        "spot_tier",
+        "provider_discord_not_connected",
+    ]

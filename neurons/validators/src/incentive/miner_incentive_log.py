@@ -18,7 +18,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
-   Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
+   Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
      spot tier, Discord not connected, paused for new rentals, running own default job
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
@@ -31,6 +31,14 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
+   Group C — a check failed this cycle: the failing check's reason code
+     (`validation_failed`, context.reason_code), so a zero from a failed check is never
+     reported without a reason. A run that passed every check and still scored 0 (the
+     score gate: collateral, CPU truth, an outdated image, a rented node's halt) is not a
+     failed check and gets no Group C reason
+   Every reason that applies is recorded, in the order above: a node blocked by Discord
+   still learns that its 8x flagship gate blocks it too. The first entry is the one the
+   old first-match evaluation reported.
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
@@ -91,6 +99,12 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    # Group C: the validation run itself did not pass; context.reason_code names the check
+    VALIDATION_FAILED = "validation_failed"
+
+
+# The reason code a failed run carries when no check produced one (an exception in the pipeline).
+UNCLASSIFIED_VALIDATION_FAILURE = "PIPELINE_VALIDATION_ERROR"
 
 
 class IncentiveReason(BaseModel):
@@ -352,7 +366,8 @@ class MinerLogLine(BaseModel):
             ),
             extra_fields={
                 "nvidia_driver_version": result.nvidia_driver_version,
-                "driver_multiplier": result.driver_multiplier,
+                # recorded only at multiplier 0; a node blocked before pricing never gets it set
+                "driver_multiplier": 0.0,
             },
         )
 
@@ -433,6 +448,38 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "available_port_count": port_limited.available_port_count,
                 "required_port_count": port_limited.required_port_count,
+            },
+        )
+
+    # ── Group C: the validation run did not pass ─────────────────────────────
+
+    @staticmethod
+    def validation_failure_code(result: JobResult) -> str:
+        """The reason code of the event that ended the run; the fallback when there is none."""
+        event = result.validation_event
+        return (
+            result.failure_reason_code
+            or (event.reason_code if event is not None else None)
+            or UNCLASSIFIED_VALIDATION_FAILURE
+        )
+
+    @staticmethod
+    def no_payout_because_validation_failed(result: JobResult) -> MinerLogLine:
+        event = result.validation_event
+        reason_code: str = MinerLogLine.validation_failure_code(result)
+        # the event's check_id/remediation belong to it only when it is the one that ended the run
+        same_event: bool = event is not None and event.reason_code == reason_code
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.VALIDATION_FAILED,
+            message=(
+                f"No subnet incentive: validation did not pass this cycle ({reason_code}). "
+                "Fix the failed check to earn; the node's validation log names it."
+            ),
+            extra_fields={
+                "reason_code": reason_code,
+                "check_id": event.check_id if same_event else None,
+                "remediation": event.remediation if same_event else None,
             },
         )
 
