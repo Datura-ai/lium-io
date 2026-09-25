@@ -95,13 +95,20 @@ RUN mkdir -p /etc/docker \
   && mkdir -p /etc/nvidia-container-runtime \
   && mkdir -p /root/.ssh
 
-RUN useradd -m -s /bin/bash liumuser && \
+# `liumuser`: the web terminal's SSH account (DAH-3522, bounty ticket-0329). Password locked, no
+# key in the image, no sudo, only its own group here (run.sh adds the Docker socket's group at
+# start: the pod shell is `docker exec`). Its login shell IS the forced command: lium-pod-shell
+# opens a shell in the pod named by CONTAINER_NAME and refuses every other name, so the account
+# has no general-purpose shell by any path. sshd_liumuser.conf closes forwarding, tunnels, rc
+# and password auth for the account. That Match block must stay the last block of sshd_config:
+# sshd_setup.sh writes its drop-in through the top-of-file Include so nothing lands inside it.
+RUN install -m 0755 liumuser_shell.sh /usr/local/bin/lium-pod-shell && \
+    useradd -m -s /usr/local/bin/lium-pod-shell liumuser && \
+    passwd -l liumuser && \
     mkdir -p /home/liumuser/.ssh && \
     chmod 700 /home/liumuser/.ssh && \
-    chown -R liumuser:liumuser /home/liumuser/.ssh
-
-RUN echo 'AcceptEnv CONTAINER_NAME' >>/etc/ssh/sshd_config && \
-    printf 'Match User liumuser\n    ForceCommand bash -c '"'"'[ -n "$CONTAINER_NAME" ] && exec docker exec -it "$CONTAINER_NAME" bash || { echo "CONTAINER_NAME not set"; exit 1; }'"'"'\n' >>/etc/ssh/sshd_config
+    chown -R liumuser:liumuser /home/liumuser/.ssh && \
+    cat sshd_liumuser.conf >>/etc/ssh/sshd_config
 
 # PerSourcePenalties off via /etc/ssh/sshd_config.d/lium.conf when this sshd knows the directive,
 # then `sshd -T` must accept the whole rendered config or the build fails (sshd_setup.sh says why).
