@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Any
 
@@ -34,8 +35,26 @@ def hidden_from_renters_text(available_port_count: int) -> str:
 LISTING_PORT_CHECK_CODE = "INSUFFICIENT_VERIFIED_PORTS"
 
 
+def declares_port_mappings(raw: Any) -> bool:
+    """True when `raw` holds at least one [internal, external] pair.
+
+    Mirrors lium-platform `_parse_nat_mapping` (utils/prepare_ports_data.py): `[]`, `"[]"`, `"{}"` and
+    unparsable text declare no mappings, so the platform check names the port range instead.
+    """
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(raw, list):
+        return False
+    return any(isinstance(m, (list, tuple)) and len(m) >= 2 for m in raw)
+
+
 def port_floor_what(state: ContextState, available_port_count: int) -> dict[str, Any]:
-    port_mappings_declared = bool(state.specs.get("port_mappings"))
+    port_mappings_declared = declares_port_mappings(state.specs.get("port_mappings"))
     return {
         "available_port_count": available_port_count,
         "required": MIN_PORT_COUNT,

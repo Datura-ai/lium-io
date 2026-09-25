@@ -654,3 +654,18 @@ def test_no_declared_range_or_mappings_reports_the_default_probed_range(declared
 
     assert what["port_range"] == "20000-65535"
     assert what["port_mappings_declared"] is False
+
+
+@pytest.mark.parametrize("empty_mappings", [[], "[]", "{}", "not json", "[[40000]]"])
+def test_empty_or_unparsable_port_mappings_are_not_declared_and_the_range_is_named(empty_mappings):
+    """Same parse as the platform check: no [internal, external] pair means no mappings, so the range is reported."""
+    state = SimpleNamespace(
+        specs={"port_range": DECLARED_RANGE, "port_mappings": empty_mappings},
+        probed_port_count=2,
+        declared_port_count=2,
+    )
+
+    what = port_floor_what(state, 1)
+
+    assert what["port_mappings_declared"] is False
+    assert what["port_range"] == DECLARED_RANGE
