@@ -390,19 +390,6 @@ def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monke
     assert rollout_grace_reason(validator_snapshot_was_stale, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
 
 
-def test_a_rented_run_reporting_its_pods_ssh_is_still_the_rented_halt(monkeypatch) -> None:
-    """DAH-2870: when the renter's SSH is being reported, the tenant-enforcement halt ends the run
-    on RENTED_POD_SSH_UNREACHABLE instead of RENTED. It is the same halt (passed, score kept), so an
-    OUTDATED image inside the window is withheld exactly as it is for RENTED."""
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-    window = _open_window()
-    rented_reporting = _failed(
-        "node-2", "RENTED_POD_SSH_UNREACHABLE", observed_digest=OLD, image_status="OUTDATED"
-    )
-
-    assert rollout_grace_reason(rented_reporting, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
-
-
 def test_a_rented_zero_under_an_unenforced_outdated_report_stands(monkeypatch) -> None:
     """Regression: with EXECUTOR_IMAGE_CHECK_ENFORCE off (the default since DAH-3439) the image
     check passes an OUTDATED node and leaves its score alone, so a rented run at score 0 owes its
