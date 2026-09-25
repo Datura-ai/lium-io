@@ -12,12 +12,16 @@ jobs:
     env:
       TAG: "latest" 
       TARGET_FILE: "docker-compose.app.yml"
-      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
       - name: Make scripts executable
         run: |

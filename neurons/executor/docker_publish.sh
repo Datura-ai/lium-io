@@ -26,11 +26,7 @@ log_header()  {
 # ── Build ──────────────────────────────────────────────────────────────────────
 log_header "Lium Executor — Publish Image"
 
-# ── Login & push ───────────────────────────────────────────────────────────────
-log_step "Logging in to Docker Hub"
-echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-log_success "Authenticated as ${DOCKERHUB_USERNAME}"
-
+# ── Push ───────────────────────────────────────────────────────────────────────
 log_step "Pushing image: ${IMAGE_NAME}"
 PUSH_OUTPUT=$(docker push "$IMAGE_NAME" 2>&1 | tee /dev/stderr)
 

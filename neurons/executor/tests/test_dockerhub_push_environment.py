@@ -1,13 +1,18 @@
-"""Every Docker Hub login in this repository runs inside the ``dockerhub-push`` environment, and the
-release tags the publish workflows react to are the ones the ``release-tags`` ruleset guards.
+"""The prod Docker Hub token is readable only in ``dockerhub-push`` jobs, never by a repository
+script, and the ``dev`` builds keep working from any branch with a separate dev token.
 
 A repository secret is readable by any workflow file on any branch; an environment secret only by a
-job that names the environment, from a ref the environment's deployment policy allows. These tests
-fail when a publish job — one that reads the token or logs in to Docker Hub, by ``docker login`` or
-``docker/login-action`` — runs outside that environment, when a script that runs with ``set -x``
-traces the ``docker login`` line, or when the tag ruleset payload drifts from the workflows' tag
-triggers. The discriminator is the login, not the secret's name, so the
-tests hold once the login moves to OIDC and no workflow names the secret any more.
+job that names the environment, from a ref the environment's deployment policy allows.
+``dockerhub-push`` allows ``main`` and the release tags; ``dockerhub-dev`` allows every branch and
+holds ``DOCKERHUB_DEV_PAT``, so a ``*_cd_dev.yml`` run from a feature branch still pushes ``:dev``.
+
+A secret in a job-level ``env:`` is in the environment of every step, including the ones that run
+``neurons/*/docker*publish.sh`` from the checked-out ref. So the token is only ever set on the one
+login step, whose command is inline in the workflow, and the publish scripts only push with the
+login that step already did. These tests fail when a job reads a Docker Hub token outside its
+environment, when the token is set anywhere but a login step, when a script logs in or reads a
+token, when a workflow that reads a token can be started by a pull request, or when the tag ruleset
+payload drifts from the prod workflows' tag triggers.
 """
 
 import json
@@ -20,19 +25,29 @@ import yaml
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOWS_DIR = REPO / ".github" / "workflows"
 WORKFLOWS = sorted([*WORKFLOWS_DIR.glob("*.yml"), *WORKFLOWS_DIR.glob("*.yaml")])
+DEV_WORKFLOWS = sorted(WORKFLOWS_DIR.glob("*_cd_dev.yml"))
 PUBLISH_SCRIPTS = sorted((REPO / "neurons").glob("*/docker*publish.sh"))
 RULESET = REPO / ".github" / "rulesets" / "release-tags.json"
-ENVIRONMENT = "dockerhub-push"
-LOGIN_LINE = 'echo "$DOCKERHUB_PAT" | docker login'
-
+PROD_ENVIRONMENT = "dockerhub-push"
+DEV_ENVIRONMENT = "dockerhub-dev"
+PROD_SECRET = "secrets.DOCKERHUB_PAT"
+DEV_SECRET = "secrets.DOCKERHUB_DEV_PAT"
+LOGIN_RUN = 'echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin'
+PULL_REQUEST_TRIGGERS = {"pull_request", "pull_request_target", "workflow_run"}
 
 DOCKER_HUB_REGISTRIES = {"", "docker.io", "registry-1.docker.io", "index.docker.io"}
 
 
-def publishes_to_docker_hub(job: dict[str, object]) -> bool:
-    """True when the job reads the Docker Hub token or logs in to Docker Hub (``docker login`` or ``docker/login-action``)."""
-    if "secrets.DOCKERHUB_PAT" in json.dumps(job):
-        return True
+def _triggers(workflow: dict) -> dict:
+    on = workflow.get("on", workflow.get(True))  # PyYAML reads the bare key ``on`` as True
+    if isinstance(on, str):
+        return {on: None}
+    if isinstance(on, list):
+        return dict.fromkeys(on)
+    return on or {}
+
+
+def logs_in_to_docker_hub(job: dict) -> bool:
     for step in job.get("steps") or []:
         if str(step.get("uses", "")).startswith("docker/login-action"):
             registry = str((step.get("with") or {}).get("registry", "")).strip()
@@ -43,82 +58,123 @@ def publishes_to_docker_hub(job: dict[str, object]) -> bool:
     return False
 
 
-def docker_hub_publish_jobs_outside_the_environment(workflow_text: str) -> list[str]:
-    """Job ids that publish to Docker Hub without ``environment: dockerhub-push``."""
+def token_problems(workflow_text: str) -> list[str]:
+    """Every place a workflow exposes a Docker Hub token beyond its environment's login step."""
     workflow = yaml.safe_load(workflow_text)
-    return [
-        job_id
-        for job_id, job in (workflow.get("jobs") or {}).items()
-        if publishes_to_docker_hub(job) and job.get("environment") != ENVIRONMENT
+    problems = []
+    if "DOCKERHUB" in json.dumps(workflow.get("env") or {}):
+        problems.append("workflow env")
+    reads_a_token = False
+    for job_id, job in (workflow.get("jobs") or {}).items():
+        text = json.dumps(job)
+        reads_prod, reads_dev = PROD_SECRET in text, DEV_SECRET in text
+        reads_a_token |= reads_prod or reads_dev
+        environment = job.get("environment")
+        if reads_prod and environment != PROD_ENVIRONMENT:
+            problems.append(f"{job_id}: prod token outside {PROD_ENVIRONMENT}")
+        if reads_dev and environment != DEV_ENVIRONMENT:
+            problems.append(f"{job_id}: dev token outside {DEV_ENVIRONMENT}")
+        if logs_in_to_docker_hub(job) and environment not in (PROD_ENVIRONMENT, DEV_ENVIRONMENT):
+            problems.append(f"{job_id}: Docker Hub login outside both environments")
+        if "DOCKERHUB" in json.dumps(job.get("env") or {}):
+            problems.append(f"{job_id}: token in job env")
+        for step in job.get("steps") or []:
+            step_text = json.dumps(step)
+            if "secrets.DOCKERHUB" not in step_text:
+                continue
+            if step.get("uses") or str(step.get("run", "")).strip() != LOGIN_RUN:
+                problems.append(f"{job_id}: token set on a step that is not the inline login")
+    if reads_a_token and PULL_REQUEST_TRIGGERS & set(_triggers(workflow)):
+        problems.append("a pull request can start a workflow that reads a token")
+    return problems
+
+
+def script_problems(script_text: str) -> bool:
+    return bool(re.search(r"docker login|DOCKERHUB_", script_text))
+
+
+PROD_JOB = (
+    "on:\n  push:\n    tags: ['executor-v*']\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n"
+    f"    environment: {PROD_ENVIRONMENT}\n    steps:\n"
+    "      - uses: actions/checkout@v4\n"
+    "      - name: Log in to Docker Hub\n        env:\n"
+    "          DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}\n"
+    "          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}\n"
+    f"        run: '{LOGIN_RUN}'\n"
+    "      - run: cd neurons/executor && ./docker_publish.sh\n"
+)
+
+
+def test_the_checker_accepts_the_prod_job_shape() -> None:
+    assert token_problems(PROD_JOB) == []
+    dev_job = PROD_JOB.replace(PROD_ENVIRONMENT, DEV_ENVIRONMENT).replace(
+        "secrets.DOCKERHUB_PAT", "secrets.DOCKERHUB_DEV_PAT"
+    )
+    assert token_problems(dev_job) == []
+
+
+def test_the_checker_flags_the_token_handed_to_a_script() -> None:
+    """Negative control: the shape before this change, the token in the job env for every step."""
+    job_env = PROD_JOB.replace(
+        "    steps:\n", "    env:\n      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}\n    steps:\n", 1
+    )
+    assert "deploy: token in job env" in token_problems(job_env)
+    script_step = PROD_JOB.replace(f"        run: '{LOGIN_RUN}'\n", "        run: ./docker_publish.sh\n")
+    assert token_problems(script_step) == ["deploy: token set on a step that is not the inline login"]
+
+
+def test_the_checker_flags_a_token_outside_its_environment() -> None:
+    """Negative controls: the prod token in a dev job, and a job with no environment at all."""
+    prod_token_in_dev = PROD_JOB.replace(PROD_ENVIRONMENT, DEV_ENVIRONMENT)
+    assert token_problems(prod_token_in_dev) == [f"deploy: prod token outside {PROD_ENVIRONMENT}"]
+    no_environment = PROD_JOB.replace(f"    environment: {PROD_ENVIRONMENT}\n", "")
+    assert token_problems(no_environment) == [
+        f"deploy: prod token outside {PROD_ENVIRONMENT}",
+        "deploy: Docker Hub login outside both environments",
     ]
-
-
-def login_traced(script_text: str) -> bool:
-    """True when the last ``set -x`` / ``set +x`` before the login line turns xtrace on."""
-    before_login = script_text.split(LOGIN_LINE, 1)[0]
-    xtrace_switches = re.findall(r"\bset ([+-])[a-z]*x", before_login)
-    return bool(xtrace_switches) and xtrace_switches[-1] == "-"
-
-
-def test_the_checker_flags_a_job_that_reads_the_token_without_the_environment() -> None:
-    """Negative control: the shape every publish job had before the environment existed."""
-    workflow_yaml = (
-        "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n"
-        "    env:\n      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}\n    steps: []\n"
-    )
-    assert docker_hub_publish_jobs_outside_the_environment(workflow_yaml) == ["deploy"]
-    assert (
-        docker_hub_publish_jobs_outside_the_environment(
-            workflow_yaml.replace("    env:", f"    environment: {ENVIRONMENT}\n    env:")
-        )
-        == []
-    )
-
-
-def test_the_checker_flags_a_docker_hub_login_step_without_the_environment() -> None:
-    """Negative control: an OIDC login (no secret named) still has to run inside the environment."""
-    workflow_yaml = (
+    oidc_login = (
         "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
         "      - uses: docker/login-action@v4\n        with:\n          username: daturaai\n"
     )
-    assert docker_hub_publish_jobs_outside_the_environment(workflow_yaml) == ["deploy"]
-    other_registry = workflow_yaml.replace(
-        "          username: daturaai\n", "          registry: ghcr.io\n"
-    )
-    assert docker_hub_publish_jobs_outside_the_environment(other_registry) == []
-    assert (
-        docker_hub_publish_jobs_outside_the_environment(
-            workflow_yaml.replace("    steps:", f"    environment: {ENVIRONMENT}\n    steps:")
-        )
-        == []
-    )
+    assert token_problems(oidc_login) == ["deploy: Docker Hub login outside both environments"]
+    assert token_problems(oidc_login.replace("username: daturaai", "registry: ghcr.io")) == []
+
+
+def test_the_checker_flags_a_pull_request_trigger() -> None:
+    for trigger in ("pull_request_target", "pull_request"):
+        on_pr = PROD_JOB.replace("on:\n", f"on:\n  {trigger}:\n", 1)
+        assert token_problems(on_pr) == ["a pull request can start a workflow that reads a token"]
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)
-def test_every_job_that_publishes_to_docker_hub_runs_in_the_environment(workflow: Path) -> None:
-    assert docker_hub_publish_jobs_outside_the_environment(workflow.read_text()) == []
+def test_no_workflow_exposes_a_docker_hub_token(workflow: Path) -> None:
+    assert token_problems(workflow.read_text()) == []
 
 
-def test_the_checker_flags_a_traced_login() -> None:
-    """Negative control: ``set -eux`` and the login line, which ``bash -x`` prints expanded."""
-    traced = f"#!/bin/bash\nset -eux -o pipefail\n{LOGIN_LINE} -u u --password-stdin\n"
-    assert login_traced(traced)
-    assert not login_traced(traced.replace(LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\n{LOGIN_LINE}"))
-    assert not login_traced(traced.replace("set -eux", "set -eu"))
-    trace_back_on_before_login = traced.replace(
-        LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\nset -x\n{LOGIN_LINE}"
-    )
-    assert login_traced(trace_back_on_before_login)
+@pytest.mark.parametrize("workflow", DEV_WORKFLOWS, ids=lambda p: p.name)
+def test_dev_builds_use_the_dev_token_from_any_branch(workflow: Path) -> None:
+    parsed = yaml.safe_load(workflow.read_text())
+    assert set(_triggers(parsed)) == {"workflow_dispatch"}
+    (job,) = parsed["jobs"].values()
+    assert job["environment"] == DEV_ENVIRONMENT
+    assert job["env"]["TAG"] == "dev"
+    text = workflow.read_text()
+    assert DEV_SECRET in text and PROD_SECRET not in text
+
+
+def test_the_checker_flags_a_script_that_logs_in() -> None:
+    assert script_problems(f"#!/bin/bash\n{LOGIN_RUN}\ndocker push x\n")
+    assert not script_problems('#!/bin/bash\ndocker push "$IMAGE_NAME"\n')
 
 
 @pytest.mark.parametrize("script", PUBLISH_SCRIPTS, ids=lambda p: f"{p.parent.name}/{p.name}")
-def test_no_publish_script_traces_the_login(script: Path) -> None:
+def test_publish_scripts_only_push(script: Path) -> None:
     script_text = script.read_text()
-    assert LOGIN_LINE in script_text, f"{script}: the login moved; update LOGIN_LINE"
-    assert not login_traced(script_text)
+    assert "docker push" in script_text
+    assert not script_problems(script_text)
 
 
-def test_release_tag_ruleset_covers_every_tag_trigger_of_the_publish_workflows() -> None:
+def test_release_tag_ruleset_covers_every_tag_trigger_of_the_prod_workflows() -> None:
     ruleset = json.loads(RULESET.read_text())
     assert ruleset["target"] == "tag" and ruleset["enforcement"] == "active"
     assert {r["type"] for r in ruleset["rules"]} == {"creation", "update", "deletion"}
@@ -129,8 +185,9 @@ def test_release_tag_ruleset_covers_every_tag_trigger_of_the_publish_workflows()
     publish_tag_refs: set[str] = set()
     for workflow in WORKFLOWS:
         parsed = yaml.safe_load(workflow.read_text())
-        push = (parsed.get("on") or parsed.get(True) or {}).get("push") or {}
-        if any(publishes_to_docker_hub(job) for job in (parsed.get("jobs") or {}).values()):
+        push = _triggers(parsed).get("push") or {}
+        jobs = (parsed.get("jobs") or {}).values()
+        if any(job.get("environment") == PROD_ENVIRONMENT for job in jobs):
             publish_tag_refs.update(f"refs/tags/{t}" for t in push.get("tags") or [])
     assert publish_tag_refs == set(ruleset["conditions"]["ref_name"]["include"])
     assert publish_tag_refs == {

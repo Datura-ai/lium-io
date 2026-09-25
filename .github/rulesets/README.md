@@ -1,21 +1,32 @@
-# Release guards: the `dockerhub-push` environment and the `release-tags` ruleset
+# Release guards: the `dockerhub-push` and `dockerhub-dev` environments and the `release-tags` ruleset
 
-Every job in this repository that logs in to Docker Hub runs in the GitHub environment
-`dockerhub-push` (`executor_cd_prod.yml`, `executor_cd_dev.yml`, `miner_cd_prod.yml`,
-`miner_cd_dev.yml`, `validator_cd_prod.yml`, `validator_cd_dev.yml`, `watchtower_image.yml`).
-The environment holds the Docker Hub credentials and a deployment policy that names the only
-refs allowed to use them: `main` and the release tags `executor-v*`, `miner-v*`, `validator-v*`,
-`watchtower-v*`. A `workflow_dispatch` from any other branch stops before the job's first step
-with "Branch … is not allowed to deploy to dockerhub-push" and never sees the secrets.
+Two Docker Hub tokens, each an environment secret, so no branch can read the prod token:
+
+- `dockerhub-push` holds the prod token (`DOCKERHUB_PAT`, `DOCKERHUB_USERNAME`). Its deployment
+  policy allows only `main` and the release tags `executor-v*`, `miner-v*`, `validator-v*`,
+  `watchtower-v*`. The jobs that use it are `executor_cd_prod.yml`, `miner_cd_prod.yml`,
+  `validator_cd_prod.yml` and `watchtower_image.yml`. A run from any other ref stops before the
+  job's first step with "Branch … is not allowed to deploy to dockerhub-push" and never sees the
+  token. A manual run of `watchtower_image.yml` from `main` still publishes without a tag.
+- `dockerhub-dev` holds the dev token (`DOCKERHUB_DEV_PAT`, `DOCKERHUB_DEV_USERNAME`) and allows
+  every branch, so `executor_cd_dev.yml`, `miner_cd_dev.yml` and `validator_cd_dev.yml` still
+  build and push `:dev` from a feature branch.
+
+In every job the token is set only on the inline "Log in to Docker Hub" step. The
+`neurons/*/docker*publish.sh` scripts never read a token: they push with the login that step
+already did. A script edited on a branch therefore gets at most the dev token, never the prod one.
+Anything outside this repository that runs these scripts (lium-io-deployment's Staging Branch
+Deploy) has to log in itself with the dev token; it cannot read either environment secret here.
 
 The tag ruleset `release-tags` (`release-tags.json`) restricts who may create, move or delete
-those four tag patterns, so only the release role can start a tag-triggered production image
-push. A manual run of `watchtower_image.yml` from `main` still publishes without a tag.
+the four release tag patterns, so only the release role can start a tag-triggered production
+image push.
 
-Both settings are repository administration. The workflow files reference the environment;
-configuring it and applying the ruleset is done once by a repository admin with the commands
-below. Until that is done, GitHub auto-creates the environment on the first run with no policy
-and no secrets, and the repository-level secrets keep resolving — nothing breaks in between.
+Both settings are repository administration, done once by a repository admin with the commands
+below. Create `dockerhub-dev` and its secrets before this change merges: the dev workflows read
+only `DOCKERHUB_DEV_PAT` and fail at the login step until it exists. Until `dockerhub-push` is
+configured, GitHub auto-creates it on the first run with no policy and no secrets, and the
+repository-level prod secrets keep resolving.
 
 ## 1. Environment (admin, once)
 
@@ -46,6 +57,23 @@ lists the five refs; `gh secret list -R "$R" --env dockerhub-push` lists the two
 
 Optional: "Required reviewers" on the environment makes every production image push a
 two-person action.
+
+### Dev environment
+
+Docker Hub → Account settings → Personal access tokens (or the organisation's access tokens):
+create a token with Read & Write only, no Delete, used only as the dev token. Then:
+
+```bash
+gh api -X PUT "repos/$R/environments/dockerhub-dev"
+gh secret set DOCKERHUB_DEV_PAT      -R "$R" --env dockerhub-dev       # paste the dev token
+gh secret set DOCKERHUB_DEV_USERNAME -R "$R" --env dockerhub-dev --body daturaai
+```
+
+Docker Hub scopes a token per repository, not per tag. While the `dev` images share their
+repositories with `latest` (`daturaai/compute-subnet-executor:dev` next to `:latest`), the dev
+token can push either tag. A dev token that cannot touch prod needs the `dev` images in their
+own repositories, which means changing the dev compose files and the dev hosts too. That is a
+separate change.
 
 ## 2. Tag ruleset (admin, once)
 

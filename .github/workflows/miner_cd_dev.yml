@@ -6,15 +6,19 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: dockerhub-push
+    environment: dockerhub-dev
     env:
       TAG: "dev" 
       TARGET_FILE: "docker-compose.app.dev.yml"
-      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_DEV_PAT }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_DEV_USERNAME }}
+        run: echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
       - name: Make scripts executable
         run: |
