@@ -9,7 +9,7 @@ throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else i
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
 **`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
-`tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
+`tests-ok` reports green either way. The platform repository runs the same gate (its
 stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
 
@@ -73,7 +73,7 @@ writes to its merge ref; a push to main writes main's, which every later PR read
 
 ## The merge gate (`make e2e-full` = `gate.sh`, CI job `e2e-gate`)
 
-The same shape as the gate lium-platform#186 adds for the platform side (not merged; that version also caps the whole
+The same shape as the platform repository's gate (that version also caps the whole
 run with a `T_TOTAL` budget): build → up → every `tests/<name>` suite → logs → down, each under GNU `timeout`
 (`T_BUILD` 25m, `T_UP` 8m, `T_SUITE` 20m per suite, SIGKILL 30 s after SIGTERM), every suite run even after one
 fails, `artifacts/` holding `timings.txt`, `summary.md`, `<suite>-junit.xml`, `compose.log`, `compose-ps.txt`,

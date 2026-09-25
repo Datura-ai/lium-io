@@ -1,7 +1,7 @@
 # lium-core
 
 Shared library for the Lium platform, published to PyPI as [`lium-core`](https://pypi.org/project/lium-core/).
-Imported from `Datura-ai/lium-core` with its history (DAH-3135); that repository is archived once this lands and PyPI's trusted publisher points here.
+Imported from `Datura-ai/lium-core` with its history; that repository is archived once this lands and PyPI's trusted publisher points here.
 
 - `lium_core.shared_config` — `SharedConfigClient`, `SharedConfig` and the defaults every service agrees on.
   Consumers: the validator and miner in this repository (`neurons/validators`, `neurons/miners`), and the
