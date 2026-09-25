@@ -188,7 +188,7 @@ DEFAULT_RESTART_POLICY = "unless-stopped"
 # `rental_verification` to report. No retry cap: PEARL's PID 1 re-exits its child's code
 # (pearl-miner/entrypoint.sh), so 143 can come from inside the container, and a capped policy would
 # leave it `exited` with 143 after the cap, which `_was_deliberately_stopped_on_the_host` reads as a
-# host stop. A crash loop is the backend's self-heal ladder's job (DAH-2419), not the restart count's.
+# host stop.
 # The backend sets `self_ending` on a job spec only when all three hold for that image: it exits 0
 # at its cap, its shutdown-SIGTERM exit is non-zero (a zero exit stays down after a host reboot:
 # the Dolphin `on_term` trap exits 0 today), and the backend has a cap-specific strategy backoff
