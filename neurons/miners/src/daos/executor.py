@@ -1,4 +1,5 @@
 from typing import Optional
+from sqlmodel import func, select, update
 from daos.base import BaseDao
 from models.executor import Executor
 
@@ -57,6 +58,21 @@ class ExecutorDao(BaseDao):
             return list(self.session.query(Executor).filter_by(validator=validator_key, uuid=executor_id))
 
         return list(self.session.query(Executor).filter_by(validator=validator_key))
+
+    def count_executors_for_validator(self, validator_key: str) -> int:
+        count_query = select(func.count(Executor.uuid)).where(Executor.validator == validator_key)
+        return self.session.exec(count_query).one()
+
+    def move_executors_to_validator(self, old_validator_key: str, new_validator_key: str) -> int:
+        """Re-key every executor of `old_validator_key` to `new_validator_key`; returns the rows moved."""
+        move_query = (
+            update(Executor)
+            .where(Executor.validator == old_validator_key)
+            .values(validator=new_validator_key)
+        )
+        result = self.session.exec(move_query)
+        self.session.commit()
+        return result.rowcount
 
     def get_all_executors(self) -> list[Executor]:
         return list(self.session.query(Executor).all())

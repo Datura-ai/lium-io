@@ -181,13 +181,40 @@ def _load_config_with_override(monkeypatch, next_hotkey: str | None):
     return module
 
 
-def test_without_an_override_only_the_current_hotkey_is_configured(monkeypatch):
-    # regression: an empty `next` becomes a second entry ("" or a duplicate of current), or the
-    # environment variable of the same name is honoured — the fleet as deployed today must see
-    # exactly one hotkey, and a provider's .env must not add a signer
+def test_without_an_override_the_built_in_pair_is_configured_current_first(monkeypatch):
+    # regression: the default build trusts only `current` (the fleet is refused by the validator
+    # after the chain swap), lists `next` first (the log names the wrong key as `current`), or
+    # honours the environment variable of the same name (a provider's .env adds a signer)
     config = _load_config_with_override(monkeypatch, next_hotkey=None)
 
-    assert config.VALIDATOR_HOTKEYS_SS58 == {"current": config.VALIDATOR_HOTKEY_SS58}
+    assert list(config.VALIDATOR_HOTKEYS_SS58.items()) == [
+        ("current", "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"),
+        ("next", "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK"),
+    ]
+
+
+def test_the_active_anchor_stays_the_current_hotkey_until_the_swap_release(monkeypatch):
+    # regression: the new address is written into `current` (the still-live validator is refused
+    # by every executor that restarts onto this release) instead of `next`
+    config = _load_config_with_override(monkeypatch, next_hotkey=None)
+
+    assert config.VALIDATOR_HOTKEY_SS58 == config._BUILTIN_VALIDATOR_HOTKEY_SS58
+    assert config.VALIDATOR_HOTKEY_SS58 != config._BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58
+
+
+def test_an_override_that_names_only_current_trusts_one_signer(monkeypatch):
+    # regression: the built-in `next` (the prod validator's new hotkey) leaks into a staging or e2e
+    # build whose override names only its own `current`
+    override = importlib.util.module_from_spec(importlib.machinery.ModuleSpec("core.config_override", None))
+    override._VALIDATOR_HOTKEY_SS58 = bittensor.Keypair.create_from_uri("//LiumStagingOnly").ss58_address
+    monkeypatch.setitem(sys.modules, "core.config_override", override)
+    monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY_SS58", bittensor.Keypair.create_from_uri("//FromEnv").ss58_address)
+    path = os.path.join(os.path.dirname(__file__), "..", "src", "core", "config.py")
+    spec = importlib.util.spec_from_file_location("config_under_test_staging", path)
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+
+    assert config.VALIDATOR_HOTKEYS_SS58 == {"current": override._VALIDATOR_HOTKEY_SS58}
 
 
 def test_the_build_time_override_adds_the_next_hotkey_after_current(monkeypatch, next_validator):
