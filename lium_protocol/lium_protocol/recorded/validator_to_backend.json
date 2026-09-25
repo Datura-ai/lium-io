@@ -140,6 +140,7 @@
         "log_text": "Host SSH unreachable",
         "log_status": "error",
         "job_batch_id": "2026-09-25T10:15:00+00:00",
+        "collateral_deposited": true,
         "validation_event": {
           "event": "Host SSH unreachable",
           "reason_code": "EXECUTOR_SSH_UNREACHABLE",
@@ -189,6 +190,7 @@
         "log_text": "No result from the miner for this node",
         "log_status": "error",
         "job_batch_id": "2026-09-25T10:15:00+00:00",
+        "collateral_deposited": true,
         "validation_event": {
           "event": "No result from the miner for this node",
           "reason_code": "EXECUTOR_RESULT_MISSING",
