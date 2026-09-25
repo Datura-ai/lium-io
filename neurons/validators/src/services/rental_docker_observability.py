@@ -212,6 +212,8 @@ def rental_run_spec_log_fields(run_spec: ContainerRunSpec) -> dict:
         ],
         "cpu_count": run_spec.cpu_count,
         "memory_gb": run_spec.memory_gb,
+        "memory_swap_gb": run_spec.memory_swap_gb,
+        "oom_score_adj": run_spec.oom_score_adj,
         "storage_limit_gb": run_spec.storage_limit_gb,
         "shm_size": run_spec.shm_size,
         "entrypoint": run_spec.entrypoint,

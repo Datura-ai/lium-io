@@ -123,6 +123,7 @@ from services.rental_docker_sdk import (
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
 )
+from services.rental_memory import RentalMemoryLimit, resolve_rental_memory_limit
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     start_storage_operation,
@@ -1462,7 +1463,12 @@ class DockerService:
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
         quote_socket: bool = False,
+        memory_limit: RentalMemoryLimit | None = None,
     ) -> ContainerRunSpec:
+        # DAH-3798: with a resolved limit the container gets it with swap off and the renter-first OOM score;
+        # without one (or with RENTAL_MEMORY_CAP_ENABLED off) the backend's memory_gb as before.
+        memory_gb = memory_limit.limit_gb if memory_limit is not None else payload.memory_gb
+        swap_off = memory_limit is not None and memory_limit.swap_off
         environment = {
             key: str(value)
             for key, value in (custom_options.environment or {}).items()
@@ -1513,11 +1519,13 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
-            ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
+            ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
-            memory_gb=payload.memory_gb,
+            memory_gb=memory_gb,
+            memory_swap_gb=memory_gb if swap_off else None,
+            oom_score_adj=settings.RENTAL_CONTAINER_OOM_SCORE_ADJ if swap_off else None,
             storage_limit_gb=effective_storage_limit_gb,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
@@ -1604,11 +1612,12 @@ class DockerService:
         forwarded verbs devices are unusable without this (DAH-2571).
 
         Both conditions matter, though the limit is a bound, not safety. Locked pages are charged to
-        the container's memory cgroup, so the tenant can pin at most `memory_gb` — but on a
-        whole-host rental that is the machine: `ram_total` is host RAM less ~2 GiB. What the cgroup
+        the container's memory cgroup, so the tenant can pin at most `memory_gb` — on a whole-host
+        rental the host's RAM less the DAH-3798 reserve (`services/rental_memory.py`). What the cgroup
         buys is a ceiling the kernel enforces and the OOM killer can act on. Without one —
-        `mem_limit` is skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 —
-        there is no ceiling at all, and mlocked pages never reclaim.
+        `mem_limit` is skipped for a falsy `memory_gb`, which now happens only when the host's RAM
+        could not be read for a pod row sized 0, or with RENTAL_MEMORY_CAP_ENABLED off — there is no
+        ceiling at all, and mlocked pages never reclaim.
         """
         forwards_rdma = any(
             device.path_on_host.startswith("/dev/infiniband/") for device in devices
@@ -6116,6 +6125,16 @@ class DockerService:
                     )
                     # the broker cold start (image pull, socket wait) must not read as port-check wait
                     prev_timestamp = now_ms()
+
+                current_step = "memory_limit"
+                memory_limit = await resolve_rental_memory_limit(
+                    ssh_client,
+                    requested_gb=payload.memory_gb,
+                    gpu_uuids=payload.gpu_uuids,
+                    log_extra=default_extra,
+                )
+                if memory_limit.cap_enabled:
+                    await self.stream_log(memory_limit.describe(), "info", log_tag)
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -6129,6 +6148,7 @@ class DockerService:
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
                     quote_socket=quote_socket,
+                    memory_limit=memory_limit,
                 )
 
                 logger.info(
