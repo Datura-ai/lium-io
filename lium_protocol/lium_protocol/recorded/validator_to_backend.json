@@ -124,6 +124,98 @@
       }
     },
     {
+      "expect": "ExecutorSpecRequest",
+      "note": "host SSH unreachable: the structured event carries the reason code, pod_ssh this cycle's probe of the node's two rented pods (one answered, one timed out)",
+      "message": {
+        "message_type": "ExecutorSpecRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "miner_coldkey": "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "executor_ip": "203.0.113.10",
+        "executor_port": 8001,
+        "specs": null,
+        "score": 0.0,
+        "synthetic_job_score": null,
+        "log_text": "Host SSH unreachable",
+        "log_status": "error",
+        "job_batch_id": "2026-09-25T10:15:00+00:00",
+        "validation_event": {
+          "event": "Host SSH unreachable",
+          "reason_code": "EXECUTOR_SSH_UNREACHABLE",
+          "severity": "error",
+          "category": "availability",
+          "impact": "The node could not be validated this cycle",
+          "remediation": null,
+          "what_we_saw": {},
+          "warnings": [],
+          "help_uri": null,
+          "check_id": "ssh_connect",
+          "pipeline_id": null,
+          "trace_id": "3f2b8c1e-6d4a-4e59-9a07-5c1d2e3f4a5b",
+          "when": "2026-09-25T10:16:40Z",
+          "context": {}
+        },
+        "pod_ssh": [
+          {
+            "pod_id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+            "result": "banner",
+            "errno": null,
+            "fleet_ok": true
+          },
+          {
+            "pod_id": "9a8b7c6d-5e4f-4302-b1a0-f9e8d7c6b5a4",
+            "result": "timeout",
+            "errno": 110,
+            "fleet_ok": true
+          }
+        ]
+      }
+    },
+    {
+      "expect": "ExecutorSpecRequest",
+      "note": "a rented node the miner returned no result for: EXECUTOR_RESULT_MISSING, zero score, no specs, only the pod SSH observations (this one taken in a cycle whose probe share put the outage on the validator's side)",
+      "message": {
+        "message_type": "ExecutorSpecRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "miner_coldkey": "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "executor_ip": "203.0.113.10",
+        "executor_port": 8001,
+        "specs": null,
+        "score": 0.0,
+        "synthetic_job_score": null,
+        "log_text": "No result from the miner for this node",
+        "log_status": "error",
+        "job_batch_id": "2026-09-25T10:15:00+00:00",
+        "validation_event": {
+          "event": "No result from the miner for this node",
+          "reason_code": "EXECUTOR_RESULT_MISSING",
+          "severity": "error",
+          "category": "availability",
+          "impact": "The node could not be validated this cycle",
+          "remediation": null,
+          "what_we_saw": {},
+          "warnings": [],
+          "help_uri": null,
+          "check_id": null,
+          "pipeline_id": null,
+          "trace_id": "3f2b8c1e-6d4a-4e59-9a07-5c1d2e3f4a5b",
+          "when": "2026-09-25T10:16:40Z",
+          "context": {}
+        },
+        "pod_ssh": [
+          {
+            "pod_id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+            "result": "refused",
+            "errno": 111,
+            "fleet_ok": false
+          }
+        ]
+      }
+    },
+    {
       "expect": "RentedMachineRequest",
       "message": {
         "message_type": "RentedMachineRequest"
