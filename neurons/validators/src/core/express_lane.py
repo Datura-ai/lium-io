@@ -10,8 +10,9 @@ executor snapshot, picks the executors assigned to this validator that registere
 cycle since start began and that no cycle has published yet, and runs the SAME pipeline the cycle
 runs — same job files, digests and image snapshot, same checks, as a first pass (DAH-3011) — on
 each one, alone, then publishes the result spec-only (scored_at stays None, so the backend creates
-the executor row but writes no incentive ledger row). The next scored cycle overwrites it as
-today. Off by default (settings.EXPRESS_LANE_ENABLED).
+the executor row but writes no incentive ledger row) under that cycle's job_batch_id, so its
+prod_executors row lands on the cycle's time. The next scored cycle overwrites it as today. Off by
+default (settings.EXPRESS_LANE_ENABLED).
 """
 
 import asyncio
@@ -51,6 +52,18 @@ MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+def _cycle_batch_id_or_clock(cycle_batch_id: str) -> str:
+    """The cycle's id, or the clock when the cycle could not read its block time
+    (SubtensorClient.get_time_from_block gives "Unknown"): the backend's write of a spec whose id
+    does not parse fails before it lists the node, and a node checked ahead of the cycle must
+    still be published."""
+    try:
+        datetime.strptime(cycle_batch_id, JOB_BATCH_ID_FORMAT)
+    except (TypeError, ValueError):
+        return datetime.now(UTC).strftime(JOB_BATCH_ID_FORMAT)
+    return cycle_batch_id
+
+
 @dataclass
 class CycleInputs:
     """What the cycle prepared for its wave. The express lane reuses it verbatim, so an express
@@ -59,6 +72,10 @@ class CycleInputs:
     encrypted_files: MinerJobEnryptedFiles
     default_image_digests: dict[str, str]
     executor_image_snapshot: ExpectedImageSnapshot | None
+    # The cycle's own job_batch_id. The backend parses it into the prod_executors row's time, and
+    # the fleet charts group rows by that time, so an express publish carries it: with an id of
+    # its own the node plots as a 1-2 node point between two fleet points.
+    job_batch_id: str
     # When the first cycle since this process started began. That cycle asked every serving miner
     # for its executors, so an executor registered before it is long-known even when its miner
     # failed or was offline that cycle and it never reached the validated set; only executors
@@ -192,6 +209,10 @@ class ExpressLane:
                     )
                 if executor.id in in_flight or pending.not_before > now:
                     continue
+                # The wave has not received this miner's list yet (a cycle started seconds ago):
+                # wait a tick, no attempt spent. See MinerService.miners_awaiting_wave_list.
+                if miner_hotkey in self.miner_service.miners_awaiting_wave_list:
+                    continue
                 candidates.append(pending)
 
         # Removed from the portal (or validated by the cycle) before this lane got to it.
@@ -258,6 +279,9 @@ class ExpressLane:
             if pending.executor.id in in_flight:
                 # The wave accepted it during the awaits above; it publishes it at the wave's end.
                 continue
+            if pending.miner_hotkey in self.miner_service.miners_awaiting_wave_list:
+                # A cycle started during the awaits above and its wave has not listed this miner.
+                continue
             miner = miners.get(pending.miner_hotkey)
             if miner is None:
                 pending.attempts += 1
@@ -283,7 +307,6 @@ class ExpressLane:
         # Counted against the node once the outcome is the node's (below); a verification the
         # validator itself spoiled is retried without spending one of MAX_ATTEMPTS.
         attempt = pending.attempts + 1
-        started_wall = datetime.now(UTC)
         started = time.monotonic()
         extra: dict[str, object] = {
             "executor_uuid": executor_id,
@@ -292,7 +315,9 @@ class ExpressLane:
         }
         try:
             payload = MinerJobRequestPayload(
-                job_batch_id=started_wall.strftime(JOB_BATCH_ID_FORMAT),
+                # The cycle whose job files this run uses, even when the next cycle starts
+                # before it publishes: that cycle's wave may publish the node under its own id.
+                job_batch_id=_cycle_batch_id_or_clock(inputs.job_batch_id),
                 miner_hotkey=miner.hotkey,
                 miner_coldkey=miner.coldkey,
                 miner_address=miner.axon_info.ip,
@@ -369,7 +394,10 @@ class ExpressLane:
         The next scored cycle overwrites the row as today.
         """
         executor_id = pending.executor.id
-        await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
+        # One node under the cycle's id: never the miner's batch for that id, the wave's is.
+        await self.miner_service.publish_machine_specs(
+            results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
+        )
         try:
             await self.redis_service.mark_executors_validated([executor_id])
         except Exception as exc:
