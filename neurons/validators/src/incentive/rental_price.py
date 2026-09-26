@@ -28,16 +28,17 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, DEFAULT_JOB_OWNER_MINER
+from services.const import (
+    DEFAULT_JOB_OWNER_MINER,
+    FIXED_RATIO,
+    MIN_PORT_COUNT,
+    SECONDS_PER_BLOCK,
+    TEMPO,
+)
 from services.task.models import MixedFormulaInputs
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
-
-# DAH-2250 — unrented incentive soft price limit (section 3 of the market-pricing
-# proposal). An unrented executor whose price_per_gpu exceeds the market p90 times
-# this multiplier forfeits the unrented rental incentive but stays active.
-SOFT_LIMIT_PRICE_RATE = 1.1
 
 # DAH-2520 — unrented incentive disk/VRAM gate. An unrented executor whose total disk
 # is below its summed GPU VRAM times this multiplier forfeits the unrented rental
@@ -88,6 +89,16 @@ class PowerCapIncapable(BaseModel):
 
     container_cap_eff: str  # effective capability mask of the executor container, hex
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
+
+
+class PortLimitedRemainder(BaseModel):
+    """The free remainder of a partially rented split node whose node has fewer free ports than
+    the marketplace floor (DAH-3698). `available_port_count` is the number PortCountCheck wrote
+    into the spec — verified ports minus the tenant's and the fillers' — the same figure the
+    platform lists against and the rent path refuses below."""
+
+    available_port_count: int
+    required_port_count: int
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -250,7 +261,7 @@ class RentalPriceIncentive(DefaultIncentive):
         return base_model
 
     def _is_over_soft_price_limit(self, result: JobResult) -> bool:
-        # miner price_per_gpu above the market p90 ceiling (p90 * SOFT_LIMIT_PRICE_RATE)
+        # miner price_per_gpu above the market p90 ceiling (p90 * soft_limit_price_rate)
         price_per_gpu = result.executor_info.price_per_gpu
         if not price_per_gpu:
             return False
@@ -258,12 +269,13 @@ class RentalPriceIncentive(DefaultIncentive):
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
         if not p90:
             return False
-        return price_per_gpu > p90 * SOFT_LIMIT_PRICE_RATE
+        return price_per_gpu > p90 * shared_client.config.soft_limit_price_rate
 
     def _log_soft_price_limit(self, result: JobResult) -> None:
         # structured log for every unrented executor over the p90 soft ceiling
         enforced = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
+        rate = shared_client.config.soft_limit_price_rate
         logger.info(
             _m(
                 "Unrented executor over market p90 soft price limit"
@@ -274,8 +286,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_count": result.gpu_count,
                     "price_per_gpu": result.executor_info.price_per_gpu,
                     "machine_price_p90": p90,
-                    "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
-                    "soft_limit_threshold": p90 * SOFT_LIMIT_PRICE_RATE if p90 else None,
+                    "soft_limit_rate": rate,
+                    "soft_limit_threshold": p90 * rate if p90 else None,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
@@ -476,6 +488,60 @@ class RentalPriceIncentive(DefaultIncentive):
                 },
             )
         )
+
+    @staticmethod
+    def _port_limited_remainder(result: JobResult) -> PortLimitedRemainder | None:
+        # None whenever the spec does not carry a readable count: a synthetic result or an
+        # older validator must never cost a miner the incentive.
+        if not result.is_split_remainder or result.spec is None:
+            return None
+        # a Lium filler does not exempt it: not rentable on Lium means no idle pay
+        available: Any = result.spec.get("available_port_count")
+        # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
+        if not isinstance(available, int) or isinstance(available, bool):
+            return None
+        if available >= MIN_PORT_COUNT:
+            return None
+        return PortLimitedRemainder(available_port_count=available, required_port_count=MIN_PORT_COUNT)
+
+    def _log_port_limited_remainder(
+        self, result: JobResult, port_limited: PortLimitedRemainder
+    ) -> None:
+        # structured log for every split remainder under the marketplace port floor; the reason
+        # code is what Loki and the provider dashboard (DAH-3699) key off
+        enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
+        logger.info(
+            _m(
+                "Free remainder of a partially rented split node is below the marketplace port floor"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required_port_count,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _withhold_idle_pay_if_port_limited(self, job_result: JobResult) -> bool:
+        """Log a port-limited split remainder; True when the flag withholds its unrented incentive.
+
+        While ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is off the shortfall is only logged.
+        """
+        port_limited: PortLimitedRemainder | None = self._port_limited_remainder(job_result)
+        if port_limited is None:
+            return False
+        self._log_port_limited_remainder(job_result, port_limited)
+        if not settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER:
+            return False
+        job_result.record_incentive_log(
+            MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited)
+        )
+        return True
 
     def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
@@ -932,6 +998,11 @@ class RentalPriceIncentive(DefaultIncentive):
             and (job_result.score > 0 or job_result.job_score > 0)
         )
 
+        # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
+        # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
+        if eligible_for_rental_share and self._withhold_idle_pay_if_port_limited(job_result):
+            eligible_for_rental_share = False
+
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays
         # active). While the flag is off we only log the would-be exclusion (shadow).
@@ -941,7 +1012,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 p90: float | None = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
                 reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
-                    job_result, p90, SOFT_LIMIT_PRICE_RATE
+                    job_result, p90, shared_client.config.soft_limit_price_rate
                 )
                 job_result.record_incentive_log(reason)
 

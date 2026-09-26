@@ -1,20 +1,44 @@
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import NamedTuple, TypeVar
 
 from core.utils import _m, get_extra_info
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerExecSpec,
     ContainerRunSpec,
+    RentalDockerContainerRestartingError,
     RentalDockerSdkClient,
+    is_docker_not_found_error,
 )
 
 logger = logging.getLogger(__name__)
 
 _DOCKER_SDK_LOG_OUTPUT_LIMIT = 2000
 _T = TypeVar("_T")
+
+
+class _FailureLog(NamedTuple):
+    """How a failed Docker SDK call is logged: its level and the reason class, None for a fault."""
+
+    level: int
+    reason: str | None
+
+
+def _failure_level_and_reason(operation: str, exc: Exception) -> _FailureLog:
+    """The log level and reason class for a failed Docker SDK call (DAH-3593).
+
+    A remove that finds nothing to remove and a workload container that keeps restarting are
+    expected outcomes, not validator faults: the first is a delete racing failed-create cleanup
+    (idempotent by design, DAH-2345), the second a renter or filler image that exits at start.
+    Everything else keeps ERROR with no reason (the logger drops None fields).
+    """
+    if operation.startswith("remove") and is_docker_not_found_error(exc):
+        return _FailureLog(logging.INFO, "already_gone")
+    if isinstance(exc, RentalDockerContainerRestartingError):
+        return _FailureLog(logging.WARNING, "workload_container_restarting")
+    return _FailureLog(logging.ERROR, None)
 
 
 def _truncate_log_text(value: object, limit: int = _DOCKER_SDK_LOG_OUTPUT_LIMIT) -> str:
@@ -90,13 +114,15 @@ async def run_logged_rental_docker_sdk_operation(
     try:
         result = await call()
     except Exception as exc:
+        failure = _failure_level_and_reason(operation, exc)
         log_rental_docker_sdk_operation(
             operation=operation,
             status="failed",
             log_extra=log_extra,
-            level=logging.ERROR,
+            level=failure.level,
             duration_ms=int((time.monotonic() - start) * 1000),
             error=str(exc),
+            reason=failure.reason,
             **fields,
         )
         raise
@@ -129,13 +155,15 @@ async def exec_logged_rental_docker_sdk_operation(
     try:
         result = await docker_client.exec_in_container(exec_spec)
     except Exception as exc:
+        failure = _failure_level_and_reason(operation, exc)
         log_rental_docker_sdk_operation(
             operation=operation,
             status="failed",
             log_extra=log_extra,
-            level=logging.ERROR,
+            level=failure.level,
             duration_ms=int((time.monotonic() - start) * 1000),
             error=str(exc),
+            reason=failure.reason,
             **fields,
         )
         raise

@@ -256,9 +256,7 @@ async def test_machine_spec_scrape_check(
         assert updated_state.specs.get("cpu") == mock_specs["cpu"]
         assert updated_state.specs.get("gpu_processes") == mock_specs["gpu_processes"]
         assert updated_state.specs.get("sysbox_runtime") == mock_specs["sysbox_runtime"]
-        # EMA network fields are always added; both None since mock_specs has no network data
-        assert updated_state.specs.get("network", {}).get("ema_download_speed") is None
-        assert updated_state.specs.get("network", {}).get("ema_upload_speed") is None
+        assert "network" not in updated_state.specs
         assert updated_state.gpu_count == 2
         assert updated_state.gpu_model == "NVIDIA RTX 3090"
         assert updated_state.gpu_model_count == "NVIDIA RTX 3090:2"
@@ -375,7 +373,7 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
 async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_slow(
     duration_ms, context_factory
 ):
-    # A scrape that dies deep in the run — past the network benchmark — is not an incompatible
+    # A scrape that dies deep in the run is not an incompatible
     # interpreter, and an upload plus a second full scrape would blow the per-executor budget.
     # Arrange
     runner = DummySSHCommandRunner(

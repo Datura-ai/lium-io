@@ -184,6 +184,28 @@ def _total_gpu_counts(all_job_results: dict[str, list]) -> dict[str, int]:
 
 
 @pytest.mark.asyncio
+async def test_cycle_with_no_miners_still_writes_snapshot_and_gpu_estimates(
+    validator_with_rental_price,
+    incentive_redis_service,
+):
+    """A network with no reachable miner still answers estimate requests, and the empty
+    cycle neither scores anyone nor ends the post-restart set_weights warm-up."""
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    await _run_sync_with_jobs(validator, [], {})
+
+    incentive_redis_service.set_incentive_snapshot.assert_awaited_once()
+    snapshot = incentive_redis_service.set_incentive_snapshot.await_args.args[0]
+    assert snapshot.mining.total_gpu_count == 0
+    incentive_redis_service.set_gpu_estimates.assert_awaited_once()
+    estimates = incentive_redis_service.set_gpu_estimates.await_args.args[0]
+    assert set(estimates) == set(BASE_GPU_MAP)
+    assert validator.miner_scores == {}
+    assert validator.completed_cycles_since_start == 0
+
+
+@pytest.mark.asyncio
 async def test_rental_price_scenario_basic_mixed(
     validator_with_rental_price,
     mock_subtensor_client,

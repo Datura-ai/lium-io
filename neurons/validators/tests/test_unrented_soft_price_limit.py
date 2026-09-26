@@ -1,7 +1,7 @@
 """DAH-2250 — unrented incentive soft price limit.
 
 An unrented executor priced above the market p90 ceiling
-(machine_prices_p90[gpu] * SOFT_LIMIT_PRICE_RATE) forfeits the unrented rental
+(machine_prices_p90[gpu] * the shared config's soft_limit_price_rate) forfeits the unrented rental
 incentive while staying active. Enforcement is gated by
 ENABLE_UNRENTED_SOFT_PRICE_LIMIT; while the flag is off the breach is only
 logged (shadow mode) and the payout is unchanged.
@@ -89,6 +89,37 @@ def test_is_over_soft_price_limit_at_threshold_is_not_over(monkeypatch):
 
     # Assert
     assert over is False
+
+
+def _set_soft_rate(monkeypatch, rate: float) -> None:
+    new_cfg = shared_client.config.model_copy(update={"soft_limit_price_rate": rate})
+    monkeypatch.setattr(shared_client, "_config", new_cfg)
+
+
+def test_the_threshold_is_the_served_soft_limit_price_rate(monkeypatch):
+    # the backend serves 1.5 when the raised soft limit is on: threshold 2.0 * 1.5 = 3.0
+    _set_p90(monkeypatch, {H200: 2.0})
+    _set_soft_rate(monkeypatch, 1.5)
+    incentive = _build_incentive()
+
+    assert incentive._is_over_soft_price_limit(_make_job(2.3)) is False
+    assert incentive._is_over_soft_price_limit(_make_job(3.0)) is False
+    assert incentive._is_over_soft_price_limit(_make_job(3.01)) is True
+
+
+@pytest.mark.asyncio
+async def test_enforced_log_quotes_the_served_rate(monkeypatch):
+    _set_p90(monkeypatch, {H200: 2.0})
+    _set_soft_rate(monkeypatch, 1.5)
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(3.1))
+
+    log = "\n".join(result.incentive_logs)
+    assert result.eligible_for_rental_share is False
+    assert "$3.0 " in log  # the ceiling / price to set
+    assert "x 1.5)" in log
 
 
 def test_is_over_soft_price_limit_no_market_data(monkeypatch):

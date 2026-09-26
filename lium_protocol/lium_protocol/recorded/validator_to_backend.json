@@ -24,7 +24,7 @@
     },
     {
       "expect": "ExecutorSpecRequest",
-      "note": "a scored node with the DAH-2467 incentive split and one DAH-2340 reason; specs is the scraper's object",
+      "note": "a scored node with the DAH-2467 incentive split, one DAH-2340 reason and two DAH-3338 pod states; specs is the scraper's object",
       "message": {
         "message_type": "ExecutorSpecRequest",
         "sent_at": 1757363580.125,
@@ -88,7 +88,19 @@
             }
           }
         ],
-        "batch_total": 140
+        "batch_total": 140,
+        "pod_states": [
+          {
+            "pod_id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+            "container_state": "running",
+            "observed_at": "2026-09-08T20:32:40Z"
+          },
+          {
+            "pod_id": "9a8b7c6d-5e4f-4302-b1a0-f9e8d7c6b5a4",
+            "container_state": "reaped",
+            "observed_at": "2026-09-08T20:31:05Z"
+          }
+        ]
       }
     },
     {
@@ -234,6 +246,39 @@
       "note": "the validator's model has no `snapshot`; the backend declares it and reads None"
     },
     {
+      "expect": "PodStatesReport",
+      "note": "DAH-3338: chunk 0 of 1 of one cycle's container states on one node; `unknown` is a pod the validator could not inspect, not an absent one",
+      "message": {
+        "message_type": "PodStatesReport",
+        "sent_at": 1757363581.5,
+        "forwarded_at": 1757363581.625,
+        "queue_depth": 1,
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "job_batch_id": "2026-09-08T20:30:00+00:00",
+        "chunk_index": 0,
+        "chunk_total": 1,
+        "pod_states": [
+          {
+            "pod_id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+            "container_state": "running",
+            "observed_at": "2026-09-08T20:32:40Z"
+          },
+          {
+            "pod_id": "c1d2e3f4-0516-4728-9a3b-4c5d6e7f8091",
+            "container_state": "unknown",
+            "observed_at": "2026-09-08T20:32:41Z"
+          },
+          {
+            "pod_id": "9a8b7c6d-5e4f-4302-b1a0-f9e8d7c6b5a4",
+            "container_state": "reaped",
+            "observed_at": "2026-09-08T20:31:05Z"
+          }
+        ]
+      }
+    },
+    {
       "expect": "ContainerCreated",
       "note": "the DAH-1524 profiler steps are the validator's ProfilerStep wire shape: name + duration, the anchor with timestamp, `skipped` only when true",
       "message": {
@@ -367,6 +412,40 @@
         "error_type": "ContainerCreationFailed",
         "error_code": "NoPortMappings",
         "msg": "No port mappings available"
+      }
+    },
+    {
+      "expect": "FailedContainerRequest",
+      "note": "1.1.0 (DAH-3504): a custom-Dockerfile build failed at docker_build; build_log_tail is the renter's own build output, detail names the step only",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "error_type": "ContainerCreationFailed",
+        "msg": "Failed create_container",
+        "detail": "Failed create_container {'executor': '203.0.113.10:2200', 'error': 'Custom dockerfile build failed (failure_step=docker_build)', 'failure_step': 'docker_build'}",
+        "error_code": "UnknownError",
+        "failure_step": "docker_build",
+        "build_log_tail": "#5 [2/2] RUN apt-get install -y nonexistent-package\n#5 0.412 E: Unable to locate package nonexistent-package\n#5 ERROR: process \"/bin/sh -c apt-get install -y nonexistent-package\" did not complete successfully: exit code: 100"
+      }
+    },
+    {
+      "expect": "FailedContainerRequest",
+      "note": "1.1.0 (DAH-3505): the volume step failed; step_detail is the Docker daemon's own bounded reason, detail names the step only",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "error_type": "ContainerCreationFailed",
+        "msg": "Failed create_container",
+        "detail": "Failed create_container {'executor': '203.0.113.10:2200', 'error': 'volume creation failed (failure_step=volume_creation)', 'failure_step': 'volume_creation'}",
+        "error_code": "UnknownError",
+        "failure_step": "volume_creation",
+        "step_detail": "500 Server Error: Internal Server Error (\"create lium-vol-0b1c2d3e: error while creating volume: no space left on device\")"
       }
     },
     {
