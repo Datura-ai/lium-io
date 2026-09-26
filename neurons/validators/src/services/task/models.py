@@ -109,7 +109,7 @@ class JobResult(BaseModel):
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
-    # DAH-3698: free GPUs of a GPU-split node that its free verified ports cannot back at the
+    # Free GPUs of a GPU-split node that its free verified ports cannot back at the
     # marketplace floor; they earn no idle pay while ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS
     # is on. 0 for every other result, so `idle_payable_gpu_count == gpu_count` there.
     port_unbacked_gpu_count: int = 0
@@ -143,7 +143,7 @@ class JobResult(BaseModel):
 
     @property
     def idle_payable_gpu_count(self) -> int:
-        """GPUs the unrented pool pays for: `gpu_count` less the port-unbacked ones (DAH-3698)."""
+        """GPUs the unrented pool pays for: `gpu_count` less the port-unbacked ones."""
         return max(self.gpu_count - self.port_unbacked_gpu_count, 0)
 
     def record_mixed_formula_inputs(self, inputs: "MixedFormulaInputs") -> None:

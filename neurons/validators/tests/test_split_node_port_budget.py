@@ -1,4 +1,4 @@
-"""DAH-3698 (owner, 22 Sep 2026) — a GPU-split node's free GPUs earn idle pay only up to the
+"""Port budget for split nodes — a GPU-split node's free GPUs earn idle pay only up to the
 number its free verified ports can back at the marketplace floor.
 
 The platform gives every pod MIN_PORT_COUNT ports (`prepare_ports_data`, the rent path's 409
@@ -415,7 +415,7 @@ async def test_flag_on_bucket_summary_counts_the_paid_gpus(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_flag_on_node_with_ports_for_every_gpu_is_paid_as_before(monkeypatch, caplog):
-    # Arrange — 4 free GPUs, 12 free ports: DAH-2467 behaviour unchanged, no line at all.
+    # Arrange — 4 free GPUs, 12 free ports: mixed split scoring unchanged, no line at all.
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
     split_job = _make_job(available_port_count=4 * MIN_PORT_COUNT)
     plain_job = _plain_idle_job()
@@ -525,7 +525,7 @@ async def test_flag_on_whole_idle_split_node_below_the_floor_gets_this_rules_rea
 @pytest.mark.asyncio
 async def test_flag_on_whole_idle_split_node_stays_in_its_gpu_count_tier(monkeypatch):
     # Arrange — an idle 8-GPU node splitting into 1-GPU pods with 6 open ports (2 GPUs backed).
-    # DAH-2528 pins a split-capable node to its gpu_count tier while that tier has a cap; the
+    # The bucket fallback pins a split-capable node to its gpu_count tier while that tier has a cap; the
     # budget changes how many GPUs it counts there, not which tier it is rated in.
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
     split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
@@ -544,7 +544,7 @@ async def test_flag_on_whole_idle_split_node_stays_in_its_gpu_count_tier(monkeyp
 @pytest.mark.asyncio
 async def test_flag_on_reassignment_moves_the_backed_gpus_only(monkeypatch):
     # Arrange — the 8× tier is capped at 8 GPUs and a plain idle 8× node already fills it. The
-    # split node (6 ports → 2 backed GPUs) is over cap there; DAH-2528 moves it to the 1× tier
+    # split node (6 ports → 2 backed GPUs) is over cap there; the bucket fallback moves it to the 1× tier
     # when the node fits — and "the node" is its 2 payable GPUs, not 8, on both sides of the move.
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
     config = IncentiveConfig(max_unrented_gpus={"H200": {1: 10, 8: 8}})

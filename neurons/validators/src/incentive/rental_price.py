@@ -110,8 +110,8 @@ PORT_UNBACKED_GPUS_EVENT = "port_unbacked_gpus"  # log/job-log event code, appen
 
 
 class PortBudgetShortfall(BaseModel):
-    """Free GPUs of a GPU-split node that its free verified ports cannot back (DAH-3698, owner
-    22 Sep 2026: a split node needs ports for every GPU it splits into). The marketplace hands
+    """Free GPUs of a GPU-split node that its free verified ports cannot back (a split node
+    needs ports for every GPU it splits into). The marketplace hands
     every pod MIN_PORT_COUNT ports and rents a split node in bundles of gpu_splitting_min_count
     GPUs, so `available_port_count // MIN_PORT_COUNT` bundles can still start on the node:
     `backed_gpu_count` free GPUs are rentable, the `unbacked_gpu_count` beyond them are not."""
@@ -848,7 +848,7 @@ class RentalPriceIncentive(DefaultIncentive):
             result.max_cap = max_cap
 
             # accumulate raw unrented GPU count and weighted rate sum per bucket; a GPU-split
-            # node's port-unbacked GPUs (DAH-3698) are left out of both
+            # node's port-unbacked GPUs are left out of both
             payable_gpu_count: int = result.idle_payable_gpu_count
             if result.hourly_rate > 0 and max_cap > 0:
                 key = (base_model, bucket)
@@ -1021,7 +1021,7 @@ class RentalPriceIncentive(DefaultIncentive):
         self._set_cycle_formula_context(result)
 
         # calculate incentive score
-        # DAH-3698: a GPU-split node's port-unbacked GPUs earn nothing here (payable count)
+        # A GPU-split node's port-unbacked GPUs earn nothing here (payable count)
         result.incentive = (
             result.rental_share * result.idle_payable_gpu_count * result.effective_rate / result.total_rental_cost
             if result.total_rental_cost > 0 else 0.0
@@ -1112,12 +1112,12 @@ class RentalPriceIncentive(DefaultIncentive):
             and (job_result.score > 0 or job_result.job_score > 0)
         )
 
-        # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
+        # A split remainder under the marketplace port floor is capacity nobody can
         # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
         if eligible_for_rental_share and self._withhold_idle_pay_if_port_limited(job_result):
             eligible_for_rental_share = False
 
-        # DAH-3698 (owner, 22 Sep 2026): a split node's free GPUs are paid idle only up to the
+        # Port budget: a split node's free GPUs are paid idle only up to the
         # number its free ports can back — one pod of gpu_splitting_min_count GPUs per
         # MIN_PORT_COUNT free ports. The result stays eligible while at least one GPU is backed
         # (only its payable count shrinks); with none backed it leaves the pool with a reason.
