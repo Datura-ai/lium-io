@@ -117,7 +117,7 @@ To set every value by hand, use the [manual setup](neurons/executor/README.md#ma
 |---|---|---|
 | Stuck at `VALIDATION PENDING`, then `NOT_DETECTED`, with no errors | The account has no coordinator, so no check ever runs | Select the Central Provider Server in [Profile Settings](https://provider.lium.io/settings), or start your self-hosted miner |
 | `INSUFFICIENT_PORTS` | Fewer than 3 renting ports are reachable from the validator | Open `RENTING_PORT_RANGE` on the firewall or NAT, or widen it, then `docker compose up -d` in `neurons/executor` |
-| `PORT_VERIFY_FAILED` | A port the validator mapped is closed, or NAT forwards a different external port | Behind NAT, list the pairs in `RENTING_PORT_MAPPINGS` rather than `RENTING_PORT_RANGE` |
+| `PORT_VERIFY_FAILED` | A port the validator mapped is closed, or NAT forwards a different external port | Behind NAT, list the pairs in `RENTING_PORT_MAPPINGS` (internal, external) and leave `RENTING_PORT_RANGE` unset |
 | SSH errors or `UPLOAD_FAILED` | The node SSH port (`2200`) is not reachable from outside | Open it, or set `SSH_PUBLIC_PORT` to the port your NAT forwards |
 | Job Logs mention `sysbox-runc` | Sysbox is missing or not working | Rerun step 3; see [Sysbox](https://docs.lium.io/providers/nodes/sysbox) |
 | `VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW` | Download speed below 100 Mbps | Reproduce it with the [VerifyX benchmark](https://docs.lium.io/providers/troubleshooting#2-run-the-verifyx-benchmark-to-reproduce-validator-checks), then fix the uplink |
