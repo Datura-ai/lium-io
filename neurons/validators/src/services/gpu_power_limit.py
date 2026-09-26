@@ -10,7 +10,7 @@ Redis state (all keys written only by this validator):
   limit; overwriting on a re-cap would ratchet the "original" down forever). Deleted only after the
   recorded limit has been successfully restored with ``nvidia-smi -pl``.
 - ``gpu_power_restore_pod:<pod_id>`` — the GPUs a filler pod capped with the watts each was capped at
-  (``{gpu_uuid: watts}``; an older index is a plain uuid list), so its delete can restore exactly its own
+  (``{gpu_uuid: watts}``, null for a GPU the cap did not lower; an older index is a plain uuid list), so its delete can restore exactly its own
   GPUs without an SSH enumeration and without sweeping a replacement filler's fresh
   records.
 
@@ -733,14 +733,15 @@ async def _raise_gpus_left_at_lium_cap(
     return await _raise_to_default(ssh, executor_id, targets, log_extra)
 
 
-def _parse_pod_index(raw_index: str | bytes) -> dict[str, int | None]:
-    """The pod index as {gpu_uuid: applied cap watts}; an index written before the cap was stored is a
-    plain list of uuids and reads with a cap of None. Raises ValueError/TypeError on anything else."""
+def _parse_pod_index(raw_index: str | bytes) -> tuple[dict[str, int | None], bool]:
+    """The pod index as ({gpu_uuid: cap watts, or None when the cap did not lower it}, legacy). An index
+    written before caps were stored is a plain list of uuids: legacy, every cap None. Raises
+    ValueError/TypeError on anything else."""
     parsed = json.loads(raw_index)
     if isinstance(parsed, dict):
-        return {str(uuid): int(watts) for uuid, watts in parsed.items()}
+        return {str(uuid): None if watts is None else int(watts) for uuid, watts in parsed.items()}, False
     if isinstance(parsed, list):
-        return {str(uuid): None for uuid in parsed}
+        return {str(uuid): None for uuid in parsed}, True
     raise TypeError(f"pod index is neither a dict nor a list: {type(parsed).__name__}")
 
 
@@ -773,7 +774,7 @@ async def restore_filler_pod_gpu_power_limits(
     if not raw_index:
         return 0
     try:
-        cap_watts_by_uuid: dict[str, int | None] = _parse_pod_index(raw_index)
+        cap_watts_by_uuid, legacy_index = _parse_pod_index(raw_index)
     except (ValueError, TypeError):
         _log(logging.ERROR, f"gpu power restore: dropped corrupt pod index {raw_index!r} for {pod_id}", {}, log_extra)
         return 0
@@ -781,7 +782,9 @@ async def restore_filler_pod_gpu_power_limits(
     # An index written before the cap was stored says nothing about the cap, so its GPUs are raised
     # only when they had no record before this restore (read first: the restore deletes what it
     # applies) and the read did not fail.
-    legacy_uuids: list[str] = [uuid for uuid, cap in cap_watts_by_uuid.items() if cap is None]
+    # A GPU the cap did not lower (cap None in a current index) is never raised: it reads the host's own
+    # limit before and after.
+    legacy_uuids: list[str] = capped_uuids if legacy_index else []
     raise_candidates: dict[str, int | None] = {
         uuid: cap for uuid, cap in cap_watts_by_uuid.items() if cap is not None
     }
@@ -841,6 +844,12 @@ async def apply_filler_gpu_power_limits(
     cap_watts_by_uuid: dict[str, int] = {
         target.gpu_uuid: _clamp_watts(target.watts, state_by_uuid[target.gpu_uuid]) for target in gpu_power_limits
     }
+    # The index keeps a GPU's cap only when the cap lowered it: a host limit at or under the target (the
+    # backend never raises one) reads the same before and after, and must never be taken for Lium's cap.
+    index_by_uuid: dict[str, int | None] = {
+        gpu_uuid: cap if cap < state_by_uuid[gpu_uuid].current_watts else None
+        for gpu_uuid, cap in cap_watts_by_uuid.items()
+    }
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
     for target in gpu_power_limits:
         pre_cap_watts = state_by_uuid[target.gpu_uuid].current_watts
@@ -849,7 +858,7 @@ async def apply_filler_gpu_power_limits(
             return False
     try:
         # The applied cap goes with each GPU: after the restore, a GPU still at it is lifted to its default.
-        await redis.set(_pod_index_key(pod_id), json.dumps(cap_watts_by_uuid))
+        await redis.set(_pod_index_key(pod_id), json.dumps(index_by_uuid))
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: could not persist pod index for {pod_id}: {exc}", {}, log_extra)
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
