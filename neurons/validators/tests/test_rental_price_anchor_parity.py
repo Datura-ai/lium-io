@@ -8,7 +8,13 @@ node until the 1.0 table in this PR is released and picked up by the pin.
 
 from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
-from incentive.config import BASE_GPU_MAP, RENTAL_PRICES_PER_HOUR, IncentiveConfig
+from incentive.config import (
+    BASE_GPU_MAP,
+    MARKET_PRICES_PER_HOUR,
+    RENTAL_PRICES_PER_HOUR,
+    UNRENTED_ANCHOR_MULTIPLIER,
+    IncentiveConfig,
+)
 from incentive.utils import get_hourly_rate
 
 SERVER = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
@@ -22,7 +28,7 @@ def test_incentive_config_anchors_server_edition_at_workstation_price():
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert prices[SERVER] == prices[WORKSTATION]
-    assert prices[SERVER] == upstream[WORKSTATION]
+    assert prices[SERVER] == upstream[WORKSTATION] * UNRENTED_ANCHOR_MULTIPLIER
 
 
 def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
@@ -52,5 +58,9 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC"}
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
     assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
-    differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
+    assert all(
+        RENTAL_PRICES_PER_HOUR[gpu] == MARKET_PRICES_PER_HOUR[gpu] * UNRENTED_ANCHOR_MULTIPLIER
+        for gpu in MARKET_PRICES_PER_HOUR
+    )
+    differing = {gpu for gpu in upstream if MARKET_PRICES_PER_HOUR[gpu] != upstream[gpu]}
     assert differing <= {SERVER, "NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 PC"}

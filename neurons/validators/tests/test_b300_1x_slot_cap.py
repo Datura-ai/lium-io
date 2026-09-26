@@ -1,4 +1,4 @@
-"""DAH-3601 (P157/P164): the B300 1× bucket pays for 4 idle cards, the 8× bucket for 32.
+"""DAH-3601 (P157/P164): the B300 1× bucket pays for 4 idle cards, the 8× bucket for 64.
 
 Regression: on 17 Sep 2026 the 13:28Z cycle held 12 idle single-card B300 nodes
 against a bucket cap of 10 (multiplier 10/12) while every 8-card node was rented.
@@ -58,7 +58,7 @@ async def test_twelve_idle_1x_b300_share_four_cards_of_pay_and_8x_is_untouched(m
 
     node_8x = jobs["miner_8x"][0]
     assert node_8x.count_bucket == 8
-    assert node_8x.max_cap == 32
+    assert node_8x.max_cap == 64
     assert node_8x.cap_dilution_applied is False
     assert node_8x.unrented_cap_multiplier == pytest.approx(1.0)
 

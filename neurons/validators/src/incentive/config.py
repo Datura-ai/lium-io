@@ -28,7 +28,13 @@ DEFAULT_PRICE = DefaultPrice()
 # validator pins the two editions to parity here; the override can go once the validator's lock
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
-RENTAL_PRICES_PER_HOUR: dict[str, float] = {
+#
+# An idle GPU is paid UNRENTED_ANCHOR_MULTIPLIER of its market anchor (B300: 6.40 -> 3.20 USD/GPU/h),
+# while the 8x bucket caps below are twice the pre-halving values, so a full 8x bucket pays the same
+# total as before and the pay is spread over twice as many GPUs. RENTAL_PRICES_PER_HOUR is read only
+# by the unrented-incentive rate; the soft price limit reads the market p90 table instead.
+UNRENTED_ANCHOR_MULTIPLIER: float = 0.5
+MARKET_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
@@ -39,7 +45,10 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
 # only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
 # from the AC entry, so a re-price of the AC card moves both names.
-RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+MARKET_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = MARKET_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+RENTAL_PRICES_PER_HOUR: dict[str, float] = {
+    gpu_model: price * UNRENTED_ANCHOR_MULTIPLIER for gpu_model, price in MARKET_PRICES_PER_HOUR.items()
+}
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -54,36 +63,41 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 #
 # The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
 # bucket cap equals `machines × gpus_per_machine`. Eligible families use
-# `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
+# `{1: 10, 8: 128}` — 10 single-GPU machines (10 GPUs) and 16 full chassis (16×8 = 128
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
+#
+# The 8× caps were doubled (B300 32 -> 64, the rest 64 -> 128) together with the halving of
+# the unrented anchor (UNRENTED_ANCHOR_MULTIPLIER): twice the idle 8× slots at half the
+# hourly pay each, so the most a full 8× bucket can earn is unchanged. The 1× caps are not
+# doubled.
 #
 # B300 1× bucket = 4 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
 # B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle.
 # The bucket pays for 4 cards, one below that p95 (Rustam, 18 Sep 2026). The
-# 8× bucket is unchanged. The 1× cap also dilutes the free GPUs of partially rented
+# 8× bucket was not changed by that decision. The 1× cap also dilutes the free GPUs of partially rented
 # split 8× nodes: their free portion is scored as a virtual result (DAH-2467) that is
 # always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
 # those cards share the 4 with the idle single-card nodes.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 4, 8: 32},
-    "B200": {1: 10, 8: 64},
-    "H200": {1: 10, 8: 64},
-    "H100": {1: 10, 8: 64},
-    "RTX 4090": {1: 10, 8: 64},
-    "A100": {1: 10, 8: 64},
-    "RTX A6000": {1: 10, 8: 64},
-    "RTX 3090": {1: 10, 8: 64},
+    "B300": {1: 4, 8: 64},
+    "B200": {1: 10, 8: 128},
+    "H200": {1: 10, 8: 128},
+    "H100": {1: 10, 8: 128},
+    "RTX 4090": {1: 10, 8: 128},
+    "A100": {1: 10, 8: 128},
+    "RTX A6000": {1: 10, 8: 128},
+    "RTX 3090": {1: 10, 8: 128},
     "H800": {},
     "A800": {},
     "CMP 170HX": {},
-    "RTX 5090": {1: 10, 8: 64},
+    "RTX 5090": {1: 10, 8: 128},
     "RTX 4000 Ada Generation": {},
-    "RTX 6000 Ada Generation": {1: 10, 8: 64},
-    "RTX PRO 6000": {1: 10, 8: 64},
+    "RTX 6000 Ada Generation": {1: 10, 8: 128},
+    "RTX PRO 6000": {1: 10, 8: 128},
     "L4": {},
-    "L40S": {1: 10, 8: 64},
-    "L40": {1: 10, 8: 64},
+    "L40S": {1: 10, 8: 128},
+    "L40": {1: 10, 8: 128},
     "RTX 2000 Ada Generation": {},
     "RTX A5000": {},
     "RTX A4500": {},
