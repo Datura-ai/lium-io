@@ -52,6 +52,10 @@ POD_SECRETS_DIR = "/run/lium/secrets"
 POD_SECRETS_TMPFS_SIZE_BYTES = 1024 * 1024
 POD_SECRETS_TMPFS_OPTIONS = f"rw,noexec,nosuid,nodev,size={POD_SECRETS_TMPFS_SIZE_BYTES},mode=0700"
 POD_SECRET_FILE_MODE = "0400"
+# Written only after every secret file is in place and handed over; the workload waits for it.
+# Secret names cannot start with a dot, so it never collides with one.
+POD_SECRETS_READY_MARKER = ".ready"
+POD_SECRETS_READY_MARKER_MODE = "0444"
 # tmpfs charges whole pages per file
 _TMPFS_PAGE_BYTES = 4096
 # None on a ContainerExecSpec: run as the container's configured USER, not pinned to root
@@ -1069,19 +1073,33 @@ def build_pod_secrets_handover_spec(
     """The one step, after every file is written, that gives the files and then the directory to
     `owner` (the container user's uid, gid), keeping 0400/0700. Only regular, unlinked files are
     touched and `chown -h` never follows a link; the directory is handed over last, so the user can
-    enter it only once nothing more is written as root."""
+    enter it only once nothing more is written as root.
+
+    Before that, the `.ready` marker (a UTC timestamp, root-owned 0444) is created exclusively under a
+    temp name and renamed into place, still inside the root-only directory. So the workload sees it
+    only when every file is there and its own, and a failure at any step leaves no marker.
+    """
     uid, gid = owner
     chown_to = f"{int(uid)}:{int(gid)}"
     secrets_dir = shlex.quote(POD_SECRETS_DIR)
     targets = " ".join(shlex.quote(f"{POD_SECRETS_DIR}/{name}") for name in valid_pod_secrets(secrets))
+    marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
+    partial_marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}.partial")
     script = (
-        "set -eu; "
+        "set -euC; umask 077; "
         + _pod_secrets_dir_guard(secrets_dir)
-        + f"for path in {targets}; do "
+        + f"for path in {partial_marker} {marker}; do "
+        "if [ -e \"$path\" ] || [ -L \"$path\" ]; then echo \"$path already exists\" >&2; exit 1; fi; "
+        "done; "
+        f"for path in {targets}; do "
         "if [ -L \"$path\" ] || [ ! -f \"$path\" ]; then echo \"$path is not a regular file\" >&2; exit 1; fi; "
         f"chown -h {chown_to} \"$path\"; chmod {POD_SECRET_FILE_MODE} \"$path\"; "
         "done; "
-        f"chown -h {chown_to} {secrets_dir}; chmod 0700 {secrets_dir}"
+        f"date -u +%Y-%m-%dT%H:%M:%SZ > {partial_marker}; "
+        f"chmod {POD_SECRETS_READY_MARKER_MODE} {partial_marker}; "
+        f"mv -T {partial_marker} {marker}; "
+        f"{{ chown -h {chown_to} {secrets_dir} && chmod 0700 {secrets_dir}; }} "
+        f"|| {{ rm -f {marker}; exit 1; }}"
     )
     return ContainerExecSpec(container_name=container_name, argv=("sh", "-c", script))
 

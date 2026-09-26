@@ -5,6 +5,7 @@ the flag off a rent is exactly today's."""
 import dataclasses
 import logging
 import os
+import re
 import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
@@ -22,6 +23,7 @@ from services.rental_docker_sdk import (
     POD_SECRETS_DIR,
     POD_SECRETS_TMPFS_OPTIONS,
     POD_SECRETS_TMPFS_SIZE_BYTES,
+    POD_SECRET_NAME_PATTERN,
     ContainerExecResult,
     ContainerExecSpec,
     RentalDockerSdkClient,
@@ -380,6 +382,7 @@ async def test_a_failed_secret_write_fails_the_rent_naming_only_the_secret(
 
     assert "Failed to write secret HF_TOKEN" in stream_messages
     assert len(_secret_specs(docker_client)) == 1
+    assert _handover_specs(docker_client) == []
     for message in stream_messages:
         for value in SECRET_VALUES:
             assert value not in str(message)
@@ -455,7 +458,8 @@ async def test_secrets_are_owned_by_the_container_user_and_stay_0700_0400(
     )
     script = handovers[0].argv[2]
     assert f'chown -h {owner} "$path"; chmod 0400 "$path"' in script
-    assert script.endswith(f"chown -h {owner} {POD_SECRETS_DIR}; chmod 0700 {POD_SECRETS_DIR}")
+    assert f"{{ chown -h {owner} {POD_SECRETS_DIR} && chmod 0700 {POD_SECRETS_DIR}; }}" in script
+    assert script.index('chown -h') < script.index("mv -T") < script.index(f"chown -h {owner} {POD_SECRETS_DIR} ")
     for name in SECRETS:
         assert f"{POD_SECRETS_DIR}/{name}" in script
     assert "mode=0700" in POD_SECRETS_TMPFS_OPTIONS.split(",")
@@ -573,7 +577,7 @@ def test_a_clean_write_then_handover_gives_the_owner_0400_files_in_a_0700_dir(pl
         assert _run_script(spec).returncode == 0
     handover = rental_docker_sdk.build_pod_secrets_handover_spec(container_name="pod", secrets=SECRETS, owner=owner)
     assert _run_script(handover).returncode == 0
-    assert sorted(os.listdir(secrets_dir)) == sorted(SECRETS)
+    assert sorted(os.listdir(secrets_dir)) == sorted([*SECRETS, ".ready"])
     for name, value in SECRETS.items():
         info = (secrets_dir / name).lstat()
         assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o400
@@ -625,6 +629,8 @@ def test_a_link_swapped_in_between_writes_fails_the_handover_without_touching_it
 
     assert run.returncode != 0
     assert "is not a regular file" in run.stderr
+    assert not os.path.lexists(secrets_dir / ".ready")
+    assert not os.path.lexists(secrets_dir / ".ready.partial")
     assert stat.S_IMODE(victim.stat().st_mode) == 0o644
     assert victim.read_text() == "original\n"
     assert stat.S_IMODE(secrets_dir.stat().st_mode) == 0o700
@@ -656,3 +662,66 @@ async def test_a_failed_handover_fails_the_rent(docker_service, executor_info, k
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "write_pod_secrets"
     assert len(_handover_specs(docker_client)) == 1
+
+
+def _handover(secrets=SECRETS):
+    return rental_docker_sdk.build_pod_secrets_handover_spec(
+        container_name="pod", secrets=secrets, owner=(os.getuid(), os.getgid())
+    )
+
+
+def test_the_ready_marker_appears_only_after_every_file_is_written_and_handed_over(plain_secrets_dir):
+    secrets_dir, _ = plain_secrets_dir
+    specs = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)
+    for spec in specs:
+        assert _run_script(spec).returncode == 0
+        assert not os.path.lexists(secrets_dir / ".ready")
+    assert all(spec.argv[2].count(".ready") == 0 for spec in specs)
+
+    assert _run_script(_handover()).returncode == 0
+
+    marker = secrets_dir / ".ready"
+    info = marker.lstat()
+    assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o444
+    content = marker.read_text().strip()
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", content)
+    for value in SECRET_VALUES:
+        assert value not in content
+    assert sorted(os.listdir(secrets_dir)) == sorted([*SECRETS, ".ready"])
+
+
+def test_a_missing_secret_file_leaves_no_ready_marker(plain_secrets_dir):
+    secrets_dir, _ = plain_secrets_dir
+    first = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)[0]
+    assert _run_script(first).returncode == 0
+
+    run = _run_script(_handover())
+
+    assert run.returncode != 0
+    assert not os.path.lexists(secrets_dir / ".ready")
+    assert not os.path.lexists(secrets_dir / ".ready.partial")
+
+
+@pytest.mark.parametrize("planted", [".ready", ".ready.partial"])
+def test_a_planted_ready_marker_or_temp_fails_the_handover(plain_secrets_dir, planted):
+    secrets_dir, victim = plain_secrets_dir
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert _run_script(spec).returncode == 0
+    (secrets_dir / planted).symlink_to(victim)
+
+    run = _run_script(_handover())
+
+    assert run.returncode != 0
+    assert "already exists" in run.stderr
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert (secrets_dir / planted).is_symlink()
+    other = ".ready" if planted == ".ready.partial" else ".ready.partial"
+    assert not os.path.lexists(secrets_dir / other)
+
+
+def test_the_marker_is_removed_if_the_directory_handover_fails():
+    script = _handover().argv[2]
+    assert script.rstrip().endswith(f"|| {{ rm -f {POD_SECRETS_DIR}/.ready; exit 1; }}")
+    assert rental_docker_sdk.POD_SECRETS_READY_MARKER == ".ready"
+    assert not POD_SECRET_NAME_PATTERN.fullmatch(".ready")
