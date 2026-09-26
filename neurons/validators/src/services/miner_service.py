@@ -296,9 +296,14 @@ class MinerService:
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
-        Flag off: list returned as is.
+        Flag off: the list minus repeats.
+
+        An executor uuid the miner lists more than once is kept once (its first entry), with or
+        without the flag: each entry starts its own pipeline, and a repeat would be validated,
+        and counted in its idle tier, twice in one cycle.
         """
         self._stop_awaiting_wave_list(payload)
+        executors = self._first_entry_per_uuid(executors, default_extra)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -314,6 +319,33 @@ class MinerService:
             self.in_flight[executor.uuid] = CYCLE_LANE
             claimed.append(executor)
         return claimed
+
+    @staticmethod
+    def _first_entry_per_uuid(
+        executors: list[ExecutorSSHInfo], default_extra: dict
+    ) -> list[ExecutorSSHInfo]:
+        unique: dict[str, ExecutorSSHInfo] = {}
+        repeats: dict[str, int] = {}
+        for executor in executors:
+            if executor.uuid in unique:
+                repeats[executor.uuid] = repeats.get(executor.uuid, 0) + 1
+                continue
+            unique[executor.uuid] = executor
+        for executor_uuid, dropped in repeats.items():
+            logger.warning(
+                _m(
+                    "Executor listed twice by miner; scored once",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": executor_uuid,
+                            "listed_count": dropped + 1,
+                            "dropped_count": dropped,
+                        }
+                    ),
+                ),
+            )
+        return list(unique.values()) if repeats else executors
 
     def _only_requested(
         self, executors: list[ExecutorSSHInfo], executor_id: str, default_extra: dict

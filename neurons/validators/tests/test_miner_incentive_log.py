@@ -32,6 +32,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "price_above_market_p90_soft_limit",
         "no_unrented_capacity_for_gpu_count",
         "nvidia_driver_below_minimum",
+        "duplicate_executor_in_cycle",
         "sysbox_not_enabled",
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
@@ -127,6 +128,11 @@ def _job(**overrides) -> JobResult:
             lambda job: MinerLogLine.no_payout_because_sysbox_not_enabled(job),
             "sysbox_not_enabled",
             "sysbox",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_duplicate_executor_in_cycle(job),
+            "duplicate_executor_in_cycle",
+            "more than once",
         ),
         (
             lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
