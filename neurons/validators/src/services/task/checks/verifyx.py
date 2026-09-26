@@ -432,7 +432,7 @@ def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | 
     cause of both and shares the link. With alpha 0.5 one such sample weighs half of the next
     cycle's verdict: a node seeded by a cycle that failed the cached-image check read 86.7 against
     the 100 gate one batch later, and passed the cycle after that. Holding the EMA leaves a
-    never-measured node never-measured, so its next cycle gets the DAH-2959 cold-sample retry and
+    never-measured node never-measured, so its next cycle gets the cold-sample retry and
     bootstraps from a sample taken in service. A cycle that VerifyX itself failed still moves the
     EMA: that is the gate working.
 
@@ -451,7 +451,7 @@ def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | 
 
 
 def _is_never_measured(ctx: Context) -> bool:
-    """No stored VerifyX EMA, per the backend's answer; False without that answer, as for DAH-2959."""
+    """No stored VerifyX EMA, per the backend's answer; False without that answer, as for the cold-sample retry."""
     if ctx.state.rented_data is None:
         return False
     prev_ema = _stored_network_ema(ctx)
@@ -467,7 +467,7 @@ def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
     """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
 
     Only keys this cycle wrote are touched. A never-measured node publishes none, which the backend
-    already reads as unseeded (the DAH-3011 first-pass deferral relies on it). The raw samples stay.
+    already reads as unseeded (the backend's first-pass deferral relies on it). The raw samples stay.
     """
     network = specs.get("network")
     if not isinstance(network, dict) or not any(key in network for key in _EMA_KEYS):

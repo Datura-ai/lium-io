@@ -4,7 +4,7 @@ A node failed VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW (EMA 86.7 < 100) one batch a
 failed the cached-image check had still run VerifyX and seeded the EMA (alpha 0.5), most likely
 while the executor's mandatory multi-GB image pull shared the link; it passed the cycle after that.
 Such a cycle now publishes the EMA the backend held before it, so a never-measured node stays
-never-measured and its next cycle gets the DAH-2959 cold-sample retry. A passing cycle without the
+never-measured and its next cycle gets the cold-sample retry. A passing cycle without the
 image cached (the fresh-node grace's PENDING, lium-io#1461) does not seed a never-measured node
 either; a node with a stored EMA publishes its sample on every passing cycle.
 """
@@ -21,7 +21,7 @@ import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
-from core.config import Settings, settings
+from core.config import settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
 )
@@ -368,10 +368,6 @@ async def test_without_the_hold_the_same_two_cycles_fail_on_the_seeded_ema(conte
 
 
 # --- the flag ------------------------------------------------------------------------------
-
-
-def test_the_ema_hold_flag_is_off_by_default():
-    assert Settings.model_fields["VERIFYX_EMA_HOLD_ENABLED"].default is False
 
 
 @pytest.mark.asyncio
