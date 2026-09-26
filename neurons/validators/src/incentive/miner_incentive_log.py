@@ -85,13 +85,13 @@ class ZeroIncentiveReason(StrEnum):
     PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
+    DUPLICATE_EXECUTOR_IN_CYCLE = "duplicate_executor_in_cycle"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
-    DUPLICATE_EXECUTOR_IN_CYCLE = "duplicate_executor_in_cycle"
 
 
 class IncentiveReason(BaseModel):
@@ -298,6 +298,17 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_duplicate_executor_in_cycle(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DUPLICATE_EXECUTOR_IN_CYCLE,
+            message=(
+                "No unrented incentive for this copy: the same executor was reported more than "
+                "once in this cycle, and it is paid once. List each executor under one miner, once."
+            ),
+        )
+
+    @staticmethod
     def no_payout_because_insufficient_disk_for_vram(
         result: JobResult, measured: InsufficientDisk
     ) -> MinerLogLine:
@@ -414,17 +425,6 @@ class MinerLogLine(BaseModel):
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
             },
-        )
-
-    @staticmethod
-    def no_payout_because_duplicate_executor_in_cycle(result: JobResult) -> MinerLogLine:
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.DUPLICATE_EXECUTOR_IN_CYCLE,
-            message=(
-                "No unrented incentive for this copy: the same executor was reported more than "
-                "once in this cycle, and it is paid once. List each executor under one miner, once."
-            ),
         )
 
     @staticmethod

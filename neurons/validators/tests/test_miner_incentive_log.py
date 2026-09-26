@@ -32,13 +32,13 @@ def test_reason_enum_pins_the_stable_code_contract():
         "price_above_market_p90_soft_limit",
         "no_unrented_capacity_for_gpu_count",
         "nvidia_driver_below_minimum",
+        "duplicate_executor_in_cycle",
         "sysbox_not_enabled",
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
-        "duplicate_executor_in_cycle",
     }
 
 
@@ -130,6 +130,11 @@ def _job(**overrides) -> JobResult:
             "sysbox",
         ),
         (
+            lambda job: MinerLogLine.no_payout_because_duplicate_executor_in_cycle(job),
+            "duplicate_executor_in_cycle",
+            "more than once",
+        ),
+        (
             lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
                 job,
                 MissingFlagshipCapability(
@@ -153,11 +158,6 @@ def _job(**overrides) -> JobResult:
             ),
             "port_limited_remainder",
             "2 free port",
-        ),
-        (
-            lambda job: MinerLogLine.no_payout_because_duplicate_executor_in_cycle(job),
-            "duplicate_executor_in_cycle",
-            "more than once",
         ),
     ],
 )
