@@ -4,6 +4,8 @@ the flag off a rent is exactly today's."""
 
 import dataclasses
 import logging
+import os
+import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -81,7 +83,19 @@ def keypair():
 
 
 def _secret_specs(docker_client):
-    return [spec for spec in docker_client.exec_specs if POD_SECRETS_DIR in " ".join(spec.argv)]
+    return [
+        spec
+        for spec in docker_client.exec_specs
+        if spec.stdin is not None and POD_SECRETS_DIR in " ".join(spec.argv)
+    ]
+
+
+def _handover_specs(docker_client):
+    return [
+        spec
+        for spec in docker_client.exec_specs
+        if spec.stdin is None and "chown -h" in " ".join(spec.argv)
+    ]
 
 
 # What `id -u && id -g` prints when Docker runs it as the image's Config.User; an unknown name fails
@@ -431,11 +445,19 @@ async def test_secrets_are_owned_by_the_container_user_and_stay_0700_0400(
     for spec, name in zip(secret_specs, SECRETS):
         script = spec.argv[2]
         assert spec.user == "0"
-        assert f"chown {owner} {POD_SECRETS_DIR};" in script
-        assert f"chmod 0700 {POD_SECRETS_DIR};" in script
-        assert f"chown {owner} {POD_SECRETS_DIR}/.{name}.partial;" in script
+        assert "chown" not in script
+        assert "set -euC" in script
         assert f"chmod 0400 {POD_SECRETS_DIR}/.{name}.partial;" in script
-        assert script.index("chown") < script.index(f"mv -f")
+    handovers = _handover_specs(docker_client)
+    assert len(handovers) == 1 and handovers[0].user == "0"
+    assert docker_client.exec_specs.index(handovers[0]) > max(
+        docker_client.exec_specs.index(spec) for spec in secret_specs
+    )
+    script = handovers[0].argv[2]
+    assert f'chown -h {owner} "$path"; chmod 0400 "$path"' in script
+    assert script.endswith(f"chown -h {owner} {POD_SECRETS_DIR}; chmod 0700 {POD_SECRETS_DIR}")
+    for name in SECRETS:
+        assert f"{POD_SECRETS_DIR}/{name}" in script
     assert "mode=0700" in POD_SECRETS_TMPFS_OPTIONS.split(",")
 
 
@@ -481,8 +503,15 @@ def test_secrets_that_together_overflow_the_tmpfs_are_refused():
     half = "HALF_VALUE_MARKER" + "x" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2)
     with pytest.raises(ValueError) as excinfo:
         valid_pod_secrets({"A": half, "B": half})
-    assert "A, B" in str(excinfo.value)
+    assert "secret B " in str(excinfo.value)
+    assert "A" not in str(excinfo.value).replace("secrets tmpfs", "")
     assert "HALF_VALUE_MARKER" not in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"SMALL": "s", "A": half, "OTHER": "o", "B": half})
+    message = str(excinfo.value)
+    assert "secret B " in message
+    for innocent in ("SMALL", "OTHER"):
+        assert innocent not in message
     exactly_full = {"A": "x" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2), "B": "y" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2)}
     assert valid_pod_secrets(exactly_full) == exactly_full
 
@@ -507,3 +536,123 @@ async def test_an_oversize_secret_fails_the_rent_before_anything_is_created(
     assert "BIG" in result.msg and "BIG_SECRET_VALUE_MARKER" not in result.msg
     assert docker_service.rental_docker_client_factory.connect_calls == []
     assert docker_client.run_specs == [] and docker_client.exec_specs == []
+
+
+def _run_script(spec):
+    return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, timeout=30)
+
+
+@pytest.fixture
+def plain_secrets_dir(tmp_path, monkeypatch):
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(mode=0o700)
+    victim = tmp_path / "victim"
+    victim.write_text("original\n")
+    victim.chmod(0o644)
+    monkeypatch.setattr(rental_docker_sdk, "POD_SECRETS_DIR", str(secrets_dir))
+    # a plain directory stands in for the mount; only the tmpfs/root-only guard is skipped
+    monkeypatch.setattr(rental_docker_sdk, "_pod_secrets_dir_guard", lambda secrets_dir: "")
+    return secrets_dir, victim
+
+
+def test_the_write_script_needs_a_root_only_tmpfs_dir_that_is_not_a_link():
+    script = build_secret_file_exec_specs(container_name="pod", secrets={"A": "v"})[0].argv[2]
+    handover = rental_docker_sdk.build_pod_secrets_handover_spec(
+        container_name="pod", secrets={"A": "v"}, owner=(1000, 1000)
+    ).argv[2]
+    for text in (script, handover):
+        assert f"[ ! -L {POD_SECRETS_DIR} ]" in text
+        assert f"grep -qs ' '{POD_SECRETS_DIR}' tmpfs ' /proc/mounts" in text
+        assert f'[ "$(stat -c %u:%a {POD_SECRETS_DIR})" = 0:700 ]' in text
+
+
+def test_a_clean_write_then_handover_gives_the_owner_0400_files_in_a_0700_dir(plain_secrets_dir, monkeypatch):
+    secrets_dir, _ = plain_secrets_dir
+    owner = (os.getuid(), os.getgid())
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert _run_script(spec).returncode == 0
+    handover = rental_docker_sdk.build_pod_secrets_handover_spec(container_name="pod", secrets=SECRETS, owner=owner)
+    assert _run_script(handover).returncode == 0
+    assert sorted(os.listdir(secrets_dir)) == sorted(SECRETS)
+    for name, value in SECRETS.items():
+        info = (secrets_dir / name).lstat()
+        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o400
+        assert (info.st_uid, info.st_gid) == owner
+        assert (secrets_dir / name).read_text() == value
+    assert stat.S_IMODE(secrets_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("planted", [".HF_TOKEN.partial", "HF_TOKEN"])
+@pytest.mark.parametrize("kind", ["symlink", "dangling symlink", "file"])
+def test_a_planted_path_cannot_redirect_a_write_and_the_write_fails_closed(
+    plain_secrets_dir, monkeypatch, planted, kind
+):
+    secrets_dir, victim = plain_secrets_dir
+    path = secrets_dir / planted
+    if kind == "symlink":
+        path.symlink_to(victim)
+    elif kind == "dangling symlink":
+        path.symlink_to(secrets_dir.parent / "does-not-exist")
+    else:
+        path.write_text("planted")
+    spec = build_secret_file_exec_specs(container_name="pod", secrets={"HF_TOKEN": SECRETS["HF_TOKEN"]})[0]
+
+    run = _run_script(spec)
+
+    assert run.returncode != 0
+    assert "already exists" in run.stderr
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert not (secrets_dir.parent / "does-not-exist").exists()
+    for value in SECRET_VALUES:
+        assert value not in run.stderr
+
+
+def test_a_link_swapped_in_between_writes_fails_the_handover_without_touching_its_target(
+    plain_secrets_dir, monkeypatch
+):
+    secrets_dir, victim = plain_secrets_dir
+    specs = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)
+    assert _run_script(specs[0]).returncode == 0
+    (secrets_dir / "HF_TOKEN").unlink()
+    (secrets_dir / "HF_TOKEN").symlink_to(victim)
+    assert _run_script(specs[1]).returncode == 0
+    handover = rental_docker_sdk.build_pod_secrets_handover_spec(
+        container_name="pod", secrets=SECRETS, owner=(os.getuid(), os.getgid())
+    )
+
+    run = _run_script(handover)
+
+    assert run.returncode != 0
+    assert "is not a regular file" in run.stderr
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(secrets_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_a_failed_handover_fails_the_rent(docker_service, executor_info, keypair, monkeypatch):
+    monkeypatch.setattr(settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.__init__()
+    _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
+    _answer_owner_probe(monkeypatch, docker_client, "1000")
+    original_exec = docker_client.exec_in_container
+
+    async def failing_handover(spec):
+        result = await original_exec(spec)
+        if "chown -h" in " ".join(spec.argv):
+            return ContainerExecResult(exit_status=1, stderr="HF_TOKEN is not a regular file")
+        return result
+
+    monkeypatch.setattr(docker_client, "exec_in_container", failing_handover)
+    result = await docker_service.create_container(
+        payload=_base_create_payload(secrets=SECRETS),
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "write_pod_secrets"
+    assert len(_handover_specs(docker_client)) == 1

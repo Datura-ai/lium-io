@@ -980,12 +980,12 @@ def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
         if size > POD_SECRETS_TMPFS_SIZE_BYTES:
             raise ValueError(f"secret {name} is larger than the {POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs")
         total += size
+        if total > POD_SECRETS_TMPFS_SIZE_BYTES:
+            raise ValueError(
+                f"secret {name} does not fit: with the secrets before it, the set needs over the "
+                f"{POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs"
+            )
         valid[name] = value
-    if total > POD_SECRETS_TMPFS_SIZE_BYTES:
-        raise ValueError(
-            f"secrets {', '.join(valid)} together need {total} bytes, over the "
-            f"{POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs"
-        )
     return valid
 
 
@@ -1010,32 +1010,43 @@ def build_pod_secrets_tmpfs(secrets: dict[str, str] | None) -> dict[str, str]:
     return {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS} if secrets else {}
 
 
+def _pod_secrets_dir_guard(secrets_dir: str) -> str:
+    # the mount check and "still root-only": the workload (maybe non-root, running concurrently) must
+    # not be able to plant links in the directory while root writes into it
+    return (
+        f"[ ! -L {secrets_dir} ] && [ -d {secrets_dir} ] "
+        f"|| {{ echo {secrets_dir} is not a directory >&2; exit 1; }}; "
+        f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts "
+        f"|| {{ echo {secrets_dir} is not a tmpfs mount >&2; exit 1; }}; "
+        f"[ \"$(stat -c %u:%a {secrets_dir})\" = 0:700 ] "
+        f"|| {{ echo {secrets_dir} is not root-only >&2; exit 1; }}; "
+    )
+
+
 def build_secret_file_exec_specs(
     *,
     container_name: str,
     secrets: dict[str, str] | None,
-    owner: tuple[int, int] = (0, 0),
 ) -> list[ContainerExecSpec]:
     """One exec per secret; the value travels on stdin only, so it is never in argv or the exec logs.
 
     The script refuses to write unless the directory is the tmpfs mount, so a missing mount can never
-    put a value on the container's disk layer. The directory and each file are chowned to `owner`
-    (the container user's uid, gid) before the file gets its name, keeping 0700/0400.
+    put a value on the container's disk layer, and unless it is still root-owned 0700. Each file is
+    created exclusively (noclobber) under a name nothing may already hold, as a link or otherwise, so
+    no write can be redirected. Files stay root's until build_pod_secrets_handover_spec().
     """
-    uid, gid = owner
-    chown_to = f"{int(uid)}:{int(gid)}"
     secrets_dir = shlex.quote(POD_SECRETS_DIR)
     specs = []
     for name, value in valid_pod_secrets(secrets).items():
         target = shlex.quote(f"{POD_SECRETS_DIR}/{name}")
         partial_target = shlex.quote(f"{POD_SECRETS_DIR}/.{name}.partial")
         script = (
-            "set -eu; umask 077; "
-            f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts "
-            f"|| {{ echo {secrets_dir} is not a tmpfs mount >&2; exit 1; }}; "
-            f"chown {chown_to} {secrets_dir}; chmod 0700 {secrets_dir}; "
+            "set -euC; umask 077; "
+            + _pod_secrets_dir_guard(secrets_dir)
+            + f"for path in {partial_target} {target}; do "
+            f"if [ -e \"$path\" ] || [ -L \"$path\" ]; then echo \"$path already exists\" >&2; exit 1; fi; "
+            "done; "
             f"cat > {partial_target}; "
-            f"chown {chown_to} {partial_target}; "
             f"chmod {POD_SECRET_FILE_MODE} {partial_target}; "
             f"mv -f {partial_target} {target}"
         )
@@ -1047,6 +1058,32 @@ def build_secret_file_exec_specs(
             )
         )
     return specs
+
+
+def build_pod_secrets_handover_spec(
+    *,
+    container_name: str,
+    secrets: dict[str, str] | None,
+    owner: tuple[int, int],
+) -> ContainerExecSpec:
+    """The one step, after every file is written, that gives the files and then the directory to
+    `owner` (the container user's uid, gid), keeping 0400/0700. Only regular, unlinked files are
+    touched and `chown -h` never follows a link; the directory is handed over last, so the user can
+    enter it only once nothing more is written as root."""
+    uid, gid = owner
+    chown_to = f"{int(uid)}:{int(gid)}"
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+    targets = " ".join(shlex.quote(f"{POD_SECRETS_DIR}/{name}") for name in valid_pod_secrets(secrets))
+    script = (
+        "set -eu; "
+        + _pod_secrets_dir_guard(secrets_dir)
+        + f"for path in {targets}; do "
+        "if [ -L \"$path\" ] || [ ! -f \"$path\" ]; then echo \"$path is not a regular file\" >&2; exit 1; fi; "
+        f"chown -h {chown_to} \"$path\"; chmod {POD_SECRET_FILE_MODE} \"$path\"; "
+        "done; "
+        f"chown -h {chown_to} {secrets_dir}; chmod 0700 {secrets_dir}"
+    )
+    return ContainerExecSpec(container_name=container_name, argv=("sh", "-c", script))
 
 
 def _default_docker_api_client_factory(**kwargs):

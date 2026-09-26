@@ -122,6 +122,7 @@ from services.rental_docker_sdk import (
     build_container_command_argv,
     is_docker_not_found_error,
     build_environment_exec_spec,
+    build_pod_secrets_handover_spec,
     build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
     build_remove_authorized_keys_exec_spec,
@@ -3895,22 +3896,31 @@ class DockerService:
                 )
             )
             return cause
-        exec_specs = build_secret_file_exec_specs(container_name=container_name, secrets=secrets, owner=owner)
-        for name, exec_spec in zip(secrets, exec_specs):
+        exec_specs = build_secret_file_exec_specs(container_name=container_name, secrets=secrets)
+        steps = [(name, "exec_write_pod_secret", spec, f"secret {name}") for name, spec in zip(secrets, exec_specs)]
+        steps.append(
+            (
+                None,
+                "exec_hand_over_pod_secrets",
+                build_pod_secrets_handover_spec(container_name=container_name, secrets=secrets, owner=owner),
+                "secrets handover",
+            )
+        )
+        for name, operation, exec_spec, label in steps:
             try:
                 result = await exec_logged_rental_docker_sdk_operation(
                     docker_client=docker_client,
-                    operation="exec_write_pod_secret",
+                    operation=operation,
                     exec_spec=exec_spec,
-                    log_extra={**log_extra, "secret_name": name},
+                    log_extra={**log_extra, "secret_name": name} if name else log_extra,
                 )
             except Exception as exc:
-                cause = f"secret {name}: {exc}"
+                cause = f"{label}: {exc}"
             else:
                 if result.exit_status == 0:
                     continue
-                cause = f"secret {name}: exit_status={result.exit_status}; stderr={result.stderr}"
-            await self.stream_log(f"Failed to write secret {name}", "error", log_tag)
+                cause = f"{label}: exit_status={result.exit_status}; stderr={result.stderr}"
+            await self.stream_log(f"Failed to write {label}" if name else "Failed to hand over secrets", "error", log_tag)
             logger.warning(
                 _m(
                     "Failed to write pod secret",
