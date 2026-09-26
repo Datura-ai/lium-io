@@ -1368,6 +1368,10 @@ def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_p
         "key_filename": str(key_path),
         "look_for_keys": False,
         "allow_agent": False,
+        # a (re)connect is bounded: TCP connect, banner, key auth
+        "timeout": 15,
+        "banner_timeout": 15,
+        "auth_timeout": 15,
     }
     assert calls["host_keys_path"] == str(known_hosts_path)
     assert isinstance(calls["policy"], FakeRejectPolicy)

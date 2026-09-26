@@ -123,6 +123,7 @@ from services.rental_docker_sdk import (
     is_docker_not_found_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
+    rental_docker_error_class,
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
@@ -1279,6 +1280,7 @@ class DockerService:
             rental_docker_client_factory
             or RentalDockerSdkClientFactory(
                 pull_timeout_seconds=_DOCKER_PULL_TIMEOUT_SECONDS,
+                transport_retry_enabled=lambda: settings.DOCKER_TRANSPORT_RETRY_ENABLED,
             )
         )
         self.lock = asyncio.Lock()
@@ -3612,6 +3614,8 @@ class DockerService:
             )
             return False
 
+        # both execs may run twice after a dropped SSH transport: the copy overwrites the file,
+        # the script ends with sshd listening on its port whichever run got there first
         create_spec = ContainerExecSpec(
             container_name=container_name,
             argv=(
@@ -3621,10 +3625,12 @@ class DockerService:
                 f"&& chmod +x {shlex.quote(container_path)}",
             ),
             stdin=script_content,
+            idempotent=True,
         )
         run_spec = ContainerExecSpec(
             container_name=container_name,
             argv=("sh", container_path),
+            idempotent=True,
         )
 
         try:
@@ -6675,6 +6681,9 @@ class DockerService:
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
+            # `error_class` (e.g. `transport`: the Docker-over-SSH channel dropped) rides in the
+            # event's detail next to the stage so the backend can count the class, flag or no flag
+            error_class = rental_docker_error_class(e)
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
@@ -6682,6 +6691,7 @@ class DockerService:
                     # DAH-2740: a tenacity RetryError says nothing; the last attempt's text is the cause
                     "error": "; ".join(_exception_texts(e)),
                     "failure_step": current_step,
+                    **({"error_class": error_class} if error_class else {}),
                 }),
             )
             # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
