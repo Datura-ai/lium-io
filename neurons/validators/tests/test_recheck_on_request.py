@@ -311,7 +311,9 @@ async def test_the_wave_claiming_during_the_queue_drop_waits_on_the_recheck(monk
     tick = asyncio.create_task(harness.lane.tick())
     await asyncio.wait_for(parked.wait(), timeout=5)
 
-    claimed = harness.miner_service._claim_for_cycle([SimpleNamespace(uuid=node)], {})
+    claimed = harness.miner_service._claim_for_cycle(
+        SimpleNamespace(miner_hotkey="miner", job_batch_id="wave"), [SimpleNamespace(uuid=node)], {}
+    )
     assert [e.uuid for e in claimed] == [node]
     assert harness.miner_service.in_flight == {node: RECHECK_LANE}
     assert node in harness.miner_service.recheck_outcomes
