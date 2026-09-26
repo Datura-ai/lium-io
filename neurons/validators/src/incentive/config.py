@@ -61,8 +61,8 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
 # those cards share the 4 with the idle single-card nodes.
 #
-# Demand-based caps (DAH-3620): A100 8× = 40 GPUs, L40S 8× = 16 GPUs (renter p95 plus one
-# spare node); the measurements are in the ticket.
+# The A100 and L40S 8-card buckets use lower, demand-based caps than the default
+# 8-card bucket; the values are in the table below.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},

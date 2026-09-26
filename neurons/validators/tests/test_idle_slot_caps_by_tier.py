@@ -1,12 +1,9 @@
-"""DAH-3620 (P163): the A100 8× bucket pays for 40 idle GPUs, the L40S 8× bucket for 16.
+"""The A100 and L40S 8-card buckets use a lower idle cap than the default 8-card bucket.
 
-Regression: with both buckets at 64 the validator would pay six idle 8-card A100 nodes
-(48 GPUs, the most renters ever held at once over 3–17 Sep 2026; p95 was 32) and three
-idle 8-card L40S nodes (24 GPUs; renters never held more than 8) in full. These tests
-replay the production `IncentiveConfig` defaults against those fills: the A100 bucket
-dilutes to 40/48 and the L40S bucket to 16/24, while today's A100 fill (one idle
-8-card node, the 17 Sep 14:29Z cycle) and a one-node L40S fill are still paid in full
-and the 1× buckets and the other families are untouched. With either cap back at 64 the dilution assertions fail.
+These tests replay the production `IncentiveConfig` defaults: a fill above the cap is
+diluted by the cap multiplier from settings, a fill under it is paid in full, and the 1×
+buckets and the other families are untouched. With either cap back at the default the
+dilution assertions fail.
 """
 
 from unittest.mock import AsyncMock
@@ -44,7 +41,7 @@ async def _run_with_production_config(
     return incentive
 
 
-def test_caps_are_the_measured_demand_and_nothing_else_moved():
+def test_a100_and_l40s_caps_and_nothing_else_moved():
     assert MAX_UNRENTED_GPUS_BY_TYPE["A100"] == {1: 10, 8: 40}
     assert MAX_UNRENTED_GPUS_BY_TYPE["L40S"] == {1: 10, 8: 16}
     for family, buckets in MAX_UNRENTED_GPUS_BY_TYPE.items():
@@ -54,8 +51,8 @@ def test_caps_are_the_measured_demand_and_nothing_else_moved():
 
 
 @pytest.mark.asyncio
-async def test_six_idle_8x_a100_nodes_share_forty_gpus_of_pay():
-    """48 idle A100 GPUs on 8-card nodes (the 14 d peak demand) against a cap of 40."""
+async def test_idle_8_card_a100_nodes_over_the_cap_share_the_capped_pay():
+    """Six idle 8-card A100 nodes exceed the bucket cap and are diluted by the cap multiplier."""
     jobs = {f"miner_{i}": [_make_pcc_job(f"a100-8x-{i}", A100, 8)] for i in range(6)}
     jobs["miner_1x"] = [_make_pcc_job("a100-1x", A100, 1)]
 
@@ -78,8 +75,8 @@ async def test_six_idle_8x_a100_nodes_share_forty_gpus_of_pay():
 
 
 @pytest.mark.asyncio
-async def test_three_idle_8x_l40s_nodes_share_sixteen_gpus_of_pay():
-    """24 idle L40S GPUs on 8-card nodes against a cap of 16: two nodes' worth of pay."""
+async def test_idle_8_card_l40s_nodes_over_the_cap_share_the_capped_pay():
+    """Three idle 8-card L40S nodes exceed the bucket cap and are diluted by the cap multiplier."""
     jobs = {f"miner_{i}": [_make_pcc_job(f"l40s-8x-{i}", L40S, 8)] for i in range(3)}
 
     incentive = await _run_with_production_config(jobs)
@@ -92,10 +89,8 @@ async def test_three_idle_8x_l40s_nodes_share_sixteen_gpus_of_pay():
 
 
 @pytest.mark.asyncio
-async def test_todays_fill_is_paid_in_full():
-    """Today's A100 fill (one idle 8-card node in the 17 Sep 2026 14:29Z cycle; no L40S
-    8-card node was idle) and a one-node L40S fill: both sit under the new caps, so
-    nothing changes for them at deploy."""
+async def test_one_idle_node_per_family_is_paid_in_full():
+    """One idle 8-card node per family sits under the cap, so it is paid in full."""
     jobs = {
         "miner_a100": [_make_pcc_job("a100-8x-0", A100, 8)],
         "miner_l40s": [_make_pcc_job("l40s-8x-0", L40S, 8)],
