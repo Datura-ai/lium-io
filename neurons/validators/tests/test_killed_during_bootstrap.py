@@ -8,7 +8,7 @@ kill` on the node) while the SSH bootstrap ran, and each rent failed as a generi
 (`removing` / `exited` / `dead`, or already "No such container") ends the bootstrap there — no exec
 is attempted against it — carrying the State read at that moment; the create names the failure
 `killed_during_bootstrap` with `oom_killed` and the exit code, or `cancelled_by_delete` when the
-validator's own delete for that pod is in flight (DAH-2728).
+validator's own delete for that pod is in flight.
 """
 
 from __future__ import annotations
@@ -327,7 +327,7 @@ async def test_a_delete_in_flight_makes_it_cancelled_by_delete(svc, monkeypatch,
 
     def inspect(container_name):
         # the second look is the bootstrap's: by then the pod's delete has landed on the node
-        # (the DAH-2728 flag is up) and taken the container with it
+        # (the cancel-on-delete flag is up) and taken the container with it
         if len(seen) == 1:
             inflight_creates.cancel(payload.pod_id)
             api.container_states = [_sigkilled_state()]
@@ -360,7 +360,7 @@ async def test_a_kill_seen_at_the_key_injection_is_the_kill_not_an_exiting_image
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "killed_during_bootstrap"
-    assert "has no long-running command" not in result.detail  # DAH-3678 is for an image's own exit
+    assert "has no long-running command" not in result.detail  # the image-exited text is for an image's own exit
     assert "it ran out of memory" in result.detail and "during add_public_keys" in result.detail
     assert api.exec_created == []
 
@@ -481,7 +481,7 @@ async def test_an_image_whose_command_exits_at_set_environment_is_not_a_kill(svc
     assert result.failure_step == "set_environment"  # the step keeps its name
     assert "Failed set_environment: image " in result.detail
     assert "has no long-running command" in result.detail and "exit_code=1" in result.detail
-    assert "status='exited'" in result.detail and "is not running" in result.detail  # the DAH-3678 markers
+    assert "status='exited'" in result.detail and "is not running" in result.detail  # the image-exited markers
     assert "killed_during_bootstrap" not in result.detail
     assert _events(caplog) == []  # no KILLED_DURING_BOOTSTRAP event: nothing on the node killed it
     own_exit = next(r.msg.extra for r in caplog.records if str(r.msg) == "Image's own command exited during bootstrap")
@@ -560,5 +560,5 @@ def test_the_host_kill_exit_codes_are_the_signals_a_stop_or_kill_leaves():
     assert HOST_KILL_EXIT_CODES == {129: "SIGHUP", 130: "SIGINT", 131: "SIGQUIT", 137: "SIGKILL", 143: "SIGTERM"}
     assert _snapshot("exited", 143, False).killed_by_host and _snapshot("exited", 143, False).kill_signal == "SIGTERM"
     assert not _snapshot("exited", 1, False).killed_by_host and _snapshot("exited", 1, False).kill_signal is None
-    # the key step shares the boundary: a stop seen there is the kill, not the DAH-3678 image text
+    # the key step shares the boundary: a stop seen there is the kill, not the image-exited text
     assert _snapshot("exited", 143, False).exited_since_start

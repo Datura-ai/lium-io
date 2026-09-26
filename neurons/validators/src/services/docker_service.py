@@ -731,11 +731,11 @@ class ImageExitedDuringKeyInjection(Exception):
 class ImageExitedDuringBootstrap(Exception):
     """A later bootstrap step (`ssh_bootstrap`, `set_environment`) found the container gone because
     the image's own command ended — not a kill, so not `killed_during_bootstrap`: the step keeps its
-    name and no KILLED_DURING_BOOTSTRAP event is written. Same DAH-3678 text as the key step."""
+    name and no KILLED_DURING_BOOTSTRAP event is written. Same image-exited text as the key step."""
 
 
 def _image_exited_explanation(*, image: str, state: ContainerStateSnapshot, during: str, cause: Exception) -> str:
-    """The renter-facing DAH-2624/3678 text: the image has no long-running command. The backend
+    """The renter-facing image-exited text: the image has no long-running command. The backend
     picks its "no long-running process" message from the `is not running` / `is restarting` /
     `status='…'` markers in here, but only when `failure_step` is `add_public_keys`; for the later
     steps (`ssh_bootstrap`, `set_environment`) this text goes to the logs only. Both steps say it
@@ -5480,7 +5480,7 @@ class DockerService:
         bootstrap_step: str,
         default_extra: dict,
     ) -> ImageExitedDuringBootstrap:
-        """The DAH-3678 explanation for an image whose own command ended while a bootstrap step ran;
+        """The image-exited explanation for an image whose own command ended while a bootstrap step ran;
         logged as the step's failure, not as a KILLED_DURING_BOOTSTRAP event."""
         state = gone.state
         assert state is not None  # container_gone_cause reads None as `removed`, a kill
@@ -6772,7 +6772,7 @@ class DockerService:
                         )
                     if isinstance(post_run_exc, ContainerGoneBeforeExec):
                         # The container left between `docker run` and the end of the bootstrap.
-                        # Our own delete (DAH-2728) is the first suspect and raises
+                        # Our own delete (cancel-on-delete) is the first suspect and raises
                         # _CreateCancelledByDelete here; otherwise the failure names the kill
                         # it was, not the exec it broke.
                         await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
