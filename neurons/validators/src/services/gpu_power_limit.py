@@ -734,13 +734,16 @@ async def restore_filler_pod_gpu_power_limits(
 
     Touching only the pod's own records means a replacement filler's fresh caps on the same host are
     never swept, and a filler we never capped costs one Redis read — no SSH. Best-effort: a record
-    whose restore failed is kept for the safety nets; the index is dropped either way (the per-GPU
-    records, not the index, are the source of truth). A GPU the index names but whose record is gone
+    whose restore failed is kept for the safety nets; the index is claimed (read and deleted at once)
+    either way (the per-GPU records, not the index, are the source of truth). A GPU the index names but whose record is gone
     is raised to its default (``_raise_capped_gpus_without_record``). Returns the restored count.
     """
     index_key = _pod_index_key(pod_id)
     try:
-        raw_index: str | bytes | None = await redis.get(index_key)
+        # Claimed, not read: a customer create that removed this filler and the filler's own delete can
+        # run at once, and only the one that takes the index restores and raises its GPUs. The other
+        # would see the GPUs the first just restored as record-less and raise a host limit to default.
+        raw_index: str | bytes | None = await redis.getdel(index_key)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power restore: redis read failed for {index_key}: {exc}; will retry later", {}, log_extra)
         return 0
@@ -749,18 +752,18 @@ async def restore_filler_pod_gpu_power_limits(
     try:
         capped_uuids: list[str] = [str(uuid) for uuid in json.loads(raw_index)]
     except (ValueError, TypeError):
-        _log(logging.ERROR, f"gpu power restore: dropping corrupt pod index {raw_index!r} for {pod_id}", {}, log_extra)
-        await _delete_pod_index(redis, pod_id, log_extra)
+        _log(logging.ERROR, f"gpu power restore: dropped corrupt pod index {raw_index!r} for {pod_id}", {}, log_extra)
         return 0
     # Which capped GPUs still have a record is read BEFORE the restore, which deletes the records it
-    # applies: a GPU without one is raised to its default afterwards.
+    # applies: a GPU without one is raised to its default afterwards. A failed read says nothing about
+    # which records exist, so nothing is raised then; the records left behind stay for the safety nets.
     read_result = await read_gpu_power_restore_records(redis, capped_uuids, log_extra)
     recorded_uuids: set[str] = {record.gpu_uuid for record in read_result.records}
     restored = await restore_tracked_gpu_power_limits(ssh, redis, capped_uuids, log_extra)
-    await _raise_capped_gpus_without_record(
-        ssh, executor_id, [uuid for uuid in capped_uuids if uuid not in recorded_uuids], log_extra
-    )
-    await _delete_pod_index(redis, pod_id, log_extra)
+    if not read_result.read_failed:
+        await _raise_capped_gpus_without_record(
+            ssh, executor_id, [uuid for uuid in capped_uuids if uuid not in recorded_uuids], log_extra
+        )
     return restored
 
 

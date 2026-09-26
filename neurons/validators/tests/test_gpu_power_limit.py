@@ -99,6 +99,9 @@ class FakeRedis:
     async def delete(self, key: str) -> None:
         self.store.pop(key, None)
 
+    async def getdel(self, key: str) -> str | None:
+        return self.store.pop(key, None)
+
 
 # ---------------------------- _parse_power_state_csv (pure) ----------------------------
 
@@ -631,6 +634,41 @@ async def test_pod_restore_leaves_a_recorded_gpu_to_its_record_and_raises_only_t
     assert commands[1:4] == _set_commands("GPU-a", 380)
     assert commands[5:] == _set_commands("GPU-b", 250)
     assert _restore_key("GPU-a") not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_second_restore_of_the_same_pod_finds_no_index_and_raises_nothing() -> None:
+    # A customer create and the filler's own delete racing: the first claims the index and restores
+    # GPU-a to the host's 300 W; the second must not see GPU-a as record-less and raise it to 400 W.
+    redis = FakeRedis({
+        _restore_key("GPU-a"): _record("GPU-a", 300),
+        _pod_index_key(POD_ID): json.dumps(["GPU-a"]),
+    })
+    first = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(300))
+    second = fake_ssh()
+
+    assert await restore_filler_pod_gpu_power_limits(first, redis, POD_ID, executor_id=EXECUTOR_ID) == 1
+    assert await restore_filler_pod_gpu_power_limits(second, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
+
+    second.run.assert_not_called()
+
+
+class RecordReadFailsRedis(FakeRedis):
+    async def get(self, key: str) -> str | None:
+        if key.startswith("gpu_power_restore:"):
+            raise ConnectionError("redis down")
+        return await super().get(key)
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_raises_nothing_when_the_record_read_fails() -> None:
+    # A failed read says nothing about which records exist: raising could override the host's limit.
+    ssh = fake_ssh()
+    redis = RecordReadFailsRedis({_pod_index_key(POD_ID): json.dumps(["GPU-a"])})
+
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
+
+    ssh.run.assert_not_called()
 
 
 # ---------------------------- read_gpu_power_restore_records (read_failed flag) ----------------------------
