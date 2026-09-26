@@ -588,6 +588,51 @@ async def test_pod_restore_drops_corrupt_index() -> None:
     assert redis.store == {}
 
 
+@pytest.mark.asyncio
+async def test_pod_restore_raises_a_capped_gpu_without_record_to_its_default() -> None:
+    # The record is gone (lost Redis key): the pre-cap limit went with it, so the GPU goes back to
+    # its default rather than staying at Lium's cap for the next renter.
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(400))
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps(["GPU-a"])})
+
+    restored = await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
+
+    assert restored == 0
+    assert _commands(ssh)[1:] == _set_commands("GPU-a", 400)
+    assert _pod_index_key(POD_ID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_raises_a_gpu_capped_above_the_floor_without_record() -> None:
+    # 368 W of 400 W is Lium's 0.92 cap: above the check's floor, still not the renter's default.
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(400))
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps(["GPU-a"])})
+
+    await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
+
+    assert _commands(ssh)[1:] == _set_commands("GPU-a", 400)
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_leaves_a_recorded_gpu_to_its_record_and_raises_only_the_other() -> None:
+    # GPU-a's record holds the host's own 380 W and is restored to it; GPU-b lost its record and goes
+    # to its default. A GPU already at its default is not touched.
+    state = "GPU-a, 368, 400, 100, 400\nGPU-b, 230, 250, 100, 250\nGPU-c, 250, 250, 100, 250\n"
+    ssh = fake_ssh(FakeRun(stdout=state), *_set_ok(380), FakeRun(stdout=state), *_set_ok(250))
+    redis = FakeRedis({
+        _restore_key("GPU-a"): _record("GPU-a", 380),
+        _pod_index_key(POD_ID): json.dumps(["GPU-a", "GPU-b", "GPU-c"]),
+    })
+
+    restored = await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
+
+    assert restored == 1
+    commands = _commands(ssh)
+    assert commands[1:4] == _set_commands("GPU-a", 380)
+    assert commands[5:] == _set_commands("GPU-b", 250)
+    assert _restore_key("GPU-a") not in redis.store
+
+
 # ---------------------------- read_gpu_power_restore_records (read_failed flag) ----------------------------
 
 

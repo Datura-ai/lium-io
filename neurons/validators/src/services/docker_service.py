@@ -1264,6 +1264,15 @@ fi
 """
 
 
+def _removed_filler_pod_ids(removed_containers: list[str] | None) -> list[str]:
+    """The pod ids of the `filler_<pod_id>` containers a create's cleanup removed."""
+    return [
+        name[len(FILLER_CONTAINER_PREFIX) :]
+        for name in removed_containers or []
+        if name.startswith(FILLER_CONTAINER_PREFIX) and len(name) > len(FILLER_CONTAINER_PREFIX)
+    ]
+
+
 class DockerService:
     def __init__(
         self,
@@ -5326,7 +5335,11 @@ class DockerService:
             # DAH-2356: the cap is applied before `docker run`, and the delete that cancelled us
             # restored nothing — at that point this pod had no record yet.
             await restore_filler_pod_gpu_power_limits(
-                ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+                ssh_client,
+                self.redis_service,
+                payload.pod_id,
+                log_extra=default_extra,
+                executor_id=payload.executor_id,
             )
         raise _CreateCancelledByDelete(
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
@@ -5947,6 +5960,19 @@ class DockerService:
                 )
                 if removed_containers:
                     docker_listing_probe = None
+                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL:
+                    # A filler this create removed had no delete of its own yet (overlapped rent
+                    # preemption): restore its GPUs the way that delete would, including raising a
+                    # capped GPU whose restore record is gone to its default, before the renter's
+                    # container starts.
+                    for removed_filler in _removed_filler_pod_ids(removed_containers):
+                        await restore_filler_pod_gpu_power_limits(
+                            ssh_client,
+                            self.redis_service,
+                            removed_filler,
+                            log_extra=default_extra,
+                            executor_id=payload.executor_id,
+                        )
 
                 removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(
                     ssh_client=ssh_client,
@@ -7858,7 +7884,11 @@ class DockerService:
                 if payload.workload_kind == WorkloadKind.FILLER:
                     with _best_effort_delete_step(log, "restore_filler_gpu_power"):
                         await restore_filler_pod_gpu_power_limits(
-                            ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+                            ssh_client,
+                            self.redis_service,
+                            payload.pod_id,
+                            log_extra=default_extra,
+                            executor_id=payload.executor_id,
                         )
                     # DAH-2427: force-removing a CUDA workload can leave an orphaned kernel
                     # pinning the card (ghost GPU); cure it right here so the ghost never
