@@ -254,7 +254,9 @@ def _codes(result: JobResult) -> list[str]:
 
 # _scoring_outputs over CASES, captured from the scoring code that reported only the first reason.
 GOLDEN: dict[str, dict[str, Any]] = json.loads(
-    (Path(__file__).parent / "fixtures" / "zero_incentive_scoring_first_reason_only.json").read_text()
+    (
+        Path(__file__).parent / "fixtures" / "zero_incentive_scoring_first_reason_only.json"
+    ).read_text()
 )
 
 
