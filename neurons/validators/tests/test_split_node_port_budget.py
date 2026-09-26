@@ -12,8 +12,10 @@ pay at all) runs first and stays as it is.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import incentive.rental_price as rental_price_module
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
@@ -281,7 +283,7 @@ async def _score(
 
 @pytest.mark.asyncio
 async def test_default_settings_pay_every_free_gpu_exactly_as_before(caplog):
-    # Rollout contract (SO §70): a money-path rule ships in shadow mode. With the settings
+    # Rollout contract: a money-path rule ships in shadow mode. With the settings
     # object untouched, the port-limited node's 4 free GPUs and a plain idle 1-GPU node share
     # the unrented pool 4 : 1 — the computation the rule never touched — and the scorer says
     # so in one shadow line. Precondition, not the assertion: the shipped default is off.
@@ -378,6 +380,36 @@ async def test_flag_on_whole_idle_split_node_is_paid_for_the_backed_gpus(monkeyp
     assert plain_job.incentive_idle == pytest.approx(0.1 * 1 / 3)
     assert split_job.incentive_formula_inputs["port_unbacked_gpu_count"] == 6
     assert "covers 2 of the 8 free GPU(s)" in split_job.full_log_text
+
+
+@pytest.mark.asyncio
+async def test_flag_on_node_excluded_by_a_later_gate_gets_no_partial_pay_line(monkeypatch):
+    # Arrange — the whole idle split node of the test above, but an enforced soft price limit
+    # (a later gate in the chain) excludes it: its job log must carry that zero reason only.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    monkeypatch.setattr(
+        rental_price_module,
+        "shared_client",
+        SimpleNamespace(config=SimpleNamespace(machine_prices_p90={"NVIDIA H200": 2.0})),
+    )
+    split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
+    plain_job = _plain_idle_job()
+    incentive = _build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job))
+    monkeypatch.setattr(incentive, "_is_over_soft_price_limit", lambda result: result is split_job)
+    monkeypatch.setattr(incentive, "_log_soft_price_limit", lambda result: None)
+
+    # Act
+    await _score(incentive)
+
+    # Assert
+    assert split_job.eligible_for_rental_share is False
+    assert split_job.incentive_idle == 0
+    assert [r.reason for r in split_job.zero_incentive_reasons] == [
+        ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT
+    ]
+    assert "covers 2 of the 8 free GPU(s)" not in split_job.full_log_text
+    assert plain_job.incentive_idle == pytest.approx(0.1)
 
 
 @pytest.mark.asyncio

@@ -632,6 +632,8 @@ class RentalPriceIncentive(DefaultIncentive):
         """Log a port-budget shortfall; with the flag on, pay idle only for the backed GPUs.
 
         While ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS is off the shortfall is only logged.
+        The partial-pay job-log line is left to `_record_port_budget_partial_pay`, which runs
+        after the later idle gates so a node they exclude is not told it is paid.
         Returns True when the budget backs no GPU at all: the result then leaves the unrented
         pool with its own zero reason, whatever ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
         says — an idle result must never finalize at 0 without a reason.
@@ -648,10 +650,18 @@ class RentalPriceIncentive(DefaultIncentive):
                 MinerLogLine.no_payout_because_port_unbacked_split_gpus(job_result, shortfall)
             )
             return True
+        return False
+
+    def _record_port_budget_partial_pay(self, job_result: JobResult) -> None:
+        """Tell the miner a still-eligible split node is paid for its port-backed GPUs only."""
+        if job_result.port_unbacked_gpu_count <= 0:
+            return
+        shortfall: PortBudgetShortfall | None = self._port_budget_shortfall(job_result)
+        if shortfall is None:
+            return
         job_result.record_incentive_log(
             MinerLogLine.unrented_gpus_beyond_port_budget(job_result, shortfall)
         )
-        return False
 
     def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
@@ -1184,6 +1194,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
+            self._record_port_budget_partial_pay(job_result)
             # NOT a penalty: an unrented executor of an eligible GPU model is intentionally
             # taken out of the mining pool and paid from the unrented rental-share pool
             # instead (its incentive is computed later in _post_process_job_result). A
