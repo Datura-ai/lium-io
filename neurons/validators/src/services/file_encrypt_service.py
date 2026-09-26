@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated
 
 import PyInstaller.__main__
+from core.config import settings
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
@@ -17,6 +18,17 @@ from services.ssh_service import SSHService
 
 # Where each cycle's job files (the frozen scrape) are written: one `cycle-*` directory per cycle.
 JOB_FILES_ROOT = Path(__file__).parent / "temp"
+
+# machine_scrape's VLOOPBACK_CHECK_SWITCH: the scrape runs its vloopback mount test only while it ends in ":on"
+VLOOPBACK_CHECK_SWITCH_ON = "lium-vloopback-check:on"
+VLOOPBACK_CHECK_SWITCH_OFF = "lium-vloopback-check:off"
+
+
+def with_vloopback_check_switch(scrape_source: str, enabled: bool) -> str:
+    """The scrape source with its vloopback mount test on or off (VLOOPBACK_SCRAPE_CHECK_ENABLED)."""
+    if enabled:
+        return scrape_source
+    return scrape_source.replace(VLOOPBACK_CHECK_SWITCH_ON, VLOOPBACK_CHECK_SWITCH_OFF)
 
 # ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
 # gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
@@ -131,6 +143,14 @@ ORIGINAL_KEYS = {
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
+    # ticket-0331: the vloopback mount test. Prefixed so no existing key is a substring of them
+    # (ecrypt_miner_job_files renames by sequential str.replace).
+    'data_vloopback_check': "vloopback_check",
+    'vc_verdict': "verdict",
+    'vc_reason_code': "reason_code",
+    'vc_detail': "detail",
+    'vc_runtime': "runtime",
+    'vc_cached': "cached",
     'data_ncu_profiling_access': "ncu_profiling_access",
     'data_ncu_profiling_scrape_error': "ncu_profiling_scrape_error",
     'data_infiniband_ports': "infiniband_ports",
@@ -331,6 +351,12 @@ class FileEncryptService:
             'data_sysbox_runtime': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
+            'data_vloopback_check': "",
+            'vc_verdict': "",
+            'vc_reason_code': "",
+            'vc_detail': "",
+            'vc_runtime': "",
+            'vc_cached': "",
             'data_ncu_profiling_scrape_error': "",
             'data_ncu_profiling_access': "",
             'data_infiniband_ports': "",
@@ -441,6 +467,9 @@ class FileEncryptService:
         all_keys, encryption_key = self.generate_key_mappings()
         for key, value in all_keys.items():
             obfuscated_content = obfuscated_content.replace(key, value)
+        obfuscated_content = with_vloopback_check_switch(
+            obfuscated_content, settings.VLOOPBACK_SCRAPE_CHECK_ENABLED
+        )
 
         # build binary with nuitka
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:

@@ -6,6 +6,9 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
+# After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
+# DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
+# with a doc link when that fails.
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
@@ -19,6 +22,17 @@ SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_V
 SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
+# the validators' _LOOPBACK_PLUGIN_ALIAS / _LOOPBACK_PLUGIN_IMAGE (neurons/validators/src/services/docker_service.py):
+# a rental with a disk limit gets a volume from this plugin, mounted into its sysbox container. The plugin runs
+# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13),
+# the image the validators install by tag.
+VLOOPBACK_PLUGIN="vloopback"
+VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
+VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
+VLOOPBACK_INSTALL_TIMEOUT=300
+VLOOPBACK_RUN_TIMEOUT=120
+VLOOPBACK_CLEANUP_TIMEOUT=30
+VLOOPBACK_TEST_NAME=""
 
 G='\033[0;32m' Y='\033[1;33m' R='\033[0;31m' B='\033[1;34m' N='\033[0m'
 ok()   { echo -e "  ${G}✓${N} $1"; }
@@ -28,7 +42,10 @@ step() { echo -e "\n${B}[$1/$2]${N} $3"; }
 
 # an `if`, not `[ … ] && rm`: under `set -e` the failing test made the EXIT trap end every run
 # with status 1, including "Nothing to do." and SUCCESS
-cleanup() { if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi; }
+cleanup() {
+    if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi
+    if [ -n "$VLOOPBACK_TEST_NAME" ]; then vloopback_remove_test_objects >/dev/null 2>&1 || true; fi
+}
 trap cleanup EXIT
 
 version_ge() {
@@ -485,6 +502,177 @@ check_sysbox() {
     pf_pass "sysbox-runc ${installed:-installed} runs a container."
 }
 
+# ── vloopback: size-limited volumes ─────────────────────
+# ticket-0331 (22 Sep 2026): pods failed at start on a host whose vloopback volumes reported a relative
+# Mountpoint ('206/fs'; runc: "setting up ID-mapped mount on path 206/fs … lstat 206: no such file or
+# directory"), while the validators' storage check passed. Install mode sets the plugin up the way the
+# validators' rental path installs it and then mounts a real volume into a sysbox container; --check only
+# reports. VLOOPBACK_REASON carries the cause of the last failure, VLOOPBACK_CHANGED what install mode changed.
+
+vloopback_plugin_state() {
+    # true / false / absent; a missing plugin makes `docker plugin inspect` print a blank line before it fails
+    (docker plugin inspect --format '{{.Enabled}}' "$VLOOPBACK_PLUGIN" 2>/dev/null || echo absent) | tail -n 1
+}
+
+vloopback_plugin_data_dir() {
+    docker plugin inspect --format '{{range .Settings.Env}}{{println .}}{{end}}' "$VLOOPBACK_PLUGIN" 2>/dev/null \
+        | sed -n 's/^DATA_DIR=//p' | head -1
+}
+
+vloopback_last_line() { grep . | tail -n 1; }
+
+ensure_vloopback_plugin() {
+    # the fix support sent by hand, idempotent: installed, DATA_DIR absolute, enabled. A plugin that already
+    # has an absolute DATA_DIR keeps it (the validators never reinstall an enabled plugin either).
+    local root state data_dir wanted out
+    VLOOPBACK_CHANGED="" VLOOPBACK_REASON=""
+    root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    case "$root" in
+        /*) ;;
+        *) VLOOPBACK_REASON="Docker reports the data-root '${root}', not an absolute path (docker info --format '{{.DockerRootDir}}')."
+           return 1 ;;
+    esac
+    # <DockerRootDir>/loopback: the DATA_DIR the validators pass to `docker plugin install` (create_local_volume)
+    wanted="${root%/}/loopback"
+    state=$(vloopback_plugin_state)
+    if [ "$state" = "absent" ]; then
+        out=$(timeout "$VLOOPBACK_INSTALL_TIMEOUT" docker plugin install "$VLOOPBACK_PLUGIN_IMAGE" --alias "$VLOOPBACK_PLUGIN" \
+            --grant-all-permissions "DATA_DIR=$wanted" 2>&1) || {
+            [ -n "$out" ] || out="timed out after ${VLOOPBACK_INSTALL_TIMEOUT}s"
+            VLOOPBACK_REASON="docker plugin install $VLOOPBACK_PLUGIN_IMAGE failed: $(echo "$out" | vloopback_last_line)"
+            return 1
+        }
+        VLOOPBACK_CHANGED="installed the $VLOOPBACK_PLUGIN plugin with DATA_DIR=$wanted"
+        return 0
+    fi
+    data_dir=$(vloopback_plugin_data_dir)
+    case "$data_dir" in
+        /*) ;;
+        *)
+            # changing the plugin under a running pod would pull its disk away
+            abort_on_active_rentals
+            if [ "$state" = "true" ]; then
+                out=$(docker plugin disable "$VLOOPBACK_PLUGIN" 2>&1) || {
+                    VLOOPBACK_REASON="the $VLOOPBACK_PLUGIN plugin has DATA_DIR '${data_dir}' and cannot be disabled to change it: $(echo "$out" | vloopback_last_line)"
+                    return 1
+                }
+            fi
+            out=$(docker plugin set "$VLOOPBACK_PLUGIN" "DATA_DIR=$wanted" 2>&1) || {
+                VLOOPBACK_REASON="docker plugin set $VLOOPBACK_PLUGIN DATA_DIR=$wanted failed: $(echo "$out" | vloopback_last_line)"
+                return 1
+            }
+            VLOOPBACK_CHANGED="set the $VLOOPBACK_PLUGIN plugin's DATA_DIR from '${data_dir}' to $wanted"
+            state=false
+            ;;
+    esac
+    if [ "$state" != "true" ]; then
+        out=$(docker plugin enable "$VLOOPBACK_PLUGIN" 2>&1) || {
+            VLOOPBACK_REASON="docker plugin enable $VLOOPBACK_PLUGIN failed: $(echo "$out" | vloopback_last_line)"
+            return 1
+        }
+        VLOOPBACK_CHANGED="${VLOOPBACK_CHANGED:-enabled the $VLOOPBACK_PLUGIN plugin}"
+    fi
+}
+
+vloopback_remove_test_objects() {
+    # the test container first: a `docker run` killed by its timeout leaves it running with the volume attached
+    local out
+    timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker rm -f "$VLOOPBACK_TEST_NAME" &>/dev/null || true
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume rm -f "$VLOOPBACK_TEST_NAME" 2>&1) || {
+        [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+        echo "$out" | vloopback_last_line
+        return 1
+    }
+}
+
+vloopback_mount_test() {
+    # what a rental with a disk limit does: create a volume, mount it into a sysbox container, write and read
+    # a file, unmount (the container exits), remove the volume. Container and volume share one name; they are
+    # removed whatever step failed, and by the EXIT trap when the script is interrupted.
+    local mountpoint out rc=0 remove_error
+    VLOOPBACK_REASON=""
+    VLOOPBACK_TEST_NAME="lium_vloopback_check_$$"
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume create -d "$VLOOPBACK_PLUGIN" -o size=1G "$VLOOPBACK_TEST_NAME" 2>&1) || {
+        [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+        VLOOPBACK_REASON="docker volume create -d $VLOOPBACK_PLUGIN -o size=1G failed: $(echo "$out" | vloopback_last_line)"
+        rc=1
+    }
+    if [ "$rc" -eq 0 ]; then
+        mountpoint=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume inspect --format '{{.Mountpoint}}' "$VLOOPBACK_TEST_NAME" 2>/dev/null)
+        case "$mountpoint" in
+            /*) ;;
+            *) VLOOPBACK_REASON="the $VLOOPBACK_PLUGIN plugin reports the Mountpoint '${mountpoint}', not an absolute path; Docker cannot mount it into a container."
+               rc=1 ;;
+        esac
+    fi
+    if [ "$rc" -eq 0 ]; then
+        out=$(timeout "$VLOOPBACK_RUN_TIMEOUT" docker run --rm --name "$VLOOPBACK_TEST_NAME" --runtime=sysbox-runc \
+            -v "$VLOOPBACK_TEST_NAME:/lium-vol" "$VERIFY_IMAGE" \
+            sh -c 'echo lium-vloopback-ok > /lium-vol/probe && cat /lium-vol/probe' 2>&1) || true
+        if ! echo "$out" | grep -qx 'lium-vloopback-ok'; then
+            [ -n "$out" ] || out="the container did not finish within ${VLOOPBACK_RUN_TIMEOUT}s"
+            VLOOPBACK_REASON="a $VLOOPBACK_PLUGIN volume does not mount into a sysbox container: $(echo "$out" | vloopback_last_line)"
+            rc=1
+        fi
+    fi
+    if ! remove_error=$(vloopback_remove_test_objects); then
+        [ "$rc" -ne 0 ] || VLOOPBACK_REASON="the test volume $VLOOPBACK_TEST_NAME did not unmount and remove: $remove_error"
+        rc=1
+    fi
+    VLOOPBACK_TEST_NAME=""
+    return "$rc"
+}
+
+check_vloopback() {
+    # --check: report the plugin, change nothing but the test volume the mount test creates and removes
+    local state data_dir
+    docker ps &>/dev/null || { pf_skip "vloopback volumes — Docker is not running."; return 0; }
+    if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc; then
+        pf_skip "vloopback volumes — the test mounts one into a sysbox container, and sysbox-runc is not registered yet."
+        return 0
+    fi
+    state=$(vloopback_plugin_state)
+    if [ "$state" = "absent" ]; then
+        pf_fix "The $VLOOPBACK_PLUGIN volume plugin is not installed — rentals with a disk limit cannot start." \
+            "$(self_cmd)   # installs it with DATA_DIR=<Docker data-root>/loopback and tests a volume in a sysbox container"
+        return 1
+    fi
+    data_dir=$(vloopback_plugin_data_dir)
+    case "$data_dir" in
+        /*) ;;
+        *) pf_fix "The $VLOOPBACK_PLUGIN plugin's DATA_DIR is '${data_dir}', not an absolute path — its volumes cannot be mounted." \
+               "$(self_cmd)   # sets DATA_DIR=<Docker data-root>/loopback and tests a volume in a sysbox container; stop rentals first"
+           return 1 ;;
+    esac
+    if [ "$state" != "true" ]; then
+        pf_fix "The $VLOOPBACK_PLUGIN plugin is installed but disabled — rentals with a disk limit cannot start." \
+            "docker plugin enable $VLOOPBACK_PLUGIN"
+        return 1
+    fi
+    if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
+        pf_skip "vloopback volumes — the test runs $VERIFY_IMAGE, which is not on this host yet (install mode pulls it)."
+        return 0
+    fi
+    if ! vloopback_mount_test; then
+        pf_fix "vloopback volumes fail on this host: $VLOOPBACK_REASON" "See $VLOOPBACK_DOC_URL"
+        return 1
+    fi
+    pf_pass "vloopback plugin (DATA_DIR=$data_dir): a 1 GB volume mounts, takes a write and unmounts in a sysbox container."
+}
+
+fail_vloopback() {
+    fail "Size-limited volumes (vloopback) do not work on this host: $VLOOPBACK_REASON"
+    fail "Rentals with a disk limit cannot start here until this is fixed. What to do: $VLOOPBACK_DOC_URL"
+}
+
+setup_vloopback() {
+    # install mode: the plugin fix, then the mount test; on a failure the caller prints fail_vloopback
+    ensure_vloopback_plugin || return 1
+    [ -z "$VLOOPBACK_CHANGED" ] || ok "vloopback: $VLOOPBACK_CHANGED."
+    vloopback_mount_test || return 1
+    ok "vloopback: a size-limited volume mounts, takes a write and unmounts in a sysbox container."
+}
+
 preflight_summary() {
     echo ""
     echo "  Preflight: $PREFLIGHT_PASS PASS, $PREFLIGHT_FIX FIX, $PREFLIGHT_SKIP SKIP."
@@ -522,6 +710,7 @@ preflight_stack() {
     check_nvidia_toolkit || true
     check_docker_features || true
     check_sysbox || true
+    check_vloopback || true
 }
 
 
@@ -537,7 +726,8 @@ case "${1:-}" in
     -h|--help)
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
-        echo "               a FIX on root, x86_64, kernel or Docker stops the install, any other FIX is printed and the install goes on"
+        echo "               a FIX on root, x86_64, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
+        echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
@@ -594,7 +784,12 @@ if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-r
         docker pull "$VERIFY_IMAGE" &>/dev/null || true
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-        ok "Sysbox is already working. Nothing to do."
+        setup_vloopback || { fail_vloopback; exit 1; }
+        if [ -n "$VLOOPBACK_CHANGED" ]; then
+            ok "Sysbox is already working."
+        else
+            ok "Sysbox is already working. Nothing to do."
+        fi
         preflight_reminder
         exit 0
     fi
@@ -769,18 +964,24 @@ ok "Docker is running."
 
 # ── 7. Verify ──────────────────────────────────────────
 
-step 6 7 "Verifying sysbox + GPU"
+step 6 7 "Verifying sysbox + GPU and a size-limited volume"
 
 if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-    echo ""
-    echo -e "  ${G}╔══════════════════════════════════════════╗${N}"
-    echo -e "  ${G}║  SUCCESS: Sysbox is working with GPUs!   ║${N}"
-    echo -e "  ${G}╚══════════════════════════════════════════╝${N}"
-    echo ""
-    ok "Your executor now supports Docker-in-Docker."
-    preflight_reminder
+    ok "A GPU container starts under sysbox-runc."
+    VLOOPBACK_OK=true
+    setup_vloopback || VLOOPBACK_OK=false
+    if [ "$VLOOPBACK_OK" = true ]; then
+        echo ""
+        echo -e "  ${G}╔══════════════════════════════════════════╗${N}"
+        echo -e "  ${G}║  SUCCESS: Sysbox is working with GPUs!   ║${N}"
+        echo -e "  ${G}╚══════════════════════════════════════════╝${N}"
+        echo ""
+        ok "Your executor now supports Docker-in-Docker."
+        preflight_reminder
+    fi
 
     # ── 8. Restart executor ──────────────────────────────
+    # also after a vloopback failure: the node was running before and still earns without disk limits
     if [ -n "$EXECUTOR_COMPOSE_DIR" ]; then
         step 7 7 "Restarting executor"
         if docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" up -d 2>/dev/null; then
@@ -788,6 +989,10 @@ if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &
         else
             warn "Failed to restart executor. Run manually: cd $EXECUTOR_COMPOSE_DIR && docker compose up -d"
         fi
+    fi
+    if [ "$VLOOPBACK_OK" = false ]; then
+        fail_vloopback
+        exit 1
     fi
 else
     echo ""

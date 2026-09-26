@@ -336,6 +336,15 @@ class Settings(BaseSettings):
     # author (/proc/cpuinfo, /sys present population, docker NCPU).
     CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)
     CPU_TRUTH_ENFORCEMENT_ENABLED: bool = Field(env="CPU_TRUTH_ENFORCEMENT_ENABLED", default=False)
+    # ticket-0331 / OD-D096 — the scrape mounts a size-limited vloopback volume the way a rental does.
+    # CHECK_ENABLED is the kill switch: off, the scrape skips the test (baked in by FileEncryptService).
+    # Report-only while ENFORCEMENT is off: the verdict goes to specs.vloopback_check and the scrape
+    # event, and storage_limit_supported stays the --storage-opt result. ENFORCEMENT on: a failed test
+    # also sets storage_limit_supported=false. supports_gpu_splitting follows --storage-opt either way.
+    VLOOPBACK_SCRAPE_CHECK_ENABLED: bool = Field(env="VLOOPBACK_SCRAPE_CHECK_ENABLED", default=True)
+    VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED: bool = Field(
+        env="VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED", default=False
+    )
     # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
     # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
     # fails device selection or serialises past a wide wall-clock threshold.
