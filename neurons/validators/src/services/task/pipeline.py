@@ -192,6 +192,9 @@ class CheckResult(BaseModel):
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
+    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # the executor task's timeout from here.
+    started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None
@@ -265,13 +268,31 @@ class EventSink(Protocol):
     async def emit(self, event: ValidationEvent) -> None: ...
 
 
+# DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
+# the validator. They are emitted on every cycle for as long as the state lasts (no collateral,
+# an old image, a banned provider, a host-side workload) and were 135,000 WARNING lines in two
+# days. The event keeps its severity for the backend and the portal; only the log line is INFO.
+PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
+    {
+        "COLLATERAL_MISSING",
+        "EXECUTOR_IMAGE_OUTDATED",
+        "PROVIDER_BANNED",
+        "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
+    }
+)
+
+
 class LoggerSink:
     def __init__(self, logger_: logging.Logger):
         self.logger = logger_
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
-        getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
+        extra = event.model_dump(mode="json")
+        if level == "warning" and event.reason_code in PROVIDER_STATE_REASON_CODES:
+            level = "info"
+            extra["reason"] = "provider_state"
+        getattr(self.logger, level)(_m(event.event, extra=extra))
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:

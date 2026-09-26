@@ -46,8 +46,9 @@ from services.task.checks.rented_pod_ssh import (
     flush_rented_pod_ssh_reports,
     silence_rented_pod_ssh_reports_on_our_own_outage,
 )
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
 from core.express_lane import CycleInputs, ExpressLane
@@ -401,7 +402,11 @@ class Validator:
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
                 )
 
                 task_info = {}
@@ -439,8 +444,11 @@ class Validator:
                     all_job_results = {}
                     miner_coldkeys = {}
 
-                    # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    # asyncio.wait rejects an empty set.
+                    if jobs:
+                        done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    else:
+                        done, pending = set(), set()
 
                     # Process completed jobs
                     for task in done:
@@ -549,6 +557,10 @@ class Validator:
                                 }
                             ),
                         ),
+                    )
+                    NETWORK_GATE_TALLY.log_and_reset(
+                        MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
                     )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
@@ -721,7 +733,10 @@ class Validator:
 
                     await self.release_cycle_claims(published_executor_ids)
 
-                    self.completed_cycles_since_start += 1
+                    # A cycle with no miners validated nobody, so it keeps the post-restart
+                    # warm-up closed: set_weights and the express lane wait for a scored cycle.
+                    if jobs:
+                        self.completed_cycles_since_start += 1
 
                     logger.info(
                         _m(

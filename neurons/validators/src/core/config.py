@@ -64,7 +64,23 @@ class VerifyXSettings(BaseSettings):
     )
     NETWORK_MIN_DOWNLOAD_SPEED_MBPS: float = Field(
         default=50.0,
-        description="Minimum required network download speed in Mbps"
+        description="Minimum Cloudflare capacity download speed in Mbps",
+    )
+    NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS: float = Field(
+        default=50.0,
+        description="Minimum package (integrity object) download speed in Mbps; also the Cloudflare fallback floor",
+    )
+    # When LIBRARY_REFRESH_ENABLED is on and the executor's libverifyx.so hash does not
+    # match, curl this URL once, install, check the hash, and retry. The validator's own
+    # file is the source of truth if the fetch hash differs. Off by default: a mismatch
+    # does not write /usr/lib on the provider host.
+    LIBRARY_REFRESH_ENABLED: bool = Field(
+        default=False,
+        description="If true, a libverifyx.so hash mismatch may replace /usr/lib/libverifyx.so on the executor",
+    )
+    LIBRARY_FETCH_URL: str = Field(
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libverifyx.so",
+        description="Raw GitHub URL the executor curls when library refresh is on and the hash does not match",
     )
     ENABLE_XET_CHALLENGE: bool = Field(
         default=True,
@@ -473,7 +489,7 @@ class Settings(BaseSettings):
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging and per-connect phase timing")
 
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
-    # whose price_per_gpu exceeds market p90 * SOFT_LIMIT_PRICE_RATE loses the unrented
+    # whose price_per_gpu exceeds market p90 * soft_limit_price_rate loses the unrented
     # rental incentive while staying active. When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)

@@ -2,6 +2,7 @@
 can measure how long a message waited at each hop, and the connector opens the websocket with a
 pong timeout long enough for the keepalive to survive a scoring-cycle burst.
 """
+
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -57,7 +58,9 @@ async def _published_payloads(jobs: list[Any], **publish_kwargs: Any) -> list[di
         redis_service=redis_service,
         attestation_service=MagicMock(),
     )
-    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck", **publish_kwargs)
+    await service.publish_machine_specs(
+        jobs, miner_hotkey="hk", miner_coldkey="ck", **publish_kwargs
+    )
     return [call.args[1] for call in redis_service.publish.await_args_list]
 
 
@@ -72,6 +75,17 @@ async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_
     # Assert
     assert [payload["batch_total"] for payload in payloads] == [2, 2]
     assert all(isinstance(payload["sent_at"], float) for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_a_spec_that_is_not_the_miners_batch_sets_no_batch_total(
+    create_job_result, mock_settings
+) -> None:
+    # The backend takes the expected count once per (validator, job_batch_id, miner), from the
+    # first spec: an express spec under the cycle's id arrives before the wave's.
+    payloads = await _published_payloads([create_job_result()], is_whole_miner_batch=False)
+
+    assert [payload["batch_total"] for payload in payloads] == [None]
 
 
 @pytest.mark.asyncio
@@ -103,7 +117,9 @@ async def test_bridge_tolerates_payload_without_stamps(create_job_result, mock_s
 
 
 @pytest.mark.asyncio
-async def test_only_a_recheck_publish_carries_the_recheck_marker(create_job_result, mock_settings) -> None:
+async def test_only_a_recheck_publish_carries_the_recheck_marker(
+    create_job_result, mock_settings
+) -> None:
     [cycle_payload] = await _published_payloads([create_job_result()])
     [recheck_payload] = await _published_payloads([create_job_result()], recheck=True)
 
@@ -116,7 +132,9 @@ async def test_only_a_recheck_publish_carries_the_recheck_marker(create_job_resu
 
 
 @pytest.mark.asyncio
-async def test_bridge_tolerates_payload_without_recheck_marker(create_job_result, mock_settings) -> None:
+async def test_bridge_tolerates_payload_without_recheck_marker(
+    create_job_result, mock_settings
+) -> None:
     [payload] = await _published_payloads([create_job_result()])
     del payload["recheck"]
 
@@ -149,7 +167,9 @@ async def test_bridge_carries_structured_validation_event(create_job_result, moc
 
 
 @pytest.mark.asyncio
-async def test_bridge_tolerates_payload_without_validation_event(create_job_result, mock_settings) -> None:
+async def test_bridge_tolerates_payload_without_validation_event(
+    create_job_result, mock_settings
+) -> None:
     [payload] = await _published_payloads([create_job_result()])
     del payload["validation_event"]
 
@@ -190,7 +210,12 @@ async def test_send_loop_stamps_forwarded_at_and_messages_still_waiting_behind()
 async def test_send_loop_stamps_container_responses_too() -> None:
     # Arrange: the queue mixes container responses (payload_models) with validator requests
     container_created = ContainerCreated(
-        miner_hotkey="hk", executor_id="ex", pod_id="pod", container_name="c", volume_name="v", port_maps=[]
+        miner_hotkey="hk",
+        executor_id="ex",
+        pod_id="pod",
+        container_name="c",
+        volume_name="v",
+        port_maps=[],
     )
     client = _client([container_created, RentedMachineRequest()])
 
@@ -198,7 +223,10 @@ async def test_send_loop_stamps_container_responses_too() -> None:
     sent = await _drain_send_loop(client, expected_sends=2)
 
     # Assert
-    assert [message["message_type"] for message in sent] == ["ContainerCreated", "RentedMachineRequest"]
+    assert [message["message_type"] for message in sent] == [
+        "ContainerCreated",
+        "RentedMachineRequest",
+    ]
     assert [message["queue_depth"] for message in sent] == [1, 0]
 
 
