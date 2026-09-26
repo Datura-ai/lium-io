@@ -11,7 +11,10 @@ delivered as files, never as environment variables, so they don't show up in `do
 | `/run/lium/secrets/<NAME>` | One file per secret, holding the value exactly as sent (no trailing newline added) |
 | `/run/lium/secrets/.ready` | Appears once every secret file is in place |
 
-- `/run/lium/secrets` is an in-memory `tmpfs` (`noexec,nosuid,nodev`, 1 MiB in total).
+- `/run/lium/secrets` is an in-memory `tmpfs` (`noexec,nosuid,nodev`).
+- Your secrets may use up to 1 MiB in total, with each file counted in whole 4 KiB pages (a 10-byte
+  token uses 4 KiB). A set over the limit is refused when you rent, before the pod is created, and
+  the error names the secret that doesn't fit.
 - The directory is `0700` and each file `0400`, owned by the user your image runs as (its `USER`,
   or root when none is set). Other users in the container cannot read them.
 - A secret name is letters, digits and `_`, not starting with a digit (for example `HF_TOKEN`).

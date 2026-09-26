@@ -49,15 +49,19 @@ RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
 # workload runs as the image's USER, which may be non-root, so the directory (0700) and every file
 # (0400) are chowned to the uid:gid that user resolves to inside the container — nobody else can read.
 POD_SECRETS_DIR = "/run/lium/secrets"
-POD_SECRETS_TMPFS_SIZE_BYTES = 1024 * 1024
+# tmpfs charges whole pages per file
+_TMPFS_PAGE_BYTES = 4096
+# What a renter's secrets may use in total, each file counted in whole pages (the documented limit).
+POD_SECRETS_LIMIT_BYTES = 1024 * 1024
+# The mount adds room for `.ready.partial` (renamed to `.ready`) plus one spare page, so a set that
+# uses the whole limit still gets its marker.
+POD_SECRETS_TMPFS_SIZE_BYTES = POD_SECRETS_LIMIT_BYTES + 2 * _TMPFS_PAGE_BYTES
 POD_SECRETS_TMPFS_OPTIONS = f"rw,noexec,nosuid,nodev,size={POD_SECRETS_TMPFS_SIZE_BYTES},mode=0700"
 POD_SECRET_FILE_MODE = "0400"
 # Written only after every secret file is in place and handed over; the workload waits for it.
 # Secret names cannot start with a dot, so it never collides with one.
 POD_SECRETS_READY_MARKER = ".ready"
 POD_SECRETS_READY_MARKER_MODE = "0444"
-# tmpfs charges whole pages per file
-_TMPFS_PAGE_BYTES = 4096
 # None on a ContainerExecSpec: run as the container's configured USER, not pinned to root
 CONTAINER_DEFAULT_USER = None
 _NUMERIC_ID_PATTERN = re.compile(r"[0-9]{1,10}")
@@ -970,8 +974,9 @@ def _invalid_secret_name_message(name: object) -> str:
 def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
     """The secrets to deliver; raises ValueError naming (never showing) a bad entry.
 
-    Sizes are checked here, before the rent starts, so a value that cannot fit the tmpfs is refused up
-    front instead of failing inside the pod on a full mount.
+    Sizes are checked here, before the rent starts: each file counts as whole tmpfs pages and the set
+    may use at most POD_SECRETS_LIMIT_BYTES. The mount is that plus headroom for the `.ready` marker,
+    so an accepted set never fails inside the pod on a full mount.
     """
     valid: dict[str, str] = {}
     total = 0
@@ -981,13 +986,13 @@ def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
         if not isinstance(value, str) or not value:
             raise ValueError(f"secret {name} has an empty value")
         size = _tmpfs_bytes(value)
-        if size > POD_SECRETS_TMPFS_SIZE_BYTES:
-            raise ValueError(f"secret {name} is larger than the {POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs")
+        if size > POD_SECRETS_LIMIT_BYTES:
+            raise ValueError(f"secret {name} is larger than the {POD_SECRETS_LIMIT_BYTES}-byte secrets limit")
         total += size
-        if total > POD_SECRETS_TMPFS_SIZE_BYTES:
+        if total > POD_SECRETS_LIMIT_BYTES:
             raise ValueError(
                 f"secret {name} does not fit: with the secrets before it, the set needs over the "
-                f"{POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs"
+                f"{POD_SECRETS_LIMIT_BYTES}-byte secrets limit (each file counts as whole 4096-byte pages)"
             )
         valid[name] = value
     return valid
@@ -1096,6 +1101,8 @@ def build_pod_secrets_handover_spec(
         f"chown -h {chown_to} \"$path\"; chmod {POD_SECRET_FILE_MODE} \"$path\"; "
         "done; "
         f"date -u +%Y-%m-%dT%H:%M:%SZ > {partial_marker}; "
+        # some `date`s exit 0 on a short write to a full tmpfs; an empty marker is never published
+        f"[ -s {partial_marker} ] || {{ rm -f {partial_marker}; echo could not write the ready marker >&2; exit 1; }}; "
         f"chmod {POD_SECRETS_READY_MARKER_MODE} {partial_marker}; "
         f"mv -T {partial_marker} {marker}; "
         f"{{ chown -h {chown_to} {secrets_dir} && chmod 0700 {secrets_dir}; }} "

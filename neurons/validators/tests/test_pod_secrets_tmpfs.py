@@ -22,6 +22,7 @@ from services.rental_docker_sdk import (
     CONTAINER_DEFAULT_USER,
     POD_SECRETS_DIR,
     POD_SECRETS_TMPFS_OPTIONS,
+    POD_SECRETS_LIMIT_BYTES,
     POD_SECRETS_TMPFS_SIZE_BYTES,
     POD_SECRET_NAME_PATTERN,
     ContainerExecResult,
@@ -495,7 +496,7 @@ async def test_an_unresolvable_container_user_fails_the_rent_closed(
 
 
 def test_a_secret_bigger_than_the_tmpfs_is_refused_naming_only_the_secret():
-    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_TMPFS_SIZE_BYTES
+    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_LIMIT_BYTES
     with pytest.raises(ValueError) as excinfo:
         valid_pod_secrets({"HF_TOKEN": "hf_SECRET_VALUE_MARKER", "BIG": huge})
     assert "BIG" in str(excinfo.value)
@@ -504,11 +505,11 @@ def test_a_secret_bigger_than_the_tmpfs_is_refused_naming_only_the_secret():
 
 
 def test_secrets_that_together_overflow_the_tmpfs_are_refused():
-    half = "HALF_VALUE_MARKER" + "x" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2)
+    half = "HALF_VALUE_MARKER" + "x" * (POD_SECRETS_LIMIT_BYTES // 2)
     with pytest.raises(ValueError) as excinfo:
         valid_pod_secrets({"A": half, "B": half})
     assert "secret B " in str(excinfo.value)
-    assert "A" not in str(excinfo.value).replace("secrets tmpfs", "")
+    assert "secret A" not in str(excinfo.value)
     assert "HALF_VALUE_MARKER" not in str(excinfo.value)
     with pytest.raises(ValueError) as excinfo:
         valid_pod_secrets({"SMALL": "s", "A": half, "OTHER": "o", "B": half})
@@ -516,15 +517,45 @@ def test_secrets_that_together_overflow_the_tmpfs_are_refused():
     assert "secret B " in message
     for innocent in ("SMALL", "OTHER"):
         assert innocent not in message
-    exactly_full = {"A": "x" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2), "B": "y" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2)}
-    assert valid_pod_secrets(exactly_full) == exactly_full
+
+
+PAGE = 4096
+
+
+def test_the_mount_has_room_for_the_marker_beyond_the_renter_limit():
+    assert POD_SECRETS_LIMIT_BYTES == 1024 * 1024
+    assert POD_SECRETS_TMPFS_SIZE_BYTES == POD_SECRETS_LIMIT_BYTES + 2 * PAGE
+    assert f"size={POD_SECRETS_TMPFS_SIZE_BYTES}" in POD_SECRETS_TMPFS_OPTIONS.split(",")
+
+
+@pytest.mark.parametrize(
+    "largest_accepted, one_more",
+    [
+        ({"A": "x" * POD_SECRETS_LIMIT_BYTES}, {"A": "x" * (POD_SECRETS_LIMIT_BYTES + 1)}),
+        (
+            {"A": "x" * (POD_SECRETS_LIMIT_BYTES // 2), "B": "y" * (POD_SECRETS_LIMIT_BYTES // 2)},
+            {"A": "x" * (POD_SECRETS_LIMIT_BYTES // 2), "B": "y" * (POD_SECRETS_LIMIT_BYTES // 2 + 1)},
+        ),
+        # page rounding: 256 one-byte secrets use the whole limit
+        ({f"S{i}": "s" for i in range(256)}, {f"S{i}": "s" for i in range(257)}),
+        (
+            {"A": "x" * (PAGE + 1), "B": "y" * (POD_SECRETS_LIMIT_BYTES - 2 * PAGE)},
+            {"A": "x" * (PAGE + 1), "B": "y" * (POD_SECRETS_LIMIT_BYTES - 2 * PAGE + 1)},
+        ),
+    ],
+)
+def test_the_size_boundary_is_the_page_rounded_limit(largest_accepted, one_more):
+    assert valid_pod_secrets(largest_accepted) == largest_accepted
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets(one_more)
+    assert "limit" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
 async def test_an_oversize_secret_fails_the_rent_before_anything_is_created(
     docker_service, executor_info, keypair, monkeypatch
 ):
-    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_TMPFS_SIZE_BYTES
+    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_LIMIT_BYTES
     _, docker_client = await _create(
         docker_service,
         executor_info,
@@ -725,3 +756,28 @@ def test_the_marker_is_removed_if_the_directory_handover_fails():
     assert script.rstrip().endswith(f"|| {{ rm -f {POD_SECRETS_DIR}/.ready; exit 1; }}")
     assert rental_docker_sdk.POD_SECRETS_READY_MARKER == ".ready"
     assert not POD_SECRET_NAME_PATTERN.fullmatch(".ready")
+
+
+def test_an_empty_marker_is_never_published(plain_secrets_dir, tmp_path):
+    secrets_dir, _ = plain_secrets_dir
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert _run_script(spec).returncode == 0
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # a `date` that exits 0 without writing, as BusyBox does on a full tmpfs
+    (fake_bin / "date").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "date").chmod(0o755)
+    spec = _handover()
+
+    run = subprocess.run(
+        list(spec.argv),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode != 0
+    assert "could not write the ready marker" in run.stderr
+    assert not os.path.lexists(secrets_dir / ".ready")
+    assert not os.path.lexists(secrets_dir / ".ready.partial")
