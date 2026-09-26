@@ -6,7 +6,7 @@ and converting the validation context into a JobResult for reporting.
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
@@ -14,8 +14,10 @@ from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, Vali
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 
+from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
 from .models import JobResult
 from .pipeline import Context
 
@@ -152,6 +154,9 @@ class ResultHandler:
                 "is_spot": is_spot,
             }
         )
+        specs = self._specs_with_verifyx_ema_hold(
+            context, specs, validation_event, executor_info.uuid
+        )
         # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
         # was actually performed (None → key omitted), mirroring gpu_metrics.
         # Rides executor.specs to the backend like tdx_attestation_passed.
@@ -229,6 +234,41 @@ class ResultHandler:
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
         )
+
+    @staticmethod
+    def _specs_with_verifyx_ema_hold(
+        context: Context,
+        specs: dict[str, Any],
+        validation_event: ValidationEvent | None,
+        executor_id: str,
+    ) -> dict[str, Any]:
+        """``specs`` with the VerifyX EMA held when this cycle must not move it and the flag is on."""
+        # The pipeline names the fatal check that ended the run in the last event's summary.
+        failed_check_id = (
+            validation_event.what_we_saw.get("steps_failed") if validation_event else None
+        )
+        ema_hold_reason = verifyx_ema_hold_reason(context, failed_check_id)
+        if not ema_hold_reason:
+            return specs
+        held_specs = hold_verifyx_ema(context, specs)
+        hold_enabled = settings.VERIFYX_EMA_HOLD_ENABLED
+        if held_specs.get("network") != specs.get("network"):
+            logger.info(
+                _m(
+                    "VerifyX EMA held: this cycle's sample does not move it"
+                    if hold_enabled
+                    else "VerifyX EMA hold is off: this cycle's sample would not have moved it",
+                    extra=get_extra_info(
+                        {
+                            "executor_id": executor_id,
+                            "reason": ema_hold_reason,
+                            "measured": specs.get("network"),
+                            "published": held_specs.get("network"),
+                        }
+                    ),
+                )
+            )
+        return held_specs if hold_enabled else specs
 
     @staticmethod
     def _get_rented_gpu_count(context: Context) -> int | None:

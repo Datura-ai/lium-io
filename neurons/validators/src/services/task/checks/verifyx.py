@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
 
+from protocol.vc_protocol.compute_requests import NetworkEMA
+
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, _is_speed_reading
@@ -16,6 +18,7 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+_EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 
 @dataclass(frozen=True)
@@ -419,6 +422,67 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
         return False
     speed = _download_speed(result)
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+
+
+def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
+    """Why this cycle's VerifyX sample must not move the published EMA, or None.
+
+    A cycle that a check other than VerifyX failed measured the link of a node that is not in
+    service; the executor's mandatory pre-pull of the recommended image, tens of GB, is a likely
+    cause of both and shares the link. With alpha 0.5 one such sample weighs half of the next
+    cycle's verdict: a node seeded by a cycle that failed the cached-image check read 86.7 against
+    the 100 gate one batch later, and passed the cycle after that. Holding the EMA leaves a
+    never-measured node never-measured, so its next cycle gets the cold-sample retry and
+    bootstraps from a sample taken in service. A cycle that VerifyX itself failed still moves the
+    EMA: that is the gate working.
+
+    A cycle that passed while the image was not cached yet (the fresh-node grace's PENDING) has the
+    same pre-pull on the link, so it does not seed a never-measured node either. A node with a
+    stored EMA publishes its sample on every passing cycle, image cached or not: a hold there would
+    let it keep passing the gate on an EMA its samples no longer support.
+    """
+    if failed_check_id:
+        if failed_check_id != VerifyXCheck.check_id:
+            return f"cycle failed {failed_check_id}"
+        return None
+    if ctx.state.recommended_image_cached is False and _is_never_measured(ctx):
+        return "never-measured node, image not cached yet"
+    return None
+
+
+def _is_never_measured(ctx: Context) -> bool:
+    """No stored VerifyX EMA, per the backend's answer; False without that answer, as for the cold-sample retry."""
+    if ctx.state.rented_data is None:
+        return False
+    prev_ema = _stored_network_ema(ctx)
+    return prev_ema is None or prev_ema.ema_verifyx_download_speed is None
+
+
+def _stored_network_ema(ctx: Context) -> NetworkEMA | None:
+    rented_data = ctx.state.rented_data
+    return rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+
+
+def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
+    """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
+
+    Only keys this cycle wrote are touched. A never-measured node publishes none, which the backend
+    already reads as unseeded (the backend's first-pass deferral relies on it). The raw samples stay.
+    """
+    network = specs.get("network")
+    if not isinstance(network, dict) or not any(key in network for key in _EMA_KEYS):
+        return specs
+    prev_ema = _stored_network_ema(ctx)
+    held = dict(network)
+    for key in _EMA_KEYS:
+        if key not in held:
+            continue
+        previous = getattr(prev_ema, key, None)
+        if previous is None:
+            del held[key]
+        else:
+            held[key] = previous
+    return {**specs, "network": held}
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:
