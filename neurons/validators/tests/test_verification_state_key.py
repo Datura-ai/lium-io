@@ -101,3 +101,48 @@ async def test_existing_state_is_preserved_on_upgrade(context_factory):
     assert (record["count"], record["failed"], record["uuids"]) == (41, 2, "gpu-001")
     assert await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR) is None
     assert await service.get_verified_job_info(EXECUTOR, HOTKEY_B) == {}
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_with_matching_gpu_uuids_migrates(context_factory):
+    service = _redis_service()
+    legacy = {"count": 7, "failed": 0, "spec": "A100:2", "uuids": "gpu-001,gpu-002"}
+    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, EXECUTOR, json.dumps(legacy))
+
+    assert await _cycle(service, context_factory, hotkey=HOTKEY_A, uuids="gpu-002,gpu-001") is True
+
+    record = await _field(service, verified_job_field(HOTKEY_A, EXECUTOR))
+    assert (record["count"], record["uuids"]) == (8, "gpu-001,gpu-002")
+    assert await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_without_gpu_uuids_starts_a_fresh_count(context_factory):
+    service = _redis_service()
+    legacy = {"count": 30, "failed": 1, "spec": "A100:1", "uuids": ""}
+    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, EXECUTOR, json.dumps(legacy))
+
+    assert await service.get_verified_job_info(EXECUTOR, HOTKEY_A) == {}
+    assert await _cycle(service, context_factory, hotkey=HOTKEY_A, uuids="gpu-001") is True
+
+    record = await _field(service, verified_job_field(HOTKEY_A, EXECUTOR))
+    assert (record["count"], record["failed"], record["uuids"]) == (1, 0, "gpu-001")
+    assert await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR) is None
+    assert await service.get_verified_job_info(EXECUTOR, HOTKEY_B) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("anchor", ["gpu-001", ""])
+async def test_failing_cycle_leaves_legacy_and_other_records_unchanged(context_factory, anchor):
+    service = _redis_service()
+    legacy = json.dumps({"count": 9, "failed": 0, "spec": "A100:1", "uuids": anchor})
+    other = json.dumps({"count": 4, "failed": 0, "spec": "A100:1", "uuids": "gpu-001"})
+    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, EXECUTOR, legacy)
+    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(HOTKEY_A, EXECUTOR), other)
+
+    verified = await service.get_verified_job_info(EXECUTOR, HOTKEY_B)
+    await service.set_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, success=False)
+    await service.clear_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, anchor_broken=True)
+
+    assert await _field(service, EXECUTOR) == json.loads(legacy)
+    assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == json.loads(other)

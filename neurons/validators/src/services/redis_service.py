@@ -624,14 +624,19 @@ class RedisService:
     async def get_verified_job_info(self, executor_id: str, miner_hotkey: str):
         """The record under (miner_hotkey, executor_id), else the uuid-only record written before the key
         carried the hotkey. The uuid-only record is never written again; it is removed by the first
-        successful write for the executor, so it moves to the hotkey that passes verification."""
+        successful write for the executor, so it moves to the hotkey whose GPU UUIDs match its anchor.
+        A uuid-only record without an anchor is not carried: that executor starts a fresh count."""
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id))
-        if not data:
-            data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
+        if data:
+            return json.loads(data)
+
+        data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
         if not data:
             return {}
-
-        return json.loads(data)
+        legacy = json.loads(data)
+        if not legacy.get(GPU_ANCHOR_KEY):
+            return {}
+        return legacy
 
     async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
