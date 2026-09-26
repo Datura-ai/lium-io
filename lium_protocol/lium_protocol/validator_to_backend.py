@@ -40,6 +40,8 @@ class ValidatorMessageType(enum.Enum):
     RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
     GpuEstimatesRequest = "GpuEstimatesRequest"
     EstimateResponse = "EstimateResponse"
+    # DAH-3338: one chunk of the container states one cycle saw on one node, after its ExecutorSpecRequest
+    PodStatesReport = "PodStatesReport"
     # answers to the backend's container requests (payload_models.ContainerResponseType)
     ContainerCreated = "ContainerCreated"
     ContainerStarted = "ContainerStarted"
@@ -85,6 +87,8 @@ class FailedContainerErrorCodes(enum.Enum):
     AttestationError = "AttestationError"
     # DAH-2703: the container the validator created was gone from the host before creation finished
     ContainerVanished = "ContainerVanished"
+    # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
+    ExecutorUnreachable = "ExecutorUnreachable"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -141,6 +145,45 @@ class IncentiveReason(pydantic.BaseModel):
 EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID = "11111111-1111-1111-1111-111111111111"
 
 
+class ContainerState(enum.Enum):
+    """DAH-3338: what the validator saw of one rented pod's container this cycle. `unknown` is a pod the
+    validator could not inspect (the SSH transport died first) and is never read as `absent`; `reaped` is
+    an orphan the stale-container cleanup removed."""
+
+    running = "running"
+    exited = "exited"
+    absent = "absent"
+    unknown = "unknown"
+    reaped = "reaped"
+
+
+class PodContainerState(pydantic.BaseModel):
+    pod_id: str
+    container_state: ContainerState
+    observed_at: datetime
+
+
+# The backend bounds `ExecutorSpecRequest.pod_states` and one `PodStatesReport` chunk at this many entries.
+POD_STATES_MAX_ITEMS = 256
+
+
+@VALIDATOR_MESSAGES.register
+class PodStatesReport(ValidatorMessage):
+    """DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's
+    `ExecutorSpecRequest` when the validator's POD_STATES_REPORT_ENABLED is on. The backend writes the
+    states onto the rental rows and nothing else (no cycle row, no validation report); the write is
+    idempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.PodStatesReport
+    validator_hotkey: str
+    miner_hotkey: str
+    executor_uuid: str
+    job_batch_id: str
+    chunk_index: int = pydantic.Field(ge=0)
+    chunk_total: int = pydantic.Field(ge=1)
+    pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
+
+
 @VALIDATOR_MESSAGES.register
 class ExecutorSpecRequest(ValidatorMessage):
     """One executor's result for one cycle. `specs` is the scraped machine description; the backend types
@@ -185,6 +228,10 @@ class ExecutorSpecRequest(ValidatorMessage):
     # DAH-2792: specs the validator scored for this miner in this job_batch_id; expected minus received
     # is what was lost on the socket
     batch_total: int | None = None
+    # DAH-3338: per rented pod, the container state this cycle saw; at most POD_STATES_MAX_ITEMS entries
+    # (the rest of the cycle's states travel in PodStatesReport chunks). None from a publisher that
+    # predates the field.
+    pod_states: list[PodContainerState] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
 
 
 @VALIDATOR_MESSAGES.register

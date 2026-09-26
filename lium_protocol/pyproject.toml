@@ -1,6 +1,6 @@
 [project]
 name = "lium-protocol"
-version = "1.2.0"
+version = "1.4.0"
 description = "The Lium validator↔backend wire protocol: pydantic models, one JSON-schema snapshot, no application code"
 authors = [
     {name = "Datura", email = "dev@datura.ai"},

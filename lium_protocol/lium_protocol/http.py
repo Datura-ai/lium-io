@@ -25,6 +25,10 @@ class RentedPod(pydantic.BaseModel):
     # DAH-2467: GPUs this pod holds; None = the backend predates the field, the validator then scores
     # the whole executor as rented
     gpu_count: int | None = None
+    # DAH-2870: the external port of the pod's container port 22; None = none mapped or an older backend
+    ssh_port: int | None = None
+    # DAH-2870: the pod's status (`RUNNING`, `REBOOT_PENDING`, ...); None = an older backend
+    status: str | None = None
 
 
 class RentedExecutor(pydantic.BaseModel):
@@ -96,6 +100,14 @@ class PodHostRebootRecoveredResponse(pydantic.BaseModel):
     recorded: bool
 
 
+class PodSshUnreachableResponse(pydantic.BaseModel):
+    """`POST …/ssh-unreachable`: ``recorded`` False when the backend already holds this outage."""
+
+    recorded: bool
+    # "notified", "recorded" or "notify_failed"; None = an older backend
+    delivery: str | None = None
+
+
 class FillerRunActiveResponse(pydantic.BaseModel):
     active: bool
     executor_id: str | None = None
@@ -146,6 +158,7 @@ HTTP_MODELS: dict[str, type[pydantic.BaseModel]] = {
         PodRentalActiveResponse,
         PodHostRebootRecoveredRequest,
         PodHostRebootRecoveredResponse,
+        PodSshUnreachableResponse,
         FillerRunActiveResponse,
         ExecutorUptimeResponse,
         ExecutorHealthCheckResponse,

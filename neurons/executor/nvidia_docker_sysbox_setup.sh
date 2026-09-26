@@ -11,9 +11,12 @@ set -e
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
 #   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
-SYSBOX_VERSION="0.6.6"
-SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
-SYSBOX_SHA="87cfa5cad97dc5dc1a243d6d88be1393be75b93a517dc1580ecd8a2801c2777a"
+# 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
+# and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
+SYSBOX_VERSION="0.7.1"
+SYSBOX_DEB_NAME="sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
+SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_DEB_NAME}"
+SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
 
@@ -102,7 +105,7 @@ sysbox_idmapped_report() {
 }
 
 sysbox_runc_version() {
-    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.6.6" is one of the
+    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.7.1" is one of the
     # tab-indented lines after it (edition, version, commit, ...), so the first line is never the
     # version. Prints the number; exit 1 when the binary is missing or prints no version.
     sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
@@ -134,10 +137,12 @@ failure_diagnostics() {
 }
 
 abort_on_active_rentals() {
-    # a rental blocks every path below, so check before anything that costs the node time or bandwidth
-    docker ps --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
-    fail "Active rentals found (pod_* containers). Cannot proceed."
-    docker ps --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
+    # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
+    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+    fail "Rentals found (pod_* containers, running or stopped). Cannot proceed."
+    docker ps -a --filter "name=pod_" --format "    - {{.Names}} ({{.Status}})" 2>/dev/null
+    fail "Check them with: docker ps -a --filter name=pod_"
     exit 1
 }
 
@@ -470,7 +475,14 @@ check_sysbox() {
             "$(self_cmd)   # re-applies the Docker 29 settings and re-verifies; then: journalctl -u sysbox-mgr --no-pager -n 20"
         return 1
     fi
-    pf_pass "sysbox-runc $(sysbox_runc_version || echo installed) runs a container."
+    local installed
+    installed=$(sysbox_runc_version || true)
+    if [ -n "$installed" ] && ! version3_ge "$installed" "$SYSBOX_VERSION"; then
+        pf_fix "sysbox-runc $installed is older than $SYSBOX_VERSION, the version this installer pins." \
+            "$(self_cmd)   # upgrades Sysbox; it refuses to run while the node has a rental"
+        return 1
+    fi
+    pf_pass "sysbox-runc ${installed:-installed} runs a container."
 }
 
 preflight_summary() {
@@ -566,7 +578,15 @@ fi
 
 # ── 2. Already working? ─────────────────────────────────
 
-if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
+INSTALLED_SYSBOX=$(sysbox_runc_version || true)
+SYSBOX_UP_TO_DATE=false
+if [ -n "$INSTALLED_SYSBOX" ] && ! version3_ge "$INSTALLED_SYSBOX" "$SYSBOX_VERSION"; then
+    warn "Sysbox $INSTALLED_SYSBOX is installed; upgrading to $SYSBOX_VERSION."
+elif command -v sysbox-runc &>/dev/null; then
+    SYSBOX_UP_TO_DATE=true
+fi
+
+if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-runc; then
     # pull first: without the image the real test cannot run and the host would be judged on kernel version alone
     if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
         abort_on_active_rentals
@@ -591,7 +611,7 @@ elif [ "$(sysbox_idmapped_report)" = "no" ]; then
 fi
 
 SKIP_INSTALL=false
-command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
+[ "$SYSBOX_UP_TO_DATE" = true ] && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
 
 # ── 3. Check running containers ─────────────────────────
 
@@ -688,7 +708,7 @@ apt_install install -y -qq nvidia-container-toolkit jq || exit 1
 ok "nvidia-container-toolkit, jq"
 
 if [ "$SKIP_INSTALL" = false ]; then
-    LOCAL_DEB="./sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
+    LOCAL_DEB="./${SYSBOX_DEB_NAME}"
     if [ -f "$LOCAL_DEB" ]; then
         SYSBOX_DEB="$LOCAL_DEB"
     else

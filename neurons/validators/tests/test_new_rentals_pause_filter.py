@@ -104,6 +104,7 @@ def _miner_service() -> MinerService:
     # __new__ skips __init__: give the service the lane map _claim_for_cycle reads when
     # EXPRESS_LANE_ENABLED is on (DAH-2958), so the suite also passes with the flag set
     service.in_flight = {}
+    service.miners_awaiting_wave_list = {}
     return service
 
 
