@@ -53,7 +53,7 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # subsidy (no buckets → no subsidy path).
 #
 # The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
-# bucket cap equals `machines × gpus_per_machine`. Eligible families use
+# bucket cap equals `machines × gpus_per_machine`. Eligible families default to
 # `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
 #
@@ -65,13 +65,16 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 # always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
 # those cards share the 4 with the idle single-card nodes.
+#
+# The A100 and L40S 8-card buckets use lower, demand-based caps than the default
+# 8-card bucket; the values are in the table below.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
     "RTX 4090": {1: 10, 8: 64},
-    "A100": {1: 10, 8: 64},
+    "A100": {1: 10, 8: 40},
     "RTX A6000": {1: 10, 8: 64},
     "RTX 3090": {1: 10, 8: 64},
     "H800": {},
@@ -82,7 +85,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 6000 Ada Generation": {1: 10, 8: 64},
     "RTX PRO 6000": {1: 10, 8: 64},
     "L4": {},
-    "L40S": {1: 10, 8: 64},
+    "L40S": {1: 10, 8: 16},
     "L40": {1: 10, 8: 64},
     "RTX 2000 Ada Generation": {},
     "RTX A5000": {},
