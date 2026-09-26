@@ -3615,7 +3615,7 @@ class DockerService:
             return False
 
         # both execs may run twice after a dropped SSH transport: the copy overwrites the file,
-        # the script converges on "sshd is listening" (DAH-2341) whichever run got there first
+        # the script ends with sshd listening on its port whichever run got there first
         create_spec = ContainerExecSpec(
             container_name=container_name,
             argv=(
