@@ -66,9 +66,26 @@ class RecordingContainerCleanup:
         return self._swept
 
 
-def _make_ctx(cleanup, rented_data=None, redis=None):
+def _listed_rented_data(executor_uuid: str = default_executor().uuid) -> RentedExecutorsResponse:
+    # Removal needs a fetched, non-empty rented list; this one lists a live pod the host does not run.
+    return RentedExecutorsResponse(
+        executors={
+            executor_uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id="listed-live", container_name="pod_listed-live")],
+            )
+        },
+    )
+
+
+_UNSET = object()
+
+
+def _make_ctx(cleanup, rented_data=_UNSET, redis=None):
     services = build_services(container_cleanup=cleanup, redis=redis or FakeRedis())
-    state = build_state(rented_data=rented_data)
+    state = build_state(rented_data=_listed_rented_data() if rented_data is _UNSET else rented_data)
     return make_context(services=services, state=state, ssh="ssh-conn-sentinel")
 
 
@@ -643,10 +660,46 @@ async def test_this_cycles_reaps_go_out_before_ids_already_sent_once():
     redis = FakeRedis({key: {pod_id: sent_earlier for pod_id in sent_ids}})
     cleanup = RecordingContainerCleanup(result=(1, [f"pod_{REAPED_POD_ID}"], []))
     services = build_services(container_cleanup=cleanup, redis=redis)
-    ctx = make_context(executor=executor, services=services, state=build_state(), ssh="ssh-conn-sentinel")
+    state = build_state(rented_data=_listed_rented_data(executor.uuid))
+    ctx = make_context(executor=executor, services=services, state=state, ssh="ssh-conn-sentinel")
 
     result = await StaleContainerCleanupCheck().run(ctx)
 
     sent = [s.pod_id for s in result.updates["state"].pod_states]
-    assert len(sent) == POD_STATES_MAX_ITEMS
+    assert len(sent) == POD_STATES_MAX_ITEMS - 1  # one slot is the listed pod's observed state
     assert REAPED_POD_ID in sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data, reason",
+    [
+        pytest.param(None, "rented_list_unavailable", id="fetch-failed-none"),
+        pytest.param(RentedExecutorsResponse(executors={}), "rented_list_empty", id="empty"),
+    ],
+)
+async def test_an_empty_or_unknown_rented_list_skips_removal_and_raises_a_warning(rented_data, reason):
+    cleanup = RecordingContainerCleanup(result=(1, ["pod_live_renter"], []))
+    ctx = _make_ctx(cleanup, rented_data=rented_data)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert cleanup.calls == []
+    assert result.passed is True
+    assert result.event.reason_code == "STALE_CLEANUP_RENTED_LIST_UNKNOWN"
+    assert result.event.severity == "warning"
+    assert result.event.what_we_saw["removed_count"] == 0
+    assert result.event.what_we_saw["rented_list_unknown"] == reason
+    # the rest of the check still runs
+    assert len(cleanup.reclaim_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_valid_rented_list_keeps_the_cleaned_event():
+    cleanup = RecordingContainerCleanup(result=(1, ["pod_orphan"], []))
+
+    result = await StaleContainerCleanupCheck().run(_make_ctx(cleanup))
+
+    assert len(cleanup.calls) == 1
+    assert result.event.reason_code == "STALE_CLEANUP_DONE"
+    assert result.event.what_we_saw["rented_list_unknown"] is None

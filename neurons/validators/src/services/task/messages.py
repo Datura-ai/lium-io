@@ -628,6 +628,13 @@ class StaleContainerCleanupMessages:
         category="prep",
         impact="Proceed",
     )
+    RENTED_LIST_UNKNOWN = MessageTemplate(
+        event="Stale container removal skipped: rented list empty or unknown",
+        reason="STALE_CLEANUP_RENTED_LIST_UNKNOWN",
+        severity="warning",
+        category="prep",
+        impact="No rental container removed this cycle; live pods and fillers are left alone",
+    )
 
 
 class CustomBuildOrphanSweepMessages:
