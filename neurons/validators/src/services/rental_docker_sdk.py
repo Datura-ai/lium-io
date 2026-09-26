@@ -957,6 +957,17 @@ def _tmpfs_bytes(value: str) -> int:
     return -(-size // _TMPFS_PAGE_BYTES) * _TMPFS_PAGE_BYTES
 
 
+def _invalid_secret_name_message(name: object) -> str:
+    # A refused name may be a pasted `NAME=value`, so it is never echoed: at most the part before the
+    # first '=', and only when that part is itself a valid name.
+    rule = "letters, digits and _ only, not starting with a digit"
+    if isinstance(name, str) and "=" in name:
+        prefix = name.split("=", 1)[0]
+        if POD_SECRET_NAME_PATTERN.fullmatch(prefix):
+            return f"invalid secret name starting {prefix}= (a name must not contain '='): {rule}"
+    return f"invalid secret name: {rule}"
+
+
 def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
     """The secrets to deliver; raises ValueError naming (never showing) a bad entry.
 
@@ -967,7 +978,7 @@ def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
     total = 0
     for name, value in (secrets or {}).items():
         if not isinstance(name, str) or not POD_SECRET_NAME_PATTERN.fullmatch(name):
-            raise ValueError(f"invalid secret name {name!r}: letters, digits and _ only, not starting with a digit")
+            raise ValueError(_invalid_secret_name_message(name))
         if not isinstance(value, str) or not value:
             raise ValueError(f"secret {name} has an empty value")
         size = _tmpfs_bytes(value)
