@@ -35,13 +35,17 @@ delivery fails, the marker is never written and the rent fails.
 In Python:
 
 ```python
-import pathlib, time
+import os, time
 
-secrets = pathlib.Path("/run/lium/secrets")
-while not (secrets / ".ready").exists():
+while not os.path.exists("/run/lium/secrets/.ready"):
     time.sleep(0.2)
-hf_token = (secrets / "HF_TOKEN").read_text()
+with open("/run/lium/secrets/HF_TOKEN") as f:
+    hf_token = f.read()
 ```
+
+Until delivery finishes, `/run/lium/secrets` is readable only by root, so a non-root process cannot
+look inside it yet. `os.path.exists` and the shell `[ -f ]` treat that as "not there yet" and keep
+waiting; `pathlib.Path.exists()` raises `PermissionError` instead, so do not use it for this loop.
 
 ## Lifetime
 
