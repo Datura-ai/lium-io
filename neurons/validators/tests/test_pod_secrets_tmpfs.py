@@ -460,7 +460,7 @@ async def test_secrets_are_owned_by_the_container_user_and_stay_0700_0400(
     script = handovers[0].argv[2]
     assert f'chown -h {owner} "$path"; chmod 0400 "$path"' in script
     assert f"{{ chown -h {owner} {POD_SECRETS_DIR} && chmod 0700 {POD_SECRETS_DIR}; }}" in script
-    assert script.index('chown -h') < script.index("mv -T") < script.index(f"chown -h {owner} {POD_SECRETS_DIR} ")
+    assert script.index('chown -h') < script.index(f"mv -f {POD_SECRETS_DIR}/.ready.partial {POD_SECRETS_DIR}/.ready;") < script.index(f"chown -h {owner} {POD_SECRETS_DIR} ")
     for name in SECRETS:
         assert f"{POD_SECRETS_DIR}/{name}" in script
     assert "mode=0700" in POD_SECRETS_TMPFS_OPTIONS.split(",")
@@ -755,6 +755,10 @@ def test_the_marker_is_removed_if_the_directory_handover_fails():
     script = _handover().argv[2]
     assert script.rstrip().endswith(f"|| {{ rm -f {POD_SECRETS_DIR}/.ready; exit 1; }}")
     assert rental_docker_sdk.POD_SECRETS_READY_MARKER == ".ready"
+    # every rename is plain `mv -f`: BusyBox before 1.34 (Alpine 3.14 and older) has no `mv -T`
+    assert "mv -T" not in script
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert "mv -T" not in spec.argv[2]
     assert not POD_SECRET_NAME_PATTERN.fullmatch(".ready")
 
 

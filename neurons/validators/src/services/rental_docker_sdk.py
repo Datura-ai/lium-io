@@ -1104,7 +1104,9 @@ def build_pod_secrets_handover_spec(
         # some `date`s exit 0 on a short write to a full tmpfs; an empty marker is never published
         f"[ -s {partial_marker} ] || {{ rm -f {partial_marker}; echo could not write the ready marker >&2; exit 1; }}; "
         f"chmod {POD_SECRETS_READY_MARKER_MODE} {partial_marker}; "
-        f"mv -T {partial_marker} {marker}; "
+        # plain `mv -f` (BusyBox before 1.34 has no `mv -T`): the directory is still root-only and neither
+        # name can exist, so nothing can turn the destination into a directory or a link
+        f"mv -f {partial_marker} {marker}; "
         f"{{ chown -h {chown_to} {secrets_dir} && chmod 0700 {secrets_dir}; }} "
         f"|| {{ rm -f {marker}; exit 1; }}"
     )
