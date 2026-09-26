@@ -1,4 +1,4 @@
-"""DAH-1482: renter secrets reach the pod as 0400 files on a tmpfs at /run/lium/secrets, behind
+"""Renter secrets reach the pod as 0400 files on a tmpfs at /run/lium/secrets, behind
 POD_SECRETS_TMPFS_ENABLED — never in the container env, /etc/environment, exec argv or the logs; with
 the flag off a rent is exactly today's."""
 

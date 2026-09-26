@@ -44,7 +44,7 @@ RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
-# DAH-1482: renter secrets live on a tmpfs, so a value exists only in the container's memory — never in
+# Renter secrets live on a tmpfs, so a value exists only in the container's memory — never in
 # an image layer, `docker commit`, a volume backup, `docker inspect` Env or /etc/environment. The
 # workload runs as the image's USER, which may be non-root, so the directory (0700) and every file
 # (0400) are chowned to the uid:gid that user resolves to inside the container — nobody else can read.

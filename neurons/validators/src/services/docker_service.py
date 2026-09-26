@@ -1135,7 +1135,7 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
 
 
 def _pod_secrets(payload: ContainerCreateRequest) -> dict[str, str]:
-    # DAH-1482: with the flag off a sent `secrets` is ignored, so the rent is exactly today's
+    # With the flag off a sent `secrets` is ignored, so the rent is exactly today's
     if not settings.POD_SECRETS_TMPFS_ENABLED:
         return {}
     return valid_pod_secrets(payload.secrets)
