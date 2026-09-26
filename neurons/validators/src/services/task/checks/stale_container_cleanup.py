@@ -10,6 +10,7 @@ from uuid import UUID
 from core.config import settings
 from core.utils import _m
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
+from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
 from ...const import POD_CONTAINER_PREFIX
@@ -90,7 +91,8 @@ class StaleContainerCleanupCheck:
         # ids an earlier cycle reaped and queued.
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
-        if first_sight:
+        rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data, ctx.executor.uuid)
+        if first_sight or rented_list_unknown is not None:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
             (
@@ -130,7 +132,7 @@ class StaleContainerCleanupCheck:
         )
 
         event = render_message(
-            Msg.CLEANED,
+            Msg.CLEANED if rented_list_unknown is None else Msg.RENTED_LIST_UNKNOWN,
             ctx=ctx,
             check_id=self.check_id,
             what={
@@ -138,6 +140,7 @@ class StaleContainerCleanupCheck:
                 "removed_containers": removed_names,
                 "unremovable_containers": unremovable_names,
                 "first_sight_grace": first_sight,
+                "rented_list_unknown": rented_list_unknown,
                 "reclaimed_cache_volumes": reclaimed_cache_volumes,
                 "swept_download_temporaries": swept_download_temporaries,
             },

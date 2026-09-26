@@ -55,6 +55,30 @@ DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 # near a minute means a wedged docker daemon rather than work in progress.
 DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 
+RENTED_LIST_UNAVAILABLE = "rented_list_unavailable"
+RENTED_LIST_EMPTY = "rented_list_empty"
+
+
+def rented_list_unknown_reason(
+    rented_data: Optional[RentedExecutorsResponse], executor_uuid: str
+) -> Optional[str]:
+    """Why the rented list for this executor cannot be trusted to authorise a removal, or None.
+
+    The backend's answer carries no explicit "this executor has no rentals" signal: an executor
+    missing from `executors` with no fillers is also what a failed fetch, a backend hiccup or a
+    node row keyed on another executor id looks like. Reaping on that deleted live renter pods and
+    fillers (a provider ticket: 5 in 24 h, every one logged with `rented_containers: set()`), so an
+    empty list means "don't know", never "nothing is rented".
+    """
+    if rented_data is None:
+        return RENTED_LIST_UNAVAILABLE
+    executor = rented_data.executors.get(executor_uuid)
+    if executor is not None and executor.pods:
+        return None
+    if rented_data.get_filler_containers(executor_uuid):
+        return None
+    return RENTED_LIST_EMPTY
+
 
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
@@ -86,6 +110,17 @@ class ContainerCleanup:
             "executor_uuid": executor_uuid,
             "threshold_minutes": self.stale_threshold_minutes,
         }
+
+        unknown_reason = rented_list_unknown_reason(rented_data, executor_uuid)
+        if unknown_reason is not None:
+            logger.warning(
+                _m(
+                    "Skipping stale container removal: rented list is empty or unknown",
+                    extra={**extra, "skip_reason": unknown_reason},
+                )
+            )
+            await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
+            return 0, [], []
 
         try:
             # Get all containers with rental prefixes.

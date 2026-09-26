@@ -6,11 +6,19 @@ DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
 volumes left behind by historical `docker rm` without `-v`.
 """
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.container_cleanup import VOLUME_RM_MAX_PER_PASS, ContainerCleanup
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from services.container_cleanup import (
+    RENTED_LIST_EMPTY,
+    RENTED_LIST_UNAVAILABLE,
+    VOLUME_RM_MAX_PER_PASS,
+    ContainerCleanup,
+    rented_list_unknown_reason,
+)
 
 
 def _ssh_mock_from_calls(call_handler):
@@ -71,6 +79,14 @@ def _rented_data(executor_uuid: str, pods: list[str]):
 
 EXECUTOR_UUID = "00000000-0000-0000-0000-000000000000"
 
+# A rented pod the backend lists but that is not on the host: removal is only allowed against a
+# fetched, non-empty rented list, so tests that exercise a removal carry one.
+LISTED_LIVE_POD = "pod_listed_live"
+
+
+def _listed():
+    return _rented_data(EXECUTOR_UUID, [LISTED_LIVE_POD])
+
 
 @pytest.mark.asyncio
 async def test_cleanup_removes_stale_running_health_check():
@@ -84,7 +100,7 @@ async def test_cleanup_removes_stale_running_health_check():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -129,7 +145,7 @@ async def test_a_volume_rm_error_after_a_successful_rm_still_counts_the_containe
     ssh.run.side_effect = handler
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert (removed_count, removed_names, unremovable) == (1, [name], [])
@@ -151,7 +167,7 @@ async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
     ssh.run.side_effect = handler
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert (removed_count, removed_names, unremovable) == (0, [], [name])
@@ -160,7 +176,7 @@ async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
 async def cleanup_with_hook(ssh, on_before_remove):
     return await ContainerCleanup(stale_threshold_minutes=15).cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
         on_before_remove=on_before_remove,
     )
@@ -183,7 +199,7 @@ async def test_cleanup_removes_stale_exited_health_check():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -203,7 +219,7 @@ async def test_cleanup_preserves_young_health_check():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -253,7 +269,7 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
     ssh.run = AsyncMock(side_effect=handler)
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    await cleanup.cleanup(ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID)
+    await cleanup.cleanup(ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID)
 
     ps_cmd = next((c for c in seen_cmds if "docker ps -a" in c), "")
     assert "pod_*" in ps_cmd
@@ -295,7 +311,7 @@ async def test_cleanup_preserves_young_unknown_filler_container():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -315,7 +331,7 @@ async def test_cleanup_removes_stale_unknown_filler_container():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -497,7 +513,7 @@ async def test_cleanup_invokes_volume_prune():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -571,7 +587,7 @@ async def test_cleanup_kills_processes_directly_when_docker_rm_cannot_kill():
     ssh, calls = _make_unkillable_ssh_mock(name, rm_failures=1)
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert removed_names == [name] and unremovable == []
@@ -588,9 +604,98 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
     ssh, calls = _make_unkillable_ssh_mock(name, rm_failures=2)
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert removed_count == 0 and removed_names == []
     assert unremovable == [name]
     assert sum(1 for c in calls if "docker rm -f" in c and name in c) == 2  # one retry, no loop
+
+
+# ---------------------------------------------------------------------------
+# An empty or unknown rented list means "don't know", never "nothing is rented"
+# ---------------------------------------------------------------------------
+
+LIVE_POD = "pod_live-0000-4000-8000-000000000001"
+LIVE_FILLER = "filler_live_bundle"
+STRAY_POD = "pod_stray-0000-4000-8000-000000000002"
+
+
+def _real_rented_data(executor_uuid: str, pods: list[str], fillers: list[str] | None = None, key: str | None = None):
+    return RentedExecutorsResponse(
+        executors={
+            (key or executor_uuid): RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id=name.removeprefix("pod_"), container_name=name) for name in pods],
+            )
+        },
+        all_filler_containers_by_executor={executor_uuid: fillers} if fillers else {},
+    )
+
+
+def _host_with_live_and_stray():
+    return _make_ssh_mock(
+        containers=[LIVE_POD, LIVE_FILLER, STRAY_POD],
+        ages_by_name={LIVE_POD: 28, LIVE_FILLER: 29, STRAY_POD: 60},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data, reason",
+    [
+        pytest.param(None, RENTED_LIST_UNAVAILABLE, id="fetch-failed-none"),
+        pytest.param(RentedExecutorsResponse(executors={}), RENTED_LIST_EMPTY, id="executor-absent"),
+        pytest.param(
+            _real_rented_data(EXECUTOR_UUID, [LIVE_POD], key="other-executor-id"),
+            RENTED_LIST_EMPTY,
+            id="rental-listed-under-another-executor-id",
+        ),
+        pytest.param(_real_rented_data(EXECUTOR_UUID, []), RENTED_LIST_EMPTY, id="executor-listed-with-no-pods"),
+    ],
+)
+async def test_an_empty_or_unknown_rented_list_removes_nothing_and_warns(rented_data, reason, caplog):
+    ssh, rm_calls = _host_with_live_and_stray()
+
+    with caplog.at_level(logging.WARNING, logger="services.container_cleanup"):
+        result = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+            ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+        )
+
+    assert result == (0, [], [])
+    assert not any("docker rm -f" in c for c in rm_calls)
+    assert not any("docker ps -a" in c for c in (call.args[0] for call in ssh.run.call_args_list))
+    assert rented_list_unknown_reason(rented_data, EXECUTOR_UUID) == reason
+    assert any("rented list is empty or unknown" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_valid_rented_list_removes_only_the_stray_never_listed_pods_or_fillers():
+    ssh, rm_calls = _host_with_live_and_stray()
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh,
+        rented_data=_real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER]),
+        executor_uuid=EXECUTOR_UUID,
+    )
+
+    assert (removed_count, removed_names, unremovable) == (1, [STRAY_POD], [])
+    removed = " ".join(c for c in rm_calls if "docker rm -f" in c)
+    assert STRAY_POD in removed
+    assert LIVE_POD not in removed and LIVE_FILLER not in removed
+
+
+@pytest.mark.asyncio
+async def test_a_filler_only_rented_list_is_authoritative_and_protects_the_filler():
+    ssh, rm_calls = _host_with_live_and_stray()
+
+    _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh,
+        rented_data=_real_rented_data(EXECUTOR_UUID, [], fillers=[LIVE_FILLER]),
+        executor_uuid=EXECUTOR_UUID,
+    )
+
+    assert LIVE_FILLER not in removed_names
+    assert STRAY_POD in removed_names
