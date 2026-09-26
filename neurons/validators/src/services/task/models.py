@@ -150,7 +150,12 @@ class JobResult(BaseModel):
         """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
         self.incentive_logs.append(line.to_log_line())
         if line.reason is not None:
-            self.zero_incentive_reasons.append(line.to_incentive_reason())
+            self.add_zero_incentive_reasons([line.to_incentive_reason()])
+
+    def add_zero_incentive_reasons(self, reasons: list[IncentiveReason]) -> None:
+        """Keep the wire list in ZERO_INCENTIVE_REPORT_ORDER, whatever order reasons arrive in."""
+        self.zero_incentive_reasons.extend(reasons)
+        self.zero_incentive_reasons.sort(key=lambda reason: reason.report_rank)
 
     @property
     def incentive_source(self) -> str:

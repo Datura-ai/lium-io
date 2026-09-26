@@ -18,7 +18,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
-   Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
+   Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
      spot tier, Discord not connected, paused for new rentals, running own default job
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
@@ -43,6 +43,8 @@ data naturally lives (some per-executor upfront, some only after cohort aggregat
 builds the matching line and records it via `result.record_incentive_log(line)` —
 which appends the text to incentive_logs AND, for zero-incentive lines, ships the
 structured reason to the backend (DAH-2340). Never append to incentive_logs directly.
+Every failing requirement is recorded, not only the first one found, so a provider sees
+all of them in one cycle; the wire list is kept in ZERO_INCENTIVE_REPORT_ORDER.
 Open THIS file to see everything a miner can be told and exactly how each message reads.
 """
 
@@ -93,6 +95,22 @@ class ZeroIncentiveReason(StrEnum):
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
 
 
+# Not something the provider fixes on the node: the idle program's GPU scope and a fleet-wide
+# cap. Reported after every node-level requirement so the first reason is the actionable one.
+INFORMATIONAL_ZERO_INCENTIVE_REASONS: tuple[ZeroIncentiveReason, ...] = (
+    ZeroIncentiveReason.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
+    ZeroIncentiveReason.NO_UNRENTED_CAPACITY_FOR_GPU_COUNT,
+)
+# Order of JobResult.zero_incentive_reasons: provider-fixable codes in declaration order, then
+# the informational ones. Independent of the order the scoring code happens to detect them in.
+ZERO_INCENTIVE_REPORT_ORDER: tuple[ZeroIncentiveReason, ...] = tuple(
+    code for code in ZeroIncentiveReason if code not in INFORMATIONAL_ZERO_INCENTIVE_REASONS
+) + INFORMATIONAL_ZERO_INCENTIVE_REASONS
+_REPORT_RANK: dict[str, int] = {
+    code.value: rank for rank, code in enumerate(ZERO_INCENTIVE_REPORT_ORDER)
+}
+
+
 class IncentiveReason(BaseModel):
     """One structured zero-incentive reason as it travels on the wire (DAH-2340).
 
@@ -106,6 +124,11 @@ class IncentiveReason(BaseModel):
     # per-reason details shown next to the message, e.g. soft_limit_threshold,
     # gpu_model, gpu_count, executor_id, incentive
     context: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def report_rank(self) -> int:
+        """Position in ZERO_INCENTIVE_REPORT_ORDER; a code unknown to this validator sorts last."""
+        return _REPORT_RANK.get(self.reason, len(_REPORT_RANK))
 
 
 class MinerLogLine(BaseModel):
@@ -341,7 +364,13 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_nvidia_driver_below_minimum(result: JobResult) -> MinerLogLine:
+    def no_payout_because_nvidia_driver_below_minimum(
+        result: JobResult, driver_multiplier: float | None = None
+    ) -> MinerLogLine:
+        # driver_multiplier: the gate's value when the result never had one scored onto it
+        # (an idle node already excluded before the rental-share formula ran)
+        if driver_multiplier is None:
+            driver_multiplier = result.driver_multiplier
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM,
@@ -352,7 +381,7 @@ class MinerLogLine(BaseModel):
             ),
             extra_fields={
                 "nvidia_driver_version": result.nvidia_driver_version,
-                "driver_multiplier": result.driver_multiplier,
+                "driver_multiplier": driver_multiplier,
             },
         )
 
