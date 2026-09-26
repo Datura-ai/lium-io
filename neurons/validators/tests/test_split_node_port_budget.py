@@ -12,10 +12,8 @@ pay at all) runs first and stays as it is.
 """
 
 import logging
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import incentive.rental_price as rental_price_module
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
@@ -24,7 +22,7 @@ from incentive.rental_price import PORT_UNBACKED_GPUS_EVENT, RentalPriceIncentiv
 from services.const import DEFAULT_JOB_OWNER_LIUM, MIN_PORT_COUNT
 from services.task_service import JobResult
 
-from core.config import settings
+from core.config import settings, shared_client
 
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 SPLIT_HOTKEY = "miner-hotkey-split"
@@ -388,11 +386,10 @@ async def test_flag_on_node_excluded_by_a_later_gate_gets_no_partial_pay_line(mo
     # (a later gate in the chain) excludes it: its job log must carry that zero reason only.
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
-    monkeypatch.setattr(
-        rental_price_module,
-        "shared_client",
-        SimpleNamespace(config=SimpleNamespace(machine_prices_p90={"NVIDIA H200": 2.0})),
+    served_config = shared_client.config.model_copy(
+        update={"machine_prices_p90": {"NVIDIA H200": 2.0}, "soft_limit_price_rate": 1.1}
     )
+    monkeypatch.setattr(shared_client, "_config", served_config)
     split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
     plain_job = _plain_idle_job()
     incentive = _build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job))
