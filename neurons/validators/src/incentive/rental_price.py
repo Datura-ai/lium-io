@@ -222,9 +222,9 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unrented_count_by_bucket: dict[tuple[str, int], int] = {}
         self._weighted_rate_sum_by_bucket: dict[tuple[str, int], float] = {}
         self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
-        # (base_model, bucket, executor uuid) already counted this cycle: a repeated result of
-        # one executor adds no GPUs to its tier.
-        self._counted_in_bucket: set[tuple[str, int, str]] = set()
+        # id() of every idle result that repeats an executor already paid this cycle
+        # (`_mark_repeated_idle_copies`); such a copy is counted nowhere and paid 0.
+        self._repeated_idle_copies: set[int] = set()
         # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
         # revisited once per-bucket fill is known. Items: (base_model, result).
         self._split_fallback_candidates: list[tuple[str, JobResult]] = []
@@ -597,6 +597,7 @@ class RentalPriceIncentive(DefaultIncentive):
         consumers (machine-spec publish, backend accounting) expect one message per executor.
         """
         split_portions: list[_PartiallyRentedSplitPortions] = self._expand_partially_rented_split_results()
+        self._mark_repeated_idle_copies()
         await super().calculate_mining_scores()
         self._merge_partially_rented_split_results(split_portions)
 
@@ -633,6 +634,42 @@ class RentalPriceIncentive(DefaultIncentive):
                     )
                 )
         return split_portions
+
+    def _mark_repeated_idle_copies(self) -> None:
+        """One idle result per `(base_model, executor uuid)` is counted and paid in a cycle.
+
+        The cycle collects miners' results in completion order, so the paid copy is picked
+        independently of it: the one under the lowest miner hotkey (string order), and within a
+        miner its first entry. Every other idle copy of that executor, under the same or another
+        hotkey, is marked and paid 0 with its reason. Rented results are not considered: a
+        partly rented split node's rented portion shares its uuid with its free portion.
+        """
+        self._repeated_idle_copies = set()
+        copies: dict[tuple[str, str], list[tuple[str, int, JobResult]]] = {}
+        for hotkey, results in self.job_results.items():
+            for index, result in enumerate(results):
+                base_model: str | None = BASE_GPU_MAP.get(result.gpu_model)
+                if (
+                    not result.is_successful
+                    or result.is_rented
+                    or base_model not in self.config.rental_incentive_gpu_types
+                ):
+                    continue
+                key = (base_model, str(result.executor_info.uuid))
+                copies.setdefault(key, []).append((hotkey, index, result))
+        for found in copies.values():
+            if len(found) < 2:
+                continue
+            found.sort(key=lambda copy: (copy[0], copy[1]))
+            self._repeated_idle_copies.update(id(result) for _, _, result in found[1:])
+
+    @staticmethod
+    def _pay_repeated_idle_copy_nothing(result: JobResult) -> None:
+        result.eligible_for_rental_share = False
+        result.mining_score = 0
+        line: MinerLogLine = MinerLogLine.no_payout_because_duplicate_executor_in_cycle(result)
+        result.record_incentive_log(line)
+        logger.warning(line.as_internal_log())
 
     @staticmethod
     def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
@@ -709,6 +746,10 @@ class RentalPriceIncentive(DefaultIncentive):
         if base_model not in self.config.rental_incentive_gpu_types:
             return
 
+        if result.eligible_for_rental_share and id(result) in self._repeated_idle_copies:
+            self._pay_repeated_idle_copy_nothing(result)
+            return
+
         #  calculate unrented gpu count that's eligible for rental price incentive
         if result.eligible_for_rental_share:
             # update result state
@@ -743,21 +784,6 @@ class RentalPriceIncentive(DefaultIncentive):
             # accumulate raw unrented GPU count and weighted rate sum per bucket
             if result.hourly_rate > 0 and max_cap > 0:
                 key = (base_model, bucket)
-                counted_key = (base_model, bucket, str(result.executor_info.uuid))
-                if counted_key in self._counted_in_bucket:
-                    logger.warning(
-                        _m(
-                            "Executor counted once in its idle tier; repeated result ignored",
-                            extra={
-                                "executor_id": counted_key[2],
-                                "base_model": base_model,
-                                "bucket": bucket,
-                                "gpu_count": result.gpu_count,
-                            },
-                        )
-                    )
-                    return
-                self._counted_in_bucket.add(counted_key)
                 self.unrented_count_by_bucket[key] = (
                     self.unrented_count_by_bucket.get(key, 0) + result.gpu_count
                 )

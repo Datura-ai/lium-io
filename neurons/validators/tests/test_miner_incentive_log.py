@@ -38,6 +38,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
+        "duplicate_executor_in_cycle",
     }
 
 
@@ -152,6 +153,11 @@ def _job(**overrides) -> JobResult:
             ),
             "port_limited_remainder",
             "2 free port",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_duplicate_executor_in_cycle(job),
+            "duplicate_executor_in_cycle",
+            "more than once",
         ),
     ],
 )

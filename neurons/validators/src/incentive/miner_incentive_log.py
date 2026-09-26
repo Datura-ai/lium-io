@@ -91,6 +91,7 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    DUPLICATE_EXECUTOR_IN_CYCLE = "duplicate_executor_in_cycle"
 
 
 class IncentiveReason(BaseModel):
@@ -413,6 +414,17 @@ class MinerLogLine(BaseModel):
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
             },
+        )
+
+    @staticmethod
+    def no_payout_because_duplicate_executor_in_cycle(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DUPLICATE_EXECUTOR_IN_CYCLE,
+            message=(
+                "No unrented incentive for this copy: the same executor was reported more than "
+                "once in this cycle, and it is paid once. List each executor under one miner, once."
+            ),
         )
 
     @staticmethod
