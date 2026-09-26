@@ -152,7 +152,7 @@ def _job(
     fields: dict[str, Any] = {
         "executor_info": ExecutorSSHInfo(
             uuid=executor_id,
-            address="10.0.0.1",
+            address="192.0.2.1",
             port=8080,
             ssh_username="root",
             ssh_port=22,
