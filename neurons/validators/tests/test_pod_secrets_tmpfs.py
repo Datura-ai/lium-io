@@ -159,34 +159,40 @@ def test_a_name_that_is_not_a_plain_identifier_is_refused(name):
         valid_pod_secrets({name: "value"})
 
 
-NAME_AS_VALUE_MARKER = "hf_PASTED_AS_NAME_MARKER"
+NAME_AS_VALUE_MARKER = "hfPASTEDASNAMEMARKER"
+# 64 base64-ish characters that also match the name pattern once any '=' padding is stripped
+RANDOM_TOKEN = "Zq3xK9vLmP2wR7tYbN4cJ8hG1sD6fA0eUoIiQyTrWxVz5B" + "k" * 18
+
+# (rejected name, the pasted value that must never be shown)
+PASTED_NAMES = [
+    (f"HF_TOKEN={NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    (f"HF TOKEN={NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    (f"={NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    (f"{NAME_AS_VALUE_MARKER}==", NAME_AS_VALUE_MARKER),
+    (f"{NAME_AS_VALUE_MARKER}=", NAME_AS_VALUE_MARKER),
+    (f"{RANDOM_TOKEN}==", RANDOM_TOKEN),
+    (f"{RANDOM_TOKEN}=", RANDOM_TOKEN),
+    (f"{RANDOM_TOKEN}-x", RANDOM_TOKEN),
+    (f"1{NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    ("HF_TOKEN=", "HF_TOKEN"),
+    ("==", "=="),
+]
 
 
-@pytest.mark.parametrize(
-    "name, shown",
-    [
-        (f"HF_TOKEN={NAME_AS_VALUE_MARKER}", "HF_TOKEN="),
-        (f"HF TOKEN={NAME_AS_VALUE_MARKER}", None),
-        (f"={NAME_AS_VALUE_MARKER}", None),
-        (NAME_AS_VALUE_MARKER + "-x", None),
-        (f"1{NAME_AS_VALUE_MARKER}", None),
-    ],
-)
-def test_a_refused_name_is_never_echoed(name, shown):
+@pytest.mark.parametrize("name, pasted", PASTED_NAMES)
+def test_no_part_of_a_refused_name_is_ever_echoed(name, pasted):
     with pytest.raises(ValueError) as excinfo:
         valid_pod_secrets({name: "value"})
     message = str(excinfo.value)
-    assert NAME_AS_VALUE_MARKER not in message
+    assert pasted not in message
     assert name not in message
-    if shown is not None:
-        assert shown in message
-    else:
-        assert message.startswith("invalid secret name:")
+    assert message == rental_docker_sdk._invalid_secret_name_message(None)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name, pasted", PASTED_NAMES)
 async def test_a_value_typed_as_a_name_never_reaches_the_rent_result_or_logs(
-    docker_service, executor_info, keypair, monkeypatch, caplog
+    docker_service, executor_info, keypair, monkeypatch, caplog, name, pasted
 ):
     caplog.set_level(logging.DEBUG)
     _, docker_client = await _create(
@@ -195,19 +201,19 @@ async def test_a_value_typed_as_a_name_never_reaches_the_rent_result_or_logs(
         keypair,
         monkeypatch,
         flag=True,
-        secrets={f"HF_TOKEN={NAME_AS_VALUE_MARKER}": "value"},
+        secrets={name: "value"},
     )
 
     result = docker_client.last_result
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "validate_request"
-    assert "HF_TOKEN=" in result.msg
     logged = "\n".join(
         f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records
     )
     assert "Invalid pod secrets" in logged
     for text in [result.msg, result.model_dump_json(), logged]:
-        assert NAME_AS_VALUE_MARKER not in text
+        assert pasted not in text
+        assert name not in text
 
 
 def test_an_empty_value_is_refused_without_echoing_other_values():

@@ -958,14 +958,9 @@ def _tmpfs_bytes(value: str) -> int:
 
 
 def _invalid_secret_name_message(name: object) -> str:
-    # A refused name may be a pasted `NAME=value`, so it is never echoed: at most the part before the
-    # first '=', and only when that part is itself a valid name.
-    rule = "letters, digits and _ only, not starting with a digit"
-    if isinstance(name, str) and "=" in name:
-        prefix = name.split("=", 1)[0]
-        if POD_SECRET_NAME_PATTERN.fullmatch(prefix):
-            return f"invalid secret name starting {prefix}= (a name must not contain '='): {rule}"
-    return f"invalid secret name: {rule}"
+    # A refused name may be a pasted value (`NAME=value`, or a token ending in base64 `=` padding), so
+    # no part of it is ever echoed.
+    return "invalid secret name: letters, digits and _ only, not starting with a digit, no '='"
 
 
 def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
