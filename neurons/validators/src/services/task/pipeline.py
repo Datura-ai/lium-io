@@ -117,6 +117,9 @@ class ContextConfig:
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
+    # A recheck the backend asked for between cycles: probes that count consecutive cycles judge
+    # from their stored state and leave it as the cycles wrote it.
+    out_of_cycle: bool = False
 
 
 @dataclass(frozen=True)

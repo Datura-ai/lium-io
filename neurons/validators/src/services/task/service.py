@@ -110,11 +110,13 @@ class TaskService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
         first_pass: bool = False,
+        out_of_cycle: bool = False,
     ):
         """New pipeline-based validation task implementation.
 
         `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
         (the express lane, DAH-2958). The wave never sets it.
+        `out_of_cycle`: a recheck the backend asked for between cycles; the wave never sets it.
         """
         attestation_digest = None
         tee_type = None
@@ -184,6 +186,7 @@ class TaskService:
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
                     encrypted_private_key=encrypted_private_key,
+                    out_of_cycle=out_of_cycle,
                 )
 
                 # Build and run validation pipeline

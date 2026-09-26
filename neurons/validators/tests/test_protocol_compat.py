@@ -134,6 +134,8 @@ def test_what_the_backend_sends_parses_through_the_validators_own_parser(entry: 
     assert type(ours).__name__ == entry["expect"]
     if entry["expect"] == "ForcedValidationCycleRequest":
         theirs = pydantic.TypeAdapter(payloads.ForcedValidationCycleRequest).validate_json(raw)
+    elif entry["expect"] == "RecheckExecutorRequest":
+        theirs = pydantic.TypeAdapter(payloads.RecheckExecutorRequest).validate_json(raw)
     elif entry["expect"] == "GetEstimateRequest":
         theirs = pydantic.TypeAdapter(payloads.GetEstimateRequest).validate_json(raw)
         # the validator's model has no message_type: it ignores the discriminator, reads the rest
@@ -179,6 +181,7 @@ def test_every_validator_wire_type_is_in_lium_protocol() -> None:
     backend_sends = {member.value for member in payloads.ContainerRequestType} | {
         "ForcedValidationCycleRequest",
         "GetEstimateRequest",  # compute_client parses it with a TypeAdapter, no enum member here
+        "RecheckExecutorRequest",  # the same
     }
     assert backend_sends <= {member.value for member in lium_protocol.BackendMessageType}
 

@@ -232,6 +232,8 @@ class ExecutorSpecRequest(ValidatorMessage):
     # (the rest of the cycle's states travel in PodStatesReport chunks). None from a publisher that
     # predates the field.
     pod_states: list[PodContainerState] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # 1.4.0: the answer to a RecheckExecutorRequest, run out of cycle; the backend credits no uptime for it
+    recheck: bool = False
 
 
 @VALIDATOR_MESSAGES.register

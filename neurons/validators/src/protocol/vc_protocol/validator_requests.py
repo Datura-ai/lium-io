@@ -200,6 +200,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # stale cleanup reaped. None when the cycle never reached the rented-state check. The backend
     # writes it onto rental_history; an older backend ignores the key.
     pod_states: list[PodContainerState] | None = None
+    # The answer to the backend's recheck request, run out of cycle: the backend lifts its hold on a
+    # passing one and credits no uptime for it, since the cycle's own report does that.
+    recheck: bool = False
 
 
 class RentedMachineRequest(BaseValidatorRequest):

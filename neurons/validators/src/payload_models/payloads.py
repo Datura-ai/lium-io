@@ -209,6 +209,18 @@ class ForcedValidationCycleRequest(BaseModel):
     message_type: Literal["ForcedValidationCycleRequest"]
 
 
+class RecheckExecutorRequest(BaseModel):
+    """Run this executor's checks now: a rent on it just failed for the host's reasons and the
+    backend has hidden it until a pass says otherwise. Parsed like ForcedValidationCycleRequest,
+    outside the container-request enum; an older validator logs it as invalid and does nothing."""
+
+    message_type: Literal["RecheckExecutorRequest"]
+    miner_hotkey: str
+    executor_id: str
+    reason: str = ""
+    pod_id: str | None = None
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"

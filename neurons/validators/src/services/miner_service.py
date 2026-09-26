@@ -4,8 +4,8 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Iterator
-from typing import Annotated
+from collections.abc import Coroutine, Iterator
+from typing import Annotated, Any
 from uuid import UUID
 
 import aiohttp
@@ -246,10 +246,17 @@ MANUAL_RENTAL_FORCED_PASS_EVENT = "Executor force-passed as special manual renta
 # DAH-2958: who is verifying an executor right now (values of MinerService.in_flight).
 CYCLE_LANE = "cycle"
 EXPRESS_LANE = "express"
+# a node the backend asked to recheck after a host-side rent failure (core/express_lane.py)
+RECHECK_LANE = "recheck"
 # The wave verified it this cycle and its result is not yet in the validated set (the cycle
 # seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
 # Kept in in_flight so the express lane does not run the same node a second time meanwhile.
 CYCLE_DONE = "cycle-done"
+
+
+def executor_budget_seconds() -> int:
+    """How long the wave gives one executor's run; the cycle waits JOB_TIME_OUT - 50 for every miner."""
+    return settings.JOB_TIME_OUT - 120
 
 
 class MinerService:
@@ -269,11 +276,18 @@ class MinerService:
         # this one process, so a plain dict is the whole coordination: each lane skips what the
         # other holds. Stays empty with the flag off.
         self.in_flight: dict[str, str] = {}
+        # Executor uuid -> the result of the recheck running on it (None when it produced none),
+        # resolved when the recheck ends. A wave that reaches the node meanwhile takes that result
+        # as the node's own: one pipeline per node at a time, and the node keeps its scored cycle.
+        self.recheck_outcomes: dict[str, asyncio.Future] = {}
         # miner hotkey -> job_batch_id of the wave that has not received that miner's executor
         # list yet. The express lane publishes under the cycle's job_batch_id; it waits for the
         # wave's list of the node's miner, or the wave could verify and publish the node again
         # under the same id once the lane let go of it. Stays empty with the flag off.
         self.miners_awaiting_wave_list: dict[str, str] = {}
+
+    # forget_cycle_done calls so far; a recheck that took a CYCLE_DONE node restores it only within the same cycle
+    cycles_closed: int = 0
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -295,11 +309,13 @@ class MinerService:
         """The wave takes every executor the miner returned, minus those the express lane is
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
-        that no cycle has published yet, so a long-known executor's scoring is untouched.
-        Flag off: list returned as is.
+        that no cycle has published yet, so a long-known executor's scoring is untouched. A node
+        under a recheck stays in the wave with the recheck's claim; the wave waits for it and takes
+        its result, or runs its own after it on a rented node (`_cycle_result`). Flags off: list
+        returned as is.
         """
         self._stop_awaiting_wave_list(payload)
-        if not settings.EXPRESS_LANE_ENABLED:
+        if not settings.express_lane_runs:
             return executors
         claimed: list[ExecutorSSHInfo] = []
         for executor in executors:
@@ -311,7 +327,8 @@ class MinerService:
                     ),
                 )
                 continue
-            self.in_flight[executor.uuid] = CYCLE_LANE
+            if self.in_flight.get(executor.uuid) != RECHECK_LANE:
+                self.in_flight[executor.uuid] = CYCLE_LANE
             claimed.append(executor)
         return claimed
 
@@ -341,15 +358,86 @@ class MinerService:
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
         cycle has seeded the validated set (forget_cycle_done), so the lane keeps skipping them."""
-        if not settings.EXPRESS_LANE_ENABLED:
+        if not settings.express_lane_runs:
             return
         for executor in executors:
             if self.in_flight.get(executor.uuid) == CYCLE_LANE:
                 self.in_flight[executor.uuid] = CYCLE_DONE
 
+    def _wave_or_lane_run(
+        self,
+        requested_executor_id: str | None,
+        executor_id: str,
+        job_batch_id: str,
+        rented_data: RentedExecutorsResponse | None,
+        pipeline: Coroutine[Any, Any, JobResult | None],
+    ) -> Coroutine[Any, Any, JobResult | None]:
+        # the express lane's own run (one requested executor) must never wait on its own recheck
+        if requested_executor_id is not None or not settings.RECHECK_ON_REQUEST_ENABLED:
+            return pipeline
+        rented = rented_data.executors.get(executor_id) if rented_data else None
+        return self._cycle_result(
+            executor_id, job_batch_id, pipeline, reuse_recheck=not (rented and rented.pods)
+        )
+
+    async def _cycle_result(
+        self,
+        executor_id: str,
+        job_batch_id: str,
+        pipeline: Coroutine[Any, Any, JobResult | None],
+        reuse_recheck: bool = True,
+    ) -> JobResult | None:
+        """The wave's result for one executor: the result of the recheck running on it, when there is
+        one, stamped with this wave's batch id; otherwise the executor's own pipeline run. The wait is
+        capped so the pipeline still has RECHECK_WAVE_PIPELINE_ROOM_SECONDS of the executor's budget.
+
+        A node with rented pods (`reuse_recheck` False) waits for the recheck and then runs its own
+        pipeline: the rented-pod SSH probe counts its streak on cycle runs only.
+        """
+        outcome = self.recheck_outcomes.get(executor_id)
+        if outcome is not None:
+            wait_seconds = max(0, executor_budget_seconds() - settings.RECHECK_WAVE_PIPELINE_ROOM_SECONDS)
+            try:
+                rechecked: JobResult | None = await asyncio.wait_for(asyncio.shield(outcome), timeout=wait_seconds)
+            except TimeoutError:
+                rechecked = None
+                logger.info(
+                    _m(
+                        "[recheck] Wave stopped waiting for the recheck; running the node itself",
+                        extra=get_extra_info({"executor_uuid": executor_id, "waited_s": wait_seconds}),
+                    )
+                )
+            except BaseException:
+                pipeline.close()
+                raise
+            if rechecked is not None and reuse_recheck:
+                pipeline.close()
+                return rechecked.model_copy(update={"job_batch_id": job_batch_id}, deep=True)
+            if self.in_flight.get(executor_id) != RECHECK_LANE:
+                # the recheck handed the node back; the wave holds it for its own run
+                self.in_flight[executor_id] = CYCLE_LANE
+        return await pipeline
+
     def forget_cycle_done(self) -> None:
         """Called by the cycle right after it recorded its published executors as validated."""
         for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
+            del self.in_flight[executor_id]
+        self.cycles_closed += 1
+
+    def claim_for_recheck(self, executor_id: str) -> int | None:
+        """Take the node for a recheck: free, or done for this cycle (CYCLE_DONE lasts until the whole cycle
+        ends, longer than a request may wait). Returns the cycle count to restore CYCLE_DONE against, if held."""
+        held_cycle_done = self.in_flight.get(executor_id) == CYCLE_DONE
+        self.in_flight[executor_id] = RECHECK_LANE
+        return self.cycles_closed if held_cycle_done else None
+
+    def release_recheck_claim(self, executor_id: str, cycle_done_at: int | None) -> None:
+        """Hand back CYCLE_DONE when the recheck took it and the cycle has not closed since."""
+        if self.in_flight.get(executor_id) != RECHECK_LANE:
+            return
+        if cycle_done_at is not None and cycle_done_at == self.cycles_closed:
+            self.in_flight[executor_id] = CYCLE_DONE
+        else:
             del self.in_flight[executor_id]
 
     @staticmethod
@@ -380,6 +468,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        out_of_cycle: bool = False,
     ):
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
@@ -392,6 +481,7 @@ class MinerService:
                 executor_image_snapshot,
                 executor_id=executor_id,
                 first_pass=first_pass,
+                out_of_cycle=out_of_cycle,
             )
         finally:
             if executor_id is None:
@@ -406,6 +496,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        out_of_cycle: bool = False,
     ):
         """Request job to miner - uses REST API if configured, otherwise WebSocket.
 
@@ -415,6 +506,8 @@ class MinerService:
         first_pass (DAH-3011): this is the executor's first, unscored verification; handed to
         TaskService.create_task, where FIRST_PASS_FAST_PATH_ENABLED decides whether the probes
         shrink. The cycle never sets it.
+        out_of_cycle: a recheck the backend asked for between cycles, handed to create_task the
+        same way; the cycle never sets it.
         """
         if settings.USE_REST_API:
             logger.info(
@@ -434,6 +527,7 @@ class MinerService:
                 executor_image_snapshot,
                 executor_id=executor_id,
                 first_pass=first_pass,
+                out_of_cycle=out_of_cycle,
             )
         else:
             logger.info(
@@ -567,20 +661,27 @@ class MinerService:
                         tasks = [
                             asyncio.create_task(
                                 asyncio.wait_for(
-                                    self.task_service.create_task(
-                                        miner_info=payload,
-                                        executor_info=executor_info,
-                                        keypair=my_key,
-                                        private_key=private_key.decode("utf-8"),
-                                        public_key=public_key.decode("utf-8"),
-                                        encrypted_files=encrypted_files,
-                                        rented_data=rented_data,
-                                        default_docker_image_digests=default_docker_image_digests,
-                                        executor_image_snapshot=executor_image_snapshot,
-                                        attestation_nonce=attestation_nonce,
-                                        first_pass=first_pass,
+                                    self._wave_or_lane_run(
+                                        executor_id,
+                                        executor_info.uuid,
+                                        payload.job_batch_id,
+                                        rented_data,
+                                        self.task_service.create_task(
+                                            miner_info=payload,
+                                            executor_info=executor_info,
+                                            keypair=my_key,
+                                            private_key=private_key.decode("utf-8"),
+                                            public_key=public_key.decode("utf-8"),
+                                            encrypted_files=encrypted_files,
+                                            rented_data=rented_data,
+                                            default_docker_image_digests=default_docker_image_digests,
+                                            executor_image_snapshot=executor_image_snapshot,
+                                            attestation_nonce=attestation_nonce,
+                                            first_pass=first_pass,
+                                            out_of_cycle=out_of_cycle,
+                                        ),
                                     ),
-                                    timeout=settings.JOB_TIME_OUT - 120
+                                    timeout=executor_budget_seconds(),
                                 )
                             )
                             for executor_info in executors
@@ -1133,9 +1234,13 @@ class MinerService:
         miner_hotkey: str,
         miner_coldkey: str,
         *,
+        recheck: bool = False,
         is_whole_miner_batch: bool = True,
     ):
         """Publish machine specs to compute app connector process.
+
+        `recheck` marks the answer to the backend's recheck request, run out of cycle; the backend
+        credits no uptime for it.
 
         `is_whole_miner_batch` False leaves `batch_total` unset: the backend's delivery metrics
         (DAH-2792) take a miner's expected spec count from the first spec per (validator,
@@ -1212,6 +1317,7 @@ class MinerService:
                         # The spec carries at most the backend's bound; the rest of the list goes
                         # in PodStatesReport chunks below, or waits for the next cycle.
                         "pod_states": self._pod_states_capped_for_spec(result, default_extra),
+                        "recheck": recheck,
                     },
                 )
             except Exception as e:
@@ -2357,6 +2463,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        out_of_cycle: bool = False,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
@@ -2452,20 +2559,27 @@ class MinerService:
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
-                                self.task_service.create_task(
-                                    miner_info=payload,
-                                    executor_info=executor_info,
-                                    keypair=my_key,
-                                    private_key=private_key.decode("utf-8"),
-                                    public_key=public_key.decode("utf-8"),
-                                    encrypted_files=encrypted_files,
-                                    rented_data=rented_data,
-                                    default_docker_image_digests=default_docker_image_digests,
-                                    executor_image_snapshot=executor_image_snapshot,
-                                    attestation_nonce=attestation_nonce,
-                                    first_pass=first_pass,
+                                self._wave_or_lane_run(
+                                    executor_id,
+                                    executor_info.uuid,
+                                    payload.job_batch_id,
+                                    rented_data,
+                                    self.task_service.create_task(
+                                        miner_info=payload,
+                                        executor_info=executor_info,
+                                        keypair=my_key,
+                                        private_key=private_key.decode("utf-8"),
+                                        public_key=public_key.decode("utf-8"),
+                                        encrypted_files=encrypted_files,
+                                        rented_data=rented_data,
+                                        default_docker_image_digests=default_docker_image_digests,
+                                        executor_image_snapshot=executor_image_snapshot,
+                                        attestation_nonce=attestation_nonce,
+                                        first_pass=first_pass,
+                                        out_of_cycle=out_of_cycle,
+                                    ),
                                 ),
-                                timeout=settings.JOB_TIME_OUT - 120
+                                timeout=executor_budget_seconds(),
                             )
                         )
                         for executor_info in executors

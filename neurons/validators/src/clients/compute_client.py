@@ -34,6 +34,7 @@ from payload_models.payloads import (
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
+    RecheckExecutorRequest,
     FailedGetPodLogs,
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
@@ -86,6 +87,7 @@ from services.redis_service import (
     NORMALIZED_SCORE_CHANNEL,
 )
 from clients.handlers.backup_handler import BackupHandler
+from services.task.checks.rental_probe import forget_last_pass
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +356,7 @@ class ComputeClient:
                             batch_total=data.get("batch_total"),
                             availability_errors=data.get("availability_errors"),
                             pod_states=data.get("pod_states"),
+                            recheck=bool(data.get("recheck")),
                         )
 
                         async with self.lock:
@@ -709,6 +712,14 @@ class ComputeClient:
             return
 
         try:
+            recheck: RecheckExecutorRequest = pydantic.TypeAdapter(RecheckExecutorRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_recheck_request(recheck)
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = "Invalid message received from backend"
@@ -807,6 +818,47 @@ class ComputeClient:
             return
 
         await self.miner_service.request_validation_cycle_now()
+
+    async def handle_recheck_request(self, req: RecheckExecutorRequest) -> None:
+        """Queue the backend's recheck for the validator process's express lane, which owns the
+        pipeline inputs; this process shares no memory with it, so Redis carries the request."""
+        extra = {
+            **self.logging_extra,
+            "executor_uuid": req.executor_id,
+            "miner_hotkey": req.miner_hotkey,
+            "pod_id": req.pod_id,
+            "reason": req.reason,
+        }
+        if not settings.RECHECK_ON_REQUEST_ENABLED:
+            logger.info(_m("[recheck] Request ignored, RECHECK_ON_REQUEST_ENABLED is off", extra=get_extra_info(extra)))
+            return
+        try:
+            await self.miner_service.redis_service.queue_recheck_request(
+                {
+                    "executor_id": req.executor_id,
+                    "miner_hotkey": req.miner_hotkey,
+                    "reason": req.reason,
+                    "pod_id": req.pod_id,
+                    "requested_at": time.time(),
+                }
+            )
+        except Exception as exc:
+            # the backend lifts its hold on its own when no answer comes
+            logger.error(
+                _m("[recheck] Could not queue the request", extra=get_extra_info({**extra, "error": str(exc)})),
+            )
+            return
+        # dropped here so whichever run reaches the node next, the recheck or the cycle, probes it
+        try:
+            await forget_last_pass(self.miner_service.redis_service, req.executor_id)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[recheck] Could not drop the rental probe's interval stamp",
+                    extra=get_extra_info({**extra, "error": str(exc)}),
+                ),
+            )
+        logger.info(_m("[recheck] Request queued", extra=get_extra_info(extra)))
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

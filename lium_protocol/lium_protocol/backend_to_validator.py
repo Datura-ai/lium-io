@@ -39,6 +39,8 @@ class BackendMessageType(enum.Enum):
     ForcedValidationCycleRequest = "ForcedValidationCycleRequest"
     # ask the validator for an exact rental estimate; it answers with EstimateResponse
     GetEstimateRequest = "GetEstimateRequest"
+    # 1.4.0: run one executor's checks now; answered by the ordinary ExecutorSpecRequest report
+    RecheckExecutorRequest = "RecheckExecutorRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -307,6 +309,20 @@ class ForcedValidationCycleRequest(BackendMessage):
     """Staging only: start the validation cycle now. No executor — the cycle validates the whole fleet."""
 
     message_type: BackendMessageType = BackendMessageType.ForcedValidationCycleRequest
+
+
+@BACKEND_MESSAGES.register
+class RecheckExecutorRequest(ServerRequest):
+    """1.4.0: a rent on this executor just failed for the host's reasons and the backend has closed it
+    to new rentals; run its checks now. There is no reply message: the
+    validator publishes the result as an ordinary spec report, and a passing one lifts the hold. A
+    validator that does not know the type drops it, and the backend lifts the hold on its own."""
+
+    message_type: BackendMessageType = BackendMessageType.RecheckExecutorRequest
+    # why the backend asks, for the validator's log (today always CREATION_FAILED_HOST_FAULT)
+    reason: str = ""
+    # the failed rental's pod, for correlating the two sides' logs
+    pod_id: str | None = None
 
 
 # --- typeless replies on the socket -----------------------------------------------------------------
