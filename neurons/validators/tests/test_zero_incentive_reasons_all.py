@@ -318,12 +318,22 @@ EXPECTED_REASONS: dict[tuple[str, bool], list[ZeroIncentiveReason]] = {
         R.NEW_RENTALS_PAUSED,
         R.MINER_DEFAULT_JOB,
     ],
+    ("spot_discord_paused_default_job", False): [
+        R.SPOT_TIER,
+        R.PROVIDER_DISCORD_NOT_CONNECTED,
+        R.NEW_RENTALS_PAUSED,
+        R.MINER_DEFAULT_JOB,
+    ],
     ("outdated_image_discord_disk", True): [
         R.PROVIDER_DISCORD_NOT_CONNECTED,
         R.INSUFFICIENT_DISK_FOR_VRAM,
         R.OUTDATED_EXECUTOR_IMAGE,
     ],
     ("not_in_program_discord", True): [
+        R.PROVIDER_DISCORD_NOT_CONNECTED,
+        R.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
+    ],
+    ("not_in_program_discord", False): [
         R.PROVIDER_DISCORD_NOT_CONNECTED,
         R.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
     ],
