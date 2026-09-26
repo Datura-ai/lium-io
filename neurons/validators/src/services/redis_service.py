@@ -154,6 +154,11 @@ class RedisWrites:
         return len(self.ops)
 
 
+def verified_job_field(miner_hotkey: str, executor_id: str) -> str:
+    """Field of an executor's verified-job record in VERIFIED_JOB_COUNT_KEY."""
+    return f"{miner_hotkey}:{executor_id}"
+
+
 class RedisService:
     def __init__(self):
         self.redis = aioredis.Redis(
@@ -573,7 +578,9 @@ class RedisService:
         if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
             data[GPU_ANCHOR_BROKEN_KEY] = True
 
-        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
+        if success:
+            await self.hdel(VERIFIED_JOB_COUNT_KEY, executor_id)
 
     async def clear_verified_job_info(
         self,
@@ -595,7 +602,7 @@ class RedisService:
         }
         if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
             data[GPU_ANCHOR_BROKEN_KEY] = True
-        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
         # penalty row (lium-platform DAH-3385). Optional on the wire: an older backend ignores the keys.
@@ -614,12 +621,22 @@ class RedisService:
             },
         )
 
-    async def get_verified_job_info(self, executor_id: str):
+    async def get_verified_job_info(self, executor_id: str, miner_hotkey: str):
+        """The record under (miner_hotkey, executor_id), else the uuid-only record written before the key
+        carried the hotkey. The uuid-only record is never written again; it is removed by the first
+        successful write for the executor, so it moves to the hotkey whose GPU UUIDs match its anchor.
+        A uuid-only record without an anchor is not carried: that executor starts a fresh count."""
+        data = await self.hget(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id))
+        if data:
+            return json.loads(data)
+
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
         if not data:
             return {}
-
-        return json.loads(data)
+        legacy = json.loads(data)
+        if not legacy.get(GPU_ANCHOR_KEY):
+            return {}
+        return legacy
 
     async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
