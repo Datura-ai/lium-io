@@ -83,9 +83,9 @@ def log_for_monitoring(
                     "sysbox_multiplier_sum": 0.0,
                     "cost_per_h": 0.0,
                 })
-                agg["count"] += r.gpu_count
-                agg["cost_per_h"] += r.gpu_count * eff
-                agg["sysbox_multiplier_sum"] += r.gpu_count * (r.sysbox_multiplier or 0)
+                agg["count"] += r.idle_payable_gpu_count
+                agg["cost_per_h"] += r.idle_payable_gpu_count * eff
+                agg["sysbox_multiplier_sum"] += r.idle_payable_gpu_count * (r.sysbox_multiplier or 0)
 
         for agg in unrented_by_bucket.values():
             cnt = agg["count"] or 1
@@ -126,10 +126,10 @@ def log_for_monitoring(
             rate = r.hourly_rate or 0
             eff = r.effective_rate or 0
             sysbox = r.sysbox_multiplier or 0
-            ex_cost = r.gpu_count * eff
+            ex_cost = r.idle_payable_gpu_count * eff
             ex_id = r.executor_info.uuid[:8] if r.executor_info.uuid else "?"
             logger.info(_m(
-                f"Rental_breakdown | {key} [{ex_id}] {bucket_key} | ${rate:.2f} * {cap:.2f} * {sysbox:.2f} = ${eff:.3f}/gpu * {r.gpu_count}gpu = ${ex_cost:.2f}",
+                f"Rental_breakdown | {key} [{ex_id}] {bucket_key} | ${rate:.2f} * {cap:.2f} * {sysbox:.2f} = ${eff:.3f}/gpu * {r.idle_payable_gpu_count}gpu = ${ex_cost:.2f}",
                 extra={"group": key, "bucket_key": bucket_key, "executor_id": ex_id,
                         "hourly_rate": rate, "unrented_cap_multiplier": cap,
                         "sysbox_multiplier": sysbox, "effective_rate": eff,

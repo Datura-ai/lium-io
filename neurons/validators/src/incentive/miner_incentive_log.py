@@ -29,6 +29,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
      free remainder of a partially rented split node with fewer free ports than the
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
+     idle GPU-split node whose free ports cannot start even one pod (the port
+       budget backs 0 of its free GPUs; open more ports to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
     from incentive.rental_price import (
         InsufficientDisk,
         MissingFlagshipCapability,
+        PortBudgetShortfall,
         PortLimitedRemainder,
         PowerCapIncapable,
     )
@@ -91,6 +94,7 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    PORT_UNBACKED_SPLIT_GPUS = "port_unbacked_split_gpus"
 
 
 class IncentiveReason(BaseModel):
@@ -436,6 +440,34 @@ class MinerLogLine(BaseModel):
             },
         )
 
+    @staticmethod
+    def no_payout_because_port_unbacked_split_gpus(
+        result: JobResult, shortfall: PortBudgetShortfall
+    ) -> MinerLogLine:
+        # Port budget with zero backed GPUs: the free ports cannot start even one pod, so no
+        # free GPU of this split node earns idle pay. Its own code, so a rollback of the
+        # ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER value never leaves a silent zero.
+        # `result` is the idle result (a whole idle split node or the free remainder).
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PORT_UNBACKED_SPLIT_GPUS,
+            message=(
+                f"No unrented incentive for the {shortfall.free_gpu_count} free GPU(s) on this "
+                f"GPU-split node: it has {shortfall.available_port_count} free port(s) and the "
+                f"marketplace gives every pod {shortfall.ports_per_bundle} ports, so not one pod of "
+                f"{shortfall.gpu_splitting_min_count} GPU(s) can start and nobody can rent these GPUs "
+                "right now. Any rented GPUs keep earning. Idle pay resumes when the node gets more "
+                "open ports in RENTING_PORT_RANGE."
+            ),
+            extra_fields={
+                "available_port_count": shortfall.available_port_count,
+                "ports_per_bundle": shortfall.ports_per_bundle,
+                "gpu_splitting_min_count": shortfall.gpu_splitting_min_count,
+                "backed_gpu_count": shortfall.backed_gpu_count,
+                "unbacked_gpu_count": shortfall.unbacked_gpu_count,
+            },
+        )
+
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 
     @staticmethod
@@ -494,6 +526,7 @@ class MinerLogLine(BaseModel):
                 "executor_id": str(result.executor_info.uuid),
                 "gpu_model": result.gpu_model,
                 "gpu_count": result.gpu_count,
+                "idle_payable_gpu_count": result.idle_payable_gpu_count,
                 "hourly_rate": result.hourly_rate,
                 "sysbox_runtime": result.sysbox_runtime,
                 "sysbox_multiplier": result.sysbox_multiplier,
@@ -510,6 +543,33 @@ class MinerLogLine(BaseModel):
                 "burn_share": result.burn_share,
                 "incentive": result.incentive,
                 "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def unrented_gpus_beyond_port_budget(result: JobResult, shortfall: PortBudgetShortfall) -> MinerLogLine:
+        # Port-budget report line, not a zero reason: the node is paid, for the GPUs its ports can back.
+        # `result` is the idle result (a whole idle split node or the free remainder), so
+        # gpu_count is the number of free GPUs the message names.
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive covers {shortfall.backed_gpu_count} of the {shortfall.free_gpu_count} "
+                f"free GPU(s) on this GPU-split node: it has {shortfall.available_port_count} free port(s), "
+                f"the marketplace gives every pod {shortfall.ports_per_bundle} ports and rents this node in "
+                f"bundles of {shortfall.gpu_splitting_min_count} GPU(s), so {shortfall.unbacked_gpu_count} "
+                "free GPU(s) cannot be rented right now and earn no idle pay. Open more ports in "
+                "RENTING_PORT_RANGE to cover every GPU the node splits into."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "port_unbacked_gpus",
+                "available_port_count": shortfall.available_port_count,
+                "ports_per_bundle": shortfall.ports_per_bundle,
+                "gpu_splitting_min_count": shortfall.gpu_splitting_min_count,
+                "backed_gpu_count": shortfall.backed_gpu_count,
+                "unbacked_gpu_count": shortfall.unbacked_gpu_count,
             },
         )
 
