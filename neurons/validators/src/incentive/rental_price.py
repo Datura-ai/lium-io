@@ -222,6 +222,9 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unrented_count_by_bucket: dict[tuple[str, int], int] = {}
         self._weighted_rate_sum_by_bucket: dict[tuple[str, int], float] = {}
         self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
+        # (base_model, bucket, executor uuid) already counted this cycle: a repeated result of
+        # one executor adds no GPUs to its tier.
+        self._counted_in_bucket: set[tuple[str, int, str]] = set()
         # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
         # revisited once per-bucket fill is known. Items: (base_model, result).
         self._split_fallback_candidates: list[tuple[str, JobResult]] = []
@@ -740,6 +743,21 @@ class RentalPriceIncentive(DefaultIncentive):
             # accumulate raw unrented GPU count and weighted rate sum per bucket
             if result.hourly_rate > 0 and max_cap > 0:
                 key = (base_model, bucket)
+                counted_key = (base_model, bucket, str(result.executor_info.uuid))
+                if counted_key in self._counted_in_bucket:
+                    logger.warning(
+                        _m(
+                            "Executor counted once in its idle tier; repeated result ignored",
+                            extra={
+                                "executor_id": counted_key[2],
+                                "base_model": base_model,
+                                "bucket": bucket,
+                                "gpu_count": result.gpu_count,
+                            },
+                        )
+                    )
+                    return
+                self._counted_in_bucket.add(counted_key)
                 self.unrented_count_by_bucket[key] = (
                     self.unrented_count_by_bucket.get(key, 0) + result.gpu_count
                 )
