@@ -286,8 +286,8 @@ async def test_apply_stores_frozen_records_pod_index_sets_clamped_and_returns_tr
     assert (record_a.watts, record_a.pod_id, record_a.executor_id) == (130, POD_ID, EXECUTOR_ID)
     assert (record_b.watts, record_b.pod_id, record_b.executor_id) == (250, POD_ID, EXECUTOR_ID)
     assert record_a.capped_at > 0
-    # the pod index remembers which GPUs this pod capped, for delete-time restore
-    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == ["GPU-a", "GPU-b"]
+    # the pod index remembers which GPUs this pod capped and at what (clamped) watts, for delete-time restore
+    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": 209, "GPU-b": 250}
     # targets are set (persistence mode first, readback verify after), clamped to hw max (GPU-b 300 -> 250)
     assert _commands(ssh)[1:] == _set_commands("GPU-a", 209) + _set_commands("GPU-b", 250)
 
@@ -651,6 +651,51 @@ async def test_a_second_restore_of_the_same_pod_finds_no_index_and_raises_nothin
     assert await restore_filler_pod_gpu_power_limits(second, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
 
     second.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_raises_a_gpu_still_at_the_recorded_cap_to_its_default() -> None:
+    # The index says GPU-a was capped at 368 W; no record is left and it still reads 368 W.
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(400))
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps({"GPU-a": 368})})
+
+    await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
+
+    assert _commands(ssh)[1:] == _set_commands("GPU-a", 400)
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_leaves_a_gpu_another_path_already_restored() -> None:
+    # A create's restore net restored GPU-a to the host's 300 W and deleted its record before this
+    # delete ran: it no longer reads the 368 W cap, so the host limit stays.
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 300, 400, 100, 400\n"))
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps({"GPU-a": 368})})
+
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
+
+    assert not any(" -pl " in command for command in _commands(ssh))
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_raises_a_gpu_whose_restore_failed_while_still_at_the_cap() -> None:
+    # The record stays for the safety nets, but the renter must not start at the cap in the meantime.
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"),
+        FakeRun(),
+        TimeoutError("nvidia-smi hung"),
+        FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"),
+        *_set_ok(400),
+    ]
+    redis = FakeRedis({
+        _restore_key("GPU-a"): _record("GPU-a", 380),
+        _pod_index_key(POD_ID): json.dumps({"GPU-a": 368}),
+    })
+
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
+
+    assert _commands(ssh)[4:] == _set_commands("GPU-a", 400)
+    assert _restore_key("GPU-a") in redis.store
 
 
 class RecordReadFailsRedis(FakeRedis):

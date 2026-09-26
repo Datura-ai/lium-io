@@ -9,8 +9,9 @@ Redis state (all keys written only by this validator):
   pre-cap limit. Never overwritten (a leftover record from a failed restore holds the TRUE original
   limit; overwriting on a re-cap would ratchet the "original" down forever). Deleted only after the
   recorded limit has been successfully restored with ``nvidia-smi -pl``.
-- ``gpu_power_restore_pod:<pod_id>`` — the gpu_uuids a filler pod capped, so its delete can restore
-  exactly its own GPUs without an SSH enumeration and without sweeping a replacement filler's fresh
+- ``gpu_power_restore_pod:<pod_id>`` — the GPUs a filler pod capped with the watts each was capped at
+  (``{gpu_uuid: watts}``; an older index is a plain uuid list), so its delete can restore exactly its own
+  GPUs without an SSH enumeration and without sweeping a replacement filler's fresh
   records.
 
 A record that outlives its filler (delete failed, SSH broke mid-teardown) is repaired by two safety
@@ -19,10 +20,11 @@ nets, so a reduced limit can never stick:
   stale cap — no penalty, and records past ``STALE_CAP_GRACE_SECONDS`` are restored.
 - ``create_container`` (validator connector): before starting any container WITHOUT a cap of its
   own, leftover records for its GPUs are restored, so customers never inherit a reduced limit.
-A record that is gone (lost, corrupt or unreadable) takes the pre-cap limit with it. The filler's
-delete, and a customer create that removes a filler itself, raise every GPU the pod index names but no
-record covers back to its default, however close to the default the cap was (Lium's cap sits above the
-check's floor), so a renter never starts on a GPU at Lium's cap.
+A record that is gone (lost, corrupt or unreadable) takes the pre-cap limit with it. After the filler's
+delete, or a customer create that removes a filler itself, has restored the pod's records, every GPU
+still reading the cap the pod index recorded goes back to its default, however close to the default the
+cap was (Lium's cap sits above the check's floor), so a renter never starts on a GPU at Lium's cap. A GPU
+another path restored first no longer reads the cap and keeps the host limit its record held.
 
 **Every set is verified** (live-repro on H100, 2026-07-13): with persistence mode off the driver
 unloads once the GPU goes idle and silently reverts ``-pl`` — nvidia-smi still exits 0 ("All done").
@@ -682,22 +684,29 @@ async def _raise_to_default(
     return await _set_side_by_side("raise", targets, raise_one, log_extra)
 
 
-async def _raise_capped_gpus_without_record(
+# A live limit within this many watts of the cap Lium applied is still Lium's cap (nvidia-smi rounds).
+LIUM_CAP_MATCH_WATTS = 1
+
+
+async def _raise_gpus_left_at_lium_cap(
     ssh: asyncssh.SSHClientConnection,
     executor_id: str,
-    capped_uuids: list[str],
+    cap_watts_by_uuid: dict[str, int | None],
     log_extra: dict[str, object] | None,
 ) -> int:
-    """Lift to its default every GPU of ``capped_uuids`` that sits below the default.
+    """Lift to its default every GPU that still sits at the cap this filler pod applied.
 
-    Called with the GPUs a filler pod capped whose restore record is gone (lost, corrupt or
-    unreadable): the pre-cap limit went with the record, and the default is the post-reboot state.
-    Unlike ``raise_low_power_limits_to_default`` this lifts a GPU anywhere below its default, not only
-    below the check's floor: Lium's own cap can sit above the floor (0.92 on lium.io), and a renter
-    must never start on it. A GPU that still has its record is restored from it instead, so a host
-    limit the record holds is kept. Always a live query. Best-effort; returns the raised count.
+    Runs after the pod's records were restored: a GPU restored by any path (this one, a create's
+    restore net, the check's stale rescue) no longer reads Lium's cap and is left alone, so a host limit
+    a record held is kept whatever order those paths ran in. A GPU still at the cap lost its record, or
+    its restore failed: its pre-cap limit is unknown here, and the default is the post-reboot state.
+    Unlike ``raise_low_power_limits_to_default`` this lifts a GPU at Lium's cap anywhere below the
+    default, not only below the check's floor: Lium's cap can sit above the floor (0.92 on lium.io),
+    and a renter must never start on it. A cap of None is an index written before the cap was stored:
+    such a GPU is lifted when below its default (the caller passes only record-less ones). Always a
+    live query. Best-effort; returns the raised count.
     """
-    if not capped_uuids:
+    if not cap_watts_by_uuid:
         return 0
     try:
         state_by_uuid = await _query_power_state(ssh)
@@ -705,9 +714,11 @@ async def _raise_capped_gpus_without_record(
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
     targets: list[_BelowFloorGpu] = []
-    for gpu_uuid in capped_uuids:
+    for gpu_uuid, cap_watts in cap_watts_by_uuid.items():
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None or state.current_watts >= state.default_watts:
+            continue
+        if cap_watts is not None and abs(state.current_watts - cap_watts) > LIUM_CAP_MATCH_WATTS:
             continue
         targets.append(
             _BelowFloorGpu(gpu_uuid=gpu_uuid, current_watts=state.current_watts, default_watts=state.default_watts)
@@ -715,11 +726,22 @@ async def _raise_capped_gpus_without_record(
     if targets:
         _log(
             logging.WARNING,
-            "gpu power raise: filler-capped GPUs without a restore record go back to their default",
+            "gpu power raise: GPUs still at the filler's cap after the restore go back to their default",
             {"gpu_uuids": [target.gpu_uuid for target in targets]},
             log_extra,
         )
     return await _raise_to_default(ssh, executor_id, targets, log_extra)
+
+
+def _parse_pod_index(raw_index: str | bytes) -> dict[str, int | None]:
+    """The pod index as {gpu_uuid: applied cap watts}; an index written before the cap was stored is a
+    plain list of uuids and reads with a cap of None. Raises ValueError/TypeError on anything else."""
+    parsed = json.loads(raw_index)
+    if isinstance(parsed, dict):
+        return {str(uuid): int(watts) for uuid, watts in parsed.items()}
+    if isinstance(parsed, list):
+        return {str(uuid): None for uuid in parsed}
+    raise TypeError(f"pod index is neither a dict nor a list: {type(parsed).__name__}")
 
 
 async def restore_filler_pod_gpu_power_limits(
@@ -735,8 +757,9 @@ async def restore_filler_pod_gpu_power_limits(
     Touching only the pod's own records means a replacement filler's fresh caps on the same host are
     never swept, and a filler we never capped costs one Redis read — no SSH. Best-effort: a record
     whose restore failed is kept for the safety nets; the index is claimed (read and deleted at once)
-    either way (the per-GPU records, not the index, are the source of truth). A GPU the index names but whose record is gone
-    is raised to its default (``_raise_capped_gpus_without_record``). Returns the restored count.
+    either way (the per-GPU records, not the index, are the source of truth). A GPU still at the cap
+    the index recorded after the restore is raised to its default (``_raise_gpus_left_at_lium_cap``).
+    Returns the restored count.
     """
     index_key = _pod_index_key(pod_id)
     try:
@@ -750,20 +773,25 @@ async def restore_filler_pod_gpu_power_limits(
     if not raw_index:
         return 0
     try:
-        capped_uuids: list[str] = [str(uuid) for uuid in json.loads(raw_index)]
+        cap_watts_by_uuid: dict[str, int | None] = _parse_pod_index(raw_index)
     except (ValueError, TypeError):
         _log(logging.ERROR, f"gpu power restore: dropped corrupt pod index {raw_index!r} for {pod_id}", {}, log_extra)
         return 0
-    # Which capped GPUs still have a record is read BEFORE the restore, which deletes the records it
-    # applies: a GPU without one is raised to its default afterwards. A failed read says nothing about
-    # which records exist, so nothing is raised then; the records left behind stay for the safety nets.
-    read_result = await read_gpu_power_restore_records(redis, capped_uuids, log_extra)
-    recorded_uuids: set[str] = {record.gpu_uuid for record in read_result.records}
+    capped_uuids: list[str] = list(cap_watts_by_uuid)
+    # An index written before the cap was stored says nothing about the cap, so its GPUs are raised
+    # only when they had no record before this restore (read first: the restore deletes what it
+    # applies) and the read did not fail.
+    legacy_uuids: list[str] = [uuid for uuid, cap in cap_watts_by_uuid.items() if cap is None]
+    raise_candidates: dict[str, int | None] = {
+        uuid: cap for uuid, cap in cap_watts_by_uuid.items() if cap is not None
+    }
+    if legacy_uuids:
+        read_result = await read_gpu_power_restore_records(redis, legacy_uuids, log_extra)
+        if not read_result.read_failed:
+            recorded: set[str] = {record.gpu_uuid for record in read_result.records}
+            raise_candidates.update({uuid: None for uuid in legacy_uuids if uuid not in recorded})
     restored = await restore_tracked_gpu_power_limits(ssh, redis, capped_uuids, log_extra)
-    if not read_result.read_failed:
-        await _raise_capped_gpus_without_record(
-            ssh, executor_id, [uuid for uuid in capped_uuids if uuid not in recorded_uuids], log_extra
-        )
+    await _raise_gpus_left_at_lium_cap(ssh, executor_id, raise_candidates, log_extra)
     return restored
 
 
@@ -810,6 +838,9 @@ async def apply_filler_gpu_power_limits(
         )
         return False
     target_uuids = [target.gpu_uuid for target in gpu_power_limits]
+    cap_watts_by_uuid: dict[str, int] = {
+        target.gpu_uuid: _clamp_watts(target.watts, state_by_uuid[target.gpu_uuid]) for target in gpu_power_limits
+    }
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
     for target in gpu_power_limits:
         pre_cap_watts = state_by_uuid[target.gpu_uuid].current_watts
@@ -817,7 +848,8 @@ async def apply_filler_gpu_power_limits(
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
             return False
     try:
-        await redis.set(_pod_index_key(pod_id), json.dumps(target_uuids))
+        # The applied cap goes with each GPU: after the restore, a GPU still at it is lifted to its default.
+        await redis.set(_pod_index_key(pod_id), json.dumps(cap_watts_by_uuid))
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: could not persist pod index for {pod_id}: {exc}", {}, log_extra)
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
@@ -825,7 +857,7 @@ async def apply_filler_gpu_power_limits(
     all_set = True
     for target in gpu_power_limits:
         state = state_by_uuid[target.gpu_uuid]
-        target_watts = _clamp_watts(target.watts, state)
+        target_watts = cap_watts_by_uuid[target.gpu_uuid]
         # one at a time and nothing else in flight: a refused session is a failed cap (fail-closed)
         if not await _set_alone(
             ssh, "cap", executor_id, target.gpu_uuid, state.current_watts, target_watts, log_extra
