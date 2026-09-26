@@ -315,6 +315,10 @@ class InspectorValidationService:
             default_extra=default_extra,
             executor_stderr=executor_stderr,
             error_type=type(exc).__name__,
+            # DAH-3593: the unclassified branch covers our own library too (InspectorValidator
+            # before create_process); only a transport error there is the node's.
+            validator_fault=message is Msg.VALIDATION_ERROR
+            or (message is Msg.FAILED_SSH_TRANSPORT and not isinstance(exc, (asyncssh.Error, OSError))),
         )
 
     def _failure_response(
@@ -326,6 +330,7 @@ class InspectorValidationService:
         default_extra: dict[str, Any],
         executor_stderr: str | None = None,
         error_type: str | None = None,
+        validator_fault: bool = False,
     ) -> InspectorValidationResponse:
         payload = {
             **diagnostics,
@@ -336,12 +341,23 @@ class InspectorValidationService:
             payload["error_type"] = error_type
         if executor_stderr:
             payload["executor_stderr"] = executor_stderr
-        logger.error(
-            _m(
-                "Inspector validation failed",
-                extra=get_extra_info({**default_extra, **payload}),
-            ),
-        )
+        # DAH-3593: the node failing the check is a verdict (INSPECTOR_FAILED_*), recorded and
+        # scored — WARNING. An exception the validator did not classify is still ERROR: that one
+        # may be ours.
+        if validator_fault:
+            logger.error(
+                _m(
+                    "Inspector validation failed",
+                    extra=get_extra_info({**default_extra, **payload}),
+                ),
+            )
+        else:
+            logger.warning(
+                _m(
+                    "Inspector validation failed",
+                    extra=get_extra_info({**default_extra, **payload, "reason_class": "node_verdict"}),
+                ),
+            )
         return InspectorValidationResponse(
             error=error,
             diagnostics=payload,
