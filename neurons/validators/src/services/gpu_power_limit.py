@@ -844,10 +844,11 @@ async def apply_filler_gpu_power_limits(
     cap_watts_by_uuid: dict[str, int] = {
         target.gpu_uuid: _clamp_watts(target.watts, state_by_uuid[target.gpu_uuid]) for target in gpu_power_limits
     }
-    # The index keeps a GPU's cap only when the cap lowered it: a host limit at or under the target (the
-    # backend never raises one) reads the same before and after, and must never be taken for Lium's cap.
+    # The index keeps a GPU's cap only when the cap lowered it by more than the match tolerance: a host
+    # limit at, under or within LIUM_CAP_MATCH_WATTS of the target reads as Lium's cap after the restore,
+    # and must never be raised for it.
     index_by_uuid: dict[str, int | None] = {
-        gpu_uuid: cap if cap < state_by_uuid[gpu_uuid].current_watts else None
+        gpu_uuid: cap if cap < state_by_uuid[gpu_uuid].current_watts - LIUM_CAP_MATCH_WATTS else None
         for gpu_uuid, cap in cap_watts_by_uuid.items()
     }
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.

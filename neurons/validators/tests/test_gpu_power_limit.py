@@ -711,6 +711,17 @@ async def test_apply_keeps_the_cap_of_a_gpu_it_lowered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_apply_keeps_no_cap_for_a_host_limit_within_a_watt_of_it() -> None:
+    # 369 W against a 368 W cap would read as Lium's cap after the restore and be raised to default.
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 369, 400, 100, 400\n"), *_set_ok(368))
+    redis = FakeRedis()
+
+    assert await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is True
+
+    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": None}
+
+
+@pytest.mark.asyncio
 async def test_pod_restore_never_raises_a_gpu_the_cap_did_not_lower() -> None:
     # The host runs at 365 W of 400 W and the backend asked for no more than that: the GPU read 365 W
     # before and after, so after the restore it is the host's limit, not Lium's cap.
