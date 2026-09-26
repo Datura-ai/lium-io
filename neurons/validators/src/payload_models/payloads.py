@@ -336,6 +336,11 @@ class ContainerCreateRequest(ContainerBaseRequest):
     active_container_names: list[str] | None = None
     cluster_membership: ClusterMembership | None = None
     active_volume_names: list[str] | None = None
+    # Renter secrets (name -> value), delivered as files on a tmpfs when
+    # POD_SECRETS_TMPFS_ENABLED is on and ignored when it is off. Parsed from the backend's message but
+    # never shown or serialized again here: `repr=False` because every container create logs the whole
+    # request as `str(payload)`, `exclude=True` so no model_dump carries a value anywhere.
+    secrets: dict[str, str] | None = Field(default=None, repr=False, exclude=True)
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.

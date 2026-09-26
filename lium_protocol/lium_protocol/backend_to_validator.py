@@ -162,6 +162,8 @@ class ContainerCreateRequest(ContainerRequest):
     active_container_names: list[str] | None = None
     active_volume_names: list[str] | None = None
     cluster_membership: ClusterMembership | None = None
+    # Renter secrets (name -> value); the validator writes them as files on a tmpfs, behind its flag
+    secrets: dict[str, str] | None = pydantic.Field(default=None, repr=False)
     # DAH-2211: build from this Dockerfile on the host instead of pulling `docker_image`
     dockerfile_content: str | None = None
     # DAH-1524: the image ships sshd (and runs Jupyter itself); None keeps the validator's bootstrap

@@ -122,8 +122,14 @@ from services.rental_docker_sdk import (
     build_container_command_argv,
     is_docker_not_found_error,
     build_environment_exec_spec,
+    build_pod_secrets_handover_spec,
+    build_pod_secrets_owner_probe_spec,
+    build_pod_secrets_tmpfs,
     build_remove_authorized_keys_exec_spec,
+    build_secret_file_exec_specs,
+    parse_pod_secrets_owner,
     require_rental_docker_ssh_host_key,
+    valid_pod_secrets,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
@@ -1128,6 +1134,13 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
     )
 
 
+def _pod_secrets(payload: ContainerCreateRequest) -> dict[str, str]:
+    # With the flag off a sent `secrets` is ignored, so the rent is exactly today's
+    if not settings.POD_SECRETS_TMPFS_ENABLED:
+        return {}
+    return valid_pod_secrets(payload.secrets)
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -1648,6 +1661,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            tmpfs=build_pod_secrets_tmpfs(_pod_secrets(payload)),
         )
 
     async def _ensure_pod_quote_socket(
@@ -3850,6 +3864,72 @@ class DockerService:
 
         return None
 
+    async def add_pod_secrets_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        secrets: dict[str, str],
+        log_tag: str,
+        log_extra: dict,
+    ) -> str | None:
+        # returns the failure cause, or None when every secret file was written; names only in logs
+        try:
+            probe = await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_resolve_pod_secrets_owner",
+                exec_spec=build_pod_secrets_owner_probe_spec(container_name=container_name),
+                log_extra=log_extra,
+            )
+            if probe.exit_status != 0:
+                raise ValueError(
+                    f"could not resolve the container user's uid:gid (exit_status={probe.exit_status})"
+                )
+            owner = parse_pod_secrets_owner(probe.stdout)
+        except Exception as exc:
+            cause = f"secrets owner: {exc}"
+            await self.stream_log("Failed to resolve the container user for secrets", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to resolve pod secrets owner",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": cause}),
+                )
+            )
+            return cause
+        exec_specs = build_secret_file_exec_specs(container_name=container_name, secrets=secrets)
+        steps = [(name, "exec_write_pod_secret", spec, f"secret {name}") for name, spec in zip(secrets, exec_specs)]
+        steps.append(
+            (
+                None,
+                "exec_hand_over_pod_secrets",
+                build_pod_secrets_handover_spec(container_name=container_name, secrets=secrets, owner=owner),
+                "secrets handover",
+            )
+        )
+        for name, operation, exec_spec, label in steps:
+            try:
+                result = await exec_logged_rental_docker_sdk_operation(
+                    docker_client=docker_client,
+                    operation=operation,
+                    exec_spec=exec_spec,
+                    log_extra={**log_extra, "secret_name": name} if name else log_extra,
+                )
+            except Exception as exc:
+                cause = f"{label}: {exc}"
+            else:
+                if result.exit_status == 0:
+                    continue
+                cause = f"{label}: exit_status={result.exit_status}; stderr={result.stderr}"
+            await self.stream_log(f"Failed to write {label}" if name else "Failed to hand over secrets", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to write pod secret",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": cause}),
+                )
+            )
+            return cause
+        return None
+
     async def resolve_sysbox_subuid_base(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -5536,6 +5616,25 @@ class DockerService:
                     failure_step=current_step,
                 )
 
+            try:
+                _pod_secrets(payload)
+            except ValueError as exc:
+                log_text = _m(
+                    "Invalid pod secrets",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+                logger.error(log_text)
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=f"Invalid pod secrets: {exc}",
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                    error_code=FailedContainerErrorCodes.UnknownError,
+                    failure_step=current_step,
+                )
+
             # add executor in pending status dict
             current_step = "pending_pod"
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -6544,6 +6643,19 @@ class DockerService:
                     )
                     if environment_error:
                         raise RuntimeError(f"Failed to set environment variables: {environment_error}")
+
+                    pod_secrets = _pod_secrets(payload)
+                    if pod_secrets:
+                        current_step = "write_pod_secrets"
+                        secrets_error = await self.add_pod_secrets_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            secrets=pod_secrets,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                        if secrets_error:
+                            raise RuntimeError(f"Failed to write pod secrets: {secrets_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.

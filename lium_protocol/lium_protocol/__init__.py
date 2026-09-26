@@ -10,7 +10,7 @@ enum member is a minor bump; making a field required, removing one, or changing 
 (and a new snapshot file). Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of lium-io.
 """
 
-PROTOCOL_VERSION = "1.3.0"
+PROTOCOL_VERSION = "1.4.0"
 
 from .backend_to_validator import BACKEND_MESSAGES, BackendMessage, BackendMessageType  # noqa: E402
 from .base import DeliveryStamps, Message, ProtocolError, Registry, WorkloadKind  # noqa: E402
