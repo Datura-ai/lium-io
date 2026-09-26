@@ -287,9 +287,9 @@ async def test_apply_stores_frozen_records_pod_index_sets_clamped_and_returns_tr
     assert (record_b.watts, record_b.pod_id, record_b.executor_id) == (250, POD_ID, EXECUTOR_ID)
     assert record_a.capped_at > 0
     # the pod index remembers which GPUs this pod capped and at what (clamped) watts, for delete-time restore
-    # neither cap lowered its GPU (GPU-a 130 W -> 209 W, GPU-b already at its clamped 250 W), so no cap is
-    # kept: after the restore neither can be taken for Lium's cap
-    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": None, "GPU-b": None}
+    # GPU-b already sat at its clamped 250 W target, which the restore cannot tell from Lium's cap, so no
+    # cap is kept for it; GPU-a was moved (130 W -> 209 W) and keeps its cap
+    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": 209, "GPU-b": None}
     # targets are set (persistence mode first, readback verify after), clamped to hw max (GPU-b 300 -> 250)
     assert _commands(ssh)[1:] == _set_commands("GPU-a", 209) + _set_commands("GPU-b", 250)
 
@@ -719,6 +719,21 @@ async def test_apply_keeps_no_cap_for_a_host_limit_within_a_watt_of_it() -> None
     assert await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is True
 
     assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": None}
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_the_cap_raised_is_raised_to_default_when_its_record_is_lost() -> None:
+    # A host under the floor (360 W of 400 W) was capped up to 368 W; its record is gone and it still
+    # reads 368 W, so the renter must not start there.
+    apply_ssh = fake_ssh(FakeRun(stdout="GPU-a, 360, 400, 100, 400\n"), *_set_ok(368))
+    redis = FakeRedis()
+    assert await apply_filler_gpu_power_limits(apply_ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is True
+    del redis.store[_restore_key("GPU-a")]
+    delete_ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(400))
+
+    await restore_filler_pod_gpu_power_limits(delete_ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
+
+    assert _commands(delete_ssh)[1:] == _set_commands("GPU-a", 400)
 
 
 @pytest.mark.asyncio
