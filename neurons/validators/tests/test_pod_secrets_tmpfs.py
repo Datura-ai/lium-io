@@ -16,13 +16,22 @@ from payload_models.payloads import ContainerCreateRequest
 from services import rental_docker_sdk
 from services.docker_service import DockerService
 from services.rental_docker_sdk import (
+    CONTAINER_DEFAULT_USER,
     POD_SECRETS_DIR,
     POD_SECRETS_TMPFS_OPTIONS,
+    POD_SECRETS_TMPFS_SIZE_BYTES,
+    ContainerExecResult,
+    ContainerExecSpec,
+    RentalDockerSdkClient,
     _build_host_config_kwargs,
+    build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
     build_secret_file_exec_specs,
+    parse_pod_secrets_owner,
     valid_pod_secrets,
 )
+from payload_models.payloads import FailedContainerRequest
+from test_rental_docker_sdk import FakeApiClient
 from test_docker_service_rental_security import (
     RecordingRentalDockerFactory,
     RecordingSSHClient,
@@ -75,18 +84,49 @@ def _secret_specs(docker_client):
     return [spec for spec in docker_client.exec_specs if POD_SECRETS_DIR in " ".join(spec.argv)]
 
 
-async def _create(docker_service, executor_info, keypair, monkeypatch, *, flag: bool, secrets):
+# What `id -u && id -g` prints when Docker runs it as the image's Config.User; an unknown name fails
+# the exec the way Docker does ("unable to find user").
+IMAGE_USERS = {
+    "": "0\n0\n",
+    "root": "0\n0\n",
+    "1000": "1000\n0\n",
+    "1000:1000": "1000\n1000\n",
+    "app": "1001\n1002\n",
+    "app:staff": "1001\n50\n",
+}
+
+
+def _answer_owner_probe(monkeypatch, docker_client, image_user: str):
+    original_exec = docker_client.exec_in_container
+
+    async def exec_as(spec):
+        result = await original_exec(spec)
+        if spec.user is CONTAINER_DEFAULT_USER:
+            if image_user not in IMAGE_USERS:
+                return ContainerExecResult(exit_status=126, stderr=f"unable to find user {image_user}")
+            return ContainerExecResult(exit_status=0, stdout=IMAGE_USERS[image_user])
+        return result
+
+    monkeypatch.setattr(docker_client, "exec_in_container", exec_as)
+
+
+async def _create(
+    docker_service, executor_info, keypair, monkeypatch, *, flag: bool, secrets, image_user: str = ""
+):
     monkeypatch.setattr(settings, "POD_SECRETS_TMPFS_ENABLED", flag)
-    docker_service.rental_docker_client_factory.client.__init__()
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.__init__()
+    _answer_owner_probe(monkeypatch, docker_client, image_user)
     _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
     payload = _base_create_payload(secrets=secrets)
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=keypair,
         private_key="encrypted-private-key",
     )
-    return payload, docker_service.rental_docker_client_factory.client
+    docker_client.last_result = result
+    return payload, docker_client
 
 
 def test_mount_spec_is_a_private_noexec_tmpfs_at_run_lium_secrets():
@@ -242,6 +282,7 @@ async def test_a_failed_secret_write_fails_the_rent_naming_only_the_secret(
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.__init__()
     _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
+    _answer_owner_probe(monkeypatch, docker_client, "")
     original_exec = docker_client.exec_in_container
 
     async def failing_secret_exec(spec):
@@ -271,3 +312,141 @@ async def test_a_failed_secret_write_fails_the_rent_naming_only_the_secret(
     for message in stream_messages:
         for value in SECRET_VALUES:
             assert value not in str(message)
+
+
+def test_the_owner_probe_runs_as_the_image_user_and_parses_uid_gid():
+    spec = build_pod_secrets_owner_probe_spec(container_name="pod")
+    assert spec.user is CONTAINER_DEFAULT_USER
+    assert spec.stdin is None
+    assert parse_pod_secrets_owner("1000\n1000\n") == (1000, 1000)
+    assert parse_pod_secrets_owner("0\n0") == (0, 0)
+
+
+@pytest.mark.parametrize("stdout", ["", "1000\n", "app\n1000\n", "1000\n1000\nextra\n", "-1\n0\n"])
+def test_an_owner_probe_that_is_not_two_numbers_is_refused(stdout):
+    with pytest.raises(ValueError):
+        parse_pod_secrets_owner(stdout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user, docker_user", [(CONTAINER_DEFAULT_USER, ""), ("0", "0")])
+async def test_exec_create_runs_the_probe_as_the_image_user_and_everything_else_as_root(
+    user, docker_user
+):
+    api_client = FakeApiClient()
+    await RentalDockerSdkClient(api_client).exec_in_container(
+        ContainerExecSpec(container_name="pod", argv=("id", "-u"), user=user)
+    )
+    assert api_client.exec_created[0]["user"] == docker_user
+    assert ContainerExecSpec(container_name="pod", argv=("true",)).user == "0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "image_user, owner",
+    [
+        ("1000", "1000:0"),
+        ("1000:1000", "1000:1000"),
+        ("app", "1001:1002"),
+        ("app:staff", "1001:50"),
+        ("", "0:0"),
+        ("root", "0:0"),
+    ],
+)
+async def test_secrets_are_owned_by_the_container_user_and_stay_0700_0400(
+    docker_service, executor_info, keypair, monkeypatch, image_user, owner
+):
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets=SECRETS,
+        image_user=image_user,
+    )
+
+    assert not isinstance(docker_client.last_result, FailedContainerRequest)
+    probes = [spec for spec in docker_client.exec_specs if spec.user is CONTAINER_DEFAULT_USER]
+    assert len(probes) == 1
+    secret_specs = _secret_specs(docker_client)
+    assert len(secret_specs) == len(SECRETS)
+    for spec, name in zip(secret_specs, SECRETS):
+        script = spec.argv[2]
+        assert spec.user == "0"
+        assert f"chown {owner} {POD_SECRETS_DIR};" in script
+        assert f"chmod 0700 {POD_SECRETS_DIR};" in script
+        assert f"chown {owner} {POD_SECRETS_DIR}/.{name}.partial;" in script
+        assert f"chmod 0400 {POD_SECRETS_DIR}/.{name}.partial;" in script
+        assert script.index("chown") < script.index(f"mv -f")
+    assert "mode=0700" in POD_SECRETS_TMPFS_OPTIONS.split(",")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_user", ["nosuchuser", "ghost:nogroup"])
+async def test_an_unresolvable_container_user_fails_the_rent_closed(
+    docker_service, executor_info, keypair, monkeypatch, caplog, image_user
+):
+    caplog.set_level(logging.DEBUG)
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets=SECRETS,
+        image_user=image_user,
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "write_pod_secrets"
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records
+    )
+    assert "Failed to resolve pod secrets owner" in logged
+    assert _secret_specs(docker_client) == []
+    for text in [result.msg, logged]:
+        for value in SECRET_VALUES:
+            assert value not in text
+
+
+def test_a_secret_bigger_than_the_tmpfs_is_refused_naming_only_the_secret():
+    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_TMPFS_SIZE_BYTES
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"HF_TOKEN": "hf_SECRET_VALUE_MARKER", "BIG": huge})
+    assert "BIG" in str(excinfo.value)
+    assert "BIG_SECRET_VALUE_MARKER" not in str(excinfo.value)
+    assert "hf_SECRET_VALUE_MARKER" not in str(excinfo.value)
+
+
+def test_secrets_that_together_overflow_the_tmpfs_are_refused():
+    half = "HALF_VALUE_MARKER" + "x" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2)
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"A": half, "B": half})
+    assert "A, B" in str(excinfo.value)
+    assert "HALF_VALUE_MARKER" not in str(excinfo.value)
+    exactly_full = {"A": "x" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2), "B": "y" * (POD_SECRETS_TMPFS_SIZE_BYTES // 2)}
+    assert valid_pod_secrets(exactly_full) == exactly_full
+
+
+@pytest.mark.asyncio
+async def test_an_oversize_secret_fails_the_rent_before_anything_is_created(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_TMPFS_SIZE_BYTES
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets={"BIG": huge},
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "validate_request"
+    assert "BIG" in result.msg and "BIG_SECRET_VALUE_MARKER" not in result.msg
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+    assert docker_client.run_specs == [] and docker_client.exec_specs == []

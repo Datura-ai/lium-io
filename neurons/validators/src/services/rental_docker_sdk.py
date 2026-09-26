@@ -45,11 +45,18 @@ RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
 # DAH-1482: renter secrets live on a tmpfs, so a value exists only in the container's memory — never in
-# an image layer, `docker commit`, a volume backup, `docker inspect` Env or /etc/environment. The pod
-# runs as root (keys go to /root/.ssh), so the directory and every file stay root-owned.
+# an image layer, `docker commit`, a volume backup, `docker inspect` Env or /etc/environment. The
+# workload runs as the image's USER, which may be non-root, so the directory (0700) and every file
+# (0400) are chowned to the uid:gid that user resolves to inside the container — nobody else can read.
 POD_SECRETS_DIR = "/run/lium/secrets"
-POD_SECRETS_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=1m,mode=0700"
+POD_SECRETS_TMPFS_SIZE_BYTES = 1024 * 1024
+POD_SECRETS_TMPFS_OPTIONS = f"rw,noexec,nosuid,nodev,size={POD_SECRETS_TMPFS_SIZE_BYTES},mode=0700"
 POD_SECRET_FILE_MODE = "0400"
+# tmpfs charges whole pages per file
+_TMPFS_PAGE_BYTES = 4096
+# None on a ContainerExecSpec: run as the container's configured USER, not pinned to root
+CONTAINER_DEFAULT_USER = None
+_NUMERIC_ID_PATTERN = re.compile(r"[0-9]{1,10}")
 # The name becomes a file name and appears in exec argv/logs; only the value is secret.
 POD_SECRET_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 logger = logging.getLogger(__name__)
@@ -178,6 +185,8 @@ class ContainerExecSpec:
     argv: tuple[str, ...]
     stdin: str | bytes | None = None
     environment: dict[str, str] = field(default_factory=dict)
+    # "0" pins rental bootstrap to root; CONTAINER_DEFAULT_USER runs as the image's USER
+    user: str | None = "0"
 
 
 @dataclass(slots=True)
@@ -728,16 +737,17 @@ class RentalDockerSdkClient:
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
-        # Every spec routed here is rental bootstrap writing to /root or /etc, so
-        # it must not inherit a non-root image USER (DAH-2534). Numeric uid, so no
-        # root entry in the image's /etc/passwd is required. The renter's own
-        # workload still runs as the image's USER — only these execs are pinned.
+        # Rental bootstrap writes to /root or /etc, so by default a spec must not
+        # inherit a non-root image USER (DAH-2534). Numeric uid, so no root entry
+        # in the image's /etc/passwd is required. The renter's own workload still
+        # runs as the image's USER; a spec with user=CONTAINER_DEFAULT_USER (the
+        # pod-secrets owner probe) runs as that USER too ("" = Docker's default).
         exec_create_result = self._api_client.exec_create(
             container=spec.container_name,
             cmd=list(spec.argv),
             stdin=stdin_data is not None,
             environment=spec.environment or None,
-            user="0",
+            user="" if spec.user is None else spec.user,
         )
         exec_id = exec_create_result["Id"]
 
@@ -942,16 +952,52 @@ def build_environment_exec_spec(
     )
 
 
+def _tmpfs_bytes(value: str) -> int:
+    size = len(value.encode("utf-8"))
+    return -(-size // _TMPFS_PAGE_BYTES) * _TMPFS_PAGE_BYTES
+
+
 def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
-    """The secrets to deliver; raises ValueError naming (never showing) a bad entry."""
+    """The secrets to deliver; raises ValueError naming (never showing) a bad entry.
+
+    Sizes are checked here, before the rent starts, so a value that cannot fit the tmpfs is refused up
+    front instead of failing inside the pod on a full mount.
+    """
     valid: dict[str, str] = {}
+    total = 0
     for name, value in (secrets or {}).items():
         if not isinstance(name, str) or not POD_SECRET_NAME_PATTERN.fullmatch(name):
             raise ValueError(f"invalid secret name {name!r}: letters, digits and _ only, not starting with a digit")
         if not isinstance(value, str) or not value:
             raise ValueError(f"secret {name} has an empty value")
+        size = _tmpfs_bytes(value)
+        if size > POD_SECRETS_TMPFS_SIZE_BYTES:
+            raise ValueError(f"secret {name} is larger than the {POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs")
+        total += size
         valid[name] = value
+    if total > POD_SECRETS_TMPFS_SIZE_BYTES:
+        raise ValueError(
+            f"secrets {', '.join(valid)} together need {total} bytes, over the "
+            f"{POD_SECRETS_TMPFS_SIZE_BYTES}-byte secrets tmpfs"
+        )
     return valid
+
+
+def build_pod_secrets_owner_probe_spec(*, container_name: str) -> ContainerExecSpec:
+    """`id -u; id -g` as the image's USER: Docker resolves names, uid[:gid] and empty (root) itself."""
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=("sh", "-c", "id -u && id -g"),
+        user=CONTAINER_DEFAULT_USER,
+    )
+
+
+def parse_pod_secrets_owner(stdout: str) -> tuple[int, int]:
+    """(uid, gid) from the probe's output; raises ValueError on anything but two numeric lines."""
+    lines = (stdout or "").split()
+    if len(lines) != 2 or not all(_NUMERIC_ID_PATTERN.fullmatch(line) for line in lines):
+        raise ValueError(f"could not resolve the container user's uid:gid (probe printed {len(lines)} fields)")
+    return int(lines[0]), int(lines[1])
 
 
 def build_pod_secrets_tmpfs(secrets: dict[str, str] | None) -> dict[str, str]:
@@ -962,12 +1008,16 @@ def build_secret_file_exec_specs(
     *,
     container_name: str,
     secrets: dict[str, str] | None,
+    owner: tuple[int, int] = (0, 0),
 ) -> list[ContainerExecSpec]:
     """One exec per secret; the value travels on stdin only, so it is never in argv or the exec logs.
 
     The script refuses to write unless the directory is the tmpfs mount, so a missing mount can never
-    put a value on the container's disk layer.
+    put a value on the container's disk layer. The directory and each file are chowned to `owner`
+    (the container user's uid, gid) before the file gets its name, keeping 0700/0400.
     """
+    uid, gid = owner
+    chown_to = f"{int(uid)}:{int(gid)}"
     secrets_dir = shlex.quote(POD_SECRETS_DIR)
     specs = []
     for name, value in valid_pod_secrets(secrets).items():
@@ -977,7 +1027,9 @@ def build_secret_file_exec_specs(
             "set -eu; umask 077; "
             f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts "
             f"|| {{ echo {secrets_dir} is not a tmpfs mount >&2; exit 1; }}; "
+            f"chown {chown_to} {secrets_dir}; chmod 0700 {secrets_dir}; "
             f"cat > {partial_target}; "
+            f"chown {chown_to} {partial_target}; "
             f"chmod {POD_SECRET_FILE_MODE} {partial_target}; "
             f"mv -f {partial_target} {target}"
         )

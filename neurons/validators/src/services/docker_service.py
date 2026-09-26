@@ -122,9 +122,11 @@ from services.rental_docker_sdk import (
     build_container_command_argv,
     is_docker_not_found_error,
     build_environment_exec_spec,
+    build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
     build_remove_authorized_keys_exec_spec,
     build_secret_file_exec_specs,
+    parse_pod_secrets_owner,
     require_rental_docker_ssh_host_key,
     valid_pod_secrets,
 )
@@ -3871,7 +3873,30 @@ class DockerService:
         log_extra: dict,
     ) -> str | None:
         # returns the failure cause, or None when every secret file was written; names only in logs
-        for name, exec_spec in zip(secrets, build_secret_file_exec_specs(container_name=container_name, secrets=secrets)):
+        try:
+            probe = await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_resolve_pod_secrets_owner",
+                exec_spec=build_pod_secrets_owner_probe_spec(container_name=container_name),
+                log_extra=log_extra,
+            )
+            if probe.exit_status != 0:
+                raise ValueError(
+                    f"could not resolve the container user's uid:gid (exit_status={probe.exit_status})"
+                )
+            owner = parse_pod_secrets_owner(probe.stdout)
+        except Exception as exc:
+            cause = f"secrets owner: {exc}"
+            await self.stream_log("Failed to resolve the container user for secrets", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to resolve pod secrets owner",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": cause}),
+                )
+            )
+            return cause
+        exec_specs = build_secret_file_exec_specs(container_name=container_name, secrets=secrets, owner=owner)
+        for name, exec_spec in zip(secrets, exec_specs):
             try:
                 result = await exec_logged_rental_docker_sdk_operation(
                     docker_client=docker_client,
@@ -5578,6 +5603,25 @@ class DockerService:
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
+                    failure_step=current_step,
+                )
+
+            try:
+                _pod_secrets(payload)
+            except ValueError as exc:
+                log_text = _m(
+                    "Invalid pod secrets",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+                logger.error(log_text)
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=f"Invalid pod secrets: {exc}",
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                    error_code=FailedContainerErrorCodes.UnknownError,
                     failure_step=current_step,
                 )
 
