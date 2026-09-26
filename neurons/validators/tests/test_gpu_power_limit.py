@@ -737,6 +737,34 @@ async def test_a_gpu_the_cap_raised_is_raised_to_default_when_its_record_is_lost
 
 
 @pytest.mark.asyncio
+async def test_a_leftover_record_near_the_cap_keeps_the_host_limit_after_a_reboot() -> None:
+    # An earlier restore failed and kept the host's 369 W record; the host rebooted to its 400 W default.
+    # The next filler caps at 368 W: what the restore writes back (369 W) is within a watt of the cap, so
+    # no cap is kept and the delete leaves the host's 369 W in place.
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 369)})
+    apply_ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), *_set_ok(368))
+    assert await apply_filler_gpu_power_limits(apply_ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is True
+    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": None}
+    delete_ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(369))
+
+    assert await restore_filler_pod_gpu_power_limits(delete_ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 1
+
+    assert _commands(delete_ssh)[1:] == _set_commands("GPU-a", 369)
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_still_at_an_old_cap_keeps_the_new_cap_when_its_record_says_otherwise() -> None:
+    # The GPU still reads an old 368 W cap, but its leftover record holds the host's real 400 W: the cap
+    # is kept, so if that record is later lost the GPU is raised instead of reaching a renter at 368 W.
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(368))
+
+    assert await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is True
+
+    assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": 368}
+
+
+@pytest.mark.asyncio
 async def test_pod_restore_never_raises_a_gpu_the_cap_did_not_lower() -> None:
     # The host runs at 365 W of 400 W and the backend asked for no more than that: the GPU read 365 W
     # before and after, so after the restore it is the host's limit, not Lium's cap.

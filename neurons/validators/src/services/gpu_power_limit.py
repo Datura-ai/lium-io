@@ -474,13 +474,15 @@ async def _ensure_restore_record(
     pod_id: str,
     executor_id: str,
     log_extra: dict[str, object] | None,
-) -> bool:
+) -> int | None:
+    """Make sure a restore record exists; return the watts the restore will write back (a leftover
+    record's, else the current limit just recorded), or None when no record could be ensured."""
     key = _restore_key(gpu_uuid)
     try:
         existing_raw: str | bytes | None = await redis.get(key)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: redis read failed for {key}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
-        return False
+        return None
     if existing_raw:
         # Frozen invariant: a leftover record (earlier restore failed) holds the TRUE original limit.
         _log(
@@ -490,16 +492,20 @@ async def _ensure_restore_record(
             {"gpu_uuid": gpu_uuid},
             log_extra,
         )
-        return True
+        try:
+            return GpuPowerRestoreRecord.model_validate_json(existing_raw).watts
+        except (ValidationError, TypeError, ValueError):
+            # A corrupt record is never restored, so the GPU keeps whatever it reads now.
+            return pre_cap_watts
     record = GpuPowerRestoreRecord(
         gpu_uuid=gpu_uuid, watts=pre_cap_watts, pod_id=pod_id, executor_id=executor_id, capped_at=time.time()
     )
     try:
         await redis.set(key, record.model_dump_json())
-        return True
+        return pre_cap_watts
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: could not persist pre-cap record for {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
-        return False
+        return None
 
 
 async def read_gpu_power_restore_records(
@@ -844,19 +850,26 @@ async def apply_filler_gpu_power_limits(
     cap_watts_by_uuid: dict[str, int] = {
         target.gpu_uuid: _clamp_watts(target.watts, state_by_uuid[target.gpu_uuid]) for target in gpu_power_limits
     }
-    # A host limit within LIUM_CAP_MATCH_WATTS of the cap cannot be told from Lium's cap once restored, so
-    # no cap is kept for that GPU and it is never raised. Every other GPU keeps its cap, including one the
-    # cap raised (a host under the floor): left at the cap with its record lost, it goes to its default.
-    index_by_uuid: dict[str, int | None] = {
-        gpu_uuid: None if abs(cap - state_by_uuid[gpu_uuid].current_watts) <= LIUM_CAP_MATCH_WATTS else cap
-        for gpu_uuid, cap in cap_watts_by_uuid.items()
-    }
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
+    restored_watts_by_uuid: dict[str, int] = {}
     for target in gpu_power_limits:
         pre_cap_watts = state_by_uuid[target.gpu_uuid].current_watts
-        if not await _ensure_restore_record(redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra):
+        restored_watts = await _ensure_restore_record(
+            redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra
+        )
+        if restored_watts is None:
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
             return False
+        restored_watts_by_uuid[target.gpu_uuid] = restored_watts
+    # A GPU whose restore writes back a limit within LIUM_CAP_MATCH_WATTS of the cap cannot be told from
+    # Lium's cap afterwards, so no cap is kept for it and it is never raised. The comparison is with what
+    # the restore writes back (a leftover record's watts, else the current limit), not with what the GPU
+    # reads now, which after a failed restore can be an old cap. Every other GPU keeps its cap, including
+    # one the cap raised (a host under the floor): left at the cap with its record lost, it goes to default.
+    index_by_uuid: dict[str, int | None] = {
+        gpu_uuid: None if abs(cap - restored_watts_by_uuid[gpu_uuid]) <= LIUM_CAP_MATCH_WATTS else cap
+        for gpu_uuid, cap in cap_watts_by_uuid.items()
+    }
     try:
         # The applied cap goes with each GPU: after the restore, a GPU still at it is lifted to its default.
         await redis.set(_pod_index_key(pod_id), json.dumps(index_by_uuid))
