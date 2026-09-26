@@ -554,7 +554,7 @@ class RentalPriceIncentive(DefaultIncentive):
         """
         eligible: bool = still_eligible
 
-        # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
+        # A split remainder under the marketplace port floor is capacity nobody can
         # rent, so it earns no idle pay.
         port_floor_enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
         port_limited: PortLimitedRemainder | None = (
@@ -569,7 +569,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited)
                 )
 
-        # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
+        # Soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays
         # active). While the flag is off we only log the would-be exclusion (shadow).
         price_limit_enforced: bool = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
@@ -587,7 +587,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     )
                 )
 
-        # DAH-2520 disk/VRAM gate: an idle machine without the required disk margin over its
+        # Disk/VRAM gate: an idle machine without the required disk margin over its
         # GPU VRAM is not realistically rentable, so it forfeits the unrented incentive (node
         # stays active). While the flag is off we only log the would-be exclusion (shadow).
         disk_limit_enforced: bool = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
@@ -607,7 +607,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     )
                 )
 
-        # DAH-2546 flagship capability gate; shadow-only while the flag is off
+        # Flagship capability gate; shadow-only while the flag is off
         flagship_limit_enforced: bool = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
         missing_capability: MissingFlagshipCapability | None = (
             self._missing_flagship_capability(job_result, base_model)
@@ -625,7 +625,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     )
                 )
 
-        # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
+        # Power cap gate: an idle machine whose container cannot apply a GPU power
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
         power_cap_limit_enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_LIMIT
