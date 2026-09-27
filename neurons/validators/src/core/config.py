@@ -31,7 +31,7 @@ class VerifyXSettings(BaseSettings):
     Set via environment variables prefixed with VERIFYX_ (e.g., VERIFYX_MEMORY_MIN_TEST_GB=16).
     Use .env for local development (git-ignored).
     """
-    model_config = SettingsConfigDict(env_prefix="VERIFYX_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="VERIFYX_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # Memory configuration
     MEMORY_ALLOCATION_PERCENTAGE: int = Field(
@@ -94,7 +94,7 @@ class DebugSettings(BaseSettings):
     Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
     Use .env for local development (git-ignored).
     """
-    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     ENABLED: bool = Field(default=False, description="Enable debug mode")
     USE_LOCAL_MINER: bool = Field(default=False, description="Use local miner")
@@ -108,7 +108,7 @@ class DebugSettings(BaseSettings):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     PROJECT_NAME: str = "compute-subnet-validator"
 
     BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
@@ -724,8 +724,7 @@ class Settings(BaseSettings):
         after = self.RENTED_POD_SSH_ENFORCE_AFTER_CYCLES
         if after is not None and after < self.RENTED_POD_SSH_PROBE_CYCLES:
             raise ValueError(
-                f"RENTED_POD_SSH_ENFORCE_AFTER_CYCLES ({after}) must not be below "
-                f"RENTED_POD_SSH_PROBE_CYCLES ({self.RENTED_POD_SSH_PROBE_CYCLES})"
+                "RENTED_POD_SSH_ENFORCE_AFTER_CYCLES must not be below RENTED_POD_SSH_PROBE_CYCLES"
             )
         return self
 
