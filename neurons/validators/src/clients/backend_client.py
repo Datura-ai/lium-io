@@ -21,6 +21,7 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
     PodSshUnreachableResponse,
     RentedExecutorsResponse,
+    RentedGpuDropResponse,
     VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
@@ -332,6 +333,45 @@ class BackendClient:
                 "boot_id_changed": boot_id_changed,
                 "boot_id_at_ok": boot_id_at_ok,
                 "boot_id_now": boot_id_now,
+            },
+            timeout=10,
+            non_200_log_level=logging.WARNING,
+        )
+
+    async def report_rented_gpu_drop(
+        self,
+        pod_id: str,
+        *,
+        state: str,
+        executor_id: str,
+        first_seen_at: str,
+        consecutive_cycles: int,
+        expected_gpu_count: int,
+        visible_gpu_count: int,
+        missing_uuids: list[str],
+        nvml_error_code: int | None,
+        faults: list[str],
+    ) -> RentedGpuDropResponse | None:
+        """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
+        (``state="recovered"``).
+
+        The backend keeps one incident per pod until the recovery and tells the provider, support and
+        the renter once per incident. Older backends 404, which is no answer: the caller reports again
+        next cycle.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
+            RentedGpuDropResponse,
+            json_data={
+                "state": state,
+                "executor_id": executor_id,
+                "first_seen_at": first_seen_at,
+                "consecutive_cycles": consecutive_cycles,
+                "expected_gpu_count": expected_gpu_count,
+                "visible_gpu_count": visible_gpu_count,
+                "missing_uuids": missing_uuids,
+                "nvml_error_code": nvml_error_code,
+                "faults": faults,
             },
             timeout=10,
             non_200_log_level=logging.WARNING,
