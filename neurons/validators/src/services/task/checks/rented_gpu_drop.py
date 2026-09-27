@@ -225,7 +225,13 @@ def _clamp(ctx: Context, pod_id: str, name: str, value: int, cap: int) -> int:
             _m(
                 "RENTED_GPU_DROP_VALUE_CLAMPED",
                 extra=get_extra_info(
-                    {**ctx.default_extra, "pod_id": pod_id, "field": name, "value": value, "sent": bounded}
+                    {
+                        **ctx.default_extra,
+                        "pod_id": pod_id,
+                        "field": name,
+                        "value": value,
+                        "sent": bounded,
+                    }
                 ),
             )
         )
@@ -405,9 +411,15 @@ class RentedGpuDropCheck:
     async def _post(
         self, ctx: Context, pod_id: str, state: str, mark: DropMark, drop: GpuDrop | None
     ) -> RentedGpuDropResponse | None:
-        expected = _clamp(ctx, pod_id, "expected_gpu_count", drop.expected if drop else 0, MAX_REPORTED_GPU_COUNT)
-        visible = _clamp(ctx, pod_id, "visible_gpu_count", drop.visible if drop else 0, MAX_REPORTED_GPU_COUNT)
-        cycles = _clamp(ctx, pod_id, "consecutive_cycles", mark.consecutive_cycles, MAX_REPORTED_CYCLES)
+        expected = _clamp(
+            ctx, pod_id, "expected_gpu_count", drop.expected if drop else 0, MAX_REPORTED_GPU_COUNT
+        )
+        visible = _clamp(
+            ctx, pod_id, "visible_gpu_count", drop.visible if drop else 0, MAX_REPORTED_GPU_COUNT
+        )
+        cycles = _clamp(
+            ctx, pod_id, "consecutive_cycles", mark.consecutive_cycles, MAX_REPORTED_CYCLES
+        )
         # Never fatal: a backend that is down, older (404) or raising is no answer, and the next cycle asks again.
         try:
             answer = await ctx.services.backend.report_rented_gpu_drop(
