@@ -15,13 +15,15 @@ the plugin is already enabled. Covered here:
 - `resolve_volume_sizing` with a probe computes the SAME result as the per-command path for the
   same host facts, running only `docker volume inspect` (nothing at all without vloopback volumes);
 - `create_local_volume` with an enabled plugin runs no SSH command and creates the identical volume;
-  with the plugin absent it still installs (negative control);
+  with the plugin absent it still installs (negative control); with the plugin installed but
+  disabled it runs `docker plugin enable` and re-reads the state, failing fast when it stays off;
 - `create_container` never probes with the flag off, probes once with it on and hands the probe to
   both the sizing and the create.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import subprocess
@@ -33,6 +35,7 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, df_command
 from payload_models.payloads import ContainerCreateRequest
 from services.docker_service import (
     DockerService,
+    LoopbackPluginDisabledError,
     VolumeHostProbe,
     _parse_volume_host_probe,
     _volume_host_probe_command,
@@ -143,6 +146,15 @@ def test_parse_probe_plugin_not_true_is_not_enabled(plugin_state):
     assert probe.loopback_plugin_enabled is False
 
 
+@pytest.mark.parametrize(
+    "plugin_state, installed", [("true", True), ("false", True), ("absent", False), ("", False)]
+)
+def test_parse_probe_plugin_installed_is_true_or_false(plugin_state, installed):
+    probe = _parse_volume_host_probe(_probe_stdout(plugin=plugin_state), with_df=True)
+
+    assert probe.loopback_plugin_installed is installed
+
+
 def test_parse_probe_without_df_section_when_not_requested():
     probe = _parse_volume_host_probe(_probe_stdout(df=None), with_df=False)
 
@@ -201,7 +213,8 @@ case "$1 $2" in
       empty) ;;
       ls-fails) echo "Cannot connect to the Docker daemon" >&2; exit 1 ;;
     esac ;;
-  "plugin inspect") [ "$mode" = plugin-absent ] && { echo; exit 1; }; echo true ;;  # real docker: blank stdout line, then exit 1
+  "plugin inspect") [ "$mode" = plugin-absent ] && { echo; exit 1; }  # real docker: blank stdout line, then exit 1
+    [ "$mode" = plugin-disabled ] && { echo false; exit 0; }; echo true ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 """
@@ -257,6 +270,16 @@ def test_probe_command_through_a_shell_absent_plugin_is_not_enabled(tmp_path):
     assert probe.loopback_plugin_enabled is False
     # the blank line docker prints before failing must not be what the field carries
     assert "PLUGIN\tabsent\n" in stdout
+    assert probe.loopback_plugin_installed is False
+
+
+def test_probe_command_through_a_shell_disabled_plugin_is_installed_not_enabled(tmp_path):
+    stdout = _run_probe_command_with_stub(tmp_path, "plugin-disabled")
+    probe = _parse_volume_host_probe(stdout, with_df=True)
+
+    assert "PLUGIN\tfalse\n" in stdout
+    assert probe.loopback_plugin_enabled is False
+    assert probe.loopback_plugin_installed is True
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +491,83 @@ async def test_create_local_volume_with_plugin_absent_still_installs_it(docker_s
         "--alias vloopback --grant-all-permissions DATA_DIR=/data/docker/loopback"
     )
     assert created[0]["driver"] == "vloopback"
+
+
+def _disabled_plugin_probe() -> VolumeHostProbe:
+    return VolumeHostProbe(
+        docker_root_dir="/var/lib/docker",
+        df_avail_bytes=None,
+        vloopback_volume_names=[],
+        loopback_plugin_enabled=False,
+        loopback_plugin_installed=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_with_disabled_plugin_enables_it_instead_of_installing(
+    docker_service,
+):
+    # 7fcd02af (20-27 Sep): installed but disabled → `plugin install` failed "already exists"
+    # and every create failed "plugin vloopback found but disabled". Enable, re-read, create.
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            Mock(stdout="vloopback\n", stderr="", exit_status=0),
+            Mock(stdout="true\n", stderr="", exit_status=0),
+        ]
+    )
+
+    created = await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+
+    calls = ssh_client.run.await_args_list
+    assert [c.args[0] for c in calls] == [
+        "/usr/bin/docker plugin enable vloopback",
+        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback 2>/dev/null "
+        "|| echo absent) | tail -n 1",
+    ]
+    assert all(c.kwargs == {"timeout": 10} for c in calls)
+    assert not any("plugin install" in c.args[0] for c in calls)
+    assert created == [
+        {
+            "volume_name": "volume_test",
+            "driver": "vloopback",
+            "driver_opts": {"size": "40g"},
+            "timeout": 10,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_disabled_plugin_that_will_not_enable_fails_fast(docker_service):
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1),
+            Mock(stdout="false\n", stderr="", exit_status=0),
+        ]
+    )
+
+    with pytest.raises(LoopbackPluginDisabledError) as exc_info:
+        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+
+    message = str(exc_info.value)
+    assert message.startswith("vloopback plugin disabled on host and could not be enabled")
+    assert "enable exit 1, state false" in message and "plugin.sock" in message
+    # lium-platform's classifier files it as volume.plugin_disabled on these two substrings
+    assert "plugin vloopback" in message.lower() and "disabled" in message.lower()
+    assert docker_service.rental_docker_client_factory.client.created_volumes == []
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_disabled_plugin_enable_timeout_fails_fast(docker_service):
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    with pytest.raises(LoopbackPluginDisabledError, match="could not be enabled"):
+        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+
+    assert ssh_client.run.await_count == 1
+    assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
