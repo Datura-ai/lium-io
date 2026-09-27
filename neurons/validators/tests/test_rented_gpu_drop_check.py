@@ -1,6 +1,7 @@
 """RENTED_GPU_DROP: a rented node that lost a GPU is reported the cycle it is seen, once per incident."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -412,6 +413,10 @@ async def test_redis_down_still_reports_the_drop_every_cycle(context_factory):
     assert services.backend.report_rented_gpu_drop.await_count == 2
 
 
+def test_the_check_does_not_import_the_rented_pod_ssh_module():
+    assert "rented_pod_ssh" not in Path(rented_gpu_drop.__file__).read_text()
+
+
 @pytest.mark.asyncio
 async def test_the_check_off_does_nothing(context_factory):
     services = _services()
@@ -421,6 +426,7 @@ async def test_the_check_off_does_nothing(context_factory):
 
     assert result.event.reason_code == Msg.DISABLED.reason
     services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.calls == 0
 
 
 def test_the_check_is_off_by_default():
