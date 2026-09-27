@@ -14,7 +14,8 @@ fails the cycle. For a rented executor it compares what the scrape listed with:
 - the anchored UUID set of the verified-job record (`missing_uuids` is the anchor minus the listed set),
 
 and reads the NVML error code out of `gpu_scrape_error`. A GPU-loss code (NVML_GPU_LOSS_CODES) is a fault
-on its own; any other scrape error only rides along with a count fault.
+on its own; any other NVML code only rides along with a count fault, and a scrape error with no NVML code
+adds no `nvml_error` label.
 
 The counts are executor-wide, and a fault is posted for every RUNNING pod on the executor; each post
 carries that pod's own `gpu_count` next to the executor totals so the backend can tell which renters of
@@ -151,7 +152,7 @@ def judge_rented_gpus(
         faults.append(FAULT_DETAILS_SHORT)
     if missing:
         faults.append(FAULT_ANCHORED_MISSING)
-    if code in NVML_GPU_LOSS_CODES or (scrape_error and faults):
+    if code in NVML_GPU_LOSS_CODES or (code is not None and faults):
         faults.append(FAULT_NVML_ERROR)
     if not faults:
         return None

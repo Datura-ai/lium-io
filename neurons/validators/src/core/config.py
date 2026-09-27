@@ -393,11 +393,8 @@ class Settings(BaseSettings):
     # the check. One blip (a streak of 1) never costs a cycle. Enforcement adds no report: the
     # one POST per outage stays the probe's.
     RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
-    # A rented node whose scrape lists fewer GPUs than it rents, than NVML counts or than its anchored
-    # UUID set, or whose NVML failed with a GPU-loss code, raises RENTED_GPU_DROP on that cycle and is
-    # reported to the backend the same cycle, once per incident per pod, then once more when every card
-    # is back, so the renter hears about a dead card before they find it. Observation only: the score is
-    # not changed here. Off by default until a run on healthy rented executors shows it stays quiet.
+    # Report a rented node that lost a GPU to the backend from the first cycle that sees it (a possible
+    # glitch waits one more); observation only, no score change. Off by default.
     RENTED_GPU_DROP_CHECK_ENABLED: bool = Field(env="RENTED_GPU_DROP_CHECK_ENABLED", default=False)
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)

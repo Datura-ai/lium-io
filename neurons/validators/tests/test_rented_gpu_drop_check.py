@@ -176,6 +176,21 @@ def test_an_nvml_error_that_is_not_a_loss_code_with_every_card_listed_is_not_a_f
     )
 
 
+def test_a_scrape_error_that_is_not_an_nvml_error_is_not_labelled_one():
+    drop = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=8,
+        listed_uuids=UUIDS[:5],
+        listed_count=5,
+        scrape_error="AttributeError('x')",
+    )
+
+    assert drop is not None and drop.nvml_error_code is None
+    assert drop.faults == [FAULT_BELOW_RENTED, FAULT_DETAILS_SHORT, FAULT_ANCHORED_MISSING]
+    assert drop.confirm_first
+
+
 def test_a_split_node_missing_a_card_outside_the_rental_is_still_reported_by_its_anchor():
     drop = judge_rented_gpus(
         rented_gpu_count=4,
@@ -575,9 +590,21 @@ async def test_the_check_off_does_nothing(context_factory):
     assert services.redis.calls == 0
 
 
-def test_the_check_is_off_by_default():
-    field = type(rented_gpu_drop.settings).model_fields["RENTED_GPU_DROP_CHECK_ENABLED"]
-    assert field.default is False
+@pytest.mark.asyncio
+async def test_the_pipeline_check_with_default_settings_posts_nothing(context_factory, monkeypatch):
+    monkeypatch.delenv("RENTED_GPU_DROP_CHECK_ENABLED", raising=False)
+    defaults = type(rented_gpu_drop.settings)(_env_file=None)
+    check = next(c for c in PipelineFactory.build_checks() if isinstance(c, RentedGpuDropCheck))
+    services = _services()
+
+    with patch.object(rented_gpu_drop, "settings", defaults):
+        result = await check.run(
+            _ctx(context_factory, services, listed=UUIDS[:5], scrape_error="NVMLError(999)")
+        )
+
+    assert result.passed and result.event.reason_code == Msg.DISABLED.reason
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.calls == 0 and services.redis.store == {}
 
 
 HEALTHY_CYCLES = [
