@@ -351,13 +351,18 @@ class BackendClient:
         missing_uuids: list[str],
         nvml_error_code: int | None,
         faults: list[str],
+        pod_gpu_count: int | None,
+        rented_gpu_count: int | None,
+        nvml_gpu_count: int,
     ) -> RentedGpuDropResponse | None:
         """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
         (``state="recovered"``).
 
         The backend keeps one incident per pod until the recovery and tells the provider, support and
         the renter once per incident. Older backends 404, which is no answer: the caller reports again
-        next cycle.
+        next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
+        ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
+        ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
         """
         return await self.post(
             f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
@@ -372,6 +377,9 @@ class BackendClient:
                 "missing_uuids": missing_uuids,
                 "nvml_error_code": nvml_error_code,
                 "faults": faults,
+                "pod_gpu_count": pod_gpu_count,
+                "rented_gpu_count": rented_gpu_count,
+                "nvml_gpu_count": nvml_gpu_count,
             },
             timeout=10,
             non_200_log_level=logging.WARNING,

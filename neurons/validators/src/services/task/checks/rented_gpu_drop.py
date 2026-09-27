@@ -16,6 +16,10 @@ fails the cycle. For a rented executor it compares what the scrape listed with:
 and reads the NVML error code out of `gpu_scrape_error`. A GPU-loss code (NVML_GPU_LOSS_CODES) is a fault
 on its own; any other scrape error only rides along with a count fault.
 
+The counts are executor-wide, and a fault is posted for every RUNNING pod on the executor; each post
+carries that pod's own `gpu_count` next to the executor totals so the backend can tell which renters of
+a split node are affected.
+
 Per RUNNING pod a Redis mark `rented_gpu_drop:<pod_id>` holds the incident: `first_seen_at`,
 `consecutive_cycles`, `reported` (the backend answered with a delivery that needs no retry) and
 `recorded` (the backend holds the incident, so it must hear the recovery). The first faulty cycle posts
@@ -114,9 +118,14 @@ def judge_rented_gpus(
     listed_count: int,
     scrape_error: object,
 ) -> GpuDrop | None:
-    """The fault this scrape shows on a rented node, or None when every rented card is there."""
+    """The fault this scrape shows on a rented node, or None when every rented card is there.
+
+    The count faults read the number of detail rows: a scrape can list one card twice (`split_uuids`,
+    GpuFingerprintCheck's `duplicate_uuid`), so the distinct UUID set can be one short on a healthy node.
+    Only `anchored_gpu_missing` reads the distinct set.
+    """
     listed = set(listed_uuids)
-    visible = len(listed) if listed else listed_count
+    visible = listed_count
     anchor = set(anchor_uuids)
     code = nvml_error_code(scrape_error)
     missing = sorted(anchor - listed)[:MAX_MISSING_UUIDS] if listed or not listed_count else []
@@ -140,6 +149,14 @@ def judge_rented_gpus(
         nvml_error_code=code,
         faults=faults,
     )
+
+
+@dataclass(frozen=True)
+class ExecutorGpus:
+    """The executor-wide counts every pod's report carries: the rental's total and the driver's count."""
+
+    rented_gpu_count: int | None
+    nvml_gpu_count: int
 
 
 @dataclass(frozen=True)
@@ -283,8 +300,11 @@ class RentedGpuDropCheck:
         if nvml_count is None:
             nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
         scrape_error = specs.get("gpu_scrape_error")
+        totals = ExecutorGpus(
+            rented_gpu_count=_rented_gpu_count(all_pods), nvml_gpu_count=nvml_count
+        )
         drop = judge_rented_gpus(
-            rented_gpu_count=_rented_gpu_count(all_pods),
+            rented_gpu_count=totals.rented_gpu_count,
             anchor_uuids=split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""),
             nvml_count=nvml_count,
             listed_uuids=_listed_uuids(gpu_details),
@@ -296,7 +316,7 @@ class RentedGpuDropCheck:
         outcomes = [
             outcome
             for pod in pods
-            if (outcome := await self._track_pod(ctx, pod, drop, now_iso)) is not None
+            if (outcome := await self._track_pod(ctx, pod, drop, totals, now_iso)) is not None
         ]
 
         if drop is not None:
@@ -304,6 +324,7 @@ class RentedGpuDropCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "expected_gpu_count": drop.expected,
                 "visible_gpu_count": drop.visible,
+                "rented_gpu_count": totals.rented_gpu_count,
                 "nvml_gpu_count": drop.nvml_count,
                 "missing_uuids": drop.missing_uuids,
                 "nvml_error_code": drop.nvml_error_code,
@@ -343,7 +364,12 @@ class RentedGpuDropCheck:
         return CheckResult(passed=True, event=event)
 
     async def _track_pod(
-        self, ctx: Context, pod: RentedPod, drop: GpuDrop | None, now_iso: str
+        self,
+        ctx: Context,
+        pod: RentedPod,
+        drop: GpuDrop | None,
+        totals: ExecutorGpus,
+        now_iso: str,
     ) -> PodDropOutcome | None:
         redis = ctx.services.redis
         key = _key(pod.pod_id)
@@ -358,7 +384,7 @@ class RentedGpuDropCheck:
         if drop is None:
             if mark is None:
                 return None
-            return await self._recover(ctx, pod, mark, redis_ok)
+            return await self._recover(ctx, pod, mark, totals, redis_ok)
 
         mark = (
             replace(mark, consecutive_cycles=mark.consecutive_cycles + 1)
@@ -367,7 +393,7 @@ class RentedGpuDropCheck:
         )
         answer: RentedGpuDropResponse | None = None
         if not mark.reported and not settings.DRY_RUN:
-            answer = await self._post(ctx, pod.pod_id, STATE_FAULT, mark, drop)
+            answer = await self._post(ctx, pod, STATE_FAULT, mark, drop, totals)
             if answer is not None:
                 mark = mark.after_answer(answer)
         if redis_ok:
@@ -383,15 +409,16 @@ class RentedGpuDropCheck:
             posted=answer is not None,
             delivery=answer.delivery if answer else None,
             reported=mark.reported,
+            extra={"gpu_count": pod.gpu_count},
         )
 
     async def _recover(
-        self, ctx: Context, pod: RentedPod, mark: DropMark, redis_ok: bool
+        self, ctx: Context, pod: RentedPod, mark: DropMark, totals: ExecutorGpus, redis_ok: bool
     ) -> PodDropOutcome:
         answer: RentedGpuDropResponse | None = None
         done = not mark.recorded
         if mark.recorded and not settings.DRY_RUN:
-            answer = await self._post(ctx, pod.pod_id, STATE_RECOVERED, mark, None)
+            answer = await self._post(ctx, pod, STATE_RECOVERED, mark, None, totals)
             done = answer is not None and answer.delivery != GPU_DROP_DELIVERY_NOTIFY_FAILED
         if done and redis_ok:
             try:
@@ -406,11 +433,19 @@ class RentedGpuDropCheck:
             posted=answer is not None,
             delivery=answer.delivery if answer else None,
             reported=done,
+            extra={"gpu_count": pod.gpu_count},
         )
 
     async def _post(
-        self, ctx: Context, pod_id: str, state: str, mark: DropMark, drop: GpuDrop | None
+        self,
+        ctx: Context,
+        pod: RentedPod,
+        state: str,
+        mark: DropMark,
+        drop: GpuDrop | None,
+        totals: ExecutorGpus,
     ) -> RentedGpuDropResponse | None:
+        pod_id = pod.pod_id
         expected = _clamp(
             ctx, pod_id, "expected_gpu_count", drop.expected if drop else 0, MAX_REPORTED_GPU_COUNT
         )
@@ -420,6 +455,17 @@ class RentedGpuDropCheck:
         cycles = _clamp(
             ctx, pod_id, "consecutive_cycles", mark.consecutive_cycles, MAX_REPORTED_CYCLES
         )
+        pod_gpus = (
+            _clamp(ctx, pod_id, "pod_gpu_count", pod.gpu_count, MAX_REPORTED_GPU_COUNT)
+            if pod.gpu_count is not None
+            else None
+        )
+        rented = (
+            _clamp(ctx, pod_id, "rented_gpu_count", totals.rented_gpu_count, MAX_REPORTED_GPU_COUNT)
+            if totals.rented_gpu_count is not None
+            else None
+        )
+        nvml = _clamp(ctx, pod_id, "nvml_gpu_count", totals.nvml_gpu_count, MAX_REPORTED_GPU_COUNT)
         # Never fatal: a backend that is down, older (404) or raising is no answer, and the next cycle asks again.
         try:
             answer = await ctx.services.backend.report_rented_gpu_drop(
@@ -433,6 +479,9 @@ class RentedGpuDropCheck:
                 missing_uuids=drop.missing_uuids if drop else [],
                 nvml_error_code=drop.nvml_error_code if drop else None,
                 faults=drop.faults if drop else [],
+                pod_gpu_count=pod_gpus,
+                rented_gpu_count=rented,
+                nvml_gpu_count=nvml,
             )
         except Exception:
             logger.warning(

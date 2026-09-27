@@ -47,7 +47,11 @@ def _details(uuids: list[str]) -> list[dict]:
 
 
 def _rented(
-    executor_uuid: str, *, status: str | None = "RUNNING", gpu_count: int | None = 8
+    executor_uuid: str,
+    *,
+    status: str | None = "RUNNING",
+    gpu_count: int | None = 8,
+    pods: list[RentedPod] | None = None,
 ) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
@@ -55,7 +59,8 @@ def _rented(
                 miner_hotkey="miner-hotkey",
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="8001",
-                pods=[
+                pods=pods
+                or [
                     RentedPod(
                         pod_id=POD_ID,
                         container_name="container_pod1",
@@ -76,6 +81,7 @@ def _ctx(
     count: int = 8,
     scrape_error: str | None = None,
     rented=True,
+    anchor: list[str] = UUIDS,
     **rented_kwargs,
 ):
     executor = default_executor()
@@ -95,7 +101,7 @@ def _ctx(
         services=services,
         state=state,
         executor=executor,
-        verified={"spec": f"{MODEL}:8", "uuids": ",".join(UUIDS)},
+        verified={"spec": f"{MODEL}:8", "uuids": ",".join(anchor)},
     )
 
 
@@ -185,6 +191,31 @@ def test_a_split_node_missing_a_card_outside_the_rental_is_still_reported_by_its
     )
 
 
+def test_a_card_listed_twice_is_counted_by_its_rows_not_its_distinct_uuids():
+    duplicated = UUIDS[:7] + [UUIDS[0]]
+
+    assert (
+        judge_rented_gpus(
+            rented_gpu_count=8,
+            anchor_uuids=UUIDS[:7],
+            nvml_count=8,
+            listed_uuids=duplicated,
+            listed_count=8,
+            scrape_error=None,
+        )
+        is None
+    )
+    drop = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=8,
+        listed_uuids=duplicated,
+        listed_count=8,
+        scrape_error=None,
+    )
+    assert drop is not None and drop.faults == [FAULT_ANCHORED_MISSING] and drop.visible == 8
+
+
 # --- the check ----------------------------------------------------------------------------------------------------
 
 
@@ -207,6 +238,8 @@ async def test_a_count_drop_on_a_rented_node_is_reported_on_the_first_cycle(cont
     assert call.kwargs["expected_gpu_count"] == 8 and call.kwargs["visible_gpu_count"] == 5
     assert call.kwargs["nvml_error_code"] == 999
     assert call.kwargs["executor_id"] == default_executor().uuid
+    assert call.kwargs["pod_gpu_count"] == 8
+    assert call.kwargs["rented_gpu_count"] == 8 and call.kwargs["nvml_gpu_count"] == 8
 
 
 @pytest.mark.asyncio
@@ -396,13 +429,15 @@ def test_the_check_is_off_by_default():
 
 
 HEALTHY_CYCLES = [
-    # (cards the scrape listed, gpu_scrape_error): a healthy rented node over several cycles, including an
-    # optional NVML query that answers NOT_SUPPORTED
-    (UUIDS, None),
-    (UUIDS, None),
-    (UUIDS, "NVMLError_NotSupported(3)"),
-    (list(reversed(UUIDS)), None),
-    (UUIDS, None),
+    # (cards the scrape listed, gpu_scrape_error, anchored UUIDs): a healthy rented node over several cycles,
+    # including an optional NVML query that answers NOT_SUPPORTED and a scrape that lists one card twice
+    # (8 detail rows, 7 distinct UUIDs, anchored as the fingerprint check stores it)
+    (UUIDS, None, UUIDS),
+    (UUIDS, None, UUIDS),
+    (UUIDS, "NVMLError_NotSupported(3)", UUIDS),
+    (list(reversed(UUIDS)), None, UUIDS),
+    (UUIDS[:7] + [UUIDS[0]], None, UUIDS[:7]),
+    (UUIDS, None, UUIDS),
 ]
 
 
@@ -411,13 +446,46 @@ async def test_a_healthy_rented_node_stays_quiet_over_many_cycles(context_factor
     services = _services()
 
     reasons = [
-        (await _run(context_factory, services, listed=listed, scrape_error=error)).event.reason_code
-        for listed, error in HEALTHY_CYCLES
+        (
+            await _run(context_factory, services, listed=listed, scrape_error=error, anchor=anchor)
+        ).event.reason_code
+        for listed, error, anchor in HEALTHY_CYCLES
     ]
 
     assert reasons == [Msg.OK.reason] * len(HEALTHY_CYCLES)
     services.backend.report_rented_gpu_drop.assert_not_awaited()
     assert services.redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_sends_each_pod_its_own_gpu_count_and_the_executor_totals(
+    context_factory,
+):
+    services = _services()
+    pods = [
+        RentedPod(pod_id=f"pod-{n}", container_name=f"container_{n}", gpu_count=n, status="RUNNING")
+        for n in (3, 5)
+    ]
+
+    result = await _run(context_factory, services, listed=UUIDS[:7], pods=pods)
+
+    sent = {
+        call.args[0]: call.kwargs
+        for call in services.backend.report_rented_gpu_drop.await_args_list
+    }
+    assert {pod: kwargs["pod_gpu_count"] for pod, kwargs in sent.items()} == {
+        "pod-3": 3,
+        "pod-5": 5,
+    }
+    assert all(
+        kwargs["rented_gpu_count"] == 8
+        and kwargs["nvml_gpu_count"] == 8
+        and kwargs["expected_gpu_count"] == 8
+        and kwargs["visible_gpu_count"] == 7
+        for kwargs in sent.values()
+    )
+    assert result.event.what_we_saw["rented_gpu_count"] == 8
+    assert [pod["gpu_count"] for pod in result.event.what_we_saw["pods"]] == [3, 5]
 
 
 @pytest.mark.asyncio
@@ -433,6 +501,8 @@ async def test_counts_above_the_backend_cap_are_clamped(context_factory):
     sent = services.backend.report_rented_gpu_drop.await_args.kwargs
     assert sent["expected_gpu_count"] == rented_gpu_drop.MAX_REPORTED_GPU_COUNT
     assert sent["visible_gpu_count"] == rented_gpu_drop.MAX_REPORTED_GPU_COUNT
+    assert sent["pod_gpu_count"] == sent["rented_gpu_count"] == sent["nvml_gpu_count"]
+    assert sent["nvml_gpu_count"] == rented_gpu_drop.MAX_REPORTED_GPU_COUNT
 
 
 @pytest.mark.parametrize(
