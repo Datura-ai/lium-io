@@ -24,8 +24,9 @@ Per RUNNING pod a Redis mark `rented_gpu_drop:<pod_id>` holds the incident: `fir
 `consecutive_cycles`, `reported` (the backend answered with a delivery that needs no retry) and
 `recorded` (the backend holds the incident, so it must hear the recovery). The first faulty cycle posts
 `POST /internal/pods/{pod_id}/gpu-drop` with `state=fault`; later cycles post again only while `reported`
-is False. A fault that rests only on detail rows cut short by a non-loss NVML error (`confirm_first`) posts
-from its second consecutive cycle instead. The first clean cycle after a recorded incident posts
+is False. A fault that rests only on detail rows cut short by a non-loss NVML error, while the driver's
+count still covers the rental and the anchor (`confirm_first`), posts from its second consecutive cycle
+instead. The first clean cycle after a recorded incident posts
 `state=recovered` and deletes the mark once the backend answered. A backend that is down or older (404) is
 no answer: the next cycle asks again. Redis down: the fault is still posted every cycle (the backend keeps
 one open incident per pod, so the renter is told once), except a `confirm_first` one, which cannot count
@@ -106,7 +107,8 @@ class GpuDrop:
     nvml_error_code: int | None
     faults: list[str]
     # the detail rows are short only because a non-loss NVML error (a timeout, say) cut the scrape's
-    # loop: a one-off glitch looks the same, so the report waits for a second faulty cycle
+    # loop while the driver still counts every rented and anchored card: a one-off glitch looks the
+    # same, so the report waits for a second faulty cycle
     confirm_first: bool = False
 
 
@@ -159,7 +161,8 @@ def judge_rented_gpus(
         faults=faults,
         confirm_first=bool(scrape_error)
         and code not in NVML_GPU_LOSS_CODES
-        and FAULT_DETAILS_SHORT in faults,
+        and FAULT_DETAILS_SHORT in faults
+        and nvml_count >= max(rented_gpu_count or 0, len(anchor)),
     )
 
 

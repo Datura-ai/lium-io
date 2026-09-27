@@ -438,10 +438,19 @@ def test_a_scrape_cut_short_by_a_non_loss_nvml_error_waits_for_confirmation():
         listed_count=7,
         scrape_error="NVMLError_NotSupported(3)",
     )
+    cut_and_driver_short = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=7,
+        listed_uuids=UUIDS[:5],
+        listed_count=5,
+        scrape_error="NVMLError_Timeout(10)",
+    )
 
     assert cut is not None and cut.confirm_first is True
     assert lost is not None and lost.confirm_first is False
     assert driver_short is not None and driver_short.confirm_first is False
+    assert cut_and_driver_short is not None and cut_and_driver_short.confirm_first is False
 
 
 @pytest.mark.asyncio
@@ -457,6 +466,24 @@ async def test_a_one_off_scrape_timeout_posts_nothing_and_a_second_one_posts(con
     await _run(context_factory, services, **timeout)
     services.backend.report_rented_gpu_drop.assert_awaited_once()
     assert services.backend.report_rented_gpu_drop.await_args.kwargs["consecutive_cycles"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_timeout_with_the_driver_count_below_the_rental_posts_on_the_first_cycle(
+    context_factory,
+):
+    services = _services()
+
+    result = await _run(
+        context_factory, services, listed=UUIDS[:5], count=7, scrape_error="NVMLError_Timeout(10)"
+    )
+
+    assert result.event.what_we_saw["pods"][0]["held"] is False
+    services.backend.report_rented_gpu_drop.assert_awaited_once()
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert call.kwargs["consecutive_cycles"] == 1
+    assert call.kwargs["nvml_gpu_count"] == 7 and call.kwargs["visible_gpu_count"] == 5
+    assert call.kwargs["rented_gpu_count"] == 8
 
 
 @pytest.mark.asyncio
