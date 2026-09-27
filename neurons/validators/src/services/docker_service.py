@@ -4196,8 +4196,15 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning(_m("Loopback plugin enable failed", extra=get_extra_info({**extra, "error": str(exc)})))
-            raise LoopbackPluginDisabledError(f"enable error: {exc}") from exc
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            error_type = exc.__class__.__name__
+            logger.warning(
+                _m(
+                    "Loopback plugin enable failed",
+                    extra=get_extra_info({**extra, "error_type": error_type}),
+                )
+            )
+            raise LoopbackPluginDisabledError(f"enable error: {error_type}") from exc
         state = (state_result.stdout or "").strip()
         if state != "true":
             detail = (result.stderr or result.stdout or "").strip()[:_PROBE_OUTPUT_LOG_CAP]
