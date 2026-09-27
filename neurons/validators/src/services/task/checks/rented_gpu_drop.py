@@ -24,10 +24,12 @@ Per RUNNING pod a Redis mark `rented_gpu_drop:<pod_id>` holds the incident: `fir
 `consecutive_cycles`, `reported` (the backend answered with a delivery that needs no retry) and
 `recorded` (the backend holds the incident, so it must hear the recovery). The first faulty cycle posts
 `POST /internal/pods/{pod_id}/gpu-drop` with `state=fault`; later cycles post again only while `reported`
-is False. The first clean cycle after a recorded incident posts `state=recovered` and deletes the mark once
-the backend answered. A backend that is down or older (404) is no answer: the next cycle asks again.
-Redis down: the fault is still posted every cycle (the backend keeps one open incident per pod, so the
-renter is told once) and the recovery is not; the check's verdict never depends on Redis.
+is False. A fault that rests only on detail rows cut short by a non-loss NVML error (`confirm_first`) posts
+from its second consecutive cycle instead. The first clean cycle after a recorded incident posts
+`state=recovered` and deletes the mark once the backend answered. A backend that is down or older (404) is
+no answer: the next cycle asks again. Redis down: the fault is still posted every cycle (the backend keeps
+one open incident per pod, so the renter is told once), except a `confirm_first` one, which cannot count
+cycles, and the recovery is not; the check's verdict never depends on Redis.
 """
 
 from __future__ import annotations
@@ -103,6 +105,9 @@ class GpuDrop:
     missing_uuids: list[str]
     nvml_error_code: int | None
     faults: list[str]
+    # the detail rows are short only because a non-loss NVML error (a timeout, say) cut the scrape's
+    # loop: a one-off glitch looks the same, so the report waits for a second faulty cycle
+    confirm_first: bool = False
 
 
 def nvml_error_code(scrape_error: object) -> int | None:
@@ -152,6 +157,9 @@ def judge_rented_gpus(
         missing_uuids=[uuid[:MAX_UUID_CHARS] for uuid in missing],
         nvml_error_code=code,
         faults=faults,
+        confirm_first=bool(scrape_error)
+        and code not in NVML_GPU_LOSS_CODES
+        and FAULT_DETAILS_SHORT in faults,
     )
 
 
@@ -396,7 +404,8 @@ class RentedGpuDropCheck:
             else DropMark(now_iso)
         )
         answer: RentedGpuDropResponse | None = None
-        if not mark.reported and not settings.DRY_RUN:
+        held = drop.confirm_first and mark.consecutive_cycles < 2
+        if not mark.reported and not held and not settings.DRY_RUN:
             answer = await self._post(ctx, pod, STATE_FAULT, mark, drop, totals)
             if answer is not None:
                 mark = mark.after_answer(answer)
@@ -413,7 +422,7 @@ class RentedGpuDropCheck:
             posted=answer is not None,
             delivery=answer.delivery if answer else None,
             reported=mark.reported,
-            extra={"gpu_count": pod.gpu_count},
+            extra={"gpu_count": pod.gpu_count, "held": held},
         )
 
     async def _recover(

@@ -413,6 +413,63 @@ async def test_redis_down_still_reports_the_drop_every_cycle(context_factory):
     assert services.backend.report_rented_gpu_drop.await_count == 2
 
 
+def test_a_scrape_cut_short_by_a_non_loss_nvml_error_waits_for_confirmation():
+    cut = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=8,
+        listed_uuids=UUIDS[:3],
+        listed_count=3,
+        scrape_error="NVMLError_Timeout(10)",
+    )
+    lost = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=8,
+        listed_uuids=UUIDS[:5],
+        listed_count=5,
+        scrape_error="NVMLError(999)",
+    )
+    driver_short = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=7,
+        listed_uuids=UUIDS[:7],
+        listed_count=7,
+        scrape_error="NVMLError_NotSupported(3)",
+    )
+
+    assert cut is not None and cut.confirm_first is True
+    assert lost is not None and lost.confirm_first is False
+    assert driver_short is not None and driver_short.confirm_first is False
+
+
+@pytest.mark.asyncio
+async def test_a_one_off_scrape_timeout_posts_nothing_and_a_second_one_posts(context_factory):
+    services = _services()
+    timeout = {"listed": UUIDS[:3], "scrape_error": "NVMLError_Timeout(10)"}
+
+    first = await _run(context_factory, services, **timeout)
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert first.event.reason_code == Msg.DROP.reason
+    assert first.event.what_we_saw["pods"][0]["held"] is True
+
+    await _run(context_factory, services, **timeout)
+    services.backend.report_rented_gpu_drop.assert_awaited_once()
+    assert services.backend.report_rented_gpu_drop.await_args.kwargs["consecutive_cycles"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_one_off_scrape_timeout_that_clears_is_never_posted(context_factory):
+    services = _services()
+
+    await _run(context_factory, services, listed=UUIDS[:3], scrape_error="NVMLError_Timeout(10)")
+    await _run(context_factory, services, listed=UUIDS)
+
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.store == {}
+
+
 def test_the_check_does_not_import_the_rented_pod_ssh_module():
     assert "rented_pod_ssh" not in Path(rented_gpu_drop.__file__).read_text()
 
