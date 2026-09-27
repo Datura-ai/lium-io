@@ -215,9 +215,69 @@ def test_a_card_listed_twice_is_counted_by_its_rows_not_its_distinct_uuids():
         scrape_error=None,
     )
     assert drop is not None and drop.faults == [FAULT_ANCHORED_MISSING] and drop.visible == 8
+    assert drop.confirm_first is True
+
+
+def test_an_anchored_card_missing_without_a_duplicate_or_with_rows_short_is_not_held():
+    no_duplicate = judge_rented_gpus(
+        rented_gpu_count=4,
+        anchor_uuids=UUIDS,
+        nvml_count=7,
+        listed_uuids=UUIDS[:7],
+        listed_count=7,
+        scrape_error=None,
+    )
+    duplicate_rows_short = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=8,
+        listed_uuids=UUIDS[:6] + [UUIDS[0]],
+        listed_count=7,
+        scrape_error=None,
+    )
+    duplicate_with_loss_code = judge_rented_gpus(
+        rented_gpu_count=8,
+        anchor_uuids=UUIDS,
+        nvml_count=8,
+        listed_uuids=UUIDS[:7] + [UUIDS[0]],
+        listed_count=8,
+        scrape_error="NVMLError(15)",
+    )
+
+    assert no_duplicate is not None and no_duplicate.confirm_first is False
+    assert duplicate_rows_short is not None and duplicate_rows_short.confirm_first is False
+    assert duplicate_with_loss_code is not None and duplicate_with_loss_code.confirm_first is False
 
 
 # --- the check ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_listing_against_a_full_anchor_is_held_then_posted_if_it_persists(
+    context_factory,
+):
+    services = _services()
+    duplicated = UUIDS[:7] + [UUIDS[0]]
+
+    first = await _run(context_factory, services, listed=duplicated)
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert first.event.what_we_saw["faults"] == [FAULT_ANCHORED_MISSING]
+    assert first.event.what_we_saw["pods"][0]["held"] is True
+
+    await _run(context_factory, services, listed=duplicated)
+    services.backend.report_rented_gpu_drop.assert_awaited_once()
+    assert services.backend.report_rented_gpu_drop.await_args.kwargs["missing_uuids"] == [UUIDS[7]]
+
+
+@pytest.mark.asyncio
+async def test_a_held_duplicate_listing_that_clears_is_never_posted(context_factory):
+    services = _services()
+
+    await _run(context_factory, services, listed=UUIDS[:7] + [UUIDS[0]])
+    await _run(context_factory, services, listed=UUIDS)
+
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.store == {}
 
 
 @pytest.mark.asyncio

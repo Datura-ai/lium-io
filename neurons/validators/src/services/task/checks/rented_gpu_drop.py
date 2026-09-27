@@ -25,8 +25,9 @@ Per RUNNING pod a Redis mark `rented_gpu_drop:<pod_id>` holds the incident: `fir
 `recorded` (the backend holds the incident, so it must hear the recovery). The first faulty cycle posts
 `POST /internal/pods/{pod_id}/gpu-drop` with `state=fault`; later cycles post again only while `reported`
 is False. A fault that rests only on detail rows cut short by a non-loss NVML error, while the driver's
-count still covers the rental and the anchor (`confirm_first`), posts from its second consecutive cycle
-instead. The first clean cycle after a recorded incident posts
+count still covers the rental and the anchor, or on an anchored UUID missing from a scrape that lists
+another card twice while its rows still cover every card (`confirm_first`), posts from its second
+consecutive cycle instead. The first clean cycle after a recorded incident posts
 `state=recovered` and deletes the mark once the backend answered. A backend that is down or older (404) is
 no answer: the next cycle asks again. Redis down: the fault is still posted every cycle (the backend keeps
 one open incident per pod, so the renter is told once), except a `confirm_first` one, which cannot count
@@ -106,9 +107,10 @@ class GpuDrop:
     missing_uuids: list[str]
     nvml_error_code: int | None
     faults: list[str]
-    # the detail rows are short only because a non-loss NVML error (a timeout, say) cut the scrape's
-    # loop while the driver still counts every rented and anchored card: a one-off glitch looks the
-    # same, so the report waits for a second faulty cycle
+    # the fault may be a one-off glitch, so the report waits for a second faulty cycle: the detail rows
+    # are short only because a non-loss NVML error (a timeout, say) cut the scrape's loop, or an anchored
+    # UUID is missing only from a scrape that lists another card twice, while the rows (or the driver)
+    # still cover every rented and anchored card
     confirm_first: bool = False
 
 
@@ -133,7 +135,8 @@ def judge_rented_gpus(
 
     The count faults read the number of detail rows: a scrape can list one card twice (`split_uuids`,
     GpuFingerprintCheck's `duplicate_uuid`), so the distinct UUID set can be one short on a healthy node.
-    Only `anchored_gpu_missing` reads the distinct set.
+    Only `anchored_gpu_missing` reads the distinct set, and it waits for a second cycle when the listed
+    UUIDs repeat one while the rows still cover every rented, anchored and driver-counted card.
     """
     listed = set(listed_uuids)
     visible = listed_count
@@ -152,17 +155,25 @@ def judge_rented_gpus(
         faults.append(FAULT_NVML_ERROR)
     if not faults:
         return None
+    expected = max(rented_gpu_count or 0, len(anchor), nvml_count)
+    cut_short = (
+        bool(scrape_error)
+        and FAULT_DETAILS_SHORT in faults
+        and nvml_count >= max(rented_gpu_count or 0, len(anchor))
+    )
+    duplicate_listed = (
+        FAULT_ANCHORED_MISSING in faults
+        and len(listed) < len(listed_uuids)
+        and listed_count >= expected
+    )
     return GpuDrop(
-        expected=max(rented_gpu_count or 0, len(anchor), nvml_count),
+        expected=expected,
         visible=visible,
         nvml_count=nvml_count,
         missing_uuids=[uuid[:MAX_UUID_CHARS] for uuid in missing],
         nvml_error_code=code,
         faults=faults,
-        confirm_first=bool(scrape_error)
-        and code not in NVML_GPU_LOSS_CODES
-        and FAULT_DETAILS_SHORT in faults
-        and nvml_count >= max(rented_gpu_count or 0, len(anchor)),
+        confirm_first=code not in NVML_GPU_LOSS_CODES and (cut_short or duplicate_listed),
     )
 
 
