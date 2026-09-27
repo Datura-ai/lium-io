@@ -68,7 +68,7 @@ RENTED_GPU_DROP_KEY_PREFIX = "rented_gpu_drop"
 # the backend's pod status (RentedPod.status) for a pod the renter is using
 POD_STATUS_RUNNING = "RUNNING"
 # a Redis outage surfaces as RedisError or, below the client, as a socket OSError
-REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
+GPU_DROP_REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
 
 FAULT_BELOW_RENTED = "below_rented_count"
 FAULT_DETAILS_SHORT = "details_short_of_count"
@@ -404,7 +404,7 @@ class RentedGpuDropCheck:
         mark: DropMark | None = None
         try:
             mark = DropMark.load(await redis.get(key))
-        except REDIS_ERRORS:
+        except GPU_DROP_REDIS_ERRORS:
             redis_ok = False
             self._log_redis_unavailable(ctx, pod.pod_id, "read")
 
@@ -427,7 +427,7 @@ class RentedGpuDropCheck:
         if redis_ok:
             try:
                 await redis.set(key, mark.dump(), ex=settings.RENTED_GPU_DROP_STATE_TTL_SECONDS)
-            except REDIS_ERRORS:
+            except GPU_DROP_REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod.pod_id, "write")
         return PodDropOutcome(
             pod_id=pod.pod_id,
@@ -451,7 +451,7 @@ class RentedGpuDropCheck:
         if done and redis_ok:
             try:
                 await ctx.services.redis.delete(_key(pod.pod_id))
-            except REDIS_ERRORS:
+            except GPU_DROP_REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod.pod_id, "delete")
         return PodDropOutcome(
             pod_id=pod.pod_id,
