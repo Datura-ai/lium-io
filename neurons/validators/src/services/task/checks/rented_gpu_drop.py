@@ -1,10 +1,9 @@
-"""RENTED_GPU_DROP — a rented node shows fewer GPUs than it rents, or NVML failed listing them (F-1468).
+"""RENTED_GPU_DROP — a rented node shows fewer GPUs than it rents, or NVML failed listing them.
 
-F-1468 (27 Sep 2026): pod 8d326b16 on executor 46297c14 (8x RTX 5090). GPU5 fell out of NVML at 05:14:44Z
-(NVMLError 999, the scrape listed 5 of 8 cards), was still gone at the next cycle (05:29:48Z) and came back
-only after a host reboot at ~06:37Z. The renter lost state; nobody was told. The scrape's per-device loop
-stops at the first NVML error, so `gpu.count` keeps the driver's 8 while `gpu.details` holds the cards read
-before it and `gpu_scrape_error` is `NVMLError(999)`.
+A card that falls off the bus on a rented node breaks the renter's workload, and without this check nobody
+is told until the next fatal cycle is investigated. The scrape's per-device loop stops at the first NVML
+error, so `gpu.count` keeps the driver's count while `gpu.details` holds only the cards read before it and
+`gpu_scrape_error` carries the NVML error.
 
 The fatal checks after the scrape (GpuModelValidCheck's DETAILS_MISMATCH, GpuFingerprintCheck) halt such a
 cycle long before TenantEnforcementCheck, so this check runs right after MachineSpecScrapeCheck and never
@@ -64,7 +63,7 @@ FAULT_ANCHORED_MISSING = "anchored_gpu_missing"
 FAULT_NVML_ERROR = "nvml_error"
 
 # NVML return codes that mean a card is gone or unusable: DRIVER_NOT_LOADED, GPU_IS_LOST, RESET_REQUIRED,
-# GPU_NOT_FOUND, UNKNOWN (what a card that fell off the bus answers, F-1468). Any other code (NOT_SUPPORTED on
+# GPU_NOT_FOUND, UNKNOWN (what a card that fell off the bus answers). Any other code (NOT_SUPPORTED on
 # an optional query, say) is not a fault unless a card is also missing.
 NVML_GPU_LOSS_CODES = frozenset({9, 15, 16, 28, 999})
 _NVML_ERROR_CODE = re.compile(r"NVMLError\w*\((\d{1,6})\)")
@@ -73,6 +72,10 @@ _NVML_ERROR_CODE = re.compile(r"NVMLError\w*\((\d{1,6})\)")
 MAX_MISSING_UUIDS = 16
 MAX_UUID_CHARS = 64
 MAX_SCRAPE_ERROR_CHARS = 120
+# The backend refuses (422) a GPU count above this or a cycle count above MAX_REPORTED_CYCLES; an out-of-range
+# value is clamped and logged so the report is not refused on every cycle.
+MAX_REPORTED_GPU_COUNT = 64
+MAX_REPORTED_CYCLES = 100_000
 
 STATE_FAULT = "fault"
 STATE_RECOVERED = "recovered"
@@ -215,6 +218,20 @@ def _key(pod_id: str) -> str:
     return f"{RENTED_GPU_DROP_KEY_PREFIX}:{pod_id}"
 
 
+def _clamp(ctx: Context, pod_id: str, name: str, value: int, cap: int) -> int:
+    bounded = min(max(value, 0), cap)
+    if bounded != value:
+        logger.warning(
+            _m(
+                "RENTED_GPU_DROP_VALUE_CLAMPED",
+                extra=get_extra_info(
+                    {**ctx.default_extra, "pod_id": pod_id, "field": name, "value": value, "sent": bounded}
+                ),
+            )
+        )
+    return bounded
+
+
 def _listed_uuids(gpu_details: list[dict]) -> list[str]:
     return [
         str(detail["uuid"])
@@ -229,7 +246,7 @@ def _rented_gpu_count(pods: list[RentedPod]) -> int | None:
 
 
 class RentedGpuDropCheck:
-    """Report a rented node that lost a GPU on the cycle it is seen, once per incident per pod (F-1468).
+    """Report a rented node that lost a GPU on the cycle it is seen, once per incident per pod.
 
     Non-fatal and never changes the score: it runs before the fatal GPU checks so a cycle those checks halt
     still reports. See the module docstring for the rule and the Redis mark.
@@ -388,6 +405,9 @@ class RentedGpuDropCheck:
     async def _post(
         self, ctx: Context, pod_id: str, state: str, mark: DropMark, drop: GpuDrop | None
     ) -> RentedGpuDropResponse | None:
+        expected = _clamp(ctx, pod_id, "expected_gpu_count", drop.expected if drop else 0, MAX_REPORTED_GPU_COUNT)
+        visible = _clamp(ctx, pod_id, "visible_gpu_count", drop.visible if drop else 0, MAX_REPORTED_GPU_COUNT)
+        cycles = _clamp(ctx, pod_id, "consecutive_cycles", mark.consecutive_cycles, MAX_REPORTED_CYCLES)
         # Never fatal: a backend that is down, older (404) or raising is no answer, and the next cycle asks again.
         try:
             answer = await ctx.services.backend.report_rented_gpu_drop(
@@ -395,9 +415,9 @@ class RentedGpuDropCheck:
                 state=state,
                 executor_id=ctx.executor.uuid,
                 first_seen_at=mark.first_seen_at,
-                consecutive_cycles=mark.consecutive_cycles,
-                expected_gpu_count=drop.expected if drop else 0,
-                visible_gpu_count=drop.visible if drop else 0,
+                consecutive_cycles=cycles,
+                expected_gpu_count=expected,
+                visible_gpu_count=visible,
                 missing_uuids=drop.missing_uuids if drop else [],
                 nvml_error_code=drop.nvml_error_code if drop else None,
                 faults=drop.faults if drop else [],

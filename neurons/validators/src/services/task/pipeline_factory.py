@@ -279,7 +279,7 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
-                # F-1468: non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
+                # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
                 RentedGpuDropCheck(),
@@ -387,7 +387,7 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
-                # F-1468: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
+                # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),

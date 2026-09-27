@@ -247,8 +247,8 @@ class RentedGpuDropResponse(BaseModel):
     # or a recovery named no open incident.
     recorded: bool
     # "notified" (every due notice went out), "recorded" (the incident was already known and told),
-    # "notify_failed" (a notice was refused; report again next cycle), "disabled" (the backend's
-    # RENTED_GPU_DROP_NOTIFY_ENABLED is off; nothing written), "not_rented" (no open rental).
+    # "notify_failed" (a notice was refused; report again next cycle), "disabled" (the platform side
+    # has the alert switched off; nothing written), "not_rented" (no open rental).
     delivery: str | None = None
 
 

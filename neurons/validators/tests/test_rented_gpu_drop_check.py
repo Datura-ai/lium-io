@@ -1,4 +1,4 @@
-"""RENTED_GPU_DROP (F-1468): a rented node that lost a GPU is reported the cycle it is seen, once per incident."""
+"""RENTED_GPU_DROP: a rented node that lost a GPU is reported the cycle it is seen, once per incident."""
 
 from datetime import UTC, datetime
 from unittest.mock import patch
@@ -31,9 +31,15 @@ from protocol.vc_protocol.compute_requests import (
 from tests.helpers import FakeRedis, build_services, build_state, default_executor
 
 MODEL = "NVIDIA GeForce RTX 5090"
-UUIDS = [f"GPU-8d3{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
-POD_ID = "8d326b16-0000-4000-8000-000000000000"
+UUIDS = [f"GPU-a0a{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
+POD_ID = "00000000-0000-4000-8000-000000000001"
 NOTIFIED = RentedGpuDropResponse(recorded=True, delivery="notified")
+
+
+@pytest.fixture(autouse=True)
+def _check_on():
+    with patch.object(rented_gpu_drop.settings, "RENTED_GPU_DROP_CHECK_ENABLED", True):
+        yield
 
 
 def _details(uuids: list[str]) -> list[dict]:
@@ -52,7 +58,7 @@ def _rented(
                 pods=[
                     RentedPod(
                         pod_id=POD_ID,
-                        container_name="container_8d326b16",
+                        container_name="container_pod1",
                         gpu_count=gpu_count,
                         status=status,
                     )
@@ -384,6 +390,51 @@ async def test_the_check_off_does_nothing(context_factory):
     services.backend.report_rented_gpu_drop.assert_not_awaited()
 
 
+def test_the_check_is_off_by_default():
+    field = type(rented_gpu_drop.settings).model_fields["RENTED_GPU_DROP_CHECK_ENABLED"]
+    assert field.default is False
+
+
+HEALTHY_CYCLES = [
+    # (cards the scrape listed, gpu_scrape_error): a healthy rented node over several cycles, including an
+    # optional NVML query that answers NOT_SUPPORTED
+    (UUIDS, None),
+    (UUIDS, None),
+    (UUIDS, "NVMLError_NotSupported(3)"),
+    (list(reversed(UUIDS)), None),
+    (UUIDS, None),
+]
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_rented_node_stays_quiet_over_many_cycles(context_factory):
+    services = _services()
+
+    reasons = [
+        (await _run(context_factory, services, listed=listed, scrape_error=error)).event.reason_code
+        for listed, error in HEALTHY_CYCLES
+    ]
+
+    assert reasons == [Msg.OK.reason] * len(HEALTHY_CYCLES)
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_counts_above_the_backend_cap_are_clamped(context_factory):
+    services = _services()
+    big = [f"GPU-b0b{i:03d}-0000-0000-0000-000000000000" for i in range(80)]
+    ctx = _ctx(context_factory, services, listed=big[:70], count=80, gpu_count=80)
+    ctx.verified["uuids"] = ",".join(big)
+
+    result = await RentedGpuDropCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.DROP.reason
+    sent = services.backend.report_rented_gpu_drop.await_args.kwargs
+    assert sent["expected_gpu_count"] == rented_gpu_drop.MAX_REPORTED_GPU_COUNT
+    assert sent["visible_gpu_count"] == rented_gpu_drop.MAX_REPORTED_GPU_COUNT
+
+
 @pytest.mark.parametrize(
     "build", [PipelineFactory.build_checks, PipelineFactory.build_dry_run_checks]
 )
@@ -396,33 +447,33 @@ def test_the_check_runs_after_the_scrape_and_before_the_fatal_gpu_checks(build):
     assert RentedGpuDropCheck.fatal is False
 
 
-# --- F-1468 replayed ----------------------------------------------------------------------------------------------
+# --- an incident replayed ----------------------------------------------------------------------------------------------
 
 
 class _Clock:
     def __init__(self):
-        self.at = datetime(2026, 9, 27, tzinfo=UTC)
+        self.at = datetime(2026, 1, 1, tzinfo=UTC)
 
     def now(self, tz=None):
         return self.at
 
 
-F1468_CYCLES = [
+DROP_CYCLES = [
     # (validator check time, cards the scrape listed, gpu_scrape_error)
-    ("2026-09-27T05:14:44+00:00", UUIDS[:5], "NVMLError(999)"),
-    ("2026-09-27T05:29:48+00:00", UUIDS[:5], "NVMLError(999)"),
-    ("2026-09-27T06:44:52+00:00", UUIDS, None),
+    ("2026-01-01T00:00:00+00:00", UUIDS[:5], "NVMLError(999)"),
+    ("2026-01-01T00:15:00+00:00", UUIDS[:5], "NVMLError(999)"),
+    ("2026-01-01T01:30:00+00:00", UUIDS, None),
 ]
 
 
 @pytest.mark.asyncio
-async def test_f1468_replay_alerts_on_the_first_cycle_once_and_recovers_once(context_factory):
+async def test_incident_replay_alerts_on_the_first_cycle_once_and_recovers_once(context_factory):
     services = _services()
     clock = _Clock()
     seen = []
 
     with patch.object(rented_gpu_drop, "datetime", clock):
-        for at, listed, error in F1468_CYCLES:
+        for at, listed, error in DROP_CYCLES:
             clock.at = datetime.fromisoformat(at)
             result = await _run(context_factory, services, listed=listed, scrape_error=error)
             seen.append(
@@ -430,12 +481,12 @@ async def test_f1468_replay_alerts_on_the_first_cycle_once_and_recovers_once(con
             )
 
     assert seen == [
-        ("2026-09-27T05:14:44+00:00", "RENTED_GPU_DROP", 1),
-        ("2026-09-27T05:29:48+00:00", "RENTED_GPU_DROP", 1),
-        ("2026-09-27T06:44:52+00:00", "RENTED_GPU_RECOVERED", 2),
+        ("2026-01-01T00:00:00+00:00", "RENTED_GPU_DROP", 1),
+        ("2026-01-01T00:15:00+00:00", "RENTED_GPU_DROP", 1),
+        ("2026-01-01T01:30:00+00:00", "RENTED_GPU_RECOVERED", 2),
     ]
     fault, recovered = services.backend.report_rented_gpu_drop.await_args_list
-    assert fault.kwargs["first_seen_at"] == "2026-09-27T05:14:44+00:00"
+    assert fault.kwargs["first_seen_at"] == "2026-01-01T00:00:00+00:00"
     assert recovered.kwargs["state"] == "recovered"
-    assert recovered.kwargs["first_seen_at"] == "2026-09-27T05:14:44+00:00"
+    assert recovered.kwargs["first_seen_at"] == "2026-01-01T00:00:00+00:00"
     assert recovered.kwargs["consecutive_cycles"] == 2
