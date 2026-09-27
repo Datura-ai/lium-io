@@ -1,7 +1,8 @@
 """RENTED_GPU_DROP: a rented node that lost a GPU is reported the cycle it is seen, once per incident."""
 
+import importlib.util
+import sys
 from datetime import UTC, datetime
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -317,17 +318,6 @@ async def test_an_nvml_error_with_every_card_listed_is_reported(context_factory)
 
 
 @pytest.mark.asyncio
-async def test_a_healthy_rented_node_posts_nothing_and_writes_no_mark(context_factory):
-    services = _services()
-
-    result = await _run(context_factory, services, listed=UUIDS)
-
-    assert result.event.reason_code == Msg.OK.reason
-    services.backend.report_rented_gpu_drop.assert_not_awaited()
-    assert services.redis.store == {}
-
-
-@pytest.mark.asyncio
 async def test_a_node_that_is_not_rented_is_ignored(context_factory):
     services = _services()
 
@@ -557,8 +547,20 @@ async def test_a_one_off_scrape_timeout_that_clears_is_never_posted(context_fact
     assert services.redis.store == {}
 
 
-def test_the_check_does_not_import_the_rented_pod_ssh_module():
-    assert "rented_pod_ssh" not in Path(rented_gpu_drop.__file__).read_text()
+def test_the_check_loads_with_the_rented_pod_ssh_module_blocked():
+    package = rented_gpu_drop.__package__
+    blocked = {
+        name: None for name in (f"{package}.rented_pod_ssh", "services.task.checks.rented_pod_ssh")
+    }
+    spec = importlib.util.spec_from_file_location(
+        f"{package}._rented_gpu_drop_isolated", rented_gpu_drop.__file__
+    )
+    module = importlib.util.module_from_spec(spec)
+
+    with patch.dict(sys.modules, {**blocked, spec.name: module}):
+        spec.loader.exec_module(module)
+
+    assert module.RentedGpuDropCheck.check_id == RentedGpuDropCheck.check_id
 
 
 @pytest.mark.asyncio

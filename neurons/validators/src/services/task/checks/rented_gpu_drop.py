@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -111,7 +111,7 @@ class GpuDrop:
     # are short only because a non-loss NVML error (a timeout, say) cut the scrape's loop, or an anchored
     # UUID is missing only from a scrape that lists another card twice, while the rows (or the driver)
     # still cover every rented and anchored card
-    confirm_first: bool = False
+    confirm_first: bool
 
 
 def nvml_error_code(scrape_error: object) -> int | None:
@@ -239,10 +239,10 @@ class PodDropOutcome:
     first_seen_at: str
     consecutive_cycles: int
     # this cycle posted and the backend answered; its delivery, None when nothing was posted or answered
-    posted: bool = False
-    delivery: str | None = None
-    reported: bool = False
-    extra: dict[str, Any] = field(default_factory=dict)
+    posted: bool
+    delivery: str | None
+    reported: bool
+    extra: dict[str, Any]
 
     def log_fields(self) -> dict[str, Any]:
         return {
