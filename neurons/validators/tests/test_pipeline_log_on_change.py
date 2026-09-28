@@ -108,7 +108,10 @@ async def test_recovery_from_a_warning_logs_at_info(caplog, sink):
 @pytest.mark.asyncio
 async def test_repeated_provider_state_verdict_logs_at_debug(caplog, sink):
     levels = await _levels(
-        caplog, sink, _event("COLLATERAL_MISSING", "warning"), _event("COLLATERAL_MISSING", "warning")
+        caplog,
+        sink,
+        _event("COLLATERAL_MISSING", "warning"),
+        _event("COLLATERAL_MISSING", "warning"),
     )
 
     assert levels == [logging.INFO, logging.DEBUG]
@@ -200,7 +203,9 @@ def durations():
     duration_logger.removeHandler(handler)
 
 
-def _timed(ms: int, reason_code: str = "SYSBOX_REQUIRED_OK", severity: str = "info") -> ValidationEvent:
+def _timed(
+    ms: int, reason_code: str = "SYSBOX_REQUIRED_OK", severity: str = "info"
+) -> ValidationEvent:
     event = _event(reason_code, severity)
     event.context["execution_time_ms"] = ms
     return event
@@ -218,7 +223,9 @@ async def _emit_at_info(sink: LoggerSink, *events: ValidationEvent) -> None:
 @pytest.mark.asyncio
 async def test_repeat_keeps_its_step_duration_at_info(durations):
     duration_logger, lines = durations
-    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger)
+    sink = LoggerSink(
+        logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger
+    )
 
     await _emit_at_info(sink, _timed(120), _timed(95), _timed(101))
 
@@ -237,7 +244,9 @@ async def test_repeat_keeps_its_step_duration_at_info(durations):
 @pytest.mark.asyncio
 async def test_no_step_duration_line_when_the_full_line_is_logged(durations):
     duration_logger, lines = durations
-    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger)
+    sink = LoggerSink(
+        logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger
+    )
 
     await _emit_at_info(
         sink,
@@ -253,7 +262,9 @@ async def test_no_step_duration_line_when_the_full_line_is_logged(durations):
 @pytest.mark.asyncio
 async def test_no_step_duration_line_when_debug_is_on(caplog, durations):
     duration_logger, lines = durations
-    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger)
+    sink = LoggerSink(
+        logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger
+    )
 
     levels = await _levels(caplog, sink, _timed(120), _timed(95))
 

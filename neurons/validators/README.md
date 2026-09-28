@@ -62,7 +62,7 @@ cp neurons/validators/.env.template neurons/validators/.env
 Replace with your information for `BITTENSOR_WALLET_NAME`, `BITTENSOR_WALLET_HOTKEY_NAME`, `HOST_WALLET_DIR`.
 If you want you can use different port for `INTERNAL_PORT`, `EXTERNAL_PORT`.
 
-`LOG_LEVEL` sets the validator's log level (default `INFO`). At `INFO`, a check outcome that repeats the previous cycle is logged only at `DEBUG`, and only its step time stays at `INFO`; set `LOG_LEVEL=DEBUG` and restart to see every outcome again. `DEBUG` makes the logs much larger, so use it for a short time.
+`LOG_LEVEL` sets the validator's log level (default `INFO`). At `INFO`, an INFO check outcome that repeats the previous cycle is logged only at `DEBUG`, and only its step time stays at `INFO`; warnings, errors and the run's last or halting event (the one carrying the step summary) still log every cycle; set `LOG_LEVEL=DEBUG` and restart to see every outcome again. `DEBUG` makes the logs much larger, so use it for a short time.
 
 #### Step 4: Docker Compose Up
 
