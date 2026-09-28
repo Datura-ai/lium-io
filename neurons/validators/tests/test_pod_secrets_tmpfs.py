@@ -912,6 +912,22 @@ def test_lost_probe_flags_a_crash_looping_pod_before_the_grace(tmp_path, exec_re
     ) == POD_SECRETS_LOST_OUTPUT
 
 
+@pytest.mark.parametrize("age_seconds", [130, POD_SECRETS_LOST_GRACE_SECONDS + 60])
+def test_lost_probe_flags_a_restarted_pod_without_the_ready_marker(tmp_path, age_seconds):
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=age_seconds, restart_count=1
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("age_seconds", [130, POD_SECRETS_LOST_GRACE_SECONDS + 60])
+def test_lost_probe_spares_a_pod_that_crashed_before_delivery(tmp_path, age_seconds):
+    # `unless-stopped` restarts a workload that died before the secrets step; the step then fills the
+    # restarted run's tmpfs, so `.ready` is there and RestartCount stays 1 for the life of the pod.
+    assert _run_lost_probe(tmp_path, mounted=True, ready=True, age_seconds=age_seconds, restart_count=1) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect", "exec"]
+
+
 def test_lost_probe_counts_the_age_from_the_container_not_the_mount(tmp_path):
     # A restart Docker does not count (dockerd restart, host reboot) still leaves the old `Created`.
     assert _run_lost_probe(

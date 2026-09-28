@@ -1126,9 +1126,11 @@ def build_pod_secrets_handover_spec(
 # ContainerCreateRequest is sent and the validator keeps no secret value to write again.
 # Ages count from the container's `Created`, never from the mount: every restart makes a new tmpfs, so a
 # workload that times out on `.ready` and exits (a crash loop) would keep a mount younger than the grace.
-# A container Docker restarted (`RestartCount` > 0) has lost them whatever the age, and is flagged even
-# while it is between restarts and `docker exec` cannot reach it. Otherwise a container older than the
-# grace period with no `.ready` is that case; a younger one may still be mid-delivery.
+# A container Docker restarted (`RestartCount` > 0) is flagged whatever the age unless `.ready` answers,
+# so one caught between restarts, where `docker exec` cannot reach it, is flagged too. The container
+# starts before delivery, so a workload that crashed once before `.ready` and then got its secrets on
+# the restarted run keeps `.ready` and is not flagged. Otherwise a container older than the grace
+# period with no `.ready` is that case; a younger one may still be mid-delivery.
 POD_SECRETS_LOST_GRACE_SECONDS = 300
 POD_SECRETS_LOST_OUTPUT = "secrets-lost"
 _POD_SECRETS_STATE_FORMAT = (
@@ -1142,15 +1144,17 @@ def build_pod_secrets_lost_probe_command(container_name: str) -> str:
     container = shlex.quote(container_name)
     marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
     ready_check = shlex.quote(f"[ -e {marker} ] && echo ready || echo missing")
+    ready_answer = f"$(/usr/bin/docker exec -u 0 {container} sh -c {ready_check} 2>/dev/null)"
     return (
         f"state=$(/usr/bin/docker inspect --format {shlex.quote(_POD_SECRETS_STATE_FORMAT)} {container} "
         "2>/dev/null) || exit 0; "
         "set -- $state; "
         '[ "$3" = secrets ] || exit 0; '
-        f'if [ "$1" -gt 0 ] 2>/dev/null; then echo {POD_SECRETS_LOST_OUTPUT}; exit 0; fi; '
+        'if [ "$1" -gt 0 ] 2>/dev/null; then '
+        f'[ "{ready_answer}" = ready ] || echo {POD_SECRETS_LOST_OUTPUT}; exit 0; fi; '
         'created=$(date -d "$2" +%s 2>/dev/null) || exit 0; '
         f'[ $(( $(date +%s) - created )) -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] || exit 0; '
-        f'[ "$(/usr/bin/docker exec -u 0 {container} sh -c {ready_check} 2>/dev/null)" = missing ] '
+        f'[ "{ready_answer}" = missing ] '
         f"&& echo {POD_SECRETS_LOST_OUTPUT}; "
         "exit 0"
     )

@@ -282,7 +282,7 @@ class TenantEnforcementCheck:
                     )
 
                 # Probed before recovery: a crash-looping pod is often caught between restarts, and the
-                # host-side probe reads RestartCount without exec into the container.
+                # host-side probe flags a restarted container whose `.ready` exec does not answer.
                 secrets_lost = await _pod_secrets_lost(ctx.ssh, pod_container_name)
                 if secrets_lost:
                     secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
