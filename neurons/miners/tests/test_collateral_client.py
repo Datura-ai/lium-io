@@ -1,6 +1,7 @@
 """CollateralClient against a fake JSON-RPC provider: what it signs and sends, and when it needs an RPC URL."""
 
 import logging
+import traceback
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
@@ -336,9 +337,19 @@ def rejecting_rpc():
     server.server_close()
 
 
+def assert_no_rpc_secret(text: str):
+    for secret in RPC_SECRETS:
+        assert secret not in text
+    assert MINER_KEY.removeprefix("0x")[:16] not in text
+
+
 @pytest.mark.parametrize(
     "args,stdin",
     [
+        (
+            ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY],
+            None,
+        ),
         (
             [
                 "reclaim-collateral",
@@ -351,6 +362,11 @@ def rejecting_rpc():
             ],
             None,
         ),
+        (
+            ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY],
+            None,
+        ),
+        (["get-balance-of-eth-address", "--private-key", MINER_KEY], None),
         (
             [
                 "finalize-reclaim-request",
@@ -379,7 +395,9 @@ def rejecting_rpc():
         (["get-reclaim-requests", "--contract", "1.0.2"], None),
         (["remove-executor", "--address", "192.0.2.10", "--port", "8001"], "y\n"),
     ],
-    ids=lambda value: value[0] if isinstance(value, list) else "",
+    ids=lambda value: (
+        value[0] + ("-contract" if "--contract" in value else "") if isinstance(value, list) else ""
+    ),
 )
 def test_collateral_command_logs_leave_out_a_keyed_rpc_url(
     archive_network, rejecting_rpc, monkeypatch, caplog, args, stdin
@@ -403,24 +421,106 @@ def test_collateral_command_logs_leave_out_a_keyed_rpc_url(
     with caplog.at_level(logging.INFO):
         result = CliRunner().invoke(cli, args, input=stdin)
 
-    assert result.exception is None, result.output
+    if result.exception is not None:
+        assert isinstance(result.exception, SystemExit), "".join(
+            traceback.format_exception(*result.exc_info)
+        )
     assert rejecting_rpc.hits, "the command never reached the RPC endpoint"
     assert any(r.levelno == logging.ERROR for r in caplog.records)
     logged = caplog.text + result.output + "".join(r.getMessage() for r in caplog.records)
-    for secret in RPC_SECRETS:
-        assert secret not in logged
-    assert MINER_KEY.removeprefix("0x")[:16] not in logged
+    if result.exc_info is not None:
+        logged += "".join(traceback.format_exception(*result.exc_info))
+    assert_no_rpc_secret(logged)
     if args[0] != "remove-executor":
         assert f'"rpc_url": "{rejecting_rpc.origin}"' in logged
         assert '"error": "ClientResponseError"' in logged
+    if "--contract" not in args and args[0] != "remove-executor":
+        assert result.exit_code == 1
 
 
-def test_collateral_command_on_an_unknown_network_names_the_setting(archive_network):
+RPC_CLI_BOOTSTRAP = """
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
+patch("lium_core.shared_config.client.SharedConfigClient._fetch", return_value=None).start()
+sys.path.insert(0, sys.argv.pop(1))
+from core.config import Settings
+
+wallet = SimpleNamespace(get_hotkey=lambda: SimpleNamespace(ss58_address="5" + "C" * 47))
+Settings.get_bittensor_wallet = lambda self: wallet
+from cli import cli
+
+cli()
+"""
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY],
+        ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY],
+        ["get-balance-of-eth-address", "--private-key", MINER_KEY],
+    ],
+    ids=lambda args: args[0],
+)
+def test_collateral_command_process_output_leaves_out_a_keyed_rpc_url(rejecting_rpc, args):
+    """The real CLI in its own process: nothing it writes to stdout or stderr, a traceback
+    included, holds the RPC URL's userinfo, path or query."""
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src"
+    env = {
+        **os.environ,
+        "BITTENSOR_NETWORK": "archive",
+        "SUBTENSOR_EVM_RPC_URL": rejecting_rpc.url,
+        "PYTHONWARNINGS": "default",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", RPC_CLI_BOOTSTRAP, str(src), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=src,
+    )
+
+    output = result.stdout + result.stderr
+    assert rejecting_rpc.hits, output
+    assert_no_rpc_secret(output)
+    assert "Traceback" not in output
+    assert result.returncode == 1
+    assert f'"rpc_url": "{rejecting_rpc.origin}"' in output
+    assert '"error": "ClientResponseError"' in output
+
+
+def test_collateral_command_on_an_unknown_network_names_the_setting(archive_network, caplog):
     from cli import cli
 
-    result = CliRunner().invoke(
-        cli, ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
+    with caplog.at_level(logging.INFO):
+        result = CliRunner().invoke(
+            cli, ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
+        )
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "SUBTENSOR_EVM_RPC_URL" in caplog.text
+    assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text + result.output
+
+
+async def test_finalize_names_a_closed_or_unknown_reclaim_request():
+    """reclaims(id) answers zeros both for a finalized request and for one never opened."""
+    reclaims = selector("reclaims(uint256)")
+    zero = hex_encode(
+        ["bytes16", "address", "uint256", "uint64"], [bytes(16), "0x" + "00" * 20, 0, 0]
     )
-    assert isinstance(result.exception, CollateralConfigError)
-    assert "SUBTENSOR_EVM_RPC_URL" in str(result.exception)
-    assert MINER_KEY.removeprefix("0x")[:16] not in str(result.exception) + result.output
+    provider = FakeProvider(calls={reclaims: zero})
+    client = client_with(provider)
+
+    with pytest.raises(CollateralTransactionError) as raised:
+        await client.finalize_reclaim(9)
+    assert "No open reclaim request 9 on this contract" in str(raised.value)
+    assert "never opened" in str(raised.value)
+    assert provider.sent == []

@@ -232,7 +232,8 @@ class CollateralClient:
         reclaim = await self.get_reclaim_request(reclaim_request_id)
         if reclaim[2] == 0:
             raise CollateralTransactionError(
-                f"Reclaim request {reclaim_request_id} has already been finalized"
+                f"No open reclaim request {reclaim_request_id} on this contract "
+                "(never opened, or already finalized or denied)"
             )
         receipt = await self._send(self.contract.functions.finalizeReclaim(reclaim_request_id))
         events = self.contract.events.Reclaimed().process_receipt(receipt)

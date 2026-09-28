@@ -1,13 +1,15 @@
 import asyncio
 import logging
+import sys
 import click
 from eth_account import Account
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from services.cli_service import CliService
+from services.cli_service import CliService, collateral_error
+from core.collateral import rpc_origin
 from core.config import settings
-from core.utils import versions_holding_collateral, versions_with_open_reclaim
+from core.utils import _m, versions_holding_collateral, versions_with_open_reclaim
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -115,6 +117,26 @@ def miner_account(private_key: str):
         return None
 
 
+def run_contract_read(coroutine, failure: str):
+    """The coroutine's result, or None after logging `failure` with the error class and the RPC origin.
+
+    A transport error's text holds the full RPC URL (path, query and API key), so neither
+    its text nor its traceback may reach the output.
+    """
+    try:
+        return asyncio.run(coroutine)
+    except Exception as e:
+        logger.error(_m(
+            failure,
+            extra={
+                "network": settings.BITTENSOR_NETWORK,
+                "rpc_url": rpc_origin(settings.SUBTENSOR_EVM_RPC_URL),
+                "error": collateral_error(e),
+            },
+        ))
+        return None
+
+
 @click.group()
 def cli():
     pass
@@ -178,7 +200,8 @@ def get_balance_of_eth_address(private_key: str):
     if miner_account(private_key) is None:
         return
     cli_service = CliService(private_key=private_key)
-    asyncio.run(cli_service.get_balance_of_eth_address())
+    if asyncio.run(cli_service.get_balance_of_eth_address()) is None:
+        sys.exit(1)
 
 
 @cli.command()
@@ -247,7 +270,12 @@ def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: s
         return
     detected = None
     if not contract_version:
-        detected = asyncio.run(versions_holding_collateral(executor_uuid))
+        detected = run_contract_read(
+            versions_holding_collateral(executor_uuid),
+            "❌ Failed to find the contract version holding this executor's collateral",
+        )
+        if detected is None:
+            sys.exit(1)
         if not detected:
             logger.error("❌ Executor %s holds no collateral on any contract version.", executor_uuid)
             return
@@ -360,7 +388,12 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
         return
     detected = None
     if not contract_version:
-        detected = asyncio.run(versions_with_open_reclaim(reclaim_request_id, account.address))
+        detected = run_contract_read(
+            versions_with_open_reclaim(reclaim_request_id, account.address),
+            "❌ Failed to find the contract version holding this reclaim request",
+        )
+        if detected is None:
+            sys.exit(1)
         if not detected:
             logger.error("❌ No open reclaim request %d for this key on any contract version.", reclaim_request_id)
             return

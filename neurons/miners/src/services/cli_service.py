@@ -259,8 +259,16 @@ class CliService:
                 extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
             ))
 
-    async def get_balance_of_eth_address(self) -> str:
-        balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+    async def get_balance_of_eth_address(self):
+        """The balance in TAO, or None after logging the failure."""
+        try:
+            balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+        except Exception as e:
+            self.logger.error(_m(
+                "❌ Failed to get the balance of the Eth address",
+                extra={**self.default_extra, "error": collateral_error(e)}
+            ))
+            return None
         self.logger.info(f"Balance of Eth address: {balance} TAO")
         return balance
 
