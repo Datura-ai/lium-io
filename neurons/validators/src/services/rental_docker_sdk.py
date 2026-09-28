@@ -1139,6 +1139,8 @@ def build_pod_secrets_handover_spec(
 # period with no `.ready` is that case; a younger one may still be mid-delivery.
 # The renter owns the directory after the handover and can delete `.ready`, but a restarted tmpfs is
 # always empty: a mount that still holds files is never flagged. A paused container gets no verdict.
+# A stopped container a Docker restart left behind gets no verdict either: the renter may have stopped it
+# after a delivered run, and exec into a stopped container cannot tell.
 # A start the platform made (a stop/start from the pod page, the undo of a failed edit) empties the
 # mount too: it records the run's `StartedAt` under POD_PLATFORM_STARTS_DIR, in a file named by the
 # container ID, and a run whose `StartedAt` matches is not flagged. Any restart after it (Docker, a host
@@ -1195,6 +1197,7 @@ def build_pod_secrets_lost_probe_command(container_name: str) -> str:
         '[ "$3" = paused ] && exit 0; '
         f'[ "$(cat {shlex.quote(POD_PLATFORM_STARTS_DIR)}/"$5" 2>/dev/null)" = "$4" ] && exit 0; '
         'if [ "$1" -gt 0 ] 2>/dev/null; then '
+        'case "$3" in running|restarting) ;; *) exit 0 ;; esac; '
         f'case "{ready_answer}" in ready|files) ;; *) echo {POD_SECRETS_LOST_OUTPUT} ;; esac; exit 0; fi; '
         'created=$(date -d "$2" +%s 2>/dev/null) || exit 0; '
         f'[ $(( $(date +%s) - created )) -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] || exit 0; '

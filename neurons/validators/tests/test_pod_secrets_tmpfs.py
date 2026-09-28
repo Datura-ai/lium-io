@@ -1042,6 +1042,35 @@ def test_lost_probe_gives_no_verdict_on_a_paused_pod(tmp_path, ready):
     assert [call.split()[0] for call in calls] == ["inspect"]
 
 
+@pytest.mark.parametrize("ready", [True, False], ids=["delivered", "never-delivered"])
+def test_lost_probe_gives_no_verdict_on_a_stopped_pod_docker_restarted_before(tmp_path, ready):
+    # crashed once before delivery, delivered on the restarted run, then stopped by the renter:
+    # exec into a stopped container prints nothing, which must not read as an empty mount
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=ready,
+        age_seconds=PAST_GRACE,
+        restart_count=1,
+        exec_reachable=False,
+        status="exited",
+    ) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+def test_lost_probe_still_flags_a_pod_docker_is_restarting(tmp_path):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=130,
+        restart_count=2,
+        exec_reachable=False,
+        status="restarting",
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
 def test_lost_probe_skips_exec_for_a_pod_without_secrets(tmp_path):
     _run_lost_probe(tmp_path, mounted=False, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60)
     calls = (tmp_path / "docker.calls").read_text().splitlines()

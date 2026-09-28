@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shlex
 import time
 from unittest.mock import AsyncMock, Mock
 
@@ -1495,7 +1496,7 @@ class RealProbeSSHClient(DummySSHClient):
     """Runs the real secrets probe against a fake `docker` that answers like dockerd for the pod's state:
     exec is refused while the container is stopped, and a started container has no `.ready`."""
 
-    def __init__(self, tmp_path, *, restart_count: int, **kwargs):
+    def __init__(self, tmp_path, *, restart_count: int, stopped_status: str = "exited", **kwargs):
         super().__init__(**kwargs)
         self.restart_count = restart_count
         self.probe_outputs: list[str] = []
@@ -1505,7 +1506,7 @@ class RealProbeSSHClient(DummySSHClient):
         self.fake_docker.write_text(
             "#!/bin/sh\n"
             'case "$1" in\n'
-            f"  inspect) status=exited; [ -e {self.running_flag} ] && status=running; "
+            f"  inspect) status={shlex.quote(stopped_status)}; [ -e {self.running_flag} ] && status=running; "
             f'echo "$(cat {tmp_path}/restart_count) {created} $status {created} {"c0ffee" + "0" * 58} secrets" ;;\n'
             f"  exec) [ -e {self.running_flag} ] || "
             "{ echo 'Error response from daemon: container is not running' >&2; exit 1; }; echo missing ;;\n"
@@ -1541,21 +1542,27 @@ class RealProbeSSHClient(DummySSHClient):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "restart_count,probe_outputs",
+    "restart_count,stopped_status,probe_outputs",
     [
         # host reboot: dockerd's restore resets RestartCount to 0 and the stopped pod refuses exec
-        (0, ["", "secrets-lost"]),
+        (0, "exited", ["", "secrets-lost"]),
         # Docker restarted it by policy and it is caught between restarts: flagged before recovery
-        (1, ["secrets-lost"]),
+        (1, "restarting", ["secrets-lost"]),
+        # Docker restarted it once, then it was stopped: no verdict until the recovery start shows the mount
+        (1, "exited", ["", "secrets-lost"]),
     ],
-    ids=["host-reboot", "between-policy-restarts"],
+    ids=["host-reboot", "between-policy-restarts", "stopped-after-an-earlier-restart"],
 )
 async def test_a_pod_recovered_in_the_cycle_is_flagged_secrets_lost_by_the_real_probe(
-    context_factory, monkeypatch, tmp_path, restart_count, probe_outputs
+    context_factory, monkeypatch, tmp_path, restart_count, stopped_status, probe_outputs
 ):
     monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
     ssh = RealProbeSSHClient(
-        tmp_path, restart_count=restart_count, pod_running=False, ssh_keys=["ssh-rsa recovered"]
+        tmp_path,
+        restart_count=restart_count,
+        stopped_status=stopped_status,
+        pod_running=False,
+        ssh_keys=["ssh-rsa recovered"],
     )
     docker = AsyncMock()
 
@@ -1572,6 +1579,23 @@ async def test_a_pod_recovered_in_the_cycle_is_flagged_secrets_lost_by_the_real_
     assert result.event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason
     assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "pod_pod-1"}]
     assert ssh.probe_outputs == probe_outputs
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_pod_docker_restarted_before_is_not_blamed_on_a_restart_when_recovery_fails(
+    context_factory, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ssh = RealProbeSSHClient(tmp_path, restart_count=1, pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = False
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert "secrets_lost_pods" not in result.event.what_we_saw
+    assert ssh.probe_outputs == [""]
 
 
 @pytest.mark.asyncio
