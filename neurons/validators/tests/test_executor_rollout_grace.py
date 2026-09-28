@@ -19,6 +19,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import HostPolicyResult
 from services.executor_image_policy import ExecutorImageReport, ImageVerdict
 from services.executor_rollout import (
+    ROLLOUT_FAILURE_REASONS,
     ROLLOUT_STATE_KEY,
     ExecutorRolloutTracker,
     RolloutWindow,
@@ -369,6 +370,26 @@ def test_a_failure_on_an_executor_already_running_the_new_image_is_a_real_failur
 
     assert rollout_grace_reason(on_new_image, window, J1) is None
     assert rollout_grace_reason(still_on_old, window, J1) == reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "SCRAPE_FAILED",
+        "SCRAPE_FAILED_NO_GPU",
+        "SCRAPE_FAILED_DRIVER",
+        "SCRAPE_FAILED_ON_HOST",
+        "SCRAPE_TIMEOUT",
+        "SCRAPE_TRANSPORT_FAILED",
+    ],
+)
+def test_every_scrape_failure_code_keeps_the_rollout_grace_scrape_failed_had(reason: str) -> None:
+    """Regression: a code SCRAPE_FAILED split into falling out of the set, so a scrape a watchtower
+    recreate ended inside the window would stand as a verdict."""
+    still_on_old = _failed("node-2", reason, observed_digest=OLD)
+
+    assert reason in ROLLOUT_FAILURE_REASONS
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == reason
 
 
 def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monkeypatch) -> None:

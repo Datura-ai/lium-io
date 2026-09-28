@@ -54,6 +54,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     ProviderSideLoadCheck,
+    RegistryPullCheck,
     RentalProbeCheck,
     RentalVerificationCheck,
     ScoreCheck,
@@ -338,6 +339,9 @@ class PipelineFactory:
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
+                # renter's pod).
+                RegistryPullCheck(),
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
@@ -511,6 +515,7 @@ class PipelineFactory:
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # RegistryPullCheck left out: it removes and pulls an image on the executor.
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
