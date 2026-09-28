@@ -1,5 +1,6 @@
 """CollateralClient against a fake JSON-RPC provider: what it signs and sends, and when it needs an RPC URL."""
 
+import logging
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
@@ -190,6 +191,36 @@ async def test_reverted_transaction_without_a_known_error_still_reports_the_hash
     )
     with pytest.raises(CollateralTransactionError, match=f"Transaction {TX_HASH} reverted"):
         await client_with(provider).finalize_reclaim(5)
+
+
+class ReplayFailsProvider(FakeProvider):
+    """The replay eth_call of the sent transaction fails in transport, with the RPC URL in the error."""
+
+    async def make_request(self, method, params):
+        if method == "eth_call" and params[0]["data"].removeprefix("0x").startswith(
+            selector("finalizeReclaim(uint256)")
+        ):
+            raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
+        return await super().make_request(method, params)
+
+
+async def test_a_failed_replay_logs_its_error_class_and_not_the_url_or_the_key(caplog):
+    provider = ReplayFailsProvider(
+        calls={selector("reclaims(uint256)"): open_reclaim()}, receipt_status=0
+    )
+    with caplog.at_level(logging.WARNING, logger="core.collateral"):
+        with pytest.raises(CollateralTransactionError) as raised:
+            await client_with(provider).finalize_reclaim(5)
+
+    assert str(raised.value) == f"Transaction {TX_HASH} reverted"
+    logged = [r.getMessage() for r in caplog.records if r.name == "core.collateral"]
+    assert logged == [
+        "Could not replay the reverted transaction at block 16 to read its revert reason: "
+        "ConnectionError"
+    ]
+    assert "secret-rpc-key" not in caplog.text
+    assert RPC_URL not in caplog.text
+    assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text
 
 
 async def test_send_without_a_key_sends_nothing():

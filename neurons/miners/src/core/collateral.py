@@ -7,6 +7,7 @@ collateral reads, start a reclaim, list open reclaims, finalize a reclaim.
 
 import hashlib
 import json
+import logging
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,8 @@ from uuid import UUID
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
 from web3.exceptions import ContractLogicError
+
+logger = logging.getLogger(__name__)
 
 ABI_PATH = pathlib.Path(__file__).with_name("collateral_abi.json")
 
@@ -177,7 +180,13 @@ class CollateralClient:
                 else str(error.args[0] if error.args else "")
             )
             return self._custom_error_name(data) or error.message or data or None
-        except Exception:
+        except Exception as error:
+            # the class name only: a transport error's text can carry the RPC URL and its API key
+            logger.warning(
+                "Could not replay the reverted transaction at block %s to read its revert reason: %s",
+                block_number,
+                type(error).__name__,
+            )
             return None
         return None
 
