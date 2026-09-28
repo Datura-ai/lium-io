@@ -3162,8 +3162,19 @@ POD_CONTAINER_ID = "a" * 64
 POD_STARTED_AT = "2026-09-28T19:58:15.767828722Z"
 
 
-def _start_request_harness(docker_service, monkeypatch, *, record_exit_status: int = 0, secrets: bool = True):
+POD_EARLIER_STARTED_AT = "2026-09-28T18:02:41.120394861Z"
+
+
+def _start_request_harness(
+    docker_service,
+    monkeypatch,
+    *,
+    record_exit_status: int = 0,
+    secrets: bool = True,
+    already_running: bool = False,
+):
     record_command = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=POD_STARTED_AT)
+    docker_client = docker_service.rental_docker_client_factory.client
 
     async def _run(cmd, *args, **kwargs):
         if cmd == record_command:
@@ -3178,20 +3189,23 @@ def _start_request_harness(docker_service, monkeypatch, *, record_exit_status: i
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
     )
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
-    docker_service.rental_docker_client_factory.client.inspect_container_state = AsyncMock(
-        return_value=ContainerStateSnapshot(
-            status="running",
-            running=True,
+    def _state(*, container_name: str) -> ContainerStateSnapshot:
+        # a stopped pod keeps its last run's StartedAt until `docker start` begins a new run
+        running = already_running or container_name in docker_client.started_containers
+        return ContainerStateSnapshot(
+            status="running" if running else "exited",
+            running=running,
             restarting=False,
             exit_code=0,
             restart_count=0,
             error=None,
             oom_killed=False,
             container_id=POD_CONTAINER_ID,
-            started_at=POD_STARTED_AT,
+            started_at=POD_STARTED_AT if running else POD_EARLIER_STARTED_AT,
             has_secrets_tmpfs=secrets,
         )
-    )
+
+    docker_client.inspect_container_state = AsyncMock(side_effect=_state)
     executor_info = ExecutorSSHInfo(
         uuid=str(uuid4()),
         address="127.0.0.1",
@@ -3280,6 +3294,37 @@ async def test_a_platform_start_of_a_pod_without_secrets_records_nothing(docker_
     await _start_existing(docker_service, executor_info, record_platform_start=True)
 
     assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+
+
+@pytest.mark.asyncio
+async def test_a_start_request_on_a_running_pod_records_nothing(docker_service, monkeypatch):
+    # Docker answers 304 and the run is the one already going, maybe one a host restart began:
+    # recording it would stop the secrets probe from flagging that restart
+    ssh_client, _, executor_info = _start_request_harness(docker_service, monkeypatch, already_running=True)
+
+    await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_start_request_is_recorded_when_the_state_before_it_cannot_be_read(docker_service, monkeypatch):
+    ssh_client, record_command, executor_info = _start_request_harness(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    read_after_start = docker_client.inspect_container_state.side_effect
+
+    async def _inspect(*, container_name: str):
+        if container_name not in docker_client.started_containers:
+            raise RuntimeError("dockerd did not answer")
+        return read_after_start(container_name=container_name)
+
+    docker_client.inspect_container_state = AsyncMock(side_effect=_inspect)
+
+    await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert record_command in _ran(ssh_client)
 
 
 @pytest.mark.asyncio

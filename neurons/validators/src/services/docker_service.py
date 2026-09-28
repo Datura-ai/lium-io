@@ -784,16 +784,28 @@ async def _record_platform_start(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
     default_extra: dict,
+    started_at_before: str | None = None,
 ) -> None:
-    """Best effort: without the record, the secrets probe flags this start as a lost-secrets restart."""
+    """Best effort: without the record, the secrets probe flags this start as a lost-secrets restart.
+
+    `started_at_before` is the `StartedAt` read before the start: when it is unchanged the pod was
+    already running (Docker answers 304), the platform started nothing, and recording that run would
+    hide an earlier restart from the probe.
+    """
     try:
         state = await docker_client.inspect_container_state(container_name=container_name)
         if not state.has_secrets_tmpfs:
             return
+        if started_at_before is not None and state.started_at == started_at_before:
+            return
         recorded = await ssh_client.run(
             build_record_platform_start_command(container_id=state.container_id, started_at=state.started_at)
         )
-        error = None if recorded.exit_status == 0 else (recorded.stderr or "").strip()
+        error = (
+            None
+            if recorded.exit_status == 0
+            else (recorded.stderr or "").strip() or f"exit status {recorded.exit_status}"
+        )
     except Exception as exc:  # noqa: BLE001 — the start itself already succeeded
         error = f"{type(exc).__name__}: {exc}"
     if error is not None:
@@ -7272,6 +7284,14 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
+            started_at_before = None
+            if record_platform_start:
+                try:
+                    started_at_before = (
+                        await docker_client.inspect_container_state(container_name=container_name)
+                    ).started_at
+                except Exception:  # noqa: BLE001 — unread, the start is recorded as before
+                    pass
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start)
             await run_logged_rental_docker_sdk_operation(
@@ -7288,7 +7308,9 @@ class DockerService:
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
                 if record_platform_start:
-                    await _record_platform_start(docker_client, ssh_client, container_name, default_extra)
+                    await _record_platform_start(
+                        docker_client, ssh_client, container_name, default_extra, started_at_before
+                    )
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
