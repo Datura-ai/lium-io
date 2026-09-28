@@ -129,7 +129,8 @@ async def test_background_job_ports_lift_an_unrented_host_to_the_floor(context_f
     assert result.updates["port_count"] == len(ANSWERED_PAIRS)
     assert result.updates["state"].specs["available_port_count"] == len(ANSWERED_PAIRS)
     # passed under the published floor: listed only while the platform counts the held ports too
-    # (lium-platform#840), so the warning says so instead of claiming the node is hidden
+    # (its count_preemptible_filler_ports_as_free setting), so the warning says so instead of claiming the
+    # node is hidden
     assert result.event.severity == "warning"
     assert result.event.impact == (
         "Listed only if the platform counts ports held by preemptible background jobs: "

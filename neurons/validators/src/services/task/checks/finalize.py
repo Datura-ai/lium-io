@@ -37,7 +37,8 @@ class FinalizeCheck:
         }
         # Two runs get here below the floor: one exempted from PortCountCheck by a pod that then proved stale
         # (hidden from renters), and an unrented one that passed on background-job ports, which the platform
-        # lists only while it counts those ports (lium-platform#840), so neither hidden nor the fix is certain.
+        # lists only while its count_preemptible_filler_ports_as_free setting counts those ports, so neither
+        # hidden nor the fix is certain.
         port_count_below_floor = port_count_below_listing_floor(ctx.state)
         if port_count_below_floor is not None:
             impact = f"{port_floor_impact_text(ctx.state, port_count_below_floor)}. {impact}"

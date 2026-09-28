@@ -159,7 +159,7 @@ class ContextState:
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
     # Ports held by the platform's preemptible background jobs that PortCountCheck counted toward the
     # floor of an unrented node; 0 when rented or none counted. Whether the platform lists a node that
-    # passed on them depends on lium-platform#840's count_preemptible_filler_ports_as_free.
+    # passed on them depends on the platform's count_preemptible_filler_ports_as_free setting.
     preemptible_background_job_port_count: int = 0
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
