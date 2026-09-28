@@ -1143,8 +1143,12 @@ def build_pod_secrets_handover_spec(
 # after a delivered run, and exec into a stopped container cannot tell.
 # A start the platform made (a stop/start from the pod page, the undo of a failed edit) empties the
 # mount too: it records the run's `StartedAt` under POD_PLATFORM_STARTS_DIR, in a file named by the
-# container ID, and a run whose `StartedAt` matches is not flagged. Any restart after it (Docker, a host
-# reboot) starts a new run with a new `StartedAt`, so it is flagged as before.
+# container ID. That container never gets secrets again, so no run of it is flagged from then on,
+# whatever restarts it later: a workload that times out on `.ready` and exits is restarted by Docker
+# and must not blame the host. A container with no record (a host reboot, a Docker restart or a crash
+# with no platform start before it) is flagged as before; a reboot from the pod page re-creates the
+# container under a new ID, which has no record. A start request on a pod that was already running
+# records nothing (see `_record_platform_start`).
 # The validator's SSH lands in the executor container, whose /var/lib/lium is its writable layer and is
 # gone after every executor update. The record lives on the `reserve_data` named volume the executor
 # compose files mount at POD_PLATFORM_STARTS_VOLUME, which outlives a recreate and is mounted into no pod.
@@ -1196,7 +1200,7 @@ def build_pod_secrets_lost_probe_command(container_name: str) -> str:
         "set -- $state; "
         '[ "$6" = secrets ] || exit 0; '
         '[ "$3" = paused ] && exit 0; '
-        f'[ "$(cat {shlex.quote(POD_PLATFORM_STARTS_DIR)}/"$5" 2>/dev/null)" = "$4" ] && exit 0; '
+        f'[ -s {shlex.quote(POD_PLATFORM_STARTS_DIR)}/"$5" ] && exit 0; '
         'if [ "$1" -gt 0 ] 2>/dev/null; then '
         'case "$3" in running|restarting) ;; *) exit 0 ;; esac; '
         f'case "{ready_answer}" in ready|files) ;; *) echo {POD_SECRETS_LOST_OUTPUT} ;; esac; exit 0; fi; '

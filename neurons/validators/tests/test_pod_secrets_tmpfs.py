@@ -1089,17 +1089,41 @@ def test_lost_probe_spares_a_stop_and_start_the_platform_made(tmp_path):
     ) == ""
 
 
-@pytest.mark.parametrize("restart_count", [0, 1], ids=["host-reboot-or-dockerd-restart", "crash"])
-def test_lost_probe_flags_a_restart_after_a_platform_start(tmp_path, restart_count):
-    # Docker's own restart after the recorded start is a new run with a new StartedAt
+@pytest.mark.parametrize(
+    "restart_count,exec_reachable,status",
+    [(0, True, "running"), (1, True, "running"), (2, True, "running"), (2, False, "restarting")],
+    ids=["host-reboot-or-dockerd-restart", "crash", "ready-timeout-twice", "restarting"],
+)
+def test_lost_probe_spares_every_restart_after_a_platform_start(tmp_path, restart_count, exec_reachable, status):
+    # the platform-started run never gets secrets again, so its `.ready` wait times out, the workload
+    # exits and Docker restarts it: a new run with a new StartedAt, still not the host's doing
     assert _run_lost_probe(
         tmp_path,
         mounted=True,
         ready=False,
         age_seconds=PAST_GRACE,
         restart_count=restart_count,
+        exec_reachable=exec_reachable,
+        status=status,
         started_at=LATER_START,
         platform_started_at=PLATFORM_START,
+    ) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+def test_lost_probe_ignores_a_record_of_another_container(tmp_path):
+    starts_dir = tmp_path / "platform-starts"
+    starts_dir.mkdir()
+    (starts_dir / ("b" * 64)).write_text(f"{PLATFORM_START}\n")
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        restart_count=2,
+        started_at=LATER_START,
+        starts_dir=starts_dir,
     ) == POD_SECRETS_LOST_OUTPUT
 
 

@@ -65,20 +65,22 @@ the kernel may page them out to swap.
 
 Rebooting the pod from the pod page creates the container again. It delivers the secrets again
 only once the platform also sends them on reboot, which needs a matching platform-side change
-deployed first; until then a rebooted pod comes back with an empty `/run/lium/secrets`, and a new
+deployed first; until then a rebooted pod comes back without `/run/lium/secrets` at all, and a new
 rent is the way to get them back.
 
 Stopping and starting the pod from the pod page, or a failed edit that puts your previous container
-back, also empties `/run/lium/secrets` and removes `.ready`, and the secrets are not delivered again
-until the platform sends them once more (a new rent, or a reboot once that ships). The validator
-does not report these starts as lost secrets: it records each one on the executor's persistent
-data volume, which no pod can reach and which is kept when the executor is updated.
+back, empties `/run/lium/secrets` and removes `.ready`. From then on the pod has no secrets until
+you rent a new pod (or reboot this one, once the platform sends secrets on reboot). The validator
+records each such start on the executor's persistent data volume, which no pod can reach and which
+is kept when the executor is updated, and from then on it does not report that container as having
+lost its secrets, even when your workload stops on its `.ready` timeout and Docker restarts it.
 
 Docker can also restart the container by itself: after a host reboot, a Docker restart, or when
 your main process dies (for example out of memory). Then `/run/lium/secrets` is empty, `.ready` is
 gone, and the secrets are not delivered again, because they are not stored on the host. Use a
 timeout when you wait for `.ready`, as in the examples above, so your workload exits with an error
 after the timeout. The validator also reports such a pod as having lost its secrets,
-including when your workload keeps stopping on that timeout and Docker keeps restarting it.
+including when your workload keeps stopping on that timeout and Docker keeps restarting it,
+unless the platform started that container after a stop or a failed edit before (above).
 To get them back, rent a new pod (or reboot this one, once the platform sends secrets on reboot,
 as above).
