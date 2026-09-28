@@ -56,7 +56,9 @@ class ManualRentalInfo(pydantic.BaseModel):
 
 
 class FillerRevenueByGpuConfig(pydantic.BaseModel):
-    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200")."""
+    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
+    over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
+    (base model, GPU count)."""
 
     base_model: str
     gpu_count: int

@@ -2957,7 +2957,7 @@
       "type": "object"
     },
     "FillerRevenueByGpuConfig": {
-      "description": "What Lium's fillers earned per GPU-hour, on average, on one GPU configuration (\"8x B200\").",
+      "description": "What Lium's fillers earned per GPU-hour, on average, on one GPU configuration (\"8x B200\"),\nover the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per\n(base model, GPU count).",
       "properties": {
         "base_model": {
           "title": "Base Model",

@@ -48,7 +48,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed) and `FailedContainerRequest.step_detail` (optional; the Docker daemon's reason for a failed volume step, or the dead-transport hint).
 - `1.2.0` — `PodStatesReport`, `ExecutorSpecRequest.pod_states` and `FailedContainerErrorCodes.ExecutorUnreachable` (per-cycle pod container states, and "unreachable" told apart from "unknown id").
 - `1.3.0` — `RentedPod.ssh_port` and `RentedPod.status` (optional), and the `PodSshUnreachableResponse` HTTP body (the renter-side SSH probe's report).
-- `1.4.0` — `RentedExecutorsResponse.filler_revenue_by_gpu_config` (optional; the average filler revenue per GPU configuration the spot-node pay and the secure floor read).
+- `1.4.0` — `RentedExecutorsResponse.filler_revenue_by_gpu_config` (optional): per (base model, GPU count), `usd_per_gpu_hour` = filler revenue / filler GPU-hours over the trailing 24 hours, with the `gpu_hours` it covers; the spot-node pay and the secure floor read it.
 - `1.0.0` — first release.
 
 ## Tests
