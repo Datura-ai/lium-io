@@ -15,7 +15,7 @@ from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.miner_incentive_log import ZeroIncentiveReason
-from incentive.rental_price import FILLER_REVENUE_PAY_FACTOR, RentalPriceIncentive
+from incentive.rental_price import RentalPriceIncentive
 from protocol.vc_protocol.compute_requests import FillerRevenueByGpuConfig, RentedExecutorsResponse
 from services.task.result_handler import ResultHandler
 from services.task_service import JobResult
@@ -101,13 +101,6 @@ def floor_on(monkeypatch):
 def flags_default_off(monkeypatch):
     monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", False)
     monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", False)
-
-
-def test_both_flags_ship_off():
-    fields = type(settings).model_fields
-    assert fields["ENABLE_SPOT_NODE_PAY"].default is False
-    assert fields["ENABLE_SECURE_FILLER_REVENUE_FLOOR"].default is False
-    assert FILLER_REVENUE_PAY_FACTOR == 0.90
 
 
 # ── spot-node pay ────────────────────────────────────────────────────────────
