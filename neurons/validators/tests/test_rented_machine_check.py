@@ -1371,7 +1371,7 @@ async def test_pod_states_is_untouched_when_the_executor_is_not_rented(context_f
 
 class SecretsLostSSHClient(DummySSHClient):
     async def run(self, command: str):
-        if "/proc/mounts" in command:
+        if ".HostConfig.Tmpfs" in command:
             self.commands_called.append(command)
             result = Mock()
             result.stdout = "secrets-lost\n"
@@ -1406,4 +1406,4 @@ async def test_tenant_enforcement_skips_the_secrets_probe_with_the_flag_off(cont
     result = await TenantEnforcementCheck().run(ctx)
 
     assert result.event.reason_code == Msg.ALREADY_RENTED.reason
-    assert not any("/proc/mounts" in command for command in ssh.commands_called)
+    assert not any(".HostConfig.Tmpfs" in command for command in ssh.commands_called)

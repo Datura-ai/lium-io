@@ -792,13 +792,11 @@ async def _check_pod_running_and_read_authorized_keys(
 
 
 async def _pod_secrets_lost(ssh_client, container_name: str) -> bool:
-    # Off: no pod has a secrets mount, so no extra exec per pod. Any failure reads as "not lost".
+    # Off: no pod has a secrets mount, so no extra command per pod. Any failure reads as "not lost".
     if not settings.POD_SECRETS_TMPFS_ENABLED:
         return False
     try:
-        result = await ssh_client.run(
-            DockerCommand.exec_command(container_name, build_pod_secrets_lost_probe_command())
-        )
+        result = await ssh_client.run(build_pod_secrets_lost_probe_command(container_name))
     except Exception:
         return False
     return (result.stdout or "").strip() == POD_SECRETS_LOST_OUTPUT

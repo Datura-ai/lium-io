@@ -860,23 +860,41 @@ def test_an_empty_marker_is_never_published(plain_secrets_dir, tmp_path):
     assert not os.path.lexists(secrets_dir / ".ready.partial")
 
 
-def _run_lost_probe(tmp_path, *, mounted: bool, ready: bool, age_seconds: int) -> str:
-    secrets_dir = tmp_path / "secrets"
-    secrets_dir.mkdir()
-    if ready:
-        (secrets_dir / ".ready").write_text("2026-09-28T00:00:00Z")
-    mounts = tmp_path / "mounts"
-    mounts.write_text(f"tmpfs {secrets_dir} tmpfs rw,nosuid,nodev,noexec 0 0\n" if mounted else "proc /proc proc rw 0 0\n")
-    started = time.time() - age_seconds
-    os.utime(secrets_dir, (started, started))
-    script = (
-        build_pod_secrets_lost_probe_command()
-        .replace("/proc/mounts", str(mounts))
-        .replace(POD_SECRETS_DIR, str(secrets_dir))
+def _run_lost_probe(
+    tmp_path,
+    *,
+    mounted: bool,
+    ready: bool,
+    age_seconds: int,
+    restart_count: int = 0,
+    exec_reachable: bool = True,
+) -> str:
+    """Runs the host probe against a fake `docker` that answers `inspect` and `exec` like dockerd."""
+    created = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - age_seconds))
+    tmpfs = "secrets" if mounted else ""
+    ready_word = "ready" if ready else "missing"
+    exec_answer = f"echo {ready_word}" if exec_reachable else "echo 'container is restarting' >&2; exit 1"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$0.calls"\n'
+        'case "$1" in\n'
+        f'  inspect) echo "{restart_count} {created} {tmpfs}" ;;\n'
+        f"  exec) {exec_answer} ;;\n"
+        "esac\n"
     )
+    fake_docker.chmod(0o755)
+    script = build_pod_secrets_lost_probe_command("tenant-123").replace("/usr/bin/docker", str(fake_docker))
     run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
     assert run.returncode == 0
     return run.stdout.strip()
+
+
+def test_lost_probe_reads_the_pods_own_container():
+    command = build_pod_secrets_lost_probe_command("tenant-123")
+    assert "/usr/bin/docker inspect --format" in command
+    assert f'index .HostConfig.Tmpfs "{POD_SECRETS_DIR}"' in command
+    assert "/usr/bin/docker exec -u 0 tenant-123 " in command
 
 
 def test_lost_probe_flags_an_empty_secrets_mount_after_a_restart(tmp_path):
@@ -885,16 +903,50 @@ def test_lost_probe_flags_an_empty_secrets_mount_after_a_restart(tmp_path):
     ) == POD_SECRETS_LOST_OUTPUT
 
 
+@pytest.mark.parametrize("exec_reachable", [True, False], ids=["up-between-restarts", "restarting"])
+def test_lost_probe_flags_a_crash_looping_pod_before_the_grace(tmp_path, exec_reachable):
+    # The workload's 2-minute `.ready` timeout exits the main process, and `unless-stopped` brings it
+    # back with a new, empty tmpfs: the container is younger than the grace only on its first run.
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=130, restart_count=1, exec_reachable=exec_reachable
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+def test_lost_probe_counts_the_age_from_the_container_not_the_mount(tmp_path):
+    # A restart Docker does not count (dockerd restart, host reboot) still leaves the old `Created`.
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 1, restart_count=0
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
 @pytest.mark.parametrize(
-    "mounted,ready,age_seconds",
+    "mounted,ready,age_seconds,restart_count,exec_reachable",
     [
-        # the pod was created without secrets: no mount
-        (False, False, POD_SECRETS_LOST_GRACE_SECONDS + 60),
+        # the pod was created without secrets: no mount, even after restarts
+        (False, False, POD_SECRETS_LOST_GRACE_SECONDS + 60, 3, True),
         # delivered and still there
-        (True, True, POD_SECRETS_LOST_GRACE_SECONDS + 60),
-        # just started: delivery may still be running
-        (True, False, 5),
+        (True, True, POD_SECRETS_LOST_GRACE_SECONDS + 60, 0, True),
+        # just created: delivery may still be running
+        (True, False, 5, 0, True),
+        # old, never restarted, but exec could not look: no verdict
+        (True, False, POD_SECRETS_LOST_GRACE_SECONDS + 60, 0, False),
     ],
 )
-def test_lost_probe_stays_quiet_otherwise(tmp_path, mounted, ready, age_seconds):
-    assert _run_lost_probe(tmp_path, mounted=mounted, ready=ready, age_seconds=age_seconds) == ""
+def test_lost_probe_stays_quiet_otherwise(tmp_path, mounted, ready, age_seconds, restart_count, exec_reachable):
+    assert (
+        _run_lost_probe(
+            tmp_path,
+            mounted=mounted,
+            ready=ready,
+            age_seconds=age_seconds,
+            restart_count=restart_count,
+            exec_reachable=exec_reachable,
+        )
+        == ""
+    )
+
+
+def test_lost_probe_skips_exec_for_a_pod_without_secrets(tmp_path):
+    _run_lost_probe(tmp_path, mounted=False, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60)
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]

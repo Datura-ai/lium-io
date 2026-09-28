@@ -1123,21 +1123,35 @@ def build_pod_secrets_handover_spec(
 
 # The tmpfs mount is in the container's HostConfig, so it comes back when Docker restarts the container
 # by itself (`unless-stopped`: host reboot, dockerd restart, the main process dying), but empty: no
-# ContainerCreateRequest is sent and the validator keeps no secret value to write again. The mount with
-# no `.ready` in it is that case. A mount younger than the grace period may still be mid-delivery.
+# ContainerCreateRequest is sent and the validator keeps no secret value to write again.
+# Ages count from the container's `Created`, never from the mount: every restart makes a new tmpfs, so a
+# workload that times out on `.ready` and exits (a crash loop) would keep a mount younger than the grace.
+# A container Docker restarted (`RestartCount` > 0) has lost them whatever the age, and is flagged even
+# while it is between restarts and `docker exec` cannot reach it. Otherwise a container older than the
+# grace period with no `.ready` is that case; a younger one may still be mid-delivery.
 POD_SECRETS_LOST_GRACE_SECONDS = 300
 POD_SECRETS_LOST_OUTPUT = "secrets-lost"
+_POD_SECRETS_STATE_FORMAT = (
+    "{{.RestartCount}} {{.Created}} "
+    '{{if index .HostConfig.Tmpfs "' + POD_SECRETS_DIR + '"}}secrets{{end}}'
+)
 
 
-def build_pod_secrets_lost_probe_command() -> str:
-    """Shell for `docker exec -u 0`: prints POD_SECRETS_LOST_OUTPUT when the secrets are gone."""
-    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+def build_pod_secrets_lost_probe_command(container_name: str) -> str:
+    """Host shell: prints POD_SECRETS_LOST_OUTPUT when the pod's secrets are gone."""
+    container = shlex.quote(container_name)
     marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
+    ready_check = shlex.quote(f"[ -e {marker} ] && echo ready || echo missing")
     return (
-        f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts || exit 0; "
-        f"[ -e {marker} ] && exit 0; "
-        f"age=$(( $(date +%s) - $(stat -c %Y {secrets_dir}) )); "
-        f"[ \"$age\" -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] && echo {POD_SECRETS_LOST_OUTPUT}; "
+        f"state=$(/usr/bin/docker inspect --format {shlex.quote(_POD_SECRETS_STATE_FORMAT)} {container} "
+        "2>/dev/null) || exit 0; "
+        "set -- $state; "
+        '[ "$3" = secrets ] || exit 0; '
+        f'if [ "$1" -gt 0 ] 2>/dev/null; then echo {POD_SECRETS_LOST_OUTPUT}; exit 0; fi; '
+        'created=$(date -d "$2" +%s 2>/dev/null) || exit 0; '
+        f'[ $(( $(date +%s) - created )) -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] || exit 0; '
+        f'[ "$(/usr/bin/docker exec -u 0 {container} sh -c {ready_check} 2>/dev/null)" = missing ] '
+        f"&& echo {POD_SECRETS_LOST_OUTPUT}; "
         "exit 0"
     )
 
