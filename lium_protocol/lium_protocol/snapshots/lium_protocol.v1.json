@@ -4334,7 +4334,7 @@
       "type": "object"
     },
     "RecheckExecutorRequest": {
-      "description": "1.4.0: a rent on this executor just failed for the host's reasons and the backend has closed it\nto new rentals; run its checks now. There is no reply message: the\nvalidator publishes the result as an ordinary spec report, and a passing one lifts the hold. A\nvalidator that does not know the type drops it, and the backend lifts the hold on its own.",
+      "description": "A rent on this executor just failed for the host's reasons and the backend has closed it\nto new rentals; run its checks now. There is no reply message: the\nvalidator publishes the result as an ordinary spec report, and a passing one lifts the hold. A\nvalidator that does not know the type drops it, and the backend lifts the hold on its own.",
       "properties": {
         "executor_id": {
           "title": "Executor Id",
