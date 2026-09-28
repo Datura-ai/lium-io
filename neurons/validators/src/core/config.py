@@ -488,6 +488,10 @@ class Settings(BaseSettings):
     # real slow connects happen.
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging and per-connect phase timing")
 
+    # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
+    # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
+    LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
+
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
     # whose price_per_gpu exceeds market p90 * soft_limit_price_rate loses the unrented
     # rental incentive while staying active. When False, the breach is only logged

@@ -156,10 +156,16 @@ def _apply_asyncssh_log_level(asyncssh_logger: logging.Logger | None = None) -> 
     return level
 
 
+def root_log_level() -> int:
+    """``settings.LOG_LEVEL`` as a logging level; an unknown name falls back to INFO."""
+    level = logging.getLevelName(str(settings.LOG_LEVEL).strip().upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
 def configure_logs_of_other_modules():
     # Configure root logger with JSON formatter
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(root_log_level())
 
     # Remove existing handlers
     for handler in root_logger.handlers[:]:
@@ -205,7 +211,7 @@ def get_logger(name: str):
             },
         },
         "root": {
-            "level": "INFO",
+            "level": root_log_level(),
             "handlers": ["console"],
         },
         "loggers": {
