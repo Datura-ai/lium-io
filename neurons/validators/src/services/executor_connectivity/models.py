@@ -14,6 +14,8 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
+    # the tiers that produced `successful`, joined with "+" when a top-up merged two
+    tier: str = "batch"
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,9 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
+    probe_tier: str | None = None
+    # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
+    declared_port_count: int | None = None
 
 
 @dataclass(frozen=True)
