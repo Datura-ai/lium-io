@@ -62,7 +62,10 @@ waiting; `pathlib.Path.exists()` raises `PermissionError` instead, so do not use
 The files are on a tmpfs and are never written to the container's disk, but on a host with swap
 the kernel may page them out to swap.
 
-Rebooting the pod from the pod page creates the container again and delivers the secrets again.
+Rebooting the pod from the pod page creates the container again. It delivers the secrets again
+only once the platform also sends them on reboot, which needs a matching platform-side change
+deployed first; until then a rebooted pod comes back with an empty `/run/lium/secrets`, and a new
+rent is the way to get them back.
 
 Docker can also restart the container by itself: after a host reboot, a Docker restart, or when
 your main process dies (for example out of memory). Then `/run/lium/secrets` is empty, `.ready` is
@@ -70,4 +73,5 @@ gone, and the secrets are not delivered again, because they are not stored on th
 timeout when you wait for `.ready`, as in the examples above, so your workload exits with an error
 after the timeout. The validator also reports such a pod as having lost its secrets,
 including when your workload keeps stopping on that timeout and Docker keeps restarting it.
-Reboot the pod from the pod page to get them back.
+To get them back, rent a new pod (or reboot this one, once the platform sends secrets on reboot,
+as above).

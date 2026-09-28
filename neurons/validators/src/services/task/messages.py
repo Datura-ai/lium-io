@@ -1001,8 +1001,9 @@ class TenantEnforcementMessages:
         impact="Pod flagged; score unchanged",
         remediation=(
             "Docker restarted the pod container by itself (host reboot, dockerd restart, or the main "
-            "process died), so /run/lium/secrets is empty and has no .ready. The renter can reboot the "
-            "pod from the pod page to get the secrets again; check the host for unplanned reboots."
+            "process died), so /run/lium/secrets is empty and has no .ready. The renter gets the secrets "
+            "again with a new rent (a reboot from the pod page delivers them only once the platform sends "
+            "secrets on reboot); check the host for unplanned reboots."
         ),
     )
 
