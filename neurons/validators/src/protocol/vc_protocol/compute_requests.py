@@ -1,3 +1,4 @@
+import math
 from datetime import datetime
 from typing import Literal
 
@@ -114,6 +115,14 @@ class ManualRentalInfo(BaseModel):
     gpu_count: int
 
 
+class FillerRevenueByGpuConfig(BaseModel):
+    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200")."""
+    base_model: str
+    gpu_count: int
+    usd_per_gpu_hour: float
+    gpu_hours: float  # the filler GPU-hours the average was taken over
+
+
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
@@ -149,6 +158,26 @@ class RentedExecutorsResponse(BaseModel):
     # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
     # field force-passes nobody (fail-closed) rather than everybody.
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
+    # Average filler revenue per GPU configuration: what the spot-node pay and the secure floor are
+    # measured against. Defaults to empty so an older backend pays spot nodes nothing, as before.
+    filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+
+    def get_filler_revenue_per_gpu_hour(
+        self, base_model: str | None, gpu_count: int, min_gpu_hours: float
+    ) -> float | None:
+        """The configuration's average filler USD per GPU-hour, or None when there is no usable
+        sample: no entry, a sample under min_gpu_hours, or a value that is not a positive number."""
+        if not base_model:
+            return None
+        for entry in self.filler_revenue_by_gpu_config:
+            if entry.base_model != base_model or entry.gpu_count != gpu_count:
+                continue
+            if not entry.gpu_hours >= min_gpu_hours:
+                return None
+            if not (entry.usd_per_gpu_hour > 0 and math.isfinite(entry.usd_per_gpu_hour)):
+                return None
+            return entry.usd_per_gpu_hour
+        return None
 
     def is_provider_banned(
         self,
