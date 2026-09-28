@@ -313,6 +313,13 @@ async def test_flag_on_mounts_the_tmpfs_and_writes_files_with_no_env_leak(
     assert "exec_write_pod_secret" in logged
     for value in SECRET_VALUES:
         assert value not in logged
+    write_logs = [
+        record.msg.extra
+        for record in caplog.records
+        if (getattr(record.msg, "extra", None) or {}).get("docker_operation") == "exec_write_pod_secret"
+    ]
+    assert {extra["operation_status"] for extra in write_logs} == {"started", "succeeded"}
+    assert not any("stdin_bytes" in extra for extra in write_logs)
 
 
 @pytest.mark.asyncio

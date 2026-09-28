@@ -137,6 +137,10 @@ async def run_logged_rental_docker_sdk_operation(
     return result
 
 
+# The stdin of these is a secret's value: its exact length is not logged either.
+_OPERATIONS_WITHOUT_STDIN_SIZE = frozenset({"exec_write_pod_secret"})
+
+
 async def exec_logged_rental_docker_sdk_operation(
     *,
     docker_client: RentalDockerSdkClient,
@@ -146,6 +150,8 @@ async def exec_logged_rental_docker_sdk_operation(
 ) -> ContainerExecResult:
     start = time.monotonic()
     fields = rental_exec_spec_log_fields(exec_spec)
+    if operation in _OPERATIONS_WITHOUT_STDIN_SIZE:
+        del fields["stdin_bytes"]
     log_rental_docker_sdk_operation(
         operation=operation,
         status="started",
