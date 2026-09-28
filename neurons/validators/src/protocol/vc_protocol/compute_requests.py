@@ -1,10 +1,13 @@
+import logging
 import math
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, RootModel, field_validator
+from pydantic import BaseModel, RootModel, ValidationError, field_validator
 
 from services.const import FILLER_CONTAINER_PREFIX
+
+logger = logging.getLogger(__name__)
 
 GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
 # The GPU itself is gone until a host reset (post-Xid): "gpu requires reset", "unknown device",
@@ -116,7 +119,9 @@ class ManualRentalInfo(BaseModel):
 
 
 class FillerRevenueByGpuConfig(BaseModel):
-    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200")."""
+    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
+    over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
+    (base model, GPU count)."""
     base_model: str
     gpu_count: int
     usd_per_gpu_hour: float
@@ -191,6 +196,28 @@ class RentedExecutorsResponse(BaseModel):
         if miner_coldkey and miner_coldkey in self.banned_coldkeys:
             return True
         return any(gpu_uuid in self.banned_provider_guids for gpu_uuid in (gpu_uuids or []))
+
+    @field_validator("filler_revenue_by_gpu_config", mode="before")
+    @classmethod
+    def drop_invalid_filler_revenue_entries(cls, value: Any) -> list[FillerRevenueByGpuConfig]:
+        # A malformed average must never fail the whole reply: without the reply a cycle cannot start.
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            logger.warning(
+                "filler_revenue_by_gpu_config is not a list (%s); read as no averages", type(value).__name__
+            )
+            return []
+        entries: list[FillerRevenueByGpuConfig] = []
+        for item in value:
+            try:
+                entries.append(FillerRevenueByGpuConfig.model_validate(item))
+            except ValidationError as e:
+                logger.warning(
+                    "dropped an invalid filler_revenue_by_gpu_config entry: %s",
+                    e.errors(include_url=False, include_input=False),
+                )
+        return entries
 
     @field_validator("filler_containers_by_executor")
     @classmethod

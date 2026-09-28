@@ -633,7 +633,7 @@ class MinerLogLine(BaseModel):
             message=(
                 "Unrented incentive: the capacity dilution for this GPU tier took this executor's "
                 "rate below 0.9 x the average filler revenue for its GPU configuration, so it is "
-                "paid at that floor instead (never above its undiluted rate)."
+                "paid at that floor instead."
             ),
             fields={
                 "executor_id": str(result.executor_info.uuid),

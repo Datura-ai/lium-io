@@ -266,6 +266,8 @@ class RentalPriceIncentive(DefaultIncentive):
             key = (base_model, int(bucket_str))
             self.unrented_count_by_bucket[key] = state.unrented_count
             self._weighted_rate_sum_by_bucket[key] = state.weighted_rate_sum
+        # An approximation: the secure-floor top-ups in this sum were computed with the live cycle's
+        # cap multipliers and are not recomputed when an estimate adds a node to a bucket.
         self._unbucketed_rental_cost = snapshot.rental.unbucketed_rental_cost
 
     def get_base_model_for_gpu(self, gpu_model: str) -> str:
@@ -1039,9 +1041,10 @@ class RentalPriceIncentive(DefaultIncentive):
         return result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
 
     def _floored_rate(self, result: JobResult, diluted_rate: float) -> float:
-        """Secure floor: a rate diluted by the bucket cap is raised to min(0.9 x the filler
-        average, the undiluted rate). It never lifts a node above its own listed rate, and a
-        bucket with no capacity (max_cap 0) stays at 0."""
+        """Secure floor: a rate diluted by the bucket cap is raised to 0.9 x the filler average,
+        even where that is above the node's own listed rate. A bucket with no capacity (max_cap 0)
+        and a node with no listed rate stay at 0: they are not in `_secure_floor_candidates`, so
+        `total_rental_cost` carries no top-up for them."""
         if (
             not settings.ENABLE_SECURE_FILLER_REVENUE_FLOOR
             or result.filler_revenue_per_gpu_hour is None
@@ -1049,8 +1052,7 @@ class RentalPriceIncentive(DefaultIncentive):
             or not result.hourly_rate
         ):
             return diluted_rate
-        floor: float = min(FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour, result.hourly_rate)
-        return max(diluted_rate, floor)
+        return max(diluted_rate, FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour)
 
     def _secure_floor_top_up(self) -> float:
         """USD/hour the secure floor adds on top of the bucket sums, so total_rental_cost pays it."""

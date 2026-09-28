@@ -571,8 +571,8 @@ class Settings(BaseSettings):
     # has no usable average, earns 0. False: every spot node earns 0, as before.
     ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
     # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
-    # bucket-cap dilution is raised to min(0.9 x its configuration's average filler revenue, its
-    # undiluted rate). False: dilution applies as before.
+    # bucket-cap dilution is raised to 0.9 x its configuration's average filler revenue, even above
+    # its listed rate. False: dilution applies as before.
     ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
     # A configuration's filler average is used only when it was taken over at least this many
     # filler GPU-hours; a thinner sample reads as no average.

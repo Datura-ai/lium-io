@@ -2,10 +2,11 @@
 
 Spot: an idle spot node running Lium fillers is paid min(0.9 x its GPU configuration's average
 filler revenue per GPU-hour, its secure rate before cap dilution), outside the buckets.
-Secure floor: an idle secure node's cap-diluted rate is raised to min(0.9 x that average, its
-undiluted rate). Both flags off reproduce the old numbers exactly.
+Secure floor: an idle secure node's cap-diluted rate is raised to 0.9 x that average, even
+above its listed rate. Both flags off reproduce the old numbers exactly.
 """
 
+import logging
 import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -25,8 +26,10 @@ from tests.helpers import build_state, default_executor
 H100 = "NVIDIA H100 80GB HBM3"
 HOURLY_RATE = 10.0
 BUCKET_CAP = 8
-# large enough that the rental share stays under the burn-emission cap in every test here
+# large enough that the rental share stays under the burn-emission cap, except where a test says so
 TAO_PRICE = 1_000_000.0
+# small enough that the rental share is capped at the burn emission
+AT_CAP_TAO_PRICE = 1e-6
 ALPHA_RATE = 1.0
 
 
@@ -43,7 +46,7 @@ def _node(uuid: str, **overrides) -> JobResult:
     fields: dict = dict(
         executor_info=ExecutorSSHInfo(
             uuid=uuid,
-            address="10.0.0.1",
+            address="192.0.2.1",
             port=8080,
             ssh_username="root",
             ssh_port=22,
@@ -69,11 +72,13 @@ def _spot(uuid: str = "spot-1", **overrides) -> JobResult:
 
 
 async def _run(
-    results: list[JobResult], config: IncentiveConfig | None = None
+    results: list[JobResult],
+    config: IncentiveConfig | None = None,
+    tao_price: float = TAO_PRICE,
 ) -> RentalPriceIncentive:
     incentive = RentalPriceIncentive(config or _config(), AsyncMock(), {"hk": results}, {})
     incentive.price_provider = AsyncMock()
-    incentive.price_provider.get_tao_price.return_value = TAO_PRICE
+    incentive.price_provider.get_tao_price.return_value = tao_price
     incentive.price_provider.get_alpha_rate.return_value = ALPHA_RATE
     await incentive.calculate_mining_scores()
     return incentive
@@ -265,11 +270,33 @@ async def test_floor_lifts_a_diluted_rate_after_dilution(floor_on):
 
 
 @pytest.mark.asyncio
-async def test_floor_never_lifts_above_the_undiluted_rate(floor_on):
+async def test_floor_lifts_above_the_listed_rate(floor_on):
     incentive = await _run(_over_cap_cycle(4 * HOURLY_RATE))
 
     for node in incentive.job_results["hk"]:
-        assert node.effective_rate == pytest.approx(HOURLY_RATE)
+        assert node.hourly_rate == HOURLY_RATE
+        assert node.effective_rate == pytest.approx(0.9 * 4 * HOURLY_RATE)
+    assert incentive.total_rental_cost == pytest.approx(_paid_cost(incentive))
+
+
+@pytest.mark.asyncio
+async def test_floor_leaves_a_bucket_with_no_capacity_at_zero(floor_on):
+    config = IncentiveConfig(
+        rental_incentive_gpu_types=["H100"],
+        max_unrented_gpus={"H100": {8: BUCKET_CAP, 1: 0}},
+        rental_prices_per_hour={H100: HOURLY_RATE},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+    )
+    no_capacity = _node("secure-1x", gpu_count=1, filler_revenue_per_gpu_hour=8.0)
+
+    incentive = await _run([*_over_cap_cycle(8.0), no_capacity], config)
+
+    assert no_capacity.max_cap == 0
+    assert no_capacity.effective_rate == 0
+    assert no_capacity.incentive == 0
+    assert sum(r.incentive for r in incentive.job_results["hk"]) == pytest.approx(
+        incentive.rental_share
+    )
 
 
 @pytest.mark.asyncio
@@ -360,6 +387,47 @@ async def test_the_two_flags_are_independent(monkeypatch):
         [0.9 * 8.0, 0.9 * 8.0, 0.9 * 2.0]
     )
     assert both.total_rental_cost == pytest.approx(_paid_cost(both))
+
+
+# ── at the burn cap: spot pay and floor top-ups scale every idle payee down ───
+# Today's behaviour, pinned so that changing it is a deliberate decision.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "flag, extra_node",
+    [
+        ("ENABLE_SPOT_NODE_PAY", lambda: _spot(filler_revenue_per_gpu_hour=2.0)),
+        (
+            "ENABLE_SECURE_FILLER_REVENUE_FLOOR",
+            lambda: _node("secure-3", filler_revenue_per_gpu_hour=8.0),
+        ),
+    ],
+)
+async def test_at_the_burn_cap_new_pay_scales_idle_payees_down(monkeypatch, flag, extra_node):
+    def cycle() -> list[JobResult]:
+        return [_node("secure-1", gpu_count=1), extra_node()]
+
+    config = IncentiveConfig(
+        rental_incentive_gpu_types=["H100"],
+        max_unrented_gpus={"H100": {8: BUCKET_CAP // 2, 1: BUCKET_CAP}},
+        rental_prices_per_hour={H100: HOURLY_RATE},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+    )
+    off = await _run(cycle(), config, tao_price=AT_CAP_TAO_PRICE)
+    monkeypatch.setattr(settings, flag, True)
+    on = await _run(cycle(), config, tao_price=AT_CAP_TAO_PRICE)
+
+    for incentive in (off, on):
+        assert incentive.rental_share_raw > incentive.total_burn_emission
+        assert incentive.rental_share == incentive.total_burn_emission
+    before, after = off.job_results["hk"][0], on.job_results["hk"][0]
+    assert after.effective_rate == before.effective_rate == HOURLY_RATE
+    assert on.total_rental_cost > off.total_rental_cost
+    assert after.incentive == pytest.approx(
+        before.incentive * off.total_rental_cost / on.total_rental_cost
+    )
+    assert after.incentive < before.incentive
 
 
 # ── flags off: the old behaviour exactly ─────────────────────────────────────
@@ -496,6 +564,83 @@ async def test_result_without_a_filler_or_backend_data(context_factory):
     for result in (no_filler, no_data):
         assert result.has_lium_filler is False
         assert result.filler_revenue_per_gpu_hour is None
+
+
+_GOOD_ENTRY: dict = {
+    "base_model": "H100",
+    "gpu_count": 8,
+    "usd_per_gpu_hour": 2.0,
+    "gpu_hours": 100,
+}
+
+
+def _reply(filler_revenue_by_gpu_config) -> dict:
+    return {
+        "executors": {},
+        "banned_hotkeys": ["banned-hk"],
+        "spot_executor_ids": ["spot-1"],
+        "filler_revenue_by_gpu_config": filler_revenue_by_gpu_config,
+    }
+
+
+def test_null_averages_read_as_none_without_a_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        data = RentedExecutorsResponse.model_validate(_reply(None))
+
+    assert data.filler_revenue_by_gpu_config == []
+    assert data.banned_hotkeys == ["banned-hk"]
+    assert caplog.records == []
+
+
+def test_invalid_average_entries_are_dropped_with_a_warning(caplog):
+    malformed = [
+        {"base_model": "H100", "gpu_count": 1},
+        {**_GOOD_ENTRY, "usd_per_gpu_hour": "lots"},
+        "8x H100",
+        None,
+        _GOOD_ENTRY,
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        data = RentedExecutorsResponse.model_validate(_reply(malformed))
+
+    assert data.filler_revenue_by_gpu_config == [FillerRevenueByGpuConfig(**_GOOD_ENTRY)]
+    assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) == 2.0
+    assert data.spot_executor_ids == ["spot-1"]
+    dropped = [
+        r for r in caplog.records if "dropped an invalid filler_revenue_by_gpu_config" in r.message
+    ]
+    assert len(dropped) == 4
+
+
+@pytest.mark.parametrize("value", [{"H100": 2.0}, "2.0", 2.0])
+def test_a_field_that_is_not_a_list_reads_as_no_averages(value, caplog):
+    with caplog.at_level(logging.WARNING):
+        data = RentedExecutorsResponse.model_validate(_reply(value))
+
+    assert data.filler_revenue_by_gpu_config == []
+    assert data.banned_hotkeys == ["banned-hk"]
+    assert any("is not a list" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_field_does_not_change_a_flags_off_cycle(context_factory):
+    executor_id = str(default_executor().uuid)
+    fillers = {"all_filler_containers_by_executor": {executor_id: ["filler_run-1"]}}
+    malformed = RentedExecutorsResponse.model_validate(
+        {**_reply([{"gpu_count": "eight"}, 7]), **fillers}
+    )
+    absent = RentedExecutorsResponse.model_validate({"executors": {}, **fillers})
+
+    handled = [await _handled(context_factory, data) for data in (malformed, absent)]
+
+    assert [r.has_lium_filler for r in handled] == [True, True]
+    assert [r.filler_revenue_per_gpu_hour for r in handled] == [None, None]
+    new, old = [await _run([result]) for result in handled]
+    after, before = new.job_results["hk"][0], old.job_results["hk"][0]
+    assert after.incentive == before.incentive
+    assert after.effective_rate == before.effective_rate
+    assert after.incentive_logs == before.incentive_logs
 
 
 def test_older_backend_sends_no_averages():
