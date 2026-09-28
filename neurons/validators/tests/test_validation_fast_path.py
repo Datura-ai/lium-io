@@ -36,6 +36,7 @@ from neurons.validators.src.services.task.checks import (
     GpuFaultProbeCheck,
     PortConnectivityCheck,
     PortCountCheck,
+    RegistryPullCheck,
     RentalVerificationCheck,
     SysboxRequiredCheck,
     TenantEnforcementCheck,
@@ -406,7 +407,13 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     lane_types = [[type(c) for c in lane] for lane in stage.lanes]
     assert VerifyXCheck not in [t for lane in lane_types for t in lane]
     assert lane_types == [
-        [PortConnectivityCheck, PortCountCheck, SysboxRequiredCheck, RentalVerificationCheck],
+        [
+            PortConnectivityCheck,
+            PortCountCheck,
+            RegistryPullCheck,
+            SysboxRequiredCheck,
+            RentalVerificationCheck,
+        ],
         [CapabilityCheck, GpuFaultProbeCheck, CachedTemplateVerificationCheck],
     ]
 

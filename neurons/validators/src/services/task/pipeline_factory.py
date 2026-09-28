@@ -405,7 +405,7 @@ class PipelineFactory:
           be pulling an image or copying a challenge while it does.
         - Then one `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
           fault probe, cached template — the challenge lives on the card) and the host lane
-          (port connectivity, port count, sysbox, rental check — containers, ports and the
+          (port connectivity, port count, registry pull, sysbox, rental check — containers, ports and the
           backend's probe). The executor's own one-call verification already runs its facts
           steps (docker, ports, inspector) beside its GPU group, and runs VerifyX before the
           matmul unless asked otherwise (`LocalVerifyService`, `parallel_gpu`) — the same split
@@ -454,6 +454,7 @@ class PipelineFactory:
                         [
                             PortConnectivityCheck(),
                             PortCountCheck(),
+                            RegistryPullCheck(),
                             SysboxRequiredCheck(),
                             RentalVerificationCheck(),
                         ],
