@@ -1,6 +1,6 @@
-"""An idle B300 earns 1.25 USD/hour per GPU, what Lium's filler workload earns on it (Fish, 28 Sep 2026).
+"""An idle B300 earns 1.25 USD/hour per GPU, at or under what Lium's filler workload earns on it.
 
-It was 6.40 (DAH-3542). The installed lium-core (0.1.8 per pdm.lock) anchors B300 at 5.10, so
+The installed lium-core (0.1.8 per pdm.lock) anchors B300 at 5.10, so
 `incentive.config.RENTAL_PRICES_PER_HOUR` pins the idle rate in the validator.
 """
 

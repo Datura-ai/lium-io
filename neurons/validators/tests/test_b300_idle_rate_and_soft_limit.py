@@ -1,4 +1,4 @@
-"""B300 idle pay (Fish, 28 Sep 2026): 1.25 USD/GPU-h, 64 GPUs in the 8× bucket, and a per-model soft limit rate.
+"""B300 idle pay: 1.25 USD/GPU-h, 64 GPUs in the 8× bucket, and a per-model soft limit rate.
 
 Two 8× B300 hosts listed at 12.90 and 12.95 USD/GPU-h were paid idle at 6.40 while Lium's filler
 earned 0.84-1.30 on idle B300s. They kept the idle pay under the soft price limit because the
@@ -129,8 +129,19 @@ def test_both_b300_names_are_paid_the_idle_rate_and_no_other_gpu_moves() -> None
 # ── 8× bucket ───────────────────────────────────────────────────────────────
 
 
-def test_b300_8x_bucket_holds_64_gpus_and_the_1x_bucket_stays_at_4() -> None:
-    assert IncentiveConfig().max_unrented_gpus["B300"] == {1: 4, 8: 64}
+@pytest.mark.asyncio
+async def test_a_full_8x_b300_bucket_leaves_the_1x_bucket_on_its_own_cap_of_4() -> None:
+    jobs = {f"miner_8x_{i}": [_job(f"exec-8x-{i}", B300_AC, 8)] for i in range(8)}
+    jobs |= {f"miner_1x_{i}": [_job(f"exec-1x-{i}", B300_AC, 1)] for i in range(5)}
+
+    incentive = await _score(jobs)
+
+    assert incentive.cap_multiplier_by_bucket[("B300", 8)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[("B300", 1)] == pytest.approx(4 / 5)
+    for i in range(5):
+        (job,) = jobs[f"miner_1x_{i}"]
+        assert job.max_cap == 4
+        assert job.effective_rate == pytest.approx(1.25 * 4 / 5)
 
 
 def test_no_other_gpu_type_cap_changes() -> None:
@@ -238,9 +249,20 @@ async def test_b300_override_is_shadow_only_while_the_flag_is_off(monkeypatch) -
     assert result.eligible_for_rental_share is True
 
 
-def test_the_override_is_empty_by_default() -> None:
-    field = type(settings).model_fields["UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL"]
-    assert field.default_factory() == {}
+def test_an_unset_override_keeps_every_model_on_the_served_ceiling(monkeypatch) -> None:
+    _serve_prod_soft_limit(monkeypatch)
+    monkeypatch.delenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", raising=False)
+    monkeypatch.setattr(
+        settings,
+        "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL",
+        Settings().UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL,
+    )
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
+
+    assert incentive._soft_limit_price_rate(B300_AC) == PROD_SOFT_LIMIT_PRICE_RATE
+    assert incentive._soft_limit_price_rate(H200) == PROD_SOFT_LIMIT_PRICE_RATE
+    assert incentive._is_over_soft_price_limit(_job("dublin", B300_AC, 8, 12.95)) is False
+    assert incentive._is_over_soft_price_limit(_job("over-served", B300_AC, 8, 12.96)) is True
 
 
 def test_the_override_is_read_from_the_environment_as_json(monkeypatch) -> None:

@@ -44,7 +44,7 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
 def test_overrides_change_only_the_server_edition_and_b300_entries():
     """Guards a hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
-    B300 is pinned at its idle rate, 1.25 (Fish, 28 Sep 2026). `NVIDIA B300 SXM6 PC` is the one key the pin may ADD: the
+    B300 is pinned at its idle rate, 1.25. `NVIDIA B300 SXM6 PC` is the one key the pin may ADD: the
     AC card's alias (derived from the AC entry, never its own price), in the lium-core source table
     but not yet in the release the lock installs — the union is a no-op once the lock carries it."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices

@@ -1,4 +1,4 @@
-"""DAH-3601 (P157/P164): the B300 1× bucket pays for 4 idle cards; the 8× bucket pays for 64 (Fish, 28 Sep 2026).
+"""The B300 1× bucket pays for 4 idle cards; the 8× bucket pays for 64.
 
 Regression: on 17 Sep 2026 the 13:28Z cycle held 12 idle single-card B300 nodes
 against a bucket cap of 10 (multiplier 10/12) while every 8-card node was rented.
