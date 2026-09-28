@@ -526,6 +526,19 @@ class Settings(BaseSettings):
         env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
 
+    # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
+    # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
+    # results are merged. It can raise many hosts' verified_port_count at once, so it ships off.
+    PORT_PROBE_TOPUP_BELOW_FLOOR: bool = Field(env="PORT_PROBE_TOPUP_BELOW_FLOOR", default=False)
+
+    # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
+    # unrented node) when every pod in the batch-start rented list is stale: not running and its
+    # rental closed (STALE_POD_NOT_RUNNING). One running pod, one still-active rental, or a pod whose
+    # state cannot be read keeps the rented exemption. False: the run completes and its events say
+    # the node is hidden. It stops idle pay on those nodes, so it stays off until the validator owner
+    # turns it on.
+    ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
