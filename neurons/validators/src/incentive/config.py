@@ -26,14 +26,19 @@ DEFAULT_PRICE = DefaultPrice()
 # the Workstation Edition at 1.0. The two are the same card for a renter (DAH-3230: the source table
 # in packages/lium-core and the backend's MACHINE_PRICES move the Server Edition to 1.0), so the
 # validator pins the two editions to parity here; the override can go once the validator's lock
-# carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
-# the pinned lium-core still has 5.10).
+# carries a lium-core release with the parity table.
+#
+# B300 is pinned below its market price, at what Lium's own filler workload earns on an idle B300,
+# so idle pay is returned at least 1:1 (Fish, 28 Sep 2026). Over 72 h the only filler on
+# B300 earned 1.30 USD/GPU-h on 1,006 GPU-h of SXM6 AC and 0.84 on 94 GPU-h of SXM6 PC, a GPU-hour
+# weighted 1.26; 1.25 is paid. It was 6.40 (DAH-3542), where the filler returned 13-20 % of it.
+B300_IDLE_USD_PER_GPU_HOUR: float = 1.25
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
-    "NVIDIA B300 SXM6 AC": 6.4,
+    "NVIDIA B300 SXM6 AC": B300_IDLE_USD_PER_GPU_HOUR,
 }
 # `NVIDIA B300 SXM6 PC`: provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300
 # SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
@@ -59,14 +64,18 @@ RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B
 #
 # B300 1× bucket = 4 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
 # B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle.
-# The bucket pays for 4 cards, one below that p95 (Rustam, 18 Sep 2026). The
-# 8× bucket is unchanged. The 1× cap also dilutes the free GPUs of partially rented
+# The bucket pays for 4 cards, one below that p95 (Rustam, 18 Sep 2026). The 1× cap
+# also dilutes the free GPUs of partially rented
 # split 8× nodes: their free portion is scored as a virtual result (DAH-2467) that is
 # always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
 # those cards share the 4 with the idle single-card nodes.
+#
+# B300 8× bucket = 64 (Fish, 28 Sep 2026): 8 idle chassis instead of 4, the size of the
+# other families' 8× bucket, paid at B300_IDLE_USD_PER_GPU_HOUR. A full bucket costs
+# 64 × 1.25 = 80 USD/h, down from 32 × 6.40 = 204.80 USD/h.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 4, 8: 32},
+    "B300": {1: 4, 8: 64},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
