@@ -602,8 +602,9 @@ class MinerLogLine(BaseModel):
         return MinerLogLine(
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
-                "rental_share * gpu_count * effective_rate / total_rental_cost, "
-                "effective_rate = min(0.9 * filler_revenue_per_gpu_hour, secure_rate)"
+                "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
+                "effective_rate = min(0.9 * filler_revenue_per_gpu_hour, secure_rate); "
+                "paid on top of the rental share"
             ),
             fields={
                 "hotkey": hotkey,
@@ -620,7 +621,8 @@ class MinerLogLine(BaseModel):
                 "rental_share": result.rental_share,
                 "burn_share": result.burn_share,
                 "incentive": result.incentive,
-                "total_rental_cost": result.total_rental_cost,
+                "unbucketed_share": result.unbucketed_share,
+                "unbucketed_rental_cost": result.unbucketed_rental_cost,
             },
         )
 

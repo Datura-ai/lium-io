@@ -120,6 +120,13 @@ class JobResult(BaseModel):
     eligible_for_rental_share: bool = False
     # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
     spot_pay_candidate: bool = False
+    # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
+    # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
+    # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers).
+    # Set only on a node paid from that share, so every other node's output is unchanged.
+    unbucketed_share: float | None = None
+    unbucketed_rental_cost: float | None = None
+    floor_top_up_rate: float | None = None
     unrented_cap_multiplier: float | None = None          # Cap dilution multiplier: min(count, cap) / count
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
@@ -203,7 +210,7 @@ class JobResult(BaseModel):
             # published straight into a JSON message.
             return self._mixed_formula_inputs.model_dump()
         if self._paid_from_rental_share:
-            return {
+            inputs: dict[str, Any] = {
                 "rental_share": self.rental_share,
                 "rental_share_raw": self.rental_share_raw,
                 "total_burn_emission": self.total_burn_emission,
@@ -229,6 +236,14 @@ class JobResult(BaseModel):
                 "seconds_per_block": self.seconds_per_block,
                 "fixed_ratio": self.fixed_ratio,
             }
+            if self.unbucketed_share is not None:
+                # incentive = rental_share * gpu_count * (effective_rate - floor_top_up_rate) / total_rental_cost
+                #           + unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
+                # (a spot node: floor_top_up_rate = effective_rate, and nothing from the first term)
+                inputs["unbucketed_share"] = self.unbucketed_share
+                inputs["unbucketed_rental_cost"] = self.unbucketed_rental_cost
+                inputs["floor_top_up_rate"] = self.floor_top_up_rate
+            return inputs
         return {
             "score": self.score,
             "mining_share": self.mining_share,

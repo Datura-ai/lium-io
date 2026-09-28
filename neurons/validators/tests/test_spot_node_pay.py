@@ -3,7 +3,9 @@
 Spot: an idle spot node running Lium fillers is paid min(0.9 x its GPU configuration's average
 filler revenue per GPU-hour, its secure rate before cap dilution), outside the buckets.
 Secure floor: an idle secure node's cap-diluted rate is raised to 0.9 x that average, even
-above its listed rate. Both flags off reproduce the old numbers exactly.
+above its listed rate. No cap (owner rule): spot pay and floor top-ups are paid on top of the
+burn-capped rental share, up to the whole incentive pool. Both flags off reproduce the old
+numbers exactly.
 """
 
 import logging
@@ -16,7 +18,8 @@ from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.miner_incentive_log import ZeroIncentiveReason
-from incentive.rental_price import RentalPriceIncentive
+from incentive.rental_price import ExecutorEstimateParams, RentalPriceIncentive
+from services.const import FIXED_RATIO, SECONDS_PER_BLOCK, TEMPO
 from protocol.vc_protocol.compute_requests import FillerRevenueByGpuConfig, RentedExecutorsResponse
 from services.task.result_handler import ResultHandler
 from services.task_service import JobResult
@@ -92,6 +95,31 @@ def _paid_cost(incentive: RentalPriceIncentive) -> float:
     return sum(r.gpu_count * (r.effective_rate or 0.0) for r in incentive.job_results["hk"])
 
 
+def _share_per_usd_hour(tao_price: float) -> float:
+    return (TEMPO * SECONDS_PER_BLOCK) / 3600 / FIXED_RATIO / (TEMPO * tao_price * ALPHA_RATE)
+
+
+def _assert_pool_pays_exactly(incentive: RentalPriceIncentive) -> None:
+    # the buckets pay from the rental share, spot pay and top-ups from the share on top of it
+    assert incentive.total_rental_cost + incentive._unbucketed_rental_cost == pytest.approx(
+        _paid_cost(incentive)
+    )
+    assert sum(r.incentive for r in incentive.job_results["hk"]) == pytest.approx(
+        incentive.rental_share + incentive.unbucketed_share
+    )
+
+
+def _top_up_pay(incentive: RentalPriceIncentive, result: JobResult) -> float:
+    if result.floor_top_up_rate is None:
+        return 0.0
+    return (
+        incentive.unbucketed_share
+        * result.gpu_count
+        * result.floor_top_up_rate
+        / incentive._unbucketed_rental_cost
+    )
+
+
 @pytest.fixture
 def spot_pay_on(monkeypatch):
     monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
@@ -124,7 +152,7 @@ async def test_spot_is_paid_the_filler_side_when_it_is_lower(spot_pay_on):
     assert spot.incentive_formula_version == "rental_price_v2"
     assert spot.mining_score == 0
     assert _codes(spot) == []
-    assert incentive.total_rental_cost == pytest.approx(_paid_cost(incentive))
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -224,22 +252,6 @@ async def test_spot_flag_off_keeps_spot_at_zero():
     assert _codes(spot) == [ZeroIncentiveReason.SPOT_TIER]
 
 
-@pytest.mark.asyncio
-async def test_spot_flag_leaves_secure_nodes_unchanged(monkeypatch):
-    def cycle() -> list[JobResult]:
-        return [_spot(filler_revenue_per_gpu_hour=2.0), _node("secure-1"), _node("secure-2")]
-
-    off = await _run(cycle())
-    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
-    on = await _run(cycle())
-
-    for before, after in zip(off.job_results["hk"][1:], on.job_results["hk"][1:], strict=True):
-        assert after.effective_rate == before.effective_rate
-        assert after.unrented_cap_multiplier == before.unrented_cap_multiplier
-        # below the burn cap the rental share grows with the pool, so a secure node's pay holds
-        assert after.incentive == pytest.approx(before.incentive)
-
-
 # ── secure floor ─────────────────────────────────────────────────────────────
 
 
@@ -266,7 +278,7 @@ async def test_floor_lifts_a_diluted_rate_after_dilution(floor_on):
     for node in incentive.job_results["hk"]:
         assert node.unrented_cap_multiplier == 0.5
         assert node.effective_rate == pytest.approx(0.9 * 8.0)
-    assert incentive.total_rental_cost == pytest.approx(_paid_cost(incentive))
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -276,7 +288,7 @@ async def test_floor_lifts_above_the_listed_rate(floor_on):
     for node in incentive.job_results["hk"]:
         assert node.hourly_rate == HOURLY_RATE
         assert node.effective_rate == pytest.approx(0.9 * 4 * HOURLY_RATE)
-    assert incentive.total_rental_cost == pytest.approx(_paid_cost(incentive))
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -294,9 +306,7 @@ async def test_floor_leaves_a_bucket_with_no_capacity_at_zero(floor_on):
     assert no_capacity.max_cap == 0
     assert no_capacity.effective_rate == 0
     assert no_capacity.incentive == 0
-    assert sum(r.incentive for r in incentive.job_results["hk"]) == pytest.approx(
-        incentive.rental_share
-    )
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -305,7 +315,7 @@ async def test_floor_below_the_diluted_rate_changes_nothing(floor_on):
 
     for node in incentive.job_results["hk"]:
         assert node.effective_rate == HOURLY_RATE * 0.5
-    assert incentive.total_rental_cost == pytest.approx(_paid_cost(incentive))
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -329,7 +339,7 @@ async def test_floor_keeps_the_nodes_own_penalties(floor_on, monkeypatch):
     penalised, full = incentive.job_results["hk"]
     assert penalised.effective_rate == pytest.approx(0.9 * 8.0 * 0.5)
     assert full.effective_rate == pytest.approx(0.9 * 8.0)
-    assert incentive.total_rental_cost == pytest.approx(_paid_cost(incentive))
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -386,55 +396,140 @@ async def test_the_two_flags_are_independent(monkeypatch):
     assert [n.effective_rate for n in both.job_results["hk"]] == pytest.approx(
         [0.9 * 8.0, 0.9 * 8.0, 0.9 * 2.0]
     )
-    assert both.total_rental_cost == pytest.approx(_paid_cost(both))
+    _assert_pool_pays_exactly(both)
 
 
-# ── at the burn cap: spot pay and floor top-ups scale every idle payee down ───
-# Today's behaviour, pinned so that changing it is a deliberate decision.
+# ── no cap: paid on top of the burn-capped rental share ──────────────────────
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "flag, extra_node",
-    [
-        ("ENABLE_SPOT_NODE_PAY", lambda: _spot(filler_revenue_per_gpu_hour=2.0)),
-        (
-            "ENABLE_SECURE_FILLER_REVENUE_FLOOR",
-            lambda: _node("secure-3", filler_revenue_per_gpu_hour=8.0),
-        ),
-    ],
-)
-async def test_at_the_burn_cap_new_pay_scales_idle_payees_down(monkeypatch, flag, extra_node):
-    def cycle() -> list[JobResult]:
-        return [_node("secure-1", gpu_count=1), extra_node()]
+def _mixed_cycle() -> list[JobResult]:
+    # 8-GPU bucket: three 8x nodes against a cap of 8 (multiplier 1/3); two have a filler average
+    return [
+        _node("secure-1x", gpu_count=1),
+        _node("secure-a", filler_revenue_per_gpu_hour=8.0),
+        _node("secure-b", filler_revenue_per_gpu_hour=8.0),
+        _node("secure-c"),
+        _spot(filler_revenue_per_gpu_hour=2.0),
+    ]
 
-    config = IncentiveConfig(
+
+def _mixed_config() -> IncentiveConfig:
+    return IncentiveConfig(
         rental_incentive_gpu_types=["H100"],
-        max_unrented_gpus={"H100": {8: BUCKET_CAP // 2, 1: BUCKET_CAP}},
+        max_unrented_gpus={"H100": {8: BUCKET_CAP, 1: BUCKET_CAP}},
         rental_prices_per_hour={H100: HOURLY_RATE},
         gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
     )
-    off = await _run(cycle(), config, tao_price=AT_CAP_TAO_PRICE)
-    monkeypatch.setattr(settings, flag, True)
-    on = await _run(cycle(), config, tao_price=AT_CAP_TAO_PRICE)
 
-    for incentive in (off, on):
-        assert incentive.rental_share_raw > incentive.total_burn_emission
-        assert incentive.rental_share == incentive.total_burn_emission
-    before, after = off.job_results["hk"][0], on.job_results["hk"][0]
-    assert after.effective_rate == before.effective_rate == HOURLY_RATE
-    assert on.total_rental_cost > off.total_rental_cost
-    assert after.incentive == pytest.approx(
-        before.incentive * off.total_rental_cost / on.total_rental_cost
-    )
-    assert after.incentive < before.incentive
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tao_price", [TAO_PRICE, AT_CAP_TAO_PRICE], ids=["below-cap", "at-cap"])
+@pytest.mark.parametrize("flag", ["ENABLE_SPOT_NODE_PAY", "ENABLE_SECURE_FILLER_REVENUE_FLOOR"])
+async def test_non_spot_idle_pay_is_identical_with_either_flag_on_or_off(
+    monkeypatch, flag, tao_price
+):
+    off = await _run(_mixed_cycle(), _mixed_config(), tao_price=tao_price)
+    monkeypatch.setattr(settings, flag, True)
+    on = await _run(_mixed_cycle(), _mixed_config(), tao_price=tao_price)
+
+    assert on.total_rental_cost == off.total_rental_cost
+    assert on.rental_share == off.rental_share
+    if tao_price == AT_CAP_TAO_PRICE:
+        assert on.rental_share_raw > on.total_burn_emission
+        assert on.rental_share == on.total_burn_emission
+    for before, after in zip(off.job_results["hk"][:4], on.job_results["hk"][:4], strict=True):
+        if after.floor_top_up_rate is None:
+            assert after.incentive == before.incentive
+            # the extras are paid out of the burn remainder; every other input is unchanged
+            inputs_after, inputs_before = (
+                after.incentive_formula_inputs,
+                before.incentive_formula_inputs,
+            )
+            assert inputs_after.pop("burn_share") == pytest.approx(
+                inputs_before.pop("burn_share") - on.unbucketed_share
+            )
+            assert inputs_after == inputs_before
+        else:
+            # a floored node keeps its diluted pay; only the top-up is added, from the share on top
+            assert after.incentive - _top_up_pay(on, after) == pytest.approx(before.incentive)
+    _assert_pool_pays_exactly(on)
+
+
+@pytest.mark.asyncio
+async def test_the_paid_share_rises_by_exactly_spot_pay_and_floor_top_ups(monkeypatch):
+    off = await _run(_mixed_cycle(), _mixed_config())
+    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
+    on = await _run(_mixed_cycle(), _mixed_config())
+
+    spot_pay = 8 * 0.9 * 2.0
+    floor_top_ups = 2 * 8 * (0.9 * 8.0 - HOURLY_RATE / 3)
+    assert on._unbucketed_rental_cost == pytest.approx(spot_pay + floor_top_ups)
+    extra_share = (spot_pay + floor_top_ups) * _share_per_usd_hour(TAO_PRICE)
+    assert on.rental_share == off.rental_share
+    assert on.unbucketed_share == pytest.approx(extra_share)
+    assert on.rental_share + on.unbucketed_share - off.rental_share == pytest.approx(extra_share)
+    assert on.burn_share == pytest.approx(off.burn_share - extra_share)
+    _assert_pool_pays_exactly(on)
+
+
+@pytest.mark.asyncio
+async def test_extras_past_the_whole_pool_are_clamped_and_only_they_shrink(monkeypatch, caplog):
+    def cycle() -> list[JobResult]:
+        return [*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)]
+
+    burn_emission = RentalPriceIncentive(_config(), AsyncMock(), {}, {}).total_burn_emission
+    bucket_cost = 2 * 8 * HOURLY_RATE * 0.5
+    extra_cost = 8 * 0.9 * 2.0 + 2 * 8 * (0.9 * 8.0 - HOURLY_RATE * 0.5)
+    # a price at which the buckets alone stay under the burn cap, but the extras would take the
+    # rental side past the pool by half their own share
+    tao_price = _share_per_usd_hour(1.0) * (bucket_cost + extra_cost / 2) / burn_emission
+
+    off = await _run(cycle(), tao_price=tao_price)
+    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
+    with caplog.at_level(logging.WARNING):
+        on = await _run(cycle(), tao_price=tao_price)
+
+    clamped = [r for r in caplog.records if "clamped to the incentive pool" in r.message]
+    assert len(clamped) == 1
+    assert on.rental_share == off.rental_share < burn_emission
+    assert on.unbucketed_share == pytest.approx(on.unbucketed_share_raw / 2)
+    assert on.mining_share + on.rental_share + on.unbucketed_share == pytest.approx(1.0)
+    assert on.burn_share == pytest.approx(0.0, abs=1e-12)
+    secure_a, secure_b, spot = on.job_results["hk"]
+    per_usd_unclamped = on.unbucketed_share_raw / on._unbucketed_rental_cost
+    assert spot.incentive == pytest.approx(per_usd_unclamped * 8 * spot.effective_rate / 2)
+    for before, after in zip(off.job_results["hk"][:2], (secure_a, secure_b), strict=True):
+        assert after.incentive - _top_up_pay(on, after) == pytest.approx(before.incentive)
+        assert _top_up_pay(on, after) == pytest.approx(
+            per_usd_unclamped * 8 * after.floor_top_up_rate / 2
+        )
+    _assert_pool_pays_exactly(on)
+
+
+@pytest.mark.asyncio
+async def test_at_the_burn_cap_the_pool_has_no_room_left_for_extras(monkeypatch, caplog):
+    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+    monkeypatch.setattr(settings, "ENABLE_SECURE_FILLER_REVENUE_FLOOR", True)
+
+    with caplog.at_level(logging.WARNING):
+        on = await _run(_mixed_cycle(), _mixed_config(), tao_price=AT_CAP_TAO_PRICE)
+
+    # the mining share is 1 - burn emission, so a capped rental share leaves the pool full
+    assert on.mining_share + on.total_burn_emission == pytest.approx(1.0)
+    assert on.rental_share == on.total_burn_emission
+    assert on.unbucketed_share == pytest.approx(0.0, abs=1e-12)
+    assert on.job_results["hk"][-1].incentive == pytest.approx(0.0, abs=1e-12)
+    assert len([r for r in caplog.records if "clamped to the incentive pool" in r.message]) == 1
 
 
 # ── flags off: the old behaviour exactly ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_flags_off_ignore_the_new_data_exactly():
+@pytest.mark.parametrize("tao_price", [TAO_PRICE, AT_CAP_TAO_PRICE], ids=["below-cap", "at-cap"])
+async def test_flags_off_ignore_the_new_data_exactly(tao_price):
     def cycle(with_new_data: bool) -> list[JobResult]:
         extra: dict = (
             {"has_lium_filler": True, "filler_revenue_per_gpu_hour": 8.0} if with_new_data else {}
@@ -446,15 +541,20 @@ async def test_flags_off_ignore_the_new_data_exactly():
             _node("spot-1", is_spot=True, **extra),
         ]
 
-    old = await _run(cycle(with_new_data=False))
-    new = await _run(cycle(with_new_data=True))
+    old = await _run(cycle(with_new_data=False), tao_price=tao_price)
+    new = await _run(cycle(with_new_data=True), tao_price=tao_price)
 
     assert new.total_rental_cost == old.total_rental_cost
     assert new.rental_share == old.rental_share
+    assert new.burn_share == old.burn_share
+    assert new.miner_incentives == old.miner_incentives
     for before, after in zip(old.job_results["hk"], new.job_results["hk"], strict=True):
         assert after.incentive == before.incentive
         assert after.effective_rate == before.effective_rate
-        assert after.incentive_logs == before.incentive_logs
+        assert after.full_log_text == before.full_log_text
+        assert after.incentive_formula_version == before.incentive_formula_version
+        assert after.incentive_formula_inputs == before.incentive_formula_inputs
+        assert "unbucketed_share" not in (after.incentive_formula_inputs or {})
         assert _codes(after) == _codes(before)
 
 
@@ -465,8 +565,39 @@ async def test_snapshot_carries_the_unbucketed_cost(spot_pay_on):
     snapshot = incentive.get_snapshot()
 
     assert snapshot.rental.unbucketed_rental_cost == pytest.approx(8 * 0.9 * 2.0)
+    assert snapshot.rental.total_rental_cost == pytest.approx(8 * HOURLY_RATE)
+    assert snapshot.burn_share == pytest.approx(
+        incentive.total_burn_emission - snapshot.rental_share - incentive.unbucketed_share
+    )
     seeded = RentalPriceIncentive(_config(), AsyncMock(), {}, {}, snapshot=snapshot)
     assert seeded._unbucketed_rental_cost == snapshot.rental.unbucketed_rental_cost
+
+
+@pytest.mark.asyncio
+async def test_an_estimate_from_the_snapshot_is_not_scaled_by_spot_pay(monkeypatch, caplog):
+    def estimate_from(incentive: RentalPriceIncentive):
+        seeded = RentalPriceIncentive(
+            _config(), AsyncMock(), {}, {}, snapshot=incentive.get_snapshot()
+        )
+        return seeded.estimate_executor(ExecutorEstimateParams(gpu_model=H100, gpu_count=8))
+
+    off = await _run(
+        [_spot(filler_revenue_per_gpu_hour=2.0), _node("secure-1")], tao_price=AT_CAP_TAO_PRICE
+    )
+    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+    on = await _run(
+        [_spot(filler_revenue_per_gpu_hour=2.0), _node("secure-1")], tao_price=AT_CAP_TAO_PRICE
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        estimate_on = await estimate_from(on)
+    estimate_off = await estimate_from(off)
+
+    assert estimate_on.incentive == estimate_off.incentive
+    assert estimate_on.total_rental_cost == estimate_off.total_rental_cost
+    # the live cycle logged the clamp once; an estimate seeded from it does not repeat it
+    assert [r for r in caplog.records if "clamped to the incentive pool" in r.message] == []
 
 
 # ── the backend's per-configuration average ──────────────────────────────────
