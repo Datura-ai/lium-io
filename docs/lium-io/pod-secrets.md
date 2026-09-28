@@ -1,4 +1,4 @@
-# Pod secrets
+# Pod secrets (not released yet)
 
 This doc is for renters who pass secrets (API tokens, keys, credentials) to a pod. Secrets are
 delivered as files, never as environment variables, so they don't show up in `docker inspect`,
