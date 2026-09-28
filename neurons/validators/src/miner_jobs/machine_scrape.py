@@ -643,117 +643,6 @@ def run_cmd(cmd):
     return proc.stdout
 
 
-def get_network_speed():
-    """Get upload and download speed of the machine."""
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("speedtest-cli --json")
-        speedtest_data = json.loads(speedtest_cmd)
-        data["upload_speed"] = speedtest_data["upload"] / 1_000_000  # Convert to Mbps
-        data["download_speed"] = speedtest_data["download"] / 1_000_000  # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def speedcheck_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("/root/app/.venv/bin/speedcheck run --type ookla")
-        json_start = speedtest_cmd.find('{')
-        json_str = speedtest_cmd[json_start:]
-        speedtest_data = json.loads(json_str)
-        data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
-        data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def netmeasure_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd(f"/root/app/.venv/bin/netmeasure speedtest_dotnet")
-        download_match = re.search(r'Download Rate: ([\d.]+) bit/s', speedtest_cmd)
-        upload_match = re.search(r'Upload Rate: ([\d.]+) bit/s', speedtest_cmd)
-
-        if download_match and upload_match:
-            download_speed = float(download_match.group(1))
-            upload_speed = float(upload_match.group(1))
-            
-            # Convert to Mbps
-            data["download_speed"] = download_speed / 1_000_000 # Convert to Mbps 
-            data["upload_speed"] = upload_speed / 1_000_000 # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def cloudflare_speed():
-    """Measure network speed using Cloudflare's speed endpoint via curl."""
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        # Download: 50 MB
-        out = run_cmd(
-            "curl -o /dev/null -s -w '%{speed_download}' "
-            "--max-time 15 "
-            "'https://speed.cloudflare.com/__down?bytes=50000000'"
-        )
-        data["download_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
-
-        # Upload: 25 MB via stdin pipe (no temp file)
-        out = run_cmd(
-            "dd if=/dev/zero bs=1M count=25 2>/dev/null | "
-            "curl -o /dev/null -s -w '%{speed_upload}' "
-            "--max-time 15 -X POST --data-binary @- "
-            "'https://speed.cloudflare.com/__up'"
-        )
-        data["upload_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-
-def benchmark_network_speed():
-    """Run network speed methods in fallback order, stopping once both metrics are satisfied.
-
-    Methods are tried in order: speedtest_cli → cloudflare → netmeasure → speedcheck.
-    Each method is only called if at least one metric (download or upload) is still missing.
-    All executed per-method raw results are stored under 'measurements' for logging.
-    """
-    order = [
-        ("speedtest_cli", get_network_speed),
-        ("cloudflare", cloudflare_speed),
-        ("netmeasure", netmeasure_output),
-        ("speedcheck", speedcheck_output),
-    ]
-
-    measurements = {}
-    download: float | None = None
-    upload: float | None = None
-    download_source: str | None = None
-    upload_source: str | None = None
-
-    for name, method in order:
-        if download is not None and upload is not None:
-            break
-
-        result = method()
-        measurements[name] = result
-
-        if download is None and result.get("download_speed"):
-            download = result["download_speed"]
-            download_source = name
-
-        if upload is None and result.get("upload_speed"):
-            upload = result["upload_speed"]
-            upload_source = name
-
-    return {
-        "download_speed": download,
-        "upload_speed": upload,
-        "download_source": download_source,
-        "upload_source": upload_source,
-        "measurements": measurements,
-    }
-
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
 # let a scrape round hang on it.
@@ -1545,19 +1434,269 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
     root that takes writes, and returns []. Read-only is the `ro` option, or `emergency_ro`: since
     kernel 6.6 an ext4 error under errors=remount-ro keeps `rw` in the options and adds
     `emergency_ro` instead. One element or none; a list so the payload shape holds."""
-    covering: tuple[str, list[str]] | None = None
+    covering = covering_mount(mounts_text, path)
+    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering.options):
+        return []
+    return [covering.mount_point]
+
+
+class MountLine:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, source: str, mount_point: str, options: list[str]) -> None:
+        self.source = source
+        self.mount_point = mount_point
+        self.options = options
+
+
+def covering_mount(mounts_text: str, path: str) -> MountLine | None:
+    """The /proc/<pid>/mounts line whose filesystem a write to `path` lands on; None when no line
+    covers the path.
+
+    The longest mount point that is `path` or a parent of it, the last line winning when a point
+    is mounted over. One rule for both readers of the mount table (`mounts_holding`,
+    `block_device_holding`), so the disk that is judged read-only is the disk that is typed."""
+    covering: MountLine | None = None
     for line in mounts_text.splitlines():
         fields = line.split()
         if len(fields) < 4:
             continue
-        mount_point, options = fields[1], fields[3].split(",")
+        mount_point = fields[1]
         if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
             continue
-        if covering is None or len(mount_point) >= len(covering[0]):
-            covering = (mount_point, options)
-    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering[1]):
+        if covering is None or len(mount_point) >= len(covering.mount_point):
+            covering = MountLine(fields[0], mount_point, fields[3].split(","))
+    return covering
+
+
+# DAH-3674: the kind of disk under docker's data root, published as `hard_disk.disk_type` on the
+# public nodes feed (lium-platform). A reading, not a verdict: nothing scores or gates on it.
+SYS_CLASS_BLOCK_PATH = "/sys/class/block"
+SYS_DEV_BLOCK_PATH = "/sys/dev/block"
+SYS_DMI_ID_PATH = "/sys/class/dmi/id"
+SYS_HYPERVISOR_TYPE_PATH = "/sys/hypervisor/type"
+PROC_CPUINFO_PATH = "/proc/cpuinfo"
+# st_mode's file-type bits and the block-device value, spelled out because the packaged scrape cannot
+# import stat (obfuscator allowlist)
+ST_MODE_TYPE_MASK = 0o170000
+ST_MODE_BLOCK_DEVICE = 0o060000
+DISK_TYPE_NVME = "nvme"
+DISK_TYPE_SSD = "ssd"
+DISK_TYPE_HDD = "hdd"
+DISK_TYPE_UNKNOWN = "unknown"
+# Devices with no physical disk of their own and nothing under `slaves/` to follow: a loop file,
+# a network block device. A device-mapper (LVM / dm-crypt) or md RAID device lands here only when
+# sysfs lists no slaves for it; with slaves it is typed by the disks underneath.
+UNTYPED_DEVICE_PREFIXES = ("dm-", "md", "loop", "nbd", "rbd", "drbd")
+# How many layers of `slaves/` to follow (LVM over LUKS over md RAID is three); sysfs is a tree,
+# the cap only bounds a broken one.
+STACKED_DEVICE_MAX_DEPTH = 8
+# DAH-3746: a virtual disk's `rotational` flag describes the hypervisor's emulated controller, not
+# the disk behind it: virtio `vd*` reports 1 whatever backs it (measured on a virtio VM, 19 Sep
+# 2026), and QEMU's emulated SATA/SCSI `sda` reported 1 on 34 of 35 checked VMs (QEMU, DigitalOcean,
+# 21 Sep 2026) whatever the host's storage is. A VM's disk is unknown, never hdd. Three tells, any
+# one enough: the device name (virtio, Xen), the disk's SCSI vendor/model (`QEMU HARDDISK`,
+# DigitalOcean's `DO Volume`, VirtualBox, VMware, Hyper-V, EC2/GCE volumes), and the host's DMI
+# vendor/product, `/sys/hypervisor/type` (what systemd-detect-virt reads), or the `hypervisor`
+# flag in `/proc/cpuinfo` (every x86 hypervisor sets it; a VM whose DMI names no listed vendor
+# still reads unknown without it). A bare-metal EC2
+# `.metal` instance carries `Amazon EC2` in DMI and reads unknown too - the marker list, not the
+# flag, is where that would change.
+VIRTUAL_DISK_PREFIXES = ("vd", "xvd")
+VIRTUAL_DISK_IDENTITY_MARKERS = (
+    "qemu",
+    "virtio",
+    "0x1af4",  # the virtio PCI vendor id, what a virtio-blk disk's device/vendor reads
+    "do volume",
+    "vbox",
+    "vmware",
+    "msft virtual",
+    "google persistentdisk",
+    "amazon elastic block store",
+    "amazon ec2 nvme",
+    "xen",
+)
+VIRTUAL_MACHINE_DMI_MARKERS = (
+    "qemu",
+    "kvm",
+    "bochs",
+    "digitalocean",
+    "droplet",
+    "amazon ec2",
+    "google",
+    "microsoft corporation",
+    "virtual machine",
+    "vmware",
+    "virtualbox",
+    "innotek",
+    "xen",
+    "openstack",
+    "parallels",
+    "bhyve",
+    "standard pc (",
+)
+
+
+def block_device_holding(mounts_text: str, path: str) -> str | None:
+    """The kernel name (`nvme1n1p1`, `sda2`, `dm-0`) of the block device whose filesystem holds
+    `path`; None when nothing covers it or the covering mount is not a /dev node (overlay, tmpfs,
+    a network filesystem).
+
+    The source is stat'ed through PID 1's root and named by its major:minor in /sys/dev/block, so a
+    `/dev/disk/by-uuid/...` or `/dev/mapper/...` link in the mount table reads as the node the kernel
+    names it by. stat follows the /proc/1/root magic link in the kernel; a userspace walk
+    (os.path.realpath) does not - readlink answers `/` and the walk carries on in this container's
+    own /dev, which has the nodes and none of udev's links. When the stat or the sysfs read fails
+    (a scrape run outside the executor container, a node sysfs does not list) the name as mounted is
+    the reading; a by-uuid link then types as unknown downstream."""
+    covering = covering_mount(mounts_text, path)
+    if covering is None or not covering.source.startswith("/dev/"):
+        return None
+    kernel_name = kernel_name_of_device_node(f"{HOST_ROOT_PREFIX}{covering.source}")
+    return kernel_name or os.path.basename(covering.source) or None
+
+
+def kernel_name_of_device_node(node_path: str) -> str | None:
+    """The kernel name (`nvme0n1p2`, `dm-3`) of the block device node at `node_path`, or None when
+    the path is not a block device or sysfs does not list its major:minor.
+
+    /sys/dev/block/<major>:<minor> is a link into the device's sysfs directory, whose last component
+    is the kernel name - the one /sys/class/block indexes by, so `whole_disk_of` can take it from
+    here. No udev needed: the node's st_rdev is the device number whatever name it was mounted by."""
+    try:
+        node_stat = os.stat(node_path)
+        if node_stat.st_mode & ST_MODE_TYPE_MASK != ST_MODE_BLOCK_DEVICE:
+            return None
+        device_number = f"{os.major(node_stat.st_rdev)}:{os.minor(node_stat.st_rdev)}"
+        return os.path.basename(os.readlink(f"{SYS_DEV_BLOCK_PATH}/{device_number}")) or None
+    except OSError:
+        return None
+
+
+def whole_disk_of(device_name: str) -> str:
+    """`nvme0n1p1` -> `nvme0n1`, `sda1` -> `sda`; a whole disk comes back unchanged.
+
+    sysfs says which is which: a partition's `/sys/class/block/<name>` carries a `partition` file
+    and resolves into its disk's directory. Read from the kernel rather than parsed off the name,
+    because the naming differs per driver (`sda1`, `nvme0n1p1`, `mmcblk0p1`)."""
+    device_path = f"{SYS_CLASS_BLOCK_PATH}/{device_name}"
+    if not os.path.exists(f"{device_path}/partition"):
+        return device_name
+    return os.path.basename(os.path.dirname(os.path.realpath(device_path)))
+
+
+def read_sysfs_text(path: str) -> str:
+    """The stripped text of one sysfs attribute, '' when it is missing or unreadable."""
+    try:
+        with open(path) as attribute_file:
+            return attribute_file.read().strip()
+    except Exception:
+        return ""
+
+
+def host_is_a_virtual_machine() -> bool:
+    """True when the host runs under a hypervisor: its DMI vendor or product names one (QEMU/KVM,
+    DigitalOcean, EC2, GCE, Hyper-V, VMware, VirtualBox, Xen, OpenStack, ...), `/sys/hypervisor/type`
+    exists (Xen), or `/proc/cpuinfo` carries the `hypervisor` flag (every x86 hypervisor sets it).
+    Bare metal names its board maker (Supermicro, Dell, ASUS, Gigabyte) and has neither tell."""
+    for attribute in ("sys_vendor", "product_name"):
+        dmi_text = read_sysfs_text(f"{SYS_DMI_ID_PATH}/{attribute}").lower()
+        if dmi_text and any(marker in dmi_text for marker in VIRTUAL_MACHINE_DMI_MARKERS):
+            return True
+    if read_sysfs_text(SYS_HYPERVISOR_TYPE_PATH):
+        return True
+    return _cpuinfo_has_hypervisor_flag()
+
+
+def _cpuinfo_has_hypervisor_flag() -> bool:
+    """True when `/proc/cpuinfo` lists `hypervisor` among the CPU flags."""
+    for line in read_sysfs_text(PROC_CPUINFO_PATH).splitlines():
+        if line.startswith("flags") or line.startswith("Flags"):
+            flags = f" {line.split(':', 1)[-1]} "
+            return " hypervisor " in flags
+    return False
+
+
+def disk_is_virtual(disk: str) -> bool:
+    """True when a whole disk is a hypervisor's emulated one: named by a paravirtual driver
+    (`vd*`, `xvd*`), or its SCSI/ATA `device/vendor` + `device/model` says so (`QEMU HARDDISK`,
+    `DO Volume`, `VBOX HARDDISK`, `VMware Virtual disk`, `Msft Virtual Disk`, ...). A real disk
+    names its maker and model there (`ATA Samsung SSD 870`, `SEAGATE ST16000NM`)."""
+    if disk.startswith(VIRTUAL_DISK_PREFIXES):
+        return True
+    identity = " ".join(
+        read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/device/{attribute}")
+        for attribute in ("vendor", "model")
+    ).lower()
+    return any(marker in identity for marker in VIRTUAL_DISK_IDENTITY_MARKERS)
+
+
+def slaves_of(disk: str) -> list[str]:
+    """The kernel names under `/sys/class/block/<disk>/slaves/` - the devices a stacked one (LVM,
+    dm-crypt, md RAID) is built on; [] for a plain disk or when sysfs has no such directory."""
+    try:
+        return sorted(os.listdir(f"{SYS_CLASS_BLOCK_PATH}/{disk}/slaves"))
+    except Exception:
         return []
-    return [covering[0]]
+
+
+def slowest_disk_type(disk_types: list[str]) -> str:
+    """The type of a stacked device. Members that resolve to different kinds (hdd vs ssd vs nvme)
+    read ``unknown`` — a mixed stack has no single kind. Unknown members are skipped, so a stack is
+    unknown when none of its members resolves or when the resolved members differ. One resolved
+    kind, repeated, is that kind."""
+    known = {disk_type for disk_type in disk_types if disk_type != DISK_TYPE_UNKNOWN}
+    if len(known) == 1:
+        return known.pop()
+    return DISK_TYPE_UNKNOWN
+
+
+def disk_type_following_slaves(device_name: str, depth: int) -> str:
+    """`disk_type_of` for one device, recursing through its slaves; `depth` is how deep this call
+    already is in the stack."""
+    disk = whole_disk_of(device_name)
+    slaves = slaves_of(disk)
+    if slaves:
+        if depth >= STACKED_DEVICE_MAX_DEPTH:
+            return DISK_TYPE_UNKNOWN
+        return slowest_disk_type(
+            [disk_type_following_slaves(slave, depth + 1) for slave in slaves]
+        )
+    if disk.startswith(UNTYPED_DEVICE_PREFIXES) or disk_is_virtual(disk):
+        return DISK_TYPE_UNKNOWN
+    if disk.startswith("nvme"):
+        return DISK_TYPE_NVME
+    rotational = read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/queue/rotational")
+    if rotational == "0":
+        return DISK_TYPE_SSD
+    if rotational == "1":
+        return DISK_TYPE_HDD
+    return DISK_TYPE_UNKNOWN
+
+
+def disk_type_of(device_name: str | None) -> str:
+    """nvme | ssd | hdd | unknown for the physical disk(s) behind a block device name.
+
+    A partition is walked up to its whole disk. A stacked device (LVM / dm-crypt `dm-*`, md RAID
+    `md*`) is followed through `slaves/` down to the physical disks: one resolved kind, repeated,
+    is that kind; different resolved kinds, or none, is unknown. `nvme*` is NVMe by name; anything
+    else is what the kernel's `queue/rotational` flag says: 0 is a solid-state disk, 1 a spinning
+    one. A virtual machine's disk, a device with no physical disk behind it (loop, nbd), a missing
+    sysfs entry or any other reading is unknown - never a default of one of the three."""
+    if not device_name or host_is_a_virtual_machine():
+        return DISK_TYPE_UNKNOWN
+    return disk_type_following_slaves(device_name, 0)
+
+
+def get_docker_root_disk_type() -> str:
+    """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+    with open(HOST_MOUNTS_PATH) as mounts_file:
+        mounts_text = mounts_file.read()
+    return disk_type_of(block_device_holding(mounts_text, docker_root_dir))
 
 
 def write_probe_failure_reason(errno_value) -> str:
@@ -1819,6 +1958,12 @@ def get_machine_specs():
         data["hard_disk_docker_scrape_error"] = repr(exc)
 
     try:
+        data["data_hard_disk"]["hard_disk_disk_type"] = get_docker_root_disk_type()
+    except Exception:
+        # a mount table the scrape cannot read is an unknown disk, not a lost hard_disk block
+        data["data_hard_disk"]["hard_disk_disk_type"] = DISK_TYPE_UNKNOWN
+
+    try:
         data["data_disk_health"] = get_disk_health().as_payload()
     except Exception as exc:
         data["data_disk_health_scrape_error"] = repr(exc)
@@ -1838,7 +1983,7 @@ def get_machine_specs():
         data["kernel_scrape_error"] = repr(exc)
 
     
-    data["data_network"] = benchmark_network_speed()
+    data["data_network"] = {}
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",

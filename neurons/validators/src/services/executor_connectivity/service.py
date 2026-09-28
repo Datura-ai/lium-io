@@ -75,6 +75,9 @@ class ExecutorConnectivityService:
                 status=verification.status,
                 error=verification.error,
                 elapsed_sec=time.monotonic() - t1,
+                dind_error=verification.dind_error,
+                probe_tier=verification.probe_tier,
+                declared_port_count=verification.declared_port_count,
             )
 
             return result

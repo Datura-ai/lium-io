@@ -41,6 +41,7 @@ STUBS = {
         case "$1 $2" in
             "version --format") echo "${STUB_DOCKER_VERSION:-28.5.2}" ;;
             "ps ") exit 0 ;;
+            "ps -a") echo "${STUB_STOPPED_POD:-}" ;;   # every container, stopped ones too
             "ps --filter") echo "${STUB_PORT_CONTAINER:-executor-1}" ;;
             "info ") echo " Runtimes: io.containerd.runc.v2 nvidia runc sysbox-runc" ;;   # the "already working?" probe of install mode
             "info --format")
@@ -64,7 +65,8 @@ STUBS = {
     ),
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
-    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t0.6.6\\n\\tcommit:\\tabc123\\n"\n',
+    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
+    "fusermount3": "#!/bin/bash\nexit 0\n",
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -546,7 +548,22 @@ def test_env_file_in_the_working_directory_is_ignored_when_piped_from_curl(tmp_p
 def test_sysbox_installed_registered_and_running_passes(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_sysbox")
     assert rc == 0
-    assert "PASS sysbox-runc 0.6.6 runs a container." in out
+    assert "PASS sysbox-runc 0.7.1 runs a container." in out
+
+
+def test_sysbox_older_than_the_pinned_version_is_a_fix(tmp_path):
+    # DAH-3833: 0.6.6 still runs small containers, so without this --check stays green on a node that fails 44+ layer images
+    rc, out, fixes = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_VERSION": "0.6.6"})
+    assert rc == 1
+    assert fixes == 1
+    assert "FIX  sysbox-runc 0.6.6 is older than 0.7.1" in out
+    assert "nvidia_docker_sysbox_setup.sh" in out
+
+
+def test_sysbox_newer_than_the_pinned_version_passes(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_VERSION": "0.7.2"})
+    assert rc == 0
+    assert "PASS sysbox-runc 0.7.2 runs a container." in out
 
 
 def test_sysbox_missing_points_at_the_installer(tmp_path):
@@ -575,6 +592,45 @@ def test_sysbox_container_start_failure_is_a_fix(tmp_path):
     assert "docker run --rm --runtime=sysbox-runc alpine echo ok' fails" in out
 
 
+# ── fuse3 ───────────────────────────────────────────────────────────────────
+
+
+def test_fusermount3_present_passes(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_fuse3")
+    assert rc == 0
+    assert "PASS fusermount3 (fuse3), which sysbox-fs 0.7.1 needs." in out
+
+
+def test_fusermount3_missing_is_a_fix_that_names_fuse3(tmp_path):
+    # the sysbox-ce 0.7.1 .deb depends on fuse (v2) only; sysbox-fs calls fusermount3 and the postinst fails
+    rc, out, fixes = run_check(tmp_path, "check_fuse3", without=("fusermount3",))
+    assert rc == 1
+    assert fixes == 1
+    assert "FIX  fusermount3 is missing — sysbox-fs 0.7.1 needs fuse3" in out
+    assert "sudo apt-get install -y fuse3" in out
+
+
+def test_check_mode_reports_a_missing_fusermount3(tmp_path):
+    proc = run_script(tmp_path, "--check", without=("fusermount3",))
+    assert proc.returncode == 1
+    assert "FIX  fusermount3 is missing" in proc.stdout
+    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+
+
+def test_fuse3_is_installed_before_the_sysbox_deb():
+    with open(SCRIPT) as fh:
+        script = fh.read()
+    packages = script.index("apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1")
+    deb = script.index('apt_install install -y -qq "$SYSBOX_DEB" || exit 1')
+    assert packages < deb
+
+
+def test_diagnostics_name_a_missing_fusermount3(tmp_path):
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", without=("fusermount3",))
+    assert rc == 0
+    assert "fusermount3:         MISSING (apt-get install -y fuse3)" in out
+
+
 # ── the script as a provider runs it ─────────────────────────────────────────
 
 
@@ -582,7 +638,7 @@ def test_check_mode_on_a_good_host_exits_zero_with_a_summary(tmp_path):
     proc = run_script(tmp_path, "--check")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FIX  " not in proc.stdout
-    assert "Preflight: 12 PASS, 0 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 13 PASS, 0 FIX, 0 SKIP." in proc.stdout
 
 
 def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_path):
@@ -593,7 +649,7 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "FIX  NVIDIA container toolkit is not installed" in proc.stdout
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
-    assert "Preflight: 9 PASS, 2 FIX, 1 SKIP." in proc.stdout
+    assert "Preflight: 10 PASS, 2 FIX, 1 SKIP." in proc.stdout
     assert f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
 
 
@@ -623,6 +679,33 @@ def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
     assert "Nothing was installed." not in proc.stdout
     assert "Sysbox is already working. Nothing to do." in proc.stdout
     assert "FIX line(s) at the top" not in proc.stdout
+
+
+@pytest.mark.parametrize("installed", ["0.6.6", "0.6.7"])
+def test_install_mode_upgrades_an_older_working_sysbox(tmp_path, installed):
+    # DAH-3833: an older sysbox still runs small images, but 0.6.6 cannot start one with 44+ layers and
+    # both miss the runc container-escape fixes of 0.7.0; a re-run must upgrade it
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": installed})
+    assert f"Sysbox {installed} is installed; upgrading to 0.7.1." in proc.stdout
+    assert "Sysbox is already working. Nothing to do." not in proc.stdout
+    assert "Checking running containers" in proc.stdout
+
+
+def test_install_mode_stops_on_a_stopped_rental(tmp_path):
+    # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
+    assert proc.returncode == 1
+    assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
+    assert "docker ps -a --filter name=pod_" in proc.stdout
+    assert "pod_abc123" in proc.stdout
+    assert "Removing stopped containers" not in proc.stdout
+
+
+def test_install_mode_keeps_a_newer_sysbox(tmp_path):
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.7.2"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert "upgrading" not in proc.stdout
 
 
 @pytest.mark.parametrize(
@@ -662,7 +745,7 @@ def test_check_mode_still_exits_one_on_an_advisory_fix(tmp_path):
     proc = run_script(tmp_path, "--check", env={"STUB_NV_DRIVER": "575.57.08"})
     assert proc.returncode == 1
     assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in proc.stdout
-    assert "Preflight: 11 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
     assert "do not stop the install" not in proc.stdout
     # the installer never installs a driver: pointing at it is the reinstall loop of ticket-0309
     script = tmp_path / "executor" / "nvidia_docker_sysbox_setup.sh"
@@ -712,3 +795,42 @@ def test_help_lists_check_and_exits_zero(tmp_path):
     proc = run_script(tmp_path, "--help")
     assert proc.returncode == 0
     assert "--check" in proc.stdout
+
+
+# ── failure diagnostics (the block printed when the verify container does not start) ─────────
+
+
+def test_diagnostics_print_false_for_a_feature_the_installer_set_to_false(tmp_path):
+    """Regression: `jq '.features.cdi // "not set"'` printed "not set" for `false`, the one value
+    this installer writes, so the block said the setting was missing on a host that had it."""
+    rc, out, _ = run_check(
+        tmp_path,
+        "failure_diagnostics",
+        files={"etc/docker/daemon.json": '{"features": {"cdi": false}}\n'},
+        with_jq=True,
+    )
+    assert rc == 0
+    assert "daemon.json cdi:     false" in out
+    assert "daemon.json time-ns: not set" in out
+
+
+def test_diagnostics_say_when_there_is_no_daemon_json(tmp_path):
+    """Regression: with no daemon.json the two lines were blank (jq's error went to /dev/null)."""
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", files={"etc/docker/daemon.json": None}, with_jq=True)
+    assert rc == 0
+    assert "daemon.json cdi:     no daemon.json" in out
+    assert "daemon.json time-ns: no daemon.json" in out
+
+
+def test_diagnostics_print_the_sysbox_runc_version_not_its_name(tmp_path):
+    """Regression: `sysbox-runc --version | head -1` is the line "sysbox-runc"; the version is on a later line."""
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics")
+    assert rc == 0
+    assert "sysbox-runc:         0.7.1" in out
+    assert "sysbox-runc:         sysbox-runc" not in out
+
+
+def test_diagnostics_say_not_found_without_sysbox_runc(tmp_path):
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", without=("sysbox-runc",))
+    assert rc == 0
+    assert "sysbox-runc:         not found" in out

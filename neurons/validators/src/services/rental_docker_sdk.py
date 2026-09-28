@@ -16,7 +16,10 @@ from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 
-DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
+# 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
+# A stuck pull looks like a slow pull, so only this deadline stops it.
+DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 60 * 60
+_REGISTRY_DIGEST_TIMEOUT_SECONDS = 10
 _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
@@ -54,6 +57,30 @@ class RentalDockerConnectionError(RuntimeError):
 
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class RentalDockerContainerRestartingError(RentalDockerOperationError):
+    """The workload container kept restarting for the whole exec retry budget (DAH-3593).
+
+    Docker answers every exec on a restarting container with the same 409, which says nothing
+    about why the workload keeps exiting. The message here names the container state and its last
+    exit code instead, so the reader sees the cause (a workload image that crashes at start on this
+    node) rather than the daemon's conflict text. The container's own log line is NOT included: the
+    text lands in the create failure the backend's GPU-fault check reads, and a renter image must
+    not be able to print its way into a provider fault (review, taiberium 21 Sep).
+    """
+
+
+def is_docker_not_found_error(exc: BaseException) -> bool:
+    """True when the exception, or any cause under it, is a Docker 404 (no such container/volume)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, Exception) and _is_docker_not_found_error(current):
+            return True
+        current = current.__cause__  # explicit `raise ... from` links only
+    return False
 
 
 def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
@@ -155,6 +182,42 @@ class _ContainerExecReadiness:
     detail: str
 
 
+@dataclass(slots=True)
+class ContainerStateSnapshot:
+    """`docker inspect` State plus RestartCount, read once at a moment of interest."""
+
+    status: str | None
+    running: bool
+    restarting: bool
+    exit_code: int | None
+    restart_count: int
+    error: str | None
+    oom_killed: bool
+
+    @property
+    def killed_by_host(self) -> bool:
+        """The kernel OOM killer or a SIGKILL (exit 137) ended it, not the image's own command."""
+        return self.oom_killed or self.exit_code == 137
+
+    @property
+    def exited_since_start(self) -> bool:
+        """The container's main process has ended at least once since `docker run`.
+
+        Not running now (exited/dead/removing), mid-restart, or running again after Docker's
+        restart policy brought it back (RestartCount > 0). A `created` container never started,
+        so it is not an exit.
+        """
+        if self.restarting or self.restart_count > 0:
+            return True
+        return not self.running and (self.status or "").lower() != "created"
+
+    def describe(self) -> str:
+        return (
+            f"status={self.status!r} running={self.running!r} restarting={self.restarting!r} "
+            f"exit_code={self.exit_code!r} restart_count={self.restart_count!r} error={self.error!r}"
+        )
+
+
 class RentalDockerSdkClient:
     def __init__(
         self,
@@ -215,6 +278,30 @@ class RentalDockerSdkClient:
             ) from exc
         return True
 
+    async def local_image_is_current(
+        self, *, image: str, auth_config: dict[str, str] | None = None
+    ) -> bool:
+        """True when the local image has the digest that the registry has now for this tag."""
+        if "@sha256:" in image:
+            return True  # a digest reference cannot move
+        try:
+            local_image = await _in_docker_thread(self._api_client.inspect_image, image)
+            distribution = await asyncio.wait_for(
+                _in_docker_thread(
+                    self._api_client.inspect_distribution, image, auth_config=auth_config
+                ),
+                timeout=_REGISTRY_DIGEST_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK registry digest check failed", exc)
+            ) from exc
+        remote_digest = distribution["Descriptor"]["digest"]
+        return any(
+            repo_digest.endswith(f"@{remote_digest}")
+            for repo_digest in local_image.get("RepoDigests") or ()
+        )
+
     async def run_container(self, spec: ContainerRunSpec) -> None:
         try:
             await _in_docker_thread(self._run_container_sync, spec)
@@ -269,9 +356,27 @@ class RentalDockerSdkClient:
                 await asyncio.sleep(delay_seconds)
 
         assert last_restart_error is not None
-        raise RentalDockerOperationError(
-            _wrap_error_message("Docker SDK exec failed", last_restart_error)
+        # DAH-3593: the 409 text hides the cause, so the container's state leads. Docker's own text
+        # stays in the message: the backend recognises a renter image that exits at start by its
+        # `is restarting` (IMAGE_EXITED_MARKERS) and must not blame the provider for it.
+        detail = await _in_docker_thread(
+            self._describe_restarting_container_sync, spec.container_name
+        )
+        raise RentalDockerContainerRestartingError(
+            f"container restarting, {detail}; "
+            f"{_wrap_error_message('Docker SDK exec failed', last_restart_error)}"
         ) from last_restart_error
+
+    def _describe_restarting_container_sync(self, container_name: str) -> str:
+        """`exit_code=N` for a container Docker keeps restarting; best effort. Only the daemon's
+        exit code, never the container's log output: the message reaches the backend's failure
+        detail, which the GPU-fault check reads."""
+        try:
+            state = self._api_client.inspect_container(container_name).get("State") or {}
+            exit_code = state.get("ExitCode")
+        except Exception:
+            exit_code = None
+        return f"exit_code={exit_code}"
 
     async def start(self, *, container_name: str) -> None:
         await self._call_api(
@@ -305,6 +410,33 @@ class RentalDockerSdkClient:
             force=force,
             v=remove_volumes,
         )
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        try:
+            return await _in_docker_thread(self._inspect_container_state_sync, container_name)
+        except RentalDockerOperationError:
+            raise
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+
+    async def container_status(self, *, container_name: str) -> str | None:
+        """Return the container's ``State.Status`` (``running``, ``exited``, ``removing``, …), or
+        None when dockerd no longer knows the name (404)."""
+        try:
+            inspect_result = await _in_docker_thread(
+                self._api_client.inspect_container, container_name
+            )
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+        state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
+        status = state.get("Status") if isinstance(state, dict) else None
+        return str(status).lower() if status else ""
 
     async def mount_source_for_destination(
         self,
@@ -444,6 +576,23 @@ class RentalDockerSdkClient:
             ready=ready,
             terminal=terminal,
             detail=_format_container_state_detail(state),
+        )
+
+    def _inspect_container_state_sync(self, container_name: str) -> ContainerStateSnapshot:
+        info = self._api_client.inspect_container(container_name)
+        state = info.get("State") if isinstance(info, dict) else None
+        if not isinstance(state, dict):
+            raise RentalDockerOperationError("Docker inspect did not include container State")
+        exit_code = state.get("ExitCode")
+        restart_count = info.get("RestartCount")
+        return ContainerStateSnapshot(
+            status=state.get("Status"),
+            running=bool(state.get("Running")),
+            restarting=bool(state.get("Restarting")),
+            exit_code=int(exit_code) if isinstance(exit_code, int) else None,
+            restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
+            error=state.get("Error") or None,
+            oom_killed=bool(state.get("OOMKilled")),
         )
 
     def _mount_source_for_destination_sync(
@@ -762,74 +911,22 @@ def build_remove_authorized_keys_exec_spec(
     )
 
 
-def _environment_file_text(environment: dict[str, str] | None) -> str:
-    """The `/etc/environment` lines a rental's custom environment appends ('' when there are none)."""
-    env_lines = [
-        f"{key}={value}"
-        for key, value in (environment or {}).items()
-        if key and value and key.strip() and str(value).strip()
-    ]
-    return "".join(f"{line}\n" for line in env_lines)
-
-
 def build_environment_exec_spec(
     *,
     container_name: str,
     environment: dict[str, str] | None,
 ) -> ContainerExecSpec | None:
-    env_text = _environment_file_text(environment)
-    if not env_text:
+    env_lines = [
+        f"{key}={value}"
+        for key, value in (environment or {}).items()
+        if key and value and key.strip() and str(value).strip()
+    ]
+    if not env_lines:
         return None
     return ContainerExecSpec(
         container_name=container_name,
         argv=("sh", "-c", "cat >> /etc/environment"),
-        stdin=env_text,
-    )
-
-
-# The exec-process variable that carries the renter's environment lines into the combined exec.
-ENVIRONMENT_LINES_EXEC_VAR = "LIUM_ENVIRONMENT_LINES"
-# Linux refuses a single environment string above MAX_ARG_STRLEN (128 KiB) at execve; a renter
-# environment larger than this stays on the stdin-based exec of its own.
-MAX_ENVIRONMENT_EXEC_VAR_BYTES = 64 * 1024
-
-
-def environment_fits_exec_variable(environment: dict[str, str] | None) -> bool:
-    """True when the renter's /etc/environment lines may ride in the combined keys exec."""
-    return len(_environment_file_text(environment).encode()) <= MAX_ENVIRONMENT_EXEC_VAR_BYTES
-
-
-def build_authorized_keys_and_environment_exec_spec(
-    *,
-    container_name: str,
-    public_keys: list[str] | tuple[str, ...],
-    environment: dict[str, str] | None,
-    target_path: str = "/root/.ssh/authorized_keys",
-) -> ContainerExecSpec:
-    """DAH-3258: the authorized_keys exec and the /etc/environment exec as ONE `docker exec`.
-
-    The keys travel on stdin exactly as in `build_authorized_keys_exec_spec`; the environment
-    lines travel as an exec-process variable (the SDK sends only its NAME to the log, as it sends
-    only the stdin size), so no renter value lands in argv or in a log line. Without environment
-    lines the spec is the keys spec itself. The caller checks `environment_fits_exec_variable`
-    first: lines above MAX_ENVIRONMENT_EXEC_VAR_BYTES keep their own stdin-based exec.
-    """
-    keys_spec = build_authorized_keys_exec_spec(
-        container_name=container_name, public_keys=public_keys, target_path=target_path
-    )
-    env_text = _environment_file_text(environment)
-    if not env_text:
-        return keys_spec
-    keys_script = keys_spec.argv[2]
-    return ContainerExecSpec(
-        container_name=container_name,
-        argv=(
-            "sh",
-            "-c",
-            f'{keys_script} && printf \'%s\' "${ENVIRONMENT_LINES_EXEC_VAR}" >> /etc/environment',
-        ),
-        stdin=keys_spec.stdin,
-        environment={ENVIRONMENT_LINES_EXEC_VAR: env_text},
+        stdin="".join(f"{line}\n" for line in env_lines),
     )
 
 
@@ -872,6 +969,10 @@ def _create_docker_api_client_with_rental_ssh_adapter(
         docker_api_client.SSHHTTPAdapter = original_adapter
 
 
+# The Docker SDK SSH session idles through a long build, so it needs a keepalive.
+RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+
+
 def _build_rental_ssh_http_adapter_class(
     *,
     key_path: Path,
@@ -880,6 +981,12 @@ def _build_rental_ssh_http_adapter_class(
     from docker.transport.sshconn import SSHHTTPAdapter
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _connect(self) -> None:
+            super()._connect()
+            transport = self.ssh_client.get_transport() if self.ssh_client else None
+            if transport is not None:
+                transport.set_keepalive(RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC)
+
         def _create_paramiko_client(self, base_url):
             import logging
             import urllib.parse

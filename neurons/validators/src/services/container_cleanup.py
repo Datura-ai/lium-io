@@ -1,7 +1,7 @@
 import logging
 import re
 import shlex
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import asyncssh
 
@@ -68,8 +68,13 @@ class ContainerCleanup:
         ssh_client,
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
+        on_before_remove: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[int, list[str], list[str]]:
         """Remove containers that are not in rented data and are older than threshold.
+
+        ``on_before_remove(container_name)`` is awaited right before each removal (DAH-3338: the
+        check queues the reap for the backend first, so a crash between the removal and the report
+        does not lose it). It must not raise; an error inside it is the caller's to swallow.
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -113,6 +118,8 @@ class ContainerCleanup:
                         )
                         continue
 
+                    if on_before_remove is not None:
+                        await on_before_remove(stripped_name)
                     if await self._remove_container(ssh_client, stripped_name):
                         removed_names.append(stripped_name)
                         logger.info(
@@ -529,7 +536,13 @@ class ContainerCleanup:
             return None
 
     async def _remove_container(self, ssh_client, container_name: str) -> bool:
-        """Remove a container and its associated resources."""
+        """Remove a container and its associated resources.
+
+        True once the container itself is gone. The pod volume removal after it is best-effort:
+        an error there is logged and does not turn a removed container into an unremovable one —
+        the caller reads False as "still on the host" (the port check names it, DAH-3338 drops its
+        reaped report), and both would be wrong about a container `docker rm` already took.
+        """
         try:
             # Remove stale containers together with anonymous Docker volumes.
             result = await ssh_client.run(DockerCommand.remove_with_volumes(container_name))
@@ -559,14 +572,6 @@ class ContainerCleanup:
                         )
                     )
                     return False
-
-            # Remove associated volume if it's a pod container
-            if container_name.startswith(POD_CONTAINER_PREFIX):
-                pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
-                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
-
-            return True
-
         except Exception as e:
             logger.warning(
                 _m(
@@ -575,3 +580,18 @@ class ContainerCleanup:
                 )
             )
             return False
+
+        # Remove associated volume if it's a pod container
+        if container_name.startswith(POD_CONTAINER_PREFIX):
+            pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
+            try:
+                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
+            except Exception as e:
+                logger.warning(
+                    _m(
+                        f"Removed container {container_name} but not its volume",
+                        extra={"container_name": container_name, "volume": f"volume_{pod_id}", "error": str(e)},
+                    )
+                )
+
+        return True

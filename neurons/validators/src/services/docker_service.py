@@ -10,9 +10,10 @@ import secrets
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 from uuid import UUID, uuid4
 
 import asyncssh
@@ -112,14 +113,15 @@ from services.rental_docker_sdk import (
     PortBinding,
     RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
+    RentalDockerContainerRestartingError,
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
-    build_authorized_keys_and_environment_exec_spec,
+    build_authorized_keys_exec_spec,
     build_container_command_argv,
+    is_docker_not_found_error,
     build_environment_exec_spec,
-    environment_fits_exec_variable,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
 )
@@ -161,14 +163,47 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 # that hold GPUs and brick the executor.
 CONTAINER_STOP_GRACE_SECONDS = 30
 
+# DAH-3467: dockerd answers a force-remove only once the rw layer is unlinked, and that can outlive
+# the Docker SDK's 60 s read timeout (prod, 12-14 Sep: 13 deletes, all of them gone by the time the
+# backend retried 9-19 min later). A read timeout therefore says "no answer yet", not "failed": the
+# container is inspected by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS; only a 404 counts as gone.
+REMOVE_CONFIRM_TIMEOUT_SECONDS = 60.0
+REMOVE_CONFIRM_POLL_SECONDS = 5.0
+# one inspect over the same Docker-over-SSH client; shorter than the SDK's own 60 s read timeout
+REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS = 15.0
+# dockerd's State.Status while it tears the container down (kill is bounded to ~20 s inside dockerd
+# and fails loudly with "did not receive an exit event", so a >60 s remove is in this phase)
+_DOCKER_REMOVING_STATUS = "removing"
+# The inspect 404 can arrive before dockerd has released the container's named-volume references,
+# so the volume removes that follow can fail with "volume is in use" while the backend closes the
+# pod on our success. On that path a named volume still in use is retried this many times, this far
+# apart. Still in use after that, the volume is left on the host and logged, as any other volume
+# error is: the container is gone, and a DeletionInProgress here would count against the backend's
+# three delete attempts (POD_DELETE_MAX_ATTEMPTS) and end in a penalty for a node that did remove
+# the container (review round 4).
+REMOVE_CONFIRM_VOLUME_ATTEMPTS = 6
+REMOVE_CONFIRM_VOLUME_RETRY_SECONDS = 5.0
+_DOCKER_VOLUME_IN_USE_PHRASE = "volume is in use"
+# How long a pod stays in pending_deletions with no delete completing for it. The backend re-asks a
+# DeletionInProgress from its retry sweep every 10 min and gives up after three attempts, so a marker
+# older than this has no re-ask coming; a probe pod's delete (rental_probe._teardown, a fresh pod id
+# each run) is never re-asked at all. Evicted on the next mark or lookup.
+PENDING_DELETION_TTL_SECONDS = 3600.0
+
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
-# compute-app) and starts the rent anyway on timeout. This grace must stay strictly below that
+# the backend) and starts the rent anyway on timeout. This grace must stay strictly below that
 # budget with room for the forced removal and the stopped-callback, so a SIGTERM-ignoring filler
 # can never burn the whole budget inside docker stop and hold the GPUs into the customer rent.
 # Half the budget leaves ~15s of headroom while still letting a well-behaved filler exit cleanly
-# and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
+# and avoid the containerd/sysbox wedge. Keep in sync with the backend FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
+
+# DAH-3706: typed event written when a `filler_*` container is still on the host after a
+# customer create's `docker rm -fv`. Same name as the backend's FILLER_STILL_RUNNING_EVENT so one
+# log query counts both halves. Join key: `executor_uuid` (the validator-side id; the backend's rent
+# path writes it too -- its `executor_id` is the backend's DB row id), plus pod_name, container_names, reason.
+FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
@@ -217,6 +252,15 @@ def _s3fs_plugin_alias(volume_name: str) -> str:
 # DAH-2496: sysbox installers reserve one 65536-wide subuid slice per host and map
 # every container's root to its base. A wider range is handed out per container.
 SYSBOX_SUBUID_SLICE_SIZE = 65536
+
+# DAH-3521: the iptables comment on every DNS ACCEPT a custom build adds to the host
+# DOCKER-USER chain. One word, no spaces: `iptables -S` then prints it unquoted and
+# `_egress_filter_script` can purge every tagged rule for a DinD IP by text match,
+# whatever resolver the rule names.
+DIND_DNS_RULE_TAG = "lium-dind-dns"
+# Bound on one readiness probe (`docker exec <dind> docker info`) of the custom-build
+# DinD; the number of probes is CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS.
+DIND_READY_PROBE_MAX_SECONDS = 10
 
 # DAH-1991: tolerate concurrent health_check_* / container_* on the executor.
 # Probe TTL is short (~30s); same-command retry within a 90s budget covers the
@@ -273,6 +317,8 @@ class _VolumeEncryptionState(enum.Enum):
 
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
+_DOCKER_READ_TIMEOUT_PHRASE = "read timed out"
+_DOCKER_READ_TIMEOUT_EXCEPTION_NAMES = frozenset({"ReadTimeout", "ReadTimeoutError"})
 # DAH-2991: dockerd sent SIGKILL but containerd never reported the task gone — the process is wedged
 # (uninterruptible I/O). `docker rm -f` fails the same way on every retry; only a direct kill of the
 # init and its shim over SSH gets past it (ticket-0287: 4 backend deletes, 5 h at score 0).
@@ -355,12 +401,24 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
     try:
         yield
     except Exception as exc:
-        log.error(
-            "delete_container post-teardown step failed (non-fatal)",
-            step=step,
-            error=str(exc),
-            **fields,
-        )
+        # DAH-3593: a volume or container that was already gone is INFO (the delete is idempotent
+        # by design, DAH-2345). Any other step failing here — Redis, the inspector stop, a GPU
+        # sweep — is still a WARNING: nothing else logs it.
+        if is_docker_not_found_error(exc):
+            log.info(
+                "delete_container post-teardown step failed (non-fatal)",
+                step=step,
+                reason="already_gone",
+                error=str(exc),
+                **fields,
+            )
+        else:
+            log.warning(
+                "delete_container post-teardown step failed (non-fatal)",
+                step=step,
+                error=str(exc),
+                **fields,
+            )
 
 
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
@@ -505,8 +563,213 @@ def _exception_texts(exc: Exception) -> list[str]:
     return texts
 
 
+# DAH-2211 follow-up: how much of a failed custom build's output travels with the failure. The renter
+# wrote the Dockerfile, so its build output is theirs to see; the cap keeps the wire message small.
+CUSTOM_BUILD_LOG_TAIL_LINES = 25
+CUSTOM_BUILD_LOG_TAIL_MAX_CHARS = 2000
+# The build command's own exit-code marker on stderr (`echo BUILD_FAILED_RC=$rc >&2`): the streamer's
+# failure signal, not a build line, so it never counts toward the renter's tail.
+CUSTOM_BUILD_FAILED_MARKER = "BUILD_FAILED_RC="
+# What execute_and_stream_logs returns as stderr when asyncio.wait_for fires — that text alone: the
+# process's own stderr is dropped with the cancelled stream. A failed build that PRINTED "process timed
+# out" comes back with its tail and the BUILD_FAILED_RC= marker around it, so it is not a timeout.
+STREAM_TIMEOUT_STDERR = "Process timed out"
+# `docker save | docker load` fails on the HOST daemon's side (its paths, its disk); that stderr is
+# for ops, the renter's tail gets this fixed line.
+CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the executor"
+# stderr with no BUILD_FAILED_RC= marker: the build script never finished and the text is the host
+# daemon's `docker exec` error, so the renter gets this fixed line.
+CUSTOM_BUILD_INTERRUPTED_REASON = "build container stopped before the build finished"
+# The build's exit code round-trips through a file in the DinD container's /tmp. When that file
+# cannot be written or read (the overlay is full or read-only) the build is treated as failed and
+# this line ends its tail, so the renter and the tests see WHY rather than `[: Illegal number:`.
+CUSTOM_BUILD_RC_UNREADABLE_REASON = (
+    "build exit code could not be read back (the build container could not write to /tmp); "
+    "the build is treated as failed"
+)
+# Paths inside the DinD container. Tests patch these; production keeps them under /tmp, outside /build.
+CUSTOM_BUILD_LOG_FILE = "/tmp/lium-build.log"
+CUSTOM_BUILD_RC_FILE = "/tmp/lium-build.rc"
+
+
+class CustomBuildOutcome(NamedTuple):
+    """What `_custom_build_image` returns: `ok`, the `failure_step` name and the renter-facing `log_tail`
+    (None, None on success)."""
+
+    ok: bool
+    failure_step: str | None
+    log_tail: str | None
+
+
+def custom_build_log_tail(output: str | None) -> str | None:
+    """The last CUSTOM_BUILD_LOG_TAIL_LINES non-empty lines of a build's output, cut to
+    CUSTOM_BUILD_LOG_TAIL_MAX_CHARS from the end (the error is at the bottom). The BUILD_FAILED_RC=
+    marker line is dropped before the cap, so a failed build yields 25 build lines, not 24 and the
+    marker. None when there is nothing."""
+    lines = [
+        line.rstrip()
+        for line in (output or "").splitlines()
+        if line.strip() and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+    ]
+    if not lines:
+        return None
+    tail = "\n".join(lines[-CUSTOM_BUILD_LOG_TAIL_LINES:])
+    return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
+
+
+def stream_timed_out(err: str | None) -> bool:
+    """True only when stderr is the streamer's own timeout sentinel and nothing else."""
+    return (err or "").strip().lower() == STREAM_TIMEOUT_STDERR.lower()
+
+
+def custom_build_inner_command(image_tag: str, ctx: str) -> str:
+    """The `sh -c` body that runs `docker build` inside the DinD container. Build output goes to
+    stdout (the streamer's success lines) and to CUSTOM_BUILD_LOG_FILE; on a non-zero exit the last
+    CUSTOM_BUILD_LOG_TAIL_LINES non-blank lines of that file go to stderr, then the
+    BUILD_FAILED_RC=<rc> marker; the exit code is the build's (no pipefail needed: it is read
+    back from CUSTOM_BUILD_RC_FILE). An rc file that cannot be written or read makes the build a
+    failure (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit`
+    that reads as success. No single quotes, so the caller's shlex.quote keeps the text verbatim."""
+    return (
+        f"{{ docker build --progress=plain --pull "
+        f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {CUSTOM_BUILD_RC_FILE}; }} "
+        f"| tee {CUSTOM_BUILD_LOG_FILE}; rc=$(cat {CUSTOM_BUILD_RC_FILE} 2>/dev/null); "
+        'if [ -z "$rc" ]; then rc=1; rc_lost=1; fi; '
+        f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {CUSTOM_BUILD_LOG_FILE} '
+        f"| tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} >&2; "
+        f'if [ -n "$rc_lost" ]; then echo "{CUSTOM_BUILD_RC_UNREADABLE_REASON}" >&2; fi; '
+        f"echo {CUSTOM_BUILD_FAILED_MARKER}$rc >&2; fi; exit $rc"
+    )
+
+
+# DAH-3505: the create steps whose exception text is the Docker daemon's own reason for the
+# volume (size, plugin, disk, or the SDK's transport) and carries no executor host data.
+VOLUME_STEP_NAMES = frozenset({"volume_sizing", "volume_creation"})
+VOLUME_STEP_DETAIL_MAX_CHARS = 300
+# docker-py's SSH transport stack (urllib3 over a paramiko channel) raises these once the session
+# under the Docker SDK client is gone; the text alone reads like a code bug, so the detail says what
+# it means.
+DEAD_DOCKER_SSH_SESSION_MARKERS = (
+    "has no attribute 'settimeout'",
+    "SSH session not active",
+    "Socket is closed",
+)
+DEAD_DOCKER_SSH_SESSION_HINT = (
+    "the Docker connection to the executor dropped while the pod was being prepared"
+)
+
+
+def _exception_text_on_one_line(exc: BaseException) -> str:
+    """The exception's text on one line, whitespace collapsed."""
+    return " ".join(str(exc).split())
+
+
+def _is_dead_docker_ssh_session(exc: BaseException) -> bool:
+    text = _exception_text_on_one_line(exc)
+    return any(marker in text for marker in DEAD_DOCKER_SSH_SESSION_MARKERS)
+
+
+def volume_step_detail(exc: BaseException) -> str | None:
+    """One bounded line saying why the volume step failed, or None when the exception has no text.
+    A dead Docker SDK transport gets a plain-language hint in front of the raw error."""
+    text = _exception_text_on_one_line(exc)
+    if not text:
+        return None
+    if _is_dead_docker_ssh_session(exc):
+        text = f"{DEAD_DOCKER_SSH_SESSION_HINT}: {text}"
+    return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
+
+
+def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
+    """Volume steps return the daemon reason via volume_step_detail. Other steps return
+    DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
+    if current_step in VOLUME_STEP_NAMES:
+        return volume_step_detail(exc)
+    if isinstance(exc, CustomBuildFailed):
+        return None
+    if _is_dead_docker_ssh_session(exc):
+        return DEAD_DOCKER_SSH_SESSION_HINT
+    return None
+
+
+class CustomBuildFailed(Exception):
+    """A custom-Dockerfile build did not produce an image. `failure_step` is the CCF step
+    (docker_build, build_timeout, build_dind_start, ...); `log_tail` is what the build printed last,
+    or a one-line reason for the setup steps, so the failure says WHY and not only WHERE.
+
+    `str()` carries the step only. The tail is renter-controlled output and the backend classifies
+    the CCF `detail` for GPU quarantine (`classify_gpu_runtime_error(msg.detail or msg.msg)`), so it
+    travels in `build_log_tail` alone; the validator's own log line carries its size, not its text
+    (a build line can hold a credential the renter wrote)."""
+
+    def __init__(self, failure_step: str, log_tail: str | None):
+        self.failure_step = failure_step
+        self.log_tail = log_tail
+        super().__init__(f"Custom dockerfile build failed (failure_step={failure_step})")
+
+
+def _last_attempt_exception(exc: Exception) -> BaseException:
+    """The exception itself, or the last attempt's when tenacity wrapped it in a RetryError."""
+    if isinstance(exc, RetryError):
+        last_exception = exc.last_attempt.exception()
+        if last_exception is not None:
+            return last_exception
+    return exc
+
+
 class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
+
+
+class ImageExitedDuringKeyInjection(Exception):
+    """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
+
+
+async def _explain_add_public_keys_failure(
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    image: str,
+    cause: Exception,
+    log_extra: dict,
+) -> Exception:
+    """The exception to raise for a failed `add_public_keys` step: the DAH-2624 explanation when the
+    container has exited or restarted since `docker run`, otherwise `cause` unchanged.
+
+    DAH-3678: the backend picks the renter-facing "image has no long-running process" text from
+    markers in this failure text (`is not running`, `is restarting`, `status='exited'` …). Only the
+    failures whose exec happened to hit Docker's 409 or the readiness poll carried one; an exec that
+    the exit itself killed (non-zero exit_status, empty stderr) read as the generic step failure —
+    6 of 8 on 19 Sep for one renter's `nvidia/cuda` templates. Every failure of the step now looks
+    at the container, which cleanup has not removed yet.
+    """
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+    except Exception as inspect_exc:
+        logger.warning(
+            _m(
+                "Could not inspect the container after a failed SSH-key injection",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "error": str(inspect_exc),
+                }),
+            )
+        )
+        return cause
+    if not state.exited_since_start or state.killed_by_host:
+        return cause
+    if state.running:
+        # Docker's restart policy already brought it back; the exec landed in the gap.
+        situation = f"Docker is restarting it ({state.describe()})"
+    else:
+        situation = f"the container is not running ({state.describe()})"
+    return ImageExitedDuringKeyInjection(
+        f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
+        f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
+        "SSH keys were being installed; a pod needs a long-running process, for example a start "
+        f"command such as `sleep infinity`. Exec error: {cause}"
+    )
 
 
 class _EditSwap:
@@ -712,6 +975,51 @@ class _InflightCreateRegistry:
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
 
+
+class _PendingDeletionRegistry:
+    """Pods whose last delete answered DeletionInProgress and has not completed since.
+
+    DAH-3467 (review): the backend re-asks a delete that answered DeletionInProgress (the container
+    still removing after the read timeout). The re-ask finds the container already absent ("No such
+    container"), which is not the inspect-confirmed path, so without this marker a "volume is in use"
+    on the volume remove would get the one best-effort attempt and the pod would close over a volume
+    dockerd was about to release. A pod marked here keeps its volume cleanup on the retried path until
+    a delete for it completes.
+
+    Entries expire after PENDING_DELETION_TTL_SECONDS (review round 4): a delete the backend gave up
+    on, or a probe pod's, is never re-asked, and without the expiry every such pod id stayed for the
+    life of the process. Expired entries are dropped on the next ``mark`` or ``is_pending``.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._marked_at: dict[str, float] = {}
+
+    def _evict_expired(self) -> None:
+        cutoff = self._clock() - PENDING_DELETION_TTL_SECONDS
+        for pod_id in [pod_id for pod_id, at in self._marked_at.items() if at < cutoff]:
+            del self._marked_at[pod_id]
+
+    def mark(self, pod_id: str) -> None:
+        self._evict_expired()
+        self._marked_at[pod_id] = self._clock()
+
+    def is_pending(self, pod_id: str) -> bool:
+        self._evict_expired()
+        return pod_id in self._marked_at
+
+    def clear(self, pod_id: str) -> None:
+        self._marked_at.pop(pod_id, None)
+
+    def __len__(self) -> int:
+        self._evict_expired()
+        return len(self._marked_at)
+
+
+# In-process like inflight_creates: the backend re-asks the validator that owns the executor. A
+# validator restart forgets the marker, and the re-ask then runs the plain best-effort volume remove.
+pending_deletions = _PendingDeletionRegistry()
+
 # How long a delete waits for the create it just cancelled. The create reads the flag at its next
 # checkpoint, and the only checkpoint gap that can orphan a container is the short one before
 # `docker run` — a pull-length wait would hold the customer's delete for nothing.
@@ -727,6 +1035,23 @@ def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
         all(phrase in text.lower() for phrase in _DOCKER_REMOVAL_IN_PROGRESS_PHRASES)
         for text in _exception_texts(exc)
     )
+
+
+def _is_docker_read_timeout_error(exc: Exception) -> bool:
+    # requests.ReadTimeout / urllib3.ReadTimeoutError, wrapped by RentalDockerOperationError. Only a
+    # READ timeout: the request reached dockerd and no reply came back. A connect timeout ("Connection
+    # to ... timed out") never reached it and stays a failure.
+    cause: BaseException | None = exc
+    while cause is not None:
+        if cause.__class__.__name__ in _DOCKER_READ_TIMEOUT_EXCEPTION_NAMES:
+            return True
+        cause = cause.__cause__
+    return any(_DOCKER_READ_TIMEOUT_PHRASE in text.lower() for text in _exception_texts(exc))
+
+
+def _is_docker_volume_in_use_error(exc: Exception) -> bool:
+    # dockerd's 409 on `volume rm`: 'remove <name>: volume is in use - [<container id>]'
+    return any(_DOCKER_VOLUME_IN_USE_PHRASE in text.lower() for text in _exception_texts(exc))
 
 
 def _is_docker_could_not_kill_error(exc: Exception) -> bool:
@@ -805,6 +1130,18 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
 
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
+
+
+def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str) -> str:
+    # the plugin's propagated-mount dir is root-only on the host, so the repair looks at it from a
+    # throwaway helper container that bind-mounts the dir at /mnt. `--mount type=bind` refuses a
+    # source that does not exist (exit 125) where `-v` would create it: a propagated-mount dir
+    # missing under a guessed docker root must read as "helper did not run", not as "volume dir gone".
+    return (
+        "/usr/bin/docker run --rm "
+        f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
+        f"{_VLOOPBACK_REPAIR_IMAGE} {helper_command}"
+    )
 
 
 def _should_repair_stale_mountpoint(
@@ -1016,39 +1353,6 @@ class DockerService:
     ) -> bool:
         rented_machine = await self.redis_service.get_rented_machine(executor_info)
         return bool(rented_machine and rented_machine.get("containers"))
-
-    async def _settle_inspector_after_failed_create(
-        self,
-        inspector_task: asyncio.Task,
-        *,
-        ssh_client: asyncssh.SSHClientConnection,
-        executor_info: ExecutorSSHInfo,
-        default_extra: dict,
-    ) -> None:
-        """DAH-3258: the collector was started alongside the mount and the create then failed.
-
-        Let the start finish (it never raises), then leave the host as a delete would: stop the
-        collector when no other rented container keeps it needed. Best-effort — the create's
-        own failure is what gets reported.
-        """
-        try:
-            await inspector_task
-            if not await self._has_rented_containers(executor_info):
-                await self._run_inspector_collector_lifecycle(
-                    ssh_client=ssh_client,
-                    executor_info=executor_info,
-                    action="stop",
-                    default_extra=default_extra,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "Inspector collector could not be settled after a failed create",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-            )
 
     def _ssh_bootstrap_script_path(self) -> Path:
         return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
@@ -1519,13 +1823,30 @@ class DockerService:
             return False
 
         # Repair by removing only the empty stale mountpoint directory.
-        helper_cmd = (
-            "/usr/bin/docker run --rm "
-            f"-v {shlex.quote(propagated_mount_dir)}:/mnt "
-            f"{_VLOOPBACK_REPAIR_IMAGE} rmdir /mnt/{shlex.quote(local_volume)}"
+        helper_cmd = _vloopback_repair_helper_cmd(
+            propagated_mount_dir, f"rmdir /mnt/{shlex.quote(local_volume)}"
         )
         repair_result = await ssh_client.run(helper_cmd, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
         if getattr(repair_result, "exit_status", 0) != 0:
+            # A directory that is already gone needs no rmdir: the provider removed it by hand, which
+            # is what the ticket replies ask for (DAH-3398 / ticket-0313: the stale dir was gone for
+            # 24 h and every cycle still counted the failed rmdir as a failed repair, so the
+            # container was never started). Only `test -e` exit 1 means absent; a helper that did
+            # not run (125+) stays a skipped repair.
+            absence_check_result = await ssh_client.run(
+                _vloopback_repair_helper_cmd(
+                    propagated_mount_dir, f"test -e /mnt/{shlex.quote(local_volume)}"
+                ),
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            if getattr(absence_check_result, "exit_status", 0) == 1:
+                logger.info(
+                    _m(
+                        "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT",
+                        extra=get_extra_info(log_extra),
+                    )
+                )
+                return True
             logger.warning(
                 _m(
                     "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED",
@@ -1786,7 +2107,17 @@ class DockerService:
         timeout: int = 0,
         raise_exception: bool = True,
         stdin_data: str | None = None,
+        check_exit_status: bool = False,
     ) -> tuple[bool, str]:
+        """Run `command` over ssh, streaming its output to the pod log.
+
+        A step fails on stderr output or on the streamer's `timeout`. With
+        `check_exit_status=True` it also fails on any non-zero exit status,
+        or none at all (the process ended on a signal): a command killed
+        silently (`timeout -k` sends SIGKILL, exit 137, nothing on stderr)
+        must not read as success. The default stays stderr-only because
+        many callers run commands whose exit status is not a verdict.
+        """
         logger.info(
             _m(
                 log_text,
@@ -1807,13 +2138,16 @@ class DockerService:
                 if stdin_data is not None:
                     process.stdin.write(stdin_data)
                     process.stdin.write_eof()
+                streamed = self._stream_process_output(
+                    process, log_tag, check_exit_status=check_exit_status
+                )
                 if timeout != 0:
-                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                    status, error = await asyncio.wait_for(streamed, timeout=timeout)
                 else:
-                    status, error = await self._stream_process_output(process, log_tag)
+                    status, error = await streamed
         except TimeoutError:
             status = False
-            error = "Process timed out"
+            error = STREAM_TIMEOUT_STDERR
             await self.stream_log(error, "error", log_tag)
             logger.warning(
                 _m(
@@ -1832,7 +2166,7 @@ class DockerService:
 
         return status, error
 
-    async def _stream_process_output(self, process, log_tag):
+    async def _stream_process_output(self, process, log_tag, check_exit_status: bool = False):
         status = True
         error = ''
 
@@ -1843,6 +2177,21 @@ class DockerService:
             status = False
             error += line.strip() + "\n"
             await self.stream_log(line.strip(), "error", log_tag)
+
+        if check_exit_status:
+            # Both streams are at EOF; the exit status arrives with the
+            # channel close, so wait for it before reading.
+            await process.wait_closed()
+            exit_status = process.exit_status
+            if exit_status != 0:
+                status = False
+                if exit_status is None:
+                    signal = getattr(process, "exit_signal", None)
+                    detail = f"Process ended without an exit status (signal: {signal})"
+                else:
+                    detail = f"Process exited with status {exit_status}"
+                error += detail + "\n"
+                await self.stream_log(detail, "error", log_tag)
 
         return status, error
 
@@ -2063,10 +2412,17 @@ class DockerService:
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        remove_every_filler: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+
+        DAH-3706: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
+        whatever ``active_container_names`` says -- a paying pod never shares the node with a
+        filler, and a backend whose stop did not confirm may still list one. The removal is then
+        re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
+        (typed fields, countable) and the create goes on.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -2081,6 +2437,8 @@ class DockerService:
                 await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
+            if remove_every_filler:
+                active_set = {name for name in active_set if not name.startswith(FILLER_CONTAINER_PREFIX)}
             # DAH-2740: a sibling create on the same host sweeps while an edit's parked container is
             # the customer's only copy; the parked twin of every active pod name is protected too
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
@@ -2107,12 +2465,14 @@ class DockerService:
                         **default_extra,
                         "container_names": container_names,
                         "active_containers": list(active_set),
+                        "remove_every_filler": remove_every_filler,
                     }),
                 ),
             )
 
-            command = f'/usr/bin/docker rm -fv {container_names}'
-            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            await self._remove_stale_containers(
+                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+            )
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2131,6 +2491,148 @@ class DockerService:
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
         return []
+
+    async def _remove_stale_containers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        stale_containers: list[str],
+        remove_every_filler: bool,
+    ) -> None:
+        """`docker rm -fv` the stale containers. A customer create (DAH-3706) uses the tolerant rm
+        and then confirms that no filler survived."""
+        if not remove_every_filler:
+            names = " ".join(shlex.quote(name) for name in stale_containers)
+            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+            return
+
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+        removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if removed_fillers:
+            await self._confirm_fillers_removed(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                pod_name=pod_name,
+                removed_fillers=removed_fillers,
+            )
+
+    async def _confirm_fillers_removed(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        removed_fillers: list[str],
+    ) -> None:
+        """Re-read `docker ps -a` after a customer create's filler removal; log any survivor.
+
+        A listing that fails, times out or exits non-zero is logged as well -- the confirmation
+        never fails the create.
+        """
+        names_after = await self._list_all_container_names(ssh_client)
+        if names_after is None:
+            logger.warning(
+                _m(
+                    "Unable to confirm the filler removal before the customer's create",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "pod_name": pod_name,
+                        "container_names": removed_fillers,
+                    }),
+                )
+            )
+            return
+        survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if survivors:
+            logger.warning(
+                _m(
+                    "Filler still running on a node a customer rents after docker rm -fv",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "event": FILLER_STILL_RUNNING_EVENT,
+                        "reason": "validator_rm_survived",
+                        "pod_name": pod_name,
+                        "container_names": survivors,
+                        "removed_fillers": removed_fillers,
+                    }),
+                )
+            )
+
+    async def _remove_stale_containers_tolerantly(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        stale_containers: list[str],
+    ) -> None:
+        """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
+
+        A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
+        non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
+        for nothing. So: one attempt; on an error re-read `docker ps -a`; names already gone are not an
+        error; names still there get retry_ssh_command's full budget (and raise as before). A re-read
+        that cannot be made re-raises the rm error.
+        """
+        names = " ".join(shlex.quote(name) for name in stale_containers)
+        try:
+            await retry_ssh_command(
+                ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers', max_attempts=1
+            )
+            return
+        except Exception:
+            still_present = await self._names_still_on_host(ssh_client, stale_containers)
+            if still_present is None:
+                raise
+        if not still_present:
+            logger.info(
+                _m(
+                    "docker rm -fv reported an error but every stale container is gone; continuing",
+                    extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                ),
+            )
+            return
+        logger.info(
+            _m(
+                "docker rm -fv failed with containers still on the host; retrying those",
+                extra=get_extra_info({**default_extra, "container_names": still_present}),
+            ),
+        )
+        names = " ".join(shlex.quote(name) for name in still_present)
+        await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+
+    @staticmethod
+    async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
+        """`docker ps -a` names with the prerun probe's timeout; None when the listing raised, timed out
+        or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
+        caller must not hang or read an empty listing as 'confirmed')."""
+        try:
+            result = await ssh_client.run(
+                DOCKER_PS_ALL_NAMES_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            logger.warning(
+                _m("docker ps -a listing failed", extra={"error_type": exc.__class__.__name__, "timeout_s": _PRERUN_HOST_PROBE_TIMEOUT_SECONDS})
+            )
+            return None
+        if result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "docker ps -a listing exited non-zero",
+                    extra={"exit_status": result.exit_status, "stderr": (result.stderr or "").strip()[:500]},
+                )
+            )
+            return None
+        return [name for name in (result.stdout or "").strip().split("\n") if name]
+
+    async def _names_still_on_host(
+        self, ssh_client: asyncssh.SSHClientConnection, names: list[str]
+    ) -> list[str] | None:
+        """Which of ``names`` `docker ps -a` still lists; None when the listing could not be read."""
+        all_names = await self._list_all_container_names(ssh_client)
+        if all_names is None:
+            return None
+        wanted = set(names)
+        return [name for name in all_names if name in wanted]
 
     async def clean_stale_vloopback_volumes(
         self,
@@ -3209,35 +3711,26 @@ class DockerService:
         public_keys: list[str] | tuple[str, ...],
         log_tag: str,
         log_extra: dict,
-        environment: dict[str, str] | None = None,
     ) -> None:
-        """Append the renter's keys to authorized_keys — and, with ``environment`` (DAH-3258), the
-        renter's `/etc/environment` lines in the same exec. Raises on a non-zero exit."""
-        # falls back to the keys-only spec when there are no environment lines
-        exec_spec = build_authorized_keys_and_environment_exec_spec(
+        exec_spec = build_authorized_keys_exec_spec(
             container_name=container_name,
             public_keys=public_keys,
-            environment=environment,
         )
-        with_environment = bool(exec_spec.environment)
-        added_items = "SSH public keys and environment" if with_environment else "SSH public keys"
         result = await exec_logged_rental_docker_sdk_operation(
             docker_client=docker_client,
-            operation=(
-                "exec_add_authorized_keys_and_environment" if with_environment else "exec_add_authorized_keys"
-            ),
+            operation="exec_add_authorized_keys",
             exec_spec=exec_spec,
             log_extra=log_extra,
         )
         if result.exit_status != 0:
             await self.stream_log(
-                result.stderr or result.stdout or f"Failed to add {added_items}",
+                result.stderr or result.stdout or "Failed to add SSH public keys",
                 "error",
                 log_tag,
             )
             logger.warning(
                 _m(
-                    f"Failed to add {added_items}",
+                    "Failed to add SSH public keys",
                     extra=get_extra_info({
                         **log_extra,
                         "container_name": container_name,
@@ -3248,7 +3741,7 @@ class DockerService:
                 )
             )
             raise Exception(
-                f"Failed to add {added_items}: "
+                "Failed to add SSH public keys: "
                 f"exit_status={result.exit_status}; "
                 f"stderr={result.stderr}; stdout={result.stdout}"
             )
@@ -3587,6 +4080,11 @@ class DockerService:
             target_path = local_volume_path if encrypted_local_volume else "/root"
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
+            # DAH-3639: `docker cp` into the container's /tmp fails with "Could not
+            # find the file /tmp in container" even after the directory exists, because
+            # the daemon resolves the destination against the container's rootfs while
+            # the container's own exec namespace sees the directory. `docker exec` runs
+            # inside that namespace, so the script is piped in from the host instead.
             command = (
                 f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
@@ -3600,20 +4098,10 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker cp /root/app/run_jupyter.sh "
-                f"{container_q}:/tmp/run_jupyter.sh"
-            )
-            await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Copying run_jupyter.sh to container",
-                log_extra=log_extra,
-                raise_exception=True,
-            )
-            command = (
-                f"/usr/bin/docker exec -u 0 {container_q} "
-                f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
+                f"test -s /root/app/run_jupyter.sh || "
+                f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
+                f"cat /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -4080,6 +4568,34 @@ class DockerService:
     def _dind_container_name(pod_id: str) -> str:
         return f"lium-dind-build-{pod_id}"
 
+    @staticmethod
+    def _dind_firewall_helper_names(dind_name: str) -> tuple[str, str]:
+        """Names of the two `--network=host` iptables helpers (apply, remove).
+
+        Named so the teardown can `docker rm -f` a helper that outlived its
+        bound: `timeout(1)` kills the `docker run` client, not the container,
+        and a helper still inserting rules for this DinD IP after the IP is
+        released would firewall whatever build gets the IP next.
+        """
+        return f"{dind_name}-fw-apply", f"{dind_name}-fw-remove"
+
+    @staticmethod
+    def _bounded_helper_command(command: str, bound_s: int, what: str) -> str:
+        """`command` under executor-side `timeout -k 5 <bound_s>`, exit 124 made loud.
+
+        `timeout(1)` prints nothing when it kills the command, so the wrapper
+        echoes one stderr line on exit 124 (the pod log says why the step
+        failed) and exits with the command's status either way. The apply
+        step does not rely on that line: it fails on the exit status itself
+        (`execute_and_stream_logs(check_exit_status=True)`), 124, 137 or any
+        other non-zero.
+        """
+        return (
+            f"timeout -k 5 {int(bound_s)} {command}; rc=$?; "
+            f"[ $rc -eq 124 ] && echo {shlex.quote(f'{what} timed out after {int(bound_s)}s')} >&2; "
+            f"exit $rc"
+        )
+
     # Build context written inside the throwaway DinD container.
     _DIND_BUILD_CONTEXT = "/build"
 
@@ -4088,12 +4604,14 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         dind_name: str,
         dockerfile_content: str,
+        timeout: int | None = None,
     ) -> None:
         """Write the Dockerfile *inside* the DinD container without argv exposure.
 
         Streams user content via stdin into `cat` (through `docker exec -i`) so
         arbitrary content (`EOF` markers, backticks, `$(...)`) cannot escape into
-        the shell. Only the controlled container name reaches argv.
+        the shell. Only the controlled container name reaches argv. `timeout`
+        bounds the SSH command (asyncssh raises `asyncio.TimeoutError`).
         """
         ctx = self._DIND_BUILD_CONTEXT
         inner = f"mkdir -p {ctx} && cat > {ctx}/Dockerfile"
@@ -4101,7 +4619,9 @@ class DockerService:
             f"/usr/bin/docker exec -i {shlex.quote(dind_name)} "
             f"sh -c {shlex.quote(inner)}"
         )
-        result = await ssh_client.run(command, input=dockerfile_content, check=False)
+        result = await ssh_client.run(
+            command, input=dockerfile_content, check=False, timeout=timeout
+        )
         if result.exit_status != 0:
             stderr = (result.stderr or "").strip()
             raise RuntimeError(
@@ -4137,7 +4657,43 @@ class DockerService:
         return cidrs
 
     @staticmethod
-    def _egress_filter_script(dind_ip: str, cidrs: list[str], apply: bool) -> str:
+    def _dind_nameservers_inside_blocked_cidrs(resolv_conf: str, cidrs: list[str]) -> list[str]:
+        """The DinD container's IPv4 nameservers that sit inside a blocked CIDR.
+
+        Docker copies the host's upstream resolvers into the container's
+        /etc/resolv.conf. On a host whose resolver is private (a cloud VPC
+        resolver at the .2 of a 10/8 or 172.16/12 network, a datacenter
+        resolver in 10/8, a router in 192.168/16) that address falls inside
+        the egress block, the DROP rules eat every DNS query and
+        `docker build --pull` fails on `FROM` after the resolver timeout.
+        Those servers get an ACCEPT on port 53 only; a public resolver needs
+        no rule and is left out.
+
+        `cidrs` is the output of `_parse_egress_block_cidrs`, already
+        normalised through `ip_network`, so every entry parses.
+        """
+        blocked = [ipaddress.ip_network(c) for c in cidrs]
+        servers: list[str] = []
+        for raw_line in (resolv_conf or "").splitlines():
+            parts = raw_line.split("#", 1)[0].split(";", 1)[0].split()
+            if len(parts) < 2 or parts[0] != "nameserver":
+                continue
+            try:
+                addr = ipaddress.ip_address(parts[1])
+            except ValueError:
+                continue
+            if addr.version != 4:
+                continue
+            if not any(addr in net for net in blocked):
+                continue
+            if str(addr) not in servers:
+                servers.append(str(addr))
+        return servers
+
+    @staticmethod
+    def _egress_filter_script(
+        dind_ip: str, cidrs: list[str], apply: bool, dns_servers: list[str] | tuple[str, ...] = ()
+    ) -> str:
         """Backend-agnostic iptables script for the host DOCKER-USER chain.
 
         Runs inside a `--network=host --cap-add=NET_ADMIN` helper container so it
@@ -4146,13 +4702,44 @@ class DockerService:
         DOCKER-USER chain. Rules are scoped to the DinD container's source IP so
         DinD-internal docker networking (172.x bridges) is never affected.
 
-        `dind_ip` and `cidrs` are pre-validated via `ipaddress`, so they are
-        shell-safe to interpolate.
+        `dns_servers` are the DinD's own resolvers inside the blocked ranges
+        (see `_dind_nameservers_inside_blocked_cidrs`). Each gets an ACCEPT for udp/tcp port
+        53, tagged `-m comment --comment {DIND_DNS_RULE_TAG}`, inserted AFTER
+        the DROP rules, so `-I` puts it above them and only DNS to that one
+        address passes; port 80 to a metadata service on the same address stays
+        dropped. Before the inserts, every tagged rule for this `dind_ip` is
+        deleted, whatever resolver it names: a build whose teardown failed
+        leaves its ACCEPTs behind, and when the DinD IP is reused by a build
+        with a different resolver, a `-C` check or a delete of the current
+        resolvers only would keep the old resolver allowed. A tagged rule the
+        apply cannot delete aborts the apply (exit 5): the caller then never
+        runs the build, so a reused DinD IP cannot build with an old resolver
+        still allowed. The teardown runs the same purge, tolerating failures,
+        so it never depends on knowing which resolvers the apply saw.
+
+        `dind_ip`, `cidrs` and `dns_servers` are pre-validated via `ipaddress`,
+        so they are shell-safe to interpolate.
         """
         lines = [
             "IPT=iptables-nft",
             "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
         ]
+        # Purge every rule tagged for this DinD IP before adding new ones, so an old
+        # resolver's ACCEPT never survives an IP reuse. On apply a failed listing or
+        # delete aborts (exit 4 / 5) before any DROP is inserted; teardown tolerates both.
+        on_list_failure = (
+            '{ echo "DOCKER-USER listing failed" >&2; exit 4; }' if apply else 'rules=""'
+        )
+        on_delete_failure = (
+            ' || { echo "tagged DNS rule delete failed" >&2; exit 5; }' if apply else ""
+        )
+        delete_rule = "$IPT -D $spec || exit 5" if apply else "$IPT -D $spec"
+        purge_tagged = (
+            f"rules=$($IPT -S DOCKER-USER 2>/dev/null) || {on_list_failure}; "
+            f"printf '%s\\n' \"$rules\" | while read -r _a spec; do "
+            f'case "$spec" in *"-s {dind_ip}/32 "*"--comment {DIND_DNS_RULE_TAG} "*) '
+            f"{delete_rule};; esac; done{on_delete_failure}"
+        )
         if apply:
             # No DOCKER-USER chain => egress filtering cannot be guaranteed. Fail
             # loudly so the caller aborts rather than running the build open.
@@ -4160,12 +4747,23 @@ class DockerService:
                 '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || '
                 '{ echo "DOCKER-USER chain not found" >&2; exit 3; }'
             )
+            lines.append(purge_tagged)
             for c in cidrs:
                 lines.append(
                     f"$IPT -C DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || "
                     f"$IPT -I DOCKER-USER -s {dind_ip} -d {c} -j DROP"
                 )
+            for ns in dns_servers:
+                for proto in ("udp", "tcp"):
+                    # Not `-C || -I`: a stale ACCEPT below the new DROP satisfies
+                    # `-C` and the insert is skipped. The purge above removed
+                    # every copy; insert one at the top of the chain.
+                    lines.append(
+                        f"$IPT -I DOCKER-USER -s {dind_ip} -d {ns} -p {proto} --dport 53 "
+                        f"-m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT"
+                    )
         else:
+            lines.append(purge_tagged)
             for c in cidrs:
                 lines.append(
                     f"$IPT -D DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || true"
@@ -4178,13 +4776,14 @@ class DockerService:
         payload: ContainerCreateRequest,
         log_tag: str,
         default_extra: dict,
-    ) -> tuple[bool, str | None]:
+    ) -> CustomBuildOutcome:
         """Build a custom image from `payload.dockerfile_content` on the executor.
 
-        Returns (success, failure_step). On success returns (True, None); the
-        built image tag is `_custom_build_image_tag(pod_id)`. On failure returns
-        (False, failure_step) — caller routes through the same CCF
-        `UnknownError` path used by today's pull-failure.
+        Returns a CustomBuildOutcome. On success `ok` is True and the built image tag is
+        `_custom_build_image_tag(pod_id)`. On failure the caller raises CustomBuildFailed so the
+        CCF `UnknownError` path used by today's pull-failure carries `failure_step` and `log_tail`:
+        the last lines the build printed (docker_build), the timeout in seconds (build_timeout),
+        or a fixed one-line reason for build_export and the setup steps (never their stderr).
         """
         from core.config import settings
 
@@ -4194,6 +4793,12 @@ class DockerService:
         ctx = self._DIND_BUILD_CONTEXT
         timeout_s = int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
         ready_timeout_s = int(settings.CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS)
+        # Bound for each setup command before the build (sysbox preflight, DinD
+        # start including its image pull, IP and resolver reads, the firewall
+        # helper, the Dockerfile write); the readiness loop keeps its own
+        # `ready_timeout_s`. Before this bound a hung `docker run` here kept
+        # the renter PENDING until the backend's 1 h stale-pod sweep.
+        setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         dind_image = settings.CUSTOM_DOCKERFILE_DIND_IMAGE
         cidrs = self._parse_egress_block_cidrs(settings.CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS)
 
@@ -4210,14 +4815,16 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "size_bytes": len(content)}),
                 )
             )
-            return False, "build_input_oversize"
+            return CustomBuildOutcome(False, "build_input_oversize", f"Dockerfile exceeds {max_bytes} byte cap")
 
         # 1. Preflight: sysbox-runc MUST be available. Never fall back to runc —
         #    a silent fallback would run an internet-enabled build on the host
         #    daemon with no user-namespace containment, defeating the design.
         try:
             info = await ssh_client.run(
-                "/usr/bin/docker info --format '{{json .Runtimes}}'", check=False
+                "/usr/bin/docker info --format '{{json .Runtimes}}'",
+                check=False,
+                timeout=setup_timeout_s,
             )
             if info.exit_status != 0 or "sysbox-runc" not in (info.stdout or ""):
                 await self.stream_log(
@@ -4231,7 +4838,7 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_sysbox_unavailable"
+                return CustomBuildOutcome(False, "build_sysbox_unavailable", "sysbox-runc runtime unavailable on executor")
         except Exception as exc:
             logger.error(
                 _m(
@@ -4240,23 +4847,50 @@ class DockerService:
                 ),
                 exc_info=True,
             )
-            return False, "build_sysbox_unavailable"
+            return CustomBuildOutcome(False, "build_sysbox_unavailable", "sysbox-runc preflight failed on executor")
 
         dind_ip: str | None = None
-        egress_applied = False
+        dns_servers: list[str] = []
         try:
             # 2. Launch the throwaway DinD build container under sysbox-runc.
             await self.stream_log(
                 f"Starting isolated build container {dind_name}", "success", log_tag
             )
+            # `timeout(1)` on the executor kills the `docker run` (and so the
+            # image pull) when it outlives the bound: asyncssh's own `timeout=`
+            # only stops waiting, the remote command would run on. The
+            # `docker rm -fv` in the finally removes a container that came up
+            # in between.
             run_dind = (
+                f"timeout -k 5 {setup_timeout_s} "
                 f"/usr/bin/docker run -d --runtime=sysbox-runc "
                 f"--name {shlex.quote(dind_name)} "
                 f"--cpus={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_CPUS))} "
                 f"--memory={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_MEMORY))} "
                 f"{shlex.quote(dind_image)}"
             )
-            start_res = await ssh_client.run(run_dind, check=False)
+            try:
+                start_res = await ssh_client.run(
+                    run_dind, check=False, timeout=setup_timeout_s + 15
+                )
+            except asyncio.TimeoutError:
+                await self.stream_log(
+                    f"Build container did not start within {setup_timeout_s}s", "error", log_tag
+                )
+                logger.error(
+                    _m(
+                        "Custom build DinD start timed out",
+                        extra=get_extra_info(
+                            {**default_extra, "setup_timeout_s": setup_timeout_s}
+                        ),
+                    )
+                )
+                return CustomBuildOutcome(False, "build_dind_start", "isolated build container failed to start")
+            if start_res.exit_status == 124:
+                # coreutils `timeout` exit code: the start (usually its image pull) outlived the bound.
+                await self.stream_log(
+                    f"Build container did not start within {setup_timeout_s}s", "error", log_tag
+                )
             if start_res.exit_status != 0:
                 logger.error(
                     _m(
@@ -4266,15 +4900,28 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_dind_start"
+                return CustomBuildOutcome(False, "build_dind_start", "isolated build container failed to start")
 
-            # 3. Wait for the inner dockerd to accept connections.
+            # 3. Wait for the inner dockerd: up to `ready_timeout_s` probes a second apart,
+            #    each bounded by `timeout(1)` on the executor so a hung `docker info` is one
+            #    "not ready" probe, and each closing its session channel before the next.
             ready = False
-            for _ in range(max(1, ready_timeout_s)):
-                probe = await ssh_client.run(
-                    f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
-                    check=False,
-                )
+            probe_timeout_s = min(ready_timeout_s, DIND_READY_PROBE_MAX_SECONDS)
+            probe_cmd = (
+                f"timeout -k 2 {probe_timeout_s} "
+                f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info"
+            )
+            for _ in range(ready_timeout_s):
+                try:
+                    async with ssh_client.create_process(probe_cmd) as probe_process:
+                        probe = await probe_process.wait(
+                            check=False, timeout=probe_timeout_s + 5
+                        )
+                except asyncio.TimeoutError:
+                    # The backstop fired; the `async with` exit closed the
+                    # channel. Not ready yet, and the probe used its bound.
+                    continue
+                # `timeout(1)` exits 124 when it killed the probe: not ready.
                 if probe.exit_status == 0:
                     ready = True
                     break
@@ -4288,16 +4935,26 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_dind_unready"
+                return CustomBuildOutcome(False, "build_dind_unready", f"isolated build container not ready after {ready_timeout_s} s")
 
             # 4. Resolve the DinD container IP and firewall its egress host-side
             #    (block cloud metadata + RFC1918; full public internet stays open).
-            ip_res = await ssh_client.run(
-                "/usr/bin/docker inspect -f "
-                "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
-                f"{shlex.quote(dind_name)}",
-                check=False,
-            )
+            try:
+                ip_res = await ssh_client.run(
+                    "/usr/bin/docker inspect -f "
+                    "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
+                    f"{shlex.quote(dind_name)}",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    _m(
+                        "Custom build DinD inspect timed out",
+                        extra=get_extra_info({**default_extra, "setup_timeout_s": setup_timeout_s}),
+                    )
+                )
+                return CustomBuildOutcome(False, "build_egress_setup", "could not resolve the build container address")
             raw_ip = (ip_res.stdout or "").strip()
             try:
                 dind_ip = str(ipaddress.ip_address(raw_ip))
@@ -4308,21 +4965,76 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "raw_ip": raw_ip}),
                     )
                 )
-                return False, "build_egress_setup"
+                return CustomBuildOutcome(False, "build_egress_setup", "could not resolve the build container address")
 
-            apply_script = self._egress_filter_script(dind_ip, cidrs, apply=True)
-            egress_cmd = (
+            # The DinD's resolvers that the block would otherwise eat. Read
+            # from the container itself: that file is what its dockerd (and
+            # so every build step) will query. Unreadable -> no DNS exception,
+            # the build runs under today's rules.
+            try:
+                resolv_res = await ssh_client.run(
+                    f"/usr/bin/docker exec {shlex.quote(dind_name)} cat /etc/resolv.conf",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    _m(
+                        "Custom build DinD resolv.conf read timed out",
+                        extra=get_extra_info({**default_extra, "setup_timeout_s": setup_timeout_s}),
+                    )
+                )
+                return CustomBuildOutcome(False, "build_egress_setup", "could not read the build container's DNS resolvers")
+            if resolv_res.exit_status == 0:
+                dns_servers = self._dind_nameservers_inside_blocked_cidrs(resolv_res.stdout or "", cidrs)
+            else:
+                logger.warning(
+                    _m(
+                        "Custom build could not read the DinD resolv.conf",
+                        extra=get_extra_info(
+                            {**default_extra, "stderr": (resolv_res.stderr or "").strip()}
+                        ),
+                    )
+                )
+            if dns_servers:
+                await self.stream_log(
+                    f"Build DNS goes to {', '.join(dns_servers)} (allowed through the egress filter)",
+                    "success",
+                    log_tag,
+                )
+
+            apply_script = self._egress_filter_script(
+                dind_ip, cidrs, apply=True, dns_servers=dns_servers
+            )
+            # The helper runs under the executor's `timeout(1)`, as the DinD
+            # start does: the streamer's own `timeout=` only stops reading,
+            # the remote `docker run` would go on inserting rules. It is named
+            # so the teardown can force-remove it before the DinD IP is
+            # released. Any non-zero exit fails the step: the streamer checks
+            # the helper's exit status itself (`check_exit_status`), so a
+            # helper killed without a word (137 from `timeout -k`, an OOM
+            # kill, a `docker run` that never got to iptables) never starts
+            # the build; `_bounded_helper_command` adds the stderr line on 124
+            # so the pod log says why. The streamer's timeout stays as the
+            # backstop, past the executor-side bound.
+            apply_helper, _ = self._dind_firewall_helper_names(dind_name)
+            egress_cmd = self._bounded_helper_command(
                 f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                f"--name {shlex.quote(apply_helper)} "
                 f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
-                f"-c {shlex.quote(apply_script)}"
+                f"-c {shlex.quote(apply_script)}",
+                setup_timeout_s,
+                "Build egress firewall helper",
             )
             ok, err = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=egress_cmd,
                 log_tag=log_tag,
                 log_text="Applying build egress firewall",
-                log_extra={**default_extra, "dind_ip": dind_ip},
+                log_extra={**default_extra, "dind_ip": dind_ip, "dns_servers": dns_servers},
+                timeout=setup_timeout_s + 15,
                 raise_exception=False,
+                check_exit_status=True,
             )
             if not ok:
                 # Cannot guarantee egress filtering -> never run the build open.
@@ -4332,15 +5044,16 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "error": err}),
                     )
                 )
-                return False, "build_egress_setup"
-            egress_applied = True
+                return CustomBuildOutcome(False, "build_egress_setup", "build egress firewall could not be applied")
 
             # 5. Write the Dockerfile into the DinD container (stdin, not argv).
             await self.stream_log(
                 f"Preparing build context in {dind_name}", "success", log_tag
             )
             try:
-                await self._write_dockerfile_into_dind(ssh_client, dind_name, content)
+                await self._write_dockerfile_into_dind(
+                    ssh_client, dind_name, content, timeout=setup_timeout_s
+                )
             except Exception as exc:
                 logger.error(
                     _m(
@@ -4349,18 +5062,21 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
-                return False, "build_setup"
+                return CustomBuildOutcome(False, "build_setup", "could not write the Dockerfile into the build container")
 
             # 6. Build INSIDE the DinD container WITH network enabled (no
             #    --network=none). BuildKit streams progress to stderr and
             #    `execute_and_stream_logs` treats any stderr as failure, so we
-            #    redirect build output to stdout (streamed as success logs) and
+            #    redirect build output to stdout (streamed as success logs, and
+            #    kept in a log file under /tmp inside the DinD container) and
             #    emit to stderr ONLY on non-zero exit — the streamer's signal.
-            inner_build = (
-                f"docker build --progress=plain --pull "
-                f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; "
-                f"rc=$?; [ $rc -ne 0 ] && echo BUILD_FAILED_RC=$rc >&2; exit $rc"
-            )
+            #    The stderr then carries the last non-blank lines of the build
+            #    output, which is the only place the reason for the failure
+            #    exists once the DinD container is torn down: the streamer
+            #    returns stderr, not stdout. The log and rc files live outside
+            #    the build context (/build) so a `COPY .` in the renter's
+            #    Dockerfile never picks them up.
+            inner_build = custom_build_inner_command(image_tag, ctx)
             build_cmd = (
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"sh -c {shlex.quote(inner_build)}"
@@ -4383,11 +5099,21 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
-                return False, "docker_build"
+                return CustomBuildOutcome(False, "docker_build", "build command could not be run on the executor")
             if not ok:
-                if "process timed out" in (err or "").lower():
-                    return False, "build_timeout"
-                return False, "docker_build"
+                # A build that printed "process timed out" and failed carries BUILD_FAILED_RC= too;
+                # only the streamer's bare sentinel is a timeout.
+                if stream_timed_out(err):
+                    return CustomBuildOutcome(False, "build_timeout", f"docker build exceeded {timeout_s} s")
+                if CUSTOM_BUILD_FAILED_MARKER not in (err or ""):
+                    logger.error(
+                        _m(
+                            "Custom build interrupted",
+                            extra=get_extra_info({**default_extra, "build_image_tag": image_tag, "error": err}),
+                        )
+                    )
+                    return CustomBuildOutcome(False, "docker_build", CUSTOM_BUILD_INTERRUPTED_REASON)
+                return CustomBuildOutcome(False, "docker_build", custom_build_log_tail(err))
 
             # 7. Export the image from DinD and load it onto the host daemon so
             #    the rental `docker run` (host-side) can use it.
@@ -4408,19 +5134,32 @@ class DockerService:
                 raise_exception=False,
             )
             if not ok:
-                if "process timed out" in (err or "").lower():
-                    return False, "build_timeout"
-                return False, "build_export"
+                if stream_timed_out(err):
+                    return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {timeout_s} s")
+                # The stderr here is the HOST daemon's `docker load` (paths, disk state), not the
+                # renter's build: it goes to ops, the renter gets a fixed reason.
+                logger.error(
+                    _m(
+                        "Custom build export failed",
+                        extra=get_extra_info(
+                            {**default_extra, "build_image_tag": image_tag, "error": err}
+                        ),
+                    )
+                )
+                return CustomBuildOutcome(False, "build_export", CUSTOM_BUILD_EXPORT_FAILED_REASON)
 
-            return True, None
+            return CustomBuildOutcome(True, None, None)
         finally:
             # Always tear down the throwaway container + its egress rules. The
             # host-loaded image is removed later by _cleanup_custom_build_artifacts.
+            # `dind_ip` goes in whenever it is known: an apply that timed out may
+            # have inserted some rules before the deadline, and the remove script
+            # is idempotent.
             await self._teardown_dind_build(
                 ssh_client=ssh_client,
                 dind_name=dind_name,
                 dind_image=dind_image,
-                dind_ip=dind_ip if egress_applied else None,
+                dind_ip=dind_ip,
                 cidrs=cidrs,
                 default_extra=default_extra,
             )
@@ -4436,18 +5175,53 @@ class DockerService:
     ) -> None:
         """Best-effort teardown of the throwaway DinD container + its egress rules.
 
+        The DNS ACCEPTs go by their tag and the DinD IP (`_egress_filter_script`),
+        so the teardown never needs to know which resolvers the apply saw.
+
+        Order: the remove helper (bounded on the executor, exit 124 logged as a
+        failure), then `docker rm -f` of both firewall helpers by name, then
+        the DinD itself. The helpers go first because removing the DinD
+        releases its IP: an apply or remove helper that outlived its bound is
+        still editing rules for that IP, and the next build to get the IP
+        would inherit them.
+
         Always called from `_custom_build_image`'s finally. Failures are logged,
         never raised — the rental flow must not break on cleanup.
         """
+        setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
+        apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
         if dind_ip:
             try:
                 remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
-                await ssh_client.run(
-                    f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
-                    f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
-                    f"-c {shlex.quote(remove_script)}",
+                remove_res = await ssh_client.run(
+                    self._bounded_helper_command(
+                        f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                        f"--name {shlex.quote(remove_helper)} "
+                        f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
+                        f"-c {shlex.quote(remove_script)}",
+                        setup_timeout_s,
+                        "Build egress firewall remove helper",
+                    ),
                     check=False,
+                    timeout=setup_timeout_s + 15,
                 )
+                if remove_res.exit_status != 0:
+                    # 124: `timeout(1)` killed the helper client; the rules may
+                    # still be in the chain and the container is removed below.
+                    logger.warning(
+                        _m(
+                            "Custom build egress rule teardown failed (non-fatal)",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "exit_status": remove_res.exit_status,
+                                    "timed_out": remove_res.exit_status == 124,
+                                    "stderr": (remove_res.stderr or "").strip(),
+                                    "dind_ip": dind_ip,
+                                }
+                            ),
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001 — best-effort
                 logger.warning(
                     _m(
@@ -4458,9 +5232,29 @@ class DockerService:
                     )
                 )
         try:
+            # Both helpers by name, before the DinD IP is released. A helper
+            # that finished is already gone (`--rm`); `rm -f` kills one that
+            # outlived its `timeout(1)`.
+            await ssh_client.run(
+                f"/usr/bin/docker rm -f {shlex.quote(apply_helper)} "
+                f"{shlex.quote(remove_helper)} 2>/dev/null || true",
+                check=False,
+                timeout=setup_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                _m(
+                    "Custom build firewall helper teardown failed (non-fatal)",
+                    extra=get_extra_info(
+                        {**default_extra, "error": str(exc), "dind_name": dind_name}
+                    ),
+                )
+            )
+        try:
             await ssh_client.run(
                 f"/usr/bin/docker rm -fv {shlex.quote(dind_name)} 2>/dev/null || true",
                 check=False,
+                timeout=setup_timeout_s,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
@@ -4537,6 +5331,33 @@ class DockerService:
         raise _CreateCancelledByDelete(
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
+
+    @staticmethod
+    async def _connect_ssh_and_docker(
+        connections: AsyncExitStack,
+        ssh_connect: AbstractAsyncContextManager[asyncssh.SSHClientConnection],
+        docker_connect: AbstractAsyncContextManager[RentalDockerSdkClient],
+    ) -> tuple[asyncssh.SSHClientConnection, RentalDockerSdkClient]:
+        """DAH-3004: enter both connection contexts at once on the caller's exit stack.
+
+        ``gather`` waits for both outcomes, so whichever succeeded is already registered on
+        ``connections`` when the SSH failure, or the Docker failure if SSH succeeded, is re-raised —
+        the stack closes it on the way out and nothing is leaked, which a bare ``gather`` (one
+        coroutine still connecting while the exception propagates) would not guarantee.
+        """
+        ssh_outcome, docker_outcome = await asyncio.gather(
+            connections.enter_async_context(ssh_connect),
+            connections.enter_async_context(docker_connect),
+            return_exceptions=True,
+        )
+        if isinstance(ssh_outcome, BaseException):
+            if isinstance(docker_outcome, BaseException):
+                # both sides failed: the SSH error is raised, the Docker one rides along as its cause
+                raise ssh_outcome from docker_outcome
+            raise ssh_outcome
+        if isinstance(docker_outcome, BaseException):
+            raise docker_outcome
+        return ssh_outcome, docker_outcome
 
     async def create_container(
         self,
@@ -4756,24 +5577,33 @@ class DockerService:
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
             # changing how the connection is established.
-            async with (
-                connect_with_phase_timing(
-                    log_extra=default_extra,
-                    host=executor_info.address,
-                    port=executor_info.ssh_port,
-                    username=executor_info.ssh_username,
-                    client_keys=[pkey],
-                    known_hosts=known_hosts_policy,
-                    keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
-                    keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
-                ) as ssh_client,
-                self.rental_docker_client_factory.connect(
-                    executor_info=executor_info,
-                    private_key=private_key,
-                ) as docker_client,
+            #
+            # DAH-3004: the asyncssh session and the Docker-SDK-over-SSH client are two
+            # independent SSH handshakes to the same host; opened one after the other they
+            # cost p50 2.1 s / p90 4.3 s per rent (container_profiler_events, 7 d). Open them
+            # together: same connections, same order of use, roughly half the wait.
+            async with AsyncExitStack() as connections:
+                ssh_client, docker_client = await self._connect_ssh_and_docker(
+                    connections,
+                    connect_with_phase_timing(
+                        log_extra=default_extra,
+                        host=executor_info.address,
+                        port=executor_info.ssh_port,
+                        username=executor_info.ssh_username,
+                        client_keys=[pkey],
+                        known_hosts=known_hosts_policy,
+                        keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
+                        keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
+                    ),
+                    self.rental_docker_client_factory.connect(
+                        executor_info=executor_info,
+                        private_key=private_key,
+                    ),
+                )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
-                _EditSwap(ssh_client, self.get_container_name(payload), default_extra) as edit_swap,
-            ):
+                edit_swap = await connections.enter_async_context(
+                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
+                )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
@@ -4823,6 +5653,32 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "error": str(exc)}),
                             )
                         )
+                    # DAH-3873: a mutable tag (`:prod`) on the host can be an old build. Pull when the
+                    # registry tag moved. When the registry does not answer, use the local image.
+                    if image_present:
+                        auth_config = (
+                            {"username": payload.docker_username, "password": payload.docker_password}
+                            if has_credentials
+                            else None
+                        )
+                        try:
+                            image_present = await docker_client.local_image_is_current(
+                                image=payload.docker_image, auth_config=auth_config
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                _m(
+                                    "Registry digest check failed; using the local image",
+                                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                                )
+                            )
+                        if not image_present:
+                            logger.info(
+                                _m(
+                                    "Local image is older than the registry tag; pulling",
+                                    extra=get_extra_info(default_extra),
+                                )
+                            )
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_IMAGE_INSPECT, prev_timestamp))
                     prev_timestamp = now_ms()
 
@@ -4872,7 +5728,7 @@ class DockerService:
                 # rental Docker SDK client.
                 if is_custom_build:
                     current_step = "docker_build"
-                    build_ok, build_failure_step = await self._custom_build_image(
+                    build_ok, build_failure_step, build_log_tail = await self._custom_build_image(
                         ssh_client=ssh_client,
                         payload=payload,
                         log_tag=log_tag,
@@ -4888,11 +5744,23 @@ class DockerService:
                         )
                         # Raise so the existing except-Exception block in
                         # create_container emits the CCF FailedContainerRequest
-                        # via the same path as today's pull failure.
+                        # via the same path as today's pull failure. The tail
+                        # stays out of `detail` because the backend runs the
+                        # GPU-quarantine classifier on it, and out of this log
+                        # line because BuildKit echoes the renter's secrets.
                         current_step = build_failure_step or "docker_build"
-                        raise Exception(
-                            f"Custom dockerfile build failed (failure_step={current_step})"
+                        logger.error(
+                            _m(
+                                "Custom build failed",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "failure_step": current_step,
+                                    "build_log_tail_lines": len((build_log_tail or "").splitlines()),
+                                    "build_log_tail_chars": len(build_log_tail or ""),
+                                }),
+                            )
                         )
+                        raise CustomBuildFailed(current_step, build_log_tail)
                     # Override docker_image so the downstream `docker run` uses
                     # the locally built tag for this branch only.
                     effective_image = self._custom_build_image_tag(payload.pod_id)
@@ -5072,6 +5940,10 @@ class DockerService:
                     active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                     host_probe=docker_listing_probe,
+                    # DAH-3706: a customer's pod never shares the node with a filler, so its
+                    # create removes every filler_* whatever the backend listed; a filler create
+                    # keeps protecting its listed sibling bundle (DAH-2465).
+                    remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                 )
                 if removed_containers:
                     docker_listing_probe = None
@@ -5540,24 +6412,6 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
-                # DAH-3258: the inspector collector is a host-side process that reads the container
-                # from outside; it needs neither the encrypted mount nor the keys, so with the flag on
-                # it starts now and runs alongside them. It is awaited before ContainerCreated is
-                # returned (nothing here moves past RUNNING), and a create that fails after this
-                # point settles it the way a delete does (_settle_inspector_after_failed_create).
-                postrun_concurrent = settings.RENTAL_POSTRUN_CONCURRENT_ENABLED
-                inspector_extra = {**default_extra, "container_name": container_name}
-                inspector_task: asyncio.Task | None = None
-                if postrun_concurrent and settings.ENABLE_INSPECTOR:
-                    inspector_task = asyncio.create_task(
-                        self._run_inspector_collector_lifecycle(
-                            ssh_client=ssh_client,
-                            executor_info=executor_info,
-                            action="start",
-                            default_extra=inspector_extra,
-                        )
-                    )
-
                 try:
                     if use_encrypted_volume:
                         current_step = "encrypted_volume_setup"
@@ -5602,26 +6456,27 @@ class DockerService:
                     # a grace period waiting for an image-provided sshd — whichever
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
-                    # DAH-3258: with the flag on the renter's /etc/environment lines ride in this
-                    # exec (one exec instead of two); they are plain data with no dependency on the
-                    # bootstrap, and the file is read at login, so writing them before sshd is up
-                    # changes nothing for the renter. An environment too large for one exec
-                    # variable keeps its own stdin exec below.
-                    environment_in_keys_exec = postrun_concurrent and environment_fits_exec_variable(
-                        custom_options.environment if custom_options else None
-                    )
-                    await self.add_ssh_public_keys_with_rental_docker(
-                        docker_client=docker_client,
-                        container_name=container_name,
-                        public_keys=payload.user_public_keys,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                        environment=(
-                            custom_options.environment
-                            if environment_in_keys_exec and custom_options
-                            else None
-                        ),
-                    )
+                    try:
+                        await self.add_ssh_public_keys_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            public_keys=payload.user_public_keys,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                    except Exception as keys_exc:
+                        # DAH-3678: name the exiting image (DAH-2624) whatever form the exec
+                        # failure took; the step and the cleanup below stay as they are.
+                        explained = await _explain_add_public_keys_failure(
+                            docker_client,
+                            container_name=container_name,
+                            image=payload.docker_image,
+                            cause=keys_exc,
+                            log_extra=default_extra,
+                        )
+                        if explained is keys_exc:
+                            raise
+                        raise explained from keys_exc
 
                     current_step = "ssh_bootstrap"
                     if image_manages_services:
@@ -5678,28 +6533,21 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.SSH_SERVICE_INSTALLATION, prev_timestamp))
                     prev_timestamp = now_ms()
 
-                    # add environment variables (already written by the keys exec with DAH-3258 on)
+                    # add environment variables
                     current_step = "set_environment"
-                    if not environment_in_keys_exec:
-                        environment_error = await self.add_environment_variables_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            environment=custom_options.environment if custom_options else None,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                        )
-                        if environment_error:
-                            raise RuntimeError(f"Failed to set environment variables: {environment_error}")
+                    environment_error = await self.add_environment_variables_with_rental_docker(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        environment=custom_options.environment if custom_options else None,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
+                    if environment_error:
+                        raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
-                    profilers.append(
-                        ProfilerStep.since(
-                            ProfilerStepName.ADDING_PUBLIC_KEYS,
-                            prev_timestamp,
-                            skipped=environment_in_keys_exec,
-                        )
-                    )
+                    profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
 
                     await self.finish_stream_logs()
@@ -5715,15 +6563,15 @@ class DockerService:
                         container_name=container_name,
                         default_extra=default_extra,
                     )
-                    if inspector_task is not None:
-                        # started alongside the mount above; this step times only what is left of it
-                        await inspector_task
-                    elif settings.ENABLE_INSPECTOR:
+                    if settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
                             executor_info=executor_info,
                             action="start",
-                            default_extra=inspector_extra,
+                            default_extra={
+                                **default_extra,
+                                "container_name": container_name,
+                            },
                         )
                     profilers.append(
                         ProfilerStep.since(
@@ -5734,13 +6582,6 @@ class DockerService:
                     )
                     prev_timestamp = now_ms()
                 except Exception:
-                    if inspector_task is not None:
-                        await self._settle_inspector_after_failed_create(
-                            inspector_task,
-                            ssh_client=ssh_client,
-                            executor_info=executor_info,
-                            default_extra=inspector_extra,
-                        )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -5843,7 +6684,45 @@ class DockerService:
                     "failure_step": current_step,
                 }),
             )
-            logger.error(log_text, exc_info=True)
+            # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
+            # deleted the pod while it was being built, or the workload image exits at start on this
+            # node; neither is a validator fault. ERROR with the traceback stays for everything else.
+            # The restarting case stays an ERROR "Failed create_container" line: lium-platform's
+            # pod_creation_failure_events ETL ingests only that message at ERROR (and classifies its
+            # "is restarting" error text as container.crash_looping).
+            if isinstance(e, _CreateCancelledByDelete):
+                logger.info(
+                    _m(
+                        "create cancelled by delete",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason": "cancelled_by_delete",
+                            "failure_step": current_step,
+                        }),
+                    )
+                )
+            elif isinstance(
+                _last_attempt_exception(e),
+                (RentalDockerContainerRestartingError, ImageExitedDuringKeyInjection),
+            ):
+                # add_public_keys re-raises the restart error wrapped in ImageExitedDuringKeyInjection
+                logger.error(
+                    _m(
+                        "Failed create_container",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": "; ".join(_exception_texts(e)),
+                            "failure_step": current_step,
+                            "reason": (
+                                "image_exited_during_key_injection"
+                                if isinstance(_last_attempt_exception(e), ImageExitedDuringKeyInjection)
+                                else "workload_container_restarting"
+                            ),
+                        }),
+                    )
+                )
+            else:
+                logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -5882,6 +6761,11 @@ class DockerService:
                     }
                     else None
                 ),
+                # Renter-safe on its own: the output of the renter's Dockerfile, no executor host data.
+                build_log_tail=e.log_tail if isinstance(e, CustomBuildFailed) else None,
+                # The Docker daemon's reason for a volume failure; the dead-transport hint alone for
+                # any other step it surfaces at (docker_run on a template switch); else None.
+                step_detail=failure_step_detail(e, current_step),
             )
 
     async def _run_bootstrap_restore(
@@ -6502,7 +7386,7 @@ class DockerService:
         # host instead of guessed from pod_id — a pod created through the edit path carries a
         # backend-supplied volume name that no convention derives. Every mount can be offered
         # blindly: repair_stale_vloopback_mountpoint accepts only a vloopback volume whose stale
-        # mountpoint dir is present and empty.
+        # mountpoint dir is unmounted and either empty (removed here) or already gone.
         inspect_result = await ssh_client.run(
             f"/usr/bin/docker inspect {shlex.quote(container_name)} "
             '--format \'{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}\'',
@@ -6561,6 +7445,81 @@ class DockerService:
             error_code=FailedContainerErrorCodes.UnknownError,
         )
 
+    @dataclass(frozen=True)
+    class _ForcedRemoval:
+        """What the forced removal established.
+
+        `failure` is the answer to return instead of going on (the container is not known to be
+        gone). `confirmed_by_inspect` (DAH-3467): the remove's reply outlived the read timeout and
+        an inspect 404 confirmed the container gone; dockerd may still hold its named-volume
+        references for a moment, so the volume removes that follow retry "volume is in use".
+        """
+
+        failure: FailedContainerRequest | None = None
+        confirmed_by_inspect: bool = False
+
+    def _deletion_in_progress(
+        self, payload: ContainerDeleteRequest, msg: str
+    ) -> FailedContainerRequest:
+        # the backend keeps the pod DELETING and re-asks from its retry sweep; no failure event
+        return FailedContainerRequest(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            msg=msg,
+            error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+            error_code=FailedContainerErrorCodes.DeletionInProgress,
+        )
+
+    async def _container_status_after_removal_timeout(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> str | None:
+        """What became of a force-remove whose reply outlived the SDK read timeout.
+
+        Polls ``inspect`` by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS. Returns None once dockerd
+        answers 404 (gone), ``"removing"`` when it is still tearing the container down at the end of
+        the window, any other ``State.Status`` as soon as it is seen (the container is not being
+        removed), or ``"unknown"`` when the inspect itself fails, times out or carries no state.
+        Only None lets the delete report success.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REMOVE_CONFIRM_TIMEOUT_SECONDS
+        while True:
+            # the window is checked between inspects, so the last inspect may run past the
+            # deadline by up to REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS (worst case ~75 s in all)
+            try:
+                status = await asyncio.wait_for(
+                    docker_client.container_status(container_name=payload.container_name),
+                    REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Could not inspect the container after the remove timed out",
+                    container_name=payload.container_name,
+                    error=str(exc),
+                )
+                return "unknown"
+            if status == "":
+                # an inspect body without State.Status: dockerd knows the name but says nothing
+                # usable about it — not proof of anything, the delete fails as before
+                log.warning(
+                    "Inspect after the remove timed out carried no container state",
+                    container_name=payload.container_name,
+                )
+                return "unknown"
+            if status is None or status != _DOCKER_REMOVING_STATUS:
+                return status
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return status
+            await asyncio.sleep(min(REMOVE_CONFIRM_POLL_SECONDS, remaining))
+
     async def _stop_container_gracefully(
         self,
         docker_client: RentalDockerSdkClient,
@@ -6607,12 +7566,57 @@ class DockerService:
             duration_ms=int((time.monotonic() - stop_started) * 1000),
         )
 
+    async def _removal_after_read_timeout(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        exc: Exception,
+    ) -> _ForcedRemoval | None:
+        """The forced removal's outcome once its reply outlived the SDK read timeout.
+
+        DAH-3467: dockerd took the force-remove and has not answered yet, so the container is
+        asked about instead of failing a delete that is most likely completing. Returns the
+        removal confirmed by inspect, DeletionInProgress while dockerd is still removing it, or
+        None when nothing proves the container gone (the caller re-raises the timeout).
+        """
+        status = await self._container_status_after_removal_timeout(docker_client, payload, log)
+        if status is None:
+            log.info(
+                "Container removal outlived the read timeout; inspect confirms it is gone",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+            return self._ForcedRemoval(confirmed_by_inspect=True)
+        if status == _DOCKER_REMOVING_STATUS:
+            log.info(
+                "Container deletion is still in progress after the read timeout",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+            return self._ForcedRemoval(
+                failure=self._deletion_in_progress(
+                    payload,
+                    msg=f"{exc}; container still '{status}' after "
+                    f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
+                )
+            )
+        # `unknown` (the inspect failed, hung or carried no state) or any other State.Status:
+        # none of them proves the container is gone
+        log.warning(
+            "Container not confirmed gone after the remove timed out",
+            container_name=payload.container_name,
+            container_status=status,
+            error=str(exc),
+        )
+        return None
+
     async def _force_remove_container(
         self,
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
-    ) -> FailedContainerRequest | None:
+    ) -> _ForcedRemoval:
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_container",
@@ -6636,15 +7640,15 @@ class DockerService:
                     container_name=payload.container_name,
                     error=error_msg,
                 )
-                return FailedContainerRequest(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    pod_id=payload.pod_id,
-                    workload_kind=payload.workload_kind,
-                    msg=error_msg,
-                    error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                    error_code=FailedContainerErrorCodes.DeletionInProgress,
+                return self._ForcedRemoval(
+                    failure=self._deletion_in_progress(payload, msg=error_msg)
                 )
+
+            if _is_docker_read_timeout_error(exc):
+                removal = await self._removal_after_read_timeout(docker_client, payload, log, exc)
+                if removal is None:
+                    raise
+                return removal
 
             # DAH-2345: deletion is idempotent for every workload kind — a container
             # that is already gone (e.g. removed by failed-create cleanup) must not
@@ -6657,7 +7661,62 @@ class DockerService:
                 container_name=payload.container_name,
                 error=str(exc),
             )
-        return None
+        return self._ForcedRemoval()
+
+    async def _remove_named_volume(
+        self,
+        docker_client: RentalDockerSdkClient,
+        volume_name: str,
+        volume_role: str,
+        log: _BoundLog,
+        *,
+        retry_in_use: bool,
+    ) -> None:
+        """Remove one named volume after the container is gone.
+
+        With `retry_in_use` (the removal was confirmed by an inspect 404 after a timed-out remove,
+        DAH-3467, or the pod carries a pending-deletion marker) a "volume is in use" answer is
+        retried REMOVE_CONFIRM_VOLUME_ATTEMPTS times, REMOVE_CONFIRM_VOLUME_RETRY_SECONDS apart:
+        dockerd can answer the inspect 404 before it has released the container's volume
+        references. Still in use after the last attempt, the error raises like any other volume
+        error, for the caller's best-effort step: the container is gone, and a DeletionInProgress
+        for a held volume would count against the backend's delete attempts and reach its penalty
+        path (review round 4). Every error without `retry_in_use` raises at once, as before.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="remove_volume",
+                    log_extra=log.base_extra,
+                    call=lambda: docker_client.remove_volume(volume_name=volume_name),
+                    volume_name=volume_name,
+                    volume_role=volume_role,
+                    attempt=attempt,
+                )
+                return
+            except Exception as exc:
+                if not retry_in_use or not _is_docker_volume_in_use_error(exc):
+                    raise
+                if attempt >= REMOVE_CONFIRM_VOLUME_ATTEMPTS:
+                    log.warning(
+                        "Named volume still in use after the container was confirmed gone; "
+                        "leaving it on the host",
+                        volume_name=volume_name,
+                        volume_role=volume_role,
+                        attempts=attempt,
+                        error=str(exc),
+                    )
+                    raise
+                log.info(
+                    "Named volume still in use after the container was confirmed gone; retrying",
+                    volume_name=volume_name,
+                    volume_role=volume_role,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                await asyncio.sleep(REMOVE_CONFIRM_VOLUME_RETRY_SECONDS)
 
     async def _force_remove_or_kill(
         self,
@@ -6665,7 +7724,7 @@ class DockerService:
         payload: ContainerDeleteRequest,
         ssh_client: asyncssh.SSHClientConnection,
         log: _BoundLog,
-    ) -> FailedContainerRequest | None:
+    ) -> _ForcedRemoval:
         """_force_remove_container, escalating once when dockerd cannot kill the process (DAH-2991).
 
         Retrying the same `rm -f` every 10 min failed 4 times in ticket-0287 and left the orphan
@@ -6765,9 +7824,17 @@ class DockerService:
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
-                    removal_failure = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
-                    if removal_failure is not None:
-                        return removal_failure
+                    removal = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
+                    if removal.failure is not None:
+                        # DeletionInProgress: the container is not gone yet and the backend will
+                        # re-ask. A filler's wedge sweep ran here when this path raised (below);
+                        # answering early must not skip it (DAH-3467, review). No-op while the
+                        # container's processes are still alive.
+                        if payload.workload_kind == WorkloadKind.FILLER:
+                            with _best_effort_delete_step(log, "sweep_wedged_gpus_before_in_progress"):
+                                await _sweep_wedged_gpus_after_teardown(ssh_client, log)
+                        pending_deletions.mark(payload.pod_id)
+                        return removal.failure
                 except Exception:
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
                     # classic wedge path — sweep before propagating so a wedged card does not
@@ -6806,36 +7873,48 @@ class DockerService:
                         call=docker_client.prune_images,
                     )
 
+                # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
+                # retried before the step gives it up; every volume failure stays best-effort. A
+                # re-ask after DeletionInProgress finds the container absent, not confirmed by
+                # inspect: the pod's marker keeps its volume cleanup on the retried path (review).
+                retry_volume_in_use = removal.confirmed_by_inspect
+                if pending_deletions.is_pending(payload.pod_id):
+                    retry_volume_in_use = True
+                    log.info(
+                        "Continuing a deletion answered in progress earlier; a volume still in use is retried",
+                        container_name=payload.container_name,
+                    )
+
                 if payload.local_volume:
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="remove_volume",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.remove_volume(
-                                volume_name=payload.local_volume
-                            ),
-                            volume_name=payload.local_volume,
-                            volume_role="local",
+                        await self._remove_named_volume(
+                            docker_client,
+                            payload.local_volume,
+                            "local",
+                            log,
+                            retry_in_use=retry_volume_in_use,
                         )
 
                 if payload.external_volume:
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="remove_volume",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.remove_volume(
-                                volume_name=payload.external_volume
-                            ),
-                            volume_name=payload.external_volume,
-                            volume_role="external",
+                        await self._remove_named_volume(
+                            docker_client,
+                            payload.external_volume,
+                            "external",
+                            log,
+                            retry_in_use=retry_volume_in_use,
                         )
                         await self.remove_s3fs_volume_plugin(
                             ssh_client=ssh_client, volume_name=payload.external_volume
                         )
+
+                # the delete completed (the volumes are gone or given up): the next delete for this
+                # pod starts clean
+                pending_deletions.clear(payload.pod_id)
 
                 log.info(
                     "Remove rented machine from redis",

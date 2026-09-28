@@ -19,7 +19,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
-from services.hardware_service import get_system_metrics, get_container_metrics
+from services.hardware_service import get_docker_client, get_system_metrics, get_container_metrics
+from services.update_status_service import ExpectedDigestCache, collect_update_status
 from core.config import settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
@@ -504,6 +505,29 @@ async def local_verify(request: Request):
         {name: step.status for name, step in result.steps.items()},
     )
     return result.model_dump(by_alias=True)
+
+
+_expected_digest_cache = ExpectedDigestCache()
+
+
+@apis_router.get("/update-status")
+async def get_update_status():
+    """
+    Self-check of the stack's update state (DAH-3419): the digest of the runner image
+    this node runs against the digest the validator signed, and the executor's own
+    image digest. `update_pending` is null when either digest is unknown.
+
+    Kept off `/version`, which the container healthcheck polls with a 5 s budget.
+
+    Returns:
+        dict: {"version": "x.y.z", "runner": {"container", "running_digest",
+        "expected_digest", "update_pending", "error"}, "executor": {"running_digest"}}
+    """
+    status = await _run_metrics_call(
+        "update_status",
+        functools.partial(collect_update_status, get_docker_client, _expected_digest_cache),
+    )
+    return {"version": _get_version(), **status}
 
 
 @apis_router.get("/containers/{container_name}/logs")
