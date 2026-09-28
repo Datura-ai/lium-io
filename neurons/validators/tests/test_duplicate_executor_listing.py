@@ -315,6 +315,25 @@ async def test_a_uuid_listed_by_two_hotkeys_is_paid_once_under_the_lowest_hotkey
 
 
 @pytest.mark.asyncio
+async def test_an_excluded_copy_under_the_lowest_hotkey_does_not_block_the_eligible_one():
+    others = {"miner-c": [_idle_b300_1x(f"exec-{n}") for n in ("c", "d", "e", "f")]}
+    excluded = _idle_b300_1x("exec-twin")
+    excluded.is_spot = True
+    jobs = {"miner-a": [excluded], "miner-b": [_idle_b300_1x("exec-twin")]} | others
+
+    incentive = await _score(jobs)
+
+    eligible = jobs["miner-b"][0]
+    assert incentive.unrented_count_by_bucket[("B300", 1)] == 5
+    assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
+    assert eligible.incentive == pytest.approx(others["miner-c"][0].incentive)
+    assert eligible.incentive == pytest.approx(incentive.rental_share / 5)
+    assert _reasons(eligible) == []
+    assert excluded.incentive == 0.0
+    assert "duplicate_executor_in_cycle" not in _reasons(excluded)
+
+
+@pytest.mark.asyncio
 async def test_a_uuid_reported_with_two_gpu_counts_is_counted_and_paid_once():
     jobs = {
         "miner-a": [_idle_b300_1x("exec-twin"), _idle_b300_1x("exec-b")],

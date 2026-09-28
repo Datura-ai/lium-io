@@ -642,7 +642,9 @@ class RentalPriceIncentive(DefaultIncentive):
         independently of it: the one under the lowest miner hotkey (string order), and within a
         miner its first entry. Every other idle copy of that executor, under the same or another
         hotkey, is marked and paid 0 with its reason. Rented results are not considered: a
-        partly rented split node's rented portion shares its uuid with its free portion.
+        partly rented split node's rented portion shares its uuid with its free portion. Nor are
+        copies excluded from both pools (ban, spot, no Discord, ...), so an excluded copy never
+        takes the paid slot from an eligible one.
         """
         self._repeated_idle_copies = set()
         copies: dict[tuple[str, str], list[tuple[str, int, JobResult]]] = {}
@@ -653,6 +655,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     not result.is_successful
                     or result.is_rented
                     or base_model not in self.config.rental_incentive_gpu_types
+                    or self._reason_excluded_from_both_pools(result) is not None
                 ):
                     continue
                 key = (base_model, str(result.executor_info.uuid))
