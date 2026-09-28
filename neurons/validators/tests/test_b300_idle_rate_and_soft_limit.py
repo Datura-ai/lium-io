@@ -237,9 +237,37 @@ def test_the_override_is_read_from_the_environment_as_json(monkeypatch) -> None:
     assert Settings().UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL == {"B300": 1.1}
 
 
-@pytest.mark.parametrize("rate", [0.0, -1.1])
-def test_a_non_positive_override_rate_is_refused(monkeypatch, rate: float) -> None:
+@pytest.mark.parametrize("rate", ["0.0", "-1.1", "NaN", "Infinity", "-Infinity", "1e400"])
+def test_a_rate_that_is_not_finite_and_above_0_is_refused(monkeypatch, rate: str) -> None:
     monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", f'{{"B300": {rate}}}')
 
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="must be a finite number above 0"):
         Settings()
+
+
+@pytest.mark.parametrize("key", ["b300", B300_AC, "B301", ""])
+def test_a_key_that_is_not_a_base_model_is_refused(monkeypatch, key: str) -> None:
+    monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", f'{{"{key}": 1.1}}')
+
+    with pytest.raises(ValueError, match="is not a base model"):
+        Settings()
+
+
+@pytest.mark.parametrize("raw", ["", "not json", '["B300", 1.1]', '{"B300": "fast"}'])
+def test_a_malformed_override_stops_the_validator(monkeypatch, raw: str) -> None:
+    monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", raw)
+
+    with pytest.raises(Exception, match="UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL"):
+        Settings()
+
+
+def test_a_json_null_override_is_no_override(monkeypatch) -> None:
+    monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", "null")
+
+    assert Settings().UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL == {}
+
+
+def test_the_proposed_b300_value_loads(monkeypatch) -> None:
+    monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", '{"B300": 1.1, "H200": 1.5}')
+
+    assert Settings().UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL == {"B300": 1.1, "H200": 1.5}

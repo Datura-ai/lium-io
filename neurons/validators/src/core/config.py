@@ -1,3 +1,4 @@
+import math
 import pathlib
 from datetime import datetime
 from enum import Enum
@@ -16,7 +17,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
-from incentive.config import IncentiveConfig
+from incentive.config import BASE_GPU_MAP, IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 
@@ -737,11 +738,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_soft_price_limit_rates(self) -> "Settings":
-        # a rate at or below 0 would put every priced idle executor of the model over the limit
+        # A NaN or inf rate would switch the model's ceiling off (price > p90 * nan is never true), a rate at
+        # or below 0 would put every priced idle executor over it, and a key that is not a base model (a
+        # lowercase or full GPU name) would silently keep the shared rate: all three stop the validator.
+        base_models: set[str] = set(BASE_GPU_MAP.values())
         for base_model, rate in self.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.items():
-            if rate <= 0:
+            if base_model not in base_models:
                 raise ValueError(
-                    f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] must be positive, got {rate}"
+                    f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL key {base_model!r} is not a base model "
+                    f"(a value of BASE_GPU_MAP, e.g. 'B300')"
+                )
+            if not math.isfinite(rate) or rate <= 0:
+                raise ValueError(
+                    f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] must be a finite number "
+                    f"above 0, got {rate}"
                 )
         return self
 
