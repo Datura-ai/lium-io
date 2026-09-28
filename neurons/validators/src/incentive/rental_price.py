@@ -636,20 +636,21 @@ class RentalPriceIncentive(DefaultIncentive):
         return split_portions
 
     def _mark_repeated_idle_copies(self) -> None:
-        """One idle result per `(base_model, executor uuid)` is counted and paid in a cycle.
+        """One idle result per `(hotkey, base_model, executor uuid)` is counted and paid in a cycle.
 
-        The cycle collects miners' results in completion order, so the paid copy is picked
-        independently of it: the one under the lowest miner hotkey (string order), and within a
-        miner its first entry. Every other idle copy of that executor, under the same or another
-        hotkey, is marked and paid 0 with its reason. Rented results are not considered: a
-        partly rented split node's rented portion shares its uuid with its free portion. Nor are
-        copies excluded from both pools (ban, spot, no Discord, ...), so an excluded copy never
-        takes the paid slot from an eligible one.
+        Within a miner the first entry is paid; every later idle copy of that executor under the
+        same hotkey is marked and paid 0 with its reason. The same uuid under two hotkeys is not
+        touched here: an executor serves one miner hotkey only (`MINER_HOTKEY_SS58_ADDRESS`) and
+        the uuid comes from the miner's own DB, so those are two machines, and cross-miner
+        duplicates belong to `DuplicateExecutorCheck` and the backend duplicate list. Rented
+        results are not considered: a partly rented split node's rented portion shares its uuid
+        with its free portion. Nor are copies excluded from both pools (ban, spot, no Discord,
+        ...), so an excluded copy never takes the paid slot from an eligible one.
         """
         self._repeated_idle_copies = set()
-        copies: dict[tuple[str, str], list[tuple[str, int, JobResult]]] = {}
+        copies: dict[tuple[str, str, str], list[JobResult]] = {}
         for hotkey, results in self.job_results.items():
-            for index, result in enumerate(results):
+            for result in results:
                 base_model: str | None = BASE_GPU_MAP.get(result.gpu_model)
                 if (
                     not result.is_successful
@@ -658,13 +659,10 @@ class RentalPriceIncentive(DefaultIncentive):
                     or self._reason_excluded_from_both_pools(result) is not None
                 ):
                     continue
-                key = (base_model, str(result.executor_info.uuid))
-                copies.setdefault(key, []).append((hotkey, index, result))
+                key = (hotkey, base_model, str(result.executor_info.uuid))
+                copies.setdefault(key, []).append(result)
         for found in copies.values():
-            if len(found) < 2:
-                continue
-            found.sort(key=lambda copy: (copy[0], copy[1]))
-            self._repeated_idle_copies.update(id(result) for _, _, result in found[1:])
+            self._repeated_idle_copies.update(id(result) for result in found[1:])
 
     @staticmethod
     def _pay_repeated_idle_copy_nothing(result: JobResult) -> None:

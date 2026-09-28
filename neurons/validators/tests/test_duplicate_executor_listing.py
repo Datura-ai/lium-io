@@ -293,8 +293,8 @@ async def test_a_uuid_repeated_within_a_miner_is_paid_one_share_and_counted_once
 
 @pytest.mark.parametrize("listed_first", ["miner-a", "miner-b"])
 @pytest.mark.asyncio
-async def test_a_uuid_listed_by_two_hotkeys_is_paid_once_under_the_lowest_hotkey(listed_first):
-    """The cycle collects miners' results in completion order; the paid copy does not depend on it."""
+async def test_a_uuid_listed_by_two_hotkeys_is_paid_under_both_and_nothing_is_marked(listed_first):
+    """An executor serves one miner hotkey only, so the same uuid under two hotkeys is two machines."""
     others = {"miner-c": [_idle_b300_1x(f"exec-{n}") for n in ("c", "d", "e", "f")]}
     twins = {"miner-a": [_idle_b300_1x("exec-twin")], "miner-b": [_idle_b300_1x("exec-twin")]}
     order = [listed_first, "miner-b" if listed_first == "miner-a" else "miner-a"]
@@ -302,28 +302,26 @@ async def test_a_uuid_listed_by_two_hotkeys_is_paid_once_under_the_lowest_hotkey
 
     incentive = await _score(jobs)
 
-    paid, unpaid = jobs["miner-a"][0], jobs["miner-b"][0]
     distinct = others["miner-c"][0]
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == 5
+    assert incentive.unrented_count_by_bucket[("B300", 1)] == 6
     assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
-    assert paid.incentive == pytest.approx(distinct.incentive)
-    assert paid.incentive == pytest.approx(incentive.rental_share / 5)
-    assert unpaid.incentive == 0.0
-    assert _reasons(unpaid) == ["duplicate_executor_in_cycle"]
-    assert _reasons(paid) == []
-    assert incentive.miner_incentives.get("miner-b", 0.0) == 0.0
+    for twin in (jobs["miner-a"][0], jobs["miner-b"][0]):
+        assert twin.incentive == pytest.approx(distinct.incentive)
+        assert twin.incentive == pytest.approx(incentive.rental_share / 6)
+        assert _reasons(twin) == []
+    assert incentive._repeated_idle_copies == set()
 
 
 @pytest.mark.asyncio
-async def test_an_excluded_copy_under_the_lowest_hotkey_does_not_block_the_eligible_one():
+async def test_an_excluded_first_entry_does_not_block_the_eligible_repeat():
     others = {"miner-c": [_idle_b300_1x(f"exec-{n}") for n in ("c", "d", "e", "f")]}
     excluded = _idle_b300_1x("exec-twin")
     excluded.is_spot = True
-    jobs = {"miner-a": [excluded], "miner-b": [_idle_b300_1x("exec-twin")]} | others
+    jobs = {"miner-a": [excluded, _idle_b300_1x("exec-twin")]} | others
 
     incentive = await _score(jobs)
 
-    eligible = jobs["miner-b"][0]
+    eligible = jobs["miner-a"][1]
     assert incentive.unrented_count_by_bucket[("B300", 1)] == 5
     assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
     assert eligible.incentive == pytest.approx(others["miner-c"][0].incentive)
@@ -336,8 +334,7 @@ async def test_an_excluded_copy_under_the_lowest_hotkey_does_not_block_the_eligi
 @pytest.mark.asyncio
 async def test_a_uuid_reported_with_two_gpu_counts_is_counted_and_paid_once():
     jobs = {
-        "miner-a": [_idle_b300_1x("exec-twin"), _idle_b300_1x("exec-b")],
-        "miner-b": [_job("exec-twin", B300, 8)],
+        "miner-a": [_idle_b300_1x("exec-twin"), _idle_b300_1x("exec-b"), _job("exec-twin", B300, 8)],
     }
 
     incentive = await _score(jobs)
@@ -345,8 +342,8 @@ async def test_a_uuid_reported_with_two_gpu_counts_is_counted_and_paid_once():
     assert incentive.unrented_count_by_bucket[("B300", 1)] == 2
     assert incentive.unrented_count_by_bucket.get(("B300", 8), 0) == 0
     assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
-    assert jobs["miner-b"][0].incentive == 0.0
-    assert _reasons(jobs["miner-b"][0]) == ["duplicate_executor_in_cycle"]
+    assert jobs["miner-a"][2].incentive == 0.0
+    assert _reasons(jobs["miner-a"][2]) == ["duplicate_executor_in_cycle"]
 
 
 @pytest.mark.asyncio
