@@ -1,3 +1,4 @@
+import logging
 from time import time
 
 from core.config import get_total_burn_emission
@@ -136,8 +137,10 @@ def log_for_monitoring(
                         "gpu_count": r.gpu_count, "executor_cost": ex_cost},
             ))
 
-        for job_list in job_results.values():
-            for job_result in job_list:
-                logger.info(_m("", extra=job_result.model_dump()))
+        # About 13 KB per executor per cycle; the summary lines above stay at INFO for the dashboards.
+        if logger.isEnabledFor(logging.DEBUG):
+            for job_list in job_results.values():
+                for job_result in job_list:
+                    logger.debug(_m("", extra=job_result.model_dump()))
     except Exception as e:
         logger.error(f"Error logging for monitoring: {e}", exc_info=True)
