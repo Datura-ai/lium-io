@@ -1,11 +1,41 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 from services.const import DEFAULT_JOB_OWNER_LIUM, MIN_PORT_COUNT
 
 from ..messages import PortCountMessages as Msg, render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
+
+
+def port_count_below_listing_floor(state: ContextState) -> int | None:
+    """The published `available_port_count` when it is below MIN_PORT_COUNT, else None.
+
+    The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
+    `daos/executor.py` get_available_executors), with no exemption for a rented node, so any run that
+    publishes a lower count leaves the node's free GPUs hidden from renters. The rent path gates
+    separately, on MIN_PORT_COUNT free `verified_ports` (`services/executor.py`).
+    None before PortCountCheck has written the count.
+    """
+    available: Any = state.specs.get("available_port_count")
+    if not isinstance(available, int) or isinstance(available, bool):
+        return None
+    return available if available < MIN_PORT_COUNT else None
+
+
+def hidden_from_renters_text(available_port_count: int) -> str:
+    return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
+
+
+def port_floor_what(state: ContextState, available_port_count: int) -> dict[str, Any]:
+    return {
+        "available_port_count": available_port_count,
+        "required": MIN_PORT_COUNT,
+        "listing_hidden": True,
+        "probed_port_count": state.probed_port_count,
+        "declared_port_count": state.declared_port_count,
+    }
 
 
 class PortCountCheck:
@@ -54,6 +84,8 @@ class PortCountCheck:
                     "required": MIN_PORT_COUNT,
                     "held_by_orphaned_containers": orphaned,
                     "held_by_preemptible_background_jobs": background_job_port_count,
+                    "probed_port_count": ctx.state.probed_port_count,
+                    "declared_port_count": ctx.state.declared_port_count,
                 },
                 remediation=(
                     f"Ports are held by orphaned rental container(s) {', '.join(orphaned)} that the validator "
@@ -68,15 +100,37 @@ class PortCountCheck:
                 event=event,
                 updates={"port_count": port_count, "state": updated_state},
             )
-        event = render_message(
-            Msg.PORT_COUNT_RECORDED,
-            ctx=ctx,
-            check_id=self.check_id,
-            what={
-                "available_port_count": port_count,
-                "held_by_preemptible_background_jobs": background_job_port_count,
-            },
-        )
+
+        if port_count < MIN_PORT_COUNT:
+            # Passed while rented, or unrented with background-job ports making up the floor: either way the
+            # published count is under it, so the free GPUs still cannot be listed or rented.
+            scored_as = (
+                "the rented portion is scored as rented"
+                if is_rented
+                else f"scored with {background_job_port_count} ports held by preemptible background jobs"
+            )
+            event = render_message(
+                Msg.PORT_COUNT_RECORDED,
+                ctx=ctx,
+                check_id=self.check_id,
+                severity="warning",
+                impact=f"{hidden_from_renters_text(port_count)}; {scored_as}",
+                what={
+                    **port_floor_what(ctx.state, port_count),
+                    "held_by_preemptible_background_jobs": background_job_port_count,
+                    "exempt_because_rented": is_rented,
+                },
+            )
+        else:
+            event = render_message(
+                Msg.PORT_COUNT_RECORDED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "available_port_count": port_count,
+                    "held_by_preemptible_background_jobs": background_job_port_count,
+                },
+            )
 
         return CheckResult(
             passed=True,
