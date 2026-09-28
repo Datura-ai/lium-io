@@ -14,6 +14,7 @@ from uuid import UUID
 
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
+from web3.exceptions import ContractLogicError
 
 ABI_PATH = pathlib.Path(__file__).with_name("collateral_abi.json")
 
@@ -33,6 +34,10 @@ _SS58_PREFIX = b"SS58PRE"
 
 
 class CollateralTransactionError(Exception):
+    pass
+
+
+class CollateralConfigError(Exception):
     pass
 
 
@@ -89,23 +94,44 @@ class CollateralClient:
         rpc_url: str | None = None,
         miner_key: str | None = None,
     ):
-        self.w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url or RPC_URLS[network]))
+        self.network = network
+        self.rpc_url = rpc_url or RPC_URLS.get(network)
         self.contract_address = AsyncWeb3.to_checksum_address(contract_address)
-        self.contract = self.w3.eth.contract(
-            address=self.contract_address, abi=json.loads(ABI_PATH.read_text())
-        )
         self.miner_account = Account.from_key(miner_key) if miner_key else None
         self.miner_address = self.miner_account.address if self.miner_account else None
+        self._w3 = None
+        self._contract = None
+
+    @property
+    def w3(self) -> AsyncWeb3:
+        # Built on first contract call so that CLI commands which never touch the
+        # contract still run on a network without a known EVM RPC endpoint.
+        if self._w3 is None:
+            if not self.rpc_url:
+                raise CollateralConfigError(
+                    f"No EVM RPC endpoint is known for BITTENSOR_NETWORK={self.network!r}; "
+                    "set SUBTENSOR_EVM_RPC_URL to call the collateral contract"
+                )
+            self._w3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_url))
+        return self._w3
+
+    @property
+    def contract(self):
+        if self._contract is None:
+            self._contract = self.w3.eth.contract(
+                address=self.contract_address, abi=json.loads(ABI_PATH.read_text())
+            )
+        return self._contract
 
     async def get_balance(self, address: str):
         balance = await self.w3.eth.get_balance(AsyncWeb3.to_checksum_address(address))
-        return self.w3.from_wei(balance, "ether")
+        return AsyncWeb3.from_wei(balance, "ether")
 
     async def get_executor_collateral(self, executor_uuid: str | UUID):
         amount = await self.contract.functions.collaterals(
             executor_uuid_bytes(executor_uuid)
         ).call()
-        return self.w3.from_wei(amount, "ether")
+        return AsyncWeb3.from_wei(amount, "ether")
 
     async def get_reclaim_request(self, reclaim_request_id: int) -> tuple:
         """(executorId, miner, amount in wei, denyTimeout) of a reclaim request; amount 0 once it is closed."""
@@ -132,8 +158,40 @@ class CollateralClient:
             tx_hash, timeout=300, poll_latency=2
         )
         if receipt["status"] == 0:
-            raise CollateralTransactionError(f"Transaction {tx_hash.hex()} reverted")
+            reason = await self._revert_reason(transaction, receipt["blockNumber"])
+            message = f"Transaction {tx_hash.hex()} reverted"
+            raise CollateralTransactionError(f"{message}: {reason}" if reason else message)
         return receipt
+
+    async def _revert_reason(self, transaction: dict, block_number: int) -> str | None:
+        """Replay a reverted transaction as an eth_call at its block and name the revert."""
+        call = {
+            key: transaction[key] for key in ("from", "to", "data", "value") if key in transaction
+        }
+        try:
+            await self.w3.eth.call(call, block_identifier=block_number)
+        except ContractLogicError as error:
+            data = (
+                error.data
+                if isinstance(error.data, str)
+                else str(error.args[0] if error.args else "")
+            )
+            return self._custom_error_name(data) or error.message or data or None
+        except Exception:
+            return None
+        return None
+
+    def _custom_error_name(self, data: str) -> str | None:
+        selector = data.removeprefix("0x")[:8].lower()
+        if len(selector) != 8:
+            return None
+        for entry in self.contract.abi:
+            if entry.get("type") != "error":
+                continue
+            signature = f"{entry['name']}({','.join(i['type'] for i in entry['inputs'])})"
+            if AsyncWeb3.keccak(text=signature)[:4].hex().removeprefix("0x") == selector:
+                return entry["name"]
+        return None
 
     async def reclaim_collateral(self, executor_uuid: str | UUID, url: str = "Manual reclaim"):
         """Start a reclaim of the executor's full collateral; returns its ReclaimProcessStarted."""
@@ -174,7 +232,7 @@ class CollateralClient:
                     reclaim_request_id=reclaim_request_id,
                     executor_uuid=str(UUID(bytes=executor_id)),
                     miner=miner,
-                    amount=float(self.w3.from_wei(amount, "ether")),
+                    amount=float(AsyncWeb3.from_wei(amount, "ether")),
                     expiration_time=datetime.fromtimestamp(expiration_time, UTC).strftime(
                         DATETIME_FORMAT
                     ),
