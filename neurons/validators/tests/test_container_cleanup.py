@@ -524,6 +524,22 @@ async def test_cleanup_invokes_volume_prune():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data",
+    [pytest.param(None, id="fetch-failed-none"), pytest.param(RentedExecutorsResponse(executors={}), id="empty")],
+)
+async def test_an_empty_or_unknown_rented_list_still_prunes_dangling_volumes(rented_data):
+    ssh, rm_calls = _volume_ssh_mock(dangling=[ANON_VOLUME_A])
+
+    result = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert result == (0, [], [])
+    assert any("docker volume rm" in c and ANON_VOLUME_A in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_preserves_every_filler_bundle_on_split_node():
     # DAH-2465: both bundle fillers must survive the stale-reaper — protecting only one let the
     # validator kill the sibling mid-cycle.

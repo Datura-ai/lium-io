@@ -678,13 +678,14 @@ async def test_this_cycles_reaps_go_out_before_ids_already_sent_once():
         pytest.param(RentedExecutorsResponse(executors={}), "rented_list_empty", id="empty"),
     ],
 )
-async def test_an_empty_or_unknown_rented_list_skips_removal_and_raises_a_warning(rented_data, reason):
-    cleanup = RecordingContainerCleanup(result=(1, ["pod_live_renter"], []))
+async def test_an_empty_or_unknown_rented_list_raises_a_warning_and_still_calls_cleanup(rented_data, reason):
+    # cleanup() itself refuses the removal on this list (test_container_cleanup) but still prunes volumes
+    cleanup = RecordingContainerCleanup(result=(0, [], []))
     ctx = _make_ctx(cleanup, rented_data=rented_data)
 
     result = await StaleContainerCleanupCheck().run(ctx)
 
-    assert cleanup.calls == []
+    assert [c["rented_data"] for c in cleanup.calls] == [rented_data]
     assert result.passed is True
     assert result.event.reason_code == "STALE_CLEANUP_RENTED_LIST_UNKNOWN"
     assert result.event.severity == "warning"

@@ -92,7 +92,7 @@ class StaleContainerCleanupCheck:
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data, ctx.executor.uuid)
-        if first_sight or rented_list_unknown is not None:
+        if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
             (
