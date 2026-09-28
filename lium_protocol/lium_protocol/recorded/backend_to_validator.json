@@ -366,7 +366,7 @@
     },
     {
       "expect": "RecheckExecutorRequest",
-      "note": "1.2.0: a rent failed on the node for the host's reasons; the backend holds it closed to new rentals until the validator's next report",
+      "note": "a rent failed on the node for the host's reasons; the backend holds it closed to new rentals until the validator's next report",
       "message": {
         "message_type": "RecheckExecutorRequest",
         "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
