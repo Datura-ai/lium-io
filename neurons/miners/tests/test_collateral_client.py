@@ -283,7 +283,10 @@ def test_non_collateral_command_runs_on_an_unknown_network(archive_network):
 @pytest.mark.parametrize(
     "url,origin",
     [
-        ("https://user:pw@evm.example.invalid:8443/v2/key?apikey=key", "https://evm.example.invalid:8443"),
+        (
+            "https://user:pw@evm.example.invalid:8443/v2/key?apikey=key",
+            "https://evm.example.invalid:8443",
+        ),
         ("https://evm.example.invalid/key", "https://evm.example.invalid"),
         ("evm.example.invalid/key", "<unparsed>"),
         (None, None),
@@ -293,7 +296,12 @@ def test_rpc_origin_keeps_only_the_scheme_and_host(url, origin):
     assert collateral_module.rpc_origin(url) == origin
 
 
-RPC_SECRETS = ("fake-rpc-user", "fake-rpc-password", "fake-rpc-key-in-path", "fake-rpc-key-in-query")
+RPC_SECRETS = (
+    "fake-rpc-user",
+    "fake-rpc-password",
+    "fake-rpc-key-in-path",
+    "fake-rpc-key-in-query",
+)
 
 
 @pytest.fixture
@@ -331,10 +339,43 @@ def rejecting_rpc():
 @pytest.mark.parametrize(
     "args,stdin",
     [
-        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY, "--contract", "1.0.2"], None),
-        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY, "--contract", "1.0.2"], None),
+        (
+            [
+                "reclaim-collateral",
+                "--executor_uuid",
+                EXECUTOR,
+                "--private-key",
+                MINER_KEY,
+                "--contract",
+                "1.0.2",
+            ],
+            None,
+        ),
+        (
+            [
+                "finalize-reclaim-request",
+                "--reclaim-request-id",
+                "5",
+                "--private-key",
+                MINER_KEY,
+                "--contract",
+                "1.0.2",
+            ],
+            None,
+        ),
         (["get-miner-collateral", "--contract", "1.0.2"], None),
-        (["get-executor-collateral", "--address", "192.0.2.10", "--port", "8001", "--contract", "1.0.2"], None),
+        (
+            [
+                "get-executor-collateral",
+                "--address",
+                "192.0.2.10",
+                "--port",
+                "8001",
+                "--contract",
+                "1.0.2",
+            ],
+            None,
+        ),
         (["get-reclaim-requests", "--contract", "1.0.2"], None),
         (["remove-executor", "--address", "192.0.2.10", "--port", "8001"], "y\n"),
     ],
