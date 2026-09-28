@@ -7332,6 +7332,13 @@ class DockerService:
     ) -> None:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
         holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
+        started_at_before = None
+        try:
+            started_at_before = (
+                await docker_client.inspect_container_state(container_name=container_name)
+            ).started_at
+        except Exception:  # noqa: BLE001 — unread, the start is recorded as before
+            pass
         await run_logged_rental_docker_sdk_operation(
             operation="start_container",
             log_extra=default_extra,
@@ -7339,7 +7346,9 @@ class DockerService:
             container_name=container_name,
         )
         # the undo empties the secrets tmpfs by design; recorded before the remount, which may still fail
-        await _record_platform_start(docker_client, ssh_client, container_name, default_extra)
+        await _record_platform_start(
+            docker_client, ssh_client, container_name, default_extra, started_at_before
+        )
         await self._restore_mount_and_sshd_after_start(
             docker_client=docker_client,
             ssh_client=ssh_client,

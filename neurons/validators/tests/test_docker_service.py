@@ -3288,6 +3288,24 @@ async def test_an_edit_rollback_records_the_platform_start(docker_service, monke
 
 
 @pytest.mark.asyncio
+async def test_an_edit_rollback_on_a_pod_still_running_records_nothing(docker_service, monkeypatch):
+    # park's stop failed, so the undo's start is a 304 on the run already going
+    ssh_client, _, _ = _start_request_harness(docker_service, monkeypatch, already_running=True)
+
+    await docker_service._bring_up_existing_container(
+        docker_client=docker_service.rental_docker_client_factory.client,
+        ssh_client=ssh_client,
+        container_name="pod_test",
+        local_volume_path="/root",
+        pod_id="pod-id",
+        default_extra={},
+    )
+
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+
+
+@pytest.mark.asyncio
 async def test_a_platform_start_of_a_pod_without_secrets_records_nothing(docker_service, monkeypatch):
     ssh_client, _, executor_info = _start_request_harness(docker_service, monkeypatch, secrets=False)
 
