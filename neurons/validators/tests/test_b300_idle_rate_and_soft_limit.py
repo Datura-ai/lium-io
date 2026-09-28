@@ -7,6 +7,13 @@ filler earns, the 8× bucket doubles, and `UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BAS
 model's ceiling differ from the shared rate. Every other GPU type keeps its rate, caps and ceiling.
 """
 
+import json
+import logging
+import math
+import os
+import pathlib
+import subprocess
+import sys
 from unittest.mock import AsyncMock
 
 import pytest
@@ -289,14 +296,18 @@ def test_a_boolean_rate_is_refused(monkeypatch, raw: str) -> None:
 @pytest.mark.parametrize("rate", [3.0, 1e308, 1.5000001])
 def test_a_rate_above_the_served_rate_stops_the_validator(rate: float) -> None:
     with pytest.raises(ValueError, match="may only tighten"):
-        validate_soft_price_limit_rates_only_tighten({"B300": rate}, PROD_SOFT_LIMIT_PRICE_RATE)
+        validate_soft_price_limit_rates_only_tighten(
+            {"B300": rate}, PROD_SOFT_LIMIT_PRICE_RATE, fetched=True
+        )
 
 
 @pytest.mark.parametrize(
     "overrides", [{"B300": 1.1}, {"B300": 1.1, "H200": PROD_SOFT_LIMIT_PRICE_RATE}, {}]
 )
 def test_a_rate_at_or_below_the_served_rate_is_accepted(overrides: dict[str, float]) -> None:
-    validate_soft_price_limit_rates_only_tighten(overrides, PROD_SOFT_LIMIT_PRICE_RATE)
+    validate_soft_price_limit_rates_only_tighten(
+        overrides, PROD_SOFT_LIMIT_PRICE_RATE, fetched=True
+    )
 
 
 @pytest.mark.parametrize(("rate", "price_per_gpu"), [(3.0, 20.00), (1e308, 1e300)])
@@ -324,3 +335,105 @@ def test_a_served_rate_that_drops_below_the_override_after_startup_wins(monkeypa
     # ceiling 8.637 × 1.0, not 8.637 × 1.1 = 9.5007
     assert incentive._soft_limit_price_rate(B300_AC) == 1.0
     assert incentive._is_over_soft_price_limit(_job("dublin", B300_AC, 8, 9.00)) is True
+
+
+def test_a_looser_rate_against_a_fetched_rate_names_it_as_served() -> None:
+    with pytest.raises(ValueError, match=r"served soft_limit_price_rate 1\.5 \(fetched"):
+        validate_soft_price_limit_rates_only_tighten({"B300": 3.0}, 1.5, fetched=True)
+
+
+def test_a_looser_rate_against_the_fallback_default_loads_with_a_warning(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="core.config"):
+        validate_soft_price_limit_rates_only_tighten(
+            {"B300": 1.3}, DEFAULT_SHARED_CONFIG.soft_limit_price_rate, fetched=False
+        )
+
+    assert "not fetched at boot" in caplog.text
+    assert "'B300'" in caplog.text
+
+
+@pytest.mark.parametrize("served", [math.nan, math.inf])
+def test_a_non_finite_served_rate_is_ignored_when_an_override_is_set(
+    monkeypatch, served: float
+) -> None:
+    _serve_prod_soft_limit(monkeypatch)
+    monkeypatch.setattr(
+        shared_client,
+        "_config",
+        shared_client.config.model_copy(update={"soft_limit_price_rate": served}),
+    )
+    monkeypatch.setattr(settings, "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", {"B300": 1.1})
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
+
+    assert incentive._soft_limit_price_rate(B300_AC) == 1.1
+    assert incentive._is_over_soft_price_limit(_job("dublin", B300_AC, 8, 12.95)) is True
+
+
+@pytest.mark.parametrize("served", [math.nan, math.inf])
+def test_a_non_finite_served_rate_without_an_override_puts_no_listing_over_the_limit(
+    monkeypatch, served: float
+) -> None:
+    _serve_prod_soft_limit(monkeypatch)
+    monkeypatch.setattr(
+        shared_client,
+        "_config",
+        shared_client.config.model_copy(update={"soft_limit_price_rate": served}),
+    )
+    monkeypatch.setattr(settings, "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", {})
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
+
+    rate = incentive._soft_limit_price_rate(B300_AC)
+    assert rate is served or (math.isnan(rate) and math.isnan(served))
+    assert incentive._is_over_soft_price_limit(_job("dublin", B300_AC, 8, 12.95)) is False
+
+
+_IMPORT_CONFIG = """
+import sys
+from unittest import mock
+
+import requests
+from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
+
+sys.path.insert(0, sys.argv[1])
+served = None if sys.argv[2] == "unreachable" else float(sys.argv[2])
+
+
+def fake_get(*args, **kwargs):
+    if served is None:
+        raise requests.ConnectionError("backend unreachable")
+    response = mock.Mock()
+    response.json.return_value = DEFAULT_SHARED_CONFIG.model_copy(
+        update={"soft_limit_price_rate": served}
+    ).model_dump(mode="json")
+    return response
+
+
+with mock.patch("requests.get", fake_get):
+    import core.config
+print("loaded", core.config.settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL)
+"""
+
+
+def _import_config(served: str, overrides: dict[str, float]) -> subprocess.CompletedProcess:
+    src = pathlib.Path(__file__).resolve().parents[1] / "src"
+    env = {**os.environ, "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL": json.dumps(overrides)}
+    return subprocess.run(
+        [sys.executable, "-c", _IMPORT_CONFIG, str(src), served],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_importing_the_config_refuses_a_rate_above_the_fetched_one() -> None:
+    result = _import_config("1.5", {"B300": 3.0})
+
+    assert result.returncode != 0
+    assert "may only tighten" in result.stderr
+    assert "loaded" not in result.stdout
+
+
+def test_importing_the_config_with_the_backend_unreachable_loads_a_looser_override() -> None:
+    result = _import_config("unreachable", {"B300": 1.3})
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "loaded {'B300': 1.3}" in result.stdout
+    assert "not fetched at boot" in result.stderr

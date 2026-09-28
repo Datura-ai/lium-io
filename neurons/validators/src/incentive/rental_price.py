@@ -11,6 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -264,11 +265,18 @@ class RentalPriceIncentive(DefaultIncentive):
     def _soft_limit_price_rate(gpu_model: str) -> float:
         base_model: str | None = BASE_GPU_MAP.get(gpu_model)
         served_rate: float = shared_client.config.soft_limit_price_rate
-        # The startup check compares against the rate served at boot; the served rate can drop
-        # on a later refresh.
-        override: float = settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.get(
-            base_model, served_rate
+        override: float | None = settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.get(
+            base_model
         )
+        if override is None:
+            return served_rate
+        # A NaN or inf served rate is ignored when an override is set (Settings refuses a
+        # non-finite override). Without an override it is returned as before: p90 * NaN or inf
+        # puts no listing over the limit.
+        if not math.isfinite(served_rate):
+            return override
+        # The startup check compares against the rate served at boot, or skips it when the fetch
+        # failed; the served rate can also drop on a later refresh.
         return min(override, served_rate)
 
     def _is_over_soft_price_limit(self, result: JobResult) -> bool:

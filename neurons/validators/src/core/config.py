@@ -1,3 +1,4 @@
+import logging
 import math
 import pathlib
 from datetime import datetime
@@ -850,26 +851,44 @@ shared_client = SharedConfigClient(
 
 
 def validate_soft_price_limit_rates_only_tighten(
-    overrides: dict[str, float], served_rate: float
+    overrides: dict[str, float], served_rate: float, fetched: bool
 ) -> None:
     """Stop the validator when a per-model soft limit rate is above the served one.
 
     The override exists to lower one model's ceiling. A higher rate would keep idle pay on
     listings the served rate refuses, and a huge one (1e308) overflows p90 * rate to inf,
     which switches the ceiling off.
+
+    When the boot fetch failed, `served_rate` is the lium-core default, not what the backend
+    serves: refusing against it would crash-loop a validator whose override is below the real
+    served rate. Only a warning then; `_soft_limit_price_rate` still caps the override at
+    whatever rate is in use.
     """
     for base_model, rate in overrides.items():
-        if rate > served_rate:
-            raise ValueError(
-                f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] = {rate} is above "
-                f"the served soft_limit_price_rate {served_rate}; the override may only tighten "
-                f"the ceiling"
+        if rate <= served_rate:
+            continue
+        if not fetched:
+            # stdlib logging: core.utils imports this module, so it may be half-initialized here.
+            logging.getLogger(__name__).warning(
+                "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[%r] = %s is above the lium-core "
+                "default soft_limit_price_rate %s; the shared config was not fetched at boot, so "
+                "it is not refused, and the rate in use caps it until the backend answers",
+                base_model,
+                rate,
+                served_rate,
             )
+            continue
+        raise ValueError(
+            f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] = {rate} is above "
+            f"the served soft_limit_price_rate {served_rate} (fetched from the shared config API); "
+            f"the override may only tighten the ceiling"
+        )
 
 
 validate_soft_price_limit_rates_only_tighten(
     settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL,
     shared_client.config.soft_limit_price_rate,
+    fetched=shared_client.config is not DEFAULT_SHARED_CONFIG,
 )
 
 
