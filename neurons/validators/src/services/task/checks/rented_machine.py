@@ -299,15 +299,19 @@ class TenantEnforcementCheck:
                 if outcome.failure:
                     return with_pod_states(outcome.failure)
                 ssh_pub_keys = outcome.ssh_pub_keys
+                # A pod down after a host reboot has RestartCount 0 and refuses exec while stopped, so
+                # the probe above could not tell; the started container answers `.ready` now.
+                if not secrets_lost and await _pod_secrets_lost(ctx.ssh, pod_container_name):
+                    secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
                 # Just recovered: judged from the renter's side next cycle, not on the way up.
                 continue
 
+            if await _pod_secrets_lost(ctx.ssh, pod_container_name):
+                secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
             if ssh_pub_keys is None:
                 # dockerd refused the keys read: not judged from the renter's side this cycle.
                 ssh_pub_keys = []
                 continue
-            if await _pod_secrets_lost(ctx.ssh, pod_container_name):
-                secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
             verdict = await probe_rented_pod_ssh(ctx, pod, ssh_pub_keys)
             if verdict is not None:
                 ssh_verdicts.append(verdict)

@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, Mock
 
 import asyncssh
@@ -1409,14 +1411,76 @@ async def test_a_pod_found_between_restarts_that_stays_down_names_its_lost_secre
     assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "pod_pod-1"}]
 
 
+class RealProbeSSHClient(DummySSHClient):
+    """Runs the real secrets probe against a fake `docker` that answers like dockerd for the pod's state:
+    exec is refused while the container is stopped, and a started container has no `.ready`."""
+
+    def __init__(self, tmp_path, *, restart_count: int, **kwargs):
+        super().__init__(**kwargs)
+        self.restart_count = restart_count
+        self.probe_outputs: list[str] = []
+        created = time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime(time.time() - 3600))
+        self.running_flag = tmp_path / "running"
+        self.fake_docker = tmp_path / "docker"
+        self.fake_docker.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            f'  inspect) echo "$(cat {tmp_path}/restart_count) {created} secrets" ;;\n'
+            f"  exec) [ -e {self.running_flag} ] || "
+            "{ echo 'Error response from daemon: container is not running' >&2; exit 1; }; echo missing ;;\n"
+            "esac\n"
+        )
+        self.fake_docker.chmod(0o755)
+        self.set_state(running=kwargs.get("pod_running", True), restart_count=restart_count)
+
+    def set_state(self, *, running: bool, restart_count: int) -> None:
+        self.pod_running = running
+        (self.fake_docker.parent / "restart_count").write_text(str(restart_count))
+        if running:
+            self.running_flag.touch()
+        else:
+            self.running_flag.unlink(missing_ok=True)
+
+    async def run(self, command: str):
+        if ".HostConfig.Tmpfs" not in command:
+            return await super().run(command)
+        self.commands_called.append(command)
+        process = await asyncio.create_subprocess_exec(
+            "sh", "-c", command.replace("/usr/bin/docker", str(self.fake_docker)),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        assert process.returncode == 0
+        result = Mock()
+        result.stdout = stdout.decode()
+        self.probe_outputs.append(result.stdout.strip())
+        return result
+
+
 @pytest.mark.asyncio
-async def test_a_pod_found_between_restarts_and_recovered_is_flagged_secrets_lost(context_factory, monkeypatch):
+@pytest.mark.parametrize(
+    "restart_count,probe_outputs",
+    [
+        # host reboot: dockerd's restore resets RestartCount to 0 and the stopped pod refuses exec
+        (0, ["", "secrets-lost"]),
+        # Docker restarted it by policy and it is caught between restarts: flagged before recovery
+        (1, ["secrets-lost"]),
+    ],
+    ids=["host-reboot", "between-policy-restarts"],
+)
+async def test_a_pod_recovered_in_the_cycle_is_flagged_secrets_lost_by_the_real_probe(
+    context_factory, monkeypatch, tmp_path, restart_count, probe_outputs
+):
     monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
-    ssh = SecretsLostSSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    ssh = RealProbeSSHClient(
+        tmp_path, restart_count=restart_count, pod_running=False, ssh_keys=["ssh-rsa recovered"]
+    )
     docker = AsyncMock()
 
     async def bring_pod_back_up(**kwargs):
-        ssh.pod_running = True
+        # `docker start` resets RestartCount too; the new tmpfs is empty
+        ssh.set_state(running=True, restart_count=0)
         return True
 
     docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
@@ -1426,7 +1490,43 @@ async def test_a_pod_found_between_restarts_and_recovered_is_flagged_secrets_los
 
     assert result.event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason
     assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "pod_pod-1"}]
-    assert sum(".HostConfig.Tmpfs" in command for command in ssh.commands_called) == 1
+    assert ssh.probe_outputs == probe_outputs
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_pod_is_not_probed_again_with_the_flag_off(context_factory, monkeypatch, tmp_path):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", False)
+    ssh = RealProbeSSHClient(tmp_path, restart_count=0, pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.set_state(running=True, restart_count=0)
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert ssh.probe_outputs == []
+
+
+@pytest.mark.asyncio
+async def test_a_pod_whose_keys_read_was_refused_is_still_probed_for_lost_secrets(context_factory, monkeypatch):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ssh = SecretsLostSSHClient(pod_running=True)
+    ctx = _tenant_ctx(context_factory, ssh, {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]})
+    monkeypatch.setattr(
+        rented_machine,
+        "_check_pod_running_and_read_authorized_keys",
+        AsyncMock(return_value=rented_machine.PodRunningAndAuthorizedKeys(running=True, authorized_keys=None)),
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason
+    assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "tenant-123"}]
 
 
 @pytest.mark.asyncio
