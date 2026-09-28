@@ -6,7 +6,6 @@ from typing import Any, NamedTuple
 
 import asyncssh
 
-from core.config import settings
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedPod
