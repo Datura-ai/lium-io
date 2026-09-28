@@ -151,6 +151,8 @@ class MachineSpecMessages:
         impact="Validation halted",
         remediation="Validator bug: missing SSH service in context",
     )
+    # What a validator before the split reported for every scrape failure below. Kept because the
+    # backend still reads it from those validators.
     SCRAPE_FAILED = MessageTemplate(
         event="Machine specs scrape failed",
         reason="SCRAPE_FAILED",
@@ -160,6 +162,71 @@ class MachineSpecMessages:
         remediation=(
             "Ensure the scrape script exists and is executable:"
             "\n  chmod +x <script>\nCheck stderr and environment on the executor."
+        ),
+    )
+    # Host side: the scrape ran on the executor and the host sent back an exit status (or a signal)
+    # with a failure.
+    SCRAPE_FAILED_NO_GPU = MessageTemplate(
+        event="Machine specs scrape found zero GPUs",
+        reason="SCRAPE_FAILED_NO_GPU",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "NVML answered on the host and listed zero GPUs. Run `nvidia-smi` on the host and make sure"
+            " the executor container starts with GPU access (NVIDIA container runtime, `--gpus all`)."
+        ),
+    )
+    SCRAPE_FAILED_DRIVER = MessageTemplate(
+        event="Machine specs scrape hit a GPU driver error",
+        reason="SCRAPE_FAILED_DRIVER",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "NVML raised on the host (driver unloaded, a GPU fallen off the bus, or a driver/library"
+            " version mismatch). Run `nvidia-smi` on the host, check `dmesg` for Xid errors, then"
+            " reboot or reinstall the driver."
+        ),
+    )
+    SCRAPE_FAILED_ON_HOST = MessageTemplate(
+        event="Machine specs scrape failed on the executor",
+        reason="SCRAPE_FAILED_ON_HOST",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The scrape exited with an error on the executor, or ended without output. Check the"
+            " stderr tail in this event, keep the executor image up to date, and make sure the host"
+            " has free disk and memory."
+        ),
+    )
+    # Undetermined: no exit status came back from the host, and a host fault and a validator fault
+    # both end this way.
+    SCRAPE_TIMEOUT = MessageTemplate(
+        event="Machine specs scrape timed out",
+        reason="SCRAPE_TIMEOUT",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The validator stopped waiting for the scrape at its timeout. Either side can cause this:"
+            " a GPU query that hangs on the host, a host link that drops packets, or a busy validator."
+            " If it repeats, check that `nvidia-smi` answers within seconds on the host."
+        ),
+    )
+    SCRAPE_TRANSPORT_FAILED = MessageTemplate(
+        event="Machine specs scrape returned no exit status",
+        reason="SCRAPE_TRANSPORT_FAILED",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The SSH session ended before the host sent the scrape's exit status, or the scrape could"
+            " not be delivered. Either side can cause this: the host's network, sshd or container going"
+            " down, a full disk on the host during the upload, or the validator's own network. The next"
+            " cycle retries; if it fails on every cycle, check that the host's SSH port answers from"
+            " outside and that the host has free disk."
         ),
     )
     SCRAPE_OK = MessageTemplate(
@@ -177,6 +244,23 @@ class MachineSpecMessages:
         impact="Validation halted — GPU unverified",
         remediation="Confirm encryption key, payload, and repo versions on both validator and executor.",
     )
+
+
+SCRAPE_HOST_SIDE_FAILURE_REASONS = frozenset(
+    {
+        MachineSpecMessages.SCRAPE_FAILED_NO_GPU.reason,
+        MachineSpecMessages.SCRAPE_FAILED_DRIVER.reason,
+        MachineSpecMessages.SCRAPE_FAILED_ON_HOST.reason,
+    }
+)
+# No split code is validator-side: each one without an exit status can come from the host's link,
+# sshd, disk or a hung GPU query as much as from the validator.
+SCRAPE_UNDETERMINED_FAILURE_REASONS = frozenset(
+    {
+        MachineSpecMessages.SCRAPE_TIMEOUT.reason,
+        MachineSpecMessages.SCRAPE_TRANSPORT_FAILED.reason,
+    }
+)
 
 
 class GpuCountMessages:
