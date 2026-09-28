@@ -493,6 +493,12 @@ class Settings(BaseSettings):
     # rental incentive while staying active. When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
+    # Soft limit rate per base model (keys of BASE_GPU_MAP's values, e.g. {"B300": 1.1}), used in place
+    # of the shared config's soft_limit_price_rate, which is one rate for every GPU. A base model left
+    # out keeps the shared rate; empty = the shared rate for all.
+    UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL: dict[str, float] = Field(
+        env="UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", default_factory=dict
+    )
     # DAH-2520 — unrented VRAM/disk sanity gate. When True, an unrented executor whose
     # total GPU VRAM exceeds the machine's total disk loses the unrented rental incentive
     # while staying active. When False, the breach is only logged (shadow mode) so prod
@@ -727,6 +733,16 @@ class Settings(BaseSettings):
                 f"RENTED_POD_SSH_ENFORCE_AFTER_CYCLES ({after}) must not be below "
                 f"RENTED_POD_SSH_PROBE_CYCLES ({self.RENTED_POD_SSH_PROBE_CYCLES})"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_soft_price_limit_rates(self) -> "Settings":
+        # a rate at or below 0 would put every priced idle executor of the model over the limit
+        for base_model, rate in self.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.items():
+            if rate <= 0:
+                raise ValueError(
+                    f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] must be positive, got {rate}"
+                )
         return self
 
     def get_bittensor_wallet(self) -> "Wallet":

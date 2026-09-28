@@ -260,8 +260,15 @@ class RentalPriceIncentive(DefaultIncentive):
         base_model = BASE_GPU_MAP[gpu_model]
         return base_model
 
+    @staticmethod
+    def _soft_limit_price_rate(gpu_model: str) -> float:
+        base_model: str | None = BASE_GPU_MAP.get(gpu_model)
+        return settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.get(
+            base_model, shared_client.config.soft_limit_price_rate
+        )
+
     def _is_over_soft_price_limit(self, result: JobResult) -> bool:
-        # miner price_per_gpu above the market p90 ceiling (p90 * soft_limit_price_rate)
+        # miner price_per_gpu above the market p90 ceiling (p90 * soft limit rate)
         price_per_gpu = result.executor_info.price_per_gpu
         if not price_per_gpu:
             return False
@@ -269,13 +276,13 @@ class RentalPriceIncentive(DefaultIncentive):
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
         if not p90:
             return False
-        return price_per_gpu > p90 * shared_client.config.soft_limit_price_rate
+        return price_per_gpu > p90 * self._soft_limit_price_rate(result.gpu_model)
 
     def _log_soft_price_limit(self, result: JobResult) -> None:
         # structured log for every unrented executor over the p90 soft ceiling
         enforced = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
-        rate = shared_client.config.soft_limit_price_rate
+        rate = self._soft_limit_price_rate(result.gpu_model)
         logger.info(
             _m(
                 "Unrented executor over market p90 soft price limit"
@@ -1012,7 +1019,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 p90: float | None = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
                 reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
-                    job_result, p90, shared_client.config.soft_limit_price_rate
+                    job_result, p90, self._soft_limit_price_rate(job_result.gpu_model)
                 )
                 job_result.record_incentive_log(reason)
 
