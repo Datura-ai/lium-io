@@ -6,9 +6,11 @@ from typing import Any, NamedTuple
 
 import asyncssh
 
+from core.config import settings
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedPod
+from services.rental_docker_sdk import POD_SECRETS_LOST_OUTPUT, build_pod_secrets_lost_probe_command
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -184,6 +186,7 @@ class TenantEnforcementCheck:
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
         state_by_pod_id: dict[str, ContainerState] = {}
+        secrets_lost_pods: list[dict[str, str]] = []
 
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
@@ -261,6 +264,8 @@ class TenantEnforcementCheck:
                 # dockerd refused the keys read: not judged from the renter's side this cycle.
                 ssh_pub_keys = []
                 continue
+            if await _pod_secrets_lost(ctx.ssh, pod_container_name):
+                secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
             verdict = await probe_rented_pod_ssh(ctx, pod, ssh_pub_keys)
             if verdict is not None:
                 ssh_verdicts.append(verdict)
@@ -315,6 +320,14 @@ class TenantEnforcementCheck:
             "actual_score": actual_score,
             "job_score": job_score,
         }
+        if secrets_lost_pods:
+            what["secrets_lost_pods"] = secrets_lost_pods
+            logger.warning(
+                _m(
+                    "Rented pod lost its secrets after a restart",
+                    extra=get_extra_info({**extra, "secrets_lost_pods": secrets_lost_pods}),
+                )
+            )
         # A pod that just crossed the unhealthy threshold owns this cycle's event, so the outage is
         # what the backend stores and the portal shows. The score is the rented score: with the
         # enforcement flag off (the default) this verdict is reported, not scored (DAH-2870).
@@ -338,6 +351,17 @@ class TenantEnforcementCheck:
                     **what,
                     "unreachable_pods": [verdict_log_fields(verdict) for verdict in reported],
                 },
+                extra=extra,
+            )
+        elif secrets_lost_pods:
+            event = render_message(
+                Msg.RENTED_POD_SECRETS_LOST,
+                ctx=ctx,
+                check_id=self.check_id,
+                remediation=(
+                    f"{Msg.RENTED_POD_SECRETS_LOST.remediation}{warning_message}" if warning_message else None
+                ),
+                what=what,
                 extra=extra,
             )
         else:
@@ -707,6 +731,19 @@ async def _check_pod_running_and_read_authorized_keys(
         ssh_keys = []
 
     return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys)
+
+
+async def _pod_secrets_lost(ssh_client, container_name: str) -> bool:
+    # Off: no pod has a secrets mount, so no extra exec per pod. Any failure reads as "not lost".
+    if not settings.POD_SECRETS_TMPFS_ENABLED:
+        return False
+    try:
+        result = await ssh_client.run(
+            DockerCommand.exec_command(container_name, build_pod_secrets_lost_probe_command())
+        )
+    except Exception:
+        return False
+    return (result.stdout or "").strip() == POD_SECRETS_LOST_OUTPUT
 
 
 # The diagnostics fields that decide whether a not-running container is the provider's fault (host lost the

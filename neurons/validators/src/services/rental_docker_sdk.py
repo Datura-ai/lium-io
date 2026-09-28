@@ -1121,6 +1121,27 @@ def build_pod_secrets_handover_spec(
     return ContainerExecSpec(container_name=container_name, argv=("sh", "-c", script))
 
 
+# The tmpfs mount is in the container's HostConfig, so it comes back when Docker restarts the container
+# by itself (`unless-stopped`: host reboot, dockerd restart, the main process dying), but empty: no
+# ContainerCreateRequest is sent and the validator keeps no secret value to write again. The mount with
+# no `.ready` in it is that case. A mount younger than the grace period may still be mid-delivery.
+POD_SECRETS_LOST_GRACE_SECONDS = 300
+POD_SECRETS_LOST_OUTPUT = "secrets-lost"
+
+
+def build_pod_secrets_lost_probe_command() -> str:
+    """Shell for `docker exec -u 0`: prints POD_SECRETS_LOST_OUTPUT when the secrets are gone."""
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+    marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
+    return (
+        f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts || exit 0; "
+        f"[ -e {marker} ] && exit 0; "
+        f"age=$(( $(date +%s) - $(stat -c %Y {secrets_dir}) )); "
+        f"[ \"$age\" -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] && echo {POD_SECRETS_LOST_OUTPUT}; "
+        "exit 0"
+    )
+
+
 def _default_docker_api_client_factory(**kwargs):
     import docker
 

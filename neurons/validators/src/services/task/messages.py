@@ -889,6 +889,21 @@ class TenantEnforcementMessages:
         "Outage past the enforcement threshold: the rented-state check fails this cycle, "
         "score 0 and the verified job cleared, until a cycle finds the pod reachable again"
     )
+    # POD_SECRETS_TMPFS_ENABLED: Docker restarted the container by itself, so its secrets tmpfs came back
+    # empty and a workload waiting for `.ready` would hang. Flagged, not scored: the provider did not lose
+    # anything the renter cannot get back with a reboot, which sends a new create with the secrets.
+    RENTED_POD_SECRETS_LOST = MessageTemplate(
+        event="Rented pod lost its secrets after a restart",
+        reason="RENTED_POD_SECRETS_LOST",
+        severity="error",
+        category="runtime",
+        impact="Pod flagged; score unchanged",
+        remediation=(
+            "Docker restarted the pod container by itself (host reboot, dockerd restart, or the main "
+            "process died), so /run/lium/secrets is empty and has no .ready. The renter can reboot the "
+            "pod from the pod page to get the secrets again; check the host for unplanned reboots."
+        ),
+    )
 
 
 class GpuUsageMessages:

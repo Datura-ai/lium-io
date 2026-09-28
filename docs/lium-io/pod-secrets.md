@@ -22,10 +22,14 @@ delivered as files, never as environment variables, so they don't show up in `do
 ## Wait for `.ready` before reading
 
 Secrets arrive shortly after the container starts, not before. A command that reads them at boot
-should wait for the marker first:
+should wait for the marker first, with a timeout (here 2 minutes):
 
 ```sh
-until [ -f /run/lium/secrets/.ready ]; do sleep 0.2; done
+i=0
+until [ -f /run/lium/secrets/.ready ]; do
+  i=$((i + 1)); [ "$i" -gt 600 ] && { echo "secrets not delivered" >&2; exit 1; }
+  sleep 0.2
+done
 export HF_TOKEN="$(cat /run/lium/secrets/HF_TOKEN)"
 ```
 
@@ -35,9 +39,12 @@ delivery fails, the marker is never written and the rent fails.
 In Python:
 
 ```python
-import os, time
+import os, sys, time
 
+deadline = time.monotonic() + 120
 while not os.path.exists("/run/lium/secrets/.ready"):
+    if time.monotonic() > deadline:
+        sys.exit("secrets not delivered")
     time.sleep(0.2)
 with open("/run/lium/secrets/HF_TOKEN") as f:
     hf_token = f.read()
@@ -50,6 +57,13 @@ waiting; `pathlib.Path.exists()` raises `PermissionError` instead, so do not use
 ## Lifetime
 
 The files are on a tmpfs and are never written to the container's disk, but on a host with swap
-the kernel may page them out to swap. After the container restarts (including a host
-reboot), `/run/lium/secrets` is empty and `.ready` is gone. Secrets are not re-delivered after a
-restart.
+the kernel may page them out to swap.
+
+Rebooting the pod from the pod page creates the container again and delivers the secrets again.
+
+Docker can also restart the container by itself: after a host reboot, a Docker restart, or when
+your main process dies (for example out of memory). Then `/run/lium/secrets` is empty, `.ready` is
+gone, and the secrets are not delivered again, because they are not stored on the host. Use a
+timeout when you wait for `.ready`, as in the examples above, so your workload stops with an error
+instead of waiting forever. The validator also reports such a pod as having lost its secrets.
+Reboot the pod from the pod page to get them back.

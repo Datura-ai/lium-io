@@ -5,6 +5,7 @@ import asyncssh
 import pytest
 from helpers import build_context_config, build_services, build_state
 from neurons.validators.src.core.docker_utils import _collect_host_context
+from neurons.validators.src.services.task.checks import rented_machine
 from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
@@ -1366,3 +1367,43 @@ async def test_pod_states_is_untouched_when_the_executor_is_not_rented(context_f
 
     assert result.event.reason_code == Msg.NOT_RENTED.reason
     assert "state" not in result.updates
+
+
+class SecretsLostSSHClient(DummySSHClient):
+    async def run(self, command: str):
+        if "/proc/mounts" in command:
+            self.commands_called.append(command)
+            result = Mock()
+            result.stdout = "secrets-lost\n"
+            return result
+        return await super().run(command)
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_flags_a_pod_whose_secrets_were_lost(context_factory, monkeypatch):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ctx = _tenant_ctx(
+        context_factory,
+        SecretsLostSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA"]),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed
+    assert result.halt
+    assert result.event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason
+    assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "tenant-123"}]
+    assert result.updates["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_skips_the_secrets_probe_with_the_flag_off(context_factory, monkeypatch):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", False)
+    ssh = SecretsLostSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA"])
+    ctx = _tenant_ctx(context_factory, ssh, {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]})
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert not any("/proc/mounts" in command for command in ssh.commands_called)

@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 import traceback
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -31,6 +32,9 @@ from services.rental_docker_sdk import (
     ContainerExecSpec,
     RentalDockerSdkClient,
     _build_host_config_kwargs,
+    POD_SECRETS_LOST_GRACE_SECONDS,
+    POD_SECRETS_LOST_OUTPUT,
+    build_pod_secrets_lost_probe_command,
     build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
     build_secret_file_exec_specs,
@@ -854,3 +858,43 @@ def test_an_empty_marker_is_never_published(plain_secrets_dir, tmp_path):
     assert "could not write the ready marker" in run.stderr
     assert not os.path.lexists(secrets_dir / ".ready")
     assert not os.path.lexists(secrets_dir / ".ready.partial")
+
+
+def _run_lost_probe(tmp_path, *, mounted: bool, ready: bool, age_seconds: int) -> str:
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    if ready:
+        (secrets_dir / ".ready").write_text("2026-09-28T00:00:00Z")
+    mounts = tmp_path / "mounts"
+    mounts.write_text(f"tmpfs {secrets_dir} tmpfs rw,nosuid,nodev,noexec 0 0\n" if mounted else "proc /proc proc rw 0 0\n")
+    started = time.time() - age_seconds
+    os.utime(secrets_dir, (started, started))
+    script = (
+        build_pod_secrets_lost_probe_command()
+        .replace("/proc/mounts", str(mounts))
+        .replace(POD_SECRETS_DIR, str(secrets_dir))
+    )
+    run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0
+    return run.stdout.strip()
+
+
+def test_lost_probe_flags_an_empty_secrets_mount_after_a_restart(tmp_path):
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize(
+    "mounted,ready,age_seconds",
+    [
+        # the pod was created without secrets: no mount
+        (False, False, POD_SECRETS_LOST_GRACE_SECONDS + 60),
+        # delivered and still there
+        (True, True, POD_SECRETS_LOST_GRACE_SECONDS + 60),
+        # just started: delivery may still be running
+        (True, False, 5),
+    ],
+)
+def test_lost_probe_stays_quiet_otherwise(tmp_path, mounted, ready, age_seconds):
+    assert _run_lost_probe(tmp_path, mounted=mounted, ready=ready, age_seconds=age_seconds) == ""
