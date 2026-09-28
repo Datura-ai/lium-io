@@ -645,7 +645,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     not result.is_successful
                     or result.is_rented
                     or base_model not in self.config.rental_incentive_gpu_types
-                    or self._reason_excluded_from_both_pools(result) is not None
+                    or self._reasons_excluded_from_both_pools(result)
                 ):
                     continue
                 key = (hotkey, base_model, str(result.executor_info.uuid))
