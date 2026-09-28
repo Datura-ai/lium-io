@@ -137,7 +137,7 @@ def log_for_monitoring(
                         "gpu_count": r.gpu_count, "executor_cost": ex_cost},
             ))
 
-        # About 13 KB per executor per cycle; the summary lines above stay at INFO for the dashboards.
+        # Large per-executor dump; the summary lines above stay at INFO for the dashboards.
         if logger.isEnabledFor(logging.DEBUG):
             for job_list in job_results.values():
                 for job_result in job_list:
