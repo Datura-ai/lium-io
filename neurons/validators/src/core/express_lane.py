@@ -43,6 +43,11 @@ EXPRESS_PUBLISHED_EVENT = "[express] Executor verified and published ahead of th
 # unreachable): try again later, a bounded number of times, then leave it to the normal cycle.
 MAX_ATTEMPTS = 3
 RETRY_SECONDS = 120
+# The one deferral the validation fast path shortens (settings.EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS):
+# the central miner serves executors from a portal snapshot it refreshes every 30 s, so a node this
+# validator's snapshot already lists is often one refresh away on the miner's side. Every other
+# deferral keeps RETRY_SECONDS.
+MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 # job_batch_id format the backend parses into the prod_executors row's time.
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -127,7 +132,8 @@ class ExpressLane:
                 "[express] Express lane started",
                 extra=get_extra_info(
                     {
-                        "tick_seconds": settings.EXPRESS_LANE_TICK_SECONDS,
+                        "tick_seconds": settings.express_lane_tick_seconds(),
+                        "fast_path": settings.VALIDATION_FAST_PATH_ENABLED,
                         "max_in_flight": settings.EXPRESS_LANE_MAX_IN_FLIGHT,
                         "max_in_flight_per_miner": settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER,
                     }
@@ -142,7 +148,7 @@ class ExpressLane:
                     _m("[express] Tick failed", extra=get_extra_info({"error": str(exc)})),
                     exc_info=True,
                 )
-            await asyncio.sleep(settings.EXPRESS_LANE_TICK_SECONDS)
+            await asyncio.sleep(settings.express_lane_tick_seconds())
 
     def _hotkey(self) -> str:
         if self._my_hotkey is None:
@@ -352,7 +358,7 @@ class ExpressLane:
                 if result.executor_info.uuid == executor_id
             ]
             if not results:
-                self._defer(pending, "miner did not return the executor")
+                self._defer(pending, MINER_DID_NOT_RETURN_EXECUTOR)
                 return
             await self._publish(pending, miner, results, extra, started)
         except Exception as exc:
@@ -439,7 +445,8 @@ class ExpressLane:
         )
 
     def _defer(self, pending: _Pending, reason: str) -> None:
-        """Try again after RETRY_SECONDS, or after MAX_ATTEMPTS leave the executor to the cycle.
+        """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave
+        the executor to the cycle.
 
         The caller has already counted the attempt.
         """
@@ -449,14 +456,40 @@ class ExpressLane:
             "attempt": pending.attempts,
             "reason": reason,
         }
-        if pending.attempts >= MAX_ATTEMPTS:
+        if pending.attempts >= max_attempts_for(reason):
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
             logger.warning(
                 _m("[express] Executor left to the normal cycle", extra=get_extra_info(extra))
             )
             return
-        pending.not_before = time.monotonic() + RETRY_SECONDS
+        retry_seconds = retry_seconds_for(reason)
+        pending.not_before = time.monotonic() + retry_seconds
         logger.info(
-            _m("[express] Executor not verified yet, will retry", extra=get_extra_info(extra))
+            _m(
+                "[express] Executor not verified yet, will retry",
+                extra=get_extra_info({**extra, "retry_seconds": retry_seconds}),
+            )
         )
+
+
+def retry_seconds_for(reason: str) -> int:
+    """How long a deferred executor waits before the lane asks its miner again.
+
+    Validation fast path: a miner that did not list the node yet is asked again once its portal
+    snapshot has had time to refresh (EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS, default 35 s >
+    the central miner's 30-s TTL) instead of after RETRY_SECONDS, and max_attempts_for gives that
+    reason more asks so the window the lane covers stays at least the serial one (the miner serves
+    a stale snapshot while its portal refresh fails, and a blip longer than the window sends the
+    node to the wave). Every other reason, and the flag off, keep RETRY_SECONDS and MAX_ATTEMPTS.
+    """
+    if settings.VALIDATION_FAST_PATH_ENABLED and reason == MINER_DID_NOT_RETURN_EXECUTOR:
+        return settings.EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
+    return RETRY_SECONDS
+
+
+def max_attempts_for(reason: str) -> int:
+    """How many asks a deferred executor gets before the lane leaves it to the cycle (see retry_seconds_for)."""
+    if settings.VALIDATION_FAST_PATH_ENABLED and reason == MINER_DID_NOT_RETURN_EXECUTOR:
+        return max(MAX_ATTEMPTS, settings.EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS)
+    return MAX_ATTEMPTS
