@@ -1285,6 +1285,21 @@ def test_two_platform_starts_recording_at_once_both_succeed(tmp_path):
         assert [code for code, _ in results] == [0, 0], results
 
 
+def test_two_records_of_one_container_at_once_both_succeed(tmp_path):
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START).replace(
+        POD_PLATFORM_STARTS_VOLUME, str(volume)
+    )
+    starts_dir = volume / "pod-platform-starts"
+    for _ in range(20):
+        runs = [subprocess.Popen(["sh", "-c", script], stderr=subprocess.PIPE, text=True) for _ in range(8)]
+        results = [(run.wait(timeout=30), run.stderr.read()) for run in runs]
+        assert [code for code, _ in results] == [0] * 8, results
+        assert [path.name for path in starts_dir.iterdir()] == [POD_CONTAINER_ID]
+        assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{PLATFORM_START}\n"
+
+
 def test_with_no_reserve_volume_the_record_fails_and_the_start_is_flagged(tmp_path):
     missing_volume = tmp_path / "reserve_data"
     run = _record_on_volume(missing_volume)
