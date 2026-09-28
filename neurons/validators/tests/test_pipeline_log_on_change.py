@@ -7,11 +7,14 @@ and ERROR lines and the run's last event (the step summary) keep their level on 
 
 import logging
 from datetime import UTC, datetime
+from unittest.mock import MagicMock
 
 import pytest
 
 from protocol.vc_protocol.validator_requests import ValidationEvent
+from services.task import pipeline_factory as pipeline_factory_module
 from services.task.pipeline import LoggerSink, StatusChangeTracker
+from services.task.pipeline_factory import PipelineFactory
 
 LOGGER = "test.sink.on_change"
 CHECK = "executor.validate.sysbox_required"
@@ -157,6 +160,22 @@ async def test_sink_without_tracker_logs_every_event_at_info(caplog):
     levels = await _levels(caplog, LoggerSink(logging.getLogger(LOGGER)), _event(), _event())
 
     assert levels == [logging.INFO, logging.INFO]
+
+
+@pytest.mark.asyncio
+async def test_pipelines_from_one_factory_share_the_tracker(caplog, monkeypatch):
+    monkeypatch.setattr(pipeline_factory_module, "InspectorValidationService", MagicMock)
+    factory = PipelineFactory(*(MagicMock() for _ in range(8)))
+    first, second = factory.build_pipeline([]), factory.build_pipeline([])
+
+    assert first.sink.tracker is second.sink.tracker is factory.status_tracker
+
+    caplog.set_level(logging.DEBUG, logger=pipeline_factory_module.logger.name)
+    caplog.clear()
+    await first.sink.emit(_event())
+    await second.sink.emit(_event())
+
+    assert [r.levelno for r in caplog.records] == [logging.INFO, logging.DEBUG]
 
 
 def test_tracker_forgets_the_oldest_entry_past_its_bound():
