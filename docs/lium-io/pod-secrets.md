@@ -71,7 +71,8 @@ rent is the way to get them back.
 Stopping and starting the pod from the pod page, or a failed edit that puts your previous container
 back, also empties `/run/lium/secrets` and removes `.ready`, and the secrets are not delivered again
 until the platform sends them once more (a new rent, or a reboot once that ships). The validator
-does not report these starts as lost secrets.
+does not report these starts as lost secrets: it records each one on the executor's persistent
+data volume, which no pod can reach and which is kept when the executor is updated.
 
 Docker can also restart the container by itself: after a host reboot, a Docker restart, or when
 your main process dies (for example out of memory). Then `/run/lium/secrets` is empty, `.ready` is

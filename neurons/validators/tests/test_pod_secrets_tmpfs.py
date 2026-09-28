@@ -11,6 +11,7 @@ import stat
 import subprocess
 import time
 import traceback
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -33,6 +34,7 @@ from services.rental_docker_sdk import (
     RentalDockerSdkClient,
     _build_host_config_kwargs,
     POD_PLATFORM_STARTS_DIR,
+    POD_PLATFORM_STARTS_VOLUME,
     POD_SECRETS_LOST_GRACE_SECONDS,
     POD_SECRETS_LOST_OUTPUT,
     POD_SECRETS_READY_MARKER,
@@ -888,6 +890,7 @@ def _run_lost_probe(
     status: str = "running",
     started_at: str = PLATFORM_START,
     platform_started_at: str | None = None,
+    starts_dir: Path | None = None,
 ) -> str:
     """Runs the host probe against a fake `docker` that answers `inspect` and `exec` like dockerd.
 
@@ -901,7 +904,7 @@ def _run_lost_probe(
         (secrets_dir / POD_SECRETS_READY_MARKER).write_text("2026-01-01T00:00:00Z\n")
     if files_left:
         (secrets_dir / "HF_TOKEN").write_text("value")
-    starts_dir = tmp_path / "platform-starts"
+    starts_dir = starts_dir or tmp_path / "platform-starts"
     if platform_started_at is not None:
         starts_dir.mkdir()
         (starts_dir / POD_CONTAINER_ID).write_text(f"{platform_started_at}\n")
@@ -1123,12 +1126,78 @@ def test_the_record_takes_only_a_container_id_and_a_docker_timestamp(container_i
         build_record_platform_start_command(container_id=container_id, started_at=started_at)
 
 
-def test_the_record_lives_outside_every_container_and_the_probe_reads_it_by_id():
+def test_the_record_lives_on_the_executors_reserve_volume_and_the_probe_reads_it_by_id():
     record = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START)
     probe = build_pod_secrets_lost_probe_command("tenant-123")
     assert f"{POD_PLATFORM_STARTS_DIR}/{POD_CONTAINER_ID}" in record
     assert "docker" not in record and "tenant-123" not in record
     assert "{{.Id}}" in probe and f'{POD_PLATFORM_STARTS_DIR}/"$5"' in probe
+
+
+def test_the_record_path_is_on_the_reserve_volume_every_executor_compose_file_mounts():
+    # the validator's SSH lands in the executor container; its /var/lib/lium is the writable layer,
+    # gone after every executor update, while the `reserve_data` named volume outlives a recreate
+    assert POD_PLATFORM_STARTS_VOLUME == "/var/lium-reserve"
+    assert POD_PLATFORM_STARTS_DIR == f"{POD_PLATFORM_STARTS_VOLUME}/pod-platform-starts"
+    executor_dir = Path(__file__).resolve().parents[2] / "executor"
+    compose_files = sorted(executor_dir.glob("docker-compose.app*.yml"))
+    assert [path.name for path in compose_files] == [
+        "docker-compose.app.dev.yml",
+        "docker-compose.app.local.yml",
+        "docker-compose.app.yml",
+    ]
+    for compose_file in compose_files:
+        compose = compose_file.read_text()
+        assert f"reserve_data:{POD_PLATFORM_STARTS_VOLUME}" in compose, compose_file.name
+
+
+def _record_on_volume(volume: Path, *, started_at: str = PLATFORM_START) -> subprocess.CompletedProcess:
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=started_at).replace(
+        POD_PLATFORM_STARTS_VOLUME, str(volume)
+    )
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+
+
+def test_a_platform_start_record_survives_an_executor_recreate(tmp_path):
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    old_layer = tmp_path / "executor-writable-layer"
+    old_layer.mkdir()
+    assert _record_on_volume(volume).returncode == 0
+
+    # recreate: the old container's writable layer is gone, the named volume is mounted again
+    subprocess.run(["rm", "-rf", str(old_layer)], check=True)
+    recreated = tmp_path / "recreated"
+    recreated.mkdir()
+    remounted = recreated / "reserve_data"
+    os.rename(volume, remounted)
+
+    starts_dir = remounted / "pod-platform-starts"
+    assert stat.S_IMODE(starts_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((starts_dir / POD_CONTAINER_ID).stat().st_mode) == 0o600
+    assert _run_lost_probe(
+        recreated,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        started_at=PLATFORM_START,
+        starts_dir=starts_dir,
+    ) == ""
+
+
+def test_with_no_reserve_volume_the_record_fails_and_the_start_is_flagged(tmp_path):
+    missing_volume = tmp_path / "reserve_data"
+    run = _record_on_volume(missing_volume)
+    assert run.returncode != 0
+    assert not missing_volume.exists()
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        started_at=PLATFORM_START,
+        starts_dir=missing_volume / "pod-platform-starts",
+    ) == POD_SECRETS_LOST_OUTPUT
 
 
 @pytest.mark.parametrize("tmpfs,expected", [({POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}, True), (None, False)])

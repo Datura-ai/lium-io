@@ -1140,12 +1140,16 @@ def build_pod_secrets_handover_spec(
 # The renter owns the directory after the handover and can delete `.ready`, but a restarted tmpfs is
 # always empty: a mount that still holds files is never flagged. A paused container gets no verdict.
 # A start the platform made (a stop/start from the pod page, the undo of a failed edit) empties the
-# mount too: it records the run's `StartedAt` under POD_PLATFORM_STARTS_DIR, outside every container,
-# in a file named by the container ID, and a run whose `StartedAt` matches is not flagged. Any restart
-# after it (Docker, a host reboot) starts a new run with a new `StartedAt`, so it is flagged as before.
+# mount too: it records the run's `StartedAt` under POD_PLATFORM_STARTS_DIR, in a file named by the
+# container ID, and a run whose `StartedAt` matches is not flagged. Any restart after it (Docker, a host
+# reboot) starts a new run with a new `StartedAt`, so it is flagged as before.
+# The validator's SSH lands in the executor container, whose /var/lib/lium is its writable layer and is
+# gone after every executor update. The record lives on the `reserve_data` named volume the executor
+# compose files mount at POD_PLATFORM_STARTS_VOLUME, which outlives a recreate and is mounted into no pod.
 POD_SECRETS_LOST_GRACE_SECONDS = 300
 POD_SECRETS_LOST_OUTPUT = "secrets-lost"
-POD_PLATFORM_STARTS_DIR = "/var/lib/lium/pod-platform-starts"
+POD_PLATFORM_STARTS_VOLUME = "/var/lium-reserve"
+POD_PLATFORM_STARTS_DIR = f"{POD_PLATFORM_STARTS_VOLUME}/pod-platform-starts"
 _POD_SECRETS_STATE_FORMAT = (
     "{{.RestartCount}} {{.Created}} {{.State.Status}} {{.State.StartedAt}} {{.Id}} "
     '{{if index .HostConfig.Tmpfs "' + POD_SECRETS_DIR + '"}}secrets{{end}}'
@@ -1158,6 +1162,7 @@ def build_record_platform_start_command(*, container_id: str, started_at: str) -
     """Host shell: records `started_at` as the run of `container_id` the platform started.
 
     Takes only values read from dockerd and checked here, so no container name reaches the host shell.
+    Only the leaf directory is created: with no volume mounted there it fails, and the start is flagged.
     """
     if not isinstance(container_id, str) or not _CONTAINER_ID_PATTERN.fullmatch(container_id):
         raise ValueError("not a full container ID")
@@ -1166,7 +1171,7 @@ def build_record_platform_start_command(*, container_id: str, started_at: str) -
     starts_dir = shlex.quote(POD_PLATFORM_STARTS_DIR)
     stamp = shlex.quote(f"{POD_PLATFORM_STARTS_DIR}/{container_id}")
     return (
-        f"umask 077 && mkdir -p {starts_dir} && chmod 0700 {starts_dir} "
+        f"umask 077 && {{ [ -d {starts_dir} ] || mkdir {starts_dir}; }} && chmod 0700 {starts_dir} "
         f"&& printf '%s\\n' {started_at} > {stamp}.partial && mv -f {stamp}.partial {stamp}"
     )
 
