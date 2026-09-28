@@ -74,6 +74,7 @@ from .pipeline import (
     LoggerSink,
     Pipeline,
     PodRecoverer,
+    StatusChangeTracker,
 )
 from .runner import SSHCommandRunner
 from .score_calculator import calculate_scores
@@ -132,6 +133,8 @@ class PipelineFactory:
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
         self.container_cleanup = ContainerCleanup(dry_run=dry_run)
+        # One tracker for the factory's lifetime: build_pipeline() makes a new sink every cycle.
+        self.status_tracker = StatusChangeTracker()
 
     async def build_context(
         self,
@@ -438,4 +441,4 @@ class PipelineFactory:
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger))
+        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker))

@@ -1,5 +1,6 @@
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -279,9 +280,31 @@ PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
 )
 
 
+class StatusChangeTracker:
+    """The last outcome each executor had on each check, kept across pipeline runs.
+
+    Every check emits one event per executor per cycle, and most of them repeat the previous cycle
+    word for word. The sink logs a repeat at DEBUG and a change at INFO. The outcome is the event
+    name, reason code and severity; `what_we_saw` and timings vary every cycle and are not part of it.
+    """
+
+    def __init__(self, max_entries: int = 200_000):
+        self.max_entries = max_entries
+        self._last: OrderedDict[tuple[str, str], tuple[str, str, str]] = OrderedDict()
+
+    def changed(self, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]) -> bool:
+        key = (executor_uuid, check_id)
+        previous = self._last.pop(key, None)
+        self._last[key] = outcome
+        if len(self._last) > self.max_entries:
+            self._last.popitem(last=False)
+        return previous != outcome
+
+
 class LoggerSink:
-    def __init__(self, logger_: logging.Logger):
+    def __init__(self, logger_: logging.Logger, tracker: StatusChangeTracker | None = None):
         self.logger = logger_
+        self.tracker = tracker
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
@@ -289,7 +312,19 @@ class LoggerSink:
         if level == "warning" and event.reason_code in PROVIDER_STATE_REASON_CODES:
             level = "info"
             extra["reason"] = "provider_state"
+        if self._is_repeat(event) and level == "info":
+            level = "debug"
         getattr(self.logger, level)(_m(event.event, extra=extra))
+
+    def _is_repeat(self, event: ValidationEvent) -> bool:
+        executor_uuid = event.context.get("executor_uuid")
+        if self.tracker is None or not executor_uuid or not event.check_id:
+            return False
+        changed = self.tracker.changed(
+            executor_uuid, event.check_id, (event.event, event.reason_code, event.severity)
+        )
+        # The run's last event carries the per-step summary; it stays at INFO as one line per run.
+        return not changed and "steps_total_s" not in event.what_we_saw
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
