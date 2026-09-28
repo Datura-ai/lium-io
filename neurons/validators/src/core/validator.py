@@ -658,7 +658,8 @@ class Validator:
                     # above, or most mapped ports refusing at once) notifies no renter. The results
                     # whose reports the gate held were rendered as RENTED_POD_SSH_UNREACHABLE before
                     # the gate ran and name a pod outage that was ours: they are rewritten to RENTED
-                    # here, before the publish, so the stored event says what happened.
+                    # (RENTED_POD_SECRETS_LOST when the cycle also found a pod's secrets lost) here,
+                    # before the publish, so the stored event says what happened.
                     try:
                         rented_pod_ssh_gate = await flush_rented_pod_ssh_reports(
                             self.redis_service,
@@ -672,7 +673,10 @@ class Validator:
                         if results_rewritten_to_rented:
                             logger.warning(
                                 _m(
-                                    "[sync] rented-pod SSH reports held back this cycle; their events publish as RENTED",
+                                    (
+                                        "[sync] rented-pod SSH reports held back this cycle; their events publish "
+                                        "as RENTED, or RENTED_POD_SECRETS_LOST when a pod's secrets were lost"
+                                    ),
                                     extra=get_extra_info(
                                         {
                                             **self.default_extra,

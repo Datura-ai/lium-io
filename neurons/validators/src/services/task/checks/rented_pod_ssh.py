@@ -782,7 +782,8 @@ async def _post_due_reports(
 def silence_rented_pod_ssh_reports_on_our_own_outage(
     job_results: list[JobResult], gate: FleetGate | None
 ) -> int:
-    """Rewrite to RENTED the cycle's ``RENTED_POD_SSH_UNREACHABLE`` results whose reports the gate held.
+    """Rewrite to RENTED (or RENTED_POD_SECRETS_LOST) the cycle's ``RENTED_POD_SSH_UNREACHABLE`` results
+    whose reports the gate held.
 
     The executor task rendered its event before the cycle-end gate ran, and that event names a pod
     outage with its notice queued. On a suppressed cycle the outage was ours and nobody is told,
