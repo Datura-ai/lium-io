@@ -281,6 +281,11 @@ class TenantEnforcementCheck:
                         )
                     )
 
+                # Probed before recovery: a crash-looping pod is often caught between restarts, and the
+                # host-side probe reads RestartCount without exec into the container.
+                secrets_lost = await _pod_secrets_lost(ctx.ssh, pod_container_name)
+                if secrets_lost:
+                    secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
                 outcome = await self._recover_downed_pod(
                     ctx=ctx,
                     container_name=pod_container_name,
@@ -288,6 +293,7 @@ class TenantEnforcementCheck:
                     diagnostics=diagnostics,
                     local_volume_path=rental_active.local_volume_path if rental_active else None,
                     extra=extra,
+                    secrets_lost=secrets_lost,
                 )
                 state_by_pod_id[pod_id] = outcome.container_state
                 if outcome.failure:
@@ -514,6 +520,7 @@ class TenantEnforcementCheck:
         diagnostics: dict[str, object],
         local_volume_path: str | None,
         extra: dict[str, Any],
+        secrets_lost: bool = False,
     ) -> _DownedPodOutcome:
         # a rented pod found not running: heal it when it carries the DAH-2306 reboot signature,
         # and report POD_NOT_RUNNING only if it is still down afterwards.
@@ -564,6 +571,11 @@ class TenantEnforcementCheck:
                 "container_name": container_name,
                 "executor_uuid": ctx.executor.uuid,
                 "diagnostics": diagnostics,
+                **(
+                    {"secrets_lost_pods": [{"pod_id": pod_id, "container_name": container_name}]}
+                    if secrets_lost
+                    else {}
+                ),
             },
             extra=extra,
         )

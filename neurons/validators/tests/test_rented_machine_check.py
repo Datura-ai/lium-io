@@ -1398,6 +1398,38 @@ async def test_tenant_enforcement_flags_a_pod_whose_secrets_were_lost(context_fa
 
 
 @pytest.mark.asyncio
+async def test_a_pod_found_between_restarts_that_stays_down_names_its_lost_secrets(context_factory, monkeypatch):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ssh = SecretsLostSSHClient(pod_running=False)
+    ctx = build_recovery_context(context_factory, ssh, AsyncMock())
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "pod_pod-1"}]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_found_between_restarts_and_recovered_is_flagged_secrets_lost(context_factory, monkeypatch):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ssh = SecretsLostSSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason
+    assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "pod_pod-1"}]
+    assert sum(".HostConfig.Tmpfs" in command for command in ssh.commands_called) == 1
+
+
+@pytest.mark.asyncio
 async def test_tenant_enforcement_skips_the_secrets_probe_with_the_flag_off(context_factory, monkeypatch):
     monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", False)
     ssh = SecretsLostSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA"])
