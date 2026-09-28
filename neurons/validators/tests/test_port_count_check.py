@@ -64,6 +64,10 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
     assert result.updates["port_count"] == MIN_PORT_COUNT - 1
+    assert result.event.severity == "warning"
+    assert result.event.impact.endswith("; the rented portion is scored as rented")
+    assert result.event.what_we_saw["exempt_because_rented"] is True
+    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == 0
 
 
 @pytest.mark.asyncio
@@ -123,6 +127,13 @@ async def test_background_job_ports_lift_an_unrented_host_to_the_floor(context_f
     # the published figures stay the answered count: the platform adds these ports itself
     assert result.updates["port_count"] == len(ANSWERED_PAIRS)
     assert result.updates["state"].specs["available_port_count"] == len(ANSWERED_PAIRS)
+    # passed, yet under the listing floor it is not rented: the warning says why it passed
+    assert result.event.severity == "warning"
+    assert result.event.impact == (
+        f"Hidden from renters: only {len(ANSWERED_PAIRS)} verified ports, need {MIN_PORT_COUNT}; "
+        f"scored with {len(BACKGROUND_JOB_PORTS)} ports held by preemptible background jobs"
+    )
+    assert result.event.what_we_saw["exempt_because_rented"] is False
 
 
 @pytest.mark.asyncio
