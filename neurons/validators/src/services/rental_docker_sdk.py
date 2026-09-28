@@ -1165,6 +1165,7 @@ def build_record_platform_start_command(*, container_id: str, started_at: str) -
 
     Takes only values read from dockerd and checked here, so no container name reaches the host shell.
     Only the leaf directory is created: with no volume mounted there it fails, and the start is flagged.
+    Two starts recording at once may both try the mkdir; the loser's `File exists` is not a failure.
     """
     if not isinstance(container_id, str) or not _CONTAINER_ID_PATTERN.fullmatch(container_id):
         raise ValueError("not a full container ID")
@@ -1173,7 +1174,7 @@ def build_record_platform_start_command(*, container_id: str, started_at: str) -
     starts_dir = shlex.quote(POD_PLATFORM_STARTS_DIR)
     stamp = shlex.quote(f"{POD_PLATFORM_STARTS_DIR}/{container_id}")
     return (
-        f"umask 077 && {{ [ -d {starts_dir} ] || mkdir {starts_dir}; }} && chmod 0700 {starts_dir} "
+        f"umask 077 && {{ mkdir {starts_dir} 2>/dev/null; [ -d {starts_dir} ]; }} && chmod 0700 {starts_dir} "
         f"&& printf '%s\\n' {started_at} > {stamp}.partial && mv -f {stamp}.partial {stamp}"
     )
 

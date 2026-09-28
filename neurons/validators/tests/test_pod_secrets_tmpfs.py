@@ -1214,6 +1214,53 @@ def test_a_platform_start_record_survives_an_executor_recreate(tmp_path):
     ) == ""
 
 
+def test_a_start_that_loses_the_first_record_mkdir_race_still_records(tmp_path):
+    # the other start creates the directory between this one's check and its mkdir: `File exists`
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "mkdir"
+    shim.write_text(
+        "#!/bin/sh\n"
+        '/bin/mkdir "$@"\n'
+        'echo "mkdir: cannot create directory \'$1\': File exists" >&2\n'
+        "exit 1\n"
+    )
+    shim.chmod(0o755)
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START).replace(
+        POD_PLATFORM_STARTS_VOLUME, str(volume)
+    )
+    run = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PATH": f"{shim_dir}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode == 0, run.stderr
+    starts_dir = volume / "pod-platform-starts"
+    assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{PLATFORM_START}\n"
+    assert stat.S_IMODE(starts_dir.stat().st_mode) == 0o700
+
+
+def test_two_platform_starts_recording_at_once_both_succeed(tmp_path):
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    for _ in range(20):
+        subprocess.run(["rm", "-rf", str(volume / "pod-platform-starts")], check=True)
+        scripts = [
+            build_record_platform_start_command(container_id=container_id, started_at=PLATFORM_START).replace(
+                POD_PLATFORM_STARTS_VOLUME, str(volume)
+            )
+            for container_id in (POD_CONTAINER_ID, "b" * 64)
+        ]
+        runs = [subprocess.Popen(["sh", "-c", script], stderr=subprocess.PIPE, text=True) for script in scripts]
+        results = [(run.wait(timeout=30), run.stderr.read()) for run in runs]
+        assert [code for code, _ in results] == [0, 0], results
+
+
 def test_with_no_reserve_volume_the_record_fails_and_the_start_is_flagged(tmp_path):
     missing_volume = tmp_path / "reserve_data"
     run = _record_on_volume(missing_volume)
