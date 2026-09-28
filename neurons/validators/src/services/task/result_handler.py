@@ -94,13 +94,11 @@ class ResultHandler:
             )
         )
 
-        # Determine log status and log appropriately
-        if success:
-            log_status = "info"
-            logger.info(log_text)
-        else:
-            log_status = "warning"
-            logger.warning(log_text)
+        # DAH-3593: INFO either way. A failed run's verdict was already emitted by the pipeline
+        # sink at its own level; this second copy carried the full what_we_saw JSON at WARNING,
+        # 2,600 lines in two days. log_status still says "warning" to the backend.
+        log_status = "info" if success else "warning"
+        logger.info(log_text)
 
         # Persist verification data to Redis (unless in DRY_RUN mode)
         if not self.dry_run:

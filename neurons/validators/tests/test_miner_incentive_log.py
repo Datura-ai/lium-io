@@ -38,6 +38,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
+        "validation_failed",
     }
 
 
@@ -175,10 +176,9 @@ def test_banned_network_abuse_message():
 def test_provider_ban_is_excluded_from_both_pools():
     incentive = object.__new__(RentalPriceIncentive)
 
-    line = incentive._reason_excluded_from_both_pools(_job(is_provider_banned=True))
+    lines = incentive._reasons_excluded_from_both_pools(_job(is_provider_banned=True))
 
-    assert line is not None
-    assert line.reason is ZeroIncentiveReason.BANNED_NETWORK_ABUSE
+    assert [line.reason for line in lines] == [ZeroIncentiveReason.BANNED_NETWORK_ABUSE]
 
 
 def test_spot_tier_carries_internal_log_message():

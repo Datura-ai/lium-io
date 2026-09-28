@@ -22,14 +22,14 @@ class DebugSettings(BaseSettings):
     Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
     Use .env for local development (git-ignored).
     """
-    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     SKIP_VALIDATOR_REGISTRATION_CHECK: bool = Field(default=False, description="Skip validator registration check")
     SKIP_SYNC_FLOW: bool = Field(default=False, description="Skip sync flow")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     PROJECT_NAME: str = "compute-subnet-miner"
 
     BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
