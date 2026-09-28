@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -301,10 +302,34 @@ class StatusChangeTracker:
         return previous != outcome
 
 
+STEP_DURATION_LOGGER = "services.task.step_duration"
+
+
+def step_duration_logger() -> logging.Logger:
+    """A logger that writes its message as the whole line, for the compact step-duration record.
+
+    The shared JSON formatter adds ~280 bytes of fixed fields to every line, which would cost more
+    than the step duration it carries on each repeated outcome.
+    """
+    lg = logging.getLogger(STEP_DURATION_LOGGER)
+    if not lg.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        lg.addHandler(handler)
+        lg.propagate = False
+    return lg
+
+
 class LoggerSink:
-    def __init__(self, logger_: logging.Logger, tracker: StatusChangeTracker | None = None):
+    def __init__(
+        self,
+        logger_: logging.Logger,
+        tracker: StatusChangeTracker | None = None,
+        duration_logger: logging.Logger | None = None,
+    ):
         self.logger = logger_
         self.tracker = tracker
+        self.duration_logger = duration_logger or step_duration_logger()
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
@@ -314,7 +339,22 @@ class LoggerSink:
             extra["reason"] = "provider_state"
         if self._is_repeat(event) and level == "info":
             level = "debug"
+            self._log_step_duration(event)
         getattr(self.logger, level)(_m(event.event, extra=extra))
+
+    def _log_step_duration(self, event: ValidationEvent) -> None:
+        # The step-duration panels unwrap extra.context.execution_time_ms per extra.check_id from
+        # every validator line, so a repeat keeps those two fields at INFO in the same shape.
+        execution_time_ms = event.context.get("execution_time_ms")
+        if execution_time_ms is None or self.logger.isEnabledFor(logging.DEBUG):
+            return
+        line = {
+            "level": "INFO",
+            "logger": STEP_DURATION_LOGGER,
+            "message": "Check step duration",
+            "extra": {"check_id": event.check_id, "context": {"execution_time_ms": execution_time_ms}},
+        }
+        self.duration_logger.info(json.dumps(line, separators=(",", ":")))
 
     def _is_repeat(self, event: ValidationEvent) -> bool:
         executor_uuid = event.context.get("executor_uuid")

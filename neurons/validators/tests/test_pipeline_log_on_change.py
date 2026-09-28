@@ -3,8 +3,10 @@
 Each check emits one event per executor per cycle, and most repeat the previous cycle. With a
 StatusChangeTracker the sink keeps a changed outcome at INFO and moves a repeat to DEBUG; WARNING
 and ERROR lines and the run's last event (the step summary) keep their level on every cycle.
+A repeat still writes its step duration at INFO as one compact line for the step-duration panels.
 """
 
+import json
 import logging
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
@@ -176,6 +178,88 @@ async def test_pipelines_from_one_factory_share_the_tracker(caplog, monkeypatch)
     await second.sink.emit(_event())
 
     assert [r.levelno for r in caplog.records] == [logging.INFO, logging.DEBUG]
+
+
+class _Lines(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(self.format(record))
+
+
+@pytest.fixture
+def durations():
+    duration_logger = logging.getLogger("test.sink.step_duration")
+    duration_logger.propagate = False
+    handler = _Lines()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    duration_logger.addHandler(handler)
+    yield duration_logger, handler.lines
+    duration_logger.removeHandler(handler)
+
+
+def _timed(ms: int, reason_code: str = "SYSBOX_REQUIRED_OK", severity: str = "info") -> ValidationEvent:
+    event = _event(reason_code, severity)
+    event.context["execution_time_ms"] = ms
+    return event
+
+
+async def _emit_at_info(sink: LoggerSink, *events: ValidationEvent) -> None:
+    sink.logger.setLevel(logging.INFO)
+    try:
+        for event in events:
+            await sink.emit(event)
+    finally:
+        sink.logger.setLevel(logging.NOTSET)
+
+
+@pytest.mark.asyncio
+async def test_repeat_keeps_its_step_duration_at_info(durations):
+    duration_logger, lines = durations
+    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger)
+
+    await _emit_at_info(sink, _timed(120), _timed(95), _timed(101))
+
+    assert [json.loads(line) for line in lines] == [
+        {
+            "level": "INFO",
+            "logger": "services.task.step_duration",
+            "message": "Check step duration",
+            "extra": {"check_id": CHECK, "context": {"execution_time_ms": ms}},
+        }
+        for ms in (95, 101)
+    ]
+    assert all("execution_time_ms" in line and len(line) < 200 for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_no_step_duration_line_when_the_full_line_is_logged(durations):
+    duration_logger, lines = durations
+    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger)
+
+    await _emit_at_info(
+        sink,
+        _timed(120, "SYSBOX_REQUIRED_MISSING", "warning"),
+        _timed(120, "SYSBOX_REQUIRED_MISSING", "warning"),
+        _timed(120, "SYSBOX_REQUIRED_OK"),
+        _event(),
+    )
+
+    assert lines == []
+
+
+@pytest.mark.asyncio
+async def test_no_step_duration_line_when_debug_is_on(caplog, durations):
+    duration_logger, lines = durations
+    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker(), duration_logger=duration_logger)
+
+    levels = await _levels(caplog, sink, _timed(120), _timed(95))
+
+    assert levels == [logging.INFO, logging.DEBUG]
+    assert caplog.records[1].msg.extra["context"]["execution_time_ms"] == 95
+    assert lines == []
 
 
 def test_tracker_forgets_the_oldest_entry_past_its_bound():
