@@ -49,6 +49,7 @@ waiting; `pathlib.Path.exists()` raises `PermissionError` instead, so do not use
 
 ## Lifetime
 
-The files live only in the container's memory. After the container restarts (including a host
+The files are on a tmpfs and are never written to the container's disk, but on a host with swap
+the kernel may page them out to swap. After the container restarts (including a host
 reboot), `/run/lium/secrets` is empty and `.ready` is gone. Secrets are not re-delivered after a
 restart.

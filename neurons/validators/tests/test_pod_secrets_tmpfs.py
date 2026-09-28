@@ -3,11 +3,13 @@ POD_SECRETS_TMPFS_ENABLED — never in the container env, /etc/environment, exec
 the flag off a rent is exactly today's."""
 
 import dataclasses
+import json
 import logging
 import os
 import re
 import stat
 import subprocess
+import traceback
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -569,6 +571,73 @@ async def test_an_oversize_secret_fails_the_rent_before_anything_is_created(
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "validate_request"
     assert "BIG" in result.msg and "BIG_SECRET_VALUE_MARKER" not in result.msg
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+    assert docker_client.run_specs == [] and docker_client.exec_specs == []
+
+
+# The request parser uses json.loads, which keeps a lone surrogate escape as a str
+LONE_SURROGATE = json.loads('"\\ud800"')
+NOT_UTF8_HEAD = "NOTUTF8HEADMARKER"
+NOT_UTF8_TAIL = "NOTUTF8TAILMARKER"
+NOT_UTF8_VALUE = NOT_UTF8_HEAD + LONE_SURROGATE + NOT_UTF8_TAIL
+NOT_UTF8_MESSAGE = "secret HF_TOKEN is not valid UTF-8 text"
+
+
+def _assert_nothing_of_the_not_utf8_value(text: str):
+    offset = str(len(NOT_UTF8_HEAD))
+    for fragment in (
+        LONE_SURROGATE,
+        "\\ud800",
+        "ud800",
+        "\\xed\\xa0\\x80",
+        NOT_UTF8_HEAD,
+        NOT_UTF8_TAIL,
+        "position",
+        "codec",
+        "surrogate",
+        f" {offset}",
+        f"{offset}:",
+    ):
+        assert fragment not in text
+
+
+def test_a_value_that_is_not_utf8_is_refused_naming_only_the_secret():
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"OTHER": "o", "HF_TOKEN": NOT_UTF8_VALUE, "LATER": "l"})
+
+    error = excinfo.value
+    assert str(error) == NOT_UTF8_MESSAGE
+    assert error.__cause__ is None and error.__context__ is None and error.__suppress_context__
+    _assert_nothing_of_the_not_utf8_value(repr(error))
+    _assert_nothing_of_the_not_utf8_value("".join(traceback.format_exception(error)))
+
+
+@pytest.mark.asyncio
+async def test_a_value_that_is_not_utf8_never_reaches_the_rent_result_or_logs(
+    docker_service, executor_info, keypair, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets={"HF_TOKEN": NOT_UTF8_VALUE},
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "validate_request"
+    assert result.msg == f"Invalid pod secrets: {NOT_UTF8_MESSAGE}"
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')} {record.exc_text or ''}"
+        + ("".join(traceback.format_exception(*record.exc_info)) if record.exc_info else "")
+        for record in caplog.records
+    )
+    assert NOT_UTF8_MESSAGE in logged
+    for text in [result.msg, result.model_dump_json(), logged]:
+        _assert_nothing_of_the_not_utf8_value(text)
     assert docker_service.rental_docker_client_factory.connect_calls == []
     assert docker_client.run_specs == [] and docker_client.exec_specs == []
 

@@ -44,8 +44,9 @@ RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
-# Renter secrets live on a tmpfs, so a value exists only in the container's memory — never in
+# Renter secrets live on a tmpfs, so a value is never written to the container's disk — never in
 # an image layer, `docker commit`, a volume backup, `docker inspect` Env or /etc/environment. The
+# mount has no `noswap` (kernel 6.4+ only), so on a host with swap its pages may be swapped out. The
 # workload runs as the image's USER, which may be non-root, so the directory (0700) and every file
 # (0400) are chowned to the uid:gid that user resolves to inside the container — nobody else can read.
 POD_SECRETS_DIR = "/run/lium/secrets"
@@ -960,8 +961,13 @@ def build_environment_exec_spec(
     )
 
 
-def _tmpfs_bytes(value: str) -> int:
-    size = len(value.encode("utf-8"))
+def _tmpfs_bytes(value: str) -> int | None:
+    # None for a str that is not valid UTF-8 (a lone surrogate survives json.loads). The codec error
+    # quotes the offending character and its offset, so it must never leave this function.
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
     return -(-size // _TMPFS_PAGE_BYTES) * _TMPFS_PAGE_BYTES
 
 
@@ -986,6 +992,8 @@ def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
         if not isinstance(value, str) or not value:
             raise ValueError(f"secret {name} has an empty value")
         size = _tmpfs_bytes(value)
+        if size is None:
+            raise ValueError(f"secret {name} is not valid UTF-8 text") from None
         if size > POD_SECRETS_LIMIT_BYTES:
             raise ValueError(f"secret {name} is larger than the {POD_SECRETS_LIMIT_BYTES}-byte secrets limit")
         total += size
