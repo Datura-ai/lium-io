@@ -359,7 +359,7 @@ class TenantEnforcementCheck:
             # The template's impact says the notice is queued for the cycle-end gate. When no pod
             # queued one this cycle (DRY_RUN, or the backend already acknowledged the outage) say so.
             queued = any(verdict.report_queued for verdict in reported)
-            # The score warning (outdated image, missing collateral) rides on the remediation as it
+            # The score warning (outdated image) rides on the remediation as it
             # does on ALREADY_RENTED: the provider keeps hearing about it while the pod is unreachable.
             event = render_message(
                 Msg.RENTED_POD_SSH_UNREACHABLE,

@@ -106,6 +106,15 @@ def resolve_contract_version(
     return select_contract_version(prompt_title)
 
 
+def miner_account(private_key: str):
+    """The key's account, or None after logging an error that leaves the key out."""
+    try:
+        return Account.from_key(private_key)
+    except Exception:
+        logger.error("❌ The Ethereum private key is malformed; expected 32 bytes as 64 hex characters.")
+        return None
+
+
 @click.group()
 def cli():
     pass
@@ -115,6 +124,8 @@ def cli():
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
+    if miner_account(private_key) is None:
+        return
     cli_service = CliService(private_key=private_key)
     success = cli_service.associate_ethereum_address()
     if success:
@@ -140,6 +151,8 @@ def show_contract_versions():
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def get_eth_ss58_address(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
+    if miner_account(private_key) is None:
+        return
     cli_service = CliService(private_key=private_key)
     ss58_address = cli_service.get_eth_ss58_address()
     print(ss58_address)
@@ -152,6 +165,8 @@ def get_eth_ss58_address(private_key: str):
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def transfer_tao_to_eth_address(private_key: str, amount: float):
     """Associate a miner's ethereum address with their hotkey."""
+    if miner_account(private_key) is None:
+        return
     cli_service = CliService(private_key=private_key)
     cli_service.transfer_tao_to_eth_address(amount)
 
@@ -160,6 +175,8 @@ def transfer_tao_to_eth_address(private_key: str, amount: float):
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def get_balance_of_eth_address(private_key: str):
     """Get the balance of the Eth address for the Bittensor hotkey."""
+    if miner_account(private_key) is None:
+        return
     cli_service = CliService(private_key=private_key)
     asyncio.run(cli_service.get_balance_of_eth_address())
 
@@ -226,6 +243,8 @@ def remove_executor(address: str, port: int):
 @contract_option
 def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: str | None):
     """Reclaim collateral for a specific executor from the contract that holds it"""
+    if miner_account(private_key) is None:
+        return
     detected = None
     if not contract_version:
         detected = asyncio.run(versions_holding_collateral(executor_uuid))
@@ -336,10 +355,12 @@ def get_reclaim_requests(contract_version: str | None):
 @contract_option
 def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract_version: str | None):
     """Finalize a reclaim request by its ID on the contract that holds it"""
+    account = miner_account(private_key)
+    if account is None:
+        return
     detected = None
     if not contract_version:
-        miner_address = Account.from_key(private_key).address
-        detected = asyncio.run(versions_with_open_reclaim(reclaim_request_id, miner_address))
+        detected = asyncio.run(versions_with_open_reclaim(reclaim_request_id, account.address))
         if not detected:
             logger.error("❌ No open reclaim request %d for this key on any contract version.", reclaim_request_id)
             return

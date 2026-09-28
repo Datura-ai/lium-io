@@ -280,6 +280,100 @@ def test_non_collateral_command_runs_on_an_unknown_network(archive_network):
     assert CONTRACT in result.output
 
 
+@pytest.mark.parametrize(
+    "url,origin",
+    [
+        ("https://user:pw@evm.example.invalid:8443/v2/key?apikey=key", "https://evm.example.invalid:8443"),
+        ("https://evm.example.invalid/key", "https://evm.example.invalid"),
+        ("evm.example.invalid/key", "<unparsed>"),
+        (None, None),
+    ],
+)
+def test_rpc_origin_keeps_only_the_scheme_and_host(url, origin):
+    assert collateral_module.rpc_origin(url) == origin
+
+
+RPC_SECRETS = ("fake-rpc-user", "fake-rpc-password", "fake-rpc-key-in-path", "fake-rpc-key-in-query")
+
+
+@pytest.fixture
+def rejecting_rpc():
+    """A local JSON-RPC endpoint that answers every request 401, so web3 raises aiohttp's
+    ClientResponseError, whose text holds the full request URL."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits.append(self.path)
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    url = (
+        f"http://{RPC_SECRETS[0]}:{RPC_SECRETS[1]}@127.0.0.1:{port}"
+        f"/v2/{RPC_SECRETS[2]}?apikey={RPC_SECRETS[3]}"
+    )
+    yield SimpleNamespace(url=url, origin=f"http://127.0.0.1:{port}", hits=hits)
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize(
+    "args,stdin",
+    [
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY, "--contract", "1.0.2"], None),
+        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY, "--contract", "1.0.2"], None),
+        (["get-miner-collateral", "--contract", "1.0.2"], None),
+        (["get-executor-collateral", "--address", "192.0.2.10", "--port", "8001", "--contract", "1.0.2"], None),
+        (["get-reclaim-requests", "--contract", "1.0.2"], None),
+        (["remove-executor", "--address", "192.0.2.10", "--port", "8001"], "y\n"),
+    ],
+    ids=lambda value: value[0] if isinstance(value, list) else "",
+)
+def test_collateral_command_logs_leave_out_a_keyed_rpc_url(
+    archive_network, rejecting_rpc, monkeypatch, caplog, args, stdin
+):
+    import services.cli_service as cli_service_module
+    from cli import cli
+
+    executor = SimpleNamespace(uuid=UUID(EXECUTOR))
+    monkeypatch.setattr(archive_network, "SUBTENSOR_EVM_RPC_URL", rejecting_rpc.url)
+    monkeypatch.setattr(cli_service_module, "get_db", lambda: iter([None]))
+    monkeypatch.setattr(
+        cli_service_module,
+        "ExecutorDao",
+        lambda session: SimpleNamespace(
+            get_all_executors=lambda: [executor], find_one=lambda address, port: executor
+        ),
+    )
+    monkeypatch.setattr(cli_service_module, "MinerSSHService", lambda: None)
+    monkeypatch.setattr(cli_service_module, "ExecutorService", lambda **kwargs: None)
+
+    with caplog.at_level(logging.INFO):
+        result = CliRunner().invoke(cli, args, input=stdin)
+
+    assert result.exception is None, result.output
+    assert rejecting_rpc.hits, "the command never reached the RPC endpoint"
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    logged = caplog.text + result.output + "".join(r.getMessage() for r in caplog.records)
+    for secret in RPC_SECRETS:
+        assert secret not in logged
+    assert MINER_KEY.removeprefix("0x")[:16] not in logged
+    if args[0] != "remove-executor":
+        assert f'"rpc_url": "{rejecting_rpc.origin}"' in logged
+        assert '"error": "ClientResponseError"' in logged
+
+
 def test_collateral_command_on_an_unknown_network_names_the_setting(archive_network):
     from cli import cli
 

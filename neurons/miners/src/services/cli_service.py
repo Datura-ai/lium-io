@@ -12,12 +12,28 @@ from daos.executor import ExecutorDao
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 from models.executor import Executor
-from core.collateral import h160_to_ss58
+from core.collateral import (
+    CollateralConfigError,
+    CollateralTransactionError,
+    h160_to_ss58,
+    rpc_origin,
+)
 from core.utils import get_collateral_contract, versions_holding_collateral, _m
 from bittensor.utils.balance import Balance
 from protocol.miner_portal_request import AddExecutorFailed
 
 logging.basicConfig(level=logging.INFO)
+
+
+def collateral_error(error: Exception) -> str:
+    """Log text for a collateral contract failure.
+
+    Only this module's own errors keep their message; any other error (a web3 or aiohttp
+    transport error) is named by its class, since its text can carry the RPC URL and its API key.
+    """
+    if isinstance(error, (CollateralTransactionError, CollateralConfigError)):
+        return str(error)
+    return type(error).__name__
 
 
 def require_executor_dao(func):
@@ -61,7 +77,7 @@ class CliService:
             "netuid": self.netuid,
             "contract_address": self.collateral_contract.contract_address,
             "network": settings.BITTENSOR_NETWORK,
-            "rpc_url": settings.SUBTENSOR_EVM_RPC_URL,
+            "rpc_url": rpc_origin(settings.SUBTENSOR_EVM_RPC_URL),
         }
 
     def get_node(self):
@@ -335,7 +351,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to reclaim collateral",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -358,7 +374,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed in getting miner collateral",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -383,7 +399,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to get executor collateral",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -425,7 +441,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to get miner reclaim requests",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -443,7 +459,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to finalize reclaim request",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -517,7 +533,7 @@ class CliService:
             self.logger.info("Removed an executor(%s:%d)", address, port)
             return True
         except Exception as e:
-            self.logger.error("Failed in removing an executor: %s", str(e))
+            self.logger.error("Failed in removing an executor: %s", collateral_error(e))
             return False
 
     @require_executor_dao

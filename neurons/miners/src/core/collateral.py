@@ -11,6 +11,7 @@ import logging
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from eth_account import Account
@@ -77,6 +78,21 @@ def h160_to_ss58(h160_address: str) -> str:
     payload = bytes([SS58_FORMAT]) + public_key
     checksum = hashlib.blake2b(_SS58_PREFIX + payload).digest()[:2]
     return _base58_encode(payload + checksum)
+
+
+def rpc_origin(rpc_url: str | None) -> str | None:
+    """Scheme and host of an RPC URL, for logs: its path, query and userinfo can carry an API key."""
+    if not rpc_url:
+        return None
+    try:
+        parts = urlsplit(rpc_url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return "<unparsed>"
+    if not parts.scheme or not host:
+        return "<unparsed>"
+    return f"{parts.scheme}://{host}" + (f":{port}" if port else "")
 
 
 def executor_uuid_bytes(executor_uuid: str | UUID) -> bytes:

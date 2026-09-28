@@ -173,6 +173,32 @@ def test_finalize_uses_the_contract_with_this_miners_open_request(chain, cli_ser
     assert cli_services == ["1.0.0"]
 
 
+MALFORMED_KEYS = ["0x" + "ab" * 8, "not-a-hex-private-key", "zq" * 32]
+
+
+@pytest.mark.parametrize("bad_key", MALFORMED_KEYS)
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR],
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--contract", "1.0.2"],
+        ["finalize-reclaim-request", "--reclaim-request-id", "7"],
+        ["finalize-reclaim-request", "--reclaim-request-id", "7", "--contract", "1.0.2"],
+    ],
+    ids=["reclaim", "reclaim-contract", "finalize", "finalize-contract"],
+)
+def test_malformed_key_logs_an_error_without_the_key(chain, cli_services, caplog, args, bad_key):
+    from cli import cli
+
+    result = CliRunner().invoke(cli, [*args, "--private-key", bad_key])
+
+    assert result.exception is None, result.output
+    assert cli_services == []
+    assert chain.reads == []
+    assert "private key is malformed" in caplog.text
+    assert bad_key not in caplog.text + result.output
+
+
 @pytest.mark.parametrize("holder,removed", [(OLD_CONTRACT, False), (None, True)])
 async def test_remove_executor_checks_every_contract_version(chain, holder, removed):
     import logging

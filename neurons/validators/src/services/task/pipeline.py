@@ -269,12 +269,11 @@ class EventSink(Protocol):
 
 
 # DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
-# the validator. They are emitted on every cycle for as long as the state lasts (no collateral,
-# an old image, a banned provider, a host-side workload) and were 135,000 WARNING lines in two
+# the validator. They are emitted on every cycle for as long as the state lasts (an old image,
+# a banned provider, a host-side workload) and were 135,000 WARNING lines in two
 # days. The event keeps its severity for the backend and the portal; only the log line is INFO.
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
-        "COLLATERAL_MISSING",
         "EXECUTOR_IMAGE_OUTDATED",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
