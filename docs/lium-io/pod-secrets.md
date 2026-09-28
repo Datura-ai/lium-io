@@ -11,7 +11,8 @@ delivered as files, never as environment variables, so they don't show up in `do
 | `/run/lium/secrets/<NAME>` | One file per secret, holding the value exactly as sent (no trailing newline added) |
 | `/run/lium/secrets/.ready` | Appears once every secret file is in place |
 
-- `/run/lium/secrets` is an in-memory `tmpfs` (`noexec,nosuid,nodev`).
+- `/run/lium/secrets` is a `tmpfs` (`noexec,nosuid,nodev`): never on disk, though on a host with
+  swap the kernel may page it out (see [Lifetime](#lifetime)).
 - Your secrets may use up to 1 MiB in total, with each file counted in whole 4 KiB pages (a 10-byte
   token uses 4 KiB). A set over the limit is refused when you rent, before the pod is created, and
   the error names the secret that doesn't fit.
