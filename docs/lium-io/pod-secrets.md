@@ -64,7 +64,7 @@ Rebooting the pod from the pod page creates the container again and delivers the
 Docker can also restart the container by itself: after a host reboot, a Docker restart, or when
 your main process dies (for example out of memory). Then `/run/lium/secrets` is empty, `.ready` is
 gone, and the secrets are not delivered again, because they are not stored on the host. Use a
-timeout when you wait for `.ready`, as in the examples above, so your workload stops with an error
-instead of waiting forever. The validator also reports such a pod as having lost its secrets,
+timeout when you wait for `.ready`, as in the examples above, so your workload exits with an error
+after the timeout. The validator also reports such a pod as having lost its secrets,
 including when your workload keeps stopping on that timeout and Docker keeps restarting it.
 Reboot the pod from the pod page to get them back.
