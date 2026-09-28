@@ -1425,7 +1425,8 @@ class RealProbeSSHClient(DummySSHClient):
         self.fake_docker.write_text(
             "#!/bin/sh\n"
             'case "$1" in\n'
-            f'  inspect) echo "$(cat {tmp_path}/restart_count) {created} secrets" ;;\n'
+            f"  inspect) status=exited; [ -e {self.running_flag} ] && status=running; "
+            f'echo "$(cat {tmp_path}/restart_count) {created} $status secrets" ;;\n'
             f"  exec) [ -e {self.running_flag} ] || "
             "{ echo 'Error response from daemon: container is not running' >&2; exit 1; }; echo missing ;;\n"
             "esac\n"

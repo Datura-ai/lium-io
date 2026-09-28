@@ -1061,7 +1061,7 @@ def build_secret_file_exec_specs(
             "set -euC; umask 077; "
             + _pod_secrets_dir_guard(secrets_dir)
             + f"for path in {partial_target} {target}; do "
-            f"if [ -e \"$path\" ] || [ -L \"$path\" ]; then echo \"$path already exists\" >&2; exit 1; fi; "
+            "if [ -e \"$path\" ] || [ -L \"$path\" ]; then echo \"$path already exists\" >&2; exit 1; fi; "
             "done; "
             f"cat > {partial_target}; "
             f"chmod {POD_SECRET_FILE_MODE} {partial_target}; "
@@ -1131,10 +1131,12 @@ def build_pod_secrets_handover_spec(
 # starts before delivery, so a workload that crashed once before `.ready` and then got its secrets on
 # the restarted run keeps `.ready` and is not flagged. Otherwise a container older than the grace
 # period with no `.ready` is that case; a younger one may still be mid-delivery.
+# The renter owns the directory after the handover and can delete `.ready`, but a restarted tmpfs is
+# always empty: a mount that still holds files is never flagged. A paused container gets no verdict.
 POD_SECRETS_LOST_GRACE_SECONDS = 300
 POD_SECRETS_LOST_OUTPUT = "secrets-lost"
 _POD_SECRETS_STATE_FORMAT = (
-    "{{.RestartCount}} {{.Created}} "
+    "{{.RestartCount}} {{.Created}} {{.State.Status}} "
     '{{if index .HostConfig.Tmpfs "' + POD_SECRETS_DIR + '"}}secrets{{end}}'
 )
 
@@ -1142,16 +1144,22 @@ _POD_SECRETS_STATE_FORMAT = (
 def build_pod_secrets_lost_probe_command(container_name: str) -> str:
     """Host shell: prints POD_SECRETS_LOST_OUTPUT when the pod's secrets are gone."""
     container = shlex.quote(container_name)
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
     marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
-    ready_check = shlex.quote(f"[ -e {marker} ] && echo ready || echo missing")
+    ready_check = shlex.quote(
+        f"if [ -e {marker} ]; then echo ready; "
+        f'elif [ -n "$(ls -A {secrets_dir})" ]; then echo files; '
+        "else echo missing; fi"
+    )
     ready_answer = f"$(/usr/bin/docker exec -u 0 {container} sh -c {ready_check} 2>/dev/null)"
     return (
         f"state=$(/usr/bin/docker inspect --format {shlex.quote(_POD_SECRETS_STATE_FORMAT)} {container} "
         "2>/dev/null) || exit 0; "
         "set -- $state; "
-        '[ "$3" = secrets ] || exit 0; '
+        '[ "$4" = secrets ] || exit 0; '
+        '[ "$3" = paused ] && exit 0; '
         'if [ "$1" -gt 0 ] 2>/dev/null; then '
-        f'[ "{ready_answer}" = ready ] || echo {POD_SECRETS_LOST_OUTPUT}; exit 0; fi; '
+        f'case "{ready_answer}" in ready|files) ;; *) echo {POD_SECRETS_LOST_OUTPUT} ;; esac; exit 0; fi; '
         'created=$(date -d "$2" +%s 2>/dev/null) || exit 0; '
         f'[ $(( $(date +%s) - created )) -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] || exit 0; '
         f'[ "{ready_answer}" = missing ] '

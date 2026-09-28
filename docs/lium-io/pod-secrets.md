@@ -36,6 +36,9 @@ export HF_TOKEN="$(cat /run/lium/secrets/HF_TOKEN)"
 The marker is written only after every secret file has been written and handed to your user. If
 delivery fails, the marker is never written and the rent fails.
 
+Do not delete `.ready`, and do not empty `/run/lium/secrets`: the validator reads a pod with no
+`.ready` and no files there as one whose secrets were lost.
+
 In Python:
 
 ```python

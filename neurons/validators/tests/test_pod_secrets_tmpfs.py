@@ -34,6 +34,7 @@ from services.rental_docker_sdk import (
     _build_host_config_kwargs,
     POD_SECRETS_LOST_GRACE_SECONDS,
     POD_SECRETS_LOST_OUTPUT,
+    POD_SECRETS_READY_MARKER,
     build_pod_secrets_lost_probe_command,
     build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
@@ -868,23 +869,37 @@ def _run_lost_probe(
     age_seconds: int,
     restart_count: int = 0,
     exec_reachable: bool = True,
+    files_left: bool = False,
+    status: str = "running",
 ) -> str:
-    """Runs the host probe against a fake `docker` that answers `inspect` and `exec` like dockerd."""
+    """Runs the host probe against a fake `docker` that answers `inspect` and `exec` like dockerd.
+
+    `exec` runs the probe's real in-container check against a stand-in secrets directory.
+    """
     created = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - age_seconds))
     tmpfs = "secrets" if mounted else ""
-    ready_word = "ready" if ready else "missing"
-    exec_answer = f"echo {ready_word}" if exec_reachable else "echo 'container is restarting' >&2; exit 1"
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    if ready:
+        (secrets_dir / POD_SECRETS_READY_MARKER).write_text("2026-01-01T00:00:00Z\n")
+    if files_left:
+        (secrets_dir / "HF_TOKEN").write_text("value")
+    exec_answer = '"$@"' if exec_reachable else "echo 'container is restarting' >&2; exit 1"
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(
         "#!/bin/sh\n"
         'echo "$@" >> "$0.calls"\n'
         'case "$1" in\n'
-        f'  inspect) echo "{restart_count} {created} {tmpfs}" ;;\n'
-        f"  exec) {exec_answer} ;;\n"
+        f'  inspect) echo "{restart_count} {created} {status} {tmpfs}" ;;\n'
+        f"  exec) shift 4; {exec_answer} ;;\n"
         "esac\n"
     )
     fake_docker.chmod(0o755)
-    script = build_pod_secrets_lost_probe_command("tenant-123").replace("/usr/bin/docker", str(fake_docker))
+    script = (
+        build_pod_secrets_lost_probe_command("tenant-123")
+        .replace("/usr/bin/docker", str(fake_docker))
+        .replace(POD_SECRETS_DIR, str(secrets_dir))
+    )
     run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
     assert run.returncode == 0
     return run.stdout.strip()
@@ -960,6 +975,46 @@ def test_lost_probe_stays_quiet_otherwise(tmp_path, mounted, ready, age_seconds,
         )
         == ""
     )
+
+
+@pytest.mark.parametrize("restart_count", [0, 1], ids=["never-restarted", "restarted-before-delivery"])
+def test_lost_probe_spares_a_pod_whose_renter_deleted_the_ready_marker(tmp_path, restart_count):
+    # after the handover the renter owns the directory; a restarted tmpfs is always empty
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        files_left=True,
+        age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60,
+        restart_count=restart_count,
+    ) == ""
+
+
+@pytest.mark.parametrize("restart_count", [0, 1])
+def test_lost_probe_flags_a_restarted_pod_with_an_empty_mount(tmp_path, restart_count):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        files_left=False,
+        age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60,
+        restart_count=restart_count,
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_lost_probe_gives_no_verdict_on_a_paused_pod(tmp_path, ready):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=ready,
+        age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60,
+        restart_count=1,
+        exec_reachable=False,
+        status="paused",
+    ) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
 
 
 def test_lost_probe_skips_exec_for_a_pod_without_secrets(tmp_path):
