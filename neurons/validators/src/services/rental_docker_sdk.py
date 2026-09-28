@@ -223,6 +223,9 @@ class ContainerStateSnapshot:
     restart_count: int
     error: str | None
     oom_killed: bool
+    container_id: str | None = None
+    started_at: str | None = None
+    has_secrets_tmpfs: bool = False
 
     @property
     def killed_by_host(self) -> bool:
@@ -623,6 +626,9 @@ class RentalDockerSdkClient:
             restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
             error=state.get("Error") or None,
             oom_killed=bool(state.get("OOMKilled")),
+            container_id=info.get("Id") or None,
+            started_at=state.get("StartedAt") or None,
+            has_secrets_tmpfs=POD_SECRETS_DIR in ((info.get("HostConfig") or {}).get("Tmpfs") or {}),
         )
 
     def _mount_source_for_destination_sync(
@@ -1133,12 +1139,36 @@ def build_pod_secrets_handover_spec(
 # period with no `.ready` is that case; a younger one may still be mid-delivery.
 # The renter owns the directory after the handover and can delete `.ready`, but a restarted tmpfs is
 # always empty: a mount that still holds files is never flagged. A paused container gets no verdict.
+# A start the platform made (a stop/start from the pod page, the undo of a failed edit) empties the
+# mount too: it records the run's `StartedAt` under POD_PLATFORM_STARTS_DIR, outside every container,
+# in a file named by the container ID, and a run whose `StartedAt` matches is not flagged. Any restart
+# after it (Docker, a host reboot) starts a new run with a new `StartedAt`, so it is flagged as before.
 POD_SECRETS_LOST_GRACE_SECONDS = 300
 POD_SECRETS_LOST_OUTPUT = "secrets-lost"
+POD_PLATFORM_STARTS_DIR = "/var/lib/lium/pod-platform-starts"
 _POD_SECRETS_STATE_FORMAT = (
-    "{{.RestartCount}} {{.Created}} {{.State.Status}} "
+    "{{.RestartCount}} {{.Created}} {{.State.Status}} {{.State.StartedAt}} {{.Id}} "
     '{{if index .HostConfig.Tmpfs "' + POD_SECRETS_DIR + '"}}secrets{{end}}'
 )
+_CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+_DOCKER_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z")
+
+
+def build_record_platform_start_command(*, container_id: str, started_at: str) -> str:
+    """Host shell: records `started_at` as the run of `container_id` the platform started.
+
+    Takes only values read from dockerd and checked here, so no container name reaches the host shell.
+    """
+    if not isinstance(container_id, str) or not _CONTAINER_ID_PATTERN.fullmatch(container_id):
+        raise ValueError("not a full container ID")
+    if not isinstance(started_at, str) or not _DOCKER_TIMESTAMP_PATTERN.fullmatch(started_at):
+        raise ValueError("not a Docker StartedAt timestamp")
+    starts_dir = shlex.quote(POD_PLATFORM_STARTS_DIR)
+    stamp = shlex.quote(f"{POD_PLATFORM_STARTS_DIR}/{container_id}")
+    return (
+        f"umask 077 && mkdir -p {starts_dir} && chmod 0700 {starts_dir} "
+        f"&& printf '%s\\n' {started_at} > {stamp}.partial && mv -f {stamp}.partial {stamp}"
+    )
 
 
 def build_pod_secrets_lost_probe_command(container_name: str) -> str:
@@ -1156,8 +1186,9 @@ def build_pod_secrets_lost_probe_command(container_name: str) -> str:
         f"state=$(/usr/bin/docker inspect --format {shlex.quote(_POD_SECRETS_STATE_FORMAT)} {container} "
         "2>/dev/null) || exit 0; "
         "set -- $state; "
-        '[ "$4" = secrets ] || exit 0; '
+        '[ "$6" = secrets ] || exit 0; '
         '[ "$3" = paused ] && exit 0; '
+        f'[ "$(cat {shlex.quote(POD_PLATFORM_STARTS_DIR)}/"$5" 2>/dev/null)" = "$4" ] && exit 0; '
         'if [ "$1" -gt 0 ] 2>/dev/null; then '
         f'case "{ready_answer}" in ready|files) ;; *) echo {POD_SECRETS_LOST_OUTPUT} ;; esac; exit 0; fi; '
         'created=$(date -d "$2" +%s 2>/dev/null) || exit 0; '

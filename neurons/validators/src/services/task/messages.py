@@ -991,8 +991,9 @@ class TenantEnforcementMessages:
         "score 0 and the verified job cleared, until a cycle finds the pod reachable again"
     )
     # POD_SECRETS_TMPFS_ENABLED: Docker restarted the container by itself, so its secrets tmpfs came back
-    # empty and a workload waiting for `.ready` would hang. Flagged, not scored: the provider did not lose
-    # anything the renter cannot get back with a reboot, which sends a new create with the secrets.
+    # empty and a workload waiting for `.ready` would hang. Flagged, not scored: a new rent brings the
+    # secrets back, and a reboot from the pod page will once the platform sends secrets on reboot. A
+    # stop/start or edit rollback the platform made is recorded and never raises this.
     RENTED_POD_SECRETS_LOST = MessageTemplate(
         event="Rented pod lost its secrets after a restart",
         reason="RENTED_POD_SECRETS_LOST",

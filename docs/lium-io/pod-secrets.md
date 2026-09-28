@@ -67,6 +67,11 @@ only once the platform also sends them on reboot, which needs a matching platfor
 deployed first; until then a rebooted pod comes back with an empty `/run/lium/secrets`, and a new
 rent is the way to get them back.
 
+Stopping and starting the pod from the pod page, or a failed edit that puts your previous container
+back, also empties `/run/lium/secrets` and removes `.ready`, and the secrets are not delivered again
+until the platform sends them once more (a new rent, or a reboot once that ships). The validator
+does not report these starts as lost secrets.
+
 Docker can also restart the container by itself: after a host reboot, a Docker restart, or when
 your main process dies (for example out of memory). Then `/run/lium/secrets` is empty, `.ready` is
 gone, and the secrets are not delivered again, because they are not stored on the host. Use a

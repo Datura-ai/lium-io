@@ -125,6 +125,7 @@ from services.rental_docker_sdk import (
     build_pod_secrets_handover_spec,
     build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
+    build_record_platform_start_command,
     build_remove_authorized_keys_exec_spec,
     build_secret_file_exec_specs,
     parse_pod_secrets_owner,
@@ -776,6 +777,32 @@ async def _explain_add_public_keys_failure(
         "SSH keys were being installed; a pod needs a long-running process, for example a start "
         f"command such as `sleep infinity`. Exec error: {cause}"
     )
+
+
+async def _record_platform_start(
+    docker_client: RentalDockerSdkClient,
+    ssh_client: asyncssh.SSHClientConnection,
+    container_name: str,
+    default_extra: dict,
+) -> None:
+    """Best effort: without the record, the secrets probe flags this start as a lost-secrets restart."""
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+        if not state.has_secrets_tmpfs:
+            return
+        recorded = await ssh_client.run(
+            build_record_platform_start_command(container_id=state.container_id, started_at=state.started_at)
+        )
+        error = None if recorded.exit_status == 0 else (recorded.stderr or "").strip()
+    except Exception as exc:  # noqa: BLE001 — the start itself already succeeded
+        error = f"{type(exc).__name__}: {exc}"
+    if error is not None:
+        logger.warning(
+            _m(
+                "Could not record a platform start of the pod container",
+                extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
+            )
+        )
 
 
 class _EditSwap:
@@ -7195,6 +7222,7 @@ class DockerService:
                 local_volume_path=payload.local_volume_path,
                 pod_id=payload.pod_id,
                 default_extra=default_extra,
+                record_platform_start=True,
             )
         except Exception as exc:
             log_text = _m(
@@ -7228,6 +7256,7 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        record_platform_start: bool = False,
     ) -> None:
         # start a container that already exists and restore the two things a bare `docker start`
         # drops: the gocryptfs plaintext mount of an encrypted rental volume, and the sshd the
@@ -7236,6 +7265,8 @@ class DockerService:
         # A falsy local_volume_path means the caller does not know the plaintext path, which is only
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
+        # record_platform_start: a start the renter or the platform asked for, not the recovery of a
+        # pod the host lost, so the secrets probe does not blame the provider for the empty mount.
         pkey = asyncssh.import_private_key(private_key)
         async with self.rental_docker_client_factory.connect(
             executor_info=executor_info,
@@ -7256,6 +7287,8 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
+                if record_platform_start:
+                    await _record_platform_start(docker_client, ssh_client, container_name, default_extra)
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
@@ -7283,6 +7316,8 @@ class DockerService:
             call=lambda: docker_client.start(container_name=container_name),
             container_name=container_name,
         )
+        # the undo empties the secrets tmpfs by design; recorded before the remount, which may still fail
+        await _record_platform_start(docker_client, ssh_client, container_name, default_extra)
         await self._restore_mount_and_sshd_after_start(
             docker_client=docker_client,
             ssh_client=ssh_client,

@@ -1447,7 +1447,7 @@ class RealProbeSSHClient(DummySSHClient):
             "#!/bin/sh\n"
             'case "$1" in\n'
             f"  inspect) status=exited; [ -e {self.running_flag} ] && status=running; "
-            f'echo "$(cat {tmp_path}/restart_count) {created} $status secrets" ;;\n'
+            f'echo "$(cat {tmp_path}/restart_count) {created} $status {created} {"c0ffee" + "0" * 58} secrets" ;;\n'
             f"  exec) [ -e {self.running_flag} ] || "
             "{ echo 'Error response from daemon: container is not running' >&2; exit 1; }; echo missing ;;\n"
             "esac\n"

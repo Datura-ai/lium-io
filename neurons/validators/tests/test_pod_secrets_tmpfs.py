@@ -32,10 +32,12 @@ from services.rental_docker_sdk import (
     ContainerExecSpec,
     RentalDockerSdkClient,
     _build_host_config_kwargs,
+    POD_PLATFORM_STARTS_DIR,
     POD_SECRETS_LOST_GRACE_SECONDS,
     POD_SECRETS_LOST_OUTPUT,
     POD_SECRETS_READY_MARKER,
     build_pod_secrets_lost_probe_command,
+    build_record_platform_start_command,
     build_pod_secrets_owner_probe_spec,
     build_pod_secrets_tmpfs,
     build_secret_file_exec_specs,
@@ -868,6 +870,12 @@ def test_an_empty_marker_is_never_published(plain_secrets_dir, tmp_path):
     assert not os.path.lexists(secrets_dir / ".ready.partial")
 
 
+POD_CONTAINER_ID = "c0ffee" + "0" * 58
+PLATFORM_START = "2026-09-28T19:00:00.000000001Z"
+LATER_START = "2026-09-28T19:30:00.000000002Z"
+PAST_GRACE = POD_SECRETS_LOST_GRACE_SECONDS + 60
+
+
 def _run_lost_probe(
     tmp_path,
     *,
@@ -878,6 +886,8 @@ def _run_lost_probe(
     exec_reachable: bool = True,
     files_left: bool = False,
     status: str = "running",
+    started_at: str = PLATFORM_START,
+    platform_started_at: str | None = None,
 ) -> str:
     """Runs the host probe against a fake `docker` that answers `inspect` and `exec` like dockerd.
 
@@ -891,13 +901,17 @@ def _run_lost_probe(
         (secrets_dir / POD_SECRETS_READY_MARKER).write_text("2026-01-01T00:00:00Z\n")
     if files_left:
         (secrets_dir / "HF_TOKEN").write_text("value")
+    starts_dir = tmp_path / "platform-starts"
+    if platform_started_at is not None:
+        starts_dir.mkdir()
+        (starts_dir / POD_CONTAINER_ID).write_text(f"{platform_started_at}\n")
     exec_answer = '"$@"' if exec_reachable else "echo 'container is restarting' >&2; exit 1"
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(
         "#!/bin/sh\n"
         'echo "$@" >> "$0.calls"\n'
         'case "$1" in\n'
-        f'  inspect) echo "{restart_count} {created} {status} {tmpfs}" ;;\n'
+        f'  inspect) echo "{restart_count} {created} {status} {started_at} {POD_CONTAINER_ID} {tmpfs}" ;;\n'
         f"  exec) shift 4; {exec_answer} ;;\n"
         "esac\n"
     )
@@ -906,6 +920,7 @@ def _run_lost_probe(
         build_pod_secrets_lost_probe_command("tenant-123")
         .replace("/usr/bin/docker", str(fake_docker))
         .replace(POD_SECRETS_DIR, str(secrets_dir))
+        .replace(POD_PLATFORM_STARTS_DIR, str(starts_dir))
     )
     run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
     assert run.returncode == 0
@@ -1028,3 +1043,110 @@ def test_lost_probe_skips_exec_for_a_pod_without_secrets(tmp_path):
     _run_lost_probe(tmp_path, mounted=False, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60)
     calls = (tmp_path / "docker.calls").read_text().splitlines()
     assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+def test_lost_probe_spares_a_stop_and_start_the_platform_made(tmp_path):
+    # a stop/start from the pod page or an edit rollback: empty mount, RestartCount 0, old Created
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        started_at=PLATFORM_START,
+        platform_started_at=PLATFORM_START,
+    ) == ""
+
+
+@pytest.mark.parametrize("restart_count", [0, 1], ids=["host-reboot-or-dockerd-restart", "crash"])
+def test_lost_probe_flags_a_restart_after_a_platform_start(tmp_path, restart_count):
+    # Docker's own restart after the recorded start is a new run with a new StartedAt
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        restart_count=restart_count,
+        started_at=LATER_START,
+        platform_started_at=PLATFORM_START,
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("restart_count", [0, 1], ids=["host-reboot", "crash"])
+def test_lost_probe_flags_a_restart_with_no_platform_start(tmp_path, restart_count):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        restart_count=restart_count,
+        started_at=LATER_START,
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+def _run_record_platform_start(tmp_path, *, started_at: str = PLATFORM_START):
+    starts_dir = tmp_path / "platform-starts"
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=started_at).replace(
+        POD_PLATFORM_STARTS_DIR, str(starts_dir)
+    )
+    run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return starts_dir
+
+
+def test_a_platform_start_records_the_runs_started_at_root_only(tmp_path):
+    starts_dir = _run_record_platform_start(tmp_path)
+    assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{PLATFORM_START}\n"
+    assert stat.S_IMODE(starts_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((starts_dir / POD_CONTAINER_ID).stat().st_mode) == 0o600
+    assert [path.name for path in starts_dir.iterdir()] == [POD_CONTAINER_ID]
+
+
+def test_a_later_platform_start_replaces_the_record(tmp_path):
+    _run_record_platform_start(tmp_path)
+    starts_dir = _run_record_platform_start(tmp_path, started_at=LATER_START)
+    assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{LATER_START}\n"
+
+
+@pytest.mark.parametrize(
+    "container_id,started_at",
+    [
+        ("tenant-123; echo MARKER", PLATFORM_START),
+        ("../" + "a" * 61, PLATFORM_START),
+        ("A" * 64, PLATFORM_START),
+        (POD_CONTAINER_ID, "2026-09-28T19:00:00Z; echo MARKER"),
+        (POD_CONTAINER_ID, ""),
+        (None, PLATFORM_START),
+    ],
+)
+def test_the_record_takes_only_a_container_id_and_a_docker_timestamp(container_id, started_at):
+    with pytest.raises(ValueError):
+        build_record_platform_start_command(container_id=container_id, started_at=started_at)
+
+
+def test_the_record_lives_outside_every_container_and_the_probe_reads_it_by_id():
+    record = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START)
+    probe = build_pod_secrets_lost_probe_command("tenant-123")
+    assert f"{POD_PLATFORM_STARTS_DIR}/{POD_CONTAINER_ID}" in record
+    assert "docker" not in record and "tenant-123" not in record
+    assert "{{.Id}}" in probe and f'{POD_PLATFORM_STARTS_DIR}/"$5"' in probe
+
+
+@pytest.mark.parametrize("tmpfs,expected", [({POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}, True), (None, False)])
+@pytest.mark.asyncio
+async def test_the_container_state_carries_what_the_platform_start_record_needs(tmpfs, expected):
+    api_client = FakeApiClient()
+    api_client.container_states = [
+        {
+            "Id": POD_CONTAINER_ID,
+            "State": {"Status": "running", "Running": True, "StartedAt": PLATFORM_START},
+            "HostConfig": {"Tmpfs": tmpfs},
+        }
+    ]
+
+    state = await RentalDockerSdkClient(api_client).inspect_container_state(container_name="tenant-123")
+
+    assert (state.container_id, state.started_at, state.has_secrets_tmpfs) == (
+        POD_CONTAINER_ID,
+        PLATFORM_START,
+        expected,
+    )
