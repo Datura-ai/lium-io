@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from neurons.validators.src.services.task.checks.finalize import FinalizeCheck
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
-from neurons.validators.src.services.task.messages import PortCountMessages as Msg
+from neurons.validators.src.services.task.messages import FinalizeMessages, PortCountMessages as Msg
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -127,13 +128,41 @@ async def test_background_job_ports_lift_an_unrented_host_to_the_floor(context_f
     # the published figures stay the answered count: the platform adds these ports itself
     assert result.updates["port_count"] == len(ANSWERED_PAIRS)
     assert result.updates["state"].specs["available_port_count"] == len(ANSWERED_PAIRS)
-    # passed, yet under the listing floor it is not rented: the warning says why it passed
+    # passed under the published floor: listed only while the platform counts the held ports too
+    # (lium-platform#840), so the warning says so instead of claiming the node is hidden
     assert result.event.severity == "warning"
     assert result.event.impact == (
-        f"Hidden from renters: only {len(ANSWERED_PAIRS)} verified ports, need {MIN_PORT_COUNT}; "
+        "Listed only if the platform counts ports held by preemptible background jobs: "
+        f"{len(ANSWERED_PAIRS)} verified ports plus {len(BACKGROUND_JOB_PORTS)} held, need {MIN_PORT_COUNT}; "
         f"scored with {len(BACKGROUND_JOB_PORTS)} ports held by preemptible background jobs"
     )
+    assert "Hidden from renters" not in result.event.impact
+    assert result.event.what_we_saw["listing_hidden"] is None
     assert result.event.what_we_saw["exempt_because_rented"] is False
+    assert result.updates["state"].preemptible_background_job_port_count == len(BACKGROUND_JOB_PORTS)
+
+
+@pytest.mark.asyncio
+async def test_a_node_lifted_by_background_job_ports_is_not_reported_hidden_at_finalize(context_factory):
+    ctx = context_factory(state=_state(_background_job_data()), score=1.0, job_score=1.0)
+
+    count_result = await PortCountCheck().run(ctx)
+    ctx = ctx.model_copy(update=count_result.updates)
+    final_result = await FinalizeCheck().run(ctx)
+
+    assert count_result.passed is True
+    assert final_result.event.reason_code == FinalizeMessages.COMPLETED.reason
+    assert "Hidden from renters" not in final_result.event.impact
+    assert final_result.event.impact.startswith(
+        "Listed only if the platform counts ports held by preemptible background jobs: "
+        f"{len(ANSWERED_PAIRS)} verified ports plus {len(BACKGROUND_JOB_PORTS)} held, need {MIN_PORT_COUNT}."
+    )
+    assert final_result.event.what_we_saw["port_floor"]["listing_hidden"] is None
+    assert final_result.event.what_we_saw["port_floor"]["held_by_preemptible_background_jobs"] == len(
+        BACKGROUND_JOB_PORTS
+    )
+    # the firewall fix is offered only for the case where the platform does not list the node
+    assert final_result.event.remediation.startswith("If the node is not listed for renters: ")
 
 
 @pytest.mark.asyncio

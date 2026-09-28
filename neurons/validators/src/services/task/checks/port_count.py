@@ -14,7 +14,9 @@ def port_count_below_listing_floor(state: ContextState) -> int | None:
 
     The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
     `daos/executor.py` get_available_executors), with no exemption for a rented node, so any run that
-    publishes a lower count leaves the node's free GPUs hidden from renters. The rent path gates
+    publishes a lower count leaves the node's free GPUs hidden from renters, unless the backend also
+    counts ports held by preemptible background jobs (lium-platform#840's
+    count_preemptible_filler_ports_as_free, see port_floor_impact_text). The rent path gates
     separately, on MIN_PORT_COUNT free `verified_ports` (`services/executor.py`).
     None before PortCountCheck has written the count.
     """
@@ -28,14 +30,37 @@ def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
 
+def listing_needs_background_job_ports_text(
+    available_port_count: int, background_job_port_count: int
+) -> str:
+    return (
+        f"Listed only if the platform counts ports held by preemptible background jobs: "
+        f"{available_port_count} verified ports plus {background_job_port_count} held, need {MIN_PORT_COUNT}"
+    )
+
+
+def port_floor_impact_text(state: ContextState, available_port_count: int) -> str:
+    background_job_port_count = state.preemptible_background_job_port_count
+    if background_job_port_count:
+        return listing_needs_background_job_ports_text(
+            available_port_count, background_job_port_count
+        )
+    return hidden_from_renters_text(available_port_count)
+
+
 def port_floor_what(state: ContextState, available_port_count: int) -> dict[str, Any]:
-    return {
+    background_job_port_count = state.preemptible_background_job_port_count
+    what: dict[str, Any] = {
         "available_port_count": available_port_count,
         "required": MIN_PORT_COUNT,
-        "listing_hidden": True,
+        # None: the platform lists the node only while it counts background-job ports (lium-platform#840)
+        "listing_hidden": None if background_job_port_count else True,
         "probed_port_count": state.probed_port_count,
         "declared_port_count": state.declared_port_count,
     }
+    if background_job_port_count:
+        what["held_by_preemptible_background_jobs"] = background_job_port_count
+    return what
 
 
 class PortCountCheck:
@@ -63,6 +88,7 @@ class PortCountCheck:
 
         updated_state = replace(
             ctx.state,
+            preemptible_background_job_port_count=background_job_port_count,
             specs={
                 **ctx.state.specs,
                 "available_port_count": port_count,
@@ -102,8 +128,9 @@ class PortCountCheck:
             )
 
         if port_count < MIN_PORT_COUNT:
-            # Passed while rented, or unrented with background-job ports making up the floor: either way the
-            # published count is under it, so the free GPUs still cannot be listed or rented.
+            # Passed while rented: the published count is under the floor, so the free GPUs cannot be listed.
+            # Passed unrented on background-job ports: the platform lists the node only while it counts
+            # those ports too (lium-platform#840's flag), so the warning does not claim it is hidden.
             scored_as = (
                 "the rented portion is scored as rented"
                 if is_rented
@@ -114,9 +141,9 @@ class PortCountCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 severity="warning",
-                impact=f"{hidden_from_renters_text(port_count)}; {scored_as}",
+                impact=f"{port_floor_impact_text(updated_state, port_count)}; {scored_as}",
                 what={
-                    **port_floor_what(ctx.state, port_count),
+                    **port_floor_what(updated_state, port_count),
                     "held_by_preemptible_background_jobs": background_job_port_count,
                     "exempt_because_rented": is_rented,
                 },
