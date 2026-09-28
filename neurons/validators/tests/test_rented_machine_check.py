@@ -1420,6 +1420,65 @@ async def test_a_gpu_outside_tenant_cycle_names_the_pods_that_lost_their_secrets
     assert any("lost its secrets" in record.getMessage() for record in caplog.records)
 
 
+class SiblingEndsTheCycleSSHClient(SecretsLostSSHClient):
+    """tenant-123 lost its secrets; the later pod tenant-456 is down, or its SSH transport dies."""
+
+    def __init__(self, *, sibling_transport_error: BaseException | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.sibling_transport_error = sibling_transport_error
+
+    async def run(self, command: str):
+        if "tenant-456" in command:
+            if "docker ps" in command:
+                if self.sibling_transport_error is not None:
+                    raise self.sibling_transport_error
+                self.commands_called.append(command)
+                result = Mock()
+                result.stdout = ""
+                return result
+            if ".HostConfig.Tmpfs" in command:
+                self.commands_called.append(command)
+                result = Mock()
+                result.stdout = ""
+                return result
+        return await super().run(command)
+
+
+@pytest.mark.parametrize(
+    "sibling_transport_error,reason",
+    [
+        (OSError("connection reset"), Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason),
+        (None, Msg.POD_NOT_RUNNING.reason),
+    ],
+    ids=["later-pod-transport-dies", "later-pod-not-running"],
+)
+@pytest.mark.asyncio
+async def test_a_later_pod_that_ends_the_cycle_still_names_earlier_lost_secrets(
+    context_factory, monkeypatch, caplog, sibling_transport_error, reason
+):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ctx = _tenant_ctx(
+        context_factory,
+        SiblingEndsTheCycleSSHClient(
+            pod_running=True, ssh_keys=["ssh-rsa AAA"], sibling_transport_error=sibling_transport_error
+        ),
+        {
+            "containers": [
+                {"name": "tenant-123", "pod_id": "pod-1"},
+                {"name": "tenant-456", "pod_id": "pod-2"},
+            ]
+        },
+    )
+
+    with caplog.at_level("WARNING", logger=rented_machine.__name__):
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == reason
+    lost_logs = [record for record in caplog.records if "lost its secrets" in record.getMessage()]
+    assert len(lost_logs) == 1
+    assert lost_logs[0].msg.extra["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "tenant-123"}]
+
+
 @pytest.mark.asyncio
 async def test_a_pod_found_between_restarts_that_stays_down_names_its_lost_secrets(context_factory, monkeypatch):
     monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)

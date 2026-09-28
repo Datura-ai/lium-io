@@ -193,13 +193,27 @@ class TenantEnforcementCheck:
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
+        def log_secrets_lost_pods() -> None:
+            if secrets_lost_pods:
+                logger.warning(
+                    _m(
+                        "Rented pod lost its secrets after a restart",
+                        extra=get_extra_info({**extra, "secrets_lost_pods": secrets_lost_pods}),
+                    )
+                )
+
+        def ended_in_loop(result: CheckResult) -> CheckResult:
+            # a later pod ends the cycle here, so the pods already found with lost secrets are named now
+            log_secrets_lost_pods()
+            return with_pod_states(result)
+
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
             try:
                 pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, pod_container_name)
             except (asyncssh.Error, OSError) as exc:
-                return with_pod_states(
+                return ended_in_loop(
                     _executor_transport_unreachable_result(
                         ctx=ctx,
                         check_id=self.check_id,
@@ -246,7 +260,7 @@ class TenantEnforcementCheck:
                             what={**port_floor_what(ctx.state, port_count_below_floor), "stale_pod": stale_what},
                             extra=extra,
                         )
-                        return with_pod_states(
+                        return ended_in_loop(
                             CheckResult(
                                 passed=False,
                                 event=event,
@@ -269,7 +283,7 @@ class TenantEnforcementCheck:
                         what=stale_what,
                         extra=extra,
                     )
-                    return with_pod_states(
+                    return ended_in_loop(
                         CheckResult(
                             passed=True,
                             event=event,
@@ -297,7 +311,7 @@ class TenantEnforcementCheck:
                 )
                 state_by_pod_id[pod_id] = outcome.container_state
                 if outcome.failure:
-                    return with_pod_states(outcome.failure)
+                    return ended_in_loop(outcome.failure)
                 ssh_pub_keys = outcome.ssh_pub_keys
                 # A pod down after a host reboot has RestartCount 0 and refuses exec while stopped, so
                 # the probe above could not tell; the started container answers `.ready` now.
@@ -316,13 +330,7 @@ class TenantEnforcementCheck:
             if verdict is not None:
                 ssh_verdicts.append(verdict)
 
-        if secrets_lost_pods:
-            logger.warning(
-                _m(
-                    "Rented pod lost its secrets after a restart",
-                    extra=get_extra_info({**extra, "secrets_lost_pods": secrets_lost_pods}),
-                )
-            )
+        log_secrets_lost_pods()
         lost_what = {"secrets_lost_pods": secrets_lost_pods} if secrets_lost_pods else {}
 
         container_names = [pod.container_name for pod in rented_pods]
