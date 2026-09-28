@@ -14,7 +14,9 @@ from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, Vali
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
+from core.config import settings
 from core.utils import _m, get_extra_info
+from incentive.config import BASE_GPU_MAP
 
 from .models import JobResult
 from .pipeline import Context
@@ -142,6 +144,17 @@ class ResultHandler:
             else None
         )
         provider_discord_connected = self._get_provider_discord_connected(context)
+        rented_data = context.state.rented_data
+        has_lium_filler = bool(
+            rented_data and rented_data.get_filler_containers(executor_info.uuid)
+        )
+        filler_revenue_per_gpu_hour = (
+            rented_data.get_filler_revenue_per_gpu_hour(
+                BASE_GPU_MAP.get(gpu_model or ""), gpu_count, settings.FILLER_REVENUE_MIN_GPU_HOURS
+            )
+            if rented_data
+            else None
+        )
 
         # add TDX attestation and spot tier to specs (propagated to compute-app
         # via MACHINE_SPEC_CHANNEL → executor.specs)
@@ -221,6 +234,8 @@ class ResultHandler:
             provider_discord_connected=provider_discord_connected,
             rental_created_at=self._get_rental_created_at(context),
             default_job_owner=default_job_owner,
+            has_lium_filler=has_lium_filler,
+            filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour,
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,

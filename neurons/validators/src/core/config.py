@@ -565,6 +565,19 @@ class Settings(BaseSettings):
         env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
 
+    # Spot-node pay. True: an unrented spot node running Lium fillers earns
+    # min(0.9 x its GPU configuration's average filler revenue, its secure idle rate before
+    # bucket-cap dilution), with no bucket cap; a spot node without a filler, or whose configuration
+    # has no usable average, earns 0. False: every spot node earns 0, as before.
+    ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
+    # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
+    # bucket-cap dilution is raised to min(0.9 x its configuration's average filler revenue, its
+    # undiluted rate). False: dilution applies as before.
+    ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
+    # A configuration's filler average is used only when it was taken over at least this many
+    # filler GPU-hours; a thinner sample reads as no average.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
+
     # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
     # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
     # results are merged. It can raise many hosts' verified_port_count at once, so it ships off.

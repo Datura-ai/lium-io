@@ -38,6 +38,8 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
+        "spot_without_lium_filler",
+        "spot_no_filler_revenue_for_gpu_config",
         "validation_failed",
     }
 

@@ -31,6 +31,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
+   Spot-node pay (ENABLE_SPOT_NODE_PAY on) — an idle spot node earns only while it runs
+     Lium fillers and its GPU configuration has an average filler revenue:
+     spot node without a Lium filler, no filler revenue average for the GPU configuration
    Group C — a check failed this cycle: the failing check's reason code
      (`validation_failed`, context.reason_code), so a zero from a failed check is never
      reported without a reason. A run that passed every check and still scored 0 (the
@@ -42,7 +45,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
-     rental_incentive_calculated, mining_score_missing (internal-error case),
+     rental_incentive_calculated, spot_pay_incentive_calculated,
+     secure_filler_revenue_floor_applied (the secure floor lifted a diluted rate),
+     mining_score_missing (internal-error case),
      unrented_bucket_reassigned (DAH-2528: node rated against its split tier
      because its own GPU-count tier was over capacity)
 
@@ -99,6 +104,9 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    # Spot-node pay (ENABLE_SPOT_NODE_PAY): an idle spot node that is not paid
+    SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
+    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
     # Group C: the validation run itself did not pass; context.reason_code names the check
     VALIDATION_FAILED = "validation_failed"
 
@@ -451,6 +459,33 @@ class MinerLogLine(BaseModel):
             },
         )
 
+    # ── Spot-node pay: an idle spot node that is not paid ────────────────────
+
+    @staticmethod
+    def no_payout_because_spot_without_lium_filler(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_WITHOUT_LIUM_FILLER,
+            message=(
+                "No subnet incentive: this spot-tier executor is not running a Lium filler job. "
+                "Spot-tier executors earn only while Lium's filler jobs run on them."
+            ),
+            extra_fields={"has_lium_filler": result.has_lium_filler},
+        )
+
+    @staticmethod
+    def no_payout_because_spot_no_filler_revenue_for_gpu_config(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG,
+            message=(
+                f"No subnet incentive: there is no average filler revenue yet for the "
+                f"{result.gpu_count}x {result.gpu_model} configuration, and spot-tier pay is "
+                "measured against it."
+            ),
+            extra_fields={"filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour},
+        )
+
     # ── Group C: the validation run did not pass ─────────────────────────────
 
     @staticmethod
@@ -557,6 +592,59 @@ class MinerLogLine(BaseModel):
                 "burn_share": result.burn_share,
                 "incentive": result.incentive,
                 "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def spot_pay_incentive_calculated(
+        hotkey: str, result: JobResult, secure_rate: float, filler_rate: float
+    ) -> MinerLogLine:
+        return MinerLogLine(
+            message=(
+                "Spot-tier incentive for executor is calculated successfully. Formula: "
+                "rental_share * gpu_count * effective_rate / total_rental_cost, "
+                "effective_rate = min(0.9 * filler_revenue_per_gpu_hour, secure_rate)"
+            ),
+            fields={
+                "hotkey": hotkey,
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour,
+                "filler_rate": filler_rate,
+                "hourly_rate": result.hourly_rate,
+                "sysbox_multiplier": result.sysbox_multiplier,
+                "driver_multiplier": result.driver_multiplier,
+                "secure_rate": secure_rate,
+                "effective_rate": result.effective_rate,
+                "rental_share": result.rental_share,
+                "burn_share": result.burn_share,
+                "incentive": result.incentive,
+                "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def secure_filler_revenue_floor_applied(
+        result: JobResult, diluted_rate: float, floored_rate: float
+    ) -> MinerLogLine:
+        # report line, not a zero reason: the node is paid more than its diluted rate
+        return MinerLogLine(
+            message=(
+                "Unrented incentive: the capacity dilution for this GPU tier took this executor's "
+                "rate below 0.9 x the average filler revenue for its GPU configuration, so it is "
+                "paid at that floor instead (never above its undiluted rate)."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "secure_filler_revenue_floor_applied",
+                "hourly_rate": result.hourly_rate,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
+                "diluted_rate": diluted_rate,
+                "floored_rate": floored_rate,
+                "filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour,
             },
         )
 

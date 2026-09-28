@@ -65,6 +65,9 @@ class JobResult(BaseModel):
     provider_discord_connected: bool = True
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive
+    has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
+    # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
+    filler_revenue_per_gpu_hour: float | None = None
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -115,6 +118,8 @@ class JobResult(BaseModel):
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
+    # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
+    spot_pay_candidate: bool = False
     unrented_cap_multiplier: float | None = None          # Cap dilution multiplier: min(count, cap) / count
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
@@ -184,7 +189,11 @@ class JobResult(BaseModel):
     def incentive_formula_version(self) -> str:
         if self._is_mixed:
             return "mixed_v1"
-        return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
+        return "rental_price_v2" if self._paid_from_rental_share else "mining_v1"
+
+    @property
+    def _paid_from_rental_share(self) -> bool:
+        return self.eligible_for_rental_share or self.spot_pay_candidate
 
     @property
     def incentive_formula_inputs(self) -> dict[str, Any]:
@@ -193,7 +202,7 @@ class JobResult(BaseModel):
             # The property's contract is a plain JSON-ready dict, and the payload is
             # published straight into a JSON message.
             return self._mixed_formula_inputs.model_dump()
-        if self.eligible_for_rental_share:
+        if self._paid_from_rental_share:
             return {
                 "rental_share": self.rental_share,
                 "rental_share_raw": self.rental_share_raw,
