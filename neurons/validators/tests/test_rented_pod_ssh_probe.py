@@ -898,18 +898,6 @@ async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdi
         "pod-reported-last-cycle"
     ]
 
-    # a held cycle that also found a pod's secrets lost keeps that reason; the held pod still moves
-    secrets_lost = _job_result(held)
-    lost_pods = [{"pod_id": POD_ID, "container_name": "tenant-123"}]
-    secrets_lost.validation_event.what_we_saw["secrets_lost_pods"] = lost_pods
-    assert rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage([secrets_lost], h.gate) == 1
-    event = secrets_lost.validation_event
-    assert event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason and event.trace_id == trace_id
-    assert event.remediation == Msg.RENTED_POD_SECRETS_LOST.remediation
-    assert event.what_we_saw["secrets_lost_pods"] == lost_pods
-    assert "unreachable_pods" not in event.what_we_saw
-    assert rented_pod_ssh.PROBE_SUPPRESSED_FLEET in event.what_we_saw
-
     # a posted cycle rewrites nothing; neither does a flush that never ran (Redis down: gate None)
     posted = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
     assert h.gate.posted == [POD_ID]

@@ -782,8 +782,7 @@ async def _post_due_reports(
 def silence_rented_pod_ssh_reports_on_our_own_outage(
     job_results: list[JobResult], gate: FleetGate | None
 ) -> int:
-    """Rewrite to RENTED (or RENTED_POD_SECRETS_LOST) the cycle's ``RENTED_POD_SSH_UNREACHABLE`` results
-    whose reports the gate held.
+    """Rewrite to RENTED the cycle's ``RENTED_POD_SSH_UNREACHABLE`` results whose reports the gate held.
 
     The executor task rendered its event before the cycle-end gate ran, and that event names a pod
     outage with its notice queued. On a suppressed cycle the outage was ours and nobody is told,
@@ -796,9 +795,8 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     A result can name several pods of one executor. The pods the gate held move under
     ``probe_suppressed_fleet``; a pod the gate did not hold (its outage was reported in an earlier
     cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because that
-    pod's outage is real and already on record. When nothing stays, the event becomes RENTED, or
-    RENTED_POD_SECRETS_LOST when the cycle also named ``secrets_lost_pods``; when something stays,
-    it keeps its reason and names only the pods whose outage stands.
+    pod's outage is real and already on record. When nothing stays, the event becomes RENTED; when
+    something stays, it keeps its reason and names only the pods whose outage stands.
     An enforced event (DAH-2255, ``what_we_saw.enforced``) is a later cycle whose backend already
     accepted the report: it failed at score 0 and is never rewritten to RENTED. It keeps reason,
     impact and pods and gains the gate's verdict under ``probe_suppressed_fleet``. The stored gate
@@ -868,21 +866,14 @@ def _event_without_held_pods(
                 },
             }
         )
-    if what.get("secrets_lost_pods"):
-        # The cycle's other finding stands without the held outage, as the check renders it.
-        template = TenantEnforcementMessages.RENTED_POD_SECRETS_LOST
-        impact, remediation = template.impact, template.remediation
-    else:
-        template = TenantEnforcementMessages.ALREADY_RENTED
-        impact = f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})"
-        remediation = "No action needed."
+    already_rented_template = TenantEnforcementMessages.ALREADY_RENTED
     return build_msg(
-        event=template.event,
-        reason=template.reason,
-        severity=template.severity,
-        category=template.category,
-        impact=impact,
-        remediation=remediation,
+        event=already_rented_template.event,
+        reason=already_rented_template.reason,
+        severity=already_rented_template.severity,
+        category=already_rented_template.category,
+        impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
+        remediation="No action needed.",
         what={**what, PROBE_SUPPRESSED_FLEET: gate_verdict},
         check_id=event.check_id or "",
         pipeline_id=event.pipeline_id,
