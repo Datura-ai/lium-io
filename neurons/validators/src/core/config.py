@@ -11,7 +11,7 @@ from datura.chain import (
     ChainEndpoint,
     chain_endpoint_candidates,
 )
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -496,7 +496,8 @@ class Settings(BaseSettings):
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
     # Soft limit rate per base model (keys of BASE_GPU_MAP's values, e.g. {"B300": 1.1}), used in place
     # of the shared config's soft_limit_price_rate, which is one rate for every GPU. A base model left
-    # out keeps the shared rate; empty = the shared rate for all.
+    # out keeps the shared rate; empty = the shared rate for all. A rate may only be at or below
+    # the shared one.
     UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL: dict[str, float] = Field(
         env="UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", default_factory=dict
     )
@@ -736,6 +737,20 @@ class Settings(BaseSettings):
             )
         return self
 
+    @field_validator("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", mode="before")
+    @classmethod
+    def refuse_boolean_soft_price_limit_rates(cls, value: object) -> object:
+        # pydantic reads JSON true as 1.0, so a boolean typo would set a real ceiling instead of
+        # stopping the validator.
+        if isinstance(value, dict):
+            for base_model, rate in value.items():
+                if isinstance(rate, bool):
+                    raise ValueError(
+                        f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] must be a "
+                        f"number, got {rate}"
+                    )
+        return value
+
     @model_validator(mode="after")
     def validate_soft_price_limit_rates(self) -> "Settings":
         # A NaN or inf rate would switch the model's ceiling off (price > p90 * nan is never true), a rate at
@@ -831,6 +846,30 @@ class Settings(BaseSettings):
 settings = Settings()
 shared_client = SharedConfigClient(
     api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
+)
+
+
+def validate_soft_price_limit_rates_only_tighten(
+    overrides: dict[str, float], served_rate: float
+) -> None:
+    """Stop the validator when a per-model soft limit rate is above the served one.
+
+    The override exists to lower one model's ceiling. A higher rate would keep idle pay on
+    listings the served rate refuses, and a huge one (1e308) overflows p90 * rate to inf,
+    which switches the ceiling off.
+    """
+    for base_model, rate in overrides.items():
+        if rate > served_rate:
+            raise ValueError(
+                f"UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL[{base_model!r}] = {rate} is above "
+                f"the served soft_limit_price_rate {served_rate}; the override may only tighten "
+                f"the ceiling"
+            )
+
+
+validate_soft_price_limit_rates_only_tighten(
+    settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL,
+    shared_client.config.soft_limit_price_rate,
 )
 
 

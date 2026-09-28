@@ -13,7 +13,12 @@ import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
-from core.config import Settings, settings, shared_client
+from core.config import (
+    Settings,
+    settings,
+    shared_client,
+    validate_soft_price_limit_rates_only_tighten,
+)
 import incentive.config as incentive_config
 from incentive.config import MAX_UNRENTED_GPUS_BY_TYPE, RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
@@ -271,3 +276,51 @@ def test_the_proposed_b300_value_loads(monkeypatch) -> None:
     monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", '{"B300": 1.1, "H200": 1.5}')
 
     assert Settings().UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL == {"B300": 1.1, "H200": 1.5}
+
+
+@pytest.mark.parametrize("raw", ['{"B300": true}', '{"B300": false}'])
+def test_a_boolean_rate_is_refused(monkeypatch, raw: str) -> None:
+    monkeypatch.setenv("UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", raw)
+
+    with pytest.raises(ValueError, match="must be a number"):
+        Settings()
+
+
+@pytest.mark.parametrize("rate", [3.0, 1e308, 1.5000001])
+def test_a_rate_above_the_served_rate_stops_the_validator(rate: float) -> None:
+    with pytest.raises(ValueError, match="may only tighten"):
+        validate_soft_price_limit_rates_only_tighten({"B300": rate}, PROD_SOFT_LIMIT_PRICE_RATE)
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"B300": 1.1}, {"B300": 1.1, "H200": PROD_SOFT_LIMIT_PRICE_RATE}, {}]
+)
+def test_a_rate_at_or_below_the_served_rate_is_accepted(overrides: dict[str, float]) -> None:
+    validate_soft_price_limit_rates_only_tighten(overrides, PROD_SOFT_LIMIT_PRICE_RATE)
+
+
+@pytest.mark.parametrize(("rate", "price_per_gpu"), [(3.0, 20.00), (1e308, 1e300)])
+def test_a_looser_override_that_skipped_the_startup_check_keeps_the_served_ceiling(
+    monkeypatch, rate: float, price_per_gpu: float
+) -> None:
+    _serve_prod_soft_limit(monkeypatch)
+    monkeypatch.setattr(settings, "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", {"B300": rate})
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
+
+    assert incentive._soft_limit_price_rate(B300_AC) == PROD_SOFT_LIMIT_PRICE_RATE
+    assert incentive._is_over_soft_price_limit(_job("dublin", B300_AC, 8, price_per_gpu)) is True
+
+
+def test_a_served_rate_that_drops_below_the_override_after_startup_wins(monkeypatch) -> None:
+    _serve_prod_soft_limit(monkeypatch)
+    monkeypatch.setattr(
+        shared_client,
+        "_config",
+        shared_client.config.model_copy(update={"soft_limit_price_rate": 1.0}),
+    )
+    monkeypatch.setattr(settings, "UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL", {"B300": 1.1})
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
+
+    # ceiling 8.637 × 1.0, not 8.637 × 1.1 = 9.5007
+    assert incentive._soft_limit_price_rate(B300_AC) == 1.0
+    assert incentive._is_over_soft_price_limit(_job("dublin", B300_AC, 8, 9.00)) is True

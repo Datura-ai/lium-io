@@ -263,9 +263,13 @@ class RentalPriceIncentive(DefaultIncentive):
     @staticmethod
     def _soft_limit_price_rate(gpu_model: str) -> float:
         base_model: str | None = BASE_GPU_MAP.get(gpu_model)
-        return settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.get(
-            base_model, shared_client.config.soft_limit_price_rate
+        served_rate: float = shared_client.config.soft_limit_price_rate
+        # The startup check compares against the rate served at boot; the served rate can drop
+        # on a later refresh.
+        override: float = settings.UNRENTED_SOFT_PRICE_LIMIT_RATE_BY_BASE_MODEL.get(
+            base_model, served_rate
         )
+        return min(override, served_rate)
 
     def _is_over_soft_price_limit(self, result: JobResult) -> bool:
         # miner price_per_gpu above the market p90 ceiling (p90 * soft limit rate)
