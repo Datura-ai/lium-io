@@ -316,6 +316,15 @@ class TenantEnforcementCheck:
             if verdict is not None:
                 ssh_verdicts.append(verdict)
 
+        if secrets_lost_pods:
+            logger.warning(
+                _m(
+                    "Rented pod lost its secrets after a restart",
+                    extra=get_extra_info({**extra, "secrets_lost_pods": secrets_lost_pods}),
+                )
+            )
+        lost_what = {"secrets_lost_pods": secrets_lost_pods} if secrets_lost_pods else {}
+
         container_names = [pod.container_name for pod in rented_pods]
         container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
@@ -335,6 +344,7 @@ class TenantEnforcementCheck:
                         "gpu_utilization": observation["gpu_utilization"],
                         "vram_utilization": observation["vram_utilization"],
                         "gpu_processes": gpu_processes,
+                        **lost_what,
                     },
                     extra=extra
                 )
@@ -354,7 +364,7 @@ class TenantEnforcementCheck:
         enforced = [verdict for verdict in reported if is_enforced(verdict)]
         if enforced:
             return self._failed_result_for_enforced_ssh_outage(
-                ctx, reported=reported, enforced=enforced, extra=extra
+                ctx, reported=reported, enforced=enforced, extra=extra, lost_what=lost_what
             )
 
         score_calculator = ctx.services.score_calculator
@@ -368,12 +378,6 @@ class TenantEnforcementCheck:
         }
         if secrets_lost_pods:
             what["secrets_lost_pods"] = secrets_lost_pods
-            logger.warning(
-                _m(
-                    "Rented pod lost its secrets after a restart",
-                    extra=get_extra_info({**extra, "secrets_lost_pods": secrets_lost_pods}),
-                )
-            )
         # A pod that just crossed the unhealthy threshold owns this cycle's event, so the outage is
         # what the backend stores and the portal shows. The score is the rented score: with the
         # enforcement flag off (the default) this verdict is reported, not scored (DAH-2870).
@@ -447,6 +451,7 @@ class TenantEnforcementCheck:
         reported: list[RentedPodSshVerdict],
         enforced: list[RentedPodSshVerdict],
         extra: dict[str, Any],
+        lost_what: dict[str, Any] | None = None,
     ) -> CheckResult:
         """The cycle's failing result when a rented pod's SSH outage is past the enforce threshold (DAH-2255).
 
@@ -469,6 +474,7 @@ class TenantEnforcementCheck:
                 "enforced": True,
                 "enforce_after_cycles": threshold,
                 "unreachable_pods": [verdict_log_fields(verdict) for verdict in reported],
+                **(lost_what or {}),
             },
             extra=extra,
         )

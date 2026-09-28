@@ -1163,15 +1163,17 @@ def _pod_states(result) -> dict[str, str]:
     return {s.pod_id: s.container_state.value for s in result.updates["state"].pod_states}
 
 
-def _tenant_ctx(context_factory, ssh_client, rented_machine, *, backend=None, prior_state=None):
+def _tenant_ctx(
+    context_factory, ssh_client, rented_machine, *, backend=None, prior_state=None, gpu_processes=(), gpu_details=()
+):
     services = build_services(
         score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
         container_cleanup=MockContainerCleanup(),
         backend=backend or DummyBackendClient(active=True),
     )
     state = build_state(
-        gpu_processes=[],
-        gpu_details=[],
+        gpu_processes=list(gpu_processes),
+        gpu_details=list(gpu_details),
         gpu_model="NVIDIA RTX 4090",
         rented_data=build_rented_data("executor-123", rented_machine),
         pod_states=prior_state or [],
@@ -1397,6 +1399,25 @@ async def test_tenant_enforcement_flags_a_pod_whose_secrets_were_lost(context_fa
     assert result.event.reason_code == Msg.RENTED_POD_SECRETS_LOST.reason
     assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "tenant-123"}]
     assert result.updates["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_outside_tenant_cycle_names_the_pods_that_lost_their_secrets(context_factory, monkeypatch, caplog):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    ctx = _tenant_ctx(
+        context_factory,
+        SecretsLostSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA"]),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
+        gpu_processes=[{"container_name": "other-container", "pid": 1234}],
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+    )
+
+    with caplog.at_level("WARNING", logger=rented_machine.__name__):
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
+    assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": "pod-1", "container_name": "tenant-123"}]
+    assert any("lost its secrets" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
