@@ -48,7 +48,7 @@ from neurons.validators.src.services.task.pipeline import (
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 
 from core.config import settings
-from tests.helpers import build_services, build_state
+from tests.helpers import build_state
 
 # --- fixtures -------------------------------------------------------------------------------------
 
