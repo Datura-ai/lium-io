@@ -14,10 +14,10 @@ from ..pipeline import CheckResult, Context, ContextState
 def port_count_below_listing_floor(state: ContextState) -> int | None:
     """The published `available_port_count` when it is below MIN_PORT_COUNT, else None.
 
-    The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (the platform's
-    listing query), with no exemption for a rented node, so any run that publishes a lower count
-    leaves the node's free GPUs hidden from renters. The platform's rent path gates separately, on
-    MIN_PORT_COUNT free `verified_ports`.
+    The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
+    `daos/executor.py` get_available_executors), with no exemption for a rented node, so any run that
+    publishes a lower count leaves the node's free GPUs hidden from renters. The rent path gates
+    separately, on MIN_PORT_COUNT free `verified_ports` (`services/executor.py`).
     None before PortCountCheck has written the count.
     """
     available: Any = state.specs.get("available_port_count")
@@ -30,11 +30,8 @@ def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
 
-# The code the portal shows when it hides a node for too few verified ports; the listing reads
-# only `available_port_count`. It is the same string as this check's own failure reason, but
-# `listing_check` is the port check's verdict; the portal shows it only when no earlier status
-# (RENTED, a new-rentals pause) applies, so a partly rented node below the floor shows it while
-# its run passes.
+# The port check's verdict as the portal names it; the portal shows it only when no earlier
+# status (RENTED, a new-rentals pause) applies.
 LISTING_PORT_CHECK_CODE = "INSUFFICIENT_PORTS"
 
 
@@ -56,20 +53,17 @@ def port_floor_what(state: ContextState, available_port_count: int) -> dict[str,
 
     It is None when the node declares mappings. Mappings that are present but hold no pair
     (`"[]"`, `"{}"`) leave the validator nothing to probe, so the range is named while none of it
-    was probed; `no_ports_probed` says so.
+    was probed (`probed_port_count` 0).
     """
-    port_mappings_declared = declares_port_mappings(state.specs.get("port_mappings"))
     return {
         "available_port_count": available_port_count,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
         "listing_check": LISTING_PORT_CHECK_CODE,
         "port_range": None
-        if port_mappings_declared
+        if declares_port_mappings(state.specs.get("port_mappings"))
         else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
-        "port_mappings_declared": port_mappings_declared,
         "probed_port_count": state.probed_port_count,
-        "no_ports_probed": not state.probed_port_count,
         "declared_port_count": state.declared_port_count,
     }
 

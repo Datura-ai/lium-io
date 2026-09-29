@@ -221,7 +221,10 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     assert count_result.passed is False
     assert count_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
     what = count_result.event.what_we_saw
-    assert (what["probed_port_count"], what["declared_port_count"]) == (BATCH_PORT_VERIFICATION_SIZE, 25536)
+    assert (what["probed_port_count"], what["declared_port_count"]) == (
+        BATCH_PORT_VERIFICATION_SIZE,
+        25536,
+    )
     assert (what["listing_check"], what["port_range"]) == ("INSUFFICIENT_PORTS", DECLARED_RANGE)
 
 
@@ -247,8 +250,9 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
     assert count_result.passed is True
     assert count_result.event.severity == "warning"
     assert count_result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
-    assert count_result.event.what_we_saw["listing_hidden"] is True
-    assert count_result.event.what_we_saw["exempt_because_rented"] is True
+    what = count_result.event.what_we_saw
+    assert what["listing_hidden"] is True and what["exempt_because_rented"] is True
+    assert what["port_range"] == DECLARED_RANGE
     assert "Hidden from renters: only 2 verified ports, need 3" in count_result.event.impact
     # the pod is gone, the run goes on as unrented and completes
     assert tenant_result.passed is True
@@ -262,9 +266,7 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
         "listing_hidden": True,
         "listing_check": "INSUFFICIENT_PORTS",
         "port_range": "40000-65535",
-        "port_mappings_declared": False,
         "probed_port_count": BATCH_PORT_VERIFICATION_SIZE,
-        "no_ports_probed": False,
         "declared_port_count": 25536,
     }
 
@@ -589,25 +591,22 @@ UNPARSED = ([], "[]", "{}", "not json", "[[40000]]")
 
 
 @pytest.mark.parametrize(
-    ("port_range", "port_mappings", "probed", "named_range", "mappings_declared"),
+    ("port_range", "port_mappings", "named_range"),
     [
-        (None, MAPPINGS, 2, None, True),
-        (DECLARED_RANGE, MAPPINGS, 2, None, True),  # mappings are what the node forwards
-        ("", None, None, "20000-65535", False),
+        (None, MAPPINGS, None),
+        (DECLARED_RANGE, MAPPINGS, None),  # mappings are what the node forwards
+        ("", None, "20000-65535"),
         # same parse as the platform check: no [internal, external] pair means no mappings
-        *[(DECLARED_RANGE, m, 0, DECLARED_RANGE, False) for m in UNPARSED],
+        *[(DECLARED_RANGE, m, DECLARED_RANGE) for m in UNPARSED],
     ],
 )
-def test_port_floor_what_names_the_range_or_the_mappings(
-    port_range, port_mappings, probed, named_range, mappings_declared
-):
+def test_port_floor_what_names_the_range_or_the_mappings(port_range, port_mappings, named_range):
     specs = {"port_range": port_range, "port_mappings": port_mappings}
-    state = SimpleNamespace(specs=specs, probed_port_count=probed, declared_port_count=2)
+    state = SimpleNamespace(specs=specs, probed_port_count=0, declared_port_count=2)
 
     what = port_floor_what(state, 1)
 
-    assert (what["port_range"], what["port_mappings_declared"]) == (named_range, mappings_declared)
-    assert what["no_ports_probed"] is (not probed)
+    assert what["port_range"] == named_range
     assert "port_mappings" not in what
 
 
@@ -630,6 +629,5 @@ async def test_a_range_next_to_empty_mappings_is_named_while_the_event_says_no_p
     assert batch.calls == []  # the selector reads the empty mappings, not the range
     assert count_result.passed is False
     what = count_result.event.what_we_saw
-    assert what["port_range"] == DECLARED_RANGE and what["port_mappings_declared"] is False
+    assert what["port_range"] == DECLARED_RANGE
     assert (what["probed_port_count"], what["declared_port_count"]) == (0, 0)
-    assert what["no_ports_probed"] is True
