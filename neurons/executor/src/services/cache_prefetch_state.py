@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aiohttp.client_exceptions import NonHttpUrlClientError
 from yarl import URL
 
 from core.logger import get_logger
@@ -102,6 +103,9 @@ _SECRET_WORDS = frozenset(
         "cookie",
         "credential",
         "credentials",
+        "csrf",
+        "hmac",
+        "jwt",
         "key",
         "pass",
         "passphrase",
@@ -110,6 +114,7 @@ _SECRET_WORDS = frozenset(
         "pw",
         "pwd",
         "secret",
+        "session",
         "sessionid",
         "sig",
         "signature",
@@ -142,10 +147,31 @@ def _is_secret_name(name: str) -> bool:
 
 # URLs, first. A URL starts at `scheme://` and runs to the next whitespace, quote or `>`, whatever
 # its host, port or length. Everything between `://` and the span's last `@` is userinfo, except an
-# `@` that starts an image digest (`repo@sha256:`). The query and fragment are replaced whole.
+# `@` that starts an image digest (`repo@sha256:`). A password holding a whitespace, quote or `>`
+# ends that span early, so a later `@` followed by a host on the same line, before the next URL,
+# ends the userinfo too. The query and fragment are replaced whole, and so is what follows a `?` or
+# `#` written as `%3F` or `%23`; a path segment after a secret-named one (`/token/<v>`) is masked.
 _URL_START = re.compile(r"(?i)\b[a-z][a-z0-9+.-]{0,31}://")
 _URL_END = re.compile(r"[\s'\">]")
+_LINE_END = re.compile(r"[\r\n]")
 _DIGEST_AT = re.compile(r"@sha(?:256|384|512):")
+# An `@` followed by a host: a bracketed IPv6 address or dot-separated labels, then what can end a
+# host (a port, a path, a query, the end of the URL).
+_HOST_AT = re.compile(
+    r"@(?:\[[0-9A-Za-z:.%]+\]|[^\W_][\w-]*(?:\.[\w-]+)*)(?=[:/?#\s'\">),;\]]|$)"
+)
+_QUERY_START = re.compile(r"[?#]|%3[Ff]|%23")
+_SEGMENT_NAME = re.compile(r"[A-Za-z_][\w.-]{0,127}")
+
+
+def _mask_path(path: str) -> str:
+    """``host/path`` with every segment that follows a secret-named segment replaced by ``***``."""
+    segments = path.split("/")
+    for index in range(2, len(segments)):
+        name = segments[index - 1]
+        if segments[index] and _SEGMENT_NAME.fullmatch(name) and _is_secret_name(name):
+            segments[index] = "***"
+    return "/".join(segments)
 
 
 def _mask_url_span(span: str) -> str:
@@ -160,27 +186,90 @@ def _mask_url_span(span: str) -> str:
         if "?" in span[:at] or "#" in span[:at]:
             return "***"
         head, rest = "***@", span[at + 1 :]
-    query = min((i for i in (rest.find("?"), rest.find("#")) if i != -1), default=-1)
-    if query != -1:
-        rest = rest[:query] + "?***"
-    return head + rest
+    query = _QUERY_START.search(rest)
+    if query:
+        marker = "?" if query[0] in "?#" else query[0]
+        return f"{head}{_mask_path(rest[: query.start()])}{marker}***"
+    return head + _mask_path(rest)
 
 
 def _mask_url(url: str) -> str:
-    start = url.find("://") + 3
+    start = url.find("://") + 3 if "://" in url else 0
     return url[:start] + _mask_url_span(url[start:])
+
+
+def _userinfo_end(text: str, start: int, end: int, bound: int) -> int:
+    """Where the userinfo of the URL at ``text[start:end]`` ends (its `@`), or -1.
+
+    A host-shaped `@` in ``text[end:bound]`` wins over one inside the span.
+    """
+    at = bound
+    while (at := text.rfind("@", end, at)) != -1:
+        if not _DIGEST_AT.match(text, at) and _HOST_AT.match(text, at):
+            return at
+    at = end
+    while (at := text.rfind("@", start, at)) != -1:
+        if not _DIGEST_AT.match(text, at):
+            return at
+    return -1
 
 
 def _redact_urls(text: str) -> str:
     parts: list[str] = []
     pos = 0
+    line_end = -1
     while match := _URL_START.search(text, pos):
-        end = _URL_END.search(text, match.end())
-        stop = end.start() if end else len(text)
-        parts += (text[pos : match.end()], _mask_url_span(text[match.end() : stop]))
-        pos = stop
+        start = match.end()
+        stop = _URL_END.search(text, start)
+        end = stop.start() if stop else len(text)
+        if line_end < end:
+            line = _LINE_END.search(text, end)
+            line_end = line.start() if line else len(text)
+        following = _URL_START.search(text, end, line_end)
+        bound = following.start() if following else line_end
+        at = _userinfo_end(text, start, end, bound)
+        if at > end:
+            stop = _URL_END.search(text, at, bound)
+            end = stop.start() if stop else bound
+        parts += (text[pos:start], _mask_url_span(text[start:end]))
+        pos = end
     parts.append(text[pos:])
     return "".join(parts)
+
+
+# Then userinfo without a scheme: a whitespace-free `user:pass@host` (a URL written without
+# `https://`, as aiohttp quotes it), and `user@host` followed by a port or a path, masked up to its
+# last `@`. An e-mail address (`user@example.com`) stays.
+_RUN = re.compile(r"\S+")
+_RUN_LEAD = re.compile(r"(?:[A-Za-z_][\w.-]*=)?['\"(<\[/]*")
+
+
+def _mask_bare_userinfo(match: re.Match) -> str:
+    run = match[0]
+    if "@" not in run or "://" in run:
+        return run
+    at = len(run)
+    while (at := run.rfind("@", 0, at)) != -1:
+        if not _DIGEST_AT.match(run, at) and (host := _HOST_AT.match(run, at)):
+            break
+    else:
+        return run
+    lead = _RUN_LEAD.match(run).end()
+    if lead >= at:
+        return run
+    urlish = (
+        ":" in run[lead:at]
+        or run.startswith((":", "/"), host.end())
+        or run[:lead].endswith("//")
+    )
+    if not urlish:
+        return run
+    tail = len(run[host.end() :].rstrip("'\")>],;")) + host.end()
+    return run[:lead] + _mask_url_span(run[lead:tail]) + run[tail:]
+
+
+def _redact_bare_userinfo(text: str) -> str:
+    return _RUN.sub(_mask_bare_userinfo, text)
 
 
 # Then secret-named values: `name=value`, `name: value`, `--name=value`, `'name': 'value'` and
@@ -188,7 +277,18 @@ def _redact_urls(text: str) -> str:
 # name and separator are matched here; the value is read only after the name is known to be
 # secret, so a pair such as `url='...'` never hides what follows it.
 _NAMED_VALUE = re.compile(
-    r"(?<![\w.])(?P<quote>['\"]?)(?P<name>[A-Za-z_][\w.-]{0,63})(?P=quote)\s{0,8}[:=]\s{0,8}"
+    r"(?<![\w.])(?P<quote>['\"]?)(?P<name>[A-Za-z_][\w.-]{0,127})(?P=quote)"
+    r"(?P<index>(?:\[[^\]\s]{0,64}\])*)\]?\s*(?P<sep>[:=])\s*"
+)
+# A class name before its message (`KeyError: 'x'`, `TokenRefreshError: ...`) names no value.
+_CLASS_NAME_WORDS = frozenset({"error", "exception", "warning"})
+# After a bare `key:` or `token:`, a quoted identifier (`invalid key: 'gpu_model'`) or an error
+# phrase (`Token: unexpected EOF`) is prose, not a secret.
+_PROSE_NAMES = frozenset({"key", "token"})
+_QUOTED_IDENTIFIER = re.compile(r"(['\"])[A-Za-z_]{1,32}[0-9]{0,3}\1")
+_ERROR_PHRASE = re.compile(
+    r"(?i)(?:unexpected|invalid|missing|expired|required|empty|malformed|unknown|not|none|null"
+    r"|undefined|failed)\b"
 )
 _AUTH_SCHEME = re.compile(r"(?i)(?:bearer|basic|token|digest)\s{1,8}")
 _PLAIN_VALUE = re.compile(r"[^\s'\",;&]+")
@@ -225,13 +325,26 @@ def _mask_named_value(text: str, name: str, start: int) -> tuple[str, int]:
     return f"{text[start:lead]}***", value.end()
 
 
+def _names_a_secret(text: str, match: re.Match) -> bool:
+    name = match["name"]
+    words = _name_words(name)
+    if words and words[-1] in _CLASS_NAME_WORDS:
+        name = ""
+    if not (_is_secret_name(name) or _is_secret_name(match["index"])):
+        return False
+    if match["sep"] == ":" and not match["quote"] and name.lower() in _PROSE_NAMES:
+        after = match.end()
+        return not (_QUOTED_IDENTIFIER.match(text, after) or _ERROR_PHRASE.match(text, after))
+    return True
+
+
 def _redact_named_values(text: str) -> str:
     parts: list[str] = []
     pos = 0
     while match := _NAMED_VALUE.search(text, pos):
         parts.append(text[pos : match.end()])
         pos = match.end()
-        if _is_secret_name(match["name"]):
+        if _names_a_secret(text, match):
             masked, pos = _mask_named_value(text, match["name"], pos)
             parts.append(masked)
     parts.append(text[pos:])
@@ -239,20 +352,21 @@ def _redact_named_values(text: str) -> str:
 
 
 # Last, credentials without a name: a bearer/basic/token value (only when it is token-shaped, so
-# prose such as "basic checks failed" stays) and known token formats.
-_TOKEN_RULES = (
-    (
-        re.compile(r"(?i)\b(bearer|basic|token)(\s{1,8})[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}"),
-        r"\1\2***",
-    ),
-    (
-        re.compile(
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-            r"|eyJ[A-Za-z0-9_-]{1,}\.[A-Za-z0-9_-]{1,}\.[A-Za-z0-9_-]{1,})"
-        ),
-        "***",
-    ),
+# prose such as "basic checks failed" stays: 16 or more token characters, or 8 or more with a
+# letter and a digit) and known token formats.
+_AUTH_VALUE = re.compile(r"(?i)\b(bearer|basic|token)(\s{1,8})([A-Za-z0-9][A-Za-z0-9._~+/=-]*)")
+_TOKEN_FORMATS = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|eyJ[A-Za-z0-9_-]{1,}\.[A-Za-z0-9_-]{1,}\.[A-Za-z0-9_-]{1,})"
 )
+
+
+def _mask_auth_value(match: re.Match) -> str:
+    value = match[3]
+    shaped = len(value) >= 16 or (
+        len(value) >= 8 and any(c.isdigit() for c in value) and any(c.isalpha() for c in value)
+    )
+    return f"{match[1]}{match[2]}***" if shaped else match[0]
 
 
 def _drop_split_tail(text: str, urls: tuple[str, ...]) -> str:
@@ -261,10 +375,14 @@ def _drop_split_tail(text: str, urls: tuple[str, ...]) -> str:
     while end and not text[end - 1].isspace():
         end -= 1
     text = text[:end]
-    for url in urls:
-        start = text.rfind(url[: url.find("://") + 3])
-        if start != -1 and len(text) - start < len(url) and url.startswith(text[start:]):
-            text = text[:start]
+    for url in filter(None, urls):
+        head = url[: url.find("://") + 3] if "://" in url else url[:1]
+        low = max(0, len(text) - len(url) + 1)
+        start = len(text)
+        while (start := text.rfind(head, low, start + len(head) - 1)) != -1:
+            if url.startswith(text[start:]):
+                text = text[:start]
+                break
     return text
 
 
@@ -279,9 +397,8 @@ def redact(text: str, urls: tuple[str, ...] = ()) -> str:
         text = _drop_split_tail(text[:MAX_REDACTED_CHARS], urls)
     for url in urls:
         text = text.replace(url, _mask_url(url))
-    text = _redact_named_values(_redact_urls(text))
-    for pattern, replacement in _TOKEN_RULES:
-        text = pattern.sub(replacement, text)
+    text = _redact_named_values(_redact_bare_userinfo(_redact_urls(text)))
+    text = _TOKEN_FORMATS.sub("***", _AUTH_VALUE.sub(_mask_auth_value, text))
     # A `***` can be longer than the value it replaces; cutting the redacted text only shortens it.
     if len(text) > MAX_REDACTED_CHARS:
         text, cut = text[:MAX_REDACTED_CHARS], True
@@ -289,22 +406,34 @@ def redact(text: str, urls: tuple[str, ...] = ()) -> str:
 
 
 def _urls_of(error: object) -> tuple[str, ...]:
-    """URLs an aiohttp error carries (``InvalidURL.url``, ``request_info``), longest first."""
+    """URLs an aiohttp error carries, whatever their scheme, longest first.
+
+    ``InvalidURL.url``, ``request_info.url`` / ``real_url``, and the first argument of
+    ``NonHttpUrlClientError`` / ``NonHttpUrlRedirectClientError``, which carry their URL (a ``URL``
+    or the raw ``Location``) there and have no ``.url``.
+    """
     urls = set()
     try:
         info = getattr(error, "request_info", None)
-        for value in (
+        values = [
             getattr(error, "url", None),
             getattr(info, "url", None),
             getattr(info, "real_url", None),
-        ):
+        ]
+        if isinstance(error, NonHttpUrlClientError) and error.args:
+            values.append(error.args[0])
+        for value in values:
             if value is not None:
                 url = str.__str__(str(value))
-                if "://" in url:
+                if url:
                     urls.add(url)
     except Exception:
         pass
     return tuple(sorted(urls, key=len, reverse=True))
+
+
+class _Described(str):
+    """What ``describe_error`` returns: ``_clip`` publishes it as is, never describing it twice."""
 
 
 def describe_error(error: object) -> str:
@@ -321,14 +450,14 @@ def describe_error(error: object) -> str:
         # `str.__str__` makes an exact str of a str subclass, whose methods could raise.
         text = str.__str__(str(error))
     except Exception:
-        return name
+        return _Described(name)
     try:
         message = redact(text, _urls_of(error))
         if isinstance(error, BaseException):
-            return f"{name}: {message}" if message else name
-        return message
+            return _Described(f"{name}: {message}" if message else name)
+        return _Described(message)
     except Exception:
-        return name
+        return _Described(name)
 
 
 def _public_url(url: str) -> str:
@@ -355,7 +484,12 @@ def _clip(value: object | None, limit: int = MAX_ERROR_CHARS) -> str | None:
     """Describe and bound one error message. ``None`` stays ``None``."""
     if value is None:
         return None
-    text = describe_error(value)
+    text = str.__str__(value) if type(value) is _Described else describe_error(value)
+    return _cut(text, limit)
+
+
+def _cut(text: str, limit: int) -> str:
+    text = str.__str__(text)
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -423,11 +557,11 @@ def _shorten_errors(doc: dict) -> None:
     short = MAX_ERROR_CHARS // 5
     for key, value in doc.items():
         if key.endswith("_error") and isinstance(value, str):
-            doc[key] = _clip(value, short)
+            doc[key] = _cut(value, short)
     for record in (doc.get("images") or {}).values():
         for key, value in record.items():
             if (key.endswith("_error") or key == "last_error") and isinstance(value, str):
-                record[key] = _clip(value, short)
+                record[key] = _cut(value, short)
 
 
 def _drop_counts(doc: dict) -> None:

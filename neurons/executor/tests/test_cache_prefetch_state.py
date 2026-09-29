@@ -37,6 +37,8 @@ TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"
 IMAGE_REF = f"{REPO}:{TAG}"
 FRESH_DIGEST = "sha256:70bd5fa697877594b753a146e207ca4de66d9b875d606ae09e6ee7bac8f4f423"
 STALE_DIGEST = "sha256:2d19c94ce8a37c6fa364f8a6211d8b6dc1a44ece574c4c22ab5579925ce7a4c8"
+# A JWT's shape: a stub header, payload and signature.
+STUB_JWT = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiJ4In0" + ".c2lnbmF0dXJl"
 
 
 def _make_client(local_digests: list[str] | None = None, image_absent: bool = False) -> MagicMock:
@@ -581,6 +583,96 @@ def test_error_text_is_clipped():
         ("GET url=/x?api_token=s3cret", "GET url=/x?api_token=***"),
         ("basic dXNlcjpzM2NyZXQtcGFzc3dvcmQ=", "basic ***"),
         ("Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl", "Bearer ***"),
+        # A JWT with nothing naming it, and a capitalised free-text Bearer with a non-JWT token.
+        (f"rejected {STUB_JWT} upstream", "rejected *** upstream"),
+        ("sent Bearer ABCDEFGHIJ0123456789 upstream", "sent Bearer *** upstream"),
+        # A short value only when it is token-shaped: 8 or more characters, a letter and a digit.
+        ("sent Token abc12345 upstream", "sent Token *** upstream"),
+        # A fragment holding an `@`: what follows it is not a host, so nothing after `://` stays.
+        ("GET https://backend.example/x#a@b.example/s3cret", "GET https://***"),
+        # A password holding a whitespace, quote or `>` in free text: masked up to the `@` before
+        # the host, not only up to the character that ends the span.
+        (
+            "Cannot connect to https://provider:s3c ret@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            "Cannot connect to https://provider:s3c'ret@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            'Cannot connect to https://provider:s3c"ret@backend.example/api',
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            "Cannot connect to https://provider:s3c>ret@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            "Cannot connect to https://provider:s3c\tret@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            "Cannot connect to https://provider:s3c\xa0ret@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            "url='https://provider:s3c r\"e't@backend.example:8443/api' refused",
+            "url='https://***@backend.example:8443/api' refused",
+        ),
+        # A URL written without its scheme, as aiohttp's NonHttpUrlClientError quotes it.
+        (
+            "NonHttpUrlClientError: provider:s3cret@backend.example:8443/api",
+            "NonHttpUrlClientError: ***@backend.example:8443/api",
+        ),
+        (
+            "url='provider:s3cret@backend.example:bad/api?token=s3cret'",
+            "url='***@backend.example:bad/api?***'",
+        ),
+        ("redirected to s3cret@backend.example/x", "redirected to ***@backend.example/x"),
+        ("redirected to //s3cret@backend.example", "redirected to //***@backend.example"),
+        ("provider:s3c'r>et@[2001:db8::1]:8443/x", "***@[2001:db8::1]:8443/x"),
+        # A secret held in the path: after a secret-named segment, or behind an encoded `?` or `#`.
+        (
+            "GET https://backend.example/api/token/s3cret/templates",
+            "GET https://backend.example/api/token/***/templates",
+        ),
+        ("GET https://backend.example/api-key/s3cret", "GET https://backend.example/api-key/***"),
+        (
+            "GET https://backend.example/api%3Ftoken%3Ds3cret",
+            "GET https://backend.example/api%3F***",
+        ),
+        ("GET https://backend.example/api%23token=s3cret", "GET https://backend.example/api%23***"),
+        (
+            "GET https://backend.example/api;token=s3cret",
+            "GET https://backend.example/api;token=***",
+        ),
+        # More names: session, csrf, jwt, hmac, an index or a bracket before the separator, a name
+        # up to 128 characters, any number of spaces around the separator.
+        ("session=s3cret csrf=s3cret", "session=*** csrf=***"),
+        ("jwt: s3cret, hmac: s3cret", "jwt: ***, hmac: ***"),
+        ("params[token]=s3cret&x[api_key]=s3cret", "params[token]=***&x[api_key]=***"),
+        ("token[0]=s3cret", "token[0]=***"),
+        ("[token]=s3cret", "[token]=***"),
+        # The last host decides: a `?` before it leaves no telling where the userinfo ends.
+        (
+            "redirected to s3cret@a.example?x@backend.example:8443/api",
+            "redirected to ***",
+        ),
+        # The prose reading of `key:` / `token:` is for an unquoted name and a `:` only.
+        ("{'token': 'abcdefgh'}", "{'token': '***'}"),
+        ("token='abcdefgh'", "token='***'"),
+        ("a" * 120 + "_token=s3cret", "a" * 120 + "_token=***"),
+        (
+            "password" + " " * 12 + "=" + " " * 12 + "s3cret",
+            "password" + " " * 12 + "=" + " " * 12 + "***",
+        ),
+        # Over-masking this rule accepts: a later `@` before a host on the same line ends the
+        # userinfo, even when the URL had none.
+        (
+            "GET https://backend.example/x refused for admin@example.com",
+            "GET https://***@example.com",
+        ),
     ],
 )
 def test_redact_removes_credentials_and_keeps_the_rest(text, expected):
@@ -605,6 +697,16 @@ def test_redact_is_linear_on_a_long_error():
         " eyJa" * 50_000,
         "eyJ" + "a." * 100_000,
         "'password': '" * 15_000 + "x" * 10_000,
+        "https://a " + "b@ " * 60_000,
+        "https://a " + "@a" * 100_000,
+        "https://a'" + "a." * 100_000 + "@",
+        "a:b@" * 50_000,
+        "a:" + "a." * 100_000 + "@a",
+        "/token" * 30_000,
+        "https://a/" + "token/" * 30_000,
+        "token" + " " * 200_000 + "=",
+        "a[" * 100_000,
+        "%3F" * 60_000,
     ):
         started = time.perf_counter()
         redacted = redact(text)
@@ -653,7 +755,7 @@ def test_nothing_past_the_cut_or_split_by_it_is_published(text):
         "403 Forbidden",
         "404 Not Found",
         "net/http: TLS handshake timeout",
-        "read tcp 10.0.0.2:51234->203.0.113.7:443: read: connection reset by peer",
+        "read tcp 192.0.2.2:51234->203.0.113.7:443: read: connection reset by peer",
         "dial tcp: lookup registry-1.docker.io: no such host",
         'Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for '
         "connection (Client.Timeout exceeded while awaiting headers)",
@@ -670,6 +772,23 @@ def test_nothing_past_the_cut_or_split_by_it_is_published(text):
         "{'monkey': 'banana', 'author': 'provider'}",
         "404 Client Error for http+docker://localhost/v1.44/images/"
         f"{REPO}@{FRESH_DIGEST}/json: Not Found",
+        # `key` / `token` before a quoted identifier or an error phrase, and a class name before
+        # its message, name no secret.
+        "invalid key: 'gpu_model'",
+        'missing key: "docker_image_tag"',
+        "Token: unexpected EOF",
+        "token: invalid character",
+        "RuntimeError: KeyError: 'docker_image'",
+        "TokenRefreshError: refresh failed",
+        "sent Token abcdefgh upstream",
+        # `>` ends a URL: what follows it is not the URL's query.
+        "moved to <https://backend.example/x>?",
+        # An `@` not followed by a host does not end a URL's userinfo, nor does the host name.
+        "GET https://backend.example/x done @ 12:00",
+        'Head "https://auth.docker.io/token": unauthorized',
+        "contact provider@example.com",
+        f"image {REPO}:{TAG}@{FRESH_DIGEST} pulled",
+        "Session is closed",
     ],
 )
 def test_redact_leaves_errors_without_credentials_unchanged(text):
@@ -735,6 +854,98 @@ def test_an_error_carrying_its_url_is_masked_whatever_the_password_holds():
         assert described == "InvalidUrlClientError: https://***@backend.example/executors/x"
 
 
+def test_an_error_carrying_a_url_without_a_scheme_is_masked():
+    # NonHttpUrlClientError and NonHttpUrlRedirectClientError carry their URL in `args`, no `.url`.
+    from aiohttp.client_exceptions import NonHttpUrlClientError, NonHttpUrlRedirectClientError
+    from yarl import URL
+
+    for error_class in (NonHttpUrlClientError, NonHttpUrlRedirectClientError):
+        for url, masked in (
+            ("provider:s3cret@backend.example:8443/api", "***@backend.example:8443/api"),
+            ("provider:s3c r'et@backend.example/api", "***@backend.example/api"),
+        ):
+            for carried in (URL(url, encoded=True), url):
+                described = describe_error(error_class(carried))
+
+                assert described == f"{error_class.__name__}: {masked}"
+
+
+def test_an_error_carrying_its_request_url_is_masked_as_one_url():
+    # Only the carried URL tells where this one ends: its password holds a space, then `://`.
+    from aiohttp import RequestInfo
+    from aiohttp.client_exceptions import ClientResponseError
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from yarl import URL
+
+    url = URL.build(
+        scheme="https",
+        user="provider",
+        password="s3c r://et",
+        host="backend.example",
+        path="/x",
+        encoded=True,
+    )
+    info = RequestInfo(url, "GET", CIMultiDictProxy(CIMultiDict()), url)
+
+    described = describe_error(ClientResponseError(info, (), status=401, message="Unauthorized"))
+
+    assert described == (
+        "ClientResponseError: 401, message='Unauthorized', url='https://***@backend.example/x'"
+    )
+
+
+# Described a second time, "AuthFailure: registry said no" reads as a secret named AuthFailure.
+AuthFailure = type("AuthFailure", (Exception,), {})
+
+
+@pytest.mark.parametrize("error", [KeyError("Descriptor"), AuthFailure("registry said no")])
+def test_a_per_image_error_is_described_once(monkeypatch, error):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    state = CachePrefetchState(path=None)
+    client = _make_client(local_digests=[STALE_DIGEST])
+    client.images.get_registry_data.side_effect = error
+
+    _run(client, _template(None), state)
+
+    described = describe_error(error)
+    assert described in ("KeyError: 'Descriptor'", "AuthFailure: registry said no")
+    assert _image(state)["last_remote_error"] == described
+    (message,), _ = logger.warning.call_args
+    assert message.endswith(described)
+
+
+def test_a_shed_document_shortens_its_errors_without_describing_them_again():
+    error = AuthFailure("registry said no " + "x" * 600)
+    state = CachePrefetchState(path=None)
+    state.note_docker(available=False, error=error)
+    state.note_gpu("unknown", "unknown", error=error)
+    state.note_backend(error=error)
+    state.note_loop_error(error)
+    state.record_loop_outcome(Outcome.LOOP_ERROR, error=error)
+    for field in ("last_remote_error", "last_local_error", "last_pull_error", "last_error"):
+        setattr(state._record(IMAGE_REF), field, describe_error(error))
+
+    doc = json.loads(state.render())
+
+    assert doc["truncated"] is True
+    assert len(doc["last_loop_error"]) <= MAX_ERROR_CHARS // 5 + 1
+    assert doc["last_loop_error"].startswith("AuthFailure: registry said no xxx")
+    record = doc["images"][IMAGE_REF]
+    assert record["last_remote_error"].startswith("AuthFailure: registry said no xxx")
+
+
+def test_a_carried_url_without_a_scheme_the_cut_splits_is_dropped_whole():
+    from aiohttp.client_exceptions import NonHttpUrlRedirectClientError
+
+    url = "provider:" + "p" * 1900 + " " + "q" * 200 + "s3cret@backend.example/x"
+
+    described = describe_error(NonHttpUrlRedirectClientError(url))
+
+    assert "ppp" not in described and "qqq" not in described and "s3cret" not in described
+    assert described == "NonHttpUrlRedirectClientError: …"
+
+
 def test_a_carried_url_the_cut_splits_is_dropped_whole():
     from aiohttp.client_exceptions import InvalidUrlClientError
 
@@ -772,6 +983,10 @@ def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
         ("https://provider:p%40ss@backend.example/api", "https://backend.example/api"),
         ("https://bäckend.example/api", "https://xn--bckend-bua.example/api"),
         ("http://[::1]:8443/api", "http://[::1]:8443/api"),
+        # A secret held in the path is masked in what is published.
+        ("https://backend.example/api;token=s3cret", "https://backend.example/api;token=***"),
+        ("https://backend.example/api/token/s3cret", "https://backend.example/api/token/***"),
+        ("https://backend.example/api%3Ftoken%3Ds3cret", "https://backend.example/api%3F***"),
     ],
 )
 def test_the_backend_url_is_rebuilt_from_its_parse(backend_url, published):

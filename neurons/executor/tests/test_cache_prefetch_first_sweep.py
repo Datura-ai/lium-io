@@ -283,6 +283,86 @@ def test_a_backend_url_aiohttp_rejects_never_publishes_its_password(
         assert "ckend.example" in text and "/api/executors/default-docker-image" in text
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # COMPUTE_REST_API_URL written without `https://`: aiohttp raises NonHttpUrlClientError.
+        "provider:s3cret@backend.example:8443/api",
+        "provider:s3cret@backend.example:bad/api",
+        "provider:s3c'r>et@backend.example/api",
+    ],
+)
+def test_a_backend_url_without_a_scheme_never_publishes_its_password(
+    monkeypatch, tmp_path, base_url
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url=base_url,
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert "NonHttpUrlClientError: ***@backend.example" in message
+    assert doc["backend_url"] == cache_prefetch_state.UNPARSEABLE_URL
+    for text in (message, doc["last_loop_error"], doc["last_error"]):
+        assert "s3c" not in text and "provider" not in text
+        assert "/api/executors/default-docker-image" in text
+    assert "s3c" not in json.dumps(doc)
+
+
+class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+    location = ""
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", self.location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["provider:s3cret@backend.example/x", "provider:s3c r'et@backend.example:8443/x?token=s3cret"],
+)
+def test_a_redirect_to_a_location_without_a_scheme_never_publishes_its_password(
+    monkeypatch, tmp_path, location
+):
+    # aiohttp raises NonHttpUrlRedirectClientError, whose text is the Location it refused.
+    handler = type("Handler", (_RedirectHandler,), {"location": location})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    try:
+        _, doc = _drive_loop(
+            monkeypatch,
+            [None],
+            sleeps_before_stop=1,
+            tmp_path=tmp_path,
+            base_url=f"http://127.0.0.1:{server.server_address[1]}",
+            fetch=cache_template_service._fetch_templates,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    (message,), _ = logger.error.call_args
+    assert "NonHttpUrlRedirectClientError: ***@backend.example" in message
+    for text in (message, doc["last_loop_error"], doc["last_error"]):
+        assert "s3c" not in text and "provider" not in text
+    assert "s3c" not in json.dumps(doc)
+
+
 class _HtmlHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"<html>maintenance</html>"
