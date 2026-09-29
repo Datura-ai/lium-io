@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from eth_abi import encode
 from eth_account import Account
 from web3 import AsyncWeb3
+from web3.exceptions import TimeExhausted
 from web3.providers.async_base import AsyncBaseProvider
 
 from core import collateral as collateral_module
@@ -236,6 +237,22 @@ async def test_send_without_a_key_sends_nothing():
     with pytest.raises(CollateralTransactionError, match="private key is required"):
         await client_with(provider, miner_key=None).finalize_reclaim(5)
     assert provider.sent == []
+
+
+async def test_a_receipt_timeout_names_the_sent_transaction(monkeypatch, caplog):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    client = client_with(provider)
+
+    async def no_receipt(*_args, **_kwargs):
+        raise TimeExhausted("no receipt")
+
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", no_receipt)
+    with caplog.at_level(logging.INFO, logger="core.collateral"):
+        with pytest.raises(CollateralTransactionError, match=f"Transaction {TX_HASH} was sent"):
+            await client.finalize_reclaim(5)
+
+    assert len(provider.sent) == 1
+    assert f"Sent transaction {TX_HASH}" in caplog.text
 
 
 async def test_gas_price_quote_above_the_ceiling_signs_and_sends_nothing():
@@ -502,9 +519,12 @@ cli()
     [
         ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY],
         ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY],
+        # --contract skips detection: the send itself fails, and that must exit 1 too
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY, "--contract", "1.0.2"],
+        ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY, "--contract", "1.0.2"],
         ["get-balance-of-eth-address", "--private-key", MINER_KEY],
     ],
-    ids=lambda args: args[0],
+    ids=lambda args: "-".join(a for a in args if a in {"reclaim-collateral", "finalize-reclaim-request", "get-balance-of-eth-address", "--contract"}),
 )
 def test_collateral_command_process_output_leaves_out_a_keyed_rpc_url(rejecting_rpc, args):
     """The real CLI in its own process: nothing it writes to stdout or stderr, a traceback

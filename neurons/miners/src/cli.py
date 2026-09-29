@@ -291,6 +291,7 @@ def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: s
         logger.info("✅ Reclaimed collateral successfully.")
     else:
         logger.error("❌ Failed to reclaim collateral.")
+        sys.exit(1)
 
 
 @cli.command()
@@ -405,6 +406,7 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
     success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
     if not success:
         logger.error("❌ Failed to finalize reclaim request.")
+        sys.exit(1)
         
 @cli.command()
 def migrate_validator_hotkey():

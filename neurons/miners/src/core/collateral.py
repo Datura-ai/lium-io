@@ -16,7 +16,7 @@ from uuid import UUID
 
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, TimeExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -185,9 +185,17 @@ class CollateralClient:
         signed = self.miner_account.sign_transaction(transaction)
         raw_transaction = getattr(signed, "raw_transaction", None) or signed.rawTransaction
         tx_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
-        receipt = await self.w3.eth.wait_for_transaction_receipt(
-            tx_hash, timeout=300, poll_latency=2
-        )
+        logger.info("Sent transaction %s; waiting for its receipt", tx_hash.hex())
+        try:
+            receipt = await self.w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=300, poll_latency=2
+            )
+        except (TimeExhausted, TimeoutError) as error:
+            # The transaction may still be mined: sending again could reclaim or finalize twice.
+            raise CollateralTransactionError(
+                f"Transaction {tx_hash.hex()} was sent but had no receipt within 300 s; "
+                "check it on the explorer before sending it again"
+            ) from error
         if receipt["status"] == 0:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
             message = f"Transaction {tx_hash.hex()} reverted"
