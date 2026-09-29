@@ -85,8 +85,10 @@ class FakeDockerHost:
         durations: dict[str, float] | None = None,
         containers: set[str] | None = None,
         volumes: set[str] | None = None,
+        probe_output: str = "lium-vloopback-ok\n",
     ) -> None:
         self.plugin = plugin
+        self.probe_output = probe_output
         self.docker_root = docker_root
         self.sysbox = sysbox
         self.mountpoint = mountpoint
@@ -175,7 +177,7 @@ class FakeDockerHost:
             if "--runtime=sysbox-runc" in command and not self.sysbox:
                 returncode, stderr = 125, NO_SYSBOX_ERROR
             else:
-                stdout = "lium-vloopback-ok\n"
+                stdout = self.probe_output
         return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
     def steps(self) -> list[str]:
@@ -280,6 +282,25 @@ def test_the_ticket_0331_host_reports_the_mount_error_and_removes_the_test_objec
     assert payload["vc_reason_code"] == "VLOOPBACK_MOUNT_FAILED"
     assert payload["vc_detail"] == TICKET_0331_RUNC_ERROR[:300]
     assert host.steps()[-2:] == ["rm -f", "volume rm"]
+    assert host.volumes == set() and host.containers == set()
+
+
+@pytest.mark.parametrize(
+    "probe_output", ["", "lium-vloopback-ok-not\n", "lium-vloopback-ok\nsomething else\n"]
+)
+def test_a_container_that_exits_zero_without_the_probe_token_fails_the_mount_test(
+    tmp_path: Path, probe_output: str
+) -> None:
+    # Arrange: the run exits 0 but never reads back what it wrote into the volume
+    host = FakeDockerHost(probe_output=probe_output)
+
+    # Act
+    payload = _check(host, tmp_path)
+
+    # Assert
+    assert payload["vc_verdict"] == "fail"
+    assert payload["vc_reason_code"] == "VLOOPBACK_MOUNT_FAILED"
+    assert payload["vc_detail"] == probe_output.strip()
     assert host.volumes == set() and host.containers == set()
 
 
@@ -448,6 +469,21 @@ def test_stale_test_objects_are_swept_and_other_validators_current_ones_are_kept
     assert ["docker", "volume", "rm", "-f", earlier_boot] in host.calls
     assert host.containers == {running_now}
     assert host.volumes == {running_now, not_ours}
+
+
+def test_the_sweep_keeps_names_that_only_contain_the_test_pattern(tmp_path: Path) -> None:
+    # Arrange: docker's name filter matches a substring, so these are listed too
+    stale = f"lium_storage_check_{UPTIME - 4000}_311_a1b2c3"
+    lookalikes = {f"old_{stale}", f"{stale}_keep"}
+    host = FakeDockerHost(containers=set(lookalikes), volumes=set(lookalikes))
+
+    # Act
+    payload = _check(host, tmp_path)
+
+    # Assert
+    assert payload["vc_verdict"] == "pass"
+    assert host.containers == lookalikes
+    assert host.volumes == lookalikes
 
 
 def test_a_pass_is_reused_for_six_hours_on_the_same_boot_plugin_and_runtime(tmp_path: Path) -> None:
