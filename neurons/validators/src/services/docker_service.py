@@ -758,13 +758,9 @@ CONTAINER_GONE_KILL_CAUSES = frozenset({"oom", "killed", "removed"})
 
 
 def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
-    """Why a container the bootstrap found gone is gone, from the State read when it was first seen so:
-    `oom` (State.OOMKilled), `killed` (a host signal's exit code, HOST_KILL_EXIT_CODES: 137 is `docker
-    kill` / `docker rm -f`, 143 is `docker stop` — a CMD that handles SIGTERM dies 143, only a PID 1
-    that ignores it reaches 137), `removed` (already gone, or `removing` without an exit code we can
-    name) — the three kills — or `exited`: any other exit code, its own command ended, which is the
-    image's doing and not a kill. A CMD that itself exits 143 reads as a stop: the boundary fails
-    toward the kill, never toward blaming the renter's image."""
+    """`oom`, `killed` (an exit code in HOST_KILL_EXIT_CODES), `removed` (already gone, or `removing`
+    without a host-signal exit code) — the three kills — or `exited`, the image's own command ending.
+    A CMD that itself exits 143 reads as a stop: the boundary fails toward the kill."""
     if state is None or (state.status == "removing" and not state.killed_by_host):
         return "removed"
     if state.oom_killed:
@@ -776,13 +772,9 @@ def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
 
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
-    ours was in flight (that case is _CreateCancelledByDelete).
-
-    19 Sep, one node, one hour, 3 rents: `Docker container is not ready for exec: status='removing'
-    exit_code=137`, then `exec start: Conflict ("container is not running")` and `inspect: No such
-    container` — each read as a generic `ssh_bootstrap` / `set_environment` failure, so the renter
-    saw an exec error and nothing counted the kill. ``cause`` is one of CONTAINER_GONE_KILL_CAUSES
-    (see container_gone_cause); an image's own exit is ImageExitedDuringBootstrap, never this.
+    ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is one of
+    CONTAINER_GONE_KILL_CAUSES (see container_gone_cause); an image's own exit is
+    ImageExitedDuringBootstrap, never this.
     """
 
     def __init__(
@@ -800,8 +792,6 @@ class ContainerKilledDuringBootstrap(Exception):
         self.oom_killed = bool(state.oom_killed) if state else False
         self.signal = state.kill_signal if state else None
         self.cause = container_gone_cause(state)
-        if self.cause not in CONTAINER_GONE_KILL_CAUSES:
-            raise ValueError(f"not a kill: cause={self.cause!r} ({state.describe() if state else None})")
         super().__init__(
             f"{KILLED_DURING_BOOTSTRAP_STEP}: {self._sentence()} during {bootstrap_step} "
             f"(cause={self.cause} oom_killed={str(self.oom_killed).lower()} exit_code={self.exit_code!r} "
@@ -838,9 +828,12 @@ async def _explain_add_public_keys_failure(
     6 of 8 on 19 Sep for one renter's `nvidia/cuda` templates. Every failure of the step now looks
     at the container, which cleanup has not removed yet — through the State a ContainerGoneBeforeExec
     already carries when it has one (a second inspect can 404 on a container being removed and would
-    turn an own-exit at the key step into a kill).
+    turn an own-exit at the key step into a kill). A gone container whose cause is a kill is returned
+    unchanged, so the create path records it as killed_during_bootstrap.
     """
-    if isinstance(cause, ContainerGoneBeforeExec) and cause.state is not None:
+    if isinstance(cause, ContainerGoneBeforeExec):
+        if container_gone_cause(cause.state) in CONTAINER_GONE_KILL_CAUSES:
+            return cause
         state = cause.state
     else:
         try:

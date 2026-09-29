@@ -64,8 +64,7 @@ class ContainerGoneBeforeExec(RentalDockerOperationError):
     already "No such container" — so no exec was attempted (a `restarting` container is waited
     for, a `paused` one is the plain error). ``state`` is the last inspect read while the
     container still answered, None once it is gone: OOMKilled and ExitCode are read from here,
-    because the next inspect may find nothing (19 Sep, one node: `status='removing'
-    exit_code=137`, then `No such container`)."""
+    because the next inspect may find nothing."""
 
     def __init__(self, message: str, *, container_name: str, state: ContainerStateSnapshot | None):
         super().__init__(message)
@@ -359,9 +358,10 @@ class RentalDockerSdkClient:
             except Exception as exc:
                 if not _is_docker_container_restarting_error(exc):
                     message = _wrap_error_message("Docker SDK exec failed", exc)
-                    if _is_docker_container_not_running_error(exc):
-                        # The container left between the readiness inspect and the exec:
-                        # read its State now, while `inspect` may still answer.
+                    if _is_docker_container_not_running_error(exc) or _is_docker_not_found_error(exc):
+                        # The container left (409 "is not running") or was removed (404) between
+                        # the readiness inspect and the exec: read its State now, while `inspect`
+                        # may still answer.
                         await self._raise_if_container_gone(spec.container_name, message)
                     raise RentalDockerOperationError(message) from exc
                 last_restart_error = exc
