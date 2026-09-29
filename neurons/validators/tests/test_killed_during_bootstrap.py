@@ -231,6 +231,11 @@ def _exec_exits(*codes: int):
     return lambda api: setattr(api, "exec_inspect", Mock(side_effect=exits))
 
 
+def _exec_exits_then_gone(n: int, *codes: int):
+    # the node finishes removing the container before the inspect that follows the failed exec
+    return lambda api: (_exec_exits(*codes)(api), _gone_at_inspect(api, n))
+
+
 _RUNNING = _container_state()
 _REMOVING_0 = _container_state(status="removing", running=False, exit_code=0)
 _DEAD_137 = _container_state(status="dead", running=False, dead=True, exit_code=137)
@@ -249,16 +254,20 @@ _SIGINT = _container_state(status="exited", running=False, exit_code=130)
          {"cause": "killed", "oom_killed": False, "exit_code": 143, "signal": "SIGTERM", "status": "exited"}),
         ("ssh_bootstrap", [_RUNNING, _RUNNING, _RUNNING, _DEAD_137], _exec_exits(0, 0, 137),
          "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "dead"}),
+        ("ssh_bootstrap", [_RUNNING] * 3, _exec_exits_then_gone(4, 0, 0, 137), "it was removed",
+         {"cause": "removed", "exit_code": None, "status": None}),
         ("add_public_keys", [_oom_killed_state()], None, "it ran out of memory", {"cause": "oom"}),
         # a SIGTERM-handling CMD exits 0 on a host stop, then the node removes the container
         ("add_public_keys", [_REMOVING_0], None, "it was removed", {"cause": "removed"}),
         ("add_public_keys", [_RUNNING, _SIGINT], _exec_exits(130), "it was stopped (SIGINT)",
          {"cause": "killed", "exit_code": 130, "signal": "SIGINT", "status": "exited"}),
+        ("add_public_keys", [_RUNNING], _exec_exits_then_gone(2, 137), "it was removed",
+         {"cause": "removed", "exit_code": None, "status": None}),
         ("set_environment", [_RUNNING], lambda api: _gone_at_inspect(api, 2), "it was removed",
          {"cause": "removed", "exit_code": None}),
     ],
-    ids=["ssh-oom", "ssh-sigkill", "ssh-docker-stop-143", "ssh-exec-137-dead", "keys-oom",
-         "keys-removing-exit-0", "keys-exec-130", "env-removed"],
+    ids=["ssh-oom", "ssh-sigkill", "ssh-docker-stop-143", "ssh-exec-137-dead", "ssh-exec-137-404",
+         "keys-oom", "keys-removing-exit-0", "keys-exec-130", "keys-exec-137-404", "env-removed"],
 )  # fmt: skip
 async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     svc, monkeypatch, caplog, step, states, setup, sentence, event

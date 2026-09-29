@@ -753,10 +753,17 @@ async def _raise_if_killed_after_exec(
     docker_client: RentalDockerSdkClient, *, container_name: str, exit_status: int
 ) -> None:
     """A kill mid-exec ends the exec with a status (137) rather than a refused exec: read the State
-    now and raise the ContainerGoneBeforeExec the create path records as killed_during_bootstrap."""
+    now and raise the ContainerGoneBeforeExec the create path records as killed_during_bootstrap.
+    A 404 there means the node already removed it: the same error, with no State to carry."""
     try:
         state = await docker_client.inspect_container_state(container_name=container_name)
-    except Exception:  # noqa: BLE001 — the exec result is the one to report
+    except Exception as inspect_exc:  # noqa: BLE001 — otherwise the exec result is the one to report
+        if is_docker_not_found_error(inspect_exc):
+            raise ContainerGoneBeforeExec(
+                f"exec exit_status={exit_status} and the container is gone",
+                container_name=container_name,
+                state=None,
+            ) from inspect_exc
         return
     if _killed_after_exec(state):
         raise ContainerGoneBeforeExec(
@@ -835,6 +842,8 @@ async def _explain_add_public_keys_failure(
         try:
             state = await docker_client.inspect_container_state(container_name=container_name)
         except Exception as inspect_exc:
+            if is_docker_not_found_error(inspect_exc):
+                return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=None)
             logger.warning(
                 _m(
                     "Could not inspect the container after a failed SSH-key injection",

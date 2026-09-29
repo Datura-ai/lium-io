@@ -7714,7 +7714,9 @@ def _state(**overrides) -> ContainerStateSnapshot:
     return ContainerStateSnapshot(**{**base, **overrides})
 
 
-async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, state, exec_error):
+async def _create_failing_at_add_public_keys(
+    docker_service, monkeypatch, *, state, exec_error, failure_step="add_public_keys"
+):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(
         docker_service, "add_ssh_public_keys_with_rental_docker", AsyncMock(side_effect=exec_error)
@@ -7733,7 +7735,7 @@ async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, sta
         private_key="encrypted",
     )
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "add_public_keys", "dashboards key on the step"
+    assert result.failure_step == failure_step, "dashboards key on the step"
     assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
     # the container was still there to inspect: the explanation is read before cleanup removes it
     assert inspect.await_args.kwargs == {"container_name": docker_service.get_container_name(payload)}
@@ -7810,15 +7812,21 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
     ],
 )
 @pytest.mark.asyncio
-async def test_a_key_injection_that_fails_after_a_host_kill_keeps_the_exec_error(
+async def test_a_key_injection_that_fails_after_a_host_kill_is_killed_during_bootstrap(
     docker_service, monkeypatch, state
 ):
     """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
     result = await _create_failing_at_add_public_keys(
-        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+        docker_service,
+        monkeypatch,
+        state=state,
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step="killed_during_bootstrap",
     )
 
-    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+    error = _failure_error_field(result)
+    assert "has no long-running command" not in error
+    assert str(_EXEC_KILLED_BY_EXIT) in error
 
 
 @pytest.mark.asyncio
