@@ -220,7 +220,21 @@ def _interconnect_summary(specs: dict[str, Any]) -> dict[str, Any] | None:
     return summary
 
 
-VLOOPBACK_CHECK_FIELDS = ("verdict", "reason_code", "detail", "runtime", "cached")
+VLOOPBACK_TEXT_FIELDS = ("verdict", "reason_code", "detail", "runtime")
+# the host sends these fields; a modified scrape can send any type or length, so the validator keeps
+# only strings, cut to the scrape's own detail cap
+VLOOPBACK_TEXT_CAP = 300
+
+
+def _host_text(value: Any) -> str | None:
+    return value[:VLOOPBACK_TEXT_CAP] if isinstance(value, str) else None
+
+
+def _vloopback_fields(vloopback: dict[str, Any]) -> dict[str, Any]:
+    reported = {field: _host_text(vloopback.get(field)) for field in VLOOPBACK_TEXT_FIELDS}
+    cached = vloopback.get("cached")
+    reported["cached"] = cached if isinstance(cached, bool) else None
+    return reported
 
 
 def _with_vloopback_verdict(specs: dict[str, Any], enforce: bool) -> dict[str, Any]:
@@ -231,10 +245,11 @@ def _with_vloopback_verdict(specs: dict[str, Any], enforce: bool) -> dict[str, A
         return specs
     if not specs.get("storage_limit_supported"):
         return specs
+    reported = _vloopback_fields(vloopback)
     return {
         **specs,
         "storage_limit_supported": False,
-        "storage_limit_scrape_error": f"{vloopback.get('reason_code')}: {vloopback.get('detail')}",
+        "storage_limit_scrape_error": f"{reported['reason_code']}: {reported['detail']}",
     }
 
 
@@ -247,7 +262,7 @@ def _storage_limit_summary(specs: dict[str, Any], enforced: bool) -> dict[str, A
         summary["detail"] = str(scrape_error)
     vloopback = specs.get("vloopback_check")
     if isinstance(vloopback, dict):
-        summary["vloopback"] = {field: vloopback.get(field) for field in VLOOPBACK_CHECK_FIELDS}
+        summary["vloopback"] = _vloopback_fields(vloopback)
     return summary
 
 
