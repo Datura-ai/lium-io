@@ -191,8 +191,10 @@ HOST_GPU_RUNTIME_FAULT_IMPACT = (
 def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
     """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing (P320).
 
-    The same updates POD_NOT_RUNNING and GPU_MISSING set, so the backend marks the executor inactive and
-    raises its penalty with this evidence. A node without a customer pod keeps the plain halt.
+    The same updates POD_NOT_RUNNING and GPU_MISSING set, so the backend marks the executor inactive and billing
+    stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
+    (penalty_trigger.py SCRAPE_FAILURE_REASONS, lium-platform#958), which holds both codes here: the provider
+    penalty policy for them is unchanged. A node without a customer pod keeps the plain halt.
     """
     if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
         return {}

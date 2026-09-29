@@ -272,3 +272,20 @@ async def test_a_scrape_failure_that_says_nothing_of_the_gpu_does_not_reset(cont
 
     assert ok is False
     assert _resets(service) == []
+
+
+# lium-platform penalty_trigger.SCRAPE_FAILURE_REASONS: the backend's reset path proposes no penalty for these.
+BACKEND_UNPENALISED_SCRAPE_REASONS = frozenset(
+    {
+        "SCRAPE_FAILED",
+        "SCRAPE_FAILED_NO_GPU",
+        "SCRAPE_FAILED_DRIVER",
+        "SCRAPE_FAILED_ON_HOST",
+        "SCRAPE_TIMEOUT",
+        "SCRAPE_TRANSPORT_FAILED",
+    }
+)
+
+
+def test_every_code_the_reset_carries_is_one_the_backend_leaves_unpenalised():
+    assert machine_spec_scrape.HOST_GPU_RUNTIME_FAULT_REASONS <= BACKEND_UNPENALISED_SCRAPE_REASONS
