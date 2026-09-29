@@ -412,6 +412,9 @@ async def test_floor_lifts_a_diluted_rate_after_dilution(floor_on):
         assert node.effective_rate == HOURLY_RATE * 0.5
         assert node.floor_top_up_rate == pytest.approx(FLOOR_FACTOR * 8.0 - HOURLY_RATE * 0.5)
         assert _paid_rate(node) == pytest.approx(FLOOR_FACTOR * 8.0)
+        [line] = _logged(node, FLOOR_APPLIED)
+        assert line["diluted_rate"] == HOURLY_RATE * 0.5
+        assert line["floored_rate"] == pytest.approx(FLOOR_FACTOR * 8.0)
     _assert_pool_pays_exactly(incentive)
 
 
@@ -477,6 +480,23 @@ async def test_floor_keeps_the_nodes_own_penalties(floor_on, monkeypatch):
     assert penalised.effective_rate == pytest.approx(HOURLY_RATE * 0.5 * 0.5)
     assert _paid_rate(penalised) == pytest.approx(FLOOR_FACTOR * 8.0 * 0.5)
     assert _paid_rate(full) == pytest.approx(FLOOR_FACTOR * 8.0)
+    _assert_pool_pays_exactly(incentive)
+
+
+@pytest.mark.asyncio
+async def test_a_floored_node_below_the_minimum_driver_adds_no_floor_cost(floor_on):
+    incentive = await _run(
+        [
+            _node("old-driver", filler_revenue_per_gpu_hour=8.0, nvidia_driver_version="535.104.05"),
+            _node("secure-2", filler_revenue_per_gpu_hour=8.0),
+        ]
+    )
+
+    old_driver, full = incentive.job_results["hk"]
+    assert old_driver.driver_multiplier == 0
+    assert old_driver.incentive == 0
+    assert _paid_rate(full) == pytest.approx(FLOOR_FACTOR * 8.0)
+    assert incentive._unbucketed_rental_cost == pytest.approx(8 * (FLOOR_FACTOR * 8.0 - HOURLY_RATE * 0.5))
     _assert_pool_pays_exactly(incentive)
 
 
