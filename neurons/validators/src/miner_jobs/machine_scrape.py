@@ -1023,12 +1023,18 @@ def storage_check_clock():
     return os.times()[4]
 
 
+def note_storage_check_error(what, error):
+    # stdout carries the encrypted payload; stderr reaches the validator's event only when the scrape fails
+    print(f"vloopback check: {what} ({type(error).__name__})", file=sys.stderr)
+
+
 def host_uptime_seconds():
     # the host's seconds since boot: the same in every container on it, and back near 0 after a reboot
     try:
         with open(HOST_UPTIME_PATH) as uptime_file:
             return int(float(uptime_file.read().split()[0]))
-    except Exception:
+    except (OSError, ValueError, IndexError) as e:
+        note_storage_check_error(f"{HOST_UPTIME_PATH} unreadable", e)
         return None
 
 
@@ -1071,18 +1077,22 @@ def read_vloopback_pass(cache_key, uptime):
         with open(VLOOPBACK_PASS_CACHE_PATH) as cache_file:
             cached_uptime, cached_key = cache_file.read().strip().split(" ", 1)
         return cached_key == cache_key and 0 <= uptime - int(cached_uptime) <= VLOOPBACK_PASS_CACHE_SECONDS
-    except Exception:
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as e:
+        note_storage_check_error("cached pass unreadable, testing again", e)
         return False
 
 
 def write_vloopback_pass(cache_key, uptime):
+    # a pass that cannot be cached only means the next scrape runs the mount test again
     try:
         partial_path = f"{VLOOPBACK_PASS_CACHE_PATH}.{os.getpid()}"
         with open(partial_path, "w") as cache_file:
             cache_file.write(f"{uptime} {cache_key}\n")
         os.replace(partial_path, VLOOPBACK_PASS_CACHE_PATH)
-    except Exception:
-        pass
+    except OSError as e:
+        note_storage_check_error("pass not cached", e)
 
 
 def remove_storage_check(name):

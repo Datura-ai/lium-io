@@ -11,6 +11,7 @@ docker CLI (same pattern as test_scrape_gpu_power_cap_probe.py).
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,6 +43,7 @@ STORAGE_HELPERS = {
     "VLOOPBACK_STALE_AFTER_SECONDS",
     "VLOOPBACK_PASS_CACHE_SECONDS",
     "STORAGE_PROBE_DETAIL_CAP",
+    "note_storage_check_error",
     "run_storage_probe",
     "run_storage_step",
     "sweep_stale_storage_checks",
@@ -194,6 +196,7 @@ def _scrape(host: FakeDockerHost, tmp_path: Path) -> dict[str, Any]:
             "subprocess": fake_subprocess,
             "os": os,
             "re": re,
+            "sys": sys,
             "storage_check_clock": lambda: host.clock,
             "host_uptime_seconds": lambda: host.uptime,
             "get_host_boot_id": lambda: host.boot_id,
@@ -554,9 +557,7 @@ def test_host_uptime_is_read_from_proc_uptime(tmp_path: Path) -> None:
     # Arrange
     uptime_file = tmp_path / "uptime"
     uptime_file.write_text("90061.42 712003.18\n")
-    scrape = build_scrape_namespace(
-        SCRAPE, {"host_uptime_seconds"}, {"HOST_UPTIME_PATH": str(uptime_file)}
-    )
+    scrape = _uptime_scrape(uptime_file)
 
     # Act
     seconds = scrape["host_uptime_seconds"]()
@@ -566,6 +567,121 @@ def test_host_uptime_is_read_from_proc_uptime(tmp_path: Path) -> None:
     # Assert
     assert seconds == 90061
     assert missing is None
+
+
+def _uptime_scrape(uptime_path: Path, **seed: Any) -> dict[str, Any]:
+    return build_scrape_namespace(
+        SCRAPE,
+        {"note_storage_check_error", "host_uptime_seconds"},
+        {"sys": sys, "HOST_UPTIME_PATH": str(uptime_path), **seed},
+    )
+
+
+def _raise(error: BaseException):
+    def raiser(*_args, **_kwargs):
+        raise error
+
+    return raiser
+
+
+@pytest.mark.parametrize(
+    ("content", "error_class"),
+    [(None, "FileNotFoundError"), ("", "IndexError"), ("up since monday\n", "ValueError")],
+)
+def test_an_unreadable_uptime_is_none_and_names_the_error_class(
+    tmp_path: Path, capsys, content: str | None, error_class: str
+) -> None:
+    # Arrange
+    uptime_file = tmp_path / "uptime"
+    if content is not None:
+        uptime_file.write_text(content)
+    scrape = _uptime_scrape(uptime_file)
+
+    # Act
+    seconds = scrape["host_uptime_seconds"]()
+
+    # Assert
+    captured = capsys.readouterr()
+    assert seconds is None
+    assert captured.out == ""
+    assert captured.err == f"vloopback check: {uptime_file} unreadable ({error_class})\n"
+
+
+def test_an_unexpected_uptime_error_is_not_swallowed(tmp_path: Path) -> None:
+    # Arrange
+    scrape = _uptime_scrape(tmp_path / "uptime", open=_raise(RuntimeError("boom")))
+
+    # Act / Assert
+    with pytest.raises(RuntimeError):
+        scrape["host_uptime_seconds"]()
+
+
+def test_a_pass_that_cannot_be_written_is_not_cached_and_names_the_error_class(
+    tmp_path: Path, capsys
+) -> None:
+    # Arrange
+    scrape = _scrape(FakeDockerHost(), tmp_path)
+    scrape["VLOOPBACK_PASS_CACHE_PATH"] = str(tmp_path / "gone" / "lium_vloopback_check_pass")
+
+    # Act
+    scrape["write_vloopback_pass"]("boot|plugin", UPTIME)
+
+    # Assert
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "vloopback check: pass not cached (FileNotFoundError)\n"
+    assert scrape["read_vloopback_pass"]("boot|plugin", UPTIME) is False
+
+
+def test_an_unexpected_error_writing_the_pass_is_not_swallowed(tmp_path: Path) -> None:
+    # Arrange
+    scrape = _scrape(FakeDockerHost(), tmp_path)
+    scrape["os"] = SimpleNamespace(getpid=os.getpid, replace=_raise(RuntimeError("boom")))
+
+    # Act / Assert
+    with pytest.raises(RuntimeError):
+        scrape["write_vloopback_pass"]("boot|plugin", UPTIME)
+
+
+@pytest.mark.parametrize(
+    ("content", "error_class"),
+    [("garbage", "ValueError"), ("soon boot|plugin", "ValueError")],
+)
+def test_a_corrupt_cached_pass_is_a_miss_and_names_the_error_class(
+    tmp_path: Path, capsys, content: str, error_class: str
+) -> None:
+    # Arrange
+    scrape = _scrape(FakeDockerHost(), tmp_path)
+    Path(scrape["VLOOPBACK_PASS_CACHE_PATH"]).write_text(content)
+
+    # Act
+    cached = scrape["read_vloopback_pass"]("boot|plugin", UPTIME)
+
+    # Assert
+    assert cached is False
+    assert capsys.readouterr().err == f"vloopback check: cached pass unreadable, testing again ({error_class})\n"
+
+
+def test_no_cached_pass_yet_is_a_quiet_miss(tmp_path: Path, capsys) -> None:
+    # Arrange
+    scrape = _scrape(FakeDockerHost(), tmp_path)
+
+    # Act
+    cached = scrape["read_vloopback_pass"]("boot|plugin", UPTIME)
+
+    # Assert
+    assert cached is False
+    assert capsys.readouterr().err == ""
+
+
+def test_an_unexpected_error_reading_the_pass_is_not_swallowed(tmp_path: Path) -> None:
+    # Arrange
+    scrape = _scrape(FakeDockerHost(), tmp_path)
+    scrape["open"] = _raise(RuntimeError("boom"))
+
+    # Act / Assert
+    with pytest.raises(RuntimeError):
+        scrape["read_vloopback_pass"]("boot|plugin", UPTIME)
 
 
 def test_the_kill_switch_survives_obfuscation_and_is_rewritten_when_disabled() -> None:
