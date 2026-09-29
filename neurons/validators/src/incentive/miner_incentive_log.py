@@ -19,7 +19,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
    Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
-     spot tier, Discord not connected, paused for new rentals, running own default job
+     spot tier, provider e-mail not confirmed, Discord not connected, paused for new
+     rentals, running own default job
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),

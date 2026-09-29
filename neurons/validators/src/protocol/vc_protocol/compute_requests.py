@@ -142,8 +142,8 @@ class RentedExecutorsResponse(BaseModel):
     # probe has nothing to check. Additive with an empty default: an older backend penalizes nobody.
     filler_create_kill_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
-    # P227: executor_ids the backend keeps unlisted until the provider confirms an e-mail address. Such a
-    # node has no listing, so it is also absent from the Discord list above; this names the real reason.
+    # executor_ids the backend keeps unlisted until the provider confirms an e-mail address. Such a node has
+    # no listing, so it is also absent from the Discord list above; the validator reports both reasons.
     # Additive with an empty default: an older backend names nobody.
     provider_email_held_executor_ids: list[str] = []
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
