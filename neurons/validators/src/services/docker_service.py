@@ -453,6 +453,24 @@ class VolumeSizingResult:
 _LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
 _LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
 _PROBE_OUTPUT_LOG_CAP = 512
+# a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
+# so only the last line is the state: true / false / absent
+_LOOPBACK_PLUGIN_STATE_COMMAND = (
+    "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+    f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1"
+)
+
+
+class LoopbackPluginDisabledError(Exception):
+    """The vloopback plugin is installed but disabled and `docker plugin enable` did not fix it.
+    The message keeps "plugin vloopback" and "disabled" so the platform classifier still files
+    it as volume.plugin_disabled."""
+
+    def __init__(self, detail: str):
+        super().__init__(
+            "vloopback plugin disabled on host and could not be enabled "
+            f"(plugin {_LOOPBACK_PLUGIN_ALIAS}: {detail})"
+        )
 
 
 @dataclass
@@ -466,6 +484,7 @@ class VolumeHostProbe:
     df_avail_bytes: int | None          # None when the probe was asked not to measure df
     vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
     loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
+    loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
 
 
 def _volume_host_probe_command(*, with_df: bool) -> str:
@@ -486,10 +505,8 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
         f"{df_part}"
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
-        # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
-        # so only the last line is the state: true / false / absent
-        "printf 'PLUGIN\\t%s\\n' \"$( (/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
-        f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1)\""
+        # the space keeps `$( (` from reading as arithmetic `$((`
+        f"printf 'PLUGIN\\t%s\\n' \"$( {_LOOPBACK_PLUGIN_STATE_COMMAND})\""
     )
 
 
@@ -535,6 +552,7 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
         df_avail_bytes=df_avail_bytes,
         vloopback_volume_names=volume_names,
         loopback_plugin_enabled=plugin_state == "true",
+        loopback_plugin_installed=plugin_state in ("true", "false"),
     )
 
 
@@ -4159,6 +4177,51 @@ class DockerService:
         )
         return max(requested_timeout, min(scaled_timeout, _LOCAL_VOLUME_TIMEOUT_MAX_SEC))
 
+    async def _enable_loopback_plugin(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        timeout: int,
+        log_extra: dict,
+    ) -> None:
+        """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
+        again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
+        at volume creation with a clear reason instead of Docker's create error."""
+        run_kwargs = {"timeout": timeout} if timeout else {}
+        extra = {**log_extra, "loopback_plugin": _LOOPBACK_PLUGIN_ALIAS}
+        try:
+            result = await ssh_client.run(
+                f"/usr/bin/docker plugin enable {shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}", **run_kwargs
+            )
+            state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            error_type = exc.__class__.__name__
+            logger.warning(
+                _m(
+                    "Loopback plugin enable failed",
+                    extra=get_extra_info({**extra, "error_type": error_type}),
+                )
+            )
+            raise LoopbackPluginDisabledError(f"enable error: {error_type}") from exc
+        state = (state_result.stdout or "").strip()
+        if state != "true":
+            detail = (result.stderr or result.stdout or "").strip()[:_PROBE_OUTPUT_LOG_CAP]
+            logger.warning(
+                _m(
+                    "Loopback plugin still disabled after enable",
+                    extra=get_extra_info(
+                        {**extra, "enable_exit_status": result.exit_status, "state": state, "error": detail}
+                    ),
+                )
+            )
+            raise LoopbackPluginDisabledError(
+                f"enable exit {result.exit_status}, state {state or 'unknown'}"
+                + (f": {detail}" if detail else "")
+            )
+        logger.info(_m("Loopback plugin was disabled; enabled it", extra=get_extra_info(extra)))
+
     async def create_local_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -4197,6 +4260,10 @@ class DockerService:
                         extra=get_extra_info({**log_extra, "loopback_plugin": loopback_plugin_name}),
                     )
                 )
+            elif host_probe is not None and host_probe.loopback_plugin_installed:
+                # Installed but disabled: `docker plugin install` would fail with "already exists"
+                # and the volume create with "plugin vloopback found but disabled".
+                await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
             else:
                 loopback_plugin_arg = shlex.quote(loopback_plugin_name)
                 data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
