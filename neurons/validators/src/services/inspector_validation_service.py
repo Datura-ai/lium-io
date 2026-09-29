@@ -4,9 +4,11 @@ import asyncio
 import ctypes
 import json
 import logging
+import os
+import re
 import shlex
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import asyncssh
 from core.checksums import sha256_from_executor, sha256_from_path
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 INSPECTOR_LIB_PATH = "/usr/lib/libinspector.so"
+INSPECTOR_FETCH_TMP_PATH = "/tmp/libinspector.so.fetch"
+_SHA256_RX = re.compile(r"[0-9a-f]{64}")
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 30
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
@@ -36,6 +40,13 @@ INSPECTOR_ERROR_TEXT_MAX_CHARS = 2048
 SENSOR_INTEGRITY_MEASURED = "tdx_measured_image"
 # a sha256sum run through the provider's own shell — unattested
 SENSOR_INTEGRITY_SHELL = "shell_sha256_unattested"
+
+
+class _ShellCapture(NamedTuple):
+    stdout: str = ""
+    stderr: str = ""
+    exit_status: int | None = None
+    transport_error: str | None = None
 
 
 class InspectionFailed(Exception):
@@ -221,19 +232,16 @@ class InspectorValidationService:
             if not sensor_attested:
                 executor_checksum = await sha256_from_executor(shell, self.lib_path)
                 if self.local_checksum != executor_checksum:
-                    return self._failure_response(
-                        error=(
-                            "Executor using outdated libinspector library. "
-                            "Run docker compose restart to update to the latest executor image"
-                        ),
-                        message=Msg.FAILED_LIB_MISMATCH,
-                        diagnostics={
-                            **diagnostics,
-                            "local_sha256": self.local_checksum,
-                            "executor_sha256": executor_checksum or None,
-                        },
+                    failure = await self._refresh_on_mismatch(
+                        shell,
+                        executor_checksum,
+                        Msg=Msg,
+                        diagnostics=diagnostics,
                         default_extra=default_extra,
                     )
+                    if failure is not None:
+                        return failure
+                    diagnostics["library_refresh"] = "INSPECTOR_LIBRARY_REPLACED"
 
             validator = InspectorValidator(self.inspector_lib)
             validator.start_session()
@@ -275,6 +283,158 @@ class InspectorValidationService:
                 validator.close_session()
             if process is not None:
                 await self._close_process(process)
+
+    async def _refresh_on_mismatch(
+        self,
+        shell,
+        executor_checksum: str,
+        *,
+        Msg,
+        diagnostics: dict[str, Any],
+        default_extra: dict[str, Any],
+    ) -> InspectorValidationResponse | None:
+        """None once the executor holds the validator's libinspector.so, else the mismatch failure.
+
+        With VERIFYX_LIBRARY_REFRESH_ENABLED off nothing is written. On, one write check, one
+        fetch of INSPECTOR_LIBRARY_FETCH_URL (installed only when its sha256 is the validator's)
+        and one re-read of the executor's hash; no retry.
+        """
+        mismatch = {
+            **diagnostics,
+            "local_sha256": self.local_checksum,
+            "executor_sha256": executor_checksum or None,
+        }
+        outdated = (
+            "Executor using outdated libinspector library. "
+            "Run docker compose restart to update to the latest executor image"
+        )
+        if not settings.verifyx.LIBRARY_REFRESH_ENABLED:
+            return self._failure_response(
+                error=outdated,
+                message=Msg.FAILED_LIB_MISMATCH,
+                diagnostics={**mismatch, "library_refresh": "INSPECTOR_LIBRARY_MISMATCH_NO_REFRESH"},
+                default_extra=default_extra,
+            )
+        if not await self._executor_can_write_lib(shell):
+            return self._failure_response(
+                error=(
+                    "Executor libinspector.so hash mismatch and /usr/lib is not writable; "
+                    "library was not replaced"
+                ),
+                message=Msg.FAILED_LIB_MISMATCH,
+                diagnostics={**mismatch, "library_refresh": "INSPECTOR_LIBRARY_WRITE_DENIED"},
+                default_extra=default_extra,
+            )
+        fetch_error = await self._refresh_executor_library(shell, default_extra)
+        if fetch_error is not None:
+            return self._failure_response(
+                error=outdated,
+                message=Msg.FAILED_LIB_MISMATCH,
+                diagnostics={
+                    **mismatch,
+                    "library_refresh": "INSPECTOR_LIBRARY_FETCH_FAILED",
+                    "fetch_error": fetch_error,
+                },
+                default_extra=default_extra,
+            )
+        refreshed_checksum = await sha256_from_executor(shell, self.lib_path)
+        if refreshed_checksum != self.local_checksum:
+            return self._failure_response(
+                error=outdated,
+                message=Msg.FAILED_LIB_MISMATCH,
+                diagnostics={
+                    **mismatch,
+                    "executor_sha256": refreshed_checksum or None,
+                    "library_refresh": "INSPECTOR_LIBRARY_STILL_MISMATCHED",
+                },
+                default_extra=default_extra,
+            )
+        return None
+
+    async def _executor_can_write_lib(self, shell) -> bool:
+        lib = shlex.quote(self.lib_path)
+        parent = shlex.quote(os.path.dirname(self.lib_path))
+        capture = await self._run_shell_command(
+            shell,
+            f"if [ -w {parent} ] && {{ [ ! -e {lib} ] || [ -w {lib} ]; }}; "
+            f"then echo WRITE_OK:1; else echo WRITE_OK:0; fi",
+            timeout=15,
+        )
+        return capture.transport_error is None and "WRITE_OK:1" in capture.stdout
+
+    async def _refresh_executor_library(self, shell, default_extra: dict[str, Any]) -> str | None:
+        """Curl INSPECTOR_LIBRARY_FETCH_URL once and install it only if its sha256 is the
+        validator's. Returns None when installed, else why not (also logged)."""
+        url = settings.INSPECTOR_LIBRARY_FETCH_URL
+        tmp = shlex.quote(INSPECTOR_FETCH_TMP_PATH)
+        capture = await self._run_shell_command(
+            shell,
+            f"curl -fsSL --max-time 60 -o {tmp} {shlex.quote(url)}; echo CURL_RC:$?; "
+            f"if [ -f {tmp} ]; then sha256sum {tmp}; fi",
+            timeout=90,
+        )
+        curl_rc = None
+        fetched_sha = ""
+        for line in capture.stdout.splitlines():
+            if line.startswith("CURL_RC:"):
+                try:
+                    curl_rc = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    curl_rc = None
+            parts = line.split()
+            if parts and _SHA256_RX.fullmatch(parts[0]):
+                fetched_sha = parts[0]
+
+        if capture.transport_error is not None:
+            fetch_error = capture.transport_error
+        elif curl_rc != 0:
+            fetch_error = f"curl exit {curl_rc}: {(capture.stderr or capture.stdout)[-400:]}"
+        elif fetched_sha != self.local_checksum:
+            fetch_error = f"fetched sha256 {fetched_sha or None} != validator {self.local_checksum}"
+        else:
+            move = await self._run_shell_command(
+                shell, f"mv {tmp} {shlex.quote(self.lib_path)}", timeout=30
+            )
+            if move.transport_error is None and move.exit_status in (None, 0):
+                logger.warning(
+                    _m(
+                        "INSPECTOR_LIBRARY_REPLACED",
+                        extra=get_extra_info({**default_extra, "sha256": fetched_sha, "url": url}),
+                    )
+                )
+                return None
+            fetch_error = move.transport_error or f"mv exit {move.exit_status}"
+
+        await self._run_shell_command(shell, f"rm -f {tmp}", timeout=15)
+        logger.warning(
+            _m(
+                "INSPECTOR_LIBRARY_FETCH_FAILED",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "url": url,
+                        "fetch_error": fetch_error,
+                        "fetched_sha256": fetched_sha or None,
+                        "expected_sha256": self.local_checksum,
+                    }
+                ),
+            )
+        )
+        return fetch_error
+
+    @staticmethod
+    async def _run_shell_command(shell, command: str, *, timeout: float) -> _ShellCapture:
+        try:
+            result = await shell.ssh_client.run(command, timeout=timeout)
+        except Exception as exc:
+            return _ShellCapture(transport_error=f"{type(exc).__name__}: {exc}")
+        if result is None:
+            return _ShellCapture(transport_error="SSH command returned no result")
+        return _ShellCapture(
+            stdout=str(getattr(result, "stdout", "") or ""),
+            stderr=str(getattr(result, "stderr", "") or ""),
+            exit_status=getattr(result, "exit_status", None),
+        )
 
     async def _validation_failure(
         self,

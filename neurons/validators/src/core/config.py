@@ -73,10 +73,14 @@ class VerifyXSettings(BaseSettings):
     # When LIBRARY_REFRESH_ENABLED is on and the executor's libverifyx.so hash does not
     # match, curl this URL once, install, check the hash, and retry. The validator's own
     # file is the source of truth if the fetch hash differs. Off by default: a mismatch
-    # does not write /usr/lib on the provider host.
+    # does not write /usr/lib on the provider host. The same switch covers libinspector.so
+    # (INSPECTOR_LIBRARY_FETCH_URL), which is installed only when the fetched hash matches.
     LIBRARY_REFRESH_ENABLED: bool = Field(
         default=False,
-        description="If true, a libverifyx.so hash mismatch may replace /usr/lib/libverifyx.so on the executor",
+        description=(
+            "If true, a libverifyx.so or libinspector.so hash mismatch may replace the "
+            "library in /usr/lib on the executor"
+        ),
     )
     LIBRARY_FETCH_URL: str = Field(
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libverifyx.so",
@@ -267,6 +271,14 @@ class Settings(BaseSettings):
     # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
     # the inspector event, no renter is told, the score is untouched.
     INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
+    # The libinspector.so sibling of VERIFYX_LIBRARY_FETCH_URL, under the same switch
+    # (VERIFYX_LIBRARY_REFRESH_ENABLED): on a hash mismatch the executor curls this once and
+    # the file is installed only if its sha256 is the validator's own libinspector.so.
+    INSPECTOR_LIBRARY_FETCH_URL: str = Field(
+        env="INSPECTOR_LIBRARY_FETCH_URL",
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
+        description="Raw GitHub URL the executor curls when library refresh is on and the libinspector.so hash does not match",
+    )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
     # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
