@@ -171,6 +171,26 @@ async def test_a_gate_logs_only_while_the_node_is_still_eligible(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforced"])
+async def test_a_port_budget_backing_no_gpu_is_recorded_on_a_blocked_node(
+    monkeypatch, caplog, discord_cutoff_passed, enforced
+):
+    # an idle split node whose 2 free ports start no pod: the enforced budget names it on a node
+    # Discord already blocks, and neither logs the shadow line nor withholds a count there
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", enforced)
+    split: dict = {"supports_gpu_splitting": True, "gpu_splitting_min_count": 1, "spec": {"available_port_count": 2}}
+
+    with caplog.at_level(logging.INFO):
+        blocked = await _incentive().calculate_executor_score(
+            _idle_flagship(provider_discord_connected=False, **split)
+        )
+
+    assert _codes(blocked) == ["provider_discord_not_connected"] + (["port_unbacked_split_gpus"] if enforced else [])
+    assert blocked.port_unbacked_gpu_count == 0
+    assert not any(getattr(record.msg, "extra", {}).get("event") == "port_unbacked_gpus" for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_driver_and_sysbox_are_recorded_on_a_node_blocked_before_pricing(
     monkeypatch, discord_cutoff_passed
 ):
