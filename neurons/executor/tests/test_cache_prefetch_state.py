@@ -498,13 +498,13 @@ def test_error_text_is_clipped():
         ),
         ("401, url='https://s3cret@backend.example/x'", "401, url='https://***@backend.example/x'"),
         ("Authorization: Bearer s3cret.value", "Authorization: Bearer ***"),
-        ("basic s3cret", "basic ***"),
         ("sent token abcdefghijklmnop0123 to backend.example", "sent token *** to backend.example"),
         ("X-Api-Key: s3cret", "X-Api-Key: ***"),
         (
             "GET https://backend.example/x?gpu=H100&access_token=s3cret&sig=s3cret#top",
-            "GET https://backend.example/x?gpu=H100&access_token=***&sig=***#top",
+            "GET https://backend.example/x?***",
         ),
+        ("GET https://backend.example/x#access_token=s3cret", "GET https://backend.example/x?***"),
         ("password=s3cret rejected", "password=*** rejected"),
         ("pushed with ghp_" + "a" * 36, "pushed with ***"),
         # A password holding an unencoded `@` or `/`: yarl and aiohttp carry such URLs as-is.
@@ -516,15 +516,71 @@ def test_error_text_is_clipped():
             "InvalidUrlClientError: https://provider:pa/ss@backend.example/executors/x",
             "InvalidUrlClientError: https://***@backend.example/executors/x",
         ),
+        # Up to the last `@`, not the first: what follows an `@` inside a password is not a host.
+        (
+            "Cannot connect to https://provider:s3c@ret/x@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        # Whatever the host, port or length of the userinfo.
+        (
+            "InvalidURL: https://provider:s3cret@backend.example:bad/api",
+            "InvalidURL: https://***@backend.example:bad/api",
+        ),
+        (
+            "https://provider:s3cret@backend.example: connection refused",
+            "https://***@backend.example: connection refused",
+        ),
+        (
+            "InvalidURL: https://provider:s3c/ret@bäckend.example/api",
+            "InvalidURL: https://***@bäckend.example/api",
+        ),
+        (
+            "InvalidURL: https://provider:" + "s3cret/" * 43 + "@backend.example/api",
+            "InvalidURL: https://***@backend.example/api",
+        ),
+        (
+            "InvalidURL: https://provider:s3c<ret@backend.example/api",
+            "InvalidURL: https://***@backend.example/api",
+        ),
+        # aiohttp quotes the request URL: its query is masked before any key=value rule runs.
+        (
+            "401, message='Unauthorized', url='https://backend.example/x?api_token=s3cret'",
+            "401, message='Unauthorized', url='https://backend.example/x?***'",
+        ),
+        (
+            "200, message='Attempt to decode JSON with unexpected mimetype: text/html', "
+            "url='https://backend.example/executors/default-docker-image?token=s3cret&gpu=H100'",
+            "200, message='Attempt to decode JSON with unexpected mimetype: text/html', "
+            "url='https://backend.example/executors/default-docker-image?***'",
+        ),
+        # An `@` in the query leaves no telling where the userinfo ends: nothing after `://` stays.
+        ("GET https://backend.example/x?to=a@b.example&token=s3cret", "GET https://***"),
         ("login with pass=s3cret and pw=s3cret", "login with pass=*** and pw=***"),
         ("{'password': 's3cret', 'user': 'provider'}", "{'password': '***', 'user': 'provider'}"),
         ('{"api_key": "s3cret", "gpu": "H100"}', '{"api_key": "***", "gpu": "H100"}'),
+        ('{"password": "s3c\\"ret", "gpu": "H100"}', '{"password": "***", "gpu": "H100"}'),
+        ('password="s3c ret" rejected', 'password="***" rejected'),
+        ("password=b's3cret' rejected", "password=b'***' rejected"),
         ("Authorization: s3cret", "Authorization: ***"),
         ("Authorization: Token s3cret", "Authorization: Token ***"),
         ("X-Api-Token: s3cret", "X-Api-Token: ***"),
         ("X-Registry-Key: s3cret", "X-Registry-Key: ***"),
         ("X-Amz-Security-Token: s3cret", "X-Amz-Security-Token: ***"),
+        ("Private-Token: s3cret", "Private-Token: ***"),
+        ("Cookie: sessionid=s3cret; csrftoken=s3cret", "Cookie: ***"),
+        ("Set-Cookie: sessionid=s3cret; Path=/; HttpOnly", "Set-Cookie: ***"),
         ("GET /x?apiKey=s3cret&clientSecret=s3cret", "GET /x?apiKey=***&clientSecret=***"),
+        ("apikey=s3cret accesstoken=s3cret", "apikey=*** accesstoken=***"),
+        ("mypassword=s3cret PGPASSWORD=s3cret", "mypassword=*** PGPASSWORD=***"),
+        ("run with --password=s3cret", "run with --password=***"),
+        ("password: s3cret", "password: ***"),
+        ("password = s3cret", "password = ***"),
+        ("client_secret: s3cret", "client_secret: ***"),
+        # A non-secret pair does not hide a secret one that follows it.
+        ("url=https://backend.example/x token=s3cret", "url=https://backend.example/x token=***"),
+        ("GET url=/x?api_token=s3cret", "GET url=/x?api_token=***"),
+        ("basic dXNlcjpzM2NyZXQtcGFzc3dvcmQ=", "basic ***"),
+        ("Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl", "Bearer ***"),
     ],
 )
 def test_redact_removes_credentials_and_keeps_the_rest(text, expected):
@@ -533,7 +589,23 @@ def test_redact_removes_credentials_and_keeps_the_rest(text, expected):
 
 def test_redact_is_linear_on_a_long_error():
     # The patterns run on the executor's event loop, three times per loop error.
-    for text in ("a." * 100_000, "key" * 70_000, "https://" * 25_000, "a=" * 100_000):
+    for text in (
+        "a." * 100_000,
+        "key" * 70_000,
+        "https://" * 25_000,
+        "a=" * 100_000,
+        "a:" * 100_000,
+        "@" * 200_000,
+        "https://a@" * 20_000,
+        "password='" * 20_000,
+        "'password': '" * 15_000,
+        "Bearer " * 30_000,
+        "token=" + "a" * 200_000,
+        "Cookie: " + "a" * 200_000,
+        " eyJa" * 50_000,
+        "eyJ" + "a." * 100_000,
+        "'password': '" * 15_000 + "x" * 10_000,
+    ):
         started = time.perf_counter()
         redacted = redact(text)
         assert time.perf_counter() - started < 0.05
@@ -550,11 +622,51 @@ def test_a_credential_past_the_redacted_length_is_cut_not_published():
 @pytest.mark.parametrize(
     "text",
     [
+        # Earlier redactions shrink the text; what lay past the cut must still not be pulled in.
+        "Bearer " + "a" * 2440 + " https://u:s3cret" + "x" * 50 + "@backend.example/x",
+        "password=" + "p" * 1500 + " " + "q" * 600 + " s3cret",
+        "Authorization: " + "a" * 1990 + " s3cret",
+        # A URL the cut splits before its `@`, and a token the cut splits: no half is published.
+        "x" * 1985 + " https://provider:s3cret@backend.example/api",
+        "x" * 1990 + " Bearer s3cretabcdefghijklmnopqrstuvwxyz",
+    ],
+)
+def test_nothing_past_the_cut_or_split_by_it_is_published(text):
+    redacted = redact(text)
+
+    assert "s3cret" not in redacted and "s3c" not in redacted
+    assert len(redacted) <= cache_prefetch_state.MAX_REDACTED_CHARS + 1
+    assert redacted.endswith("…")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         f"manifest for {REPO}@{FRESH_DIGEST} not found",
+        f"manifest unknown: {REPO}@{FRESH_DIGEST}",
         "toomanyrequests: You have reached your pull rate limit",
+        "no space left on device",
+        "write /var/lib/docker/tmp/x: disk quota exceeded",
+        "unauthorized: authentication required",
+        "pull access denied for daturaai/pytorch, repository does not exist or may require "
+        "'docker login': denied: requested access to the resource is denied",
+        "403 Forbidden",
+        "404 Not Found",
+        "net/http: TLS handshake timeout",
+        "read tcp 10.0.0.2:51234->203.0.113.7:443: read: connection reset by peer",
+        "dial tcp: lookup registry-1.docker.io: no such host",
+        'Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for '
+        "connection (Client.Timeout exceeded while awaiting headers)",
+        "Error while fetching server API version: ('Connection aborted.', "
+        "FileNotFoundError(2, 'No such file or directory'))",
+        "NVMLError_LibraryNotFound: NVML Shared Library Not Found",
+        "No such image: daturaai/pytorch:latest",
+        "failed to register layer: basic checks failed",
+        "Bearer token expired",
         "token expired",
         "Cannot connect to host backend.example:443 ssl:default [Connection refused]",
-        "monkey=1 design=2 author=3 passenger=4 cache_keyring=5",
+        "https://backend.example:8443/executors/default-docker-image",
+        "monkey=1 design=2 author=3 passenger=4 cache_keyring=5 tokenizer=6 bypass=7 passport=8",
         "{'monkey': 'banana', 'author': 'provider'}",
         "404 Client Error for http+docker://localhost/v1.44/images/"
         f"{REPO}@{FRESH_DIGEST}/json: Not Found",
@@ -565,7 +677,9 @@ def test_redact_leaves_errors_without_credentials_unchanged(text):
 
 
 def test_an_error_is_described_by_its_class_and_redacted_text():
-    assert describe_error(RuntimeError("Bearer s3cret")) == "RuntimeError: Bearer ***"
+    assert describe_error(RuntimeError("Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln")) == (
+        "RuntimeError: Bearer ***"
+    )
     assert describe_error(TimeoutError()) == "TimeoutError"
     assert describe_error("HTTP 503") == "HTTP 503"
 
@@ -583,10 +697,59 @@ def test_an_unprintable_error_is_described_by_its_class():
     assert state.as_dict()["last_loop_error"] == "Unprintable"
 
 
+def test_an_error_whose_text_or_class_name_misbehaves_is_still_described():
+    class HostileText(str):
+        def __getitem__(self, key):
+            raise RuntimeError("no slicing")
+
+        def replace(self, *args):
+            raise RuntimeError("no replace")
+
+    class HostileStr(Exception):
+        def __str__(self):
+            return HostileText("password=s3cret")
+
+    class HostileName(type):
+        @property
+        def __name__(cls):
+            raise RuntimeError("no name")
+
+    class Nameless(Exception, metaclass=HostileName):
+        pass
+
+    assert describe_error(HostileStr()) == "HostileStr: password=***"
+    assert describe_error(Nameless("password=s3cret")) == (
+        f"{cache_prefetch_state.UNNAMED_ERROR}: password=***"
+    )
+
+
+def test_an_error_carrying_its_url_is_masked_whatever_the_password_holds():
+    # aiohttp's InvalidURL carries the URL it refused as `.url`, and its text is that URL.
+    from aiohttp.client_exceptions import InvalidUrlClientError
+
+    for password in ('s3c/r"et', "s3c/r et", "s3c/r>et", "s3c/r<et"):
+        url = f"https://provider:{password}@backend.example/executors/x"
+
+        described = describe_error(InvalidUrlClientError(url))
+
+        assert described == "InvalidUrlClientError: https://***@backend.example/executors/x"
+
+
+def test_a_carried_url_the_cut_splits_is_dropped_whole():
+    from aiohttp.client_exceptions import InvalidUrlClientError
+
+    url = "https://provider:" + "p" * 1900 + " " + "q" * 200 + "s3cret@backend.example/executors/x"
+
+    described = describe_error(InvalidUrlClientError(url))
+
+    assert "ppp" not in described and "qqq" not in described and "s3cret" not in described
+    assert described == "InvalidUrlClientError: …"
+
+
 def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
     state = CachePrefetchState(path=None, backend_url="https://provider:s3cret@backend.example")
 
-    state.note_docker(available=False, error=RuntimeError("Bearer s3cret"))
+    state.note_docker(available=False, error=RuntimeError("Authorization: Bearer s3cret"))
     state.note_loop_error(ConnectionError("https://provider:s3cret@backend.example refused"))
     state.record_loop_outcome(Outcome.LOOP_ERROR, error=ValueError("password=s3cret"))
     state.record_image_outcome(IMAGE_REF, Outcome.PULL_FAILED, error="?token=s3cret")
@@ -594,8 +757,8 @@ def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
     payload = state.render()
     assert "s3cret" not in payload
     doc = json.loads(payload)
-    assert doc["backend_url"] == "https://backend.example"
-    assert doc["docker_error"] == "RuntimeError: Bearer ***"
+    assert doc["backend_url"] == "https://backend.example/"
+    assert doc["docker_error"] == "RuntimeError: Authorization: Bearer ***"
     assert doc["last_loop_error"] == "ConnectionError: https://***@backend.example refused"
     assert doc["last_error"] == "ValueError: password=***"
 
@@ -604,15 +767,42 @@ def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
     ("backend_url", "published"),
     [
         ("https://provider:p@ss@backend.example/api", "https://backend.example/api"),
-        ("https://s3cret@backend.example/api?gpu=H100", "https://backend.example/api?gpu=H100"),
-        # yarl cannot parse a `/` in the password, so the text rule has to catch it.
-        ("https://provider:pa/ss@backend.example/api", "https://***@backend.example/api"),
+        ("https://s3cret@backend.example/api?gpu=H100", "https://backend.example/api"),
+        ("https://backend.example:8443/api?token=s3cret#x", "https://backend.example:8443/api"),
+        ("https://provider:p%40ss@backend.example/api", "https://backend.example/api"),
+        ("https://bäckend.example/api", "https://xn--bckend-bua.example/api"),
+        ("http://[::1]:8443/api", "http://[::1]:8443/api"),
     ],
 )
-def test_the_backend_url_loses_its_userinfo(backend_url, published):
+def test_the_backend_url_is_rebuilt_from_its_parse(backend_url, published):
     doc = CachePrefetchState(path=None, backend_url=backend_url).as_dict()
 
     assert doc["backend_url"] == published
+
+
+@pytest.mark.parametrize(
+    "backend_url",
+    [
+        # yarl refuses these; none of their text is published.
+        "https://provider:pa/s3cret@backend.example/api",
+        "https://provider:s3cret@backend.example:bad/api",
+        'https://provider:s3c/r"et@backend.example/api',
+        "https://provider:s3c/r et@backend.example/api",
+        "https://provider:" + "s3cret/" * 43 + "@backend.example/api",
+        "https://provider:s3c/ret@bäckend.example/api",
+        # yarl parses these, but the password lands in the port and path.
+        "https://provider:1234/s3cret@backend.example/api",
+        "https://provider:1234?s3cret@backend.example/api",
+        "https://provider:1234#s3cret@backend.example/api",
+        # No scheme, or no scheme and host.
+        "//backend.example/api",
+        "backend.example/api",
+    ],
+)
+def test_a_backend_url_without_a_clean_parse_is_published_as_a_placeholder(backend_url):
+    doc = CachePrefetchState(path=None, backend_url=backend_url).as_dict()
+
+    assert doc["backend_url"] == cache_prefetch_state.UNPARSEABLE_URL
 
 
 def test_document_is_capped_and_marked_truncated():

@@ -82,11 +82,16 @@ def _utcnow() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# What `redact` returns at most, and how far past that it reads. The patterns run on the executor's
-# event loop, so their input is bounded first; the extra reach lets a credential that starts before
-# the cut be matched whole, and whatever lies past the cut is dropped, never published.
+# What `redact` returns at most. The text is cut to this length before any rule runs, and no rule
+# looks past the cut, so every character published has been read by every rule. When the text is
+# cut, its last run of non-whitespace is dropped as well: a URL or token the cut splits is never
+# published in part.
 MAX_REDACTED_CHARS = 4 * MAX_ERROR_CHARS
-_REDACT_READ_CHARS = MAX_REDACTED_CHARS + 512
+
+# Published in place of a URL yarl cannot parse cleanly; nothing of the raw text is kept.
+UNPARSEABLE_URL = "<unparseable URL>"
+# Shown in place of an error's class name when reading that name fails.
+UNNAMED_ERROR = "error"
 
 # Words that make a parameter or key name secret when they are one of its words (`access_token`,
 # `apiKey`, `X-Amz-Signature`), so `monkey`, `design` and `author` are not.
@@ -94,6 +99,7 @@ _SECRET_WORDS = frozenset(
     {
         "auth",
         "authorization",
+        "cookie",
         "credential",
         "credentials",
         "key",
@@ -104,6 +110,7 @@ _SECRET_WORDS = frozenset(
         "pw",
         "pwd",
         "secret",
+        "sessionid",
         "sig",
         "signature",
         "token",
@@ -111,13 +118,19 @@ _SECRET_WORDS = frozenset(
 )
 # Prefixes a secret word is often written flush against (`apikey`, `accesstoken`).
 _SECRET_PREFIXES = ("access", "api", "auth", "client", "private", "refresh", "secret", "session")
+# Secret words that stay secret at the end of a longer word (`mypassword`, `PGPASSWORD`,
+# `csrftoken`). `key` and `pass` are left out, so `monkey` and `bypass` stay.
+_SECRET_SUFFIXES = ("password", "passwd", "passphrase", "secret", "token")
 _NAME_WORDS = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
 
 
+def _name_words(name: str) -> list[str]:
+    return [word.lower() for word in _NAME_WORDS.findall(name)]
+
+
 def _is_secret_name(name: str) -> bool:
-    for word in _NAME_WORDS.findall(name):
-        word = word.lower()
-        if word in _SECRET_WORDS:
+    for word in _name_words(name):
+        if word in _SECRET_WORDS or word.endswith(_SECRET_SUFFIXES):
             return True
         if any(
             word.startswith(prefix) and word[len(prefix) :] in _SECRET_WORDS
@@ -127,93 +140,215 @@ def _is_secret_name(name: str) -> bool:
     return False
 
 
-def _mask_secret_value(match: re.Match) -> str:
-    if not _is_secret_name(match["name"]):
-        return match[0]
-    return f"{match[0][: match.start('value') - match.start()]}***{match['close']}"
+# URLs, first. A URL starts at `scheme://` and runs to the next whitespace, quote or `>`, whatever
+# its host, port or length. Everything between `://` and the span's last `@` is userinfo, except an
+# `@` that starts an image digest (`repo@sha256:`). The query and fragment are replaced whole.
+_URL_START = re.compile(r"(?i)\b[a-z][a-z0-9+.-]{0,31}://")
+_URL_END = re.compile(r"[\s'\">]")
+_DIGEST_AT = re.compile(r"@sha(?:256|384|512):")
 
 
-# Credentials an error's text can carry: the userinfo of a URL such as COMPUTE_REST_API_URL (up to
-# the last `@` before the host, since a password may hold an unencoded `@` or `/`), an
-# authorization or API-key/token header, a bearer/basic/token value, a known token shape, and a
-# secret-named key=value or quoted 'key': 'value' pair. Hosts, paths, status codes and image
-# digests are kept: they are what a provider needs to act on the error. Every quantifier is
-# bounded, so each pattern is linear in its (already bounded) input.
-_URL_USERINFO = re.compile(
-    r"(?i)\b([a-z][a-z0-9+.-]{0,31}://)[^\s'\"<>]{1,256}@"
-    r"(?=(?:[a-z0-9_.-]{1,253}|\[[0-9a-f:.]{2,45}\])(?::\d{1,5})?(?![\w.:@-]))"
+def _mask_url_span(span: str) -> str:
+    """One URL's text after ``://``, without its userinfo, query and fragment."""
+    at = span.rfind("@")
+    while at != -1 and _DIGEST_AT.match(span, at):
+        at = span.rfind("@", 0, at)
+    rest = span
+    head = ""
+    if at != -1:
+        # A `?` or `#` before that `@` means the `@` may sit in the query: keep nothing.
+        if "?" in span[:at] or "#" in span[:at]:
+            return "***"
+        head, rest = "***@", span[at + 1 :]
+    query = min((i for i in (rest.find("?"), rest.find("#")) if i != -1), default=-1)
+    if query != -1:
+        rest = rest[:query] + "?***"
+    return head + rest
+
+
+def _mask_url(url: str) -> str:
+    start = url.find("://") + 3
+    return url[:start] + _mask_url_span(url[start:])
+
+
+def _redact_urls(text: str) -> str:
+    parts: list[str] = []
+    pos = 0
+    while match := _URL_START.search(text, pos):
+        end = _URL_END.search(text, match.end())
+        stop = end.start() if end else len(text)
+        parts += (text[pos : match.end()], _mask_url_span(text[match.end() : stop]))
+        pos = stop
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+# Then secret-named values: `name=value`, `name: value`, `--name=value`, `'name': 'value'` and
+# headers such as `Authorization: Bearer v`, `Private-Token: v` and `Cookie: a=b; c=d`. Only the
+# name and separator are matched here; the value is read only after the name is known to be
+# secret, so a pair such as `url='...'` never hides what follows it.
+_NAMED_VALUE = re.compile(
+    r"(?<![\w.])(?P<quote>['\"]?)(?P<name>[A-Za-z_][\w.-]{0,63})(?P=quote)\s{0,8}[:=]\s{0,8}"
 )
-_REDACTIONS = (
-    (_URL_USERINFO, r"\1***@"),
+_AUTH_SCHEME = re.compile(r"(?i)(?:bearer|basic|token|digest)\s{1,8}")
+_PLAIN_VALUE = re.compile(r"[^\s'\",;&]+")
+_COOKIE_VALUE = re.compile(r"[^\r\n'\"]+")
+
+
+def _quoted_value_end(text: str, start: int) -> int:
+    """Index of the quote closing the value opened at ``start``, or the end of ``text``."""
+    quote = text[start]
+    pos = start + 1
+    while (pos := text.find(quote, pos)) != -1:
+        if text[pos - 1] != "\\":
+            return pos
+        pos += 1
+    return len(text)
+
+
+def _mask_named_value(text: str, name: str, start: int) -> tuple[str, int]:
+    """The masked value of secret ``name`` starting at ``start``, and where the value ends."""
+    lead = start
+    if text.startswith(("b'", 'b"'), start):
+        lead += 1
+    if lead < len(text) and text[lead] in "'\"":
+        close = _quoted_value_end(text, lead)
+        return f"{text[start : lead + 1]}***", close
+    if "cookie" in _name_words(name):
+        value = _COOKIE_VALUE.match(text, start)
+        return ("***", value.end()) if value else ("", start)
+    scheme = _AUTH_SCHEME.match(text, start)
+    lead = scheme.end() if scheme else start
+    value = _PLAIN_VALUE.match(text, lead)
+    if not value:
+        return "", start
+    return f"{text[start:lead]}***", value.end()
+
+
+def _redact_named_values(text: str) -> str:
+    parts: list[str] = []
+    pos = 0
+    while match := _NAMED_VALUE.search(text, pos):
+        parts.append(text[pos : match.end()])
+        pos = match.end()
+        if _is_secret_name(match["name"]):
+            masked, pos = _mask_named_value(text, match["name"], pos)
+            parts.append(masked)
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+# Last, credentials without a name: a bearer/basic/token value (only when it is token-shaped, so
+# prose such as "basic checks failed" stays) and known token formats.
+_TOKEN_RULES = (
     (
-        re.compile(
-            r"(?i)\b((?:proxy-)?authorization|(?:x-)?api[-_]?(?:key|token)"
-            r"|x-[a-z0-9-]{0,64}-(?:token|key|secret|signature))"
-            r"(\s{0,8}:\s{0,8})((?:bearer|basic|token|digest)\s{1,8})?[^\s'\",;]{1,4096}"
-        ),
-        r"\1\2\3***",
+        re.compile(r"(?i)\b(bearer|basic|token)(\s{1,8})[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}"),
+        r"\1\2***",
     ),
-    (re.compile(r"(?i)\b(bearer|basic)(\s{1,8})[^\s'\",;]{1,4096}"), r"\1\2***"),
-    (re.compile(r"(?i)\b(token)(\s{1,8})[A-Za-z0-9._~+/=-]{16,4096}"), r"\1\2***"),
     (
         re.compile(
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,4096}|github_pat_[A-Za-z0-9_]{20,4096}"
-            r"|eyJ[A-Za-z0-9_-]{1,4096}\.[A-Za-z0-9_-]{1,4096}\.[A-Za-z0-9_-]{1,4096})"
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+            r"|eyJ[A-Za-z0-9_-]{1,}\.[A-Za-z0-9_-]{1,}\.[A-Za-z0-9_-]{1,})"
         ),
         "***",
     ),
-    (
-        re.compile(
-            r"(?<![\w.-])(?P<name>[A-Za-z_][\w.-]{0,63})=(?P<quote>['\"]?)"
-            r"(?P<value>[^&\s#'\",;]{1,4096})(?P<close>)"
-        ),
-        _mask_secret_value,
-    ),
-    (
-        re.compile(
-            r"(?P<quote>['\"])(?P<name>[A-Za-z_][\w.-]{0,63})(?P=quote)\s{0,8}:\s{0,8}"
-            r"(?P<open>['\"])(?P<value>[^'\"]{1,4096})(?P<close>(?P=open))"
-        ),
-        _mask_secret_value,
-    ),
 )
 
 
-def redact(text: str) -> str:
-    """``text`` with any credentials in it replaced by ``***``, cut to ``MAX_REDACTED_CHARS``."""
+def _drop_split_tail(text: str, urls: tuple[str, ...]) -> str:
+    """``text`` (already cut) without the run the cut split, nor a carried URL the cut split."""
+    end = len(text)
+    while end and not text[end - 1].isspace():
+        end -= 1
+    text = text[:end]
+    for url in urls:
+        start = text.rfind(url[: url.find("://") + 3])
+        if start != -1 and len(text) - start < len(url) and url.startswith(text[start:]):
+            text = text[:start]
+    return text
+
+
+def redact(text: str, urls: tuple[str, ...] = ()) -> str:
+    """``text`` cut to ``MAX_REDACTED_CHARS``, with any credentials in it replaced by ``***``.
+
+    ``urls`` are URLs the error carries as attributes: each is masked as one URL wherever it
+    appears, even when its password holds a space or a quote that ends a URL in free text.
+    """
     cut = len(text) > MAX_REDACTED_CHARS
-    text = text[:_REDACT_READ_CHARS]
-    for pattern, replacement in _REDACTIONS:
+    if cut:
+        text = _drop_split_tail(text[:MAX_REDACTED_CHARS], urls)
+    for url in urls:
+        text = text.replace(url, _mask_url(url))
+    text = _redact_named_values(_redact_urls(text))
+    for pattern, replacement in _TOKEN_RULES:
         text = pattern.sub(replacement, text)
-    return text[:MAX_REDACTED_CHARS] + "…" if cut else text
+    # A `***` can be longer than the value it replaces; cutting the redacted text only shortens it.
+    if len(text) > MAX_REDACTED_CHARS:
+        text, cut = text[:MAX_REDACTED_CHARS], True
+    return text + "…" if cut else text
+
+
+def _urls_of(error: object) -> tuple[str, ...]:
+    """URLs an aiohttp error carries (``InvalidURL.url``, ``request_info``), longest first."""
+    urls = set()
+    try:
+        info = getattr(error, "request_info", None)
+        for value in (
+            getattr(error, "url", None),
+            getattr(info, "url", None),
+            getattr(info, "real_url", None),
+        ):
+            if value is not None:
+                url = str.__str__(str(value))
+                if "://" in url:
+                    urls.add(url)
+    except Exception:
+        pass
+    return tuple(sorted(urls, key=len, reverse=True))
 
 
 def describe_error(error: object) -> str:
     """How an error is shown in the log and in the document: its class and its redacted text.
 
-    Never raises: it runs inside the loop's except clauses, so an error whose ``str()`` raises
-    is shown by its class alone.
+    Never raises: it runs inside the loop's except clauses. An error whose class name cannot be
+    read is named ``UNNAMED_ERROR``; one whose ``str()`` raises is shown by its class alone.
     """
-    name = type(error).__name__
     try:
-        text = str(error)
+        name = str.__str__(type(error).__name__)
+    except Exception:
+        name = UNNAMED_ERROR
+    try:
+        # `str.__str__` makes an exact str of a str subclass, whose methods could raise.
+        text = str.__str__(str(error))
     except Exception:
         return name
-    message = redact(text)
-    if isinstance(error, BaseException):
-        return f"{name}: {message}" if message else name
-    return message
+    try:
+        message = redact(text, _urls_of(error))
+        if isinstance(error, BaseException):
+            return f"{name}: {message}" if message else name
+        return message
+    except Exception:
+        return name
 
 
 def _public_url(url: str) -> str:
-    """``url`` without its userinfo, and redacted. A URL yarl cannot parse is redacted as text."""
+    """``url`` as ``scheme://host[:port]/path`` from yarl's parse, else ``UNPARSEABLE_URL``.
+
+    The userinfo, query and fragment are never published. A parse that leaves an `@` after the
+    host (a password holding an unencoded `/`, `?` or `#`, read as host, port and path) is refused,
+    as is a URL without a scheme and host.
+    """
     try:
         parsed = URL(url)
-        if parsed.user is not None or parsed.password is not None:
-            url = str(parsed.with_user(None))
-    except ValueError:
-        pass
-    return redact(url)
+        if not (parsed.absolute and parsed.scheme and parsed.raw_host):
+            return UNPARSEABLE_URL
+        if "@" in f"{parsed.raw_path}{parsed.raw_query_string}{parsed.raw_fragment}":
+            return UNPARSEABLE_URL
+        host = f"[{parsed.raw_host}]" if ":" in parsed.raw_host else parsed.raw_host
+        port = f":{parsed.explicit_port}" if parsed.explicit_port is not None else ""
+        return redact(f"{parsed.scheme}://{host}{port}{parsed.raw_path}")
+    except Exception:
+        return UNPARSEABLE_URL
 
 
 def _clip(value: object | None, limit: int = MAX_ERROR_CHARS) -> str | None:
