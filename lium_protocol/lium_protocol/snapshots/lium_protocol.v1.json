@@ -4629,6 +4629,14 @@
           "default": null,
           "title": "Provider Discord Connected Executor Ids"
         },
+        "provider_spot_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Spot Executor Ids",
+          "type": "array"
+        },
         "spot_executor_ids": {
           "default": [],
           "items": {

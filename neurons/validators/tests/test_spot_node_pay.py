@@ -73,7 +73,9 @@ def _node(uuid: str, **overrides) -> JobResult:
 
 
 def _spot(uuid: str = "spot-1", **overrides) -> JobResult:
-    return _node(uuid, **{"is_spot": True, "has_lium_filler": True, **overrides})
+    return _node(
+        uuid, **{"is_spot": True, "is_provider_chosen_spot": True, "has_lium_filler": True, **overrides}
+    )
 
 
 async def _run(
@@ -341,6 +343,39 @@ async def test_spot_flag_off_keeps_spot_at_zero():
 
     await _run([spot])
 
+    assert spot.incentive == 0
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_TIER]
+
+
+@pytest.mark.asyncio
+async def test_a_spot_node_the_provider_did_not_choose_is_scored_as_before(monkeypatch):
+    # a demoted, force-spot, pinned or no-incentive-rental node: spot, but not provider-chosen
+    def cycle() -> list[JobResult]:
+        return [
+            _spot("restricted", is_provider_chosen_spot=False, filler_revenue_per_gpu_hour=2.0),
+            _node("secure-1"),
+        ]
+
+    off = cycle()
+    await _run(off)
+    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+    on = cycle()
+    await _run(on)
+
+    assert on[0].incentive == 0
+    assert on[0].spot_pay_candidate is False
+    assert _codes(on[0]) == [ZeroIncentiveReason.SPOT_TIER]
+    assert on[0].incentive_logs == off[0].incentive_logs
+    assert on[1].incentive == pytest.approx(off[1].incentive)
+
+
+@pytest.mark.asyncio
+async def test_a_spot_result_built_without_the_providers_choice_is_not_paid(spot_pay_on):
+    spot = _node("spot-1", is_spot=True, has_lium_filler=True, filler_revenue_per_gpu_hour=2.0)
+
+    await _run([spot])
+
+    assert spot.is_provider_chosen_spot is False
     assert spot.incentive == 0
     assert _codes(spot) == [ZeroIncentiveReason.SPOT_TIER]
 
@@ -948,8 +983,10 @@ def test_unusable_average_reads_as_no_average(value):
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
 
 
-async def _handled(context_factory, rented_data: RentedExecutorsResponse | None) -> JobResult:
-    state = build_state(gpu_model_count=f"{H100}:8", rented_data=rented_data)
+async def _handled(
+    context_factory, rented_data: RentedExecutorsResponse | None, **context_overrides
+) -> JobResult:
+    state = build_state(gpu_model_count=f"{H100}:8", rented_data=rented_data, sysbox_runtime=True)
     ctx = context_factory(
         state=state,
         tdx_attestation_passed=False,
@@ -958,6 +995,7 @@ async def _handled(context_factory, rented_data: RentedExecutorsResponse | None)
         collateral_deposited=True,
         ssh_pub_keys=[],
         rented=False,
+        **context_overrides,
     )
     return await ResultHandler(redis_service=None, dry_run=True).handle_result(
         context=ctx,
@@ -999,6 +1037,107 @@ async def test_result_without_a_filler_or_backend_data(context_factory):
     for result in (no_filler, no_data):
         assert result.has_lium_filler is False
         assert result.filler_revenue_per_gpu_hour is None
+
+
+def _spot_reply(**fields) -> RentedExecutorsResponse:
+    # a spot node with a filler and an average: everything spot pay needs but the provider's choice
+    executor_id = str(default_executor().uuid)
+    return RentedExecutorsResponse.model_validate(
+        {
+            "executors": {},
+            "spot_executor_ids": [executor_id],
+            "all_filler_containers_by_executor": {executor_id: ["filler_run-1"]},
+            "filler_revenue_by_gpu_config": [_GOOD_ENTRY],
+            **fields,
+        }
+    )
+
+
+_EXECUTOR_ID = str(default_executor().uuid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields, context, expected_codes",
+    [
+        # demoted, force-spot, pinned and no-incentive-rental nodes all arrive this way: in the spot
+        # list, not in the provider's
+        ({"provider_spot_executor_ids": []}, {}, [ZeroIncentiveReason.SPOT_TIER]),
+        ({"provider_spot_executor_ids": ["another-executor"]}, {}, [ZeroIncentiveReason.SPOT_TIER]),
+        # an older backend that does not send the field
+        ({}, {}, [ZeroIncentiveReason.SPOT_TIER]),
+        # a banned provider is out even if the backend listed the node as provider-chosen
+        (
+            {"provider_spot_executor_ids": [_EXECUTOR_ID], "banned_hotkeys": ["miner-hotkey"]},
+            {"is_provider_banned": True},
+            [ZeroIncentiveReason.BANNED_NETWORK_ABUSE],
+        ),
+        (
+            {"banned_hotkeys": ["miner-hotkey"]},
+            {"is_provider_banned": True},
+            [ZeroIncentiveReason.BANNED_NETWORK_ABUSE, ZeroIncentiveReason.SPOT_TIER],
+        ),
+    ],
+    ids=["demoted-or-pinned", "listed-for-another-node", "field-absent", "banned-listed", "banned"],
+)
+async def test_only_a_provider_chosen_spot_node_is_paid(
+    context_factory, spot_pay_on, fields, context, expected_codes
+):
+    result = await _handled(context_factory, _spot_reply(**fields), **context)
+
+    assert result.is_spot is True
+    assert result.has_lium_filler is True
+    assert result.filler_revenue_per_gpu_hour == 2.0
+    await _run([result, _node("secure-1")])
+    assert result.incentive == 0
+    assert result.spot_pay_candidate is False
+    assert _codes(result) == expected_codes
+
+
+@pytest.mark.asyncio
+async def test_a_provider_chosen_spot_node_is_paid(context_factory, spot_pay_on):
+    result = await _handled(
+        context_factory, _spot_reply(provider_spot_executor_ids=[_EXECUTOR_ID])
+    )
+
+    assert result.is_provider_chosen_spot is True
+    await _run([result, _node("secure-1")])
+    assert result.spot_pay_candidate is True
+    assert result.effective_rate == pytest.approx(0.9 * 2.0)
+    assert result.incentive > 0
+    assert _codes(result) == []
+
+
+@pytest.mark.asyncio
+async def test_the_provider_list_alone_does_not_make_a_node_spot(context_factory):
+    data = RentedExecutorsResponse(executors={}, provider_spot_executor_ids=[_EXECUTOR_ID])
+
+    result = await _handled(context_factory, data)
+
+    assert result.is_spot is False
+    assert result.is_provider_chosen_spot is False
+
+
+@pytest.mark.parametrize(
+    "value, expected, warns",
+    [
+        (None, [], False),
+        ("spot-1", [], True),
+        ({"spot-1": True}, [], True),
+        (["spot-1", 7, None, "spot-2"], ["spot-1", "spot-2"], False),
+    ],
+    ids=["null", "string", "dict", "mixed-items"],
+)
+def test_a_malformed_provider_spot_list_reads_as_empty(value, expected, warns, caplog):
+    with caplog.at_level(logging.WARNING):
+        data = RentedExecutorsResponse.model_validate(
+            {**_reply([_GOOD_ENTRY]), "provider_spot_executor_ids": value}
+        )
+
+    assert data.provider_spot_executor_ids == expected
+    assert data.spot_executor_ids == ["spot-1"]
+    assert data.banned_hotkeys == ["banned-hk"]
+    assert any("provider_spot_executor_ids is not a list" in r.message for r in caplog.records) is warns
 
 
 _GOOD_ENTRY: dict = {
@@ -1083,3 +1222,4 @@ def test_older_backend_sends_no_averages():
 
     assert data.filler_revenue_by_gpu_config == []
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
+    assert data.provider_spot_executor_ids == []

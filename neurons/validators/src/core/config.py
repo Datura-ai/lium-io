@@ -565,10 +565,13 @@ class Settings(BaseSettings):
         env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
 
-    # Spot-node pay. True: an unrented spot node running Lium fillers earns
+    # Spot-node pay. True: an unrented spot node whose provider chose Spot (the backend's
+    # provider_spot_executor_ids) and that runs Lium fillers earns
     # min(0.9 x its GPU configuration's average filler revenue, its secure idle rate before
     # bucket-cap dilution), with no bucket cap; a spot node without a filler, or whose configuration
-    # has no usable average, earns 0. False: every spot node earns 0, as before.
+    # has no usable average, earns 0, and a demoted, force-spot, pinned or no-incentive-rental one
+    # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
+    # False: every spot node earns 0, as before.
     ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
     # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
     # bucket-cap dilution is raised to 0.9 x its configuration's average filler revenue, even above

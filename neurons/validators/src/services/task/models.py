@@ -60,6 +60,9 @@ class JobResult(BaseModel):
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
     is_spot: bool = False
+    # in the backend's provider_spot_executor_ids: the provider chose Spot, rather than a demotion,
+    # force-spot hotkey, pin or no-incentive rental putting the node there. Gates spot-node pay.
+    is_provider_chosen_spot: bool = False
     is_new_rentals_paused: bool = False
     is_provider_banned: bool = False
     provider_discord_connected: bool = True

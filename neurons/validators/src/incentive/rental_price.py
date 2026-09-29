@@ -1056,11 +1056,14 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _on_spot_pay_path(result: JobResult) -> bool:
-        # a rented spot node stays out of both pools, as before, and so does the free remainder of a
+        # Only a node whose provider chose Spot is paid: a demoted, force-spot, pinned or
+        # no-incentive-rental node is spot as a restriction and keeps spot_tier, as before. A rented
+        # spot node stays out of both pools, as before, and so does the free remainder of a
         # partially rented one: it has no configuration average of its own (spot_tier, not "no average")
         return (
             settings.ENABLE_SPOT_NODE_PAY
             and result.is_spot
+            and result.is_provider_chosen_spot
             and not result.is_rented
             and not result.is_split_remainder
         )
