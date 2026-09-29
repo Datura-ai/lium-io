@@ -122,7 +122,8 @@ class JobResult(BaseModel):
     spot_pay_candidate: bool = False
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
-    # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers).
+    # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),
+    # on top of its effective_rate, which stays the listed or diluted rate.
     # Set only on a node paid from that share, so every other node's output is unchanged.
     unbucketed_share: float | None = None
     unbucketed_rental_cost: float | None = None
@@ -237,7 +238,7 @@ class JobResult(BaseModel):
                 "fixed_ratio": self.fixed_ratio,
             }
             if self.unbucketed_share is not None:
-                # incentive = rental_share * gpu_count * (effective_rate - floor_top_up_rate) / total_rental_cost
+                # incentive = rental_share * gpu_count * effective_rate / total_rental_cost
                 #           + unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
                 # (a spot node: floor_top_up_rate = effective_rate, and nothing from the first term)
                 inputs["unbucketed_share"] = self.unbucketed_share

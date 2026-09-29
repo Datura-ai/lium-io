@@ -33,7 +33,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      NVIDIA driver below the minimum, sysbox runtime not enabled
    Spot-node pay (ENABLE_SPOT_NODE_PAY on) — an idle spot node earns only while it runs
      Lium fillers and its GPU configuration has an average filler revenue:
-     spot node without a Lium filler, no filler revenue average for the GPU configuration
+     spot node without a Lium filler, no filler revenue average for the GPU configuration,
+     no room left in the incentive pool because the rental share is at the burn cap
    Group C — a check failed this cycle: the failing check's reason code
      (`validation_failed`, context.reason_code), so a zero from a failed check is never
      reported without a reason. A run that passed every check and still scored 0 (the
@@ -46,7 +47,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
      rental_incentive_calculated, spot_pay_incentive_calculated,
-     secure_filler_revenue_floor_applied (the secure floor lifted a diluted rate),
+     secure_filler_revenue_floor_applied (the secure floor paid a top-up on the listed or
+       diluted rate), secure_filler_revenue_floor_not_paid (no room at the burn cap),
      mining_score_missing (internal-error case),
      unrented_bucket_reassigned (DAH-2528: node rated against its split tier
      because its own GPU-count tier was over capacity)
@@ -107,6 +109,7 @@ class ZeroIncentiveReason(StrEnum):
     # Spot-node pay (ENABLE_SPOT_NODE_PAY): an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
+    SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
     # Group C: the validation run itself did not pass; context.reason_code names the check
     VALIDATION_FAILED = "validation_failed"
 
@@ -486,6 +489,22 @@ class MinerLogLine(BaseModel):
             extra_fields={"filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour},
         )
 
+    @staticmethod
+    def no_payout_because_spot_no_headroom_at_burn_cap(result: JobResult, paid_fraction: float) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_NO_HEADROOM_AT_BURN_CAP,
+            message=(
+                "No subnet incentive this cycle: the unrented pool already takes the whole burn "
+                "emission, so nothing is left for spot-tier pay, which is paid on top of it."
+            ),
+            extra_fields={
+                "effective_rate": result.effective_rate,
+                "unbucketed_share": result.unbucketed_share,
+                "paid_fraction": paid_fraction,
+            },
+        )
+
     # ── Group C: the validation run did not pass ─────────────────────────────
 
     @staticmethod
@@ -597,14 +616,15 @@ class MinerLogLine(BaseModel):
 
     @staticmethod
     def spot_pay_incentive_calculated(
-        hotkey: str, result: JobResult, secure_rate: float, filler_rate: float
+        hotkey: str, result: JobResult, secure_rate: float, filler_rate: float, paid_fraction: float
     ) -> MinerLogLine:
         return MinerLogLine(
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
                 "effective_rate = min(0.9 * filler_revenue_per_gpu_hour, secure_rate); "
-                "paid on top of the rental share"
+                "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
+                "that part of spot pay and floor top-ups)"
             ),
             fields={
                 "hotkey": hotkey,
@@ -623,19 +643,22 @@ class MinerLogLine(BaseModel):
                 "incentive": result.incentive,
                 "unbucketed_share": result.unbucketed_share,
                 "unbucketed_rental_cost": result.unbucketed_rental_cost,
+                "paid_fraction": paid_fraction,
             },
         )
 
     @staticmethod
     def secure_filler_revenue_floor_applied(
-        result: JobResult, diluted_rate: float, floored_rate: float
+        result: JobResult, diluted_rate: float, floored_rate: float, top_up_incentive: float, paid_fraction: float
     ) -> MinerLogLine:
-        # report line, not a zero reason: the node is paid more than its diluted rate
+        # report line, not a zero reason: the node is paid more than its listed or diluted rate
         return MinerLogLine(
             message=(
-                "Unrented incentive: the capacity dilution for this GPU tier took this executor's "
-                "rate below 0.9 x the average filler revenue for its GPU configuration, so it is "
-                "paid at that floor instead."
+                "Unrented incentive: this executor's listed or diluted rate is below 0.9 x the "
+                "average filler revenue for its GPU configuration, so the difference is paid on top "
+                "of the line above. Formula: unbucketed_share * gpu_count * floor_top_up_rate / "
+                "unbucketed_rental_cost (paid_fraction < 1: the pool had room for only that part of "
+                "spot pay and floor top-ups)."
             ),
             fields={
                 "executor_id": str(result.executor_info.uuid),
@@ -647,6 +670,34 @@ class MinerLogLine(BaseModel):
                 "diluted_rate": diluted_rate,
                 "floored_rate": floored_rate,
                 "filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour,
+                "floor_top_up_rate": result.floor_top_up_rate,
+                "unbucketed_share": result.unbucketed_share,
+                "unbucketed_rental_cost": result.unbucketed_rental_cost,
+                "paid_fraction": paid_fraction,
+                "top_up_incentive": top_up_incentive,
+                "incentive": result.incentive,
+            },
+        )
+
+    @staticmethod
+    def secure_filler_revenue_floor_not_paid(result: JobResult, diluted_rate: float, floored_rate: float) -> MinerLogLine:
+        # report line, not a zero reason: the node keeps the pay in the line above
+        return MinerLogLine(
+            message=(
+                "Unrented incentive: 0.9 x the average filler revenue for this GPU configuration is "
+                "above this executor's listed or diluted rate, but no top-up is paid this cycle: the "
+                "unrented pool already takes the whole burn emission, and top-ups are paid on top of it."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "secure_filler_revenue_floor_not_paid",
+                "diluted_rate": diluted_rate,
+                "floored_rate": floored_rate,
+                "floor_top_up_rate": result.floor_top_up_rate,
+                "unbucketed_share": result.unbucketed_share,
+                "incentive": result.incentive,
             },
         )
 
