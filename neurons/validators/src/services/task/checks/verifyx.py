@@ -437,17 +437,11 @@ def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | 
         if failed_check_id != VerifyXCheck.check_id:
             return f"cycle failed {failed_check_id}"
         return None
-    if ctx.state.recommended_image_cached is False and _is_never_measured(ctx):
-        return "never-measured node, image not cached yet"
+    if ctx.state.recommended_image_cached is False:
+        prev_ema = _stored_network_ema(ctx)
+        if prev_ema is None or prev_ema.ema_verifyx_download_speed is None:
+            return "never-measured node, image not cached yet"
     return None
-
-
-def _is_never_measured(ctx: Context) -> bool:
-    """No stored VerifyX EMA, per the backend's answer; False without that answer, as for the cold-sample retry."""
-    if ctx.state.rented_data is None:
-        return False
-    prev_ema = _stored_network_ema(ctx)
-    return prev_ema is None or prev_ema.ema_verifyx_download_speed is None
 
 
 def _stored_network_ema(ctx: Context) -> NetworkEMA | None:
