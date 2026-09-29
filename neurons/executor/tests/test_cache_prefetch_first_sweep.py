@@ -232,6 +232,11 @@ def test_a_long_error_cannot_carry_a_credential_past_the_cut(monkeypatch, tmp_pa
         ("https://provider:s3c/ret@backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
         ("https://provider:s3cret@backend.example:bad/api", cache_prefetch_state.UNPARSEABLE_URL),
         ("https://provider:1234/s3cret@backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
+        ("https://s3cret%40backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
+        (
+            "https://backend.example/api/token%2Fs3cret",
+            "https://backend.example/api/token%2F***/executors/default-docker-image",
+        ),
     ],
 )
 def test_the_backend_url_is_published_without_its_credentials(
@@ -316,6 +321,41 @@ def test_a_backend_url_without_a_scheme_never_publishes_its_password(
     assert "s3c" not in json.dumps(doc)
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # The userinfo separator written as `%40`, or as a fullwidth or small at-sign.
+        "https://provider:s3cret%40backend.example:8443/api",
+        "https://provider:s3cret\uff20backend.example/api",
+        "https://provider:s3cret\ufe6bbackend.example:8443/api",
+        "provider:s3cret%40backend.example:8443/api",
+        "provider:s3cret\uff20backend.example:8443/api",
+        "provider:s3cret\ufe6bbackend.example/api",
+    ],
+)
+def test_a_backend_url_with_an_encoded_at_sign_never_publishes_its_password(
+    monkeypatch, tmp_path, base_url
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url=base_url,
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert doc["backend_url"] == cache_prefetch_state.UNPARSEABLE_URL
+    for text in (message, doc["last_loop_error"], doc["last_error"]):
+        assert "s3c" not in text and "provider" not in text
+        assert "UrlClientError: " in text and "backend.example" in text
+    assert "s3c" not in json.dumps(doc)
+
+
 class _RedirectHandler(http.server.BaseHTTPRequestHandler):
     location = ""
 
@@ -386,7 +426,17 @@ def html_backend():
     server.server_close()
 
 
-@pytest.mark.parametrize("suffix", ["/api?token=s3cret", "?auth=s3cret", "/api?api_token=s3cret"])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "/api?token=s3cret",
+        "?auth=s3cret",
+        "/api?api_token=s3cret",
+        # A path secret behind an encoded `/`.
+        "/api/token%2Fs3cret",
+        "/api/token%2fs3cret/x",
+    ],
+)
 def test_a_backend_answering_html_never_publishes_the_urls_query(
     monkeypatch, tmp_path, html_backend, suffix
 ):
@@ -409,6 +459,7 @@ def test_a_backend_answering_html_never_publishes_the_urls_query(
         assert "s3cret" not in text
         assert html_backend in text
     assert "s3cret" not in json.dumps(doc)
+    assert doc["backend_url"].startswith(html_backend)
 
 
 def test_retry_jitter_stays_inside_its_bound():

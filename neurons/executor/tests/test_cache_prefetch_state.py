@@ -667,11 +667,105 @@ def test_error_text_is_clipped():
             "password" + " " * 12 + "=" + " " * 12 + "s3cret",
             "password" + " " * 12 + "=" + " " * 12 + "***",
         ),
-        # Over-masking this rule accepts: a later `@` before a host on the same line ends the
-        # userinfo, even when the URL had none.
+        # Each secret word, prefix and token format on its own.
+        ("X-Amz-Credential=AKIDEXAMPLE", "X-Amz-Credential=***"),
+        ("sig=s3cret signature=s3cret", "sig=*** signature=***"),
+        ("sessionid=s3cret", "sessionid=***"),
+        ("privatekey=s3cret", "privatekey=***"),
+        *(
+            (f"pushed {prefix}{'a' * 36} upstream", "pushed *** upstream")
+            for prefix in ("gho_", "ghs_", "ghu_", "ghr_", "github_pat_")
+        ),
+        # A quoted value holding letters and digits after `token:` is not an identifier.
+        ("token: 'abc123def456'", "token: '***'"),
+        # An upper-case scheme, and a lower-case encoded `?`.
         (
-            "GET https://backend.example/x refused for admin@example.com",
-            "GET https://***@example.com",
+            "GET HTTPS://provider:s3cret@backend.example/x",
+            "GET HTTPS://***@backend.example/x",
+        ),
+        (
+            "GET https://backend.example/api%3ftoken%3Ds3cret",
+            "GET https://backend.example/api%3f***",
+        ),
+        # A host-shaped `@` on the next line does not end the userinfo of the URL above it.
+        (
+            "GET https://provider\nrefused for admin@backend.example/x",
+            "GET https://provider\nrefused for ***@backend.example/x",
+        ),
+        # The userinfo separator written as `%40`, or as a fullwidth or small at-sign.
+        (
+            "InvalidUrlClientError: https://provider:s3cret%40backend.example:8443/api",
+            "InvalidUrlClientError: https://***%40backend.example:8443/api",
+        ),
+        (
+            "InvalidUrlClientError: https://provider:s3cret\uff20backend.example/api",
+            "InvalidUrlClientError: https://***\uff20backend.example/api",
+        ),
+        (
+            "https://provider:s3c ret\ufe6bbackend.example/api refused",
+            "https://***\ufe6bbackend.example/api refused",
+        ),
+        (
+            "NonHttpUrlClientError: provider:s3cret%40backend.example:8443/api",
+            "NonHttpUrlClientError: ***%40backend.example:8443/api",
+        ),
+        (
+            "NonHttpUrlClientError: provider:s3cret%EF%BC%A0backend.example:8443/api",
+            "NonHttpUrlClientError: ***%EF%BC%A0backend.example:8443/api",
+        ),
+        *(
+            (
+                f"redirected to provider:s3cret{sign}backend.example/x",
+                f"redirected to ***{sign}backend.example/x",
+            )
+            for sign in ("%ef%bc%a0", "%EF%B9%AB", "%ef%b9%ab")
+        ),
+        (
+            "Cannot connect to host s3cret%40backend.example:443",
+            "Cannot connect to host ***%40backend.example:443",
+        ),
+        # A path secret behind an encoded `/`.
+        (
+            "GET https://backend.example/api/token%2Fs3cret/x",
+            "GET https://backend.example/api/token%2F***/x",
+        ),
+        ("GET https://backend.example/token%2fs3cret", "GET https://backend.example/token%2f***"),
+        # A span without a dotted host does not end the userinfo, even with a port-shaped part.
+        (
+            "Cannot connect to https://provider s3cret@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        (
+            "Cannot connect to https://provider:12 34@backend.example/api",
+            "Cannot connect to https://***@backend.example/api",
+        ),
+        # A `--name value` flag, `=>` and an encoded `=` separate a secret name from its value.
+        ("run with --password s3cret --verbose", "run with --password *** --verbose"),
+        ("run with --api-key 's3c ret'", "run with --api-key '***'"),
+        (
+            "{'password' => 's3cret', 'user' => 'provider'}",
+            "{'password' => '***', 'user' => 'provider'}",
+        ),
+        ("password=>s3cret", "password=>***"),
+        ("sent password%3Ds3cret%26gpu%3DH100", "sent password%3D***%26gpu%3DH100"),
+        (
+            "GET https://backend.example/x/token%3ds3cret",
+            "GET https://backend.example/x/token%3d***",
+        ),
+        # Prose after `session:`, `credentials:` or `auth:` stays, but a value there is masked.
+        ("session: abc123def456", "session: ***"),
+        ("session: Abcdefgh more", "session: *** more"),
+        ("session: abc123 more", "session: *** more"),
+        ("auth: basic dXNlcjpwYXNz", "auth: basic ***"),
+        ("auth: basic hunter", "auth: basic ***"),
+        ("credentials: hunter", "credentials: ***"),
+        # Only a name made secret by those words alone.
+        ("password: hunter two", "password: *** two"),
+        ("session_password: hunter two", "session_password: *** two"),
+        # A `user@host` with a port after a URL is masked on its own; the URL and the words stay.
+        (
+            "Get https://registry.example/v2/: unauthorized for provider@host.example:22",
+            "Get https://registry.example/v2/: unauthorized for ***@host.example:22",
         ),
     ],
 )
@@ -707,6 +801,13 @@ def test_redact_is_linear_on_a_long_error():
         "token" + " " * 200_000 + "=",
         "a[" * 100_000,
         "%3F" * 60_000,
+        "https://a" + "%40sha256:" * 20_000,
+        "https://a" + "\uff20" * 200_000,
+        "a%40" * 50_000,
+        "--password " * 20_000,
+        "--" * 100_000,
+        "session: " * 20_000,
+        "password%3D" * 20_000,
     ):
         started = time.perf_counter()
         redacted = redact(text)
@@ -785,10 +886,27 @@ def test_nothing_past_the_cut_or_split_by_it_is_published(text):
         "moved to <https://backend.example/x>?",
         # An `@` not followed by a host does not end a URL's userinfo, nor does the host name.
         "GET https://backend.example/x done @ 12:00",
+        "GET https://backend done @ 12:00",
         'Head "https://auth.docker.io/token": unauthorized',
         "contact provider@example.com",
         f"image {REPO}:{TAG}@{FRESH_DIGEST} pulled",
         "Session is closed",
+        # Prose after `session:`, `credentials:` or `auth:` names no value.
+        "failed to create session: context deadline exceeded",
+        'error getting credentials: exec: "docker-credential-desktop": executable file not found',
+        "auth: token expired",
+        "session: expired",
+        # A flag followed by another flag has no value.
+        "docker login --password-stdin --username provider",
+        # An e-mail address after a URL on the same line: the URL's host and the words stay.
+        "GET https://backend.example/x refused for admin@example.com",
+        'Get "https://registry.example/v2/": unauthorized: denied for provider@example.com',
+        "GET https://registry.example:5000/v2/ denied for provider@example.com",
+        "GET https://backend.example refused for admin@example.com",
+        "GET https://[2001:db8::1]:8443 refused for admin@example.com",
+        "https://backend.example: unauthorized for admin@example.com",
+        # An encoded `@` in a path or a query is not a userinfo separator.
+        "GET https://backend.example/users/provider%40example.com/templates",
     ],
 )
 def test_redact_leaves_errors_without_credentials_unchanged(text):
@@ -946,6 +1064,19 @@ def test_a_carried_url_without_a_scheme_the_cut_splits_is_dropped_whole():
     assert described == "NonHttpUrlRedirectClientError: …"
 
 
+def test_a_long_carried_url_is_described_in_bounded_time():
+    from aiohttp.client_exceptions import InvalidUrlClientError
+
+    url = "https://provider:s3cret@backend.example/" + "x/" * 2_500_000
+
+    started = time.perf_counter()
+    described = describe_error(InvalidUrlClientError(url))
+
+    assert time.perf_counter() - started < 0.05
+    assert "s3cret" not in described
+    assert len(described) <= cache_prefetch_state.MAX_REDACTED_CHARS + 30
+
+
 def test_a_carried_url_the_cut_splits_is_dropped_whole():
     from aiohttp.client_exceptions import InvalidUrlClientError
 
@@ -987,6 +1118,7 @@ def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
         ("https://backend.example/api;token=s3cret", "https://backend.example/api;token=***"),
         ("https://backend.example/api/token/s3cret", "https://backend.example/api/token/***"),
         ("https://backend.example/api%3Ftoken%3Ds3cret", "https://backend.example/api%3F***"),
+        ("https://backend.example/api/token%2Fs3cret", "https://backend.example/api/token%2F***"),
     ],
 )
 def test_the_backend_url_is_rebuilt_from_its_parse(backend_url, published):
@@ -1009,6 +1141,11 @@ def test_the_backend_url_is_rebuilt_from_its_parse(backend_url, published):
         "https://provider:1234/s3cret@backend.example/api",
         "https://provider:1234?s3cret@backend.example/api",
         "https://provider:1234#s3cret@backend.example/api",
+        # yarl reads the userinfo before a `%40` as part of the host.
+        "https://s3cret%40backend.example/api",
+        "https://provider:s3cret%40backend.example:8443/api",
+        "https://provider:s3cret\uff20backend.example/api",
+        "https://s3cret%EF%BC%A0backend.example/api",
         # No scheme, or no scheme and host.
         "//backend.example/api",
         "backend.example/api",

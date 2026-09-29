@@ -146,46 +146,89 @@ def _is_secret_name(name: str) -> bool:
 
 
 # URLs, first. A URL starts at `scheme://` and runs to the next whitespace, quote or `>`, whatever
-# its host, port or length. Everything between `://` and the span's last `@` is userinfo, except an
-# `@` that starts an image digest (`repo@sha256:`). A password holding a whitespace, quote or `>`
-# ends that span early, so a later `@` followed by a host on the same line, before the next URL,
-# ends the userinfo too. The query and fragment are replaced whole, and so is what follows a `?` or
-# `#` written as `%3F` or `%23`; a path segment after a secret-named one (`/token/<v>`) is masked.
+# its host, port or length. Everything between `://` and the span's last at-sign is userinfo, except
+# an `@` that starts an image digest (`repo@sha256:`). An at-sign is `@`, and also `%40` or a
+# fullwidth or small at-sign (which NFKC folds to `@`, raw or percent-encoded as UTF-8) before any
+# `/`, `?` or `#`. A password
+# holding a whitespace, quote or `>` ends that span early, so when the span holds no complete host,
+# a later at-sign followed by a host on the same line, before the next URL, ends the userinfo too.
+# The query and fragment are replaced whole, and so is what follows a `?` or `#` written as `%3F` or
+# `%23`; a path segment after a secret-named one (`/token/<v>`, `/token%2F<v>`) is masked.
 _URL_START = re.compile(r"(?i)\b[a-z][a-z0-9+.-]{0,31}://")
 _URL_END = re.compile(r"[\s'\">]")
 _LINE_END = re.compile(r"[\r\n]")
-_DIGEST_AT = re.compile(r"@sha(?:256|384|512):")
-# An `@` followed by a host: a bracketed IPv6 address or dot-separated labels, then what can end a
-# host (a port, a path, a query, the end of the URL).
-_HOST_AT = re.compile(
-    r"@(?:\[[0-9A-Za-z:.%]+\]|[^\W_][\w-]*(?:\.[\w-]+)*)(?=[:/?#\s'\">),;\]]|$)"
+_AT_SIGNS = (
+    "@",
+    "%40",
+    "\uff20",
+    "\ufe6b",
+    "%EF%BC%A0",
+    "%ef%bc%a0",
+    "%EF%B9%AB",
+    "%ef%b9%ab",
 )
+_DIGEST = re.compile(r"sha(?:256|384|512):")
+# A host: a bracketed IPv6 address or dot-separated labels, then what can end a host (a port, a
+# path, a query, the end of the URL).
+_HOST = re.compile(r"(?:\[[0-9A-Za-z:.%]+\]|[^\W_][\w-]*(?:\.[\w-]+)*)(?=[:/?#\s'\">),;\]]|$)")
+# A span that starts with a complete host (dotted, bracketed or `localhost`, then a numeric port or
+# nothing) and ends or goes on to a path, query or fragment: its userinfo cannot run past the span.
+_COMPLETE_HOST = re.compile(
+    r"(?:\[[0-9A-Fa-f:.]+\]|[^\W_][\w-]*(?:\.[\w-]+)+|localhost)(?::\d{0,5})?(?:[/?#]|\Z)"
+)
+_AUTHORITY_END = re.compile(r"[/?#]")
 _QUERY_START = re.compile(r"[?#]|%3[Ff]|%23")
+_SEGMENT_SEPARATOR = re.compile(r"(/|%2[Ff])")
 _SEGMENT_NAME = re.compile(r"[A-Za-z_][\w.-]{0,127}")
+
+
+def _at_signs(text: str, start: int, end: int, authority_end: int):
+    """Every at-sign in ``text[start:end]``, last first, as ``(index, length)``.
+
+    ``@`` counts anywhere; its encoded and fullwidth forms only before ``authority_end``, so an
+    encoded `@` in a path (`/users/a%40b.example`) is not a userinfo separator.
+    """
+    found = {sign: text.rfind(sign, start, end) for sign in _AT_SIGNS}
+    while True:
+        sign = max(found, key=found.__getitem__)
+        at = found[sign]
+        if at == -1:
+            return
+        if sign == "@" or at < authority_end:
+            yield at, len(sign)
+        found[sign] = text.rfind(sign, start, at)
+
+
+def _authority_end(text: str, start: int, end: int) -> int:
+    stop = _AUTHORITY_END.search(text, start, end)
+    return stop.start() if stop else end
 
 
 def _mask_path(path: str) -> str:
     """``host/path`` with every segment that follows a secret-named segment replaced by ``***``."""
-    segments = path.split("/")
-    for index in range(2, len(segments)):
-        name = segments[index - 1]
-        if segments[index] and _SEGMENT_NAME.fullmatch(name) and _is_secret_name(name):
-            segments[index] = "***"
-    return "/".join(segments)
+    parts = _SEGMENT_SEPARATOR.split(path)
+    for index in range(4, len(parts), 2):
+        name = parts[index - 2]
+        if parts[index] and _SEGMENT_NAME.fullmatch(name) and _is_secret_name(name):
+            parts[index] = "***"
+    return "".join(parts)
 
 
 def _mask_url_span(span: str) -> str:
     """One URL's text after ``://``, without its userinfo, query and fragment."""
-    at = span.rfind("@")
-    while at != -1 and _DIGEST_AT.match(span, at):
-        at = span.rfind("@", 0, at)
+    at, size = -1, 0
+    for at, size in _at_signs(span, 0, len(span), _authority_end(span, 0, len(span))):
+        if not _DIGEST.match(span, at + size):
+            break
+    else:
+        at = -1
     rest = span
     head = ""
     if at != -1:
         # A `?` or `#` before that `@` means the `@` may sit in the query: keep nothing.
         if "?" in span[:at] or "#" in span[:at]:
             return "***"
-        head, rest = "***@", span[at + 1 :]
+        head, rest = f"***{span[at : at + size]}", span[at + size :]
     query = _QUERY_START.search(rest)
     if query:
         marker = "?" if query[0] in "?#" else query[0]
@@ -199,17 +242,18 @@ def _mask_url(url: str) -> str:
 
 
 def _userinfo_end(text: str, start: int, end: int, bound: int) -> int:
-    """Where the userinfo of the URL at ``text[start:end]`` ends (its `@`), or -1.
+    """Where the userinfo of the URL at ``text[start:end]`` ends (its at-sign), or -1.
 
-    A host-shaped `@` in ``text[end:bound]`` wins over one inside the span.
+    When the span holds no complete host, a host-shaped at-sign in ``text[end:bound]`` wins over
+    one inside the span.
     """
-    at = bound
-    while (at := text.rfind("@", end, at)) != -1:
-        if not _DIGEST_AT.match(text, at) and _HOST_AT.match(text, at):
-            return at
-    at = end
-    while (at := text.rfind("@", start, at)) != -1:
-        if not _DIGEST_AT.match(text, at):
+    if not _COMPLETE_HOST.match(text, start, end):
+        authority_end = _authority_end(text, start, bound)
+        for at, size in _at_signs(text, end, bound, authority_end):
+            if not _DIGEST.match(text, at + size) and _HOST.match(text, at + size):
+                return at
+    for at, size in _at_signs(text, start, end, _authority_end(text, start, end)):
+        if not _DIGEST.match(text, at + size):
             return at
     return -1
 
@@ -239,22 +283,21 @@ def _redact_urls(text: str) -> str:
 
 # Then userinfo without a scheme: a whitespace-free `user:pass@host` (a URL written without
 # `https://`, as aiohttp quotes it), and `user@host` followed by a port or a path, masked up to its
-# last `@`. An e-mail address (`user@example.com`) stays.
+# last at-sign. An e-mail address (`user@example.com`) stays.
 _RUN = re.compile(r"\S+")
 _RUN_LEAD = re.compile(r"(?:[A-Za-z_][\w.-]*=)?['\"(<\[/]*")
 
 
 def _mask_bare_userinfo(match: re.Match) -> str:
     run = match[0]
-    if "@" not in run or "://" in run:
+    if "://" in run or not any(sign in run for sign in _AT_SIGNS):
         return run
-    at = len(run)
-    while (at := run.rfind("@", 0, at)) != -1:
-        if not _DIGEST_AT.match(run, at) and (host := _HOST_AT.match(run, at)):
+    lead = _RUN_LEAD.match(run).end()
+    for at, size in _at_signs(run, 0, len(run), _authority_end(run, lead, len(run))):
+        if not _DIGEST.match(run, at + size) and (host := _HOST.match(run, at + size)):
             break
     else:
         return run
-    lead = _RUN_LEAD.match(run).end()
     if lead >= at:
         return run
     urlish = (
@@ -272,26 +315,39 @@ def _redact_bare_userinfo(text: str) -> str:
     return _RUN.sub(_mask_bare_userinfo, text)
 
 
-# Then secret-named values: `name=value`, `name: value`, `--name=value`, `'name': 'value'` and
-# headers such as `Authorization: Bearer v`, `Private-Token: v` and `Cookie: a=b; c=d`. Only the
-# name and separator are matched here; the value is read only after the name is known to be
-# secret, so a pair such as `url='...'` never hides what follows it.
+# Then secret-named values: `name=value`, `name: value`, `name => value`, `name%3Dvalue`,
+# `--name=value`, `--name value`, `'name': 'value'` and headers such as `Authorization: Bearer v`,
+# `Private-Token: v` and `Cookie: a=b; c=d`. Only the name and separator are matched here; the value
+# is read only after the name is known to be secret, so a pair such as `url='...'` never hides what
+# follows it.
 _NAMED_VALUE = re.compile(
     r"(?<![\w.])(?P<quote>['\"]?)(?P<name>[A-Za-z_][\w.-]{0,127})(?P=quote)"
-    r"(?P<index>(?:\[[^\]\s]{0,64}\])*)\]?\s*(?P<sep>[:=])\s*"
+    r"(?P<index>(?:\[[^\]\s]{0,64}\])*)\]?\s*(?P<sep>=>|[:=]|%3[Dd])\s*"
 )
+# A flag and its value after a space; a value that starts with `-` is the next flag.
+_FLAG_VALUE = re.compile(r"(?<![\w.-])--(?P<name>[A-Za-z_][\w.-]{0,127})[ \t]+(?=[^\s-])")
 # A class name before its message (`KeyError: 'x'`, `TokenRefreshError: ...`) names no value.
 _CLASS_NAME_WORDS = frozenset({"error", "exception", "warning"})
 # After a bare `key:` or `token:`, a quoted identifier (`invalid key: 'gpu_model'`) or an error
 # phrase (`Token: unexpected EOF`) is prose, not a secret.
 _PROSE_NAMES = frozenset({"key", "token"})
+# After a name made secret only by `session`, `credential(s)` or `auth` and a `:`, an error phrase
+# or a lower-case word followed by another word or a `:` is prose (`session: context deadline
+# exceeded`, `credentials: exec: "docker-credential-desktop": executable file not found`). An auth
+# scheme word is prose only before an error phrase (`auth: token expired`), so `auth: basic <v>` is
+# masked.
+_PROSE_WORD_NAMES = frozenset({"auth", "credential", "credentials", "session"})
 _QUOTED_IDENTIFIER = re.compile(r"(['\"])[A-Za-z_]{1,32}[0-9]{0,3}\1")
 _ERROR_PHRASE = re.compile(
     r"(?i)(?:unexpected|invalid|missing|expired|required|empty|malformed|unknown|not|none|null"
     r"|undefined|failed)\b"
 )
+_PROSE_WORD = re.compile(r"(?P<word>[a-z]{2,16})(?::\s|[ \t]{1,8}(?=(?P<next>[a-z]{2,}\b)))")
+_SCHEME_WORDS = frozenset({"bearer", "basic", "token", "digest"})
 _AUTH_SCHEME = re.compile(r"(?i)(?:bearer|basic|token|digest)\s{1,8}")
 _PLAIN_VALUE = re.compile(r"[^\s'\",;&]+")
+# After an encoded `=`, an encoded `&` ends the value too.
+_ENCODED_VALUE = re.compile(r"(?:(?!%26)[^\s'\",;&])+")
 _COOKIE_VALUE = re.compile(r"[^\r\n'\"]+")
 
 
@@ -306,7 +362,9 @@ def _quoted_value_end(text: str, start: int) -> int:
     return len(text)
 
 
-def _mask_named_value(text: str, name: str, start: int) -> tuple[str, int]:
+def _mask_named_value(
+    text: str, name: str, start: int, encoded: bool = False
+) -> tuple[str, int]:
     """The masked value of secret ``name`` starting at ``start``, and where the value ends."""
     lead = start
     if text.startswith(("b'", 'b"'), start):
@@ -319,10 +377,26 @@ def _mask_named_value(text: str, name: str, start: int) -> tuple[str, int]:
         return ("***", value.end()) if value else ("", start)
     scheme = _AUTH_SCHEME.match(text, start)
     lead = scheme.end() if scheme else start
-    value = _PLAIN_VALUE.match(text, lead)
+    value = (_ENCODED_VALUE if encoded else _PLAIN_VALUE).match(text, lead)
     if not value:
         return "", start
     return f"{text[start:lead]}***", value.end()
+
+
+def _names_only_prose_words(name: str) -> bool:
+    secret = [word for word in _name_words(name) if _is_secret_name(word)]
+    return bool(secret) and all(word in _PROSE_WORD_NAMES for word in secret)
+
+
+def _is_prose(text: str, at: int) -> bool:
+    if _ERROR_PHRASE.match(text, at):
+        return True
+    prose = _PROSE_WORD.match(text, at)
+    if not prose:
+        return False
+    if prose["word"] in _SCHEME_WORDS:
+        return prose["next"] is not None and bool(_ERROR_PHRASE.match(text, prose.start("next")))
+    return True
 
 
 def _names_a_secret(text: str, match: re.Match) -> bool:
@@ -332,9 +406,12 @@ def _names_a_secret(text: str, match: re.Match) -> bool:
         name = ""
     if not (_is_secret_name(name) or _is_secret_name(match["index"])):
         return False
-    if match["sep"] == ":" and not match["quote"] and name.lower() in _PROSE_NAMES:
+    if match["sep"] == ":":
         after = match.end()
-        return not (_QUOTED_IDENTIFIER.match(text, after) or _ERROR_PHRASE.match(text, after))
+        if not match["quote"] and name.lower() in _PROSE_NAMES:
+            return not (_QUOTED_IDENTIFIER.match(text, after) or _ERROR_PHRASE.match(text, after))
+        if _names_only_prose_words(name) and _is_prose(text, after):
+            return False
     return True
 
 
@@ -345,6 +422,20 @@ def _redact_named_values(text: str) -> str:
         parts.append(text[pos : match.end()])
         pos = match.end()
         if _names_a_secret(text, match):
+            encoded = match["sep"].startswith("%")
+            masked, pos = _mask_named_value(text, match["name"], pos, encoded)
+            parts.append(masked)
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _redact_flag_values(text: str) -> str:
+    parts: list[str] = []
+    pos = 0
+    while match := _FLAG_VALUE.search(text, pos):
+        parts.append(text[pos : match.end()])
+        pos = match.end()
+        if _is_secret_name(match["name"]):
             masked, pos = _mask_named_value(text, match["name"], pos)
             parts.append(masked)
     parts.append(text[pos:])
@@ -395,9 +486,13 @@ def redact(text: str, urls: tuple[str, ...] = ()) -> str:
     cut = len(text) > MAX_REDACTED_CHARS
     if cut:
         text = _drop_split_tail(text[:MAX_REDACTED_CHARS], urls)
+    # A carried URL longer than the cut text cannot appear in it whole; `_drop_split_tail` has
+    # already removed a partial copy.
     for url in urls:
-        text = text.replace(url, _mask_url(url))
+        if len(url) <= len(text):
+            text = text.replace(url, _mask_url(url))
     text = _redact_named_values(_redact_bare_userinfo(_redact_urls(text)))
+    text = _redact_flag_values(text)
     text = _TOKEN_FORMATS.sub("***", _AUTH_VALUE.sub(_mask_auth_value, text))
     # A `***` can be longer than the value it replaces; cutting the redacted text only shortens it.
     if len(text) > MAX_REDACTED_CHARS:
@@ -465,11 +560,14 @@ def _public_url(url: str) -> str:
 
     The userinfo, query and fragment are never published. A parse that leaves an `@` after the
     host (a password holding an unencoded `/`, `?` or `#`, read as host, port and path) is refused,
-    as is a URL without a scheme and host.
+    as is a URL without a scheme and host, and a host holding a `%` (yarl reads the userinfo
+    before an encoded `@` as part of the host).
     """
     try:
         parsed = URL(url)
         if not (parsed.absolute and parsed.scheme and parsed.raw_host):
+            return UNPARSEABLE_URL
+        if "%" in parsed.raw_host:
             return UNPARSEABLE_URL
         if "@" in f"{parsed.raw_path}{parsed.raw_query_string}{parsed.raw_fragment}":
             return UNPARSEABLE_URL
