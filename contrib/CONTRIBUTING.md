@@ -13,10 +13,12 @@ The following is a set of guidelines for contributing to `lium-io`, the Subnet 5
    1. [Refactoring](#refactoring)
    1. [Peer Review](#peer-review)
  1. [Suggesting Enhancements and Features](#suggesting-enhancements-and-features)
+1. [Running the Tests](#running-the-tests)
+1. [Releases](#releases)
 
 
 ## How Can I Contribute?
-Open an issue on [Datura-ai/lium-io](https://github.com/Datura-ai/lium-io/issues) describing the bug or the change you want, or pick one that is open. Fork the repository, branch from `main`, and open a pull request against `main` — the [README](../README.md) lists the layout and the exact test command for each neuron. Every pull request needs one approving review before it merges; the **Tests** workflow (validator, executor and miner suites) runs on every pull request against `main` or `dev` — keep it green.
+Open an issue on [Datura-ai/lium-io](https://github.com/Datura-ai/lium-io/issues) describing the bug or the change you want, or pick one that is open. Fork the repository, branch from `main`, and open a pull request against `main` — the [README](../README.md#architecture) describes the layout and [Running the Tests](#running-the-tests) below has the exact test command for each neuron. Every pull request needs one approving review before it merges; the **Tests** workflow (validator, executor and miner suites) runs on every pull request — keep it green.
 
 ## Communication Channels
 GitHub issues and pull requests on this repository. Providers running a node reach the team in the Lium Discord (linked from [docs.lium.io](https://docs.lium.io/providers)); questions about the code belong in an issue so the answer stays findable.
@@ -25,7 +27,7 @@ GitHub issues and pull requests on this repository. Providers running a node rea
 
 Here is a high-level summary:
 - Code consistency is crucial; adhere to established programming language conventions.
-- Use `black` to format your Python code; it ensures readability and consistency.
+- Use `ruff format` to format your Python code (the pre-commit hook in `.pre-commit-config.yaml` runs it); it ensures readability and consistency.
 - Write concise Git commit messages; summarize changes in ~50 characters.
 - Follow these six commit rules:
   - Atomic Commits: Focus on one task or fix per commit.
@@ -72,7 +74,7 @@ Please follow these steps to have your contribution considered by the maintainer
 *Before* creating the PR:
 1. Read the [development workflow](./DEVELOPMENT_WORKFLOW.md) defined for this repository to understand our workflow.
 2. Ensure your PR meets the criteria stated in the 'Pull Request Philosophy' section.
-3. Include relevant tests for any fixed bugs or new features as stated in the [testing guide](./TESTING.md).
+3. Include relevant tests for any fixed bugs or new features, and run them as described in [Running the Tests](#running-the-tests).
 4. Ensure your commit messages are clear and concise. Include the issue number if applicable.
 5. If you have multiple commits, rebase them into a single commit using `git rebase -i`.
 6. Explain what your changes do and why you think they should be merged in the PR description consistent with the [style guide](./STYLE.md).
@@ -101,7 +103,7 @@ After you submit a pull request, it will be reviewed by the maintainers. They ma
 ```bash
 git remote add upstream https://github.com/Datura-ai/lium-io.git
 git fetch upstream
-git merge upstream/<your-branch-name>
+git merge upstream/main
 git push origin <your-branch-name>
 ```
 
@@ -170,7 +172,7 @@ Explain the problem and include additional details to help maintainers reproduce
 * **Provide specific examples to demonstrate the steps**. Include links to files or GitHub projects, or copy/pasteable snippets, which you use in those examples. If you're providing snippets in the issue, use [Markdown code blocks](https://help.github.com/articles/markdown-basics/#multiple-lines).
 * **Describe the behavior you observed after following the steps** and point out what exactly is the problem with that behavior.
 * **Explain which behavior you expected to see instead and why.**
-* **Include screenshots and animated GIFs** which show you following the described steps and clearly demonstrate the problem. You can use [this tool](https://www.cockos.com/licecap/) to record GIFs on macOS and Windows, and [this tool](https://github.com/colinkeenan/silentcast) or [this tool](https://github.com/GNOME/byzanz) on Linux.
+* **Include screenshots and animated GIFs** which show you following the described steps and clearly demonstrate the problem. You can use [this tool](https://www.cockos.com/licecap/) to record GIFs on macOS and Windows, and [this tool](https://github.com/colinkeenan/silentcast) or [this tool](https://gitlab.gnome.org/Archive/byzanz) on Linux.
 * **If you're reporting that Bittensor crashed**, include a crash report with a stack trace from the operating system. On macOS, the crash report will be available in `Console.app` under "Diagnostic and usage information" > "User diagnostic reports". Include the crash report in the issue in a [code block](https://help.github.com/articles/markdown-basics/#multiple-lines), a [file attachment](https://help.github.com/articles/file-attachments-on-issues-and-pull-requests/), or put it in a [gist](https://gist.github.com/) and provide link to that gist.
 * **If the problem is related to performance or memory**, include a CPU profile capture with your report, if you're using a GPU then include a GPU profile capture as well. Look into the [PyTorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) to look at memory usage of your model.
 * **If the problem wasn't triggered by a specific action**, describe what you were doing before the problem happened and share more information using the guidelines below.
@@ -193,11 +195,11 @@ Include details about your configuration and environment:
 
 This section guides you through submitting an enhancement suggestion, including completely new features and minor improvements to existing functionality. Following these guidelines helps maintainers and the community understand your suggestion :pencil: and find related suggestions :mag_right:.
 
-When you are creating an enhancement suggestion, please [include as many details as possible](#how-do-i-submit-a-good-enhancement-suggestion). Fill in [the template](https://bit.ly/atom-behavior-pr), including the steps that you imagine you would take if the feature you're requesting existed.
+When you are creating an enhancement suggestion, please [include as many details as possible](#how-do-i-submit-a-good-enhancement-suggestion). Include the steps that you imagine you would take if the feature you're requesting existed.
 
 #### Before Submitting An Enhancement Suggestion
 
-* **Check the [debugging guide](./DEBUGGING.md).** for tips — you might discover that the enhancement is already available. Most importantly, check if you're using the latest version of the project first.
+* **Check the [documentation](https://docs.lium.io)** — you might discover that the enhancement is already available. Most importantly, check if you're using the latest version of the project first.
 
 #### How to Submit A (Good) Feature Suggestion
 
@@ -205,9 +207,49 @@ When you are creating an enhancement suggestion, please [include as many details
 * **Provide a step-by-step description of the suggested enhancement** in as many details as possible.
 * **Provide specific examples to demonstrate the steps**. Include copy/pasteable snippets which you use in those examples, as [Markdown code blocks](https://help.github.com/articles/markdown-basics/#multiple-lines).
 * **Describe the current behavior** and **explain which behavior you expected to see instead** and why.
-* **Include screenshots and animated GIFs** which help you demonstrate the steps or point out the part of the project which the suggestion is related to. You can use [this tool](https://www.cockos.com/licecap/) to record GIFs on macOS and Windows, and [this tool](https://github.com/colinkeenan/silentcast) or [this tool](https://github.com/GNOME/byzanz) on Linux.
+* **Include screenshots and animated GIFs** which help you demonstrate the steps or point out the part of the project which the suggestion is related to. You can use [this tool](https://www.cockos.com/licecap/) to record GIFs on macOS and Windows, and [this tool](https://github.com/colinkeenan/silentcast) or [this tool](https://gitlab.gnome.org/Archive/byzanz) on Linux.
 * **Explain why this enhancement would be useful** to most users.
 * **List some other text editors or applications where this enhancement exists.**
 * **Specify the name and version of the OS you're using.**
 
 Thank you for considering contributing to Bittensor! Any help is greatly appreciated along this journey to incentivize open and permissionless intelligence.
+
+## Running the Tests
+
+Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm project; the validator suite is the large one (about three minutes, SQLite — no Postgres needed). From the repository root, each service in its own subshell so the block runs top to bottom:
+
+```bash
+(cd neurons/validators && pdm install && \
+ BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
+ SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
+ ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
+ pdm run pytest tests/ -v --tb=short --strict-markers)
+
+(cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -v --tb=short)
+(cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
+(cd lium_protocol && pip install . pytest "pydantic==2.13.*" && python -m lium_protocol.schema --check && python -m pytest tests -v --tb=short)
+```
+
+These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
+
+- `route` reads the changed files (`.github/actions/changed-packages`), after dropping `*.md`, `.gitignore` and the root `docs/` tree — a README-only PR runs no neuron job.
+- Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed; the validators job also runs when `lium_protocol/` changed (its `tests/test_protocol_compat.py` replays the package's recordings).
+- `protocol` (the `lium_protocol` line above, pydantic pinned to `2.13.*` because the snapshot is pydantic's JSON Schema) runs when `lium_protocol/`, `datura/` or `.github/` changed.
+- `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
+- `lint` (`ruff format --check`, report-only, not required) runs per changed neuron.
+- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `lium_protocol/`, `datura/`, `.github/` or `e2e/` changed.
+- `tests-ok` is the one status check to require; it reports on every PR.
+
+Tests follow Arrange-Act-Assert, one behavior per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+
+## Releases
+
+Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` workflows from each neuron's `docker_build.sh` / `docker_publish.sh` (and the `*_runner_*` pair for the auto-updating runner image):
+
+| Tag pushed | Workflow | Images |
+|---|---|---|
+| `executor-v*` | `executor_cd_prod.yml` | `daturaai/compute-subnet-executor`, `daturaai/compute-subnet-executor-runner` |
+| `validator-v*` | `validator_cd_prod.yml` | `daturaai/compute-subnet-validator`, `daturaai/compute-subnet-validator-runner` |
+| `miner-v*` | `miner_cd_prod.yml` | `daturaai/compute-subnet-miner`, `daturaai/compute-subnet-miner-runner` |
+
+The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. `packages/lium-core/` has its own CI (`lium-core-ci.yml`) and is released by hand through `lium-core-release.yml`.
