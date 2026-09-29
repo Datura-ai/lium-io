@@ -220,8 +220,9 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     assert ctx.state.specs["available_port_count"] == 2
     assert count_result.passed is False
     assert count_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
-    assert count_result.event.what_we_saw["probed_port_count"] == BATCH_PORT_VERIFICATION_SIZE
-    assert count_result.event.what_we_saw["declared_port_count"] == 25536
+    what = count_result.event.what_we_saw
+    assert (what["probed_port_count"], what["declared_port_count"]) == (BATCH_PORT_VERIFICATION_SIZE, 25536)
+    assert (what["listing_check"], what["port_range"]) == ("INSUFFICIENT_PORTS", DECLARED_RANGE)
 
 
 @pytest.mark.asyncio
@@ -245,7 +246,9 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
     # exempt at the port check because the list still named the pod
     assert count_result.passed is True
     assert count_result.event.severity == "warning"
+    assert count_result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
     assert count_result.event.what_we_saw["listing_hidden"] is True
+    assert count_result.event.what_we_saw["exempt_because_rented"] is True
     assert "Hidden from renters: only 2 verified ports, need 3" in count_result.event.impact
     # the pod is gone, the run goes on as unrented and completes
     assert tenant_result.passed is True
@@ -332,16 +335,20 @@ async def test_topup_flag_reprobes_the_failed_ports_through_published_ports(cont
 
 
 @pytest.mark.asyncio
-async def test_topup_leaves_a_batch_at_the_floor_alone(context_factory, monkeypatch):
+@pytest.mark.parametrize("reachable", [MIN_PORT_COUNT, MIN_PORT_COUNT + 1])
+async def test_topup_leaves_a_batch_at_the_floor_alone(context_factory, monkeypatch, reachable):
     monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
-    batch, semi = HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts()
+    batch, semi = HostNetworkBatch(reachable=reachable), PublishedPorts()
     ctx = run_context(context_factory, connectivity(batch, semi, PublishedPorts()))
 
     _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
 
     assert semi.calls == []
-    assert ctx.state.verified_port_count == MIN_PORT_COUNT
+    assert ctx.state.verified_port_count == reachable
     assert ctx.default_extra["probe_tier"] == "batch"
+    assert count_result.passed is True
+    assert "listing_check" not in count_result.event.what_we_saw
 
 
 @pytest.mark.asyncio
@@ -602,40 +609,6 @@ def test_port_floor_what_names_the_range_or_the_mappings(
     assert (what["port_range"], what["port_mappings_declared"]) == (named_range, mappings_declared)
     assert what["no_ports_probed"] is (not probed)
     assert "port_mappings" not in what
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("reachable", "rented", "listing_check"),
-    [
-        (MIN_PORT_COUNT - 1, False, "INSUFFICIENT_PORTS"),
-        (MIN_PORT_COUNT - 1, True, "INSUFFICIENT_PORTS"),  # the rented exemption still passes
-        (MIN_PORT_COUNT, False, None),
-        (MIN_PORT_COUNT + 1, False, None),
-    ],
-)
-async def test_the_listing_check_is_the_code_the_portal_hides_a_low_port_node_under(
-    context_factory, reachable, rented, listing_check
-):
-    """Below the port floor the portal hides the node under INSUFFICIENT_PORTS; at it, lists it."""
-    ctx = run_context(
-        context_factory,
-        connectivity(HostNetworkBatch(reachable=reachable), PublishedPorts(), PublishedPorts()),
-        **({"rented_data": rented_with_one_pod()} if rented else {}),
-    )
-
-    _, ctx = await apply(ctx, PortConnectivityCheck())
-    count_result, _ = await apply(ctx, PortCountCheck())
-
-    assert ctx.state.verified_port_count == reachable
-    what = count_result.event.what_we_saw
-    assert what.get("listing_check") == listing_check
-    assert count_result.passed is (rented or not listing_check)
-    if listing_check:  # a scored-zero failure, or the rented exemption's warning
-        reason = "PORT_COUNT_RECORDED" if rented else "INSUFFICIENT_PORTS"
-        assert count_result.event.reason_code == getattr(PortCountMessages, reason).reason
-        assert what["port_range"] == DECLARED_RANGE
-        assert what.get("exempt_because_rented", False) is rented
 
 
 @pytest.mark.asyncio
