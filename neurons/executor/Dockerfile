@@ -93,7 +93,7 @@ RUN mv /root/app/libdmcompverify.so /usr/lib/ \
 # build of the liumd step-1 change (no release key exists yet), committed like the provers above and
 # pinned here by sha256. The child manifest is hashed from this image's own files, after the provers
 # are in place; run.sh writes the host settings at start.
-RUN echo "d8949e6d3e0e4e107693021e27f5b26cc24040f37c1470c7392917f84bee1d29  liumd/liumd" | sha256sum -c - \
+RUN echo "52ac48a88f8fb6a3fef489cc75b0a9d3a4d239f1ccc3a66f532731d858191a7b  liumd/liumd" | sha256sum -c - \
   && install -D -m 0755 liumd/liumd /usr/local/lib/liumd/liumd \
   && install -m 0755 liumd/liumd.sh /usr/local/bin/liumd \
   && rm -rf liumd \

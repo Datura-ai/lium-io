@@ -84,7 +84,7 @@ def _load_executor_host_files():
 class Image:
     """A temporary executor image: fake children, fixture docker, host files, the wrapper."""
 
-    def __init__(self, root: Path, validator_ss58: str):
+    def __init__(self, root: Path, validator_ss58: str, verifyx_script: str = VERIFYX_SCRIPT):
         self.root = root
         host_files = _load_executor_host_files()
         sys_root = root / "sys"
@@ -101,7 +101,7 @@ class Image:
             "python": python,
             "matmul_script": put("src/decrypt_challenge.sh", MATMUL_SCRIPT.encode()),
             "matmul": put("lib/libdmcompverify.so", b"matmul-lib"),
-            "verifyx_script": put("src/verifyx_executor.sh", VERIFYX_SCRIPT.encode()),
+            "verifyx_script": put("src/verifyx_executor.sh", verifyx_script.encode()),
             "verifyx": put("lib/libverifyx.so", VERIFYX_LIB),
             "inspector": put("lib/libinspector.so", b"inspector-lib"),
         }
@@ -390,8 +390,8 @@ async def test_the_shadow_compares_the_binarys_answer_with_todays_verdicts(
     image, keypair, monkeypatch
 ):
     validation, verifyx = _judging_services(monkeypatch)
-    # Below 2**63: see test_a_verifyx_seed_above_i64_is_accepted.
-    monkeypatch.setattr(vvs.random, "getrandbits", lambda bits: 2**62 + 7)
+    # The top of getrandbits(64)'s range.
+    monkeypatch.setattr(vvs.random, "getrandbits", lambda bits: 2**64 - 1)
     events = [
         _event("gpu.validate.verifyx", "VERIFYX_OK"),
         _event("gpu.validate.capability", "GPU_VERIFY_OK"),
@@ -437,18 +437,15 @@ async def test_the_shadow_compares_the_binarys_answer_with_todays_verdicts(
     assert [r["env"] for r in sshd.requests] == [{}]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the liumd step-1 binary reads VerifyXStep.seed as i64; the validator draws it with "
-        "random.getrandbits(64), so about half of real intents are refused (exit 2, invalid_intent)"
-    ),
-)
+# The validator draws the seed with random.getrandbits(64).
+@pytest.mark.parametrize("seed", [2**63 + 5, 2**64 - 1])
 @pytest.mark.asyncio
-async def test_a_verifyx_seed_above_i64_is_accepted(image, keypair):
+async def test_a_verifyx_seed_above_i64_reaches_the_child_as_sent(tmp_path, keypair, seed):
+    image = Image(tmp_path / "image", keypair.ss58_address, verifyx_script='echo "argv: $*"\n')
     async with FakeSshd(image.wrapper) as sshd, sshd.connect() as ssh:
         answer = await LiumdExecClient(keypair, timeout_s=60).run(
-            ssh, _intent(verifyx=VerifyXStep(seed=2**63 + 5, cipher_text="vx-challenge"))
+            ssh, _intent(verifyx=VerifyXStep(seed=seed, cipher_text="vx-challenge"))
         )
 
     assert isinstance(answer, LocalVerifyAnswer), answer
+    assert answer.steps["verifyx"].stdout.split()[:3] == ["argv:", "--seed", str(seed)]
