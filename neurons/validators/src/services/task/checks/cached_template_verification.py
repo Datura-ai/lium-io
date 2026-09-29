@@ -30,43 +30,49 @@ _PREFETCH_ERROR_CHARS = 200
 # How long the first sighting of a node without its image is remembered. Past it, a node that is
 # still uncached reopens the grace only while its executor's first sweep is also incomplete.
 _FIRST_UNCACHED_TTL_SECONDS = 30 * 24 * 3600
-# The executor's own error, quoted to the provider; the writer already caps it at 500.
-_QUOTED_ERROR_CHARS = 300
 # A failing NOT_CACHED whose prefetch document names no cause.
 _NOT_CACHED_NEXT_STEP = (
     "Run `docker pull {ref}` on the host to see why the executor's pre-pull could not fetch it; "
     "the executor retries on its own."
 )
 
-# First match wins, so the "No such image" of an executor that predates the stream-error capture
-# is read before the "404"/"not found" it also contains.
-_PULL_ERROR_NEXT_STEPS: tuple[tuple[tuple[str, ...], str], ...] = (
+# The executor publishes each error as {class, code, host, status} and never its text; an older
+# executor published the text, which is never quoted: only its code is read from it (first match
+# wins, so the "No such image" of an executor that predates the stream-error capture is read
+# before the "404"/"not found" it also contains). Each code maps to the provider's next step.
+_PULL_ERROR_NEXT_STEPS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     (
+        "image_missing",
         ("no such image",),
         "The pull ended without the image and the registry's own error was not recorded (older "
         "executor releases drop it): update the executor, then run `docker pull {ref}` on the "
         "host to see it.",
     ),
     (
+        "rate_limited",
         ("toomanyrequests", "rate limit"),
         "Docker Hub is rate-limiting this host: log its Docker daemon in to Docker Hub "
         "(`docker login`) or wait for the limit to reset.",
     ),
     (
+        "disk_full",
         ("no space left", "disk quota"),
         "The Docker root is out of space: free disk there; the executor retries on its own.",
     ),
     (
+        "registry_denied",
         ("unauthorized", "denied", "forbidden", "403"),
         "The registry refused the pull: check the Docker login and any registry-mirrors entry in "
         "/etc/docker/daemon.json.",
     ),
     (
+        "manifest_unknown",
         ("manifest unknown", "not found", "404"),
         "The registry, or a registry mirror in /etc/docker/daemon.json, does not serve this "
         "digest: remove or fix the mirror.",
     ),
     (
+        "registry_unreachable",
         (
             "timeout",
             "timed out",
@@ -81,6 +87,46 @@ _PULL_ERROR_NEXT_STEPS: tuple[tuple[tuple[str, ...], str], ...] = (
         "registry-1.docker.io and production.cloudflare.docker.com.",
     ),
 )
+# Network codes the executor reads from an error's type, sharing the unreachable registry's step.
+_NETWORK_CODES = frozenset({"timeout", "connect_error", "dns_error", "tls_error"})
+# Every code an executor may publish; anything else is read as "unknown".
+_ERROR_CODES = frozenset(
+    {
+        "timeout",
+        "connect_error",
+        "dns_error",
+        "tls_error",
+        "http_error",
+        "bad_response",
+        "invalid_url",
+        "image_missing",
+        "rate_limited",
+        "disk_full",
+        "registry_denied",
+        "manifest_unknown",
+        "registry_unreachable",
+        "pull_failed",
+        "docker_error",
+        "nvml_error",
+        "unknown",
+    }
+)
+_ERROR_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+_ERROR_HOST = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+    r"|\[[0-9a-f:.]{2,45}\]"
+)
+_ORIGIN = re.compile(rf"(?P<scheme>https?)://(?P<host>{_ERROR_HOST.pattern})")
+_UNPARSEABLE_URL = "<unparseable URL>"
+_STATE_ERROR_FIELDS = ("gpu_error", "docker_error", "last_backend_error", "last_loop_error", "last_error")
+_IMAGE_ERROR_FIELDS = (
+    "last_error",
+    "last_local_error",
+    "last_remote_error",
+    "last_pull_error",
+    "last_cleanup_error",
+)
+_TEMPLATE_FIELDS = frozenset({"docker_image", "docker_image_tag"})
 
 
 def _repo_digest(stdout: str | None, repo: str) -> str | None:
@@ -132,13 +178,6 @@ def _first_sweep_completed(state: dict | None) -> bool | None:
     return None
 
 
-def _quote(value: object) -> str:
-    text = " ".join(str(value).split())
-    if len(text) > _QUOTED_ERROR_CHARS:
-        text = text[:_QUOTED_ERROR_CHARS] + "…"
-    return f'"{text}"'
-
-
 def _error_mentions(lowered_error: str, needle: str) -> bool:
     # A status code must stand alone: a digest's hex can hold "403" or "404".
     if needle.isdigit():
@@ -146,10 +185,101 @@ def _error_mentions(lowered_error: str, needle: str) -> bool:
     return needle in lowered_error
 
 
-def _pull_error_next_step(error: str, ref: str) -> str:
+def _legacy_pull_code(error: str) -> str:
+    """The code an older executor's pull-error text names; the text itself goes no further."""
     lowered = error.lower()
-    for needles, step in _PULL_ERROR_NEXT_STEPS:
+    for code, needles, _ in _PULL_ERROR_NEXT_STEPS:
         if any(_error_mentions(lowered, needle) for needle in needles):
+            return code
+    return "unknown"
+
+
+def _error_record(value: object, *, pull: bool = False) -> dict | None:
+    """One published error as {class, code, host, status}, each checked; no free text survives.
+
+    An older executor's text becomes its code (for a pull error) or "unknown".
+    """
+    if value is None:
+        return None
+    record = {"class": None, "code": "unknown", "host": None, "status": None}
+    if isinstance(value, dict):
+        cls, code, host, status = (value.get(key) for key in ("class", "code", "host", "status"))
+        if isinstance(cls, str) and _ERROR_CLASS.fullmatch(cls):
+            record["class"] = cls
+        if code in _ERROR_CODES:
+            record["code"] = code
+        if isinstance(host, str) and _ERROR_HOST.fullmatch(host):
+            record["host"] = host
+        if type(status) is int and 100 <= status <= 599:
+            record["status"] = status
+    elif isinstance(value, str) and pull:
+        record["code"] = _legacy_pull_code(value)
+    return record
+
+
+def _public_backend_url(value: object) -> str | None:
+    if value == _UNPARSEABLE_URL:
+        return value
+    return value if isinstance(value, str) and _ORIGIN.fullmatch(value) else None
+
+
+def _public_prefetch_state(state: dict) -> dict:
+    """The executor's document with every error, the backend URL and the malformed template
+    reduced to what the check publishes: no text an error or an older executor carried."""
+    public = dict(state)
+    for key in _STATE_ERROR_FIELDS:
+        if key in public:
+            public[key] = _error_record(public[key])
+    if "backend_url" in public:
+        public["backend_url"] = _public_backend_url(public["backend_url"])
+    if "last_malformed_template" in public:
+        malformed = public["last_malformed_template"]
+        missing = malformed.get("missing") if isinstance(malformed, dict) else None
+        public["last_malformed_template"] = (
+            {"missing": [name for name in missing if name in _TEMPLATE_FIELDS]}
+            if isinstance(missing, list)
+            else None
+        )
+    images = public.get("images")
+    if isinstance(images, dict):
+        public["images"] = {
+            ref: (
+                {
+                    **record,
+                    **{
+                        key: _error_record(record[key], pull=key in ("last_pull_error", "last_error"))
+                        for key in _IMAGE_ERROR_FIELDS
+                        if key in record
+                    },
+                }
+                if isinstance(record, dict)
+                else record
+            )
+            for ref, record in images.items()
+        }
+    return public
+
+
+def _describe_error(record: dict | None) -> str:
+    """``code (class, HTTP status, host host)``, from the parts the record holds."""
+    if not record:
+        return "no reason recorded"
+    details = [
+        part
+        for part in (
+            record.get("class"),
+            f"HTTP {record['status']}" if record.get("status") else None,
+            f"host {record['host']}" if record.get("host") else None,
+        )
+        if part
+    ]
+    return f"{record['code']} ({', '.join(details)})" if details else record["code"]
+
+
+def _pull_error_next_step(record: dict, ref: str) -> str:
+    code = "registry_unreachable" if record["code"] in _NETWORK_CODES else record["code"]
+    for step_code, _, step in _PULL_ERROR_NEXT_STEPS:
+        if step_code == code:
             return step.format(ref=ref)
     return f"Run `docker pull {ref}` on the host to reproduce it."
 
@@ -174,6 +304,7 @@ def _remediation_from_prefetch_state(
             f"executor, then run `docker pull {pull_ref}` on the host to see why {why}."
         )
     # The document comes from the provider's host: a wrong shape names no cause, never raises.
+    state = _public_prefetch_state(state)
     images = state.get("images")
     record = images.get(image_ref) if isinstance(images, dict) else None
     if not isinstance(record, dict):
@@ -189,8 +320,8 @@ def _remediation_from_prefetch_state(
     # A later up-to-date sweep or disk skip does not clear an older pull error.
     if pull_error and record.get("last_outcome") not in ("pull_ok", "up_to_date"):
         return (
-            f"The executor's last pull of {image_ref} failed: {_quote(pull_error)}. "
-            f"{_pull_error_next_step(str(pull_error), pull_ref)}"
+            f"The executor's last pull of {image_ref} failed: {_describe_error(pull_error)}. "
+            f"{_pull_error_next_step(pull_error, pull_ref)}"
         )
     loop_outcome = state.get("last_outcome")
     if loop_outcome == "prefetch_disabled_no_backend_url":
@@ -200,23 +331,23 @@ def _remediation_from_prefetch_state(
         )
     if loop_outcome == "docker_unavailable":
         return (
-            f"The executor's pre-pull cannot reach Docker ({_quote(state.get('docker_error'))}): "
+            f"The executor's pre-pull cannot reach Docker ({_describe_error(state.get('docker_error'))}): "
             "check that /var/run/docker.sock is mounted into the executor container."
         )
     if loop_outcome == "gpu_unknown":
         return (
-            f"The executor's pre-pull cannot read the GPU ({_quote(state.get('gpu_error'))}), so "
+            f"The executor's pre-pull cannot read the GPU ({_describe_error(state.get('gpu_error'))}), so "
             "it does not know which image to pull: check the NVIDIA driver and that the executor "
             "container sees the GPUs."
         )
     if loop_outcome == "backend_no_templates":
         return (
             f"The executor's pre-pull got no image from the backend "
-            f"({_quote(state.get('last_backend_error'))}): check that the executor can reach "
+            f"({_describe_error(state.get('last_backend_error'))}): check that the executor can reach "
             f"{state.get('backend_url') or 'the backend'}."
         )
     if loop_outcome == "loop_error" and state.get("last_loop_error"):
-        return f"The executor's pre-pull loop failed: {_quote(state['last_loop_error'])}."
+        return f"The executor's pre-pull loop failed: {_describe_error(state['last_loop_error'])}."
     if not cached and record.get("last_pull_ok_at") and record.get("last_outcome") in (
         "pull_ok",
         "up_to_date",
@@ -257,7 +388,8 @@ class CachedTemplateVerificationCheck:
     DAH-2470: on the failure path only, the event also carries ``prefetch_state`` — the
     executor's own record of what its cache-prefetch loop was doing — so the reason a node
     holds a stale image is readable in Grafana without SSHing anywhere. The failure's remediation
-    quotes that document: the executor's own pull error and the step it points to.
+    names the executor's own pull error by its reason code, class, status and host, and the step
+    it points to; no error text from the document is attached or quoted.
 
     With ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED``, a node this validator has only just
     found without the image is held as PENDING (passed, score untouched by this check) while its
@@ -305,7 +437,7 @@ class CachedTemplateVerificationCheck:
             return {"unavailable": "unparseable", "raw_prefix": raw[:_PREFETCH_ERROR_CHARS]}
         if not isinstance(state, dict):
             return {"unavailable": "unparseable", "raw_prefix": raw[:_PREFETCH_ERROR_CHARS]}
-        return state
+        return _public_prefetch_state(state)
 
     async def _fresh_node_grace(self, ctx: Context, prefetch_state: dict) -> FreshNodeGrace | None:
         """Whether a node found without its image is still inside its fresh-node grace.
