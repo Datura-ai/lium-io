@@ -22,13 +22,16 @@ delivered as files, never as environment variables, so they don't show up in `do
 
 ## Wait for `.ready` before reading
 
-Secrets arrive shortly after the container starts, not before. A command that reads them at boot
-should wait for the marker first, with a timeout (here 2 minutes):
+Secrets arrive after the container starts, not before: they are written only once the pod's SSH
+server and Jupyter are set up. On an image without them that setup installs them first, which took
+about 70 seconds on `ubuntu:24.04` and takes longer on a slow host. A command that reads them at
+boot should wait for the marker first, with a generous timeout (here 10 minutes), so it does not
+exit, and get restarted by Docker, before the secrets arrive:
 
 ```sh
 i=0
 until [ -f /run/lium/secrets/.ready ]; do
-  i=$((i + 1)); [ "$i" -gt 600 ] && { echo "secrets not delivered" >&2; exit 1; }
+  i=$((i + 1)); [ "$i" -gt 3000 ] && { echo "secrets not delivered" >&2; exit 1; }
   sleep 0.2
 done
 export HF_TOKEN="$(cat /run/lium/secrets/HF_TOKEN)"
@@ -45,7 +48,7 @@ In Python:
 ```python
 import os, sys, time
 
-deadline = time.monotonic() + 120
+deadline = time.monotonic() + 600
 while not os.path.exists("/run/lium/secrets/.ready"):
     if time.monotonic() > deadline:
         sys.exit("secrets not delivered")

@@ -3327,10 +3327,7 @@ async def test_a_start_request_on_a_running_pod_records_nothing(docker_service, 
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_a_start_request_is_recorded_when_the_state_before_it_cannot_be_read(docker_service, monkeypatch):
-    ssh_client, record_command, executor_info = _start_request_harness(docker_service, monkeypatch)
-    docker_client = docker_service.rental_docker_client_factory.client
+def _fail_the_read_before_the_start(docker_client) -> None:
     read_after_start = docker_client.inspect_container_state.side_effect
 
     async def _inspect(*, container_name: str):
@@ -3340,9 +3337,47 @@ async def test_a_start_request_is_recorded_when_the_state_before_it_cannot_be_re
 
     docker_client.inspect_container_state = AsyncMock(side_effect=_inspect)
 
-    await _start_existing(docker_service, executor_info, record_platform_start=True)
 
-    assert record_command in _ran(ssh_client)
+@pytest.mark.asyncio
+async def test_a_start_request_is_not_recorded_when_the_state_before_it_cannot_be_read(
+    docker_service, monkeypatch, caplog
+):
+    # a record exempts the container for good, so an unsure start must flag rather than hide
+    ssh_client, _, executor_info = _start_request_harness(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    _fail_the_read_before_the_start(docker_client)
+
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert docker_client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    assert any("the platform start is not recorded" in str(record.msg) for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_an_edit_rollback_is_not_recorded_when_the_state_before_it_cannot_be_read(
+    docker_service, monkeypatch, caplog
+):
+    ssh_client, _, _ = _start_request_harness(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    _fail_the_read_before_the_start(docker_client)
+
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await docker_service._bring_up_existing_container(
+            docker_client=docker_client,
+            ssh_client=ssh_client,
+            container_name="pod_test",
+            local_volume_path="/root",
+            pod_id="pod-id",
+            default_extra={},
+        )
+
+    assert docker_client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    assert any("the platform start is not recorded" in str(record.msg) for record in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -790,7 +790,10 @@ async def _record_platform_start(
 
     `started_at_before` is the `StartedAt` read before the start: when it is unchanged the pod was
     already running (Docker answers 304), the platform started nothing, and recording that run would
-    hide an earlier restart from the probe.
+    hide an earlier restart from the probe. A caller that could not read it records nothing.
+
+    A record exempts its container from the probe for good. Any future path that sends secrets again
+    to an existing container must delete that container's record first.
     """
     try:
         state = await docker_client.inspect_container_state(container_name=container_name)
@@ -815,6 +818,17 @@ async def _record_platform_start(
                 extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
             )
         )
+
+
+def _warn_platform_start_unrecorded(container_name: str, default_extra: dict, exc: Exception) -> None:
+    logger.warning(
+        _m(
+            "Could not read the pod container's state before the start; the platform start is not recorded",
+            extra=get_extra_info(
+                {**default_extra, "container_name": container_name, "error": f"{type(exc).__name__}: {exc}"}
+            ),
+        )
+    )
 
 
 class _EditSwap:
@@ -7290,8 +7304,9 @@ class DockerService:
                     started_at_before = (
                         await docker_client.inspect_container_state(container_name=container_name)
                     ).started_at
-                except Exception:  # noqa: BLE001 — unread, the start is recorded as before
-                    pass
+                except Exception as exc:  # noqa: BLE001 — unread, the start goes unrecorded
+                    record_platform_start = False
+                    _warn_platform_start_unrecorded(container_name, default_extra, exc)
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start)
             await run_logged_rental_docker_sdk_operation(
@@ -7333,12 +7348,14 @@ class DockerService:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
         holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
         started_at_before = None
+        record_platform_start = True
         try:
             started_at_before = (
                 await docker_client.inspect_container_state(container_name=container_name)
             ).started_at
-        except Exception:  # noqa: BLE001 — unread, the start is recorded as before
-            pass
+        except Exception as exc:  # noqa: BLE001 — unread, the start goes unrecorded
+            record_platform_start = False
+            _warn_platform_start_unrecorded(container_name, default_extra, exc)
         await run_logged_rental_docker_sdk_operation(
             operation="start_container",
             log_extra=default_extra,
@@ -7346,9 +7363,10 @@ class DockerService:
             container_name=container_name,
         )
         # the undo empties the secrets tmpfs by design; recorded before the remount, which may still fail
-        await _record_platform_start(
-            docker_client, ssh_client, container_name, default_extra, started_at_before
-        )
+        if record_platform_start:
+            await _record_platform_start(
+                docker_client, ssh_client, container_name, default_extra, started_at_before
+            )
         await self._restore_mount_and_sshd_after_start(
             docker_client=docker_client,
             ssh_client=ssh_client,

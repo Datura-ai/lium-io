@@ -1148,7 +1148,9 @@ def build_pod_secrets_handover_spec(
 # and must not blame the host. A container with no record (a host reboot, a Docker restart or a crash
 # with no platform start before it) is flagged as before; a reboot from the pod page re-creates the
 # container under a new ID, which has no record. A start request on a pod that was already running
-# records nothing (see `_record_platform_start`).
+# records nothing, nor does a start whose state before it could not be read (see `_record_platform_start`).
+# Any future path that sends secrets again to an existing container must delete that container's record
+# first, or a later loss of those secrets is never flagged.
 # The validator's SSH lands in the executor container, whose /var/lib/lium is its writable layer and is
 # gone after every executor update. The record lives on the `reserve_data` named volume the executor
 # compose files mount at POD_PLATFORM_STARTS_VOLUME, which outlives a recreate and is mounted into no pod.
