@@ -545,9 +545,13 @@ def _async(value):
     return call
 
 
-@pytest.mark.parametrize("open_ports", [set(range(60000, 65536)), set()], ids=["lifted", "still-failing"])
+@pytest.mark.parametrize(
+    "open_ports", [set(range(60000, 65536)), set()], ids=["lifted", "still-failing"]
+)
 @pytest.mark.asyncio
-async def test_pass_two_ports_reach_the_events_probed_and_failed_counts(topup_on, context_factory, open_ports):
+async def test_pass_two_ports_reach_the_events_probed_and_failed_counts(
+    topup_on, context_factory, open_ports
+):
     info = _info(port_range="40000-65535")
     main, _, new, new_host = await _both(Host(open_ports=open_ports), info)
 
@@ -557,7 +561,9 @@ async def test_pass_two_ports_reach_the_events_probed_and_failed_counts(topup_on
     assert new.selected_ports[: len(main.selected)] == main.selected
     assert [p.external for p in new.selected_ports[len(main.selected) :]] == list(two)
     two_failed = {e for e in two if e not in open_ports}
-    assert set(new.failed_ports) == set(main.failed) | {p for p in new.selected_ports if p.external in two_failed}
+    assert set(new.failed_ports) == set(main.failed) | {
+        p for p in new.selected_ports if p.external in two_failed
+    }
     assert len(new.failed_ports) == len(main.failed) + len(two_failed)
 
     ctx = context_factory(
@@ -585,7 +591,10 @@ async def test_pass_two_ports_reach_the_events_probed_and_failed_counts(topup_on
     else:
         assert new.status == "no_working_ports"
         assert event.what_we_saw["failed_ports"] == len(main.failed) + BATCH_PORT_VERIFICATION_SIZE
-        assert event.what_we_saw["total_ports_tested"] == len(main.failed) + BATCH_PORT_VERIFICATION_SIZE
+        assert (
+            event.what_we_saw["total_ports_tested"]
+            == len(main.failed) + BATCH_PORT_VERIFICATION_SIZE
+        )
 
 
 @pytest.mark.asyncio
