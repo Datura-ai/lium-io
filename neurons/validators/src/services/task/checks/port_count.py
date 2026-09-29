@@ -30,16 +30,17 @@ def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
 
-# The platform's code for "the listing hides this node for too few verified ports" (lium-platform
-# services/node_verification.py). Not INSUFFICIENT_PORTS: that one means this run failed and scored 0.
-LISTING_PORT_CHECK_CODE = "INSUFFICIENT_VERIFIED_PORTS"
+# The code the platform's listing check shows when it hides a node for too few verified ports.
+# It is the same string as this check's own failure reason, but `listing_check` names the
+# listing's verdict, which a rented node below the floor gets while its run passes.
+LISTING_PORT_CHECK_CODE = "INSUFFICIENT_PORTS"
 
 
 def declares_port_mappings(raw: Any) -> bool:
     """True when `raw` holds at least one [internal, external] pair.
 
-    Mirrors lium-platform `_parse_nat_mapping` (utils/prepare_ports_data.py): `[]`, `"[]"`, `"{}"` and
-    unparsable text declare no mappings, so the platform check names the port range instead.
+    Same rule as the platform's port-mapping parser: `[]`, `"[]"`, `"{}"` and unparsable text
+    declare no mappings, so the platform's listing check reads the port range instead.
     """
     if not raw:
         return False
@@ -60,7 +61,9 @@ def port_floor_what(state: ContextState, available_port_count: int) -> dict[str,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
         "listing_check": LISTING_PORT_CHECK_CODE,
-        "port_range": None if port_mappings_declared else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
+        "port_range": None
+        if port_mappings_declared
+        else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
         "port_mappings_declared": port_mappings_declared,
         "probed_port_count": state.probed_port_count,
         "declared_port_count": state.declared_port_count,

@@ -258,7 +258,7 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
         "available_port_count": 2,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
-        "listing_check": "INSUFFICIENT_VERIFIED_PORTS",
+        "listing_check": "INSUFFICIENT_PORTS",
         "port_range": "40000-65535",
         "port_mappings_declared": False,
         "probed_port_count": BATCH_PORT_VERIFICATION_SIZE,
@@ -578,8 +578,13 @@ async def test_finalize_keeps_the_score_warning_and_adds_the_port_floor_fix(cont
 
 
 @pytest.mark.asyncio
-async def test_the_scored_zero_failure_names_the_listing_check_and_the_declared_range(context_factory):
-    ctx = run_context(context_factory, connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()))
+async def test_the_scored_zero_failure_names_the_listing_check_and_the_declared_range(
+    context_factory,
+):
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+    )
 
     _, ctx = await apply(ctx, PortConnectivityCheck())
     count_result, _ = await apply(ctx, PortCountCheck())
@@ -588,7 +593,7 @@ async def test_the_scored_zero_failure_names_the_listing_check_and_the_declared_
     assert count_result.passed is False
     assert count_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
     what = count_result.event.what_we_saw
-    assert what["listing_check"] == LISTING_PORT_CHECK_CODE == "INSUFFICIENT_VERIFIED_PORTS"
+    assert what["listing_check"] == LISTING_PORT_CHECK_CODE == "INSUFFICIENT_PORTS"
     assert (what["available_port_count"], what["required"]) == (2, MIN_PORT_COUNT)
     assert what["port_range"] == DECLARED_RANGE and what["port_mappings_declared"] is False
     assert what["held_by_orphaned_containers"] == []
@@ -609,7 +614,7 @@ async def test_the_rented_exemption_still_passes_and_names_the_listing_check(con
     assert count_result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
     assert count_result.event.severity == "warning"
     what = count_result.event.what_we_saw
-    assert what["listing_check"] == "INSUFFICIENT_VERIFIED_PORTS"
+    assert what["listing_check"] == "INSUFFICIENT_PORTS"
     assert what["port_range"] == DECLARED_RANGE
     assert what["exempt_because_rented"] is True
 
@@ -636,7 +641,9 @@ def test_declared_port_mappings_drop_a_declared_range_too():
         probed_port_count=2,
         declared_port_count=2,
     )
-    range_only = SimpleNamespace(specs={"port_range": DECLARED_RANGE}, probed_port_count=2, declared_port_count=2)
+    range_only = SimpleNamespace(
+        specs={"port_range": DECLARED_RANGE}, probed_port_count=2, declared_port_count=2
+    )
 
     assert port_floor_what(both, 1)["port_range"] is None
     assert port_floor_what(both, 1)["port_mappings_declared"] is True
@@ -647,7 +654,9 @@ def test_declared_port_mappings_drop_a_declared_range_too():
 @pytest.mark.parametrize("declared_range", [None, ""])
 def test_no_declared_range_or_mappings_reports_the_default_probed_range(declared_range):
     state = SimpleNamespace(
-        specs={"port_range": declared_range, "port_mappings": None}, probed_port_count=2, declared_port_count=2
+        specs={"port_range": declared_range, "port_mappings": None},
+        probed_port_count=2,
+        declared_port_count=2,
     )
 
     what = port_floor_what(state, 1)
@@ -669,3 +678,23 @@ def test_empty_or_unparsable_port_mappings_are_not_declared_and_the_range_is_nam
 
     assert what["port_mappings_declared"] is False
     assert what["port_range"] == DECLARED_RANGE
+
+
+def test_the_listing_check_is_the_code_the_portal_hides_a_low_port_node_under():
+    """The portal hides a node below the port floor under INSUFFICIENT_PORTS; the event names it."""
+    assert LISTING_PORT_CHECK_CODE == "INSUFFICIENT_PORTS"
+
+
+def test_a_range_next_to_empty_mappings_is_named_while_the_event_shows_no_ports_probed():
+    """The listing check reads the range; this run probed the empty mapping list, so 0 ports."""
+    state = SimpleNamespace(
+        specs={"port_range": DECLARED_RANGE, "port_mappings": "[]"},
+        probed_port_count=0,
+        declared_port_count=0,
+    )
+
+    what = port_floor_what(state, 0)
+
+    assert what["port_range"] == DECLARED_RANGE
+    assert what["port_mappings_declared"] is False
+    assert (what["probed_port_count"], what["declared_port_count"]) == (0, 0)
