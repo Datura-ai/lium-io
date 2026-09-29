@@ -681,9 +681,25 @@ def test_empty_or_unparsable_port_mappings_are_not_declared_and_the_range_is_nam
     assert what["port_range"] == DECLARED_RANGE
 
 
-def test_the_listing_check_is_the_code_the_portal_hides_a_low_port_node_under():
-    """The portal hides a node below the port floor under INSUFFICIENT_PORTS; the event names it."""
-    assert LISTING_PORT_CHECK_CODE == "INSUFFICIENT_PORTS"
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reachable", "listing_check"),
+    [(MIN_PORT_COUNT - 1, "INSUFFICIENT_PORTS"), (MIN_PORT_COUNT, None), (MIN_PORT_COUNT + 1, None)],
+)
+async def test_the_listing_check_is_the_code_the_portal_hides_a_low_port_node_under(
+    context_factory, reachable, listing_check
+):
+    """The portal hides a node below the port floor under INSUFFICIENT_PORTS; a node at the floor is listed."""
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=reachable), PublishedPorts(), PublishedPorts()),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
+
+    assert ctx.state.verified_port_count == reachable
+    assert count_result.event.what_we_saw.get("listing_check") == listing_check
 
 
 @pytest.mark.asyncio
