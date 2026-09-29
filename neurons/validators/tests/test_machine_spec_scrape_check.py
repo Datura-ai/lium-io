@@ -743,7 +743,9 @@ FORGED_FAIL = {
 
 
 @pytest.mark.asyncio
-async def test_forged_host_fields_are_capped_in_the_scrape_error(context_factory, vloopback_enforcement):
+async def test_forged_host_fields_are_capped_in_the_scrape_error(
+    context_factory, vloopback_enforcement
+):
     # Arrange
     vloopback_enforcement(True)
 
