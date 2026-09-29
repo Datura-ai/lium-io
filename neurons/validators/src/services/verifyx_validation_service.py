@@ -1,13 +1,16 @@
 import ctypes
 import json
+import math
 import random
 import os
 import logging
+import re
+import shlex
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
-from core.config import settings, FeatureFlag
+from core.config import FeatureFlag, settings
 from core.utils import _m, get_extra_info
 from core.checksums import sha256_from_executor, sha256_from_path
 
@@ -27,6 +30,15 @@ STDERR_TAIL_BYTES = 2048
 # minutes, so this is generous — it only cuts true hangs (same silent-hang class as the
 # matrix check, DAH-2365) instead of blocking until the outer JOB_TIME_OUT cancellation.
 VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
+
+# LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
+LIB_PATH = "/usr/lib/libverifyx.so"
+# Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
+# a host that failed the probe for its own reason can mention that URL.
+_CLOUDFLARE_PROBE_FAIL_RX = re.compile(
+    r"429|timeout|timed out|outage|connection refused|rate.?limit",
+    re.I,
+)
 
 
 class VerifyXFailureClass(str, Enum):
@@ -160,35 +172,91 @@ class VerifyXChallenge:
     expected_lib_sha256: str
 
 
+@dataclass
+class NetworkGateTally:
+    """DAH-2774: the download-EMA floor (checks/verifyx.py) counted per node since the last
+    summary. `probe_fallback` is a Cloudflare failure that used the package download instead of
+    feeding the EMA a zero."""
+
+    capacity_pass: int = 0
+    capacity_fail: int = 0
+    unmeasured: int = 0
+    probe_failed: int = 0
+    probe_fallback: int = 0
+
+    def record(self, capacity_ema: float | None, floor_mbps: float, fallback: bool = False) -> None:
+        # probe_fallback is incremented in `_package_fallback_stats` once per probe, not here.
+        if capacity_ema is None:
+            self.unmeasured += 1
+            return
+        if capacity_ema >= floor_mbps:
+            self.capacity_pass += 1
+        else:
+            self.capacity_fail += 1
+
+    def record_probe_failed(self) -> None:
+        self.probe_failed += 1
+
+    def log_and_reset(self, floor_mbps: float, default_extra: dict) -> dict[str, int]:
+        counts = {name: getattr(self, name) for name in self.__dataclass_fields__}
+        message = (
+            "VerifyX network gate summary "
+            f"floor_mbps={floor_mbps:.0f} "
+            + " ".join(f"{name}={value}" for name, value in counts.items())
+        )
+        logger.info(
+            _m(
+                message,
+                extra=get_extra_info({**default_extra, "floor_mbps": floor_mbps, **counts}),
+            )
+        )
+        for name in counts:
+            setattr(self, name, 0)
+        return counts
+
+
+# One per process: the validator and the ioc container each build a VerifyXValidationService.
+NETWORK_GATE_TALLY = NetworkGateTally()
+
+
 class VerifyXValidationService:
     def __init__(self):
-        self.lib_name = "/usr/lib/libverifyx.so"
-        self._lib_sha256: str | None = None
+        self.lib_name = LIB_PATH
+        self._lib_sha256s: dict[str, str] = {}
 
-    def lib_sha256(self) -> str:
-        """sha256 of the validator's own libverifyx.so, read once per process.
+    def gated_lib_name(self) -> str:
+        """The one library: libverifyx.so."""
+        return self.lib_name
 
-        The file changes only with a validator upgrade, which restarts the process, so both readers
+    def lib_sha256(self, lib_name: str | None = None) -> str:
+        """sha256 of one of the validator's own libraries (the gated one by default), read once per process.
+
+        The files change only with a validator upgrade, which restarts the process, so both readers
         (the SSH path's checksum gate and the challenge's `expected_lib_sha256`) share one digest.
         """
-        if self._lib_sha256 is None:
-            self._lib_sha256 = sha256_from_path(self.lib_name)
-        return self._lib_sha256
+        lib_name = lib_name or self.gated_lib_name()
+        if lib_name not in self._lib_sha256s:
+            self._lib_sha256s[lib_name] = sha256_from_path(lib_name)
+        return self._lib_sha256s[lib_name]
 
     def prepare_verifyx_challenge(
         self,
         machine_spec: dict,
         default_extra: dict,
         challenge_config_overrides: dict | None = None,
+        *,
+        lib_name: str | None = None,
     ) -> "VerifyXChallenge":
         """Encrypt one VerifyX challenge; the caller decides how it reaches the executor.
 
         The SSH path runs `verifyx_executor.py --seed … --cipher_text …` over the shell; the local
         path (liumd phase 1, `POST /verify`) sends the same two arguments in the intent. Either way
         the response comes back to `evaluate_verifyx_capture`, the one place that decides.
+        `lib_name` defaults to the gated library.
         """
         # challenge_config_overrides (DAH-3011): keys of the challenge `config` block to replace for
         # this run — a first, unscored verification writes less RAM/disk. None = today's config.
+        lib_name = lib_name or self.gated_lib_name()
         gpu_details = machine_spec.get("gpu", {}).get("details", [])
         gpu_count = machine_spec.get("gpu", {}).get("count", 0)
         gpu_uuids = ",".join([detail.get("uuid", "") for detail in gpu_details])
@@ -197,7 +265,7 @@ class VerifyXValidationService:
         gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
 
         seed = random.getrandbits(64)
-        verifyx_validator = VerifyXValidator(self.lib_name, seed)
+        verifyx_validator = VerifyXValidator(lib_name, seed)
 
         challenge_config = {
             "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
@@ -229,7 +297,7 @@ class VerifyXValidationService:
             cipher_text=cipher_text,
             challenge_input=challenge_input,
             log_extra=log_extra,
-            expected_lib_sha256=self.lib_sha256(),
+            expected_lib_sha256=self.lib_sha256(lib_name),
         )
 
     def evaluate_verifyx_capture(
@@ -268,6 +336,7 @@ class VerifyXValidationService:
         try:
             payload = challenge.validator.verify_response(challenge_response)
             verification_result = _perform_verification_checks(payload)
+            _log_verifyx_network_speeds(verification_result.get("network") or {}, default_extra)
             return VerifyXResponse(data=verification_result)
         except Exception as e:
             return self._failure_response(
@@ -289,17 +358,67 @@ class VerifyXValidationService:
         # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
         try:
             # Verify checksum before proceeding with validation
-            local_checksum = self.lib_sha256()
-            executor_checksum = await sha256_from_executor(shell, self.lib_name)
+            lib_name = self.gated_lib_name()
+            local_checksum = self.lib_sha256(lib_name)
+            executor_checksum = await sha256_from_executor(shell, lib_name)
 
             if local_checksum != executor_checksum:
-                return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
+                mismatch_extra = {
+                    **default_extra,
+                    "local_sha256": local_checksum,
+                    "executor_sha256": executor_checksum,
+                }
+                if not settings.verifyx.LIBRARY_REFRESH_ENABLED:
+                    logger.warning(
+                        _m(
+                            "VERIFYX_LIBRARY_MISMATCH_NO_REFRESH",
+                            extra=get_extra_info(mismatch_extra),
+                        )
+                    )
+                    return VerifyXResponse(
+                        error=OUTDATED_LIBRARY_ERROR,
+                        diagnostics={"event": "VERIFYX_LIBRARY_MISMATCH_NO_REFRESH"},
+                    )
+                if not await self._executor_can_write_lib(shell):
+                    logger.warning(
+                        _m(
+                            "VERIFYX_LIBRARY_WRITE_DENIED",
+                            extra=get_extra_info(mismatch_extra),
+                        )
+                    )
+                    return VerifyXResponse(
+                        error=(
+                            "Executor libverifyx.so hash mismatch and /usr/lib is not writable; "
+                            "library was not replaced"
+                        ),
+                        diagnostics={"event": "VERIFYX_LIBRARY_WRITE_DENIED"},
+                    )
+                refreshed = await self._refresh_executor_library(
+                    shell, local_checksum, default_extra
+                )
+                if not refreshed:
+                    return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
+                executor_checksum = await sha256_from_executor(shell, lib_name)
+                if local_checksum != executor_checksum:
+                    logger.warning(
+                        _m(
+                            "VerifyX library hash still mismatched after one fetch",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "local_sha256": local_checksum,
+                                    "executor_sha256": executor_checksum,
+                                }
+                            ),
+                        )
+                    )
+                    return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
 
             challenge = self.prepare_verifyx_challenge(
-                machine_spec, default_extra, challenge_config_overrides
+                machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {challenge.seed} --cipher_text {challenge.cipher_text}"
+            command = self._verifyx_command(executor_info, challenge, lib_name)
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
@@ -316,10 +435,142 @@ class VerifyXValidationService:
             logger.error(_m("VerifyX validation failed", extra=get_extra_info({**default_extra, **diagnostics})))
             return VerifyXResponse(error=f"unexpected error ({e})", diagnostics=diagnostics)
 
-    async def _run_ssh_command(self, shell, command: str) -> SSHCapture:
+    async def _executor_can_write_lib(self, shell) -> bool:
+        """True when the SSH user can replace LIB_PATH. Checked before a mismatch is fatal
+        under LIBRARY_REFRESH_ENABLED, so a read-only root does not go through a failed mv."""
+        lib = shlex.quote(LIB_PATH)
+        parent = shlex.quote(os.path.dirname(LIB_PATH))
+        cmd = (
+            f"if [ -w {parent} ] && {{ [ ! -e {lib} ] || [ -w {lib} ]; }}; "
+            f"then echo WRITE_OK:1; else echo WRITE_OK:0; fi"
+        )
+        capture = await self._run_ssh_command(shell, cmd, timeout=15)
+        if capture.transport_error is not None:
+            return False
+        return "WRITE_OK:1" in (capture.stdout or "")
+
+    def _log_library_replaced(self, default_extra: dict, **fields) -> None:
+        logger.warning(
+            _m(
+                "VERIFYX_LIBRARY_REPLACED",
+                extra=get_extra_info({**default_extra, **fields}),
+            )
+        )
+
+    async def _refresh_executor_library(
+        self, shell, expected_sha256: str, default_extra: dict
+    ) -> bool:
+        """One attempt to put the validator's libverifyx.so on the executor.
+
+        Caller must have LIBRARY_REFRESH_ENABLED and a passing write check. Curl the raw
+        GitHub URL, install, check the hash. If the fetch fails or the hash differs,
+        upload the validator's own file (the source of truth). Log every outcome,
+        including the fetch error. Returns True when the executor hash matches.
+        """
+        url = settings.verifyx.LIBRARY_FETCH_URL
+        tmp = "/tmp/libverifyx.so.fetch"
+        curl_cmd = (
+            f"curl -fsSL --max-time 60 -o {shlex.quote(tmp)} {shlex.quote(url)}; "
+            f"echo CURL_RC:$?; "
+            f"if [ -f {shlex.quote(tmp)} ]; then sha256sum {shlex.quote(tmp)}; fi"
+        )
+        capture = await self._run_ssh_command(shell, curl_cmd, timeout=90)
+        fetch_error = capture.transport_error or ""
+        stdout = capture.stdout or ""
+        curl_rc = None
+        fetched_sha = ""
+        for line in stdout.splitlines():
+            if line.startswith("CURL_RC:"):
+                try:
+                    curl_rc = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    curl_rc = None
+            parts = line.split()
+            if parts and len(parts[0]) == 64 and all(c in "0123456789abcdef" for c in parts[0]):
+                fetched_sha = parts[0]
+        if curl_rc == 0 and fetched_sha == expected_sha256:
+            move = await self._run_ssh_command(
+                shell,
+                f"mv {shlex.quote(tmp)} {shlex.quote(LIB_PATH)}",
+                timeout=30,
+            )
+            if move.transport_error is None and (move.exit_status in (None, 0)):
+                self._log_library_replaced(
+                    default_extra, sha256=fetched_sha, url=url, method="curl"
+                )
+                return True
+            fetch_error = move.transport_error or f"mv exit {move.exit_status}"
+        elif curl_rc not in (0, None):
+            fetch_error = fetch_error or f"curl exit {curl_rc}: {(capture.stderr or stdout)[-400:]}"
+        elif fetched_sha and fetched_sha != expected_sha256:
+            fetch_error = (
+                fetch_error
+                or f"fetched sha256 {fetched_sha} != validator {expected_sha256}"
+            )
+        logger.warning(
+            _m(
+                "VerifyX library fetch failed; installing the validator's file",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "url": url,
+                        "fetch_error": fetch_error,
+                        "fetched_sha256": fetched_sha or None,
+                        "expected_sha256": expected_sha256,
+                    }
+                ),
+            )
+        )
+        put_error = await self._put_validator_library(shell)
+        if put_error:
+            logger.warning(
+                _m(
+                    "VerifyX library install on the executor failed",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "fetch_error": fetch_error,
+                            "put_error": put_error,
+                        }
+                    ),
+                )
+            )
+            return False
+        self._log_library_replaced(
+            default_extra, sha256=expected_sha256, url=url, method="sftp"
+        )
+        return True
+
+    async def _put_validator_library(self, shell) -> str | None:
+        """SFTP the validator's libverifyx.so onto the executor. Returns an error string or None."""
+        start = getattr(getattr(shell, "ssh_client", None), "start_sftp_client", None)
+        if start is None:
+            return "no SFTP client"
+        try:
+            async with start() as sftp:
+                await sftp.put(LIB_PATH, LIB_PATH)
+        except TypeError:
+            try:
+                sftp = start()
+                await sftp.put(LIB_PATH, LIB_PATH)
+            except Exception as e:
+                return f"{type(e).__name__}: {e}"
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
+        return None
+
+    def _verifyx_command(self, executor_info, challenge: "VerifyXChallenge", lib_name: str) -> str:
+        return (
+            f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py "
+            f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
+        )
+
+    async def _run_ssh_command(
+        self, shell, command: str, timeout: float = VERIFYX_COMMAND_TIMEOUT_SECONDS
+    ) -> SSHCapture:
         """Run SSH command; on transport failure populate `transport_error`, else the payload fields."""
         try:
-            result = await shell.ssh_client.run(command, timeout=VERIFYX_COMMAND_TIMEOUT_SECONDS)
+            result = await shell.ssh_client.run(command, timeout=timeout)
         except Exception as e:
             return SSHCapture(transport_error=f"{type(e).__name__}: {e}")
 
@@ -413,6 +664,13 @@ def _verify_memory_test(challenge_data: dict, response_data: dict) -> Tuple[dict
 
 
 def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    """The gated answer's network: Cloudflare capacity is the number. A Cloudflare probe
+    failure (429, timeout, outage) falls back to the package download instead of a zero."""
+    return _verify_network_capacity_test(challenge_data, response_data)
+
+
+def _verify_network_package_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    """The package (integrity object) download check; also the Cloudflare fallback."""
     network_execution = response_data["network_execution"]
 
     if not network_execution["success"]:
@@ -452,6 +710,155 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
     }
 
     return stats, errors
+
+
+def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
+    """True only for a probe-side transport or Cloudflare fault in the probe's own error.
+
+    A failed probe with no error, or an error that only names the Cloudflare URL, is a
+    host-caused failure and does not fall back to the package download.
+    """
+    capacity = (network_execution.get("speedtest") or {}).get("download_mbps")
+    if _is_positive_number(capacity):
+        return False
+    err = str(network_execution.get("error") or "").strip()
+    if not err:
+        return False
+    return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
+
+
+def _package_fallback_stats(
+    network_execution: dict,
+    *,
+    capacity_speed,
+    package_speed,
+    upload_speed,
+    errors: list[str],
+) -> Tuple[dict, List[str]]:
+    """Use the package download as the gated number when Cloudflare failed. Never feed 0."""
+    NETWORK_GATE_TALLY.probe_fallback += 1
+    logger.warning(
+        "VerifyX Cloudflare probe failed; using the package download reading "
+        f"package_mbps={_format_mbps(package_speed)} "
+        f"error={network_execution.get('error', 'Unknown error')}"
+    )
+    success = True
+    if package_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Package download speed inadequate: {package_speed:.2f} Mbps achieved, "
+            f"{settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+    stats = {
+        "download_speed": package_speed,
+        "upload_speed": upload_speed if _is_speed_reading(upload_speed) else None,
+        "package_download_speed": package_speed,
+        "capacity_download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
+        "success": success,
+        "cloudflare_fallback": True,
+        "execution_time_ms": network_execution.get("execution_time_ms"),
+    }
+    return stats, errors
+
+
+def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    """libverifyx.so's network: `download_speed` is the Cloudflare capacity. A Cloudflare
+    probe failure falls back to the package download instead of a zero. The package download
+    keeps its own floor and is published as `package_download_speed`."""
+    network_execution = response_data["network_execution"]
+
+    if not network_execution["success"]:
+        # The probe fails as a whole when either direction fails, but the directions are
+        # independent (celium-gpu-verifier#25): an upload that could not move its payload still
+        # leaves real download readings from the same run. Keep the capacity reading so the fatal
+        # download EMA (checks/verifyx.py) is fed the measured value, not a 0; success and
+        # upload_speed carry the failure. A Cloudflare outage/429/timeout with a package
+        # reading uses that package number instead of feeding the EMA a zero.
+        speedtest = network_execution.get("speedtest") or {}
+        capacity_speed = speedtest.get("download_mbps")
+        package_speed = (network_execution.get("download") or {}).get("speed_mbps")
+        upload_speed = speedtest.get("upload_mbps")
+        if _is_cloudflare_probe_failure(network_execution) and _is_positive_number(package_speed):
+            return _package_fallback_stats(
+                network_execution,
+                capacity_speed=capacity_speed,
+                package_speed=package_speed,
+                upload_speed=upload_speed,
+                errors=[
+                    f"Network execution failed: {network_execution.get('error', 'Unknown error')}"
+                ],
+            )
+        stats = {
+            "download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
+            # 0.0 is how the probe reports the failed direction; anything that is not a number is
+            # a malformed payload and reads as "no upload measurement" like the download above.
+            "upload_speed": upload_speed if _is_speed_reading(upload_speed) else None,
+            "package_download_speed": package_speed if _is_positive_number(package_speed) else None,
+            "success": False,
+            "capacity_download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
+            "execution_time_ms": network_execution.get("execution_time_ms"),
+        }
+        return stats, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
+
+    errors = []
+    success = True
+
+    expected_download = challenge_data["network_challenge"]["download"]
+    download_result = network_execution["download"]
+    if download_result["pkg"] != expected_download["pkg"]:
+        errors.append(f"Resource validation failed: {download_result['pkg']}")
+        success = False
+
+    if download_result["size"] != expected_download["size"]:
+        errors.append(f"Size validation failed for {download_result['pkg']}")
+        success = False
+
+    if download_result["hash"] != expected_download["hash"]:
+        errors.append(f"Integrity check failed for {download_result['pkg']}")
+        success = False
+
+    speedtest = network_execution.get("speedtest") or {}
+    upload_speed = speedtest.get("upload_mbps")
+    capacity_speed = speedtest.get("download_mbps")
+    package_download_speed = download_result.get("speed_mbps")
+    download_speed = capacity_speed
+    stats = {
+        "download_speed": download_speed,
+        "upload_speed": upload_speed,
+        "package_download_speed": package_download_speed,
+        "capacity_download_speed": capacity_speed,
+        "success": success,
+        "execution_time_ms": network_execution.get("execution_time_ms"),
+    }
+
+    # A probe that could not reach Cloudflare (no `speedtest` block, a null or zero reading) is a
+    # failed measurement, never an exception: an exception here is caught upstream as "challenge
+    # verification failed" and rejects the machine even while VERIFYX_NETWORK_VALIDATION is off.
+    if not all(_is_positive_number(value) for value in (upload_speed, capacity_speed, package_download_speed)):
+        if _is_cloudflare_probe_failure(network_execution) and _is_positive_number(package_download_speed):
+            return _package_fallback_stats(
+                network_execution,
+                capacity_speed=capacity_speed,
+                package_speed=package_download_speed,
+                upload_speed=upload_speed,
+                errors=errors,
+            )
+        errors.append("Network performance data unavailable")
+        return {**stats, "success": False}, errors
+
+    if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Cloudflare download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    if package_download_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    return {**stats, "success": success}, errors
 
 
 def _verify_storage_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
@@ -529,6 +936,57 @@ def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, L
         "hash": xet_execution.get("hash", ""),
         "error": xet_execution.get("error"),
     }, errors
+
+
+def _is_positive_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _is_speed_reading(value: object) -> bool:
+    """A usable Mbps reading: a finite positive number, or 0 (how a failed direction reads).
+
+    A bool, a string, NaN, ±inf or a negative number is not one — both vendored libraries only
+    serializes f64, so any such value is a malformed payload and must never reach EMA arithmetic.
+    """
+    if _is_positive_number(value):
+        return math.isfinite(value)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
+
+
+def _format_mbps(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}"
+    return "none"
+
+
+def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
+    package_download_mbps = network.get("package_download_speed")
+    cloudflare_download_mbps = network.get("capacity_download_speed")
+    cloudflare_upload_mbps = network.get("upload_speed")
+    exec_id = default_extra.get("executor_uuid") or "none"
+    message = (
+        "VerifyX network speeds "
+        f"package_download_mbps={_format_mbps(package_download_mbps)} "
+        f"cloudflare_download_mbps={_format_mbps(cloudflare_download_mbps)} "
+        f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
+        f"success={network.get('success')} "
+        f"cloudflare_fallback={network.get('cloudflare_fallback', False)} "
+        f"exec={exec_id}"
+    )
+    logger.info(
+        _m(
+            message,
+            extra=get_extra_info(
+                {
+                    **default_extra,
+                    "package_download_mbps": package_download_mbps,
+                    "cloudflare_download_mbps": cloudflare_download_mbps,
+                    "cloudflare_upload_mbps": cloudflare_upload_mbps,
+                    "network_success": network.get("success"),
+                }
+            ),
+        )
+    )
 
 
 def _perform_verification_checks(payload: dict) -> Dict[str, Any]:

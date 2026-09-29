@@ -20,11 +20,325 @@ from neurons.validators.src.services.verifyx_validation_service import (
     OUTDATED_LIBRARY_ERROR,
     VerifyXFailureClass,
     VerifyXValidationService,
+    _format_mbps,
+    _is_speed_reading,
+    _log_verifyx_network_speeds,
+    _perform_verification_checks,
+    _verify_network_test,
+    settings,
 )
+
+
 
 
 def _executor_info() -> SimpleNamespace:
     return SimpleNamespace(python_path="/usr/bin/python3", root_dir="/root/app", uuid="exec-1")
+
+
+def _network_payload(
+    *,
+    cloudflare_download_speed: float = 100.0,
+    package_download_speed: float = 100.0,
+    upload_speed: float | None = 20.0,
+) -> tuple[dict, dict]:
+    challenge_data = {
+        "network_challenge": {
+            "download": {"pkg": "network.bin", "size": 1024, "hash": "expected"}
+        }
+    }
+    response_data = {
+        "network_execution": {
+            "success": True,
+            "download": {
+                "pkg": "network.bin",
+                "size": 1024,
+                "hash": "expected",
+                "speed_mbps": package_download_speed,
+            },
+            "speedtest": {
+                "download_mbps": cloudflare_download_speed,
+                "upload_mbps": upload_speed,
+            },
+            "execution_time_ms": 250,
+        }
+    }
+    return challenge_data, response_data
+
+
+def test_network_stats_use_cloudflare_download_speed():
+    challenge_data, response_data = _network_payload(
+        cloudflare_download_speed=125.0,
+        package_download_speed=80.0,
+    )
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert errors == []
+    assert stats == {
+        "download_speed": 125.0,
+        "upload_speed": 20.0,
+        "package_download_speed": 80.0,
+        "capacity_download_speed": 125.0,
+        "success": True,
+        "execution_time_ms": 250,
+    }
+
+
+def test_network_fails_when_package_download_is_too_slow():
+    challenge_data, response_data = _network_payload(package_download_speed=49.0)
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert any("Package download speed inadequate" in error for error in errors)
+
+
+def test_package_floor_is_its_own_setting():
+    # A package floor lowered to 20 Mbps lets a 30 Mbps CDN object through while the 50 Mbps
+    # Cloudflare capacity floor still applies.
+    challenge_data, response_data = _network_payload(
+        package_download_speed=30.0, cloudflare_download_speed=49.0
+    )
+
+    with patch.object(
+        settings.verifyx, "NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS", 20.0
+    ):
+        stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert errors == [
+        "Cloudflare download speed inadequate: 49.00 Mbps achieved, 50 Mbps required"
+    ]
+
+
+def test_network_fails_when_cloudflare_download_is_too_slow():
+    challenge_data, response_data = _network_payload(cloudflare_download_speed=49.0)
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert any("Cloudflare download speed inadequate" in error for error in errors)
+
+
+def test_network_fails_without_positive_upload_speed():
+    challenge_data, response_data = _network_payload(upload_speed=None)
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert "Network performance data unavailable" in errors
+
+
+def test_upload_timeout_keeps_the_download_reading():
+    # celium-gpu-verifier#25: an upload that timed out leaves the probe with success=False but a
+    # real download reading. The validator must keep that download (the fatal EMA gate reads it)
+    # and only carry the failure on success/upload_speed, not zero the download.
+    challenge_data, response_data = _network_payload(
+        cloudflare_download_speed=2100.0,
+        package_download_speed=700.0,
+    )
+    response_data["network_execution"]["success"] = False
+    response_data["network_execution"]["speedtest"]["upload_mbps"] = 0.0
+    response_data["network_execution"]["error"] = (
+        "Cloudflare up speedtest timeout after 120 seconds"
+    )
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["download_speed"] == 2100.0
+    assert stats["package_download_speed"] == 700.0
+    assert stats["upload_speed"] == 0.0
+    assert errors == [
+        "Network execution failed: Cloudflare up speedtest timeout after 120 seconds"
+    ]
+
+
+@pytest.mark.parametrize("upload_mbps", ["fast", True, float("nan"), float("inf"), -1.0])
+def test_upload_failure_reports_a_malformed_upload_as_none(upload_mbps):
+    # Same filter as the download on the probe-failed path: a value that is not a number never
+    # reaches the check's EMA arithmetic; 0.0 (the failed direction's reading) still passes.
+    challenge_data, response_data = _network_payload(cloudflare_download_speed=2100.0)
+    response_data["network_execution"]["success"] = False
+    response_data["network_execution"]["speedtest"]["upload_mbps"] = upload_mbps
+    response_data["network_execution"]["error"] = "Cloudflare up speedtest failed"
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["upload_speed"] is None
+    assert stats["download_speed"] == 2100.0
+    assert errors == ["Network execution failed: Cloudflare up speedtest failed"]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (2100.0, True),
+        (1, True),
+        (0, True),
+        (0.0, True),
+        (None, False),
+        ("fast", False),
+        (True, False),
+        (False, False),
+        (float("nan"), False),
+        (float("inf"), False),
+        (-0.5, False),
+    ],
+)
+def test_is_speed_reading(value, expected):
+    assert _is_speed_reading(value) is expected
+
+
+def test_download_failure_reports_no_download_reading():
+    # When the probe fails with no positive download (a package-download or download-direction
+    # failure), the download stays None so the EMA gate is fed 0.0.
+    challenge_data, response_data = _network_payload()
+    response_data["network_execution"]["success"] = False
+    response_data["network_execution"]["speedtest"]["download_mbps"] = 0.0
+    response_data["network_execution"]["download"]["speed_mbps"] = 0.0
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["download_speed"] is None
+    assert stats["package_download_speed"] is None
+
+
+def test_network_reports_unavailable_when_probe_has_no_speedtest_block():
+    # An executor whose Cloudflare probe never ran returns no `speedtest` block at all.
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["speedtest"]
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats == {
+        "download_speed": None,
+        "upload_speed": None,
+        "package_download_speed": 100.0,
+        "capacity_download_speed": None,
+        "success": False,
+        "execution_time_ms": 250,
+    }
+    assert errors == ["Network performance data unavailable"]
+
+
+@pytest.mark.parametrize("download_mbps", [None, 0, 0.0, "fast", True])
+def test_network_reports_unavailable_for_a_missing_or_zero_cloudflare_download(download_mbps):
+    challenge_data, response_data = _network_payload()
+    response_data["network_execution"]["speedtest"]["download_mbps"] = download_mbps
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["download_speed"] == download_mbps
+    assert errors == ["Network performance data unavailable"]
+
+
+def test_network_reports_unavailable_when_package_speed_is_missing():
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["download"]["speed_mbps"]
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["package_download_speed"] is None
+    assert errors == ["Network performance data unavailable"]
+
+
+def test_missing_speedtest_block_does_not_reject_while_network_flag_is_off():
+    # The whole verification, not a mocked network step: the probe's `speedtest` block is missing
+    # and VERIFYX_NETWORK_VALIDATION is off, so the machine still passes with the error recorded.
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["speedtest"]
+    payload = {"challenge_data": challenge_data, "response_data": response_data}
+
+    with patch.dict(
+        "neurons.validators.src.services.verifyx_validation_service.settings.FEATURE_FLAGS",
+        {"verifyx_network_validation": False},
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_memory_test",
+        return_value=({"success": True}, []),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_storage_test",
+        return_value=({"success": True}, []),
+    ):
+        result = _perform_verification_checks(payload)
+
+    assert result["success"] is True
+    assert result["network"]["success"] is False
+    assert result["network"]["download_speed"] is None
+    assert result["errors"] == ["Network performance data unavailable"]
+
+
+def test_missing_speedtest_block_rejects_when_network_flag_is_on():
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["speedtest"]
+    payload = {"challenge_data": challenge_data, "response_data": response_data}
+
+    with patch.dict(
+        "neurons.validators.src.services.verifyx_validation_service.settings.FEATURE_FLAGS",
+        {"verifyx_network_validation": True},
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_memory_test",
+        return_value=({"success": True}, []),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_storage_test",
+        return_value=({"success": True}, []),
+    ):
+        result = _perform_verification_checks(payload)
+
+    assert result["success"] is False
+    assert result["errors"] == ["Network performance data unavailable"]
+
+
+def test_network_failure_does_not_reject_when_flag_is_off():
+    payload = {"challenge_data": {}, "response_data": {}}
+
+    with patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_network_test",
+        return_value=({"success": False}, ["network failed"]),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_memory_test",
+        return_value=({"success": True}, []),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_storage_test",
+        return_value=({"success": True}, []),
+    ):
+        result = _perform_verification_checks(payload)
+
+    assert result["success"] is True
+    assert result["network"]["success"] is False
+    assert result["errors"] == ["network failed"]
+
+
+def test_format_mbps_and_network_speed_log_line(caplog):
+    assert _format_mbps(125.456) == "125.46"
+    assert _format_mbps(None) == "none"
+
+    with caplog.at_level(logging.INFO):
+        _log_verifyx_network_speeds(
+            {
+                "package_download_speed": 80.0,
+                "download_speed": 125.5,
+                "capacity_download_speed": 125.5,
+                "upload_speed": 20.25,
+                "success": True,
+            },
+            {"executor_uuid": "exec-abc"},
+        )
+
+    assert any(
+        "VerifyX network speeds "
+        "package_download_mbps=80.00 "
+        "cloudflare_download_mbps=125.50 "
+        "cloudflare_upload_mbps=20.25 "
+        "success=True "
+        "cloudflare_fallback=False "
+        "exec=exec-abc" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -122,7 +436,7 @@ async def test_run_ssh_command_is_bounded_by_the_hard_timeout():
 
 
 @pytest.mark.asyncio
-async def test_the_library_digest_is_read_once_per_service(tmp_path):
+async def test_the_library_digest_is_read_once_per_service(tmp_path, monkeypatch):
     """Review round on #1340: `validate_verifyx_and_process_job` hashed libverifyx.so for the
     checksum gate and `prepare_verifyx_challenge` hashed it again for `expected_lib_sha256`, so
     every SSH run read the .so twice. The digest is cached on the service: the file is hashed

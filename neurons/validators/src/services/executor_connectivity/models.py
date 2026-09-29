@@ -14,11 +14,14 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
+    # the tiers that produced `successful`, joined with "+" when a top-up merged two
+    tier: str = "batch"
 
 
 @dataclass(frozen=True)
 class DindLogCause:
-    """Why the DinD container's sshd never answered: a stable code and the words the provider reads."""
+    """Why the DinD probe failed — the container's sshd never answered, or `docker run` itself was refused
+    by the NVIDIA container hook: a stable code and the words the provider reads."""
 
     code: str
     message: str
@@ -46,7 +49,8 @@ class DindProbeResult:
     port: PortPair | None
     log_text: str | None = None
     # DAH-2856: the cause when the container started but sshd never answered, read from the
-    # container's own logs before removal (None when the probe passed or never got that far).
+    # container's own logs before removal. DAH-3634: also when `docker run` itself was refused by
+    # the NVIDIA container hook (docker's stderr). None when the probe passed or the cause is unknown.
     error: DindLogCause | None = None
 
 
@@ -63,6 +67,9 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
+    probe_tier: str | None = None
+    # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
+    declared_port_count: int | None = None
 
 
 @dataclass(frozen=True)

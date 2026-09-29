@@ -1494,6 +1494,18 @@
       "title": "ContainerStarted",
       "type": "object"
     },
+    "ContainerState": {
+      "description": "DAH-3338: what the validator saw of one rented pod's container this cycle. `unknown` is a pod the\nvalidator could not inspect (the SSH transport died first) and is never read as `absent`; `reaped` is\nan orphan the stale-container cleanup removed.",
+      "enum": [
+        "running",
+        "exited",
+        "absent",
+        "unknown",
+        "reaped"
+      ],
+      "title": "ContainerState",
+      "type": "string"
+    },
     "ContainerStopRequest": {
       "properties": {
         "container_name": {
@@ -2399,6 +2411,22 @@
           "default": null,
           "title": "Node State At Cycle"
         },
+        "pod_states": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PodContainerState"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod States"
+        },
         "price_per_gpu": {
           "anyOf": [
             {
@@ -2687,7 +2715,8 @@
         "RentingInProgress",
         "NoJupyterPortMapping",
         "AttestationError",
-        "ContainerVanished"
+        "ContainerVanished",
+        "ExecutorUnreachable"
       ],
       "title": "FailedContainerErrorCodes",
       "type": "string"
@@ -2706,6 +2735,18 @@
     },
     "FailedContainerRequest": {
       "properties": {
+        "build_log_tail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Log Tail"
+        },
         "detail": {
           "anyOf": [
             {
@@ -2800,6 +2841,18 @@
           ],
           "default": null,
           "title": "Sent At"
+        },
+        "step_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step Detail"
         },
         "volume_encryption_status": {
           "anyOf": [
@@ -3874,6 +3927,29 @@
       "title": "PayloadPortMapping",
       "type": "object"
     },
+    "PodContainerState": {
+      "properties": {
+        "container_state": {
+          "$ref": "#/$defs/ContainerState"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pod_id",
+        "container_state",
+        "observed_at"
+      ],
+      "title": "PodContainerState",
+      "type": "object"
+    },
     "PodHostRebootRecoveredRequest": {
       "description": "`POST \u2026/host-reboot-recovered`: the container exit the recovery reacted to.",
       "properties": {
@@ -4132,6 +4208,123 @@
         "active"
       ],
       "title": "PodRentalActiveResponse",
+      "type": "object"
+    },
+    "PodSshUnreachableResponse": {
+      "description": "`POST \u2026/ssh-unreachable`: ``recorded`` False when the backend already holds this outage.",
+      "properties": {
+        "delivery": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delivery"
+        },
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded"
+      ],
+      "title": "PodSshUnreachableResponse",
+      "type": "object"
+    },
+    "PodStatesReport": {
+      "description": "DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's\n`ExecutorSpecRequest` when the validator's POD_STATES_REPORT_ENABLED is on. The backend writes the\nstates onto the rental rows and nothing else (no cycle row, no validation report); the write is\nidempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`.",
+      "properties": {
+        "chunk_index": {
+          "minimum": 0,
+          "title": "Chunk Index",
+          "type": "integer"
+        },
+        "chunk_total": {
+          "minimum": 1,
+          "title": "Chunk Total",
+          "type": "integer"
+        },
+        "executor_uuid": {
+          "title": "Executor Uuid",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "job_batch_id": {
+          "title": "Job Batch Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "PodStatesReport"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_states": {
+          "items": {
+            "$ref": "#/$defs/PodContainerState"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Pod States",
+          "type": "array"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "validator_hotkey",
+        "miner_hotkey",
+        "executor_uuid",
+        "job_batch_id",
+        "chunk_index",
+        "chunk_total",
+        "pod_states"
+      ],
+      "title": "PodStatesReport",
       "type": "object"
     },
     "RemoveSshPublicKeysRequest": {
@@ -4600,6 +4793,30 @@
           },
           "title": "Rented Ports",
           "type": "array"
+        },
+        "ssh_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ssh Port"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
         }
       },
       "required": [
@@ -5160,6 +5377,7 @@
         "RevenuePerGpuTypeRequest",
         "GpuEstimatesRequest",
         "EstimateResponse",
+        "PodStatesReport",
         "ContainerCreated",
         "ContainerStarted",
         "ContainerStopped",
@@ -5272,11 +5490,14 @@
     "PodRentalActiveResponse": {
       "$ref": "#/$defs/PodRentalActiveResponse"
     },
+    "PodSshUnreachableResponse": {
+      "$ref": "#/$defs/PodSshUnreachableResponse"
+    },
     "RentedExecutorsResponse": {
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.0.0",
+  "protocol_version": "1.3.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
@@ -5348,6 +5569,9 @@
     },
     "PodLogsResponseToServer": {
       "$ref": "#/$defs/PodLogsResponseToServer"
+    },
+    "PodStatesReport": {
+      "$ref": "#/$defs/PodStatesReport"
     },
     "RentedMachineRequest": {
       "$ref": "#/$defs/RentedMachineRequest"

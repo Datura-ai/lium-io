@@ -58,8 +58,10 @@ async def test_default_incentive_records_outdated_reason_before_score_early_retu
     await incentive._pre_process_job_result("miner", result)
 
     assert result.mining_score == 0
+    # the run failed too, so its own reason follows the image reason
     assert [reason.reason for reason in result.zero_incentive_reasons] == [
-        ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE
+        ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
+        ZeroIncentiveReason.VALIDATION_FAILED,
     ]
 
 
@@ -76,7 +78,8 @@ async def test_rental_price_incentive_records_reason_before_unsuccessful_filter(
     await incentive._pre_process_job_result("miner", result)
 
     assert [reason.reason for reason in result.zero_incentive_reasons] == [
-        ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE
+        ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
+        ZeroIncentiveReason.VALIDATION_FAILED,
     ]
 
 
@@ -154,7 +157,10 @@ async def test_warning_only_rental_price_incentive_records_no_outdated_reason(wa
 
     await incentive._pre_process_job_result("miner", result)
 
-    assert result.zero_incentive_reasons == []
+    # the failed run keeps its own reason; warn-only adds no image reason
+    assert [reason.reason for reason in result.zero_incentive_reasons] == [
+        ZeroIncentiveReason.VALIDATION_FAILED
+    ]
 
 
 @pytest.mark.asyncio

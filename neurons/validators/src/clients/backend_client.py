@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
@@ -19,6 +19,7 @@ from protocol.vc_protocol.compute_requests import (
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
+    PodSshUnreachableResponse,
     RentedExecutorsResponse,
     VerificationStartedResponse,
 )
@@ -296,6 +297,44 @@ class BackendClient:
             PodHostRebootRecoveredResponse,
             json_data={"container_finished_at": container_finished_at},
             timeout=10,
+        )
+
+    async def report_pod_ssh_unreachable(
+        self,
+        pod_id: str,
+        *,
+        ssh_port: int | None,
+        faults: list[str],
+        first_failed_at: str,
+        consecutive_cycles: int,
+        boot_id_changed: bool | None,
+        boot_id_at_ok: str | None,
+        boot_id_now: str | None,
+    ) -> PodSshUnreachableResponse | None:
+        """Tell the backend a RUNNING rented pod refuses its renter (DAH-2870).
+
+        Sent on every cycle at or past the threshold until the backend answers 200 with a
+        ``delivery`` other than ``notify_failed`` (the caller keeps that answer in the pod's streak;
+        a ``notify_failed`` answer means the renter's mail was refused, so the caller posts again
+        next cycle and the mail is re-sent — lium-platform#429). The backend records the event
+        against the pod and the provider and tells the renter; it does not change the pod's state.
+        Older backends 404, which is no answer: the caller posts again next cycle, so the outage is
+        not lost.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-unreachable",
+            PodSshUnreachableResponse,
+            json_data={
+                "ssh_port": ssh_port,
+                "faults": faults,
+                "first_failed_at": first_failed_at,
+                "consecutive_cycles": consecutive_cycles,
+                "boot_id_changed": boot_id_changed,
+                "boot_id_at_ok": boot_id_at_ok,
+                "boot_id_now": boot_id_now,
+            },
+            timeout=10,
+            non_200_log_level=logging.WARNING,
         )
 
     async def get_filler_run_active(
