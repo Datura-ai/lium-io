@@ -29,6 +29,9 @@ RPC_URLS = {
 }
 
 GAS_LIMIT = 200_000
+# The RPC quotes the gas price; above this ceiling nothing is signed, so a faulty or hostile RPC
+# cannot spend the address balance on fees (at GAS_LIMIT, 100 gwei caps a transaction at 0.02 TAO).
+DEFAULT_MAX_GAS_PRICE_GWEI = 100
 RECLAIM_LOOKBACK_BLOCKS = 1000
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 
@@ -112,8 +115,10 @@ class CollateralClient:
         contract_address: str,
         rpc_url: str | None = None,
         miner_key: str | None = None,
+        max_gas_price_gwei: float = DEFAULT_MAX_GAS_PRICE_GWEI,
     ):
         self.network = network
+        self.max_gas_price_gwei = max_gas_price_gwei
         self.rpc_url = rpc_url or RPC_URLS.get(network)
         self.contract_address = AsyncWeb3.to_checksum_address(contract_address)
         self.miner_account = Account.from_key(miner_key) if miner_key else None
@@ -161,12 +166,19 @@ class CollateralClient:
             raise CollateralTransactionError(
                 "An Ethereum private key is required to send this transaction"
             )
+        gas_price = await self.w3.eth.gas_price
+        max_gas_price = AsyncWeb3.to_wei(self.max_gas_price_gwei, "gwei")
+        if gas_price > max_gas_price:
+            raise CollateralTransactionError(
+                f"The RPC quoted a gas price of {AsyncWeb3.from_wei(gas_price, 'gwei')} gwei, above the "
+                f"{self.max_gas_price_gwei} gwei ceiling (COLLATERAL_MAX_GAS_PRICE_GWEI); no transaction was sent"
+            )
         transaction = await function_call.build_transaction(
             {
                 "from": self.miner_address,
                 "nonce": await self.w3.eth.get_transaction_count(self.miner_address),
                 "gas": GAS_LIMIT,
-                "gasPrice": await self.w3.eth.gas_price,
+                "gasPrice": gas_price,
                 "chainId": await self.w3.eth.chain_id,
             }
         )

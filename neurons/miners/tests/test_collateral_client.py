@@ -42,9 +42,16 @@ class FakeProvider(AsyncBaseProvider):
     """Answers the JSON-RPC methods the client uses; eth_call is routed by function selector."""
 
     def __init__(
-        self, calls=None, receipt_status=1, logs=None, revert_data=None, endpoint_uri=None
+        self,
+        calls=None,
+        receipt_status=1,
+        logs=None,
+        revert_data=None,
+        endpoint_uri=None,
+        gas_price=GAS_PRICE,
     ):
         super().__init__()
+        self.gas_price = gas_price
         self.endpoint_uri = endpoint_uri
         self.calls = calls or {}
         self.receipt_status = receipt_status
@@ -69,7 +76,7 @@ class FakeProvider(AsyncBaseProvider):
             return {"jsonrpc": "2.0", "id": 1, "result": TX_HASH}
         results = {
             "eth_chainId": hex(CHAIN_ID),
-            "eth_gasPrice": hex(GAS_PRICE),
+            "eth_gasPrice": hex(self.gas_price),
             "eth_getTransactionCount": hex(NONCE),
             "eth_getTransactionReceipt": {
                 "transactionHash": TX_HASH,
@@ -229,6 +236,41 @@ async def test_send_without_a_key_sends_nothing():
     with pytest.raises(CollateralTransactionError, match="private key is required"):
         await client_with(provider, miner_key=None).finalize_reclaim(5)
     assert provider.sent == []
+
+
+async def test_gas_price_quote_above_the_ceiling_signs_and_sends_nothing():
+    ceiling_wei = collateral_module.DEFAULT_MAX_GAS_PRICE_GWEI * 10**9
+    provider = FakeProvider(
+        calls={selector("reclaims(uint256)"): open_reclaim()}, gas_price=ceiling_wei + 1
+    )
+    with pytest.raises(CollateralTransactionError, match="COLLATERAL_MAX_GAS_PRICE_GWEI"):
+        await client_with(provider).finalize_reclaim(5)
+    assert provider.sent == []
+    assert "eth_getTransactionCount" not in [method for method, _ in provider.requests]
+
+
+async def test_gas_price_quote_at_the_ceiling_is_signed():
+    ceiling_wei = collateral_module.DEFAULT_MAX_GAS_PRICE_GWEI * 10**9
+    provider = FakeProvider(
+        calls={selector("reclaims(uint256)"): open_reclaim()},
+        logs=[reclaimed_log()],
+        gas_price=ceiling_wei,
+    )
+    await client_with(provider).finalize_reclaim(5)
+    assert len(provider.sent) == 1
+    assert decode_legacy(provider.sent[0])["gasPrice"] == ceiling_wei
+
+
+async def test_configured_gas_price_ceiling_reaches_the_client(monkeypatch):
+    from core import utils
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "COLLATERAL_MAX_GAS_PRICE_GWEI", 5)
+    client = utils.get_collateral_contract(miner_key=MINER_KEY)
+    client._w3 = AsyncWeb3(FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}))
+    with pytest.raises(CollateralTransactionError, match="5 gwei ceiling"):
+        await client.finalize_reclaim(5)
+    assert client._w3.provider.sent == []
 
 
 def test_unknown_network_without_rpc_url_builds_a_client_without_a_connection():

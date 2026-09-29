@@ -8,6 +8,7 @@ from datura.chain import (
     ChainEndpoint,
     chain_endpoint_candidates,
 )
+from core.collateral import DEFAULT_MAX_GAS_PRICE_GWEI
 from lium_core.shared_config import SharedConfigClient
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -48,6 +49,9 @@ class Settings(BaseSettings):
     )
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
+    COLLATERAL_MAX_GAS_PRICE_GWEI: float = Field(
+        env="COLLATERAL_MAX_GAS_PRICE_GWEI", default=DEFAULT_MAX_GAS_PRICE_GWEI, gt=0
+    )
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
 
