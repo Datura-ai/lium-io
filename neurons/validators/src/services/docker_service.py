@@ -728,30 +728,6 @@ class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
 
-class ImageExitedDuringBootstrap(Exception):
-    """A later bootstrap step (`ssh_bootstrap`, `set_environment`) found the container gone because
-    the image's own command ended — not a kill, so not `killed_during_bootstrap`: the step keeps its
-    name and no KILLED_DURING_BOOTSTRAP event is written. Same image-exited text as the key step."""
-
-
-def _image_exited_explanation(*, image: str, state: ContainerStateSnapshot, during: str, cause: Exception) -> str:
-    """The renter-facing image-exited text: the image has no long-running command. The backend
-    picks its "no long-running process" message from the `is not running` / `is restarting` /
-    `status='…'` markers in here, but only when `failure_step` is `add_public_keys`; for the later
-    steps (`ssh_bootstrap`, `set_environment`) this text goes to the logs only. Both steps say it
-    the same way so the log reads alike."""
-    if state.running:
-        # Docker's restart policy already brought it back; the exec landed in the gap.
-        situation = f"Docker is restarting it ({state.describe()})"
-    else:
-        situation = f"the container is not running ({state.describe()})"
-    return (
-        f"image {image!r} has no long-running command — its default command exited right after start "
-        f"(exit_code={state.exit_code!r}) and {situation} while {during}; a pod needs a long-running "
-        f"process, for example a start command such as `sleep infinity`. Exec error: {cause}"
-    )
-
-
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
 KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
 CONTAINER_GONE_KILL_CAUSES = frozenset({"oom", "killed", "removed"})
@@ -773,8 +749,7 @@ def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
     ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is one of
-    CONTAINER_GONE_KILL_CAUSES (see container_gone_cause); an image's own exit is
-    ImageExitedDuringBootstrap, never this.
+    CONTAINER_GONE_KILL_CAUSES (see container_gone_cause); an image's own exit is never this.
     """
 
     def __init__(
@@ -852,11 +827,16 @@ async def _explain_add_public_keys_failure(
             return cause
     if not state.exited_since_start or state.killed_by_host:
         return cause
+    if state.running:
+        # Docker's restart policy already brought it back; the exec landed in the gap.
+        situation = f"Docker is restarting it ({state.describe()})"
+    else:
+        situation = f"the container is not running ({state.describe()})"
     return ImageExitedDuringKeyInjection(
-        "Failed to add SSH public keys: "
-        + _image_exited_explanation(
-            image=image, state=state, during="the SSH keys were being installed", cause=cause
-        )
+        f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
+        f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
+        "SSH keys were being installed; a pod needs a long-running process, for example a start "
+        f"command such as `sleep infinity`. Exec error: {cause}"
     )
 
 
@@ -5464,39 +5444,6 @@ class DockerService:
         )
         return killed
 
-    def _explain_image_exited_during_bootstrap(
-        self,
-        gone: ContainerGoneBeforeExec,
-        *,
-        image: str,
-        container_name: str,
-        bootstrap_step: str,
-        default_extra: dict,
-    ) -> ImageExitedDuringBootstrap:
-        """The image-exited explanation for an image whose own command ended while a bootstrap step ran;
-        logged as the step's failure, not as a KILLED_DURING_BOOTSTRAP event."""
-        state = gone.state
-        assert state is not None  # container_gone_cause reads None as `removed`, a kill
-        logger.warning(
-            _m(
-                "Image's own command exited during bootstrap",
-                extra=get_extra_info({
-                    **default_extra,
-                    "container_name": container_name,
-                    "bootstrap_step": bootstrap_step,
-                    "cause": "exited",
-                    "exit_code": state.exit_code,
-                    "status": state.status,
-                }),
-            )
-        )
-        return ImageExitedDuringBootstrap(
-            f"Failed {bootstrap_step}: "
-            + _image_exited_explanation(
-                image=image, state=state, during=f"{bootstrap_step} ran", cause=gone
-            )
-        )
-
     @staticmethod
     async def _connect_ssh_and_docker(
         connections: AsyncExitStack,
@@ -6770,15 +6717,8 @@ class DockerService:
                         # it was, not the exec it broke.
                         await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                         if container_gone_cause(post_run_exc.state) not in CONTAINER_GONE_KILL_CAUSES:
-                            # The image's own command ended (no OOM, not 137, not being removed):
-                            # the renter's image, not a kill — the step keeps its name, no event.
-                            raise self._explain_image_exited_during_bootstrap(
-                                post_run_exc,
-                                image=payload.docker_image,
-                                container_name=container_name,
-                                bootstrap_step=current_step,
-                                default_extra=default_extra,
-                            ) from post_run_exc
+                            # The image's own command ended: not a kill, the step keeps its name.
+                            raise
                         killed = self._explain_container_killed_during_bootstrap(
                             post_run_exc,
                             container_name=container_name,
