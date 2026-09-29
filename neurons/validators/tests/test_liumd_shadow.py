@@ -1,4 +1,4 @@
-"""liumd M2 step 1 (DAH-2834): the shadow comparison is logged, never scored, and runs nothing
+"""The liumd shadow comparison is logged, never scored, and runs nothing
 with VALIDATOR_LIUMD_SHADOW off."""
 
 from __future__ import annotations

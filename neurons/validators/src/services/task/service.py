@@ -233,7 +233,7 @@ class TaskService:
                 # (success=True, score 0 when the image is OUTDATED).
                 if not success or result.score <= 0:
                     result.failure_reason_code = last_event.reason_code
-                # liumd M2 step 1: logged only. The result above is final before it starts.
+                # The liumd shadow is logged only; the result above is final before it starts.
                 if settings.VALIDATOR_LIUMD_SHADOW and not settings.DRY_RUN:
                     await run_liumd_shadow(
                         last_context,

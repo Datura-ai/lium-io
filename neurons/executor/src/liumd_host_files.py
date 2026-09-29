@@ -1,6 +1,6 @@
-"""The files `liumd run` reads on this host (DAH-2834, liumd M2 step 1). The executor never runs
-liumd itself; the validator does, over SSH, and an SSH exec session does not carry this
-container's environment, so every setting liumd needs is a file.
+"""The files `liumd run` reads on this host. The executor never runs liumd itself; the validator
+does, over SSH, and an SSH exec session does not carry this container's environment, so every
+setting liumd needs is a file.
 
     python src/liumd_host_files.py children <out>   # image build: the child manifest
     python src/liumd_host_files.py host             # container start: the host settings

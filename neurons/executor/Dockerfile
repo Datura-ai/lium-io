@@ -88,7 +88,7 @@ RUN mv /root/app/libdmcompverify.so /usr/lib/ \
   && mv /root/app/libverifyx.so /usr/lib/ \
   && mv /root/app/libinspector.so /usr/lib/
 
-# liumd M2 step 1 (DAH-2834): the liumd binary, unused by the executor's Python app; the validator's
+# The liumd binary, unused by the executor's Python app; the validator's
 # shadow runs `/usr/local/bin/liumd run` over SSH. liumd/liumd is the unsigned musl dev-static CI
 # build of the liumd step-1 change (no release key exists yet), committed like the provers above and
 # pinned here by sha256. The child manifest is hashed from this image's own files, after the provers

@@ -1,4 +1,4 @@
-"""liumd M2 step 1 (DAH-2834): `LiumdExecClient`'s exit-status mapping, bounds and exec request,
+"""`LiumdExecClient`'s exit-status mapping, bounds and exec request,
 against a scripted asyncssh process. The binary itself answers in test_liumd_exec_e2e.py."""
 
 from __future__ import annotations

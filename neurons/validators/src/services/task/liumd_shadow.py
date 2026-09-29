@@ -1,4 +1,4 @@
-"""liumd M2 step 1 (DAH-2834): the shadow comparison of `liumd run` with today's verify.
+"""The shadow comparison of `liumd run` with today's verify.
 
 `TaskService.create_task` calls `run_liumd_shadow` once per node, after the pipeline has run and
 the node's `JobResult` is built, on the SSH session the pipeline used. With

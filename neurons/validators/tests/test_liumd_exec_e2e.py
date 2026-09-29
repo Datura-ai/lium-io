@@ -1,4 +1,4 @@
-"""liumd M2 step 1 (DAH-2834), end to end: the executor image's own `liumd` binary
+"""End to end: the executor image's own `liumd` binary
 (`neurons/executor/liumd/liumd`, the pinned dev-static build) answering `LiumdExecClient` and the
 shadow over a real SSH exec channel.
 

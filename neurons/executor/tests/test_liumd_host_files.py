@@ -1,4 +1,4 @@
-"""liumd M2 step 1 (DAH-2834): the files the executor image gives `liumd run`."""
+"""The files the executor image gives `liumd run`."""
 
 import hashlib
 import json
@@ -160,11 +160,26 @@ def test_the_dockerfile_installs_liumd_and_hashes_the_children_after_the_provers
         assert DOCKERFILE.index(line) > provers, line
 
 
-def test_the_wrapper_hands_the_image_manifest_to_the_binary():
-    assert "LIUMD_CHILD_MANIFEST_FILE=/etc/liumd/children.json" in WRAPPER
-    assert "\nexport LIUMD_CHILD_MANIFEST_FILE\n" in WRAPPER
-    assert WRAPPER.rstrip().endswith('exec /usr/local/lib/liumd/liumd "$@"')
-    assert "LIUMD_MINER_HOTKEY" not in WRAPPER
+def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
+    # The image's wrapper with its binary path pointed at a stand-in that prints what it was given;
+    # a wrapper naming another binary path would exec nothing and fail here.
+    stand_in = tmp_path / "liumd"
+    stand_in.write_text(
+        '#!/bin/sh\necho "$LIUMD_CHILD_MANIFEST_FILE|${LIUMD_MINER_HOTKEY-unset}|$*"\n'
+    )
+    stand_in.chmod(0o755)
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(WRAPPER.replace("/usr/local/lib/liumd/liumd", str(stand_in)))
+
+    out = subprocess.run(
+        ["/bin/sh", str(wrapper), "run"],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert out.stdout.strip() == "/etc/liumd/children.json|unset|run"
 
 
 def test_run_sh_writes_the_host_files_before_sshd_and_never_stops_the_executor():

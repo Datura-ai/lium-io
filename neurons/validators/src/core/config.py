@@ -308,7 +308,7 @@ class Settings(BaseSettings):
     # `GET /version` (connect, and twice this as its whole budget) and the tunnel's local bind and
     # connect; the direct-tcpip channel open on the executor runs inside the whole-call budget.
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
-    # liumd M2 step 1 (DAH-2834): after the pipeline has produced the node's result, run the same
+    # The liumd shadow: after the pipeline has produced the node's result, run the same
     # GPU steps again through `liumd run` on an SSH exec channel of the same session and log one
     # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.

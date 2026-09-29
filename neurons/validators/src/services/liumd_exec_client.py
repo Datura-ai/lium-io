@@ -1,4 +1,4 @@
-"""Validator side of `liumd run` over an SSH exec channel (DAH-2834, liumd M2 step 1).
+"""Validator side of `liumd run` over an SSH exec channel.
 
 The executor image ships `liumd` at `LIUMD_COMMAND`. On the SSH session the pipeline already holds
 (`Context.ssh`), this client opens one exec channel running `/usr/local/bin/liumd run` — no
