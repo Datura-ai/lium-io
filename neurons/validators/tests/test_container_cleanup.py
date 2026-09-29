@@ -599,7 +599,7 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
 
 @pytest.mark.asyncio
 async def test_cleanup_drops_a_stale_pods_dind_volumes_with_its_volume():
-    """DAH-3796: a stale pod_* leaves no inner Docker store or /workspace volume behind."""
+    """A stale pod_* leaves no inner Docker store or /workspace volume behind."""
     name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
     ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
 
@@ -714,6 +714,27 @@ async def test_store_probe_containers_left_behind_are_removed_once_stale():
 
     assert removed == 1
     assert calls[-1] == "/usr/bin/docker rm -f abc123 >/dev/null 2>&1"
+
+
+@pytest.mark.parametrize("sweep", ["probe-containers", "orphan-volumes"])
+@pytest.mark.asyncio
+async def test_a_failed_dind_sweep_logs_the_error_class_not_its_message(sweep, caplog):
+    async def handler(cmd, *args, **kwargs):
+        raise ConnectionError("response carried header value canary-7f3e")
+
+    ssh = _ssh_mock_from_calls(handler)
+    cleanup = ContainerCleanup()
+
+    with caplog.at_level("WARNING", logger="services.container_cleanup"):
+        if sweep == "probe-containers":
+            removed = await cleanup.prune_stale_dind_probe_containers(ssh, EXECUTOR_UUID)
+        else:
+            removed = await cleanup.prune_orphaned_dind_volumes(ssh, _rented_data(EXECUTOR_UUID, []), EXECUTOR_UUID)
+
+    assert removed == 0
+    record = next(r for r in caplog.records if "sweep failed" in r.getMessage())
+    assert record.msg.extra["error_type"] == "ConnectionError"
+    assert "canary-7f3e" not in record.msg.to_full_string()
 
 
 @pytest.mark.parametrize(("dry_run", "list_status"), [(True, 0), (False, 1)], ids=["dry-run", "listing-failed"])

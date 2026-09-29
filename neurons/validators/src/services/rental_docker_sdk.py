@@ -168,7 +168,7 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
-    # DAH-3796: merged into the container's /etc/docker/daemon.json between create and start
+    # Docker-in-Docker address pools, merged into the container's /etc/docker/daemon.json between create and start
     inner_daemon_address_pools: tuple[AddressPool, ...] = ()
 
 

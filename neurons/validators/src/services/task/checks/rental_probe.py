@@ -1121,7 +1121,7 @@ async def _remove_over_shell(ctx: Context, *, container_name: str, volume_name: 
             ctx.ssh.run(DockerCommand.volume_remove_strict(volume_name), check=False),
             timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
-        # DAH-3796: absent unless the DinD volume flags were on for this probe
+        # Absent unless the DinD volume flags were on for this probe
         await asyncio.wait_for(
             ctx.ssh.run(
                 DockerCommand.volume_remove(*dind_companion_volume_names(volume_name)), check=False

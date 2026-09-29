@@ -299,7 +299,7 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
-# DAH-3796: the store check's SSH calls. The probe command's own deadlines (the marker read, the
+# The Docker-in-Docker store check's SSH calls. The probe command's own deadlines (the marker read, the
 # image's dockerd) fit well inside its timeout; the finally removes its containers either way.
 _DIND_STORE_PROBE_TIMEOUT_SEC = 90
 _DIND_STORE_RESET_TIMEOUT_SEC = DIND_STORE_RESET_DEADLINE_SEC + 60
@@ -1157,7 +1157,7 @@ def _build_dind_volume_mounts(
     encrypted_local_volume: bool,
     occupied_targets: set[str],
 ) -> list[VolumeMount]:
-    """DAH-3796: the per-pod inner Docker store and, on an encrypted pod, a bind-mountable /workspace.
+    """The per-pod inner Docker store and, on an encrypted pod, a bind-mountable /workspace.
 
     Named after the pod's own volume, so a reboot or an edit (same volume, new container) mounts the
     same ones again. Docker creates them with the local driver on first use. A target the rental
@@ -1760,7 +1760,7 @@ class DockerService:
         local_volume: str | None,
         default_extra: dict,
     ) -> None:
-        """DAH-3796: empty the pod's inner Docker store when its image's dockerd is older than the
+        """Empty the pod's inner Docker store when its image's dockerd is older than the
         one that last wrote it (an edit to an older template); an older dockerd may not start on a
         newer store. Best-effort: on any failure the pod keeps its store, as it would without this.
 
@@ -1851,7 +1851,7 @@ class DockerService:
         container_name: str,
         default_extra: dict,
     ) -> None:
-        """DAH-3796: write the running pod's dockerd version into its store, for the next create."""
+        """Write the running pod's dockerd version into its store, for the next create."""
         if _dind_store_volume(run_spec, local_volume) is None:
             return
         try:
@@ -2868,7 +2868,7 @@ class DockerService:
     ) -> list[str]:
         """Remove vloopback `volume_*` volumes no container mounts (minus ``skip_volume_names``).
 
-        DAH-3796: with them go their `_docker`/`_workspace` companions, and any companion no
+        With them go their `_docker`/`_workspace` companions, and any companion no
         container references whose pod volume is gone (orphaned_dind_companion_volumes).
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
@@ -8155,7 +8155,7 @@ class DockerService:
                             log,
                             retry_in_use=retry_volume_in_use,
                         )
-                    # DAH-3796: the pod's inner Docker store and /workspace, whichever it has
+                    # The pod's inner Docker store and /workspace, whichever it has
                     with _best_effort_delete_step(
                         log, "remove_volume_dind", volume_name=payload.local_volume
                     ):

@@ -1,4 +1,4 @@
-"""Docker-in-Docker defaults for a rented sysbox pod (DAH-3796).
+"""Docker-in-Docker defaults for a rented sysbox pod.
 
 Three things every renter who runs Docker inside a pod hits:
 
@@ -224,7 +224,7 @@ _DOCKERD_VERSION_RE = re.compile(
     r"(?:, build [0-9A-Za-z.+~_-]{1,64})?"
 )
 
-# Helper containers of the store check: named per pod, labelled for the stale sweep, limited.
+# Helper containers of the store check: named per pod, labeled for the stale sweep, limited.
 DIND_PROBE_CONTAINER_PREFIX = "lium-dind-probe-"
 DIND_PROBE_LABEL = "io.lium.purpose=dind-store-probe"
 DIND_PROBE_RESOURCE_FLAGS = "--memory 128m --memory-swap 128m --cpus 0.5 --pids-limit 32"
@@ -280,7 +280,7 @@ def dind_store_version_probe_command(
     A store volume that does not exist yet prints nothing. Each value is at most
     DIND_VERSION_MAX_BYTES printable bytes. The marker is read only if it is a regular file, by our
     helper, with a deadline inside it. The image's dockerd runs detached under the pod's own runtime,
-    named, labelled and limited, with no network and no mounts; it gets
+    named, labeled and limited, with no network and no mounts; it gets
     DIND_PROBE_DOCKERD_DEADLINE_SEC to exit, then its first bytes of log are read and it is removed
     whether it exited or not.
     """

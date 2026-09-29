@@ -1198,7 +1198,7 @@ def test_a_volume_rm_that_fails_is_a_leftover_not_a_clean_teardown():
 
 
 def test_shell_removal_also_drops_the_dind_volumes_without_judging_them():
-    """DAH-3796: a probe created with the DinD volume flags on owns `volume_<id>_docker` (and on an encrypted
+    """A probe created with the DinD volume flags on owns `volume_<id>_docker` (and on an encrypted
     pod `_workspace`); the fallback removes them too, and their absence is not a leftover."""
     ctx, _, _ = make_probe_context()
     ctx.ssh.run.side_effect = [

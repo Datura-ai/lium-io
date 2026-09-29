@@ -1,4 +1,4 @@
-# Docker-in-Docker on rented pods (DAH-3796)
+# Docker-in-Docker on rented pods
 
 What the validator adds to a sysbox customer rental so Docker inside the pod works, and what that
 costs. Code: `neurons/validators/src/services/rental_dind.py`, wired in `docker_service.py` and
@@ -62,12 +62,12 @@ image is theirs), so:
   not a symlink, by our `alpine:3.19` helper, with a 10 s deadline inside it.
 - Only an exact `Docker version X.Y.Z[suffix][, build B]` line counts. Anything else is
   `unknown_version`, and the store is kept. The log carries only the parsed `X.Y.Z`.
-- The helpers (`lium-dind-probe-<pod>-marker`, `-dockerd`, `-reset`) are labelled
+- The helpers (`lium-dind-probe-<pod>-marker`, `-dockerd`, `-reset`) are labeled
   `io.lium.purpose=dind-store-probe` and run with `--memory 128m --memory-swap 128m --cpus 0.5
   --pids-limit 32` and no network. The image's `dockerd --version` runs detached, gets 20 s to
   exit, and is then removed whether it exited or not; its log is capped at 64 KiB.
 - The validator always removes the pod's helpers after the check, with its own 30 s timeout. The
-  periodic stale-container cleanup removes any labelled helper older than 10 minutes by the host's
+  periodic stale-container cleanup removes any labeled helper older than 10 minutes by the host's
   clock (a validator that lost its SSH session mid-check).
 - The SSH calls are bounded: 90 s for the check, 360 s for a reset (`rm -rf` has a 300 s deadline
   inside the helper), 30 s for recording the version. An image whose dockerd never answers costs

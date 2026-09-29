@@ -1,4 +1,4 @@
-"""DAH-3796: Docker-in-Docker defaults for a rented sysbox pod."""
+"""Docker-in-Docker defaults for a rented sysbox pod."""
 
 import io
 import ipaddress
@@ -644,7 +644,7 @@ def test_the_version_probe_runs_the_images_dockerd_under_the_pods_runtime_withou
     assert parse_dind_store_version_probe("") == (None, None)
 
 
-def test_the_probes_helpers_are_named_labelled_limited_and_deadlined():
+def test_the_probes_helpers_are_named_labeled_limited_and_deadlined():
     command = _probe_command()
     limits = (
         "--network none --label io.lium.purpose=dind-store-probe "

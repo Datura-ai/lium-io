@@ -174,7 +174,7 @@ class ContainerCleanup:
         return len(removed_names), removed_names, unremovable_names
 
     async def prune_stale_dind_probe_containers(self, ssh_client, executor_uuid: str) -> int:
-        """DAH-3796: remove store-check helper containers a validator left behind (its SSH session
+        """Remove Docker-in-Docker store-check helper containers a validator left behind (its SSH session
         died mid-check), by label and name prefix, once older than DIND_PROBE_STALE_AFTER_SEC by the
         host's clock. Best-effort: never raises; returns how many it asked docker to remove.
         """
@@ -204,7 +204,7 @@ class ContainerCleanup:
             )
             return len(stale)
         except Exception as e:
-            logger.warning(_m("DinD store probe container sweep failed", extra=extra | {"error": str(e)}))
+            logger.warning(_m("DinD store probe container sweep failed", extra=extra | {"error_type": type(e).__name__}))
             return 0
 
     async def prune_orphaned_dind_volumes(
@@ -213,7 +213,7 @@ class ContainerCleanup:
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
     ) -> int:
-        """DAH-3796: remove `volume_*_docker` / `volume_*_workspace` volumes whose pod is gone.
+        """Remove Docker-in-Docker `volume_*_docker` / `volume_*_workspace` volumes whose pod is gone.
 
         Orphaned = no container references it (dangling), its pod volume is no longer on the host,
         and the backend does not list its pod on this executor. Covers a pod volume removed by a
@@ -253,7 +253,7 @@ class ContainerCleanup:
             )
             return len(orphans)
         except Exception as e:
-            logger.warning(_m("DinD orphan volume sweep failed", extra=extra | {"error": str(e)}))
+            logger.warning(_m("DinD orphan volume sweep failed", extra=extra | {"error_type": type(e).__name__}))
             return 0
 
     async def prune_dangling_anonymous_volumes(

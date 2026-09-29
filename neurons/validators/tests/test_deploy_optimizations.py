@@ -1011,7 +1011,7 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
 
 
 # ------------------------------------------------------------------
-# DAH-3796 — the inner Docker store's dockerd version around the create
+# Docker-in-Docker — the inner Docker store's dockerd version around the create
 # ------------------------------------------------------------------
 
 

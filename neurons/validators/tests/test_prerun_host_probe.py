@@ -651,7 +651,7 @@ _NEW_POD_VOLUME = "volume_00000000-0000-4000-8000-000000000002"
 async def test_clean_stale_vloopback_takes_a_stale_pods_dind_volumes_and_orphans_along(
     docker_service, monkeypatch
 ):
-    """DAH-3796: a stale vloopback pod volume goes with its _docker/_workspace companions, and a
+    """A stale vloopback pod volume goes with its _docker/_workspace companions, and a
     companion whose pod volume is already gone is swept too; the live listing and the probe agree."""
     ran: list[str] = []
 
