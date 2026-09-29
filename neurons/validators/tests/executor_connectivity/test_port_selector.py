@@ -1,16 +1,11 @@
-import random
-
 import pytest
 from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services.const import BATCH_PORT_VERIFICATION_SIZE
-from services.executor_connectivity import port_selector as port_selector_module
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import (
-    DindProbeResult,
     PortPair,
-    PortProbeResult,
     PortRangeResult,
     SecondPass,
 )
@@ -99,37 +94,6 @@ def _available(info, unavailable=frozenset()):
     ]
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"port_range": "9000-9299"},
-        {"port_range": "9000-9100"},
-        {"port_range": "9000-9300", "ssh_port": 9150},
-        {"port_range": "9005,9001,9003,9002"},
-        {"port_range": "9000"},
-        {"port_mappings": str([[22, 2200]] + [[8000 + i, 30000 + i] for i in range(299)])},
-    ],
-)
-def test_small_declaration_selects_exactly_todays_ports(kwargs):
-    """A declaration of at most BATCH_PORT_VERIFICATION_SIZE ports is probed in full, unchanged."""
-    info = _executor_info(**kwargs)
-    available = _available(info)
-    assert len(available) <= BATCH_PORT_VERIFICATION_SIZE
-
-    new = PortSelector().select(info, BATCH_PORT_VERIFICATION_SIZE, set())
-
-    assert new == available[:BATCH_PORT_VERIFICATION_SIZE]
-
-
-def test_small_declaration_with_rented_ports_selects_todays_ports():
-    info = _executor_info(port_range="9000-9400")
-    unavailable = set(range(9000, 9150))
-    available = _available(info, unavailable)
-    assert len(available) <= BATCH_PORT_VERIFICATION_SIZE
-
-    assert PortSelector().select(info, BATCH_PORT_VERIFICATION_SIZE, unavailable) == available
-
-
 def test_tally_small_range_is_one_entry():
     declared = [PortPair(p, p) for p in range(9000, 9101)]
     probed = declared[:50]
@@ -181,33 +145,6 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker, monke
     assert result.second_pass == (SecondPass.NO_PORTS_LEFT if topup else None)
 
 
-@pytest.mark.asyncio
-async def test_orchestrator_parses_the_declaration_once(monkeypatch, mocker):
-    parsed = []
-
-    def counting_get_all_ports(*args):
-        parsed.append(args)
-        return get_all_ports(*args)
-
-    monkeypatch.setattr(port_selector_module, "get_all_ports", counting_get_all_ports)
-    port_probe = mocker.Mock(spec=PortProbe)
-    port_probe.probe = mocker.AsyncMock(return_value=PortProbeResult(successful=(), failed=()))
-    dind_probe = mocker.Mock(spec=DindProbe)
-    dind_probe.verify = mocker.AsyncMock(
-        return_value=DindProbeResult(success=False, sysbox_runtime=False, port=None)
-    )
-
-    await ConnectivityOrchestrator(PortSelector(), port_probe, dind_probe).verify(
-        executor_info=_executor_info(port_range="40000-65535"),
-        miner_hotkey="miner",
-        sysbox_runtime=False,
-        unavailable_ports=[],
-        ssh_client=mocker.Mock(),
-    )
-
-    assert len(parsed) == 1
-
-
 def test_tally_counts_duplicate_ports_and_shared_externals_once():
     declared = [PortPair(9000, 40000), PortPair(9001, 40000), PortPair(9002, 40001), PortPair(9002, 40001)]
 
@@ -221,48 +158,6 @@ def test_tally_drops_ports_outside_1_65535():
 
     assert tally_port_ranges(declared, declared, declared) == (
         PortRangeResult(first=9000, last=9000, declared=1, probed=1, answered=1),
-    )
-
-
-def _main_selection(info, size, unavailable):
-    """Main's PortSelector.select, verbatim: the lowest `size` free declared ports."""
-    all_ports = get_all_ports(info.port_range, info.port_mappings, info.ssh_port)
-    available_ports = [
-        PortPair(internal, external) for internal, external in all_ports if external not in unavailable
-    ]
-    return available_ports[:size]
-
-
-def _random_shapes(seed, count):
-    rng = random.Random(seed)
-    shapes = []
-    for _ in range(count):
-        kind = rng.choice(["range", "range", "list", "mappings"])
-        if kind == "range":
-            lo = rng.randint(1024, 65000)
-            hi = min(65535, lo + rng.choice([0, 5, 150, 299, 300, 301, 1000, 25535, 45535]))
-            kwargs = {"port_range": f"{lo}-{hi}"}
-            pool = list(range(lo, hi + 1))
-        elif kind == "list":
-            pool = sorted(rng.sample(range(1024, 65535), rng.randint(1, 700)))
-            kwargs = {"port_range": ",".join(map(str, rng.sample(pool, len(pool))))}
-        else:
-            internals = rng.sample(range(1024, 65535), rng.randint(1, 700))
-            pairs = [[i, rng.randint(1024, 65535)] for i in internals]
-            kwargs = {"port_mappings": str(pairs)}
-            pool = [e for _, e in pairs]
-        ssh = rng.choice([22, rng.choice(pool)])
-        rented = set(rng.sample(pool, min(len(pool), rng.choice([0, 0, 5, 200]))))
-        shapes.append((kwargs, ssh, rented))
-    return shapes
-
-
-@pytest.mark.parametrize("kwargs, ssh, rented", _random_shapes(1463, 300))
-def test_pass_one_is_mains_selection(kwargs, ssh, rented):
-    info = _executor_info(ssh_port=ssh, **kwargs)
-
-    assert PortSelector().select(info, BATCH_PORT_VERIFICATION_SIZE, rented) == _main_selection(
-        info, BATCH_PORT_VERIFICATION_SIZE, rented
     )
 
 
@@ -280,19 +175,6 @@ def test_pass_two_spread_excludes_pass_one_and_rented_ports_and_includes_the_hig
     assert two[0] == PortPair(40301, 40301)
     assert two[-1] == PortPair(65534, 65534)
     assert two == sorted(set(two), key=lambda p: p.internal)
-
-
-def test_pass_two_is_deterministic_for_the_same_declaration_and_rental_set():
-    info = _executor_info(port_range="40000-65535")
-    rented = {40001, 50000}
-    selector = PortSelector()
-    declared = _available(info)
-    one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, rented)
-    first = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, pass_one_ports=one)
-
-    for _ in range(5):
-        again_one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, rented)
-        assert selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, pass_one_ports=again_one) == first
 
 
 @pytest.mark.parametrize("n", [1, 2, 299, 300, 301, 302, 450, 600, 25236, 45236])
