@@ -780,7 +780,7 @@ async def test_forged_host_fields_are_capped_and_typed_in_the_event(
         "runtime": None,
         "cached": None,
     }
-    assert len(summary.get("detail", "")) <= 601
+    assert summary.get("detail") == (f"{'R' * 300}: {'x' * 300}" if enforced else None)
 
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
