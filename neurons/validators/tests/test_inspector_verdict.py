@@ -278,7 +278,7 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
 
 @pytest.mark.parametrize("container", ["my-own-jupyter", "pod_gone-since-the-list-was-fetched"])
 def test_a_finding_on_a_container_that_is_not_a_rented_pod_names_no_pod(container):
-    """A provider inside their own container is provider-origin but harms no renter (taiberium, #1342)."""
+    """A provider inside their own container is provider-origin but harms no renter."""
     finding = _finding(HUMAN_SHELL, host=True, nested=False)
     finding["container"] = container
     verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=True)
@@ -515,9 +515,9 @@ async def test_provider_finding_records_the_verdict_and_its_evidence(context_fac
 @pytest.mark.parametrize("rented", [True, False])
 @pytest.mark.asyncio
 async def test_a_malicious_finding_on_a_rented_pod_changes_no_score_and_triggers_no_enforcement(context_factory, rented):
-    """Owner decision, 29 Sep 2026: no enforcement on the validator side and no scoring based on
-    Inspector findings. The context the MALICIOUS run hands on scores exactly like the CLEAN run's,
-    the check passes and nothing is published to a renter's pod stream."""
+    """No enforcement on the validator side and no scoring based on Inspector findings: the context
+    the MALICIOUS run hands on scores exactly like the CLEAN run's, the check passes and nothing is
+    published to a renter's pod stream."""
 
     async def run(findings):
         redis = AsyncMock()
@@ -568,7 +568,7 @@ def test_no_scoring_or_enforcement_path_reads_inspector_findings():
 @pytest.mark.asyncio
 async def test_finding_on_a_non_rented_container_is_recorded_and_names_no_pod(context_factory):
     """The provider entered their own container: MALICIOUS is recorded with the container under
-    `unmatched_containers`, and the impact text says it is not a rented pod (taiberium, 11 Sep)."""
+    `unmatched_containers`, and the impact text says it is not a rented pod."""
     redis = AsyncMock()
     finding = _finding(HUMAN_SHELL, host=True, nested=False)
     finding["container"] = "my-own-jupyter"
