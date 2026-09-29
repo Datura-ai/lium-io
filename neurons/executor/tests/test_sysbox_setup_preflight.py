@@ -57,6 +57,7 @@ STUBS = {
         case "$1 $2" in
             "version --format") echo "${STUB_DOCKER_VERSION:-28.5.2}" ;;
             "ps ") exit 0 ;;
+            "ps --format") [ -z "${STUB_RUNNING:-}" ] || echo "$STUB_RUNNING" ;;   # install mode's running-container sort
             "ps -a")   # every container, stopped ones too
                 echo "${STUB_STOPPED_POD:-}"
                 [ "$4" != name=pod_ ] || [ -z "${STUB_PODS:-}" ] || echo "$STUB_PODS" ;;
@@ -1026,6 +1027,22 @@ def test_install_mode_stops_on_a_stopped_rental(tmp_path):
     assert "docker ps -a --filter name=pod_" in proc.stdout
     assert "pod_abc123" in proc.stdout
     assert "Removing stopped containers" not in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("running", "message", "absent"),
+    [
+        ("lium_storage_check_90000_311_a1b2c3", "Validator check in progress", "Unknown containers found"),
+        ("container_4f1c", "Validator check in progress", "Unknown containers found"),
+        ("my_app", "Unknown containers found", "Validator check in progress"),
+    ],
+)
+def test_install_mode_waits_for_a_validators_vloopback_test_container(tmp_path, running, message, absent):
+    # a validator's scrape runs its vloopback test in a lium_storage_check_* container for up to a minute
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_RUNNING": running})
+    assert proc.returncode == 1
+    assert message in proc.stdout
+    assert absent not in proc.stdout
 
 
 def test_install_mode_keeps_a_newer_sysbox(tmp_path):

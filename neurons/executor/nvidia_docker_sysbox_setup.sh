@@ -833,7 +833,7 @@ unknown_list=""
 for name in $all_containers; do
     case "$name" in
         pod_*)       ;;  # handled by abort_on_active_rentals below
-        container_*) has_validator=true ;;
+        container_*|lium_storage_check_*) has_validator=true ;;  # a validator's scrape or its vloopback test
         executor-*|executor_*)
             has_executor=true
             if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
@@ -847,7 +847,7 @@ done
 abort_on_active_rentals
 
 if [ "$has_validator" = true ]; then
-    fail "Validator check in progress (container_* containers). Wait ~30 seconds and retry."
+    fail "Validator check in progress (container_* or lium_storage_check_* containers). Wait ~30 seconds and retry."
     exit 1
 fi
 
