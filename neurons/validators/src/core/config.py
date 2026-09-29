@@ -567,15 +567,16 @@ class Settings(BaseSettings):
 
     # Spot-node pay. True: an unrented spot node whose provider chose Spot (the backend's
     # provider_spot_executor_ids) and that runs Lium fillers earns
-    # min(0.9 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap; a spot node without a filler, or whose configuration
+    # min(0.95 x its GPU configuration's average filler revenue, its secure idle rate before
+    # bucket-cap dilution), with no bucket cap (0.95 = FILLER_REVENUE_PAY_FACTOR); a spot node without a filler, or whose configuration
     # has no usable average, earns 0, and a demoted, force-spot, pinned or no-incentive-rental one
     # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
     # False: every spot node earns 0, as before.
     ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
     # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
-    # bucket-cap dilution is raised to 0.9 x its configuration's average filler revenue, even above
-    # its listed rate. False: dilution applies as before.
+    # bucket-cap dilution is raised to 0.95 x its configuration's average filler revenue, even above
+    # its listed rate (0.95 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
+    # False: dilution applies as before.
     ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
     # A configuration's filler average is used only when it was taken over at least this many
     # filler GPU-hours; a thinner sample reads as no average.

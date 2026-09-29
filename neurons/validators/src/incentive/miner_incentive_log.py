@@ -616,13 +616,18 @@ class MinerLogLine(BaseModel):
 
     @staticmethod
     def spot_pay_incentive_calculated(
-        hotkey: str, result: JobResult, secure_rate: float, filler_rate: float, paid_fraction: float
+        hotkey: str,
+        result: JobResult,
+        secure_rate: float,
+        filler_rate: float,
+        paid_fraction: float,
+        pay_factor: float,
     ) -> MinerLogLine:
         return MinerLogLine(
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
-                "effective_rate = min(0.9 * filler_revenue_per_gpu_hour, secure_rate); "
+                f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
                 "that part of spot pay and floor top-ups)"
             ),
@@ -649,12 +654,17 @@ class MinerLogLine(BaseModel):
 
     @staticmethod
     def secure_filler_revenue_floor_applied(
-        result: JobResult, diluted_rate: float, floored_rate: float, top_up_incentive: float, paid_fraction: float
+        result: JobResult,
+        diluted_rate: float,
+        floored_rate: float,
+        top_up_incentive: float,
+        paid_fraction: float,
+        floor_factor: float,
     ) -> MinerLogLine:
         # report line, not a zero reason: the node is paid more than its listed or diluted rate
         return MinerLogLine(
             message=(
-                "Unrented incentive: this executor's listed or diluted rate is below 0.9 x the "
+                f"Unrented incentive: this executor's listed or diluted rate is below {floor_factor:g} x the "
                 "average filler revenue for its GPU configuration, so the difference is paid on top "
                 "of the line above. Formula: unbucketed_share * gpu_count * floor_top_up_rate / "
                 "unbucketed_rental_cost (paid_fraction < 1: the pool had room for only that part of "
@@ -680,11 +690,13 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def secure_filler_revenue_floor_not_paid(result: JobResult, diluted_rate: float, floored_rate: float) -> MinerLogLine:
+    def secure_filler_revenue_floor_not_paid(
+        result: JobResult, diluted_rate: float, floored_rate: float, floor_factor: float
+    ) -> MinerLogLine:
         # report line, not a zero reason: the node keeps the pay in the line above
         return MinerLogLine(
             message=(
-                "Unrented incentive: 0.9 x the average filler revenue for this GPU configuration is "
+                f"Unrented incentive: {floor_factor:g} x the average filler revenue for this GPU configuration is "
                 "above this executor's listed or diluted rate, but no top-up is paid this cycle: the "
                 "unrented pool already takes the whole burn emission, and top-ups are paid on top of it."
             ),

@@ -61,9 +61,11 @@ NCU_PROFILING_UNRESTRICTED = "unrestricted"
 CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
 
-# Spot-node pay and the secure floor: the share of a GPU configuration's average filler revenue
-# per GPU-hour that a node is paid (ENABLE_SPOT_NODE_PAY, ENABLE_SECURE_FILLER_REVENUE_FLOOR).
-FILLER_REVENUE_PAY_FACTOR = 0.90
+# The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
+# spot-node pay (ENABLE_SPOT_NODE_PAY) and the secure floor (ENABLE_SECURE_FILLER_REVENUE_FLOOR).
+# Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
+FILLER_REVENUE_PAY_FACTOR = 0.95
+SECURE_FILLER_REVENUE_FLOOR_FACTOR = 0.95
 
 
 # ── Spec measurements ────────────────────────────────────────────────────────
@@ -954,6 +956,7 @@ class RentalPriceIncentive(DefaultIncentive):
                         secure_rate=self._spot_secure_rate(result),
                         filler_rate=FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
                         paid_fraction=self.unbucketed_paid_fraction,
+                        pay_factor=FILLER_REVENUE_PAY_FACTOR,
                     )
                 )
             self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
@@ -1001,12 +1004,19 @@ class RentalPriceIncentive(DefaultIncentive):
             if top_up_incentive > 0:
                 result.record_incentive_log(
                     MinerLogLine.secure_filler_revenue_floor_applied(
-                        result, diluted_rate, floored_rate, top_up_incentive, self.unbucketed_paid_fraction
+                        result,
+                        diluted_rate,
+                        floored_rate,
+                        top_up_incentive,
+                        self.unbucketed_paid_fraction,
+                        floor_factor=SECURE_FILLER_REVENUE_FLOOR_FACTOR,
                     )
                 )
             elif self._unbucketed_clamped_to_zero:
                 result.record_incentive_log(
-                    MinerLogLine.secure_filler_revenue_floor_not_paid(result, diluted_rate, floored_rate)
+                    MinerLogLine.secure_filler_revenue_floor_not_paid(
+                        result, diluted_rate, floored_rate, floor_factor=SECURE_FILLER_REVENUE_FLOOR_FACTOR
+                    )
                 )
 
         # DAH-2528: tell the miner why the node was rated against its split tier
@@ -1091,7 +1101,7 @@ class RentalPriceIncentive(DefaultIncentive):
         return job_result
 
     def _price_spot_node(self, result: JobResult) -> None:
-        """Spot rate per GPU = min(0.9 x filler average, the secure rate for this node).
+        """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average, the secure rate for this node).
 
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
         runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
@@ -1125,7 +1135,8 @@ class RentalPriceIncentive(DefaultIncentive):
         return result.hourly_rate * result.sysbox_multiplier * result.driver_multiplier
 
     def _floored_rate(self, result: JobResult, diluted_rate: float) -> float:
-        """Secure floor: a rate diluted by the bucket cap is raised to 0.9 x the filler average,
+        """Secure floor: a rate diluted by the bucket cap is raised to SECURE_FILLER_REVENUE_FLOOR_FACTOR x
+        the filler average,
         even where that is above the node's own listed rate. A bucket with no capacity (max_cap 0)
         and a node with no listed rate stay at 0: they are not in `_secure_floor_candidates`, so
         the unbucketed cost carries no top-up for them."""
@@ -1136,7 +1147,7 @@ class RentalPriceIncentive(DefaultIncentive):
             or not result.hourly_rate
         ):
             return diluted_rate
-        return max(diluted_rate, FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour)
+        return max(diluted_rate, SECURE_FILLER_REVENUE_FLOOR_FACTOR * result.filler_revenue_per_gpu_hour)
 
     def _secure_floor_top_up(self) -> float:
         """USD/hour the secure floor adds on top of the bucket sums, paid from the unbucketed share."""
