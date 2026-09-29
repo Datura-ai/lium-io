@@ -659,7 +659,10 @@ def test_a_corrupt_cached_pass_is_a_miss_and_names_the_error_class(
 
     # Assert
     assert cached is False
-    assert capsys.readouterr().err == f"vloopback check: cached pass unreadable, testing again ({error_class})\n"
+    assert (
+        capsys.readouterr().err
+        == f"vloopback check: cached pass unreadable, testing again ({error_class})\n"
+    )
 
 
 def test_no_cached_pass_yet_is_a_quiet_miss(tmp_path: Path, capsys) -> None:
