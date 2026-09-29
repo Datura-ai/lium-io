@@ -242,7 +242,7 @@ class JobResult(BaseModel):
             }
             if self.unbucketed_share is not None:
                 # rental_price_v2 has two terms once these keys are present (documented in the
-                # lium_protocol README, 1.4.0):
+                # lium_protocol README, 1.5.0):
                 #   rental term:     rental_share * gpu_count * effective_rate / total_rental_cost
                 #   unbucketed term: unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
                 # A floored secure node is paid both. A spot node (spot_pay: true) is paid only the
