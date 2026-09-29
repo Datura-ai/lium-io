@@ -725,6 +725,17 @@ async def test_mismatch_fetches_installs_and_the_check_passes(refresh_on, full_s
 
 
 @pytest.mark.asyncio
+async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, full_sha_validator):
+    shell = refreshing_executor(
+        curl_stdout=f"CURL_RC:0\n{full_sha_validator}  /tmp/libinspector.so.fetch\nmotd: welcome\n",
+        installs_as=full_sha_validator,
+    )
+    result = await _validate(shell)
+    assert result.error is None
+    assert _kinds(shell) == ["write-check", "curl", "mv"]
+
+
+@pytest.mark.asyncio
 async def test_fetched_hash_that_differs_is_not_installed(refresh_on, full_sha_validator):
     other = "f" * 64
     shell = refreshing_executor(curl_stdout=f"CURL_RC:0\n{other}  /tmp/libinspector.so.fetch\n")

@@ -275,7 +275,6 @@ class Settings(BaseSettings):
     # (VERIFYX_LIBRARY_REFRESH_ENABLED): on a hash mismatch the executor curls this once and
     # the file is installed only if its sha256 is the validator's own libinspector.so.
     INSPECTOR_LIBRARY_FETCH_URL: str = Field(
-        env="INSPECTOR_LIBRARY_FETCH_URL",
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when library refresh is on and the libinspector.so hash does not match",
     )
