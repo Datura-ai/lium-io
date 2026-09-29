@@ -30,20 +30,12 @@ def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
 
-def listing_needs_background_job_ports_text(
-    available_port_count: int, background_job_port_count: int
-) -> str:
-    return (
-        "Listed only if the platform counts ports held by preemptible background jobs: "
-        f"{available_port_count} verified ports plus {background_job_port_count} held, need {MIN_PORT_COUNT}"
-    )
-
-
 def port_floor_impact_text(state: ContextState, available_port_count: int) -> str:
     background_job_port_count = state.preemptible_background_job_port_count
     if background_job_port_count:
-        return listing_needs_background_job_ports_text(
-            available_port_count, background_job_port_count
+        return (
+            "Listed only if the platform counts ports held by preemptible background jobs: "
+            f"{available_port_count} verified ports plus {background_job_port_count} held, need {MIN_PORT_COUNT}"
         )
     return hidden_from_renters_text(available_port_count)
 

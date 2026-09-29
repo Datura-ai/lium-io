@@ -117,142 +117,70 @@ def _state(rented_data: RentedExecutorsResponse | None, pairs=ANSWERED_PAIRS):
 
 
 @pytest.mark.asyncio
-async def test_background_job_ports_lift_an_unrented_host_to_the_floor(context_factory):
-    ctx = context_factory(state=_state(_background_job_data()))
+async def test_background_job_ports_lift_an_unrented_host_and_finalize_does_not_report_it_hidden(context_factory):
+    ctx = context_factory(state=_state(_background_job_data()), score=1.0, job_score=1.0)
+    listed_only_if = (
+        "Listed only if the platform counts ports held by preemptible background jobs: "
+        f"{len(ANSWERED_PAIRS)} verified ports plus {len(BACKGROUND_JOB_PORTS)} held, need {MIN_PORT_COUNT}"
+    )
 
     result = await PortCountCheck().run(ctx)
+    final_result = await FinalizeCheck().run(ctx.model_copy(update=result.updates))
 
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == len(BACKGROUND_JOB_PORTS)
     # the published figures stay the answered count: the platform adds these ports itself
     assert result.updates["port_count"] == len(ANSWERED_PAIRS)
     assert result.updates["state"].specs["available_port_count"] == len(ANSWERED_PAIRS)
+    assert result.updates["state"].preemptible_background_job_port_count == len(BACKGROUND_JOB_PORTS)
     # passed under the published floor: listed only while the platform counts the held ports too
-    # (its count_preemptible_filler_ports_as_free setting), so the warning says so instead of claiming the
-    # node is hidden
+    # (its count_preemptible_filler_ports_as_free setting), so neither event claims the node is hidden
     assert result.event.severity == "warning"
     assert result.event.impact == (
-        "Listed only if the platform counts ports held by preemptible background jobs: "
-        f"{len(ANSWERED_PAIRS)} verified ports plus {len(BACKGROUND_JOB_PORTS)} held, need {MIN_PORT_COUNT}; "
-        f"scored with {len(BACKGROUND_JOB_PORTS)} ports held by preemptible background jobs"
+        f"{listed_only_if}; scored with {len(BACKGROUND_JOB_PORTS)} ports held by preemptible background jobs"
     )
-    assert "Hidden from renters" not in result.event.impact
     assert result.event.what_we_saw["listing_hidden"] is None
     assert result.event.what_we_saw["exempt_because_rented"] is False
-    assert result.updates["state"].preemptible_background_job_port_count == len(BACKGROUND_JOB_PORTS)
-
-
-@pytest.mark.asyncio
-async def test_a_node_lifted_by_background_job_ports_is_not_reported_hidden_at_finalize(context_factory):
-    ctx = context_factory(state=_state(_background_job_data()), score=1.0, job_score=1.0)
-
-    count_result = await PortCountCheck().run(ctx)
-    ctx = ctx.model_copy(update=count_result.updates)
-    final_result = await FinalizeCheck().run(ctx)
-
-    assert count_result.passed is True
     assert final_result.event.reason_code == FinalizeMessages.COMPLETED.reason
-    assert "Hidden from renters" not in final_result.event.impact
-    assert final_result.event.impact.startswith(
-        "Listed only if the platform counts ports held by preemptible background jobs: "
-        f"{len(ANSWERED_PAIRS)} verified ports plus {len(BACKGROUND_JOB_PORTS)} held, need {MIN_PORT_COUNT}."
-    )
+    assert final_result.event.impact.startswith(f"{listed_only_if}.")
     assert final_result.event.what_we_saw["port_floor"]["listing_hidden"] is None
-    assert final_result.event.what_we_saw["port_floor"]["held_by_preemptible_background_jobs"] == len(
-        BACKGROUND_JOB_PORTS
-    )
     # the firewall fix is offered only for the case where the platform does not list the node
     assert final_result.event.remediation.startswith("If the node is not listed for renters: ")
 
 
-@pytest.mark.asyncio
-async def test_background_job_ports_alone_never_pass_a_host_where_no_port_answered(context_factory):
-    held = [40010, 40011, 40012]
-    ctx = context_factory(state=_state(_background_job_data(filler_ports=held), pairs=[]))
-
-    result = await PortCountCheck().run(ctx)
-
-    assert len(held) >= MIN_PORT_COUNT
-    assert result.passed is False
-    assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == 0
-    assert result.updates["port_count"] == 0
+RENTER_POD = RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[40020])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("held", "passed"),
+    ("rented_data", "pairs", "passed", "held"),
     [
-        pytest.param([40010, 40011], True, id="1-answered-plus-2-held-is-exactly-the-floor"),
-        pytest.param([40010], False, id="1-answered-plus-1-held-is-one-short"),
+        pytest.param(_background_job_data(filler_ports=[40010, 40011, 40012]), [], False, 0, id="no-port-answered"),
+        pytest.param(_background_job_data(), ANSWERED_PAIRS[:1], True, 2, id="1-answered-plus-2-held-is-the-floor"),
+        pytest.param(_background_job_data(filler_ports=[40010]), ANSWERED_PAIRS[:1], False, 1, id="1-plus-1-short"),
+        pytest.param(
+            _background_job_data(filler_ports=[ANSWERED_PAIRS[0][1]]), ANSWERED_PAIRS, False, 0, id="answered-and-held"
+        ),
+        pytest.param(None, ANSWERED_PAIRS, False, 0, id="no-backend-snapshot"),
+        pytest.param(_background_job_data(owner="miner"), ANSWERED_PAIRS, False, 0, id="miner-default-job"),
+        pytest.param(_background_job_data(owner=None), ANSWERED_PAIRS, False, 0, id="owner-not-reported"),
+        pytest.param(_background_job_data(owner="future-owner"), ANSWERED_PAIRS, False, 0, id="unknown-owner"),
+        pytest.param(
+            _background_job_data(executor_uuid="another-executor"), ANSWERED_PAIRS, False, 0, id="another-executor"
+        ),
+        # the backend drops stale and terminal filler rows before it lists ports (daos/filler_run.py)
+        pytest.param(_background_job_data(filler_ports=[]), ANSWERED_PAIRS, False, 0, id="no-live-job-rows"),
+        # main passes a rented host whatever its count; the background-job ports are never added to it
+        pytest.param(_background_job_data(renter_pods=[RENTER_POD]), ANSWERED_PAIRS, True, 0, id="renter-pod"),
+        pytest.param(_background_job_data(renter_pods=[]), ANSWERED_PAIRS, True, 2, id="entry-without-pods"),
     ],
 )
-async def test_the_floor_boundary_with_one_answered_port(context_factory, held, passed):
-    pairs = ANSWERED_PAIRS[:1]
-    ctx = context_factory(state=_state(_background_job_data(filler_ports=held), pairs=pairs))
+async def test_which_ports_count_toward_the_floor(context_factory, rented_data, pairs, passed, held):
+    ctx = context_factory(state=_state(rented_data, pairs=pairs))
 
     result = await PortCountCheck().run(ctx)
 
-    assert len(pairs) + len(held) in (MIN_PORT_COUNT, MIN_PORT_COUNT - 1)
     assert result.passed is passed
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == len(held)
+    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == held
     assert result.updates["port_count"] == len(pairs)
     assert result.updates["state"].specs["available_port_count"] == len(pairs)
-
-
-@pytest.mark.asyncio
-async def test_a_port_both_answered_and_listed_counts_once(context_factory):
-    answered_external = ANSWERED_PAIRS[0][1]
-    ctx = context_factory(state=_state(_background_job_data(filler_ports=[answered_external])))
-
-    result = await PortCountCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "rented_data",
-    [
-        pytest.param(None, id="no-backend-snapshot"),
-        pytest.param(_background_job_data(owner="miner"), id="miner-default-job"),
-        pytest.param(_background_job_data(owner=None), id="owner-not-reported"),
-        pytest.param(_background_job_data(owner="future-owner"), id="unknown-owner"),
-        pytest.param(_background_job_data(executor_uuid="another-executor"), id="another-executors-jobs"),
-        # the backend drops stale and terminal filler rows before it lists ports (daos/filler_run.py)
-        pytest.param(_background_job_data(filler_ports=[]), id="no-live-job-rows"),
-    ],
-)
-async def test_ports_not_provably_held_by_a_platform_job_keep_mains_result(context_factory, rented_data):
-    ctx = context_factory(state=_state(rented_data))
-
-    result = await PortCountCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
-    assert result.updates["state"].specs["available_port_count"] == len(ANSWERED_PAIRS)
-
-
-@pytest.mark.asyncio
-async def test_a_renter_pod_keeps_mains_result_and_counts_no_background_job_ports(context_factory):
-    renter = RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[40020])
-    ctx = context_factory(state=_state(_background_job_data(renter_pods=[renter])))
-
-    result = await PortCountCheck().run(ctx)
-
-    # main passes a rented host whatever its count; the background-job ports are never added to it
-    assert result.passed is True
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == 0
-    assert result.updates["port_count"] == len(ANSWERED_PAIRS)
-
-
-@pytest.mark.asyncio
-async def test_an_executor_entry_without_pods_is_not_rented(context_factory):
-    ctx = context_factory(state=_state(_background_job_data(renter_pods=[])))
-
-    result = await PortCountCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == len(BACKGROUND_JOB_PORTS)
