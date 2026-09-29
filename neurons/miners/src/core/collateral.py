@@ -8,7 +8,6 @@ collateral reads, start a reclaim, list open reclaims, finalize a reclaim.
 import hashlib
 import json
 import logging
-import os
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,7 +17,7 @@ from uuid import UUID
 from bittensor_wallet import Keypair
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
-from web3.exceptions import ContractLogicError, TransactionNotFound
+from web3.exceptions import ContractLogicError
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +31,9 @@ RPC_URLS = {
 # The Bittensor EVM chain of each network. A transaction is signed for this chain only, so an RPC that reports
 # another one (Ethereum mainnet, say) never gets a transaction it could broadcast there.
 CHAIN_IDS = {"finney": 964, "archive": 964, "test": 945, "local": 42}
-# The last transaction this machine broadcast, per chain and address, until its receipt has been read: a retry
-# never pays gas while an earlier send's outcome is unknown.
-SENT_RECORD_PATH = pathlib.Path(
-    os.environ.get("COLLATERAL_SENT_RECORD", "~/.lium-miner/collateral-sent.json")
-).expanduser()
+RETRY_IS_SAFE = (
+    "Run this again: nothing is sent while it is pending, and once it is applied the contract rejects a repeat"
+)
 
 GAS_LIMIT = 200_000
 # The RPC quotes the gas price; above this ceiling nothing is signed, so a faulty or hostile RPC
@@ -175,7 +172,6 @@ class CollateralClient:
                 f"The RPC reports EVM chain {rpc_chain_id}, not {chain_id} ({self.network}); "
                 "no transaction was signed. Check SUBTENSOR_EVM_RPC_URL"
             )
-        await self._settle_earlier_send(chain_id)
         gas_price = await self.w3.eth.gas_price
         max_gas_price = AsyncWeb3.to_wei(self.max_gas_price_gwei, "gwei")
         if gas_price > max_gas_price:
@@ -185,6 +181,8 @@ class CollateralClient:
             )
         # A retry after a lost receipt must not pay gas for a second copy: an earlier send still pending blocks
         # this one, and a mined one leaves a call the contract now rejects, which the simulation catches unsent.
+        # The retry signs the account's next unused nonce, so an earlier send the mempool dropped is replaced by
+        # it, and the two can never both be mined.
         nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
         pending_nonce = await self.w3.eth.get_transaction_count(self.miner_address, "pending")
         if pending_nonce > nonce:
@@ -211,20 +209,23 @@ class CollateralClient:
         )
         signed = self.miner_account.sign_transaction(transaction)
         raw_transaction = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        self._write_sent_record(chain_id, {"nonce": nonce, "hash": signed.hash.hex()})
         try:
             tx_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
         except ValueError as error:
-            # the RPC answered with an error: the transaction was refused, not sent
-            self._write_sent_record(chain_id, None)
+            message = self._rpc_error_message(error)
+            if "known" in message.lower():
+                # "already known" / "known transaction": the node holds this transaction, so it may be mined
+                raise CollateralOutcomeUnknownError(
+                    f"The RPC already holds transaction {signed.hash.hex()} ({message}); its outcome is unknown. "
+                    f"{RETRY_IS_SAFE}"
+                ) from error
             raise CollateralTransactionError(
-                f"The RPC refused the transaction ({self._rpc_error_message(error)}); no transaction was sent"
+                f"The RPC refused the transaction ({message}); no transaction was sent"
             ) from error
         except Exception as error:
             raise CollateralOutcomeUnknownError(
                 f"Transaction {signed.hash.hex()} may have been sent, but the RPC's answer was lost "
-                f"({type(error).__name__}); its outcome is unknown. Run this again to read its outcome; "
-                "nothing is sent until it is known"
+                f"({type(error).__name__}); its outcome is unknown. {RETRY_IS_SAFE}"
             ) from error
         logger.info("Sent transaction %s; waiting for its receipt", tx_hash.hex())
         try:
@@ -235,90 +236,13 @@ class CollateralClient:
             # the class name only: a transport error's text can carry the RPC URL and its API key
             raise CollateralOutcomeUnknownError(
                 f"Transaction {tx_hash.hex()} was sent but its receipt could not be read "
-                f"({type(error).__name__}); its outcome is unknown. Run this again to read its outcome; "
-                "nothing is sent until it is known"
+                f"({type(error).__name__}); its outcome is unknown. {RETRY_IS_SAFE}"
             ) from error
-        self._write_sent_record(chain_id, None)
         if receipt["status"] == 0:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
             message = f"Transaction {tx_hash.hex()} reverted"
             raise CollateralTransactionError(f"{message}: {reason}" if reason else message)
         return receipt
-
-    async def _settle_earlier_send(self, chain_id: int) -> None:
-        """Read the outcome of this machine's last unsettled send. Raises when there is one: the run that learns an
-        earlier send's outcome reports it and sends nothing."""
-        record = self._read_sent_record(chain_id)
-        if record is None:
-            return
-        tx_hash = record["hash"]
-        try:
-            receipt = await self.w3.eth.get_transaction_receipt(tx_hash)
-        except TransactionNotFound:
-            receipt = None
-        except Exception as error:
-            raise CollateralOutcomeUnknownError(
-                f"The receipt of transaction {tx_hash}, sent earlier, could not be read ({type(error).__name__}); "
-                "no transaction was sent. Run this again to read its outcome"
-            ) from error
-        if receipt is None:
-            nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
-            if nonce <= record["nonce"]:
-                raise CollateralOutcomeUnknownError(
-                    f"Transaction {tx_hash}, sent earlier, is not mined yet; no transaction was sent. "
-                    "Run this again once it is mined"
-                )
-            self._write_sent_record(chain_id, None)
-            raise CollateralTransactionError(
-                f"Transaction {tx_hash}, sent earlier, was never mined: another transaction took its nonce. "
-                "No transaction was sent; run this again to retry"
-            )
-        self._write_sent_record(chain_id, None)
-        outcome = "succeeded" if receipt["status"] == 1 else "reverted"
-        raise CollateralTransactionError(
-            f"Transaction {tx_hash}, sent earlier, {outcome} in block {receipt['blockNumber']}; "
-            "no transaction was sent. Run this again if it still needs doing"
-        )
-
-    def _sent_record_key(self, chain_id: int) -> str:
-        return f"{chain_id}:{self.miner_address}"
-
-    def _read_sent_record(self, chain_id: int) -> dict | None:
-        try:
-            records = json.loads(SENT_RECORD_PATH.read_text())
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as error:
-            raise CollateralTransactionError(
-                f"The record of earlier sends ({SENT_RECORD_PATH}) could not be read ({type(error).__name__}); "
-                "no transaction was sent"
-            ) from error
-        return records.get(self._sent_record_key(chain_id))
-
-    def _write_sent_record(self, chain_id: int, record: dict | None) -> None:
-        try:
-            records = json.loads(SENT_RECORD_PATH.read_text()) if SENT_RECORD_PATH.exists() else {}
-            if record is None:
-                records.pop(self._sent_record_key(chain_id), None)
-            else:
-                records[self._sent_record_key(chain_id)] = record
-            SENT_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
-            temporary = SENT_RECORD_PATH.with_suffix(".tmp")
-            temporary.write_text(json.dumps(records))
-            temporary.replace(SENT_RECORD_PATH)
-        except (OSError, ValueError) as error:
-            if record is None:
-                # the outcome is already known; the next run reads it again and reports it
-                logger.warning(
-                    "Could not clear the record of earlier sends (%s): %s",
-                    SENT_RECORD_PATH,
-                    type(error).__name__,
-                )
-                return
-            raise CollateralTransactionError(
-                f"The record of earlier sends ({SENT_RECORD_PATH}) could not be written ({type(error).__name__}); "
-                "no transaction was sent"
-            ) from error
 
     @staticmethod
     def _rpc_error_message(error: ValueError) -> str:
