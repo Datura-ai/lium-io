@@ -7,12 +7,18 @@ JSON document inside the executor container, where the validator's cached-templa
 check can read it over the SSH connection it already holds (``run.sh`` starts sshd
 in this very container) and attach it to the failure event.
 
-Two rules govern everything here:
+Three rules govern everything here:
 
 * **Never wedge the loop.** Every mutator swallows its own errors. A broken state
   file must not change a single pull decision.
 * **Never grow without bound.** The document is capped, because the validator's log
   line already carries a large monitoring payload and this rides along with it.
+* **Never publish an error's text.** The validator attaches the document to its event
+  and quotes it to the provider, and an error's text can carry a backend URL's
+  credentials. Every error field holds only ``class``, ``code`` (a ``Reason``),
+  ``host`` and ``status``, each read from the error's type or structured attributes;
+  ``backend_url`` is published as ``scheme://host``. The loop's local log lines keep
+  the text, through ``describe_error``.
 
 The file is deliberately *not* durable. Watchtower recreates the executor container
 on every update, which resets the counters. ``started_at`` and ``sweep_count`` are
@@ -21,31 +27,43 @@ never mistakes a fresh reset for a healthy node.
 """
 
 import copy
+import errno
 import functools
 import json
 import os
 import re
+import socket
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aiohttp.client_exceptions import NonHttpUrlClientError
+from aiohttp.client_exceptions import (
+    ClientConnectionError,
+    ClientError,
+    ClientConnectorError,
+    ClientPayloadError,
+    ClientResponseError,
+    ClientSSLError,
+    ContentTypeError,
+    InvalidURL,
+    NonHttpUrlClientError,
+)
 from yarl import URL
 
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Bump when the document shape changes in a way a reader must notice.
-SCHEMA_VERSION = 1
+# Bump when the document shape changes in a way a reader must notice. 2: every error field is
+# a {class, code, host, status} object, and backend_url is scheme://host.
+SCHEMA_VERSION = 2
 
 # Inside the executor container. The validator's shell lands in this same container,
 # so no bind-mount is involved.
 STATE_PATH = "/var/lib/lium/cache_prefetch_state.json"
 
-# Per-error and whole-document limits. 4 KB comfortably holds one image's full
-# history; the reduction ladder in `_fit` handles anything larger.
-MAX_ERROR_CHARS = 500
+# Whole-document limit. 4 KB comfortably holds one image's full history; the reduction
+# ladder in `_fit` handles anything larger.
 MAX_PAYLOAD_BYTES = 4096
 
 
@@ -78,18 +96,54 @@ class Outcome:
     PULL_FAILED = "pull_failed"
 
 
+class Reason:
+    """The ``code`` of a published error: a fixed word in place of the error's text.
+
+    The registry codes (``rate_limited`` to ``registry_unreachable``) are read from a docker
+    or pull error's text on the executor; the text itself never leaves it.
+    """
+
+    TIMEOUT = "timeout"
+    CONNECT_ERROR = "connect_error"
+    DNS_ERROR = "dns_error"
+    TLS_ERROR = "tls_error"
+    HTTP_ERROR = "http_error"
+    BAD_RESPONSE = "bad_response"
+    INVALID_URL = "invalid_url"
+    IMAGE_MISSING = "image_missing"
+    RATE_LIMITED = "rate_limited"
+    DISK_FULL = "disk_full"
+    REGISTRY_DENIED = "registry_denied"
+    MANIFEST_UNKNOWN = "manifest_unknown"
+    REGISTRY_UNREACHABLE = "registry_unreachable"
+    PULL_FAILED = "pull_failed"
+    DOCKER_ERROR = "docker_error"
+    NVML_ERROR = "nvml_error"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class Failure:
+    """An error the loop names itself (an HTTP status, too little disk): no exception to read."""
+
+    code: str
+    status: int | None = None
+    host: str | None = None
+
+
 def _utcnow() -> str:
     """Timestamp in the same shape the rest of the fleet's JSON uses."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# What `redact` returns at most. The text is cut to this length before any rule runs, and no rule
-# looks past the cut, so every character published has been read by every rule. When the text is
-# cut, its last run of non-whitespace is dropped as well: a URL or token the cut splits is never
-# published in part.
-MAX_REDACTED_CHARS = 4 * MAX_ERROR_CHARS
+# `redact` and `describe_error` serve the loop's local log lines only; nothing they return is
+# published. What `redact` returns at most: the text is cut to this length before any rule runs,
+# and no rule looks past the cut, so every character logged has been read by every rule. When the
+# text is cut, its last run of non-whitespace is dropped as well: a URL or token the cut splits is
+# never logged in part.
+MAX_REDACTED_CHARS = 2000
 
-# Published in place of a URL yarl cannot parse cleanly; nothing of the raw text is kept.
+# Published in place of a URL whose scheme and host yarl cannot read cleanly.
 UNPARSEABLE_URL = "<unparseable URL>"
 # Shown in place of an error's class name when reading that name fails.
 UNNAMED_ERROR = "error"
@@ -527,12 +581,16 @@ def _urls_of(error: object) -> tuple[str, ...]:
     return tuple(sorted(urls, key=len, reverse=True))
 
 
-class _Described(str):
-    """What ``describe_error`` returns: ``_clip`` publishes it as is, never describing it twice."""
+def _class_name(error: object) -> str:
+    try:
+        name = str.__str__(type(error).__name__)
+    except Exception:
+        return UNNAMED_ERROR
+    return name if _CLASS_NAME.fullmatch(name) else UNNAMED_ERROR
 
 
 def describe_error(error: object) -> str:
-    """How an error is shown in the log and in the document: its class and its redacted text.
+    """How an error is shown in the loop's local log: its class and its redacted text.
 
     Never raises: it runs inside the loop's except clauses. An error whose class name cannot be
     read is named ``UNNAMED_ERROR``; one whose ``str()`` raises is shown by its class alone.
@@ -545,50 +603,229 @@ def describe_error(error: object) -> str:
         # `str.__str__` makes an exact str of a str subclass, whose methods could raise.
         text = str.__str__(str(error))
     except Exception:
-        return _Described(name)
+        return name
     try:
         message = redact(text, _urls_of(error))
         if isinstance(error, BaseException):
-            return _Described(f"{name}: {message}" if message else name)
-        return _Described(message)
+            return f"{name}: {message}" if message else name
+        return message
     except Exception:
-        return _Described(name)
+        return name
 
 
-def _public_url(url: str) -> str:
-    """``url`` as ``scheme://host[:port]/path`` from yarl's parse, else ``UNPARSEABLE_URL``.
+# What a published class name, scheme and host may hold. A host is IDNA-encoded by yarl, so a
+# name is ASCII labels; an IPv6 literal is published in brackets.
+_CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+_SCHEME = re.compile(r"[a-z][a-z0-9+.-]{0,15}")
+_HOST_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+_HOST_V6 = re.compile(r"[0-9a-f]{0,4}(?::[0-9a-f.]{0,15}){2,8}")
+_AT_SIGNS_LOWER = tuple(dict.fromkeys(sign.lower() for sign in _AT_SIGNS))
 
-    The userinfo, query and fragment are never published. A parse that leaves an `@` after the
-    host (a password holding an unencoded `/`, `?` or `#`, read as host, port and path) is refused,
-    as is a URL without a scheme and host, and a host holding a `%` (yarl reads the userinfo
-    before an encoded `@` as part of the host).
+
+def _origin(url: object) -> tuple[str, str] | None:
+    """``(scheme, host)`` of ``url`` from yarl's parse, or None when it cannot be read cleanly.
+
+    Refused: no scheme or host; a host that is not ASCII labels or an IPv6 literal (yarl reads
+    the userinfo before an encoded or fullwidth at-sign as host); and any at-sign, in any
+    spelling, beyond the one yarl took as the userinfo's end (a password holding `@`, `/`, `?`
+    or `#` moves the host into the userinfo, or the password into the host, port or path).
     """
     try:
-        parsed = URL(url)
+        text = str.__str__(str(url))
+        parsed = URL(text)
         if not (parsed.absolute and parsed.scheme and parsed.raw_host):
-            return UNPARSEABLE_URL
-        if "%" in parsed.raw_host:
-            return UNPARSEABLE_URL
-        if "@" in f"{parsed.raw_path}{parsed.raw_query_string}{parsed.raw_fragment}":
-            return UNPARSEABLE_URL
-        host = f"[{parsed.raw_host}]" if ":" in parsed.raw_host else parsed.raw_host
-        port = f":{parsed.explicit_port}" if parsed.explicit_port is not None else ""
-        return redact(f"{parsed.scheme}://{host}{port}{parsed.raw_path}")
+            return None
+        lowered = text.lower()
+        at_signs = sum(lowered.count(sign) for sign in _AT_SIGNS_LOWER)
+        has_userinfo = parsed.raw_user is not None or parsed.raw_password is not None
+        if at_signs > (1 if has_userinfo else 0):
+            return None
+        scheme = parsed.scheme.lower()
+        host = parsed.raw_host.lower()
+        if not _SCHEME.fullmatch(scheme):
+            return None
+        if ":" in host:
+            return (scheme, f"[{host}]") if _HOST_V6.fullmatch(host) else None
+        return (scheme, host) if _HOST_NAME.fullmatch(host) else None
     except Exception:
-        return UNPARSEABLE_URL
-
-
-def _clip(value: object | None, limit: int = MAX_ERROR_CHARS) -> str | None:
-    """Describe and bound one error message. ``None`` stays ``None``."""
-    if value is None:
         return None
-    text = str.__str__(value) if type(value) is _Described else describe_error(value)
-    return _cut(text, limit)
 
 
-def _cut(text: str, limit: int) -> str:
-    text = str.__str__(text)
-    return text if len(text) <= limit else text[:limit] + "…"
+def public_host(url: object) -> str | None:
+    """The host of ``url`` alone (no userinfo, port, path or query), or None."""
+    origin = _origin(url)
+    return origin[1] if origin else None
+
+
+def _public_origin(url: object) -> str:
+    """``url`` as ``scheme://host``, else ``UNPARSEABLE_URL``."""
+    origin = _origin(url)
+    return f"{origin[0]}://{origin[1]}" if origin else UNPARSEABLE_URL
+
+
+_REASONS = frozenset(
+    value for name, value in vars(Reason).items() if not name.startswith("_")
+)
+# The registry codes, read from a docker or pull error's text; first match wins, in the order the
+# validator reads an older executor's text. A status code must stand alone (a digest's hex can
+# hold "404").
+_REGISTRY_REASONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (Reason.IMAGE_MISSING, ("no such image",)),
+    (Reason.RATE_LIMITED, ("toomanyrequests", "too many requests", "rate limit", "429")),
+    (Reason.DISK_FULL, ("no space left", "disk quota")),
+    (Reason.REGISTRY_DENIED, ("unauthorized", "denied", "forbidden", "401", "403")),
+    (Reason.MANIFEST_UNKNOWN, ("manifest unknown", "not found", "404")),
+    (
+        Reason.REGISTRY_UNREACHABLE,
+        (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "unexpected eof",
+            "tls",
+            "no such host",
+            "network is unreachable",
+        ),
+    ),
+)
+_STATUS_REASONS = {
+    429: Reason.RATE_LIMITED,
+    401: Reason.REGISTRY_DENIED,
+    403: Reason.REGISTRY_DENIED,
+    404: Reason.MANIFEST_UNKNOWN,
+}
+# Enough of an error's text to find the words above; the text is never kept.
+_REASON_READ_CHARS = 10_000
+
+
+def _mentions(text: str, needle: str) -> bool:
+    if needle.isdigit():
+        return re.search(rf"(?<![0-9A-Za-z]){needle}(?![0-9A-Za-z])", text) is not None
+    return needle in text
+
+
+def _registry_reason(error: BaseException, status: int | None) -> str | None:
+    try:
+        text = str.__str__(str(error))[:_REASON_READ_CHARS].lower()
+    except Exception:
+        text = ""
+    for code, needles in _REGISTRY_REASONS:
+        if any(_mentions(text, needle) for needle in needles):
+            return code
+    return _STATUS_REASONS.get(status)
+
+
+def _class_names(error: BaseException) -> frozenset[str]:
+    try:
+        return frozenset(str.__str__(cls.__name__) for cls in type(error).__mro__)
+    except Exception:
+        return frozenset()
+
+
+def _status_of(error: object) -> int | None:
+    """An HTTP status the error carries (aiohttp's ``status``, docker's ``status_code``)."""
+    for attr in ("status", "status_code"):
+        try:
+            value = getattr(error, attr, None)
+        except Exception:
+            continue
+        if type(value) is int and 100 <= value <= 599:
+            return value
+    return None
+
+
+def _reason_of(
+    error: BaseException, status: int | None, fallback: str, registry: bool
+) -> str:
+    if isinstance(error, (InvalidURL, NonHttpUrlClientError)):
+        return Reason.INVALID_URL
+    if isinstance(error, ClientSSLError):
+        return Reason.TLS_ERROR
+    if isinstance(error, ClientConnectorError) and isinstance(error.os_error, socket.gaierror):
+        return Reason.DNS_ERROR
+    if isinstance(error, TimeoutError):
+        return Reason.TIMEOUT
+    if isinstance(error, (ContentTypeError, ClientPayloadError, json.JSONDecodeError)):
+        return Reason.BAD_RESPONSE
+    if isinstance(error, ClientResponseError):
+        return Reason.HTTP_ERROR
+    if isinstance(error, (ClientConnectionError, ConnectionError)):
+        return Reason.CONNECT_ERROR
+    if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EDQUOT):
+        return Reason.DISK_FULL
+    names = _class_names(error)
+    if any(name.startswith("NVMLError") for name in names):
+        return Reason.NVML_ERROR
+    docker_error = "DockerException" in names
+    pull_error = "PullStreamError" in names
+    if registry or docker_error or pull_error:
+        reason = _registry_reason(error, status)
+        if reason:
+            return reason
+        if pull_error:
+            return Reason.PULL_FAILED
+        if docker_error and not registry:
+            return Reason.DOCKER_ERROR
+    return fallback
+
+
+def _host_of(error: BaseException, backend_host: str | None) -> str | None:
+    """The host of a URL the error carries, else the backend's for an aiohttp or timeout error.
+
+    Only from a parse ``_origin`` accepts; never from the error's text. The loop's only aiohttp
+    session is the backend call, so an aiohttp error without a readable URL is the backend's.
+    """
+    for url in _urls_of(error):
+        host = public_host(url)
+        if host:
+            return host
+    if backend_host and isinstance(error, (ClientError, TimeoutError)):
+        return backend_host
+    return None
+
+
+def _error_record(
+    error: object | None,
+    fallback: str = Reason.UNKNOWN,
+    *,
+    registry: bool = False,
+    backend_host: str | None = None,
+) -> dict | None:
+    """What the document publishes for one error: ``class``, ``code``, ``host`` and ``status``.
+
+    Nothing of the error's text is kept: ``class`` is its type's name, ``code`` a ``Reason``
+    (the registry codes are read from the text of a docker or pull error, or of any error when
+    ``registry``), ``host`` comes from ``_host_of`` and ``status`` is an int. ``None`` stays
+    ``None``; a value that is neither an exception nor a ``Failure`` is published as ``fallback``.
+    """
+    if error is None:
+        return None
+    record = {"class": None, "code": fallback, "host": None, "status": None}
+    try:
+        if isinstance(error, Failure):
+            record["code"] = error.code if error.code in _REASONS else Reason.UNKNOWN
+            record["status"] = _status_of(error)
+            if error.code == Reason.HTTP_ERROR:
+                record["host"] = backend_host
+        elif isinstance(error, BaseException):
+            record["class"] = _class_name(error)
+            record["status"] = _status_of(error)
+            record["code"] = _reason_of(error, record["status"], fallback, registry)
+            record["host"] = _host_of(error, backend_host)
+    except Exception:
+        pass
+    return record
+
+
+_REQUIRED_TEMPLATE_FIELDS = ("docker_image", "docker_image_tag")
+
+
+def _malformed_record(entry: object) -> dict:
+    """Which required fields a backend entry lacks; nothing of its values."""
+    if not isinstance(entry, dict):
+        return {"missing": list(_REQUIRED_TEMPLATE_FIELDS)}
+    return {"missing": [name for name in _REQUIRED_TEMPLATE_FIELDS if not entry.get(name)]}
 
 
 def _executor_version() -> str:
@@ -608,7 +845,7 @@ def _never_raises(method):
         try:
             return method(self, *args, **kwargs)
         except Exception as e:
-            logger.warning(f"cache prefetch state: {method.__name__} failed: {e}")
+            logger.warning(f"cache prefetch state: {method.__name__} failed: {describe_error(e)}")
         return None
 
     return wrapper
@@ -625,9 +862,9 @@ def _dump(doc: dict) -> str:
 def _fit(doc: dict) -> str:
     """Serialise ``doc``, shedding detail until it fits ``MAX_PAYLOAD_BYTES``.
 
-    Detail is dropped least-useful-first: extra images, then long error text, then
-    the counters, then the images map entirely. ``truncated`` marks that this ran, so
-    a reader never mistakes a trimmed document for the whole story.
+    Detail is dropped least-useful-first: extra images, then the counters, then the
+    images map entirely. ``truncated`` marks that this ran, so a reader never mistakes
+    a trimmed document for the whole story.
     """
     payload = _dump(doc)
     if _size(payload) <= MAX_PAYLOAD_BYTES:
@@ -635,7 +872,7 @@ def _fit(doc: dict) -> str:
 
     doc = copy.deepcopy(doc)
     doc["truncated"] = True
-    for shed in (_keep_newest_image, _shorten_errors, _drop_counts, _drop_images):
+    for shed in (_keep_newest_image, _drop_counts, _drop_images):
         shed(doc)
         payload = _dump(doc)
         if _size(payload) <= MAX_PAYLOAD_BYTES:
@@ -649,17 +886,6 @@ def _keep_newest_image(doc: dict) -> None:
         return
     newest = max(images.items(), key=lambda kv: kv[1].get("last_outcome_at") or "")
     doc["images"] = {newest[0]: newest[1]}
-
-
-def _shorten_errors(doc: dict) -> None:
-    short = MAX_ERROR_CHARS // 5
-    for key, value in doc.items():
-        if key.endswith("_error") and isinstance(value, str):
-            doc[key] = _cut(value, short)
-    for record in (doc.get("images") or {}).values():
-        for key, value in record.items():
-            if (key.endswith("_error") or key == "last_error") and isinstance(value, str):
-                record[key] = _cut(value, short)
 
 
 def _drop_counts(doc: dict) -> None:
@@ -684,22 +910,33 @@ class _ImageRecord:
 
     last_outcome: str | None = None
     last_outcome_at: str | None = None
-    last_error: str | None = None
+    last_error: dict | None = None
     local_digests: list[str] = field(default_factory=list)
     local_digest_first_seen_at: str | None = None
     digest_changed_at: str | None = None
-    last_local_error: str | None = None
+    last_local_error: dict | None = None
     expected_digest: str | None = None
     remote_digest: str | None = None
     last_remote_read_ok_at: str | None = None
-    last_remote_error: str | None = None
+    last_remote_error: dict | None = None
     last_pull_attempt_at: str | None = None
     last_pull_ok_at: str | None = None
-    last_pull_error: str | None = None
-    last_cleanup_error: str | None = None
+    last_pull_error: dict | None = None
+    last_cleanup_error: dict | None = None
     last_disk_required_bytes: int | None = None
     last_disk_available_bytes: int | None = None
     outcome_counts: dict[str, int] = field(default_factory=dict)
+
+
+# The code of an error recorded with an outcome, when the error names none more precise.
+_LOOP_FALLBACKS = {
+    Outcome.DOCKER_UNAVAILABLE: Reason.DOCKER_ERROR,
+    Outcome.GPU_UNKNOWN: Reason.NVML_ERROR,
+}
+_IMAGE_FALLBACKS = {
+    Outcome.REMOTE_DIGEST_UNREADABLE: Reason.DOCKER_ERROR,
+    Outcome.PULL_FAILED: Reason.PULL_FAILED,
+}
 
 
 class CachePrefetchState:
@@ -720,30 +957,31 @@ class CachePrefetchState:
         self._started_at = _utcnow()
         self._sweep_count = 0
         self._executor_version = _executor_version()
-        self._backend_url = _public_url(backend_url) if backend_url else None
+        self._backend_url = _public_origin(backend_url) if backend_url else None
+        self._backend_host = public_host(backend_url) if backend_url else None
         self._refresh_interval_seconds = refresh_interval_seconds
 
         self._gpu_model: str | None = None
         self._driver_version: str | None = None
         self._gpu_resolved_at: str | None = None
-        self._gpu_error: str | None = None
+        self._gpu_error: dict | None = None
 
         self._docker_available: bool | None = None
-        self._docker_error: str | None = None
+        self._docker_error: dict | None = None
 
         self._last_backend_status: int | None = None
         self._last_backend_template_count: int | None = None
-        self._last_backend_error: str | None = None
+        self._last_backend_error: dict | None = None
 
-        self._last_loop_error: str | None = None
+        self._last_loop_error: dict | None = None
         self._last_loop_error_at: str | None = None
 
-        self._last_malformed_template: str | None = None
+        self._last_malformed_template: dict | None = None
         self._last_malformed_template_at: str | None = None
 
         self._last_outcome: str | None = None
         self._last_outcome_at: str | None = None
-        self._last_error: str | None = None
+        self._last_error: dict | None = None
         self._outcome_counts: dict[str, int] = {}
         # The validator holds a fresh node's cached-image verdict until this is set. Top-level
         # rather than read off outcome_counts, which `_fit` sheds under size pressure.
@@ -760,13 +998,13 @@ class CachePrefetchState:
     @_never_raises
     def note_docker(self, available: bool, error: object | None = None) -> None:
         self._docker_available = available
-        self._docker_error = _clip(error)
+        self._docker_error = _error_record(error, Reason.DOCKER_ERROR)
 
     @_never_raises
     def note_gpu(self, gpu_model: str, driver_version: str, error: object | None = None) -> None:
         self._gpu_model = gpu_model
         self._driver_version = driver_version
-        self._gpu_error = _clip(error)
+        self._gpu_error = _error_record(error, Reason.NVML_ERROR)
         if gpu_model and gpu_model != "unknown":
             self._gpu_resolved_at = _utcnow()
 
@@ -779,7 +1017,7 @@ class CachePrefetchState:
     ) -> None:
         self._last_backend_status = status
         self._last_backend_template_count = template_count
-        self._last_backend_error = _clip(error)
+        self._last_backend_error = _error_record(error, backend_host=self._backend_host)
 
     @_never_raises
     def note_malformed_template(self, entry: object) -> None:
@@ -788,21 +1026,23 @@ class CachePrefetchState:
         Kept in its own field rather than the outcome slot: the sweep still finishes, so
         `last_outcome` moves on to `sweep_ok` and would otherwise bury this.
         """
-        self._last_malformed_template = _clip(entry)
+        self._last_malformed_template = _malformed_record(entry)
         self._last_malformed_template_at = _utcnow()
         counts = self._outcome_counts
         counts[Outcome.MALFORMED_TEMPLATE] = counts.get(Outcome.MALFORMED_TEMPLATE, 0) + 1
 
     @_never_raises
     def note_loop_error(self, error: object) -> None:
-        self._last_loop_error = _clip(error)
+        self._last_loop_error = _error_record(error, backend_host=self._backend_host)
         self._last_loop_error_at = _utcnow()
 
     @_never_raises
     def record_loop_outcome(self, outcome: str, error: object | None = None) -> None:
         self._last_outcome = outcome
         self._last_outcome_at = _utcnow()
-        self._last_error = _clip(error)
+        self._last_error = _error_record(
+            error, _LOOP_FALLBACKS.get(outcome, Reason.UNKNOWN), backend_host=self._backend_host
+        )
         self._outcome_counts[outcome] = self._outcome_counts.get(outcome, 0) + 1
         if outcome == Outcome.SWEEP_OK and self._first_sweep_ok_at is None:
             self._first_sweep_ok_at = self._last_outcome_at
@@ -819,7 +1059,7 @@ class CachePrefetchState:
         record = self._record(image_ref)
         previous = record.local_digests
         record.local_digests = list(digests)
-        record.last_local_error = _clip(error)
+        record.last_local_error = _error_record(error, Reason.DOCKER_ERROR)
         if not previous and digests:
             record.local_digest_first_seen_at = _utcnow()
         elif previous and digests and previous != list(digests):
@@ -837,7 +1077,7 @@ class CachePrefetchState:
     ) -> None:
         record = self._record(image_ref)
         record.remote_digest = digest
-        record.last_remote_error = _clip(error)
+        record.last_remote_error = _error_record(error, Reason.DOCKER_ERROR, registry=True)
         if digest:
             record.last_remote_read_ok_at = _utcnow()
 
@@ -859,11 +1099,15 @@ class CachePrefetchState:
 
     @_never_raises
     def note_pull_error(self, image_ref: str, error: object) -> None:
-        self._record(image_ref).last_pull_error = _clip(error)
+        self._record(image_ref).last_pull_error = _error_record(
+            error, Reason.PULL_FAILED, registry=True
+        )
 
     @_never_raises
     def note_cleanup_error(self, image_ref: str, error: object | None) -> None:
-        self._record(image_ref).last_cleanup_error = _clip(error)
+        self._record(image_ref).last_cleanup_error = _error_record(
+            error, Reason.DOCKER_ERROR, registry=True
+        )
 
     @_never_raises
     def record_image_outcome(
@@ -872,7 +1116,9 @@ class CachePrefetchState:
         record = self._record(image_ref)
         record.last_outcome = outcome
         record.last_outcome_at = _utcnow()
-        record.last_error = _clip(error)
+        record.last_error = _error_record(
+            error, _IMAGE_FALLBACKS.get(outcome, Reason.UNKNOWN), registry=True
+        )
         counts = record.outcome_counts
         counts[outcome] = counts.get(outcome, 0) + 1
 

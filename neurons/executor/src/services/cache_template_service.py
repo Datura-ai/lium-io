@@ -11,9 +11,10 @@ event loop (and therefore its HTTP API) is never blocked by a multi-minute pull.
 
 DAH-2470: every branch below also records a named outcome into a
 ``CachePrefetchState`` document, which the validator reads over SSH when it zeroes a
-node for a bad image digest. The helpers therefore return their error text instead of
-only logging it — the state file is the single source a reader will have, so nothing
-this module prints may be lost on the way there. Recording never changes a pull
+node for a bad image digest. The helpers therefore return their error instead of only
+logging it — the state file is the single source a reader will have. The document keeps
+only each error's class, reason code, host and status, never its text; the log line
+here keeps the text, through ``describe_error``. Recording never changes a pull
 decision: state failures are swallowed inside ``cache_prefetch_state``.
 """
 
@@ -31,7 +32,9 @@ from core.logger import get_logger
 from services.cache_prefetch_state import (
     STATE_PATH,
     CachePrefetchState,
+    Failure,
     Outcome,
+    Reason,
     describe_error,
 )
 from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller
@@ -60,11 +63,11 @@ SWEEP_DEADLINE_MARGIN_SECONDS = STREAM_READ_TIMEOUT_SECONDS + 30
 DEFAULT_DOCKER_IMAGE_PATH = "/executors/default-docker-image"
 
 
-def _get_gpu_info() -> tuple[str, str, str | None]:
+def _get_gpu_info() -> tuple[str, str, Exception | None]:
     """Return (gpu_model, driver_version, error) via NVML, degrading to "unknown"."""
     gpu_name = "unknown"
     driver_version = "unknown"
-    error: str | None = None
+    error: Exception | None = None
     try:
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
@@ -76,7 +79,7 @@ def _get_gpu_info() -> tuple[str, str, str | None]:
             driver_version = driver_version.decode("utf-8")
     except Exception as e:
         logger.error(f"Failed to get GPU info for cache pre-pull: {describe_error(e)}")
-        error = describe_error(e)
+        error = e
     finally:
         try:
             pynvml.nvmlShutdown()
@@ -87,12 +90,12 @@ def _get_gpu_info() -> tuple[str, str, str | None]:
 
 async def _fetch_templates(
     session: aiohttp.ClientSession, url: str, params: dict
-) -> tuple[list[dict], int | None, str | None]:
+) -> tuple[list[dict], int | None, Failure | None]:
     """Return (templates, http_status, error) for the backend recommendation call."""
     async with session.get(url, params=params) as response:
         if response.status != 200:
             logger.error(f"Failed to get cache templates. Status: {response.status}")
-            return [], response.status, f"HTTP {response.status}"
+            return [], response.status, Failure(Reason.HTTP_ERROR, status=response.status)
         data = await response.json()
         logger.info(f"Received {len(data) if data else 0} cache template(s)")
         return data or [], response.status, None
@@ -100,19 +103,19 @@ async def _fetch_templates(
 
 async def _remote_digest(
     client: "docker.DockerClient", image_ref: str
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, Exception | None]:
     """Return (manifest digest the registry serves for image_ref, error)."""
     try:
         registry_data = await asyncio.to_thread(client.images.get_registry_data, image_ref)
         return registry_data.id, None
     except Exception as e:
         logger.warning(f"Could not read remote digest for {image_ref}: {describe_error(e)}")
-        return None, describe_error(e)
+        return None, e
 
 
 async def _local_digests(
     client: "docker.DockerClient", image_ref: str
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], Exception | None]:
     """Return (RepoDigests of the locally cached image, error). Absent image is not an error."""
     try:
         image = await asyncio.to_thread(client.images.get, image_ref)
@@ -120,7 +123,7 @@ async def _local_digests(
         return [], None
     except Exception as e:
         logger.warning(f"Could not read local image {image_ref}: {describe_error(e)}")
-        return [], describe_error(e)
+        return [], e
     return image.attrs.get("RepoDigests", []) or [], None
 
 
@@ -155,7 +158,7 @@ async def _cleanup_old_tags(
     repository: str,
     keep_tag: str,
     keep_tags: frozenset[str] = frozenset(),
-) -> str | None:
+) -> Exception | None:
     """Remove other locally cached tags of the same repository; return the last error.
 
     ``keep_tags`` (DAH-2977): tags of pre-pull templates, which may share the repository
@@ -165,8 +168,8 @@ async def _cleanup_old_tags(
         images = await asyncio.to_thread(client.images.list, repository)
     except Exception as e:
         logger.warning(f"Failed to list images for {repository}: {describe_error(e)}")
-        return describe_error(e)
-    error: str | None = None
+        return e
+    error: Exception | None = None
     for image in images:
         for tag in list(image.tags):
             repo, _, tg = tag.rpartition(":")
@@ -176,7 +179,7 @@ async def _cleanup_old_tags(
                     logger.info(f"Removed unused image: {tag}")
                 except Exception as e:
                     logger.warning(f"Failed to remove image {tag}: {describe_error(e)}")
-                    error = describe_error(e)
+                    error = e
     return error
 
 
@@ -253,7 +256,7 @@ async def _ensure_template(
             state.record_image_outcome(
                 image_ref,
                 Outcome.INSUFFICIENT_DISK,
-                error=f"required {required_space}, available {available_space}",
+                error=Failure(Reason.DISK_FULL),
             )
             return
 
