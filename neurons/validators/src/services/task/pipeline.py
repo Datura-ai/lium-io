@@ -281,7 +281,8 @@ class EventSink(Protocol):
 # DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
 # the validator. They are emitted on every cycle for as long as the state lasts (no collateral,
 # an old image, a banned provider, a host-side workload) and were 135,000 WARNING lines in two
-# days. The event keeps its severity for the backend and the portal; only the log line is INFO.
+# days. The event keeps its severity for the backend and the portal; only the log line is INFO
+# (DEBUG when it repeats the previous cycle, see StatusChangeTracker).
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "COLLATERAL_MISSING",
@@ -332,15 +333,10 @@ def step_duration_logger() -> logging.Logger:
 
 
 class LoggerSink:
-    def __init__(
-        self,
-        logger_: logging.Logger,
-        tracker: StatusChangeTracker | None = None,
-        duration_logger: logging.Logger | None = None,
-    ):
+    def __init__(self, logger_: logging.Logger, tracker: StatusChangeTracker | None = None):
         self.logger = logger_
         self.tracker = tracker
-        self.duration_logger = duration_logger or step_duration_logger()
+        self.duration_logger = step_duration_logger()
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]

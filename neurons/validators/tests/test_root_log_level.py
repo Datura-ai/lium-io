@@ -10,7 +10,12 @@ from core.utils import root_log_level
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("INFO", logging.INFO), ("debug", logging.DEBUG), (" Warning ", logging.WARNING), ("nonsense", logging.INFO)],
+    [
+        ("INFO", logging.INFO),
+        ("debug", logging.DEBUG),
+        (" Warning ", logging.WARNING),
+        ("nonsense", logging.INFO),
+    ],
 )
 def test_root_log_level_reads_the_setting(monkeypatch, value, expected):
     monkeypatch.setattr(settings, "LOG_LEVEL", value)
