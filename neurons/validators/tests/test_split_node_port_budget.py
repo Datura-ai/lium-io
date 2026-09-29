@@ -552,6 +552,36 @@ async def test_flag_on_whole_idle_split_node_below_the_floor_gets_this_rules_rea
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("available_port_count", [2, 6])
+async def test_flag_on_node_excluded_from_both_pools_learns_the_port_budget_too(
+    monkeypatch, caplog, available_port_count
+):
+    # Arrange — a spot node is out of both pools before any idle gate. With 2 open ports the
+    # enforced budget still records its own reason (every reason that applies is recorded);
+    # with 6 (2 GPUs backed) there is no zero to name, so nothing is added.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    split_job = _make_job(
+        available_port_count=available_port_count, is_rented=False, rented_gpu_count=None
+    )
+    split_job.is_spot = True
+    plain_job = _plain_idle_job()
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
+
+    # Assert — the payout is the exclusion's: 0, the plain node takes the pool, no count withheld.
+    assert split_job.incentive == 0.0
+    assert split_job.port_unbacked_gpu_count == 0
+    assert plain_job.incentive_idle == pytest.approx(0.1)
+    expected: list[str] = [ZeroIncentiveReason.SPOT_TIER.value]
+    if available_port_count == 2:
+        expected.append(ZeroIncentiveReason.PORT_UNBACKED_SPLIT_GPUS.value)
+    assert [r.reason for r in split_job.zero_incentive_reasons] == expected
+    assert _budget_lines(caplog) == []  # the shadow numbers count only nodes still in the pool
+
+
+@pytest.mark.asyncio
 async def test_flag_on_whole_idle_split_node_stays_in_its_gpu_count_tier(monkeypatch):
     # Arrange — an idle 8-GPU node splitting into 1-GPU pods with 6 open ports (2 GPUs backed).
     # The bucket fallback pins a split-capable node to its gpu_count tier while that tier has a cap; the
