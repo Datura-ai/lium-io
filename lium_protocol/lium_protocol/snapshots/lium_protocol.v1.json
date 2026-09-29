@@ -2411,6 +2411,22 @@
           "default": null,
           "title": "Node State At Cycle"
         },
+        "pod_ssh": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PodSshObservation"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod Ssh"
+        },
         "pod_states": {
           "anyOf": [
             {
@@ -2551,6 +2567,17 @@
           ],
           "default": null,
           "title": "Tee Type"
+        },
+        "validation_event": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValidationEvent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "validator_hotkey": {
           "title": "Validator Hotkey",
@@ -4210,6 +4237,52 @@
       "title": "PodRentalActiveResponse",
       "type": "object"
     },
+    "PodSshObservation": {
+      "description": "One rented pod's SSH probe in one cycle. `errno` is the OS error behind a failed connect, None when\nthere was none. `fleet_ok` is False when the cycle's non-banner share says the outage is on the\nvalidator's side, so the observation says nothing about this pod.",
+      "properties": {
+        "errno": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Errno"
+        },
+        "fleet_ok": {
+          "default": true,
+          "title": "Fleet Ok",
+          "type": "boolean"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/PodSshResult"
+        }
+      },
+      "required": [
+        "pod_id",
+        "result"
+      ],
+      "title": "PodSshObservation",
+      "type": "object"
+    },
+    "PodSshResult": {
+      "description": "What the validator's once-per-cycle SSH probe of one rented pod read, without a key: `banner` is an\n`SSH-2.0` line; `refused` a connection the host turned away; `no_banner` a connection that closed or\nsent something else; `timeout` no answer within the probe's timeout (a powered-off machine lands here).",
+      "enum": [
+        "banner",
+        "refused",
+        "no_banner",
+        "timeout"
+      ],
+      "title": "PodSshResult",
+      "type": "string"
+    },
     "PodSshUnreachableResponse": {
       "description": "`POST \u2026/ssh-unreachable`: ``recorded`` False when the backend already holds this outage.",
       "properties": {
@@ -5362,6 +5435,124 @@
       "title": "SshPubKeyRemoved",
       "type": "object"
     },
+    "ValidationEvent": {
+      "additionalProperties": true,
+      "description": "The validator's structured event for the check that decided the cycle's outcome (or where the\npipeline halted). `reason_code` is a plain string: new codes appear on the validator first, and a\nreceiver that does not know one still reads the event. Both peers keep extra keys.",
+      "properties": {
+        "category": {
+          "default": "runtime",
+          "title": "Category",
+          "type": "string"
+        },
+        "check_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Id"
+        },
+        "context": {
+          "additionalProperties": true,
+          "title": "Context",
+          "type": "object"
+        },
+        "event": {
+          "title": "Event",
+          "type": "string"
+        },
+        "help_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Help Uri"
+        },
+        "impact": {
+          "title": "Impact",
+          "type": "string"
+        },
+        "pipeline_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pipeline Id"
+        },
+        "reason_code": {
+          "title": "Reason Code",
+          "type": "string"
+        },
+        "remediation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remediation"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "trace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trace Id"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        },
+        "what_we_saw": {
+          "additionalProperties": true,
+          "title": "What We Saw",
+          "type": "object"
+        },
+        "when": {
+          "format": "date-time",
+          "title": "When",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "reason_code",
+        "severity",
+        "impact",
+        "when"
+      ],
+      "title": "ValidationEvent",
+      "type": "object"
+    },
     "ValidatorMessageType": {
       "enum": [
         "AuthenticateRequest",
@@ -5497,7 +5688,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.3.0",
+  "protocol_version": "1.4.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
