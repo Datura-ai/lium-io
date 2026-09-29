@@ -86,13 +86,10 @@ class PortSelector:
         executor_info: ExecutorSSHInfo,
         size: int,
         unavailable_ports: set[int],
-        declared: list[PortPair] | None = None,
+        declared: list[PortPair],
     ) -> list[PortPair]:
-        """Select ports to check, skipping external ports already taken by pods or fillers.
-
-        `declared` is `declared_ports(executor_info)` when the caller has already parsed it."""
-        if declared is None:
-            declared = declared_ports(executor_info)
+        """Select ports to check from `declared_ports(executor_info)`, skipping external ports
+        already taken by pods or fillers."""
         available_ports = [p for p in declared if p.external not in unavailable_ports]
         return available_ports[:size]
 

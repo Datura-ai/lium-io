@@ -9,14 +9,6 @@ from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
-SECOND_PASS_NOTES: dict[SecondPass, str] = {
-    SecondPass.SKIPPED_BATCH_FAILED: (
-        "second port pass skipped: the first pass's batch container didn't complete "
-        "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
-    ),
-}
-
-
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
 
@@ -82,8 +74,11 @@ class PortConnectivityCheck:
             "port_ranges": [r.as_dict() for r in result.port_ranges],
             "second_pass": result.second_pass,
         }
-        if result.second_pass in SECOND_PASS_NOTES:
-            event_extra["second_pass_note"] = SECOND_PASS_NOTES[result.second_pass]
+        if result.second_pass == SecondPass.SKIPPED_BATCH_FAILED:
+            event_extra["second_pass_note"] = (
+                "second port pass skipped: the first pass's batch container didn't complete "
+                "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
+            )
         updated_state = replace(
             ctx.state,
             specs={

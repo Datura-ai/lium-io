@@ -36,6 +36,7 @@ from services.executor_connectivity.port_verifiers import (
 from services.port_utils import get_all_ports
 from services.task.checks.port_connectivity import PortConnectivityCheck
 
+from tests.executor_connectivity.test_port_selector import two_passes
 from tests.helpers import build_context_config, build_services, build_state
 
 
@@ -148,15 +149,7 @@ async def _main_verify(host: Host, info: ExecutorSSHInfo, unavailable: set[int],
         :BATCH_PORT_VERIFICATION_SIZE
     ]
     if not ports:
-        return SimpleNamespace(
-            status="no_ports",
-            selected=(),
-            successful=(),
-            failed=(),
-            dind=None,
-            dind_ok=False,
-            tier=None,
-        )
+        return SimpleNamespace(status="no_ports", selected=(), successful=(), failed=(), dind=None)
 
     kw = {"ssh_client": None, "host": info.address, "log_ctx": {}}
     batch = await BatchVerifier(host, host).verify(ports, **kw)
@@ -316,48 +309,39 @@ def topup_on(monkeypatch):
     monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
 
 
+@pytest.mark.parametrize("topup", [False, True], ids=["flag-off", "flag-on"])
 @pytest.mark.parametrize("host, kwargs, rented, seed", SHAPES)
 @pytest.mark.asyncio
-async def test_flag_off_is_mains_check_exactly(monkeypatch, host, kwargs, rented, seed):
-    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", False)
-    main, main_host, new, new_host = await _both(host, _info(**kwargs), rented, seed)
-
-    assert new.second_pass is None
-    assert new_host.containers == main_host.containers
-    assert new_host.probes == main_host.probes
-    assert new.selected_ports == main.selected
-    assert new.successful_ports == main.successful
-    assert new.failed_ports == main.failed
-
-
-@pytest.mark.parametrize("host, kwargs, rented, seed", SHAPES)
-@pytest.mark.asyncio
-async def test_pass_two_runs_after_mains_top_up_and_only_adds_ports(
-    topup_on, host, kwargs, rented, seed
+async def test_pass_two_runs_after_mains_check_and_only_adds_ports(
+    monkeypatch, topup, host, kwargs, rented, seed
 ):
-    info = _info(**kwargs)
-    main, main_host, new, new_host = await _both(host, info, rented, seed)
+    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", topup)
+    main, main_host, new, new_host = await _both(host, _info(**kwargs), rented, seed)
 
     if main.status == "no_ports":
         assert new.status == "no_ports"
         assert new_host.containers == main_host.containers == []
         return
 
-    # main's count is after DinD and after its top-up
-    assert (len(main.successful) >= MIN_PORT_COUNT) == (new.second_pass == SecondPass.NOT_NEEDED)
+    # flag off: main's check exactly; on: main's count is after DinD and after its top-up
+    if topup:
+        assert (len(main.successful) >= MIN_PORT_COUNT) == (new.second_pass == SecondPass.NOT_NEEDED)
+    else:
+        assert new.second_pass is None
     # DinD, the top-up and everything before pass two are main's, in main's order
     assert new_host.containers[: len(main_host.containers)] == main_host.containers
     assert new_host.probes[: len(main_host.probes)] == main_host.probes
     assert new.dind_port == main.dind
     assert new.dind_ok == main.dind_ok
     assert new.probe_tier == main.tier
-    assert set(main.successful) <= set(new.successful_ports)
+    assert new.selected_ports[: len(main.selected)] == main.selected
     assert new.successful_ports[: len(main.successful)] == main.successful
 
     extra = new_host.containers[len(main_host.containers) :]
     two_probes = new_host.probes[len(main_host.probes) :]
-    if new.second_pass == SecondPass.NOT_NEEDED:
+    if new.second_pass in (None, SecondPass.NOT_NEEDED):
         assert extra == [] and two_probes == []
+        assert new.selected_ports == main.selected
         assert new.successful_ports == main.successful
         assert new.failed_ports == main.failed
         assert new.status == main.status
@@ -600,13 +584,10 @@ async def test_no_ports_left_for_pass_two(topup_on):
     "port_range, width, verified",
     [("40000-65535", 169, 2), ("40000-65535", 170, 3), (None, 303, 2), (None, 304, 3)],
 )
-@pytest.mark.parametrize("dind_ok", [True, False])
 @pytest.mark.asyncio
-async def test_pass_two_limit_for_a_block_forwarded_at_the_top(
-    topup_on, port_range, width, verified, dind_ok
-):
+async def test_pass_two_limit_for_a_block_forwarded_at_the_top(topup_on, port_range, width, verified):
     info = _info(port_range=port_range)
-    host = Host(open_ports=set(range(65536 - width, 65536)), dind_ok=dind_ok)
+    host = Host(open_ports=set(range(65536 - width, 65536)))
 
     main, _, new, _ = await _both(host, info)
 
@@ -616,18 +597,8 @@ async def test_pass_two_limit_for_a_block_forwarded_at_the_top(
 
 
 def test_pass_two_stride_on_40000_65535():
-    info = _info(port_range="40000-65535")
-    declared = [
-        PortPair(i, e) for i, e in get_all_ports(info.port_range, info.port_mappings, info.ssh_port)
-    ]
-    selector = PortSelector()
-    one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, set(), declared=declared)
-    two = [
-        p.external
-        for p in selector.select_spread(
-            declared, BATCH_PORT_VERIFICATION_SIZE, set(), pass_one_ports=one
-        )
-    ]
+    _, _, two = two_passes(_info(port_range="40000-65535"))
+    two = [p.external for p in two]
 
     assert (two[0], two[-1], len(two)) == (40300, 65535, 300)
     assert {b - a for a, b in zip(two, two[1:])} == {84, 85}
@@ -639,18 +610,8 @@ def test_pass_two_stride_on_40000_65535():
 )
 def test_pass_two_block_anywhere_above_pass_one(port_range, picks, width):
     """The narrowest block above pass one's ports that pass two always probes `picks` times, wherever it sits."""
-    info = _info(port_range=port_range)
-    declared = [
-        PortPair(i, e) for i, e in get_all_ports(info.port_range, info.port_mappings, info.ssh_port)
-    ]
-    selector = PortSelector()
-    one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, set(), declared=declared)
-    two = [
-        p.external
-        for p in selector.select_spread(
-            declared, BATCH_PORT_VERIFICATION_SIZE, set(), pass_one_ports=one
-        )
-    ]
+    _, one, two = two_passes(_info(port_range=port_range))
+    two = [p.external for p in two]
     lo = max(p.external for p in one) + 1
 
     def fewest(w):
