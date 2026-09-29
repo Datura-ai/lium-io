@@ -348,7 +348,8 @@ class Settings(BaseSettings):
     # author (/proc/cpuinfo, /sys present population, docker NCPU).
     CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)
     CPU_TRUTH_ENFORCEMENT_ENABLED: bool = Field(env="CPU_TRUTH_ENFORCEMENT_ENABLED", default=False)
-    # ticket-0331 / OD-D096 — the scrape mounts a size-limited vloopback volume the way a rental does.
+    # ticket-0331 — the scrape mounts a size-limited vloopback volume the way a rental does, so a host
+    # whose rental volumes cannot mount shows up at validation, before a renter's pod fails to start.
     # CHECK_ENABLED is the kill switch: off, the scrape skips the test (baked in by FileEncryptService).
     # Report-only while ENFORCEMENT is off: the verdict goes to specs.vloopback_check and the scrape
     # event, and storage_limit_supported stays the --storage-opt result. ENFORCEMENT on: a failed test
