@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import pathlib
+import shlex
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -628,41 +632,81 @@ async def test_validate_rented_executor_marks_the_shell_checksum_unattested():
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 STALE_SHA256 = "different"
+STALE_BYTES = b"stale libinspector build"
 EXECUTOR = SimpleNamespace(uuid="exec-1", python_path="/usr/bin/python3", root_dir="/root/app")
+needs_shell_tools = pytest.mark.skipif(
+    not all(shutil.which(tool) for tool in ("curl", "mktemp", "sha256sum")),
+    reason="needs curl, mktemp and sha256sum",
+)
 
 
 def _ok(stdout: str = "", stderr: str = "", exit_status: int = 0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, exit_status=exit_status)
 
 
+def _install_stdout(sha: str, *, curl_rc: int = 0, mv_rc: int | None = 0) -> str:
+    out = f"TMP:/usr/lib/.libinspector.so.AbC123\nCURL_RC:{curl_rc}\nSHA256:{sha}\n"
+    return out + (f"MV_RC:{mv_rc}\n" if mv_rc is not None else "")
+
+
 def refreshing_executor(
     *,
     writable: bool = True,
-    curl_stdout: str = f"CURL_RC:0\n{VALIDATOR_SHA256:0>64}  /tmp/libinspector.so.fetch\n",
-    curl_stderr: str = "",
-    mv_exit: int = 0,
+    install_stdout: str | None = None,
+    install_stderr: str = "",
     installs_as: str = VALIDATOR_SHA256,
 ) -> FakeShell:
-    """An executor on a stale libinspector.so that answers the refresh commands."""
+    """An executor on a stale libinspector.so that answers the refresh commands with canned output."""
 
     def respond(command: str):
         if command.startswith("if [ -w "):
             return _ok(f"WRITE_OK:{int(writable)}\n")
-        if command.startswith("curl "):
-            return _ok(curl_stdout, curl_stderr)
-        if command.startswith("mv "):
-            if mv_exit == 0:
+        if "mktemp" in command:
+            stdout = install_stdout if install_stdout is not None else _install_stdout(f"{VALIDATOR_SHA256:0>64}")
+            if "MV_RC:0" in stdout:
                 shell.sha256 = installs_as
-            return _ok(exit_status=mv_exit)
+            return _ok(stdout, install_stderr)
         return _ok()
 
     shell = FakeShell(sha256=STALE_SHA256, respond=respond)
     return shell
 
 
+class LocalExecutor:
+    """The executor side for real: the validator's commands run in /bin/sh against a temp
+    directory standing in for /usr/lib. `limits` is prepended to every command (e.g. a
+    `ulimit -f` that plays a full disk)."""
+
+    def __init__(self, *, limits: str = "") -> None:
+        self.limits = limits
+        self.ssh_client = self
+        self.commands: list[str] = []
+        self.outputs: list[str] = []
+        self.remote_checksum_calls = 0
+
+    async def run(self, command: str, timeout: float | None = None):
+        self.commands.append(command)
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", self.limits + command,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        self.outputs.append(out.decode())
+        return _ok(out.decode(), err.decode(), proc.returncode)
+
+    async def get_sha256_checksum_by_path(self, path: str) -> str:
+        self.remote_checksum_calls += 1
+        file = pathlib.Path(path)
+        return hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else ""
+
+    def temp_used(self) -> pathlib.Path:
+        return pathlib.Path(next(line[4:] for out in self.outputs for line in out.splitlines() if line.startswith("TMP:")))
+
+
 @pytest.fixture
 def refresh_on(enable_collector_ensure):
     enable_collector_ensure.verifyx.LIBRARY_REFRESH_ENABLED = True
+    return enable_collector_ensure
 
 
 @pytest.fixture
@@ -675,15 +719,39 @@ def full_sha_validator(monkeypatch):
     return f"{VALIDATOR_SHA256:0>64}"
 
 
-def _kinds(shell: FakeShell) -> list[str]:
+@pytest.fixture
+def local_library(tmp_path, monkeypatch, refresh_on):
+    """A stale /usr/lib/libinspector.so in tmp_path, the validator's file served over file://,
+    and a service whose executor-side path is the stale one."""
+    lib_dir = tmp_path / "usr_lib"
+    lib_dir.mkdir()
+    lib = lib_dir / "libinspector.so"
+    lib.write_bytes(STALE_BYTES)
+    source = tmp_path / "raw" / "libinspector.so"
+    source.parent.mkdir()
+    source.write_bytes(os.urandom(256 * 1024))
+    sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    refresh_on.INSPECTOR_LIBRARY_FETCH_URL = source.as_uri()
+    monkeypatch.setattr(
+        "neurons.validators.src.services.inspector_validation_service.sha256_from_path",
+        lambda _path: sha,
+    )
+    return SimpleNamespace(
+        lib=lib, source=source, sha=sha, settings=refresh_on,
+        service=InspectorValidationService(lib_path=str(lib)),
+        leftovers=lambda: sorted(p.name for p in lib_dir.iterdir() if p.name != "libinspector.so"),
+    )
+
+
+def _kinds(shell) -> list[str]:
     return [
-        "write-check" if command.startswith("if ") else command.split()[0]
+        "write-check" if command.startswith("if ") else "install" if "mktemp" in command else command.split()[0]
         for command in shell.ssh_client.commands
     ]
 
 
-async def _validate(shell: FakeShell, ssh: FakeSSH | None = None):
-    return await InspectorValidationService().validate_rented_executor(
+async def _validate(shell, ssh: FakeSSH | None = None, service: InspectorValidationService | None = None):
+    return await (service or InspectorValidationService()).validate_rented_executor(
         shell, ssh or FakeSSH(), EXECUTOR, {"executor_uuid": "exec-1"}
     )
 
@@ -708,60 +776,102 @@ async def test_refresh_on_and_hash_match_runs_nothing_on_the_executor(refresh_on
     assert shell.remote_checksum_calls == 1
 
 
+@needs_shell_tools
 @pytest.mark.asyncio
-async def test_mismatch_fetches_installs_and_the_check_passes(refresh_on, full_sha_validator):
-    shell = refreshing_executor(installs_as=full_sha_validator)
+async def test_mismatch_fetches_installs_by_rename_and_the_check_passes(local_library):
+    shell = LocalExecutor()
     ssh = FakeSSH()
-    result = await _validate(shell, ssh)
+    result = await _validate(shell, ssh, local_library.service)
     assert result.error is None
     assert result.report is not None
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_REPLACED"
-    assert _kinds(shell) == ["write-check", "curl", "mv"]
-    curl, move = shell.ssh_client.commands[1:]
-    assert FETCH_URL in curl and "/tmp/libinspector.so.fetch" in curl
-    assert move == "mv /tmp/libinspector.so.fetch /usr/lib/libinspector.so"
+    assert _kinds(shell) == ["write-check", "install"]
+    assert local_library.lib.read_bytes() == local_library.source.read_bytes()
+    assert oct(local_library.lib.stat().st_mode & 0o777) == "0o644"
+    # downloaded beside the library (same filesystem, so mv is a rename), and nothing left over
+    assert shell.temp_used().parent == local_library.lib.parent
+    assert shell.temp_used().name.startswith(".libinspector.so.")
+    assert local_library.leftovers() == []
     assert shell.remote_checksum_calls == 2
     assert "--interactive" in ssh.command
+
+
+@needs_shell_tools
+@pytest.mark.asyncio
+async def test_fetched_hash_that_differs_is_not_installed(local_library):
+    local_library.service.local_checksum = "f" * 64
+    shell = LocalExecutor()
+    ssh = FakeSSH()
+    result = await _validate(shell, ssh, local_library.service)
+    assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
+    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
+    assert local_library.sha in result.diagnostics["fetch_error"]
+    # the validator's file is the source of truth: the library is untouched, the download removed
+    assert local_library.lib.read_bytes() == STALE_BYTES
+    assert local_library.leftovers() == []
+    assert ssh.command == ""
+
+
+@needs_shell_tools
+@pytest.mark.asyncio
+async def test_fetch_failure_is_logged_and_nothing_is_installed(local_library, caplog):
+    local_library.settings.INSPECTOR_LIBRARY_FETCH_URL = (local_library.source.parent / "missing.so").as_uri()
+    shell = LocalExecutor()
+    with caplog.at_level("WARNING"):
+        result = await _validate(shell, service=local_library.service)
+    assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
+    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
+    assert result.diagnostics["fetch_error"].startswith("curl exit 37: ")
+    assert local_library.lib.read_bytes() == STALE_BYTES
+    assert local_library.leftovers() == []
+    assert shell.remote_checksum_calls == 1
+    assert "INSPECTOR_LIBRARY_FETCH_FAILED" in caplog.text
+
+
+@needs_shell_tools
+@pytest.mark.asyncio
+async def test_failed_install_is_a_fetch_failure(local_library):
+    # a full disk: `ulimit -f 32` stops writes far below the 256 KiB download
+    shell = LocalExecutor(limits="ulimit -f 32; ")
+    result = await _validate(shell, service=local_library.service)
+    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
+    assert result.diagnostics["fetch_error"].startswith("curl exit ")
+    # the partial download was the temp beside the library, never the library itself
+    assert shell.temp_used().parent == local_library.lib.parent
+    assert local_library.lib.read_bytes() == STALE_BYTES
+    assert local_library.leftovers() == []
+
+
+@needs_shell_tools
+@pytest.mark.asyncio
+async def test_a_url_with_a_quote_and_command_substitution_is_one_word(local_library):
+    source = local_library.source.with_name("lib'$(id).so")
+    local_library.source.rename(source)
+    url = f"file://{source}"
+    local_library.settings.INSPECTOR_LIBRARY_FETCH_URL = url
+    install = local_library.service._install_command(url)
+    assert shlex.quote(url) in install
+    lexer = shlex.shlex(install, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    words = list(lexer)
+    curl = words.index("curl")
+    assert words[curl + 4 : curl + 7] == ["-o", "$tmp", url]
+    shell = LocalExecutor()
+    result = await _validate(shell, service=local_library.service)
+    # the literal file was fetched: `$(id)` was not run and the quote did not end the word
+    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_REPLACED"
+    assert local_library.lib.read_bytes() == source.read_bytes()
 
 
 @pytest.mark.asyncio
 async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, full_sha_validator):
     shell = refreshing_executor(
-        curl_stdout=f"CURL_RC:0\n{full_sha_validator}  /tmp/libinspector.so.fetch\nmotd: welcome\n",
+        install_stdout=_install_stdout(full_sha_validator) + f"{'e' * 64}  motd\n",
         installs_as=full_sha_validator,
     )
     result = await _validate(shell)
     assert result.error is None
-    assert _kinds(shell) == ["write-check", "curl", "mv"]
-
-
-@pytest.mark.asyncio
-async def test_fetched_hash_that_differs_is_not_installed(refresh_on, full_sha_validator):
-    other = "f" * 64
-    shell = refreshing_executor(curl_stdout=f"CURL_RC:0\n{other}  /tmp/libinspector.so.fetch\n")
-    ssh = FakeSSH()
-    result = await _validate(shell, ssh)
-    assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
-    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
-    assert other in result.diagnostics["fetch_error"]
-    # the validator's file is the source of truth: no mv, the download is removed
-    assert _kinds(shell) == ["write-check", "curl", "rm"]
-    assert shell.sha256 == STALE_SHA256
-    assert ssh.command == ""
-
-
-@pytest.mark.asyncio
-async def test_fetch_failure_is_logged_and_nothing_is_installed(refresh_on, full_sha_validator, caplog):
-    shell = refreshing_executor(curl_stdout="CURL_RC:22\n", curl_stderr="The requested URL returned error: 404")
-    with caplog.at_level("WARNING"):
-        result = await _validate(shell)
-    assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
-    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
-    assert result.diagnostics["fetch_error"].startswith("curl exit 22: ")
-    assert "404" in result.diagnostics["fetch_error"]
-    assert _kinds(shell) == ["write-check", "curl", "rm"]
-    assert shell.remote_checksum_calls == 1
-    assert "INSPECTOR_LIBRARY_FETCH_FAILED" in caplog.text
+    assert _kinds(shell) == ["write-check", "install"]
 
 
 @pytest.mark.asyncio
@@ -769,15 +879,13 @@ async def test_fetch_transport_error_installs_nothing(refresh_on, full_sha_valid
     def respond(command: str):
         if command.startswith("if [ -w "):
             return _ok("WRITE_OK:1\n")
-        if command.startswith("curl "):
-            raise OSError("connection reset")
-        return _ok()
+        raise OSError("connection reset")
 
     shell = FakeShell(sha256=STALE_SHA256, respond=respond)
     result = await _validate(shell)
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
     assert result.diagnostics["fetch_error"] == "OSError: connection reset"
-    assert _kinds(shell) == ["write-check", "curl", "rm"]
+    assert _kinds(shell) == ["write-check", "install"]
 
 
 @pytest.mark.asyncio
@@ -791,12 +899,20 @@ async def test_mismatch_with_read_only_usr_lib_does_not_fetch(refresh_on):
 
 
 @pytest.mark.asyncio
-async def test_failed_install_is_a_fetch_failure(refresh_on, full_sha_validator):
-    shell = refreshing_executor(mv_exit=1)
+async def test_mktemp_failure_is_a_fetch_failure(refresh_on, full_sha_validator):
+    shell = refreshing_executor(install_stdout="MKTEMP_FAILED\n", install_stderr="mktemp: No space left on device")
     result = await _validate(shell)
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
-    assert result.diagnostics["fetch_error"] == "mv exit 1"
-    assert _kinds(shell) == ["write-check", "curl", "mv", "rm"]
+    assert result.diagnostics["fetch_error"].startswith("mktemp next to /usr/lib/libinspector.so failed")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rename_is_a_fetch_failure(refresh_on, full_sha_validator):
+    shell = refreshing_executor(install_stdout=_install_stdout(full_sha_validator, mv_rc=1))
+    result = await _validate(shell)
+    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
+    assert result.diagnostics["fetch_error"].startswith("mv exit 1")
+    assert shell.remote_checksum_calls == 1
 
 
 @pytest.mark.asyncio
@@ -806,7 +922,7 @@ async def test_hash_still_mismatched_after_install_fails_without_a_second_fetch(
     result = await _validate(shell, ssh)
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_STILL_MISMATCHED"
     assert result.diagnostics["executor_sha256"] == "e" * 64
-    assert _kinds(shell) == ["write-check", "curl", "mv"]
+    assert _kinds(shell) == ["write-check", "install"]
     assert shell.remote_checksum_calls == 2
     assert ssh.command == ""
 

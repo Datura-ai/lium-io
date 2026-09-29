@@ -75,6 +75,9 @@ class VerifyXSettings(BaseSettings):
     # file is the source of truth if the fetch hash differs. Off by default: a mismatch
     # does not write /usr/lib on the provider host. The same switch covers libinspector.so
     # (INSPECTOR_LIBRARY_FETCH_URL), which is installed only when the fetched hash matches.
+    # That refresh runs on RENTED executors, during the rental (the Inspector check), while the
+    # libverifyx.so one runs only on unrented executors: turning this on also allows root writes
+    # to /usr/lib on rented hosts.
     LIBRARY_REFRESH_ENABLED: bool = Field(
         default=False,
         description=(
@@ -272,8 +275,9 @@ class Settings(BaseSettings):
     # the inspector event, no renter is told, the score is untouched.
     INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
     # The libinspector.so sibling of VERIFYX_LIBRARY_FETCH_URL, under the same switch
-    # (VERIFYX_LIBRARY_REFRESH_ENABLED): on a hash mismatch the executor curls this once and
-    # the file is installed only if its sha256 is the validator's own libinspector.so.
+    # (VERIFYX_LIBRARY_REFRESH_ENABLED): on a hash mismatch a RENTED executor, during the rental,
+    # curls this once into a temp file beside /usr/lib/libinspector.so, and the file replaces
+    # the library (one rename) only if its sha256 is the validator's own libinspector.so.
     INSPECTOR_LIBRARY_FETCH_URL: str = Field(
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when library refresh is on and the libinspector.so hash does not match",

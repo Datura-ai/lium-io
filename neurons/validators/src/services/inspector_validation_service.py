@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 INSPECTOR_LIB_PATH = "/usr/lib/libinspector.so"
-INSPECTOR_FETCH_TMP_PATH = "/tmp/libinspector.so.fetch"
 _SHA256_RX = re.compile(r"[0-9a-f]{64}")
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 30
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
@@ -362,50 +361,56 @@ class InspectorValidationService:
         )
         return capture.transport_error is None and "WRITE_OK:1" in capture.stdout
 
+    def _install_command(self, url: str) -> str:
+        """One shell run on the executor: download into a mktemp file NEXT TO the library, check
+        its sha256 there, and only then `mv -f` it over the library. Same directory, so the mv
+        is a rename (atomic; the old file is never truncated, even on a full disk); /tmp can be
+        its own mount (setup_disk_reserve.sh), where mv would copy. The temp file goes on every
+        other exit, a signal included."""
+        lib_dir, lib_name = os.path.split(self.lib_path)
+        template = shlex.quote(os.path.join(lib_dir, f".{lib_name}.XXXXXX"))
+        return (
+            f"tmp=$(mktemp {template}) || {{ echo MKTEMP_FAILED; exit 0; }}; echo TMP:$tmp; "
+            "trap 'rm -f -- \"$tmp\"' EXIT; trap 'exit 1' HUP INT TERM; "
+            f"curl -fsSL --max-time 60 -o \"$tmp\" {shlex.quote(url)}; rc=$?; echo CURL_RC:$rc; "
+            "got=$(sha256sum < \"$tmp\" | cut -d' ' -f1); echo SHA256:$got; "
+            f"if [ \"$rc\" -eq 0 ] && [ \"$got\" = {shlex.quote(self.local_checksum)} ]; then "
+            f"chmod 644 \"$tmp\" && mv -f -- \"$tmp\" {shlex.quote(self.lib_path)}; echo MV_RC:$?; fi"
+        )
+
     async def _refresh_executor_library(self, shell, default_extra: dict[str, Any]) -> str | None:
         """Curl INSPECTOR_LIBRARY_FETCH_URL once and install it only if its sha256 is the
         validator's. Returns None when installed, else why not (also logged)."""
         url = settings.INSPECTOR_LIBRARY_FETCH_URL
-        tmp = shlex.quote(INSPECTOR_FETCH_TMP_PATH)
-        capture = await self._run_shell_command(
-            shell,
-            f"curl -fsSL --max-time 60 -o {tmp} {shlex.quote(url)}; echo CURL_RC:$?; "
-            f"if [ -f {tmp} ]; then sha256sum {tmp}; fi",
-            timeout=90,
-        )
-        curl_rc = None
-        fetched_sha = ""
+        capture = await self._run_shell_command(shell, self._install_command(url), timeout=90)
+        markers: dict[str, str] = {}
         for line in capture.stdout.splitlines():
-            if line.startswith("CURL_RC:"):
-                try:
-                    curl_rc = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    curl_rc = None
-            parts = line.split()
-            if parts and _SHA256_RX.fullmatch(parts[0]):
-                fetched_sha = parts[0]
+            key, sep, value = line.partition(":")
+            if sep and key in ("TMP", "CURL_RC", "SHA256", "MV_RC"):
+                markers[key] = value.strip()
+        fetched_sha = markers.get("SHA256", "")
+        if not _SHA256_RX.fullmatch(fetched_sha):
+            fetched_sha = ""
 
         if capture.transport_error is not None:
             fetch_error = capture.transport_error
-        elif curl_rc != 0:
-            fetch_error = f"curl exit {curl_rc}: {(capture.stderr or capture.stdout)[-400:]}"
+        elif "MKTEMP_FAILED" in capture.stdout.splitlines():
+            fetch_error = f"mktemp next to {self.lib_path} failed: {capture.stderr[-400:]}"
+        elif markers.get("CURL_RC") != "0":
+            fetch_error = f"curl exit {markers.get('CURL_RC')}: {(capture.stderr or capture.stdout)[-400:]}"
         elif fetched_sha != self.local_checksum:
             fetch_error = f"fetched sha256 {fetched_sha or None} != validator {self.local_checksum}"
+        elif markers.get("MV_RC") != "0":
+            fetch_error = f"mv exit {markers.get('MV_RC')}: {capture.stderr[-400:]}"
         else:
-            move = await self._run_shell_command(
-                shell, f"mv {tmp} {shlex.quote(self.lib_path)}", timeout=30
-            )
-            if move.transport_error is None and move.exit_status in (None, 0):
-                logger.warning(
-                    _m(
-                        "INSPECTOR_LIBRARY_REPLACED",
-                        extra=get_extra_info({**default_extra, "sha256": fetched_sha, "url": url}),
-                    )
+            logger.warning(
+                _m(
+                    "INSPECTOR_LIBRARY_REPLACED",
+                    extra=get_extra_info({**default_extra, "sha256": fetched_sha, "url": url}),
                 )
-                return None
-            fetch_error = move.transport_error or f"mv exit {move.exit_status}"
+            )
+            return None
 
-        await self._run_shell_command(shell, f"rm -f {tmp}", timeout=15)
         logger.warning(
             _m(
                 "INSPECTOR_LIBRARY_FETCH_FAILED",
