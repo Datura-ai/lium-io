@@ -19,6 +19,7 @@ from pathlib import Path
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.rental_dind import (
+    INNER_DAEMON_CONFIG_MAX_BYTES,
     INNER_DAEMON_CONFIG_PATH,
     AddressPool,
     merge_inner_daemon_config,
@@ -34,6 +35,8 @@ _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
 _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
+# Headers, padding and end-of-archive blocks around one file in a tar, with room for pax headers.
+_TAR_OVERHEAD_BYTES = 16 * 1024
 # DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
 # the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
 # a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
@@ -673,7 +676,9 @@ class RentalDockerSdkClient:
 
     def _write_inner_daemon_pools_sync(self, container_name: str, pools: tuple[AddressPool, ...]) -> str:
         try:
-            existing = self._read_container_file_sync(container_name, INNER_DAEMON_CONFIG_PATH)
+            existing = self._read_container_file_sync(
+                container_name, INNER_DAEMON_CONFIG_PATH, max_bytes=INNER_DAEMON_CONFIG_MAX_BYTES
+            )
             merged = merge_inner_daemon_config(existing, pools)
             if merged is None:
                 return "kept_image_config"
@@ -691,18 +696,40 @@ class RentalDockerSdkClient:
         except Exception as exc:  # noqa: BLE001 — the pod rents without the pools
             return f"failed: {_wrap_error_message(type(exc).__name__, exc)}"
 
-    def _read_container_file_sync(self, container_name: str, path: str) -> bytes | None:
-        """A regular file's bytes from a container's filesystem; None when the path does not exist."""
+    def _read_container_file_sync(
+        self, container_name: str, path: str, *, max_bytes: int
+    ) -> bytes | None:
+        """A regular file's bytes from a container's filesystem; None when the path does not exist.
+
+        A file over `max_bytes` is refused before it is read when the archive's stat gives its size,
+        and while the archive streams otherwise, so the container never decides how much we buffer.
+        """
         try:
-            chunks, _ = self._api_client.get_archive(container_name, path)
+            chunks, stat = self._api_client.get_archive(container_name, path)
         except Exception as exc:
             if _is_docker_not_found_error(exc):
                 return None
             raise
-        with tarfile.open(fileobj=io.BytesIO(b"".join(chunks))) as archive:
+        too_large = RentalDockerOperationError(
+            f"{path} in {container_name} is larger than {max_bytes} bytes"
+        )
+        size = (stat or {}).get("size")
+        if isinstance(size, int) and size > max_bytes:
+            _close_stream(chunks)
+            raise too_large
+        archive_limit = max_bytes + _TAR_OVERHEAD_BYTES
+        buffer = bytearray()
+        for chunk in chunks:
+            buffer += chunk
+            if len(buffer) > archive_limit:
+                _close_stream(chunks)
+                raise too_large
+        with tarfile.open(fileobj=io.BytesIO(bytes(buffer))) as archive:
             member = next(iter(archive.getmembers()), None)
             if member is None or not member.isfile():
                 raise RentalDockerOperationError(f"{path} in {container_name} is not a regular file")
+            if member.size > max_bytes:
+                raise too_large
             handle = archive.extractfile(member)
             return handle.read() if handle is not None else b""
 
@@ -1457,6 +1484,12 @@ def _validate_paramiko_known_hosts(known_hosts_path: Path) -> None:
                 exc,
             )
         ) from exc
+
+
+def _close_stream(chunks) -> None:
+    close = getattr(chunks, "close", None)
+    if callable(close):
+        close()
 
 
 def _wrap_error_message(message: str, exc: Exception) -> str:

@@ -14,6 +14,7 @@ from payload_models.payloads import ContainerCreateRequest, CustomOptions, Workl
 from services.docker_service import DockerService
 from services.rental_dind import (
     DIND_VERSION_MAX_BYTES,
+    INNER_DAEMON_CONFIG_MAX_BYTES,
     RESERVED_POD_RANGES,
     AddressPool,
     dind_base_volume_name,
@@ -201,6 +202,8 @@ class _ArchiveApiClient:
         get_error=None,
         put_error=None,
         network_subnets: tuple[str, ...] = ("172.31.0.0/16",),
+        stat_size: int | None = None,
+        archive: bytes | None = None,
     ):
         self.network_subnets = network_subnets
         self.events = []
@@ -208,6 +211,9 @@ class _ArchiveApiClient:
         self.get_error = get_error
         self.put_error = put_error
         self.put = []
+        self.stat_size = stat_size
+        self.archive = archive
+        self.streamed = 0
 
     def create_host_config(self, **kwargs):
         return kwargs
@@ -222,7 +228,19 @@ class _ArchiveApiClient:
             raise self.get_error
         if self.daemon_json is None:
             raise NotFound(f"Could not find the file {path} in container {container}")
-        return iter([_tar_of("daemon.json", self.daemon_json)]), {"name": "daemon.json"}
+        archive = (
+            self.archive if self.archive is not None else _tar_of("daemon.json", self.daemon_json)
+        )
+        stat = {"name": "daemon.json"}
+        if self.stat_size is not None:
+            stat["size"] = self.stat_size
+        return self._stream(archive), stat
+
+    def _stream(self, archive: bytes, chunk: int = 4096):
+        for start in range(0, len(archive), chunk):
+            piece = archive[start : start + chunk]
+            self.streamed += len(piece)
+            yield piece
 
     def put_archive(self, container, path, data):
         self.events.append(("put_archive", container, path))
@@ -310,6 +328,70 @@ async def test_a_daemon_json_that_cannot_be_read_or_written_never_fails_the_crea
     [record] = [r for r in caplog.records if r.getMessage() == "Inner Docker daemon address pools"]
     assert record.levelname == "WARNING"
     assert record.msg.extra["outcome"].startswith("failed: APIError")
+
+
+def _daemon_json_of(size: int) -> bytes:
+    return b"{}" + b" " * (size - 2)
+
+
+def _pools_outcome(caplog) -> str:
+    [record] = [r for r in caplog.records if r.getMessage() == "Inner Docker daemon address pools"]
+    return record.msg.extra["outcome"]
+
+
+@pytest.mark.parametrize(
+    "daemon_json",
+    [PYTORCH_TEMPLATE_DAEMON_JSON, _daemon_json_of(INNER_DAEMON_CONFIG_MAX_BYTES)],
+    ids=["template", "exactly-the-limit"],
+)
+@pytest.mark.parametrize("stat_has_size", [True, False])
+@pytest.mark.asyncio
+async def test_a_daemon_json_up_to_the_limit_is_seeded(daemon_json, stat_has_size, caplog):
+    api = _ArchiveApiClient(
+        daemon_json=daemon_json, stat_size=len(daemon_json) if stat_has_size else None
+    )
+
+    await RentalDockerSdkClient(api).run_container(_spec())
+
+    assert _pools_outcome(caplog) == "seeded"
+    [(_, members)] = api.put
+    assert json.loads(members["daemon.json"][2])["default-address-pools"] == [
+        {"base": "10.200.0.0/14", "size": 24}
+    ]
+
+
+@pytest.mark.parametrize("stat_has_size", [True, False])
+@pytest.mark.asyncio
+async def test_a_daemon_json_one_byte_over_the_limit_is_refused_and_the_pod_still_rents(
+    stat_has_size, caplog
+):
+    daemon_json = _daemon_json_of(INNER_DAEMON_CONFIG_MAX_BYTES + 1)
+    api = _ArchiveApiClient(
+        daemon_json=daemon_json, stat_size=len(daemon_json) if stat_has_size else None
+    )
+
+    await RentalDockerSdkClient(api).run_container(_spec())
+
+    assert api.put == []
+    assert api.events[-1] == "start"
+    assert _pools_outcome(caplog) == (
+        "failed: RentalDockerOperationError: /etc/docker/daemon.json in pod_x is larger than"
+        f" {INNER_DAEMON_CONFIG_MAX_BYTES} bytes"
+    )
+    if stat_has_size:
+        assert api.streamed == 0
+
+
+@pytest.mark.asyncio
+async def test_a_huge_archive_is_cut_off_while_it_streams(caplog):
+    api = _ArchiveApiClient(archive=b"\0" * (8 * 1024 * 1024))
+
+    await RentalDockerSdkClient(api).run_container(_spec())
+
+    assert api.put == []
+    assert api.events[-1] == "start"
+    assert "is larger than" in _pools_outcome(caplog)
+    assert api.streamed <= 2 * INNER_DAEMON_CONFIG_MAX_BYTES
 
 
 @pytest.mark.asyncio

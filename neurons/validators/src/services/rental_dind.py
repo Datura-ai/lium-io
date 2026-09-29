@@ -30,6 +30,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 INNER_DAEMON_CONFIG_PATH = "/etc/docker/daemon.json"
+# The image's daemon.json is renter-controlled and read into validator memory; real ones are
+# a few hundred bytes.
+INNER_DAEMON_CONFIG_MAX_BYTES = 64 * 1024
 DEFAULT_ADDRESS_POOLS_KEY = "default-address-pools"
 
 DIND_STORE_TARGET = "/var/lib/docker"
