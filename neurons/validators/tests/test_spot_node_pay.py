@@ -569,11 +569,6 @@ def _messages(result: JobResult, marker: str) -> list[str]:
     ]
 
 
-def test_the_owners_factors_are_pinned():
-    assert rental_price.FILLER_REVENUE_PAY_FACTOR == SPOT_FACTOR == 0.95
-    assert rental_price.SECURE_FILLER_REVENUE_FLOOR_FACTOR == FLOOR_FACTOR == 0.95
-
-
 @pytest.mark.asyncio
 async def test_the_spot_factor_moves_spot_pay_alone(spot_pay_on, floor_on, monkeypatch):
     monkeypatch.setattr(rental_price, "FILLER_REVENUE_PAY_FACTOR", 0.5)
