@@ -261,7 +261,7 @@ class VerifyXCheck:
                 deferred_network = {
                     key: value
                     for key, value in updated_specs["network"].items()
-                    if key not in ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
+                    if key not in _EMA_KEYS
                 }
                 updated_state = replace(
                     ctx.state, specs={**updated_specs, "network": deferred_network}
@@ -427,20 +427,12 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
 def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
     """Why this cycle's VerifyX sample must not move the published EMA, or None.
 
-    A cycle that a check other than VerifyX failed measured the link of a node that is not in
-    service; the executor's mandatory pre-pull of the recommended image, tens of GB, is a likely
-    cause of both and shares the link. With alpha 0.5 one such sample weighs half of the next
-    cycle's verdict: a node seeded by a cycle that failed the cached-image check read 86.7 against
-    the 100 gate one batch later, and passed the cycle after that. Holding the EMA leaves a
-    never-measured node never-measured, so its next cycle gets the cold-sample retry and
-    bootstraps from a sample taken in service. A cycle that VerifyX itself failed still moves the
-    EMA: that is the gate working.
-
-    A cycle that passed while the image was not cached yet (the fresh-node grace's PENDING) has the
-    same pre-pull on the link, so it does not seed a never-measured node either. A node with a
-    stored EMA publishes its sample on every passing cycle, image cached or not: a hold there would
-    let it keep passing the gate on an EMA its samples no longer support.
+    Held: a cycle another check failed, and a passing cycle without the image cached on a
+    never-measured node, since the image pre-pull shares the link. Not held: a cycle VerifyX itself
+    failed (the gate working), and anything without the backend's answer, as for the cold retry.
     """
+    if ctx.state.rented_data is None:
+        return None
     if failed_check_id:
         if failed_check_id != VerifyXCheck.check_id:
             return f"cycle failed {failed_check_id}"
