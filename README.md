@@ -47,8 +47,7 @@ Docs and the Provider Portal call a miner a **provider** and an executor a **nod
 
 - **Two income streams.** You list each node at your own price per GPU-hour and get a share of what renters pay. On top of that, your hotkey earns Subnet 51 emission for rented nodes. See [How providers earn](https://docs.lium.io/providers/rewards).
 - **Idle pay.** An eligible GPU that is not rented still earns from the unrented pool (see [How incentives work](#how-incentives-work)).
-- **No coordinator server required.** Opt into the Lium.io Central Provider Server and all you run is the node agent on each GPU host.
-- **One-command setup.** `lium mine` installs, configures and checks a node, then prints the values for the portal's **Add Node** form.
+- **One-command setup.** `lium mine` installs, configures and checks a node.
 
 ### Requirements
 
