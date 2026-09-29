@@ -291,6 +291,40 @@ async def test_rented_spot_stays_out_of_both_pools(spot_pay_on):
 
 
 @pytest.mark.asyncio
+async def test_the_free_remainder_of_a_partially_rented_spot_node_keeps_spot_tier(monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", True)
+    config = IncentiveConfig(
+        rental_incentive_gpu_types=["H100"],
+        max_unrented_gpus={"H100": {8: BUCKET_CAP, 1: BUCKET_CAP}},
+        rental_prices_per_hour={H100: HOURLY_RATE},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+    )
+
+    def split_spot() -> JobResult:
+        return _spot(
+            "split-spot",
+            is_rented=True,
+            rented_gpu_count=4,
+            supports_gpu_splitting=True,
+            gpu_splitting_min_count=1,
+            filler_revenue_per_gpu_hour=2.0,
+        )
+
+    off = split_spot()
+    await _run([off], config)
+    monkeypatch.setattr(settings, "ENABLE_SPOT_NODE_PAY", True)
+    on = split_spot()
+    await _run([on], config)
+
+    # the remainder has no average of its own: it stays out as before, not "no average yet"
+    assert on.incentive == off.incentive == 0
+    assert ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG not in _codes(on)
+    assert set(_codes(on)) == {ZeroIncentiveReason.SPOT_TIER}
+    assert _codes(on) == _codes(off)
+    assert on.full_log_text == off.full_log_text
+
+
+@pytest.mark.asyncio
 async def test_spot_blocked_by_another_exclusion_is_not_paid(spot_pay_on):
     spot = _spot(is_provider_banned=True, filler_revenue_per_gpu_hour=2.0)
 
@@ -428,11 +462,17 @@ async def test_floor_skips_the_free_remainder_of_a_partially_rented_split_node(
         filler_revenue_per_gpu_hour=8.0,
     )
 
-    await _run([split], config)
+    incentive = await _run([split], config)
 
     free = split.incentive_formula_inputs["unrented"]
     assert free["unrented_cap_multiplier"] == 0.25
     assert free["effective_rate"] == HOURLY_RATE * 0.25
+    # no top-up on the remainder: nothing paid from the unbucketed share, nothing in its cost
+    assert "unbucketed_share" not in free
+    assert "floor_top_up_rate" not in free
+    assert split.floor_top_up_rate is None
+    assert incentive._unbucketed_rental_cost == 0
+    assert incentive.unbucketed_share == 0
 
 
 @pytest.mark.asyncio
@@ -604,6 +644,109 @@ async def test_at_the_burn_cap_the_pool_has_no_room_left_for_extras(monkeypatch,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "zero_rate_spot, own_reason",
+    [
+        (
+            dict(gpu_model="NVIDIA H200"),
+            ZeroIncentiveReason.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
+        ),
+        (dict(gpu_count=1), ZeroIncentiveReason.NO_UNRENTED_CAPACITY_FOR_GPU_COUNT),
+        (dict(nvidia_driver_version="535.104.05"), ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM),
+    ],
+    ids=["model-outside-the-program", "zero-cap-tier", "low-driver"],
+)
+async def test_a_zero_rate_spot_node_at_the_cap_keeps_only_its_own_reason(
+    spot_pay_on, zero_rate_spot, own_reason
+):
+    config = IncentiveConfig(
+        rental_incentive_gpu_types=["H100"],
+        max_unrented_gpus={"H100": {8: BUCKET_CAP, 1: 0}},
+        rental_prices_per_hour={H100: HOURLY_RATE},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+    )
+    paid = _spot("spot-paid", filler_revenue_per_gpu_hour=2.0)
+    zero_rate = _spot("spot-zero", filler_revenue_per_gpu_hour=2.0, **zero_rate_spot)
+
+    incentive = await _run([_node("secure-1"), paid, zero_rate], config, tao_price=AT_CAP_TAO_PRICE)
+
+    assert incentive.unbucketed_share_raw > 0
+    assert incentive.unbucketed_share == 0.0
+    assert _codes(paid) == [ZeroIncentiveReason.SPOT_NO_HEADROOM_AT_BURN_CAP]
+    assert zero_rate.effective_rate == 0
+    assert zero_rate.incentive == 0
+    assert _codes(zero_rate) == [own_reason]
+
+
+@pytest.mark.asyncio
+async def test_a_price_outage_reports_no_burn_cap_reason_or_note(spot_pay_on, floor_on, caplog):
+    with caplog.at_level(logging.WARNING):
+        incentive = await _run(
+            [*_over_cap_cycle(8.0), _spot(filler_revenue_per_gpu_hour=2.0)], tao_price=None
+        )
+
+    # no price: every share is 0, but the rental share is not at the burn cap
+    assert incentive.rental_share == 0
+    assert incentive.unbucketed_share_raw == incentive.unbucketed_share == 0
+    assert incentive._unbucketed_rental_cost > 0
+    for node in incentive.job_results["hk"]:
+        assert node.incentive == 0
+        assert ZeroIncentiveReason.SPOT_NO_HEADROOM_AT_BURN_CAP not in _codes(node)
+        assert _logged(node, FLOOR_NOT_PAID) == []
+        assert _logged(node, FLOOR_APPLIED) == []
+    assert [r for r in caplog.records if "clamped to the incentive pool" in r.message] == []
+
+
+@pytest.mark.asyncio
+async def test_flags_off_at_the_cap_log_no_clamp_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        off = await _run(_mixed_cycle(), _mixed_config(), tao_price=AT_CAP_TAO_PRICE)
+
+    assert off.rental_share == off.total_burn_emission
+    assert off.unbucketed_share_raw == 0
+    assert [r for r in caplog.records if "clamped to the incentive pool" in r.message] == []
+
+
+@pytest.mark.asyncio
+async def test_spot_and_floored_nodes_publish_both_terms_of_the_formula(spot_pay_on, floor_on):
+    incentive = await _run(
+        [*_over_cap_cycle(8.0), _node("plain-1x", gpu_count=1), _spot(filler_revenue_per_gpu_hour=2.0)],
+        _mixed_config(),
+    )
+    floored, _, plain, spot = incentive.job_results["hk"]
+    unbucketed_cost = 8 * 0.9 * 2.0 + 2 * 8 * (0.9 * 8.0 - HOURLY_RATE * 0.5)
+
+    def rental_term(inputs: dict) -> float:
+        return inputs["rental_share"] * inputs["gpu_count"] * inputs["effective_rate"] / inputs["total_rental_cost"]
+
+    def unbucketed_term(inputs: dict) -> float:
+        return (
+            inputs["unbucketed_share"] * inputs["gpu_count"] * inputs["floor_top_up_rate"]
+            / inputs["unbucketed_rental_cost"]
+        )
+
+    floored_inputs = floored.incentive_formula_inputs
+    assert floored.incentive_formula_version == spot.incentive_formula_version == "rental_price_v2"
+    assert floored_inputs["unbucketed_share"] == incentive.unbucketed_share > 0
+    assert floored_inputs["unbucketed_rental_cost"] == pytest.approx(unbucketed_cost)
+    assert floored_inputs["effective_rate"] == HOURLY_RATE * 0.5
+    assert floored_inputs["floor_top_up_rate"] == pytest.approx(0.9 * 8.0 - HOURLY_RATE * 0.5)
+    assert "spot_pay" not in floored_inputs
+    assert rental_term(floored_inputs) + unbucketed_term(floored_inputs) == pytest.approx(floored.incentive)
+
+    spot_inputs = spot.incentive_formula_inputs
+    assert spot_inputs["spot_pay"] is True
+    assert spot_inputs["unbucketed_share"] == incentive.unbucketed_share
+    assert spot_inputs["unbucketed_rental_cost"] == pytest.approx(unbucketed_cost)
+    assert spot_inputs["floor_top_up_rate"] == spot_inputs["effective_rate"] == pytest.approx(0.9 * 2.0)
+    # a spot node is paid the unbucketed term alone
+    assert unbucketed_term(spot_inputs) == pytest.approx(spot.incentive)
+
+    for key in ("unbucketed_share", "unbucketed_rental_cost", "floor_top_up_rate", "spot_pay"):
+        assert key not in plain.incentive_formula_inputs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "tao_price", [TAO_PRICE, "half-clamp", AT_CAP_TAO_PRICE], ids=["below-clamp", "clamped", "at-cap"]
 )
 async def test_the_logged_formulas_reproduce_the_paid_incentive(spot_pay_on, floor_on, tao_price):
@@ -631,16 +774,37 @@ async def test_the_logged_formulas_reproduce_the_paid_incentive(spot_pay_on, flo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tao_price", [TAO_PRICE, AT_CAP_TAO_PRICE], ids=["below-cap", "at-cap"])
 async def test_monitoring_splits_the_rental_pool_by_the_bucket_rate(floor_on, caplog, tao_price):
-    incentive = await _run(_over_cap_cycle(8.0), tao_price=tao_price)
+    with caplog.at_level(logging.INFO):
+        incentive = await _run(_over_cap_cycle(8.0), tao_price=tao_price)
+
+    def logged(prefix: str) -> list[dict]:
+        return [r.msg.extra for r in caplog.records if str(r.msg).startswith(prefix)]
+
+    summaries = logged("Unrented_bucket_summary")
+    assert [s["bucket_key"] for s in summaries] == ["H100_8"]
+    assert summaries[0]["share_of_rental_pool"] == pytest.approx(1.0)
+    assert summaries[0]["cost_per_h"] == pytest.approx(incentive.total_rental_cost)
+    # the splits add up to the burn emission only with the unbucketed share in them
+    assert incentive._unbucketed_rental_cost > 0
+    for line in (*logged("Incentive_results"), *logged("Final emission splits calculated")):
+        assert line["unbucketed_share"] == incentive.unbucketed_share
+        assert line["unbucketed_rental_cost"] == incentive._unbucketed_rental_cost
+        assert line["rental_share"] + line["burn_share"] + line["unbucketed_share"] == pytest.approx(
+            incentive.total_burn_emission
+        )
+    assert len(logged("Incentive_results")) == len(logged("Final emission splits calculated")) == 1
+
+
+@pytest.mark.asyncio
+async def test_monitoring_defaults_to_no_unbucketed_share(caplog):
+    incentive = await _run(_over_cap_cycle(8.0))
 
     caplog.clear()
     with caplog.at_level(logging.INFO):
         log_for_monitoring(incentive.job_results, 0.0, incentive.unrented_count_by_bucket)
 
-    summaries = [r.msg.extra for r in caplog.records if str(r.msg).startswith("Unrented_bucket_summary")]
-    assert [s["bucket_key"] for s in summaries] == ["H100_8"]
-    assert summaries[0]["share_of_rental_pool"] == pytest.approx(1.0)
-    assert summaries[0]["cost_per_h"] == pytest.approx(incentive.total_rental_cost)
+    (line,) = [r.msg.extra for r in caplog.records if str(r.msg).startswith("Incentive_results")]
+    assert (line["unbucketed_share"], line["unbucketed_rental_cost"]) == (0.0, 0.0)
 
 
 @pytest.mark.asyncio

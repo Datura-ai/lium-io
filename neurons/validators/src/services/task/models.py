@@ -238,12 +238,17 @@ class JobResult(BaseModel):
                 "fixed_ratio": self.fixed_ratio,
             }
             if self.unbucketed_share is not None:
-                # incentive = rental_share * gpu_count * effective_rate / total_rental_cost
-                #           + unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
-                # (a spot node: floor_top_up_rate = effective_rate, and nothing from the first term)
+                # rental_price_v2 has two terms once these keys are present (documented in the
+                # lium_protocol README, 1.4.0):
+                #   rental term:     rental_share * gpu_count * effective_rate / total_rental_cost
+                #   unbucketed term: unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
+                # A floored secure node is paid both. A spot node (spot_pay: true) is paid only the
+                # unbucketed term, with floor_top_up_rate = effective_rate.
                 inputs["unbucketed_share"] = self.unbucketed_share
                 inputs["unbucketed_rental_cost"] = self.unbucketed_rental_cost
                 inputs["floor_top_up_rate"] = self.floor_top_up_rate
+                if self.spot_pay_candidate:
+                    inputs["spot_pay"] = True
             return inputs
         return {
             "score": self.score,

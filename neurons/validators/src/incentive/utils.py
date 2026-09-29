@@ -48,6 +48,8 @@ def log_for_monitoring(
     job_results: dict[str, list[JobResult]],
     started_at: float,
     unrented_count_by_bucket: dict | None = None,
+    unbucketed_share: float = 0.0,
+    unbucketed_rental_cost: float = 0.0,
 ) -> None:
     try:
         first_with_rental = next(
@@ -102,6 +104,9 @@ def log_for_monitoring(
             "rental_share": rental_share,
             "burn_share": burn_share,
             "total_rental_cost": total_rental_cost,
+            # spot pay and floor top-ups, paid on top of rental_share and out of the burn remainder
+            "unbucketed_share": unbucketed_share,
+            "unbucketed_rental_cost": unbucketed_rental_cost,
         }))
 
         for key, agg in sorted(unrented_by_bucket.items()):

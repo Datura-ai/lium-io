@@ -874,6 +874,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "rental_share": self.rental_share,
                     "burn_share": self.burn_share,
                     "total_rental_cost": self.total_rental_cost,
+                    "unbucketed_share": self.unbucketed_share,
+                    "unbucketed_rental_cost": self._unbucketed_rental_cost,
                 },
             )
         )
@@ -1054,8 +1056,14 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _on_spot_pay_path(result: JobResult) -> bool:
-        # a rented spot node stays out of both pools, as before
-        return settings.ENABLE_SPOT_NODE_PAY and result.is_spot and not result.is_rented
+        # a rented spot node stays out of both pools, as before, and so does the free remainder of a
+        # partially rented one: it has no configuration average of its own (spot_tier, not "no average")
+        return (
+            settings.ENABLE_SPOT_NODE_PAY
+            and result.is_spot
+            and not result.is_rented
+            and not result.is_split_remainder
+        )
 
     @staticmethod
     def _qualify_spot_node(job_result: JobResult, excluded_from_both_pools: bool) -> JobResult:
