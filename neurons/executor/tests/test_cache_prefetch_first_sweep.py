@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import docker
 import pytest
+from aiohttp.client_exceptions import InvalidUrlClientError
 
 docker.errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
 
@@ -86,16 +87,26 @@ class _Stop(BaseException):
     """Ends the loop from inside a patched sleep; the loop only catches Exception."""
 
 
-def _drive_loop(monkeypatch, ensure_outcomes: list, sleeps_before_stop: int, tmp_path, gpu=None):
+def _drive_loop(
+    monkeypatch,
+    ensure_outcomes: list,
+    sleeps_before_stop: int,
+    tmp_path,
+    gpu=None,
+    base_url="https://backend",
+    fetch=None,
+):
     """Run the loop with one template until `sleeps_before_stop` sleeps; return the delays."""
-    monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", "https://backend")
+    monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", base_url)
     monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
     monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", False)
     monkeypatch.setattr(cache_template_service.docker, "from_env", MagicMock())
     gpu = gpu or (lambda: ("NVIDIA H100", "580", None))
     monkeypatch.setattr(cache_template_service, "_get_gpu_info", gpu)
     monkeypatch.setattr(
-        cache_template_service, "_fetch_templates", AsyncMock(return_value=([TEMPLATE], 200, None))
+        cache_template_service,
+        "_fetch_templates",
+        fetch or AsyncMock(return_value=([TEMPLATE], 200, None)),
     )
     monkeypatch.setattr(
         cache_template_service, "_ensure_template", AsyncMock(side_effect=ensure_outcomes)
@@ -158,6 +169,8 @@ def test_an_unknown_gpu_at_boot_uses_none_of_the_fast_retries(monkeypatch, tmp_p
         ),
         aiohttp.ClientError("GET https://backend.example/executors?api_token=s3cret failed"),
         RuntimeError("backend.example answered 401 to Authorization: Bearer s3cret"),
+        aiohttp.ClientError("Cannot connect to https://provider:s3c@ret@backend.example/api"),
+        InvalidUrlClientError("https://provider:s3c/ret@backend.example/executors/x"),
     ],
 )
 def test_a_loop_error_reaches_log_and_document_without_its_credentials(
@@ -171,16 +184,23 @@ def test_a_loop_error_reaches_log_and_document_without_its_credentials(
     (message,), _ = logger.error.call_args
     for text in (message, doc["last_loop_error"], doc["last_error"]):
         assert "s3cret" not in text
+        assert "s3c" not in text and "ret@" not in text
         assert type(error).__name__ in text
         assert "backend.example" in text
 
 
-def test_the_backend_url_is_published_without_its_credentials(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        cache_template_service.settings,
-        "COMPUTE_REST_API_URL",
-        "https://provider:s3cret@backend.example/api",
-    )
+@pytest.mark.parametrize(
+    ("base_url", "published"),
+    [
+        ("https://provider:s3cret@backend.example/api", "https://backend.example/api"),
+        ("https://provider:s3c@ret@backend.example/api", "https://backend.example/api"),
+        ("https://provider:s3c/ret@backend.example/api", "https://***@backend.example/api"),
+    ],
+)
+def test_the_backend_url_is_published_without_its_credentials(
+    monkeypatch, tmp_path, base_url, published
+):
+    monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", base_url)
     monkeypatch.setattr(
         cache_template_service.docker, "from_env", MagicMock(side_effect=RuntimeError("no docker"))
     )
@@ -189,8 +209,29 @@ def test_the_backend_url_is_published_without_its_credentials(monkeypatch, tmp_p
     asyncio.run(cache_template_service.run_cache_template_prefetch(str(path)))
 
     backend_url = json.loads(path.read_text())["backend_url"]
-    assert "s3cret" not in backend_url
-    assert backend_url == "https://***@backend.example/api/executors/default-docker-image"
+    assert backend_url == f"{published}/executors/default-docker-image"
+
+
+def test_a_backend_url_aiohttp_rejects_never_publishes_its_password(monkeypatch, tmp_path):
+    # A `/` in the password makes aiohttp refuse the URL before connecting, with the raw URL
+    # as the error's text.
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url="https://provider:s3c/ret@backend.example/api",
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert "InvalidUrlClientError" in message
+    for text in (message, doc["last_loop_error"], doc["last_error"], doc["backend_url"]):
+        assert "s3c" not in text and "ret@" not in text
+        assert "backend.example" in text
 
 
 def test_retry_jitter_stays_inside_its_bound():

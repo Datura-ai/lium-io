@@ -106,8 +106,8 @@ async def _remote_digest(
         registry_data = await asyncio.to_thread(client.images.get_registry_data, image_ref)
         return registry_data.id, None
     except Exception as e:
-        logger.warning(f"Could not read remote digest for {image_ref}: {e}")
-        return None, str(e)
+        logger.warning(f"Could not read remote digest for {image_ref}: {describe_error(e)}")
+        return None, describe_error(e)
 
 
 async def _local_digests(
@@ -119,8 +119,8 @@ async def _local_digests(
     except docker.errors.ImageNotFound:
         return [], None
     except Exception as e:
-        logger.warning(f"Could not read local image {image_ref}: {e}")
-        return [], str(e)
+        logger.warning(f"Could not read local image {image_ref}: {describe_error(e)}")
+        return [], describe_error(e)
     return image.attrs.get("RepoDigests", []) or [], None
 
 
@@ -164,8 +164,8 @@ async def _cleanup_old_tags(
     try:
         images = await asyncio.to_thread(client.images.list, repository)
     except Exception as e:
-        logger.warning(f"Failed to list images for {repository}: {e}")
-        return str(e)
+        logger.warning(f"Failed to list images for {repository}: {describe_error(e)}")
+        return describe_error(e)
     error: str | None = None
     for image in images:
         for tag in list(image.tags):
@@ -175,8 +175,8 @@ async def _cleanup_old_tags(
                     await asyncio.to_thread(client.images.remove, tag)
                     logger.info(f"Removed unused image: {tag}")
                 except Exception as e:
-                    logger.warning(f"Failed to remove image {tag}: {e}")
-                    error = str(e)
+                    logger.warning(f"Failed to remove image {tag}: {describe_error(e)}")
+                    error = describe_error(e)
     return error
 
 
@@ -339,7 +339,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
         client = docker.from_env()
         state.note_docker(available=True)
     except Exception as e:
-        logger.error(f"Cannot connect to docker; cache pre-pull disabled: {e}")
+        logger.error(f"Cannot connect to docker; cache pre-pull disabled: {describe_error(e)}")
         state.note_docker(available=False, error=e)
         state.record_loop_outcome(Outcome.DOCKER_UNAVAILABLE, error=e)
         state.flush()

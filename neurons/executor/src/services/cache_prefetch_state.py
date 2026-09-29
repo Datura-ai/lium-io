@@ -29,6 +29,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from yarl import URL
+
 from core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -80,46 +82,138 @@ def _utcnow() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# Credentials an error's text can carry: the user:password (or token) part of a URL such as
-# COMPUTE_REST_API_URL, a bearer/basic/token value, an API-key header, a known token shape, and
-# a secret-named query or key=value parameter. Hosts, paths, status codes and image digests are
-# kept: they are what a provider needs to act on the error.
+# What `redact` returns at most, and how far past that it reads. The patterns run on the executor's
+# event loop, so their input is bounded first; the extra reach lets a credential that starts before
+# the cut be matched whole, and whatever lies past the cut is dropped, never published.
+MAX_REDACTED_CHARS = 4 * MAX_ERROR_CHARS
+_REDACT_READ_CHARS = MAX_REDACTED_CHARS + 512
+
+# Words that make a parameter or key name secret when they are one of its words (`access_token`,
+# `apiKey`, `X-Amz-Signature`), so `monkey`, `design` and `author` are not.
+_SECRET_WORDS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "credential",
+        "credentials",
+        "key",
+        "pass",
+        "passphrase",
+        "passwd",
+        "password",
+        "pw",
+        "pwd",
+        "secret",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+# Prefixes a secret word is often written flush against (`apikey`, `accesstoken`).
+_SECRET_PREFIXES = ("access", "api", "auth", "client", "private", "refresh", "secret", "session")
+_NAME_WORDS = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def _is_secret_name(name: str) -> bool:
+    for word in _NAME_WORDS.findall(name):
+        word = word.lower()
+        if word in _SECRET_WORDS:
+            return True
+        if any(
+            word.startswith(prefix) and word[len(prefix) :] in _SECRET_WORDS
+            for prefix in _SECRET_PREFIXES
+        ):
+            return True
+    return False
+
+
+def _mask_secret_value(match: re.Match) -> str:
+    if not _is_secret_name(match["name"]):
+        return match[0]
+    return f"{match[0][: match.start('value') - match.start()]}***{match['close']}"
+
+
+# Credentials an error's text can carry: the userinfo of a URL such as COMPUTE_REST_API_URL (up to
+# the last `@` before the host, since a password may hold an unencoded `@` or `/`), an
+# authorization or API-key/token header, a bearer/basic/token value, a known token shape, and a
+# secret-named key=value or quoted 'key': 'value' pair. Hosts, paths, status codes and image
+# digests are kept: they are what a provider needs to act on the error. Every quantifier is
+# bounded, so each pattern is linear in its (already bounded) input.
+_URL_USERINFO = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.-]{0,31}://)[^\s'\"<>]{1,256}@"
+    r"(?=(?:[a-z0-9_.-]{1,253}|\[[0-9a-f:.]{2,45}\])(?::\d{1,5})?(?![\w.:@-]))"
+)
 _REDACTIONS = (
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@'\"]+@"), r"\1***@"),
-    (re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s'\",;]+"), r"\1\2***"),
-    (re.compile(r"(?i)\b(token)(\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1\2***"),
-    (re.compile(r"(?i)\b((?:x-)?api[-_]?key|x-auth-token)(\s*:\s*)[^\s'\",;]+"), r"\1\2***"),
+    (_URL_USERINFO, r"\1***@"),
     (
         re.compile(
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-            r"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
+            r"(?i)\b((?:proxy-)?authorization|(?:x-)?api[-_]?(?:key|token)"
+            r"|x-[a-z0-9-]{0,64}-(?:token|key|secret|signature))"
+            r"(\s{0,8}:\s{0,8})((?:bearer|basic|token|digest)\s{1,8})?[^\s'\",;]{1,4096}"
+        ),
+        r"\1\2\3***",
+    ),
+    (re.compile(r"(?i)\b(bearer|basic)(\s{1,8})[^\s'\",;]{1,4096}"), r"\1\2***"),
+    (re.compile(r"(?i)\b(token)(\s{1,8})[A-Za-z0-9._~+/=-]{16,4096}"), r"\1\2***"),
+    (
+        re.compile(
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,4096}|github_pat_[A-Za-z0-9_]{20,4096}"
+            r"|eyJ[A-Za-z0-9_-]{1,4096}\.[A-Za-z0-9_-]{1,4096}\.[A-Za-z0-9_-]{1,4096})"
         ),
         "***",
     ),
     (
         re.compile(
-            r"(?i)([?&;\s]|^)([\w.-]*(?:token|key|secret|passw(?:or)?d|pwd|auth|sig|credential)"
-            r"[\w.-]*=)[^&\s#'\",;]+"
+            r"(?<![\w.-])(?P<name>[A-Za-z_][\w.-]{0,63})=(?P<quote>['\"]?)"
+            r"(?P<value>[^&\s#'\",;]{1,4096})(?P<close>)"
         ),
-        r"\1\2***",
+        _mask_secret_value,
+    ),
+    (
+        re.compile(
+            r"(?P<quote>['\"])(?P<name>[A-Za-z_][\w.-]{0,63})(?P=quote)\s{0,8}:\s{0,8}"
+            r"(?P<open>['\"])(?P<value>[^'\"]{1,4096})(?P<close>(?P=open))"
+        ),
+        _mask_secret_value,
     ),
 )
 
 
 def redact(text: str) -> str:
-    """``text`` with any credentials in it replaced by ``***``."""
+    """``text`` with any credentials in it replaced by ``***``, cut to ``MAX_REDACTED_CHARS``."""
+    cut = len(text) > MAX_REDACTED_CHARS
+    text = text[:_REDACT_READ_CHARS]
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
-    return text
+    return text[:MAX_REDACTED_CHARS] + "…" if cut else text
 
 
 def describe_error(error: object) -> str:
-    """How an error is shown in the log and in the document: its class and its redacted text."""
+    """How an error is shown in the log and in the document: its class and its redacted text.
+
+    Never raises: it runs inside the loop's except clauses, so an error whose ``str()`` raises
+    is shown by its class alone.
+    """
+    name = type(error).__name__
+    try:
+        text = str(error)
+    except Exception:
+        return name
+    message = redact(text)
     if isinstance(error, BaseException):
-        message = redact(str(error))
-        name = type(error).__name__
         return f"{name}: {message}" if message else name
-    return redact(str(error))
+    return message
+
+
+def _public_url(url: str) -> str:
+    """``url`` without its userinfo, and redacted. A URL yarl cannot parse is redacted as text."""
+    try:
+        parsed = URL(url)
+        if parsed.user is not None or parsed.password is not None:
+            url = str(parsed.with_user(None))
+    except ValueError:
+        pass
+    return redact(url)
 
 
 def _clip(value: object | None, limit: int = MAX_ERROR_CHARS) -> str | None:
@@ -259,7 +353,7 @@ class CachePrefetchState:
         self._started_at = _utcnow()
         self._sweep_count = 0
         self._executor_version = _executor_version()
-        self._backend_url = redact(backend_url) if backend_url else None
+        self._backend_url = _public_url(backend_url) if backend_url else None
         self._refresh_interval_seconds = refresh_interval_seconds
 
         self._gpu_model: str | None = None

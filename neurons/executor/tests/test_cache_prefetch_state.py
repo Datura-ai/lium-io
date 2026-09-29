@@ -9,6 +9,7 @@ the document nor a broken write may ever disturb the loop.
 
 import asyncio
 import json
+import time
 from unittest.mock import MagicMock
 
 import docker
@@ -29,7 +30,7 @@ from services.cache_prefetch_state import (  # noqa: E402
     redact,
 )
 
-from services import cache_template_service  # noqa: E402
+from services import cache_prefetch_state, cache_template_service  # noqa: E402
 
 REPO = "daturaai/pytorch"
 TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"
@@ -220,6 +221,98 @@ def test_cleanup_error_is_kept():
     assert "cannot list" in _image(state)["last_cleanup_error"]
 
 
+def _docker_error(*args, **kwargs):
+    raise RuntimeError("registry answered 401 to Authorization: Bearer s3cret")
+
+
+def _assert_described(text):
+    assert text.startswith("RuntimeError: ")
+    assert "s3cret" not in text
+    assert "401" in text
+
+
+def _assert_logged(log_method):
+    messages = [call.args[0] for call in log_method.call_args_list]
+    assert any("RuntimeError: " in message for message in messages)
+    assert not any("s3cret" in message for message in messages)
+
+
+def _break_local_lookup(client):
+    lookup = client.images.get.side_effect
+    client.images.get.side_effect = lambda ref: lookup(ref) if "@" in ref else _docker_error()
+
+
+@pytest.mark.parametrize(
+    ("field", "break_client"),
+    [
+        (
+            "last_remote_error",
+            lambda client: setattr(client.images.get_registry_data, "side_effect", _docker_error),
+        ),
+        ("last_local_error", _break_local_lookup),
+        ("last_cleanup_error", lambda client: setattr(client.images, "list", _docker_error)),
+    ],
+)
+def test_per_image_errors_are_logged_and_published_with_their_class(
+    monkeypatch, field, break_client
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    state = CachePrefetchState(path=None)
+    client = _make_client(local_digests=[STALE_DIGEST], image_absent=field == "last_cleanup_error")
+    break_client(client)
+
+    _run(client, _template(None if field == "last_remote_error" else FRESH_DIGEST), state)
+
+    _assert_described(_image(state)[field])
+    _assert_logged(logger.warning)
+
+
+def test_a_failed_image_removal_is_logged_and_published_with_its_class(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    state = CachePrefetchState(path=None)
+    client = _make_client(image_absent=True)
+    client.images.list.return_value = [MagicMock(tags=[f"{REPO}:old"])]
+    client.images.remove.side_effect = _docker_error
+
+    _run(client, _template(FRESH_DIGEST), state)
+
+    _assert_described(_image(state)["last_cleanup_error"])
+    _assert_logged(logger.warning)
+
+
+def test_the_gpu_error_is_logged_and_published_with_its_class(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    monkeypatch.setattr(cache_template_service.pynvml, "nvmlInit", _docker_error)
+
+    gpu_model, _, error = cache_template_service._get_gpu_info()
+
+    assert gpu_model == "unknown"
+    _assert_described(error)
+    (message,), _ = logger.error.call_args
+    assert "RuntimeError: " in message
+    assert "s3cret" not in message
+
+
+def test_a_failed_sweep_is_logged_with_its_class(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    pre_puller = MagicMock()
+
+    async def sweep(*args, **kwargs):
+        _docker_error()
+
+    pre_puller.sweep = sweep
+
+    asyncio.run(cache_template_service._run_pre_pull_sweep(pre_puller, [], frozenset(), 0.0))
+
+    (message,), _ = logger.warning.call_args
+    assert message.startswith("pre-pull sweep failed: RuntimeError: ")
+    assert "s3cret" not in message
+
+
 def test_digest_change_is_timestamped():
     state = CachePrefetchState(path=None)
 
@@ -300,6 +393,21 @@ def test_docker_unavailable(monkeypatch, tmp_path):
     assert doc["docker_available"] is False
     assert "no docker socket" in doc["docker_error"]
     assert doc["backend_url"].endswith("/executors/default-docker-image")
+
+
+def test_docker_unavailable_is_logged_with_its_class(monkeypatch, tmp_path):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    monkeypatch.setattr(
+        cache_template_service.settings, "COMPUTE_REST_API_URL", "https://lium.io/api"
+    )
+    monkeypatch.setattr(cache_template_service.docker, "from_env", _docker_error)
+
+    _prefetch(str(tmp_path / "state.json"))
+
+    (message,), _ = logger.error.call_args
+    assert message.startswith("Cannot connect to docker; cache pre-pull disabled: RuntimeError: ")
+    assert "s3cret" not in message
 
 
 def test_gpu_unknown():
@@ -399,10 +507,44 @@ def test_error_text_is_clipped():
         ),
         ("password=s3cret rejected", "password=*** rejected"),
         ("pushed with ghp_" + "a" * 36, "pushed with ***"),
+        # A password holding an unencoded `@` or `/`: yarl and aiohttp carry such URLs as-is.
+        (
+            "Cannot connect to https://provider:p@ss@backend.example:8443/api",
+            "Cannot connect to https://***@backend.example:8443/api",
+        ),
+        (
+            "InvalidUrlClientError: https://provider:pa/ss@backend.example/executors/x",
+            "InvalidUrlClientError: https://***@backend.example/executors/x",
+        ),
+        ("login with pass=s3cret and pw=s3cret", "login with pass=*** and pw=***"),
+        ("{'password': 's3cret', 'user': 'provider'}", "{'password': '***', 'user': 'provider'}"),
+        ('{"api_key": "s3cret", "gpu": "H100"}', '{"api_key": "***", "gpu": "H100"}'),
+        ("Authorization: s3cret", "Authorization: ***"),
+        ("Authorization: Token s3cret", "Authorization: Token ***"),
+        ("X-Api-Token: s3cret", "X-Api-Token: ***"),
+        ("X-Registry-Key: s3cret", "X-Registry-Key: ***"),
+        ("X-Amz-Security-Token: s3cret", "X-Amz-Security-Token: ***"),
+        ("GET /x?apiKey=s3cret&clientSecret=s3cret", "GET /x?apiKey=***&clientSecret=***"),
     ],
 )
 def test_redact_removes_credentials_and_keeps_the_rest(text, expected):
     assert redact(text) == expected
+
+
+def test_redact_is_linear_on_a_long_error():
+    # The patterns run on the executor's event loop, three times per loop error.
+    for text in ("a." * 100_000, "key" * 70_000, "https://" * 25_000, "a=" * 100_000):
+        started = time.perf_counter()
+        redacted = redact(text)
+        assert time.perf_counter() - started < 0.05
+        assert len(redacted) <= cache_prefetch_state.MAX_REDACTED_CHARS + 1
+
+
+def test_a_credential_past_the_redacted_length_is_cut_not_published():
+    text = "x" * (cache_prefetch_state.MAX_REDACTED_CHARS - 10) + " password=s3cret-and-more"
+
+    assert "s3cret" not in redact(text)
+    assert redact(text).endswith("…")
 
 
 @pytest.mark.parametrize(
@@ -412,6 +554,10 @@ def test_redact_removes_credentials_and_keeps_the_rest(text, expected):
         "toomanyrequests: You have reached your pull rate limit",
         "token expired",
         "Cannot connect to host backend.example:443 ssl:default [Connection refused]",
+        "monkey=1 design=2 author=3 passenger=4 cache_keyring=5",
+        "{'monkey': 'banana', 'author': 'provider'}",
+        "404 Client Error for http+docker://localhost/v1.44/images/"
+        f"{REPO}@{FRESH_DIGEST}/json: Not Found",
     ],
 )
 def test_redact_leaves_errors_without_credentials_unchanged(text):
@@ -422,6 +568,19 @@ def test_an_error_is_described_by_its_class_and_redacted_text():
     assert describe_error(RuntimeError("Bearer s3cret")) == "RuntimeError: Bearer ***"
     assert describe_error(TimeoutError()) == "TimeoutError"
     assert describe_error("HTTP 503") == "HTTP 503"
+
+
+def test_an_unprintable_error_is_described_by_its_class():
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("str() failed")
+
+    assert describe_error(Unprintable()) == "Unprintable"
+
+    state = CachePrefetchState(path=None)
+    state.note_loop_error(ValueError("old"))
+    state.note_loop_error(Unprintable())
+    assert state.as_dict()["last_loop_error"] == "Unprintable"
 
 
 def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
@@ -435,10 +594,25 @@ def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
     payload = state.render()
     assert "s3cret" not in payload
     doc = json.loads(payload)
-    assert doc["backend_url"] == "https://***@backend.example"
+    assert doc["backend_url"] == "https://backend.example"
     assert doc["docker_error"] == "RuntimeError: Bearer ***"
     assert doc["last_loop_error"] == "ConnectionError: https://***@backend.example refused"
     assert doc["last_error"] == "ValueError: password=***"
+
+
+@pytest.mark.parametrize(
+    ("backend_url", "published"),
+    [
+        ("https://provider:p@ss@backend.example/api", "https://backend.example/api"),
+        ("https://s3cret@backend.example/api?gpu=H100", "https://backend.example/api?gpu=H100"),
+        # yarl cannot parse a `/` in the password, so the text rule has to catch it.
+        ("https://provider:pa/ss@backend.example/api", "https://***@backend.example/api"),
+    ],
+)
+def test_the_backend_url_loses_its_userinfo(backend_url, published):
+    doc = CachePrefetchState(path=None, backend_url=backend_url).as_dict()
+
+    assert doc["backend_url"] == published
 
 
 def test_document_is_capped_and_marked_truncated():
