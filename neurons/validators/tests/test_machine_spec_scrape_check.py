@@ -125,7 +125,9 @@ class DummySSHService:
 
 @pytest.mark.parametrize("nvml_name", ["NVIDIA A10", "NVIDIA A10G"])
 def test_normalize_gpu_details_canonicalizes_a10_alias(nvml_name):
-    assert _normalize_gpu_details([{"name": nvml_name, "uuid": "GPU-abc123"}]) == [
+    assert _normalize_gpu_details(
+        [{"name": nvml_name, "uuid": "GPU-abc123"}]
+    ) == [
         {"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"}
     ]
 
@@ -134,7 +136,9 @@ def test_normalize_gpu_details_canonicalizes_a10_alias(nvml_name):
 async def test_machine_spec_scrape_preserves_raw_a10_name_for_native_challenge(
     context_factory,
 ):
-    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout=FERNET_TOKEN)
+    )
     services = build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS))
     config = build_context_config(
         machine_scrape_filename="scrape.sh",
@@ -249,10 +253,7 @@ async def test_machine_spec_scrape_check(
     # Verify runner was called correctly (if we got that far)
     if has_remote_dir and has_script_filename:
         assert runner.called_with is not None
-        assert (
-            "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh"
-            in runner.called_with.command
-        )
+        assert "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh" in runner.called_with.command
         assert runner.called_with.timeout == 300
         assert runner.called_with.retryable is False
 
@@ -284,7 +285,9 @@ async def test_machine_spec_scrape_check(
 async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(context_factory):
     # Arrange
     source = "print('obfuscated scrape')"
-    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout=FERNET_TOKEN)
+    )
     ctx = context_factory(
         services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
         config=build_context_config(machine_scrape_source=source),
@@ -310,7 +313,9 @@ async def test_machine_spec_scrape_runs_the_uploaded_binary_when_no_source_was_d
     # With ENABLE_SCRAPE_SOURCE_DELIVERY off the config carries no source, so UploadFilesCheck
     # uploaded the binary and it is what runs.
     # Arrange
-    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout=FERNET_TOKEN)
+    )
     ctx = context_factory(
         services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
         config=build_context_config(machine_scrape_source=None),
@@ -445,7 +450,9 @@ async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_de
     # The failure mode a probe cannot see: the modules import, the scrape runs, and the token it
     # produces is not one this validator can read.
     # Arrange
-    ssh_service = DummySSHService(decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN)
+    ssh_service = DummySSHService(
+        decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN
+    )
     runner = DummySSHCommandRunner(
         results=[
             make_command_result(success=True, stdout=UNREADABLE_TOKEN, duration_ms=15_000),
@@ -543,9 +550,7 @@ async def test_machine_spec_scrape_reads_a_token_longer_than_the_search_window(
     # Arrange
     long_token = FERNET_TOKEN + "x" * (400 * 1024)
     ssh_service = DummySSHService(decrypted_data=RAW_SPECS, valid_payload=long_token)
-    runner = DummySSHCommandRunner(
-        result=make_command_result(success=True, stdout=f"chatter\n{long_token}")
-    )
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=f"chatter\n{long_token}"))
     ctx = context_factory(
         services=build_services(ssh=ssh_service),
         config=build_context_config(machine_scrape_source="print('scrape')"),
@@ -612,9 +617,7 @@ PASSED = {"verdict": "pass", "reason_code": "", "detail": "", "runtime": "defaul
 @pytest.fixture
 def vloopback_enforcement(monkeypatch):
     def _set(enabled: bool) -> None:
-        monkeypatch.setattr(
-            machine_spec_scrape.settings, "VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED", enabled
-        )
+        monkeypatch.setattr(machine_spec_scrape.settings, "VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED", enabled)
 
     _set(False)
     return _set
@@ -626,9 +629,7 @@ async def _scrape_ok_event_for(context_factory, extra_specs: dict[str, Any]):
     rented_data = SimpleNamespace(gpu_splitting_config={"executor-123": 2}, network_ema={})
     ctx = context_factory(
         services=build_services(ssh=DummySSHService(decrypted_data={**RAW_SPECS, **extra_specs})),
-        config=build_context_config(
-            machine_scrape_filename="scrape.sh", machine_scrape_timeout=300, obfuscation_keys={}
-        ),
+        config=build_context_config(machine_scrape_filename="scrape.sh", machine_scrape_timeout=300, obfuscation_keys={}),
         state=build_state(remote_dir="/remote/path", rented_data=rented_data),
         runner=runner,
         encrypt_key="test-encrypt-key",
@@ -648,15 +649,8 @@ async def _scrape_ok_event_for(context_factory, extra_specs: dict[str, Any]):
             {"supported": True, "vloopback_enforced": False, "vloopback": MOUNT_FAILED},
         ),
         (
-            {
-                "storage_limit_supported": False,
-                "storage_limit_scrape_error": "Storage limit is not supported.",
-            },
-            {
-                "supported": False,
-                "vloopback_enforced": False,
-                "detail": "Storage limit is not supported.",
-            },
+            {"storage_limit_supported": False, "storage_limit_scrape_error": "Storage limit is not supported."},
+            {"supported": False, "vloopback_enforced": False, "detail": "Storage limit is not supported."},
         ),
         # an executor on a scrape from before the vloopback test
         ({"storage_limit_supported": True}, {"supported": True, "vloopback_enforced": False}),
@@ -738,21 +732,15 @@ async def test_enforcement_changes_nothing_unless_the_test_failed(
     # Assert
     assert result.updates["state"].specs["storage_limit_supported"] is True
 
-
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
 # failure no host fault can produce, and none of these qualifies).
 NVML_DRIVER_ERROR = "NVMLError_DriverNotLoaded('Driver Not Loaded')"
-NO_GPU_REPORT = json.dumps(
-    {"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}}
-)
+NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
 DRIVER_REPORT = json.dumps(
     {
         "error": "no_gpu_details",
-        "data": {
-            "data_gpu": {"gpu_count": 0, "gpu_details": []},
-            "gpu_scrape_error": NVML_DRIVER_ERROR,
-        },
+        "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}, "gpu_scrape_error": NVML_DRIVER_ERROR},
     }
 )
 
@@ -777,41 +765,29 @@ async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation
     "scrape_run,expected_reason",
     [
         pytest.param(
-            make_command_result(
-                success=False, exit_code=-1, duration_ms=300_000, error_type="timeout"
-            ),
+            make_command_result(success=False, exit_code=-1, duration_ms=300_000, error_type="timeout"),
             Msg.SCRAPE_TIMEOUT.reason,
             id="validator-timed-out",
         ),
         pytest.param(
-            make_command_result(
-                success=False, exit_code=-1, duration_ms=4_000, error_type="ConnectionLost"
-            ),
+            make_command_result(success=False, exit_code=-1, duration_ms=4_000, error_type="ConnectionLost"),
             Msg.SCRAPE_TRANSPORT_FAILED.reason,
             id="ssh-session-dropped",
         ),
         pytest.param(
-            make_command_result(
-                success=False, exit_code=-1, duration_ms=5, error_type="ChannelOpenError"
-            ),
+            make_command_result(success=False, exit_code=-1, duration_ms=5, error_type="ChannelOpenError"),
             Msg.SCRAPE_TRANSPORT_FAILED.reason,
             id="channel-refused",
         ),
         pytest.param(
             make_command_result(
-                success=False,
-                exit_code=-1,
-                stdout="gAAAAABcut",
-                duration_ms=4_000,
-                error_type=NO_EXIT_STATUS,
+                success=False, exit_code=-1, stdout="gAAAAABcut", duration_ms=4_000, error_type=NO_EXIT_STATUS
             ),
             Msg.SCRAPE_TRANSPORT_FAILED.reason,
             id="channel-closed-without-exit-status",
         ),
         pytest.param(
-            make_command_result(
-                success=False, exit_code=-1, duration_ms=5, error_type="RuntimeError"
-            ),
+            make_command_result(success=False, exit_code=-1, duration_ms=5, error_type="RuntimeError"),
             Msg.SCRAPE_TRANSPORT_FAILED.reason,
             id="runner-raised",
         ),
@@ -831,23 +807,17 @@ async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation
             id="no-gpu-report-without-data",
         ),
         pytest.param(
-            make_command_result(
-                success=False, exit_code=1, stdout=f"{DRIVER_REPORT}\natexit hook says bye"
-            ),
+            make_command_result(success=False, exit_code=1, stdout=f"{DRIVER_REPORT}\natexit hook says bye"),
             Msg.SCRAPE_FAILED_DRIVER.reason,
             id="image-prints-after-the-report",
         ),
         pytest.param(
-            make_command_result(
-                success=False, exit_code=127, stderr="scrape.sh: No such file or directory"
-            ),
+            make_command_result(success=False, exit_code=127, stderr="scrape.sh: No such file or directory"),
             Msg.SCRAPE_FAILED_ON_HOST.reason,
             id="script-missing",
         ),
         pytest.param(
-            make_command_result(
-                success=False, exit_code=1, stderr="IndexError: list index out of range"
-            ),
+            make_command_result(success=False, exit_code=1, stderr="IndexError: list index out of range"),
             Msg.SCRAPE_FAILED_ON_HOST.reason,
             id="scrape-traceback",
         ),
@@ -903,10 +873,7 @@ async def test_machine_spec_scrape_driver_failure_carries_the_nvml_error(context
 
 @pytest.mark.parametrize(
     "report,expected_reason",
-    [
-        (NO_GPU_REPORT, Msg.SCRAPE_FAILED_NO_GPU.reason),
-        (DRIVER_REPORT, Msg.SCRAPE_FAILED_DRIVER.reason),
-    ],
+    [(NO_GPU_REPORT, Msg.SCRAPE_FAILED_NO_GPU.reason), (DRIVER_REPORT, Msg.SCRAPE_FAILED_DRIVER.reason)],
 )
 @pytest.mark.asyncio
 async def test_machine_spec_scrape_reads_the_no_gpu_report_through_the_key_substitution(
@@ -947,9 +914,7 @@ async def test_machine_spec_scrape_no_gpu_on_stdin_keeps_its_host_side_code(cont
     # the host-side code.
     # Arrange
     runner = DummySSHCommandRunner(
-        result=make_command_result(
-            success=False, exit_code=1, stdout=DRIVER_REPORT, duration_ms=20_000
-        )
+        result=make_command_result(success=False, exit_code=1, stdout=DRIVER_REPORT, duration_ms=20_000)
     )
     ctx = context_factory(
         services=build_services(),
