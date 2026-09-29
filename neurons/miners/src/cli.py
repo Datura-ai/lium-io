@@ -278,7 +278,7 @@ def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: s
             sys.exit(1)
         if not detected:
             logger.error("❌ Executor %s holds no collateral on any contract version.", executor_uuid)
-            return
+            sys.exit(1)
     selected_version = resolve_contract_version(
         contract_version, "Contract Version Selection for Reclaim Collateral", detected
     )
@@ -397,7 +397,7 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
             sys.exit(1)
         if not detected:
             logger.error("❌ No open reclaim request %d for this key on any contract version.", reclaim_request_id)
-            return
+            sys.exit(1)
     selected_version = resolve_contract_version(
         contract_version, "Contract Version Selection for Finalizing Reclaim Request", detected
     )

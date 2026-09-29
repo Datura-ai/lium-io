@@ -71,6 +71,9 @@ class FakeProvider(AsyncBaseProvider):
         self.revert_data = revert_data
         self.requests = []
         self.sent = []
+        self.chain_id = CHAIN_ID
+        self.receipt_found = True
+        self.send_error = None
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -92,10 +95,16 @@ class FakeProvider(AsyncBaseProvider):
             nonce = self.pending_nonce if params[1] == "pending" else NONCE
             return {"jsonrpc": "2.0", "id": 1, "result": hex(nonce)}
         if method == "eth_sendRawTransaction":
+            if self.send_error == "refused":
+                return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "insufficient funds"}}
             self.sent.append(params[0])
+            if self.send_error == "lost":
+                raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
             return {"jsonrpc": "2.0", "id": 1, "result": TX_HASH}
+        if method == "eth_getTransactionReceipt" and not self.receipt_found:
+            return {"jsonrpc": "2.0", "id": 1, "result": None}
         results = {
-            "eth_chainId": hex(CHAIN_ID),
+            "eth_chainId": hex(self.chain_id),
             "eth_gasPrice": hex(self.gas_price),
             "eth_getTransactionReceipt": {
                 "transactionHash": TX_HASH,
@@ -271,16 +280,62 @@ async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_sends_nothing(
     assert "secret-rpc-key" not in str(raised.value)
     assert f"Sent transaction {TX_HASH}" in caplog.text
 
-    # still pending: the retry sends nothing
-    provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralTransactionError, match="still pending; no transaction was sent"):
+    # not mined yet: the retry sends nothing
+    provider.receipt_found = False
+    with pytest.raises(CollateralOutcomeUnknownError, match="is not mined yet; no transaction was sent"):
         await client.reclaim_collateral(EXECUTOR)
-    # mined: the contract now rejects the same call, and the retry sends nothing
-    provider.pending_nonce = NONCE
-    provider.simulate_revert = "0x" + selector("InsufficientCollateralForReclaim()")
-    with pytest.raises(CollateralTransactionError, match=r"rejects this call \(InsufficientCollateralForReclaim\)"):
+    # mined with a failed receipt, the call still simulating: the retry reports it and sends nothing
+    provider.receipt_found, provider.receipt_status = True, 0
+    with pytest.raises(CollateralTransactionError, match="sent earlier, reverted in block 16; no transaction was sent"):
         await client.reclaim_collateral(EXECUTOR)
     assert len(provider.sent) == 1
+    # once its outcome is reported, the next run may send again
+    assert client._read_sent_record(CHAIN_ID) is None
+
+
+async def test_a_lost_broadcast_answer_names_the_hash_and_the_retry_sends_nothing():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
+    provider.send_error = "lost"
+    client = client_with(provider)
+
+    with pytest.raises(CollateralOutcomeUnknownError, match="may have been sent") as raised:
+        await client.finalize_reclaim(5)
+    signed_hash = AsyncWeb3.keccak(hexstr=provider.sent[0]).hex()
+    assert signed_hash.removeprefix("0x") in str(raised.value)
+    assert "secret-rpc-key" not in str(raised.value)
+
+    provider.send_error = None
+    with pytest.raises(CollateralTransactionError, match="sent earlier, succeeded in block 16; no transaction was sent"):
+        await client.finalize_reclaim(5)
+    assert ("eth_getTransactionReceipt", [signed_hash if signed_hash.startswith("0x") else "0x" + signed_hash]) in (
+        provider.requests
+    )
+    assert len(provider.sent) == 1
+
+
+async def test_a_broadcast_the_rpc_refuses_is_not_sent_and_the_next_run_sends():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
+    provider.send_error = "refused"
+    client = client_with(provider)
+
+    with pytest.raises(CollateralTransactionError, match=r"refused the transaction \(insufficient funds\)"):
+        await client.finalize_reclaim(5)
+    provider.send_error = None
+    await client.finalize_reclaim(5)
+    assert len(provider.sent) == 1
+
+
+@pytest.mark.parametrize("network,rpc_chain_id", [("finney", 1), ("test", 964), ("archive", 945)])
+async def test_an_rpc_on_another_chain_gets_nothing_signed(network, rpc_chain_id):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.chain_id = rpc_chain_id
+    client = CollateralClient(network=network, contract_address=CONTRACT, miner_key=MINER_KEY)
+    client._w3 = AsyncWeb3(provider)
+
+    with pytest.raises(CollateralConfigError, match=f"reports EVM chain {rpc_chain_id}"):
+        await client.finalize_reclaim(5)
+    assert provider.sent == []
+    assert "eth_getTransactionCount" not in [method for method, _ in provider.requests]
 
 
 @pytest.mark.parametrize("over,sent", [(1, 0), (0, 1)], ids=["above", "at"])

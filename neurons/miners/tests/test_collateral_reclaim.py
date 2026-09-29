@@ -147,13 +147,20 @@ def test_reclaim_contract_option_skips_detection(chain, cli_services):
     assert chain.reads == []
 
 
-def test_reclaim_without_collateral_anywhere_sends_nothing(chain, cli_services):
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR],
+        ["finalize-reclaim-request", "--reclaim-request-id", "7"],
+    ],
+    ids=["no collateral", "no open request"],
+)
+def test_nothing_to_do_on_any_contract_exits_1_and_sends_nothing(chain, cli_services, args):
     from cli import cli
 
-    result = CliRunner().invoke(
-        cli, ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
-    )
-    assert result.exit_code == 0, result.output
+    result = CliRunner().invoke(cli, [*args, "--private-key", MINER_KEY])
+    # the same exit code as the contract rejecting the call when --contract names one
+    assert result.exit_code == 1, result.output
     assert cli_services == []
     assert sorted(chain.reads) == sorted([CONTRACT, OLD_CONTRACT])
 

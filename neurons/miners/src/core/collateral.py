@@ -8,15 +8,17 @@ collateral reads, start a reclaim, list open reclaims, finalize a reclaim.
 import hashlib
 import json
 import logging
+import os
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from bittensor_wallet import Keypair
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, TransactionNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,14 @@ RPC_URLS = {
     "test": "https://test.finney.opentensor.ai",
     "finney": "https://lite.chain.opentensor.ai",
 }
+# The Bittensor EVM chain of each network. A transaction is signed for this chain only, so an RPC that reports
+# another one (Ethereum mainnet, say) never gets a transaction it could broadcast there.
+CHAIN_IDS = {"finney": 964, "archive": 964, "test": 945, "local": 42}
+# The last transaction this machine broadcast, per chain and address, until its receipt has been read: a retry
+# never pays gas while an earlier send's outcome is unknown.
+SENT_RECORD_PATH = pathlib.Path(
+    os.environ.get("COLLATERAL_SENT_RECORD", "~/.lium-miner/collateral-sent.json")
+).expanduser()
 
 GAS_LIMIT = 200_000
 # The RPC quotes the gas price; above this ceiling nothing is signed, so a faulty or hostile RPC
@@ -36,8 +46,6 @@ RECLAIM_LOOKBACK_BLOCKS = 1000
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 
 SS58_FORMAT = 42
-_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_SS58_PREFIX = b"SS58PRE"
 
 
 class CollateralTransactionError(Exception):
@@ -64,16 +72,6 @@ class ReclaimRequest:
     block_number: int
 
 
-def _base58_encode(data: bytes) -> str:
-    number = int.from_bytes(data, "big")
-    encoded = ""
-    while number:
-        number, remainder = divmod(number, 58)
-        encoded = _BASE58_ALPHABET[remainder] + encoded
-    leading_zeros = len(data) - len(data.lstrip(b"\0"))
-    return "1" * leading_zeros + encoded
-
-
 def h160_to_ss58(h160_address: str) -> str:
     """The SS58 account (generic prefix 42) that mirrors an EVM (H160) address on Bittensor.
 
@@ -82,9 +80,7 @@ def h160_to_ss58(h160_address: str) -> str:
     """
     address_bytes = bytes.fromhex(h160_address.removeprefix("0x"))
     public_key = hashlib.blake2b(b"evm:" + address_bytes, digest_size=32).digest()
-    payload = bytes([SS58_FORMAT]) + public_key
-    checksum = hashlib.blake2b(_SS58_PREFIX + payload).digest()[:2]
-    return _base58_encode(payload + checksum)
+    return Keypair(public_key=public_key.hex(), ss58_format=SS58_FORMAT).ss58_address
 
 
 def rpc_origin(rpc_url: str | None) -> str | None:
@@ -168,6 +164,18 @@ class CollateralClient:
             raise CollateralTransactionError(
                 "An Ethereum private key is required to send this transaction"
             )
+        chain_id = CHAIN_IDS.get(self.network)
+        if chain_id is None:
+            raise CollateralConfigError(
+                f"No EVM chain ID is known for BITTENSOR_NETWORK={self.network!r}; no transaction was signed"
+            )
+        rpc_chain_id = await self.w3.eth.chain_id
+        if rpc_chain_id != chain_id:
+            raise CollateralConfigError(
+                f"The RPC reports EVM chain {rpc_chain_id}, not {chain_id} ({self.network}); "
+                "no transaction was signed. Check SUBTENSOR_EVM_RPC_URL"
+            )
+        await self._settle_earlier_send(chain_id)
         gas_price = await self.w3.eth.gas_price
         max_gas_price = AsyncWeb3.to_wei(self.max_gas_price_gwei, "gwei")
         if gas_price > max_gas_price:
@@ -198,12 +206,26 @@ class CollateralClient:
                 "nonce": nonce,
                 "gas": GAS_LIMIT,
                 "gasPrice": gas_price,
-                "chainId": await self.w3.eth.chain_id,
+                "chainId": chain_id,
             }
         )
         signed = self.miner_account.sign_transaction(transaction)
         raw_transaction = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        tx_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
+        self._write_sent_record(chain_id, {"nonce": nonce, "hash": signed.hash.hex()})
+        try:
+            tx_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
+        except ValueError as error:
+            # the RPC answered with an error: the transaction was refused, not sent
+            self._write_sent_record(chain_id, None)
+            raise CollateralTransactionError(
+                f"The RPC refused the transaction ({self._rpc_error_message(error)}); no transaction was sent"
+            ) from error
+        except Exception as error:
+            raise CollateralOutcomeUnknownError(
+                f"Transaction {signed.hash.hex()} may have been sent, but the RPC's answer was lost "
+                f"({type(error).__name__}); its outcome is unknown. Run this again to read its outcome; "
+                "nothing is sent until it is known"
+            ) from error
         logger.info("Sent transaction %s; waiting for its receipt", tx_hash.hex())
         try:
             receipt = await self.w3.eth.wait_for_transaction_receipt(
@@ -213,14 +235,95 @@ class CollateralClient:
             # the class name only: a transport error's text can carry the RPC URL and its API key
             raise CollateralOutcomeUnknownError(
                 f"Transaction {tx_hash.hex()} was sent but its receipt could not be read "
-                f"({type(error).__name__}); its outcome is unknown. Check it on the explorer before "
-                "running this again"
+                f"({type(error).__name__}); its outcome is unknown. Run this again to read its outcome; "
+                "nothing is sent until it is known"
             ) from error
+        self._write_sent_record(chain_id, None)
         if receipt["status"] == 0:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
             message = f"Transaction {tx_hash.hex()} reverted"
             raise CollateralTransactionError(f"{message}: {reason}" if reason else message)
         return receipt
+
+    async def _settle_earlier_send(self, chain_id: int) -> None:
+        """Read the outcome of this machine's last unsettled send. Raises when there is one: the run that learns an
+        earlier send's outcome reports it and sends nothing."""
+        record = self._read_sent_record(chain_id)
+        if record is None:
+            return
+        tx_hash = record["hash"]
+        try:
+            receipt = await self.w3.eth.get_transaction_receipt(tx_hash)
+        except TransactionNotFound:
+            receipt = None
+        except Exception as error:
+            raise CollateralOutcomeUnknownError(
+                f"The receipt of transaction {tx_hash}, sent earlier, could not be read ({type(error).__name__}); "
+                "no transaction was sent. Run this again to read its outcome"
+            ) from error
+        if receipt is None:
+            nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
+            if nonce <= record["nonce"]:
+                raise CollateralOutcomeUnknownError(
+                    f"Transaction {tx_hash}, sent earlier, is not mined yet; no transaction was sent. "
+                    "Run this again once it is mined"
+                )
+            self._write_sent_record(chain_id, None)
+            raise CollateralTransactionError(
+                f"Transaction {tx_hash}, sent earlier, was never mined: another transaction took its nonce. "
+                "No transaction was sent; run this again to retry"
+            )
+        self._write_sent_record(chain_id, None)
+        outcome = "succeeded" if receipt["status"] == 1 else "reverted"
+        raise CollateralTransactionError(
+            f"Transaction {tx_hash}, sent earlier, {outcome} in block {receipt['blockNumber']}; "
+            "no transaction was sent. Run this again if it still needs doing"
+        )
+
+    def _sent_record_key(self, chain_id: int) -> str:
+        return f"{chain_id}:{self.miner_address}"
+
+    def _read_sent_record(self, chain_id: int) -> dict | None:
+        try:
+            records = json.loads(SENT_RECORD_PATH.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            raise CollateralTransactionError(
+                f"The record of earlier sends ({SENT_RECORD_PATH}) could not be read ({type(error).__name__}); "
+                "no transaction was sent"
+            ) from error
+        return records.get(self._sent_record_key(chain_id))
+
+    def _write_sent_record(self, chain_id: int, record: dict | None) -> None:
+        try:
+            records = json.loads(SENT_RECORD_PATH.read_text()) if SENT_RECORD_PATH.exists() else {}
+            if record is None:
+                records.pop(self._sent_record_key(chain_id), None)
+            else:
+                records[self._sent_record_key(chain_id)] = record
+            SENT_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary = SENT_RECORD_PATH.with_suffix(".tmp")
+            temporary.write_text(json.dumps(records))
+            temporary.replace(SENT_RECORD_PATH)
+        except (OSError, ValueError) as error:
+            if record is None:
+                # the outcome is already known; the next run reads it again and reports it
+                logger.warning(
+                    "Could not clear the record of earlier sends (%s): %s",
+                    SENT_RECORD_PATH,
+                    type(error).__name__,
+                )
+                return
+            raise CollateralTransactionError(
+                f"The record of earlier sends ({SENT_RECORD_PATH}) could not be written ({type(error).__name__}); "
+                "no transaction was sent"
+            ) from error
+
+    @staticmethod
+    def _rpc_error_message(error: ValueError) -> str:
+        detail = error.args[0] if error.args else None
+        return str(detail.get("message", "error")) if isinstance(detail, dict) else "error"
 
     async def _revert_reason(self, transaction: dict, block_number: int) -> str | None:
         """Replay a reverted transaction as an eth_call at its block and name the revert."""
