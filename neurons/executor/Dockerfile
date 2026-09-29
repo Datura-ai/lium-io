@@ -88,6 +88,20 @@ RUN mv /root/app/libdmcompverify.so /usr/lib/ \
   && mv /root/app/libverifyx.so /usr/lib/ \
   && mv /root/app/libinspector.so /usr/lib/
 
+# liumd M2 step 1 (DAH-2834): the liumd binary, unused by the executor's Python app; the validator's
+# shadow runs `/usr/local/bin/liumd run` over SSH. liumd/liumd is the unsigned musl dev-static CI
+# build of the liumd step-1 change (no release key exists yet), committed like the provers above and
+# pinned here by sha256. The child manifest is hashed from this image's own files, after the provers
+# are in place; run.sh writes the host settings at start.
+RUN echo "d8949e6d3e0e4e107693021e27f5b26cc24040f37c1470c7392917f84bee1d29  liumd/liumd" | sha256sum -c - \
+  && install -D -m 0755 liumd/liumd /usr/local/lib/liumd/liumd \
+  && install -m 0755 liumd/liumd.sh /usr/local/bin/liumd \
+  && rm -rf liumd \
+  && install -d -m 0755 /etc/liumd \
+  && install -d -m 0700 /var/lib/liumd/nonces \
+  && /root/app/.venv/bin/python src/liumd_host_files.py children /etc/liumd/children.json \
+  && /usr/local/bin/liumd version
+
 # Remove existing SSH host keys
 RUN rm -f /etc/ssh/ssh_host_*
 
