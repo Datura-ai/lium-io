@@ -36,6 +36,8 @@ from services.executor_connectivity.port_verifiers import (
 from services.port_utils import get_all_ports
 from services.task.checks.port_connectivity import PortConnectivityCheck
 
+from tests.helpers import build_context_config, build_services, build_state
+
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
@@ -541,6 +543,49 @@ def _async(value):
         return value
 
     return call
+
+
+@pytest.mark.parametrize("open_ports", [set(range(60000, 65536)), set()], ids=["lifted", "still-failing"])
+@pytest.mark.asyncio
+async def test_pass_two_ports_reach_the_events_probed_and_failed_counts(topup_on, context_factory, open_ports):
+    info = _info(port_range="40000-65535")
+    main, _, new, new_host = await _both(Host(open_ports=open_ports), info)
+
+    assert new.second_pass == SecondPass.RAN
+    (two,) = [ports for _, p, ports in new_host.probes if p == 2]
+    assert len(two) == BATCH_PORT_VERIFICATION_SIZE
+    assert new.selected_ports[: len(main.selected)] == main.selected
+    assert [p.external for p in new.selected_ports[len(main.selected) :]] == list(two)
+    two_failed = {e for e in two if e not in open_ports}
+    assert set(new.failed_ports) == set(main.failed) | {p for p in new.selected_ports if p.external in two_failed}
+    assert len(new.failed_ports) == len(main.failed) + len(two_failed)
+
+    ctx = context_factory(
+        services=build_services(
+            redis=SimpleNamespace(
+                renting_in_progress=_async(False),
+                record_dind_probe_miss=_async(False),
+                clear_dind_probe_miss=_async(None),
+            ),
+            backend=SimpleNamespace(get_all_rented_executors=_async(None)),
+            connectivity=SimpleNamespace(verify_ports=_async(new)),
+        ),
+        config=build_context_config(job_batch_id="batch-1463"),
+        state=build_state(),
+        executor=info,
+    )
+    event = (await PortConnectivityCheck().run(ctx)).event
+
+    assert event.context["probed_port_count"] == len(main.selected) + BATCH_PORT_VERIFICATION_SIZE
+    assert event.context["verified_port_count"] == len(new.successful_ports)
+    assert event.context["second_pass"] == SecondPass.RAN
+    if open_ports:
+        assert new.status == "ok"
+        assert f" fail={len(main.failed) + len(two_failed)}[" in event.what_we_saw["message"]
+    else:
+        assert new.status == "no_working_ports"
+        assert event.what_we_saw["failed_ports"] == len(main.failed) + BATCH_PORT_VERIFICATION_SIZE
+        assert event.what_we_saw["total_ports_tested"] == len(main.failed) + BATCH_PORT_VERIFICATION_SIZE
 
 
 @pytest.mark.asyncio
