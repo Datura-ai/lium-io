@@ -572,6 +572,32 @@ def test_pull_exception_is_logged_as_one_failed_line_and_not_recorded(quiet_node
     assert CU128_REF not in puller.state.images
 
 
+def test_a_pull_error_is_logged_with_its_class_and_without_its_credentials(
+    quiet_node, monkeypatch, caplog
+):
+    def boom(*_):
+        raise RuntimeError("GET https://provider:s3cret@registry.example/v2/?token=s3cret failed")
+
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", boom)
+    puller = PrePuller(_client(), state_path=None)
+
+    with caplog.at_level(logging.INFO):
+        _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image=")]
+    assert "detail=RuntimeError: GET https://***@registry.example/v2/?*** failed" in line
+    assert "s3cret" not in line
+
+
+def test_a_registry_error_event_is_logged_without_its_credentials(monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    client, _ = _pull_client([{"error": "denied: https://provider:s3cret@registry.example/v2/"}])
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, 60)
+
+    assert (outcome, detail) == ("pull_failed", "denied: https://***@registry.example/v2/")
+
+
 # --- disk guard -------------------------------------------------------------------------
 
 
