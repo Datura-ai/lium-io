@@ -380,7 +380,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     state.begin_sweep()
                     # When the next mandatory refresh is due. With the pre-pull on, the sleep below
                     # runs only up to it, so the default image is re-checked every refresh_interval
-                    # whatever the sweep did (review, DAH-2977).
+                    # whatever the sweep did.
                     refresh_deadline = time.monotonic() + refresh_interval
                     # Resolve GPU info off-thread, and keep retrying while it is still
                     # unknown: at early boot the NVIDIA driver may not be ready yet,
@@ -446,8 +446,8 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                         if not data.get("pre_pull"):
                             await _ensure_template(client, data, state, keep_tags)
                     if pre_puller:
-                        # The default image's outcome is what the validator reads (DAH-2470): publish
-                        # it now, not after a sweep that can wait out the start jitter and one pull.
+                        # The default image's outcome is what the validator reads: publish it
+                        # now, not after a sweep that can wait out the start jitter and one pull.
                         state.flush()
                         if sweep_task is not None and not sweep_task.done():
                             logger.info(
@@ -483,13 +483,13 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     logger.info("Cache template pre-pull cancelled")
                     raise
                 except aiohttp.ClientError as e:
-                    logger.error(f"Network error during cache pre-pull: {e}")
+                    logger.error(f"Network error during cache pre-pull: {type(e).__name__}")
                     state.note_loop_error(e)
                     state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                     state.flush()
                     await asyncio.sleep(next_error_sleep_seconds())
                 except Exception as e:
-                    logger.error(f"Unexpected error during cache pre-pull: {e}")
+                    logger.error(f"Unexpected error during cache pre-pull: {type(e).__name__}")
                     state.note_loop_error(e)
                     state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                     state.flush()

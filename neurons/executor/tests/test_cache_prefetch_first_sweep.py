@@ -11,6 +11,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import docker
 import pytest
 
@@ -147,6 +148,22 @@ def test_an_unknown_gpu_at_boot_uses_none_of_the_fast_retries(monkeypatch, tmp_p
 
     jitter = cache_template_service.FIRST_SWEEP_RETRY_JITTER_SECONDS
     assert delays == [cache_template_service.ERROR_INTERVAL_SECONDS, 15 + jitter]
+
+
+@pytest.mark.parametrize(
+    "error", [aiohttp.ClientError("Authorization: Bearer s3cret"), RuntimeError("Bearer s3cret")]
+)
+def test_a_loop_error_logs_its_class_not_its_text(monkeypatch, tmp_path, error):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(monkeypatch, [error], sleeps_before_stop=1, tmp_path=tmp_path)
+
+    (message,), _ = logger.error.call_args
+    assert message.endswith(type(error).__name__)
+    assert "s3cret" not in message
+    # The state document, not the log, keeps the text.
+    assert "s3cret" in doc["last_loop_error"]
 
 
 def test_retry_jitter_stays_inside_its_bound():
