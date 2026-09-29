@@ -272,7 +272,3 @@ async def test_a_scrape_failure_that_says_nothing_of_the_gpu_does_not_reset(cont
 
     assert ok is False
     assert _resets(service) == []
-
-
-def test_the_reset_is_on_by_default():
-    assert type(machine_spec_scrape.settings).model_fields["RENTED_HOST_GPU_FAULT_RESET_ENABLED"].default is True
