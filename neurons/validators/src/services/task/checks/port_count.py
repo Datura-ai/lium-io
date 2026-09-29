@@ -14,10 +14,10 @@ from ..pipeline import CheckResult, Context, ContextState
 def port_count_below_listing_floor(state: ContextState) -> int | None:
     """The published `available_port_count` when it is below MIN_PORT_COUNT, else None.
 
-    The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
-    `daos/executor.py` get_available_executors), with no exemption for a rented node, so any run that
-    publishes a lower count leaves the node's free GPUs hidden from renters. The rent path gates
-    separately, on MIN_PORT_COUNT free `verified_ports` (`services/executor.py`).
+    The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (the platform's
+    listing query), with no exemption for a rented node, so any run that publishes a lower count
+    leaves the node's free GPUs hidden from renters. The platform's rent path gates separately, on
+    MIN_PORT_COUNT free `verified_ports`.
     None before PortCountCheck has written the count.
     """
     available: Any = state.specs.get("available_port_count")
@@ -30,17 +30,18 @@ def hidden_from_renters_text(available_port_count: int) -> str:
     return f"Hidden from renters: only {available_port_count} verified ports, need {MIN_PORT_COUNT}"
 
 
-# The code the platform's listing check shows when it hides a node for too few verified ports.
-# It is the same string as this check's own failure reason, but `listing_check` names the
-# listing's verdict, which a rented node below the floor gets while its run passes.
+# The code the portal shows when it hides a node for too few verified ports; the listing reads
+# only `available_port_count`. It is the same string as this check's own failure reason, but
+# `listing_check` names the listing's verdict. A node with no free GPUs shows RENTED first, so a
+# partly rented node below the floor shows this code while its run passes.
 LISTING_PORT_CHECK_CODE = "INSUFFICIENT_PORTS"
 
 
 def declares_port_mappings(raw: Any) -> bool:
     """True when `raw` holds at least one [internal, external] pair.
 
-    Same rule as the platform's port-mapping parser: `[]`, `"[]"`, `"{}"` and unparsable text
-    declare no mappings, so the platform's listing check reads the port range instead.
+    Same rule as the platform's rent-path port-mapping parser: `[]`, `"[]"`, `"{}"` and
+    unparsable text declare no mappings. The listing does not read mappings or the range.
     """
     if not raw:
         return False
@@ -55,6 +56,12 @@ def declares_port_mappings(raw: Any) -> bool:
 
 
 def port_floor_what(state: ContextState, available_port_count: int) -> dict[str, Any]:
+    """`port_range` is the range the node declares, or the default one when it declares none.
+
+    It is None when the node declares mappings. Mappings that are present but hold no pair
+    (`"[]"`, `"{}"`) leave the validator nothing to probe, so the range is named while none of it
+    was probed; `no_ports_probed` says so.
+    """
     port_mappings_declared = declares_port_mappings(state.specs.get("port_mappings"))
     return {
         "available_port_count": available_port_count,
@@ -66,6 +73,7 @@ def port_floor_what(state: ContextState, available_port_count: int) -> dict[str,
         else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
         "port_mappings_declared": port_mappings_declared,
         "probed_port_count": state.probed_port_count,
+        "no_ports_probed": state.probed_port_count == 0,
         "declared_port_count": state.declared_port_count,
     }
 

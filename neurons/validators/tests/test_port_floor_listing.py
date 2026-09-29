@@ -262,6 +262,7 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
         "port_range": "40000-65535",
         "port_mappings_declared": False,
         "probed_port_count": BATCH_PORT_VERIFICATION_SIZE,
+        "no_ports_probed": False,
         "declared_port_count": 25536,
     }
 
@@ -685,16 +686,29 @@ def test_the_listing_check_is_the_code_the_portal_hides_a_low_port_node_under():
     assert LISTING_PORT_CHECK_CODE == "INSUFFICIENT_PORTS"
 
 
-def test_a_range_next_to_empty_mappings_is_named_while_the_event_shows_no_ports_probed():
-    """The listing check reads the range; this run probed the empty mapping list, so 0 ports."""
-    state = SimpleNamespace(
-        specs={"port_range": DECLARED_RANGE, "port_mappings": "[]"},
-        probed_port_count=0,
-        declared_port_count=0,
+@pytest.mark.asyncio
+async def test_a_range_next_to_empty_mappings_is_named_while_the_event_says_no_ports_were_probed(
+    context_factory,
+):
+    """The real selector reads the empty mapping list, not the range, so none of the range is probed."""
+    batch = HostNetworkBatch(reachable=2)
+    ctx = run_context(
+        context_factory,
+        connectivity(batch, PublishedPorts(), PublishedPorts()),
+        backend=RentalsBackendClient(None),
+    )
+    ctx = ctx.model_copy(
+        update={"executor": ctx.executor.model_copy(update={"port_mappings": "[]"})}
     )
 
-    what = port_floor_what(state, 0)
+    connectivity_result, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
 
-    assert what["port_range"] == DECLARED_RANGE
-    assert what["port_mappings_declared"] is False
+    assert PortSelector().declared_count(ctx.executor) == 0
+    assert connectivity_result.event.what_we_saw["verification_status"] == "no_ports"
+    assert batch.calls == []
+    assert count_result.passed is False
+    what = count_result.event.what_we_saw
+    assert what["port_range"] == DECLARED_RANGE and what["port_mappings_declared"] is False
     assert (what["probed_port_count"], what["declared_port_count"]) == (0, 0)
+    assert what["no_ports_probed"] is True
