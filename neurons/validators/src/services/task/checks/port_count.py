@@ -160,12 +160,6 @@ class PortCountCheck:
 
     @staticmethod
     def _ports_held_by_platform_background_jobs(ctx: Context) -> int:
-        """Ports held by the platform's preemptible background jobs on this executor, not already answered.
-
-        A customer rent preempts these jobs and takes their ports, so they count toward the floor.
-        The backend's filler-port list also carries a miner's default job, which does not count; the
-        executor's default-job owner tells the two apart, and anything but "lium" counts nothing.
-        """
         rented_data = ctx.state.rented_data
         if rented_data is None:
             return 0
