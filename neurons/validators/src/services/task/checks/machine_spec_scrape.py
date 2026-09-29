@@ -237,6 +237,16 @@ def _vloopback_fields(vloopback: dict[str, Any]) -> dict[str, Any]:
     return reported
 
 
+def _with_capped_vloopback_check(specs: dict[str, Any]) -> dict[str, Any]:
+    # specs are stored and published as scraped; only the known fields, capped and typed, go on
+    if "vloopback_check" not in specs:
+        return specs
+    vloopback = specs["vloopback_check"]
+    if not isinstance(vloopback, dict):
+        return {key: value for key, value in specs.items() if key != "vloopback_check"}
+    return {**specs, "vloopback_check": _vloopback_fields(vloopback)}
+
+
 def _with_vloopback_verdict(specs: dict[str, Any], enforce: bool) -> dict[str, Any]:
     # ticket-0331: report-only until VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED; then a failed mount test
     # also takes the disk limit off this node's rentals, with the test's reason in storage_limit_scrape_error
@@ -246,10 +256,11 @@ def _with_vloopback_verdict(specs: dict[str, Any], enforce: bool) -> dict[str, A
     if not specs.get("storage_limit_supported"):
         return specs
     reported = _vloopback_fields(vloopback)
+    reason = ": ".join(part for part in (reported["reason_code"], reported["detail"]) if part)
     return {
         **specs,
         "storage_limit_supported": False,
-        "storage_limit_scrape_error": f"{reported['reason_code']}: {reported['detail']}",
+        "storage_limit_scrape_error": reason or "vloopback mount test failed",
     }
 
 
@@ -259,7 +270,7 @@ def _storage_limit_summary(specs: dict[str, Any], enforced: bool) -> dict[str, A
     summary: dict[str, Any] = {"supported": supported, "vloopback_enforced": enforced}
     scrape_error = specs.get("storage_limit_scrape_error")
     if not supported and scrape_error:
-        summary["detail"] = str(scrape_error)
+        summary["detail"] = str(scrape_error)[:VLOOPBACK_TEXT_CAP]
     vloopback = specs.get("vloopback_check")
     if isinstance(vloopback, dict):
         summary["vloopback"] = _vloopback_fields(vloopback)
@@ -435,7 +446,7 @@ class MachineSpecScrapeCheck:
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
             enforce_vloopback = settings.VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED
-            specs = _with_vloopback_verdict(specs, enforce_vloopback)
+            specs = _with_vloopback_verdict(_with_capped_vloopback_check(specs), enforce_vloopback)
 
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,

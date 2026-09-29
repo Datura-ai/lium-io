@@ -782,7 +782,101 @@ async def test_forged_host_fields_are_capped_and_typed_in_the_event(
         "runtime": None,
         "cached": None,
     }
-    assert summary.get("detail") == (f"{'R' * 300}: {'x' * 300}" if enforced else None)
+    assert summary.get("detail") == ("R" * 300 if enforced else None)
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+@pytest.mark.asyncio
+async def test_forged_host_fields_are_capped_and_typed_in_the_stored_specs(
+    context_factory, vloopback_enforcement, enforced
+):
+    # Arrange
+    vloopback_enforcement(enforced)
+
+    # Act
+    result = await _scrape_ok_event_for(
+        context_factory,
+        {
+            "storage_limit_supported": True,
+            "vloopback_check": {**FORGED_FAIL, "extra": "y" * 100_000},
+        },
+    )
+
+    # Assert
+    assert result.updates["state"].specs["vloopback_check"] == {
+        "verdict": "fail",
+        "reason_code": "R" * 300,
+        "detail": "x" * 300,
+        "runtime": None,
+        "cached": None,
+    }
+
+
+@pytest.mark.parametrize("vloopback_check", ["notadict", ["fail"], None])
+@pytest.mark.asyncio
+async def test_a_vloopback_check_that_is_not_a_dict_is_not_stored(
+    context_factory, vloopback_enforcement, vloopback_check
+):
+    # Arrange
+    vloopback_enforcement(True)
+
+    # Act
+    result = await _scrape_ok_event_for(
+        context_factory, {"storage_limit_supported": True, "vloopback_check": vloopback_check}
+    )
+
+    # Assert
+    specs = result.updates["state"].specs
+    assert "vloopback_check" not in specs
+    assert specs["storage_limit_supported"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_host_reported_scrape_error_is_capped_in_the_event(
+    context_factory, vloopback_enforcement
+):
+    # Act
+    result = await _scrape_ok_event_for(
+        context_factory,
+        {
+            "storage_limit_supported": False,
+            "storage_limit_scrape_error": "e" * 100_000,
+            "vloopback_check": PASSED,
+        },
+    )
+
+    # Assert
+    assert result.event.what_we_saw["storage_limit"]["detail"] == "e" * 300
+
+
+@pytest.mark.parametrize(
+    ("vloopback_check", "scrape_error"),
+    [
+        ({"verdict": "fail"}, "vloopback mount test failed"),
+        (
+            {"verdict": "fail", "reason_code": "VLOOPBACK_CHECK_ERROR", "detail": ""},
+            "VLOOPBACK_CHECK_ERROR",
+        ),
+        ({"verdict": "fail", "detail": "boom"}, "boom"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failure_without_reason_fields_still_names_the_mount_test(
+    context_factory, vloopback_enforcement, vloopback_check, scrape_error
+):
+    # Arrange
+    vloopback_enforcement(True)
+
+    # Act
+    result = await _scrape_ok_event_for(
+        context_factory, {"storage_limit_supported": True, "vloopback_check": vloopback_check}
+    )
+
+    # Assert
+    specs = result.updates["state"].specs
+    assert specs["storage_limit_supported"] is False
+    assert specs["storage_limit_scrape_error"] == scrape_error
+
 
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
