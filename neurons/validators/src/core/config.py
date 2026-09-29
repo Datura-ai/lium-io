@@ -353,7 +353,11 @@ class Settings(BaseSettings):
     # CHECK_ENABLED is the kill switch: off, the scrape skips the test (baked in by FileEncryptService).
     # Report-only while ENFORCEMENT is off: the verdict goes to specs.vloopback_check and the scrape
     # event, and storage_limit_supported stays the --storage-opt result. ENFORCEMENT on: a failed test
-    # also sets storage_limit_supported=false. supports_gpu_splitting follows --storage-opt either way.
+    # also sets storage_limit_supported=false. The validator's own supports_gpu_splitting follows
+    # --storage-opt either way, but the platform backend reads storage_limit_supported for the disk
+    # limit, for whether GPU-split rentals are allowed and for whether a partly rented node's free
+    # GPUs are listed, so enforcement takes a failing node out of all three. Turning it on changes
+    # listing: a human decision, not a default.
     VLOOPBACK_SCRAPE_CHECK_ENABLED: bool = Field(env="VLOOPBACK_SCRAPE_CHECK_ENABLED", default=True)
     VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED: bool = Field(
         env="VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED", default=False
