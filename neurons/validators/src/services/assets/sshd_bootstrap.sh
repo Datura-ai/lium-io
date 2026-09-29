@@ -330,16 +330,16 @@ verify_sshd() {
 watchdog_loop() {
     while true; do
         if ! is_sshd_running; then
+            acquire_lock
             if ensure_sshd_installed; then
-                acquire_lock
                 prepare_sshd_runtime
                 if ! start_sshd_if_needed; then
                     log "Failed to restart sshd from watchdog"
                 fi
-                release_lock
             else
                 log "Watchdog could not install sshd"
             fi
+            release_lock
         fi
 
         sleep "$SLEEP_SECONDS"
@@ -412,9 +412,11 @@ if get_sshd_binary >/dev/null 2>&1; then
     fi
 fi
 
-# 3. Fallback: this script owns sshd bring-up.
-ensure_sshd_installed
+# 3. Fallback: this script owns sshd bring-up. The lock is taken before the install: a
+#    second run of this script (the validator retries the exec once after a dropped SSH
+#    transport) must wait out the first run's `apt-get install`, not trip on its dpkg lock.
 acquire_lock
+ensure_sshd_installed
 if is_sshd_running; then
     # The image's setup slipped in while we were installing/locking.
     release_lock
