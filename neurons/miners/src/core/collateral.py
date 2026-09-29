@@ -16,7 +16,7 @@ from uuid import UUID
 
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
-from web3.exceptions import ContractLogicError, TimeExhausted
+from web3.exceptions import ContractLogicError
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,10 @@ class CollateralTransactionError(Exception):
 
 class CollateralConfigError(Exception):
     pass
+
+
+class CollateralOutcomeUnknownError(CollateralTransactionError):
+    """A transaction was broadcast but its receipt was never read: it may still be mined."""
 
 
 @dataclass
@@ -98,9 +102,7 @@ def rpc_origin(rpc_url: str | None) -> str | None:
     return f"{parts.scheme}://{host}" + (f":{port}" if port else "")
 
 
-def executor_uuid_bytes(executor_uuid: str | UUID) -> bytes:
-    if isinstance(executor_uuid, UUID):
-        return executor_uuid.bytes
+def executor_uuid_bytes(executor_uuid: str) -> bytes:
     try:
         raw = UUID(executor_uuid).bytes
     except ValueError:
@@ -151,7 +153,7 @@ class CollateralClient:
         balance = await self.w3.eth.get_balance(AsyncWeb3.to_checksum_address(address))
         return AsyncWeb3.from_wei(balance, "ether")
 
-    async def get_executor_collateral(self, executor_uuid: str | UUID):
+    async def get_executor_collateral(self, executor_uuid: str):
         amount = await self.contract.functions.collaterals(
             executor_uuid_bytes(executor_uuid)
         ).call()
@@ -173,10 +175,27 @@ class CollateralClient:
                 f"The RPC quoted a gas price of {AsyncWeb3.from_wei(gas_price, 'gwei')} gwei, above the "
                 f"{self.max_gas_price_gwei} gwei ceiling (COLLATERAL_MAX_GAS_PRICE_GWEI); no transaction was sent"
             )
+        # A retry after a lost receipt must not pay gas for a second copy: an earlier send still pending blocks
+        # this one, and a mined one leaves a call the contract now rejects, which the simulation catches unsent.
+        nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
+        pending_nonce = await self.w3.eth.get_transaction_count(self.miner_address, "pending")
+        if pending_nonce > nonce:
+            raise CollateralTransactionError(
+                f"An earlier transaction from {self.miner_address} (nonce {nonce}) is still pending; "
+                "no transaction was sent. Check it on the explorer and run this again once it is mined"
+            )
+        try:
+            await function_call.call({"from": self.miner_address})
+        except ContractLogicError as error:
+            data = error.data if isinstance(error.data, str) else ""
+            reason = self._custom_error_name(data) or error.message or "execution reverted"
+            raise CollateralTransactionError(
+                f"The contract rejects this call ({reason}); no transaction was sent"
+            ) from error
         transaction = await function_call.build_transaction(
             {
                 "from": self.miner_address,
-                "nonce": await self.w3.eth.get_transaction_count(self.miner_address),
+                "nonce": nonce,
                 "gas": GAS_LIMIT,
                 "gasPrice": gas_price,
                 "chainId": await self.w3.eth.chain_id,
@@ -190,11 +209,12 @@ class CollateralClient:
             receipt = await self.w3.eth.wait_for_transaction_receipt(
                 tx_hash, timeout=300, poll_latency=2
             )
-        except (TimeExhausted, TimeoutError) as error:
-            # The transaction may still be mined: sending again could reclaim or finalize twice.
-            raise CollateralTransactionError(
-                f"Transaction {tx_hash.hex()} was sent but had no receipt within 300 s; "
-                "check it on the explorer before sending it again"
+        except Exception as error:
+            # the class name only: a transport error's text can carry the RPC URL and its API key
+            raise CollateralOutcomeUnknownError(
+                f"Transaction {tx_hash.hex()} was sent but its receipt could not be read "
+                f"({type(error).__name__}); its outcome is unknown. Check it on the explorer before "
+                "running this again"
             ) from error
         if receipt["status"] == 0:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
@@ -238,7 +258,7 @@ class CollateralClient:
                 return entry["name"]
         return None
 
-    async def reclaim_collateral(self, executor_uuid: str | UUID, url: str = "Manual reclaim"):
+    async def reclaim_collateral(self, executor_uuid: str, url: str = "Manual reclaim"):
         """Start a reclaim of the executor's full collateral; returns its ReclaimProcessStarted."""
         receipt = await self._send(
             self.contract.functions.reclaimCollateral(

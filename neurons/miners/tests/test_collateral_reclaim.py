@@ -24,7 +24,6 @@ def test_h160_to_ss58_maps_an_evm_address_to_its_mirror_account():
 
 def test_executor_uuid_bytes_is_the_16_byte_contract_key():
     assert executor_uuid_bytes(EXECUTOR) == UUID(EXECUTOR).bytes
-    assert executor_uuid_bytes(UUID(EXECUTOR)) == UUID(EXECUTOR).bytes
     assert executor_uuid_bytes("0xabcd") == bytes.fromhex("abcd") + b"\0" * 14
 
 
@@ -187,12 +186,12 @@ MALFORMED_KEYS = ["0x" + "ab" * 8, "not-a-hex-private-key", "zq" * 32]
     ],
     ids=["reclaim", "reclaim-contract", "finalize", "finalize-contract"],
 )
-def test_malformed_key_logs_an_error_without_the_key(chain, cli_services, caplog, args, bad_key):
+def test_malformed_key_exits_1_and_logs_an_error_without_the_key(chain, cli_services, caplog, args, bad_key):
     from cli import cli
 
     result = CliRunner().invoke(cli, [*args, "--private-key", bad_key])
 
-    assert result.exception is None, result.output
+    assert result.exit_code == 1, result.output
     assert cli_services == []
     assert chain.reads == []
     assert "private key is malformed" in caplog.text

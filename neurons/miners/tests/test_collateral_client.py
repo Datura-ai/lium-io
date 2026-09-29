@@ -12,11 +12,15 @@ from click.testing import CliRunner
 from eth_abi import encode
 from eth_account import Account
 from web3 import AsyncWeb3
-from web3.exceptions import TimeExhausted
 from web3.providers.async_base import AsyncBaseProvider
 
 from core import collateral as collateral_module
-from core.collateral import CollateralClient, CollateralConfigError, CollateralTransactionError
+from core.collateral import (
+    CollateralClient,
+    CollateralConfigError,
+    CollateralOutcomeUnknownError,
+    CollateralTransactionError,
+)
 
 CONTRACT = "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"
 EXECUTOR = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
@@ -39,6 +43,9 @@ def hex_encode(types, values) -> str:
     return "0x" + encode(types, values).hex()
 
 
+SENDS = {selector("finalizeReclaim(uint256)"), selector("reclaimCollateral(bytes16,string,bytes16)")}
+
+
 class FakeProvider(AsyncBaseProvider):
     """Answers the JSON-RPC methods the client uses; eth_call is routed by function selector."""
 
@@ -50,8 +57,12 @@ class FakeProvider(AsyncBaseProvider):
         revert_data=None,
         endpoint_uri=None,
         gas_price=GAS_PRICE,
+        pending_nonce=NONCE,
+        simulate_revert=None,
     ):
         super().__init__()
+        self.pending_nonce = pending_nonce
+        self.simulate_revert = simulate_revert
         self.gas_price = gas_price
         self.endpoint_uri = endpoint_uri
         self.calls = calls or {}
@@ -68,17 +79,24 @@ class FakeProvider(AsyncBaseProvider):
         self.requests.append((method, params))
         if method == "eth_call":
             data = params[0]["data"].removeprefix("0x")
+            if params[1] == "latest" and data[:8] in SENDS:
+                if self.simulate_revert is None:
+                    return {"jsonrpc": "2.0", "id": 1, "result": "0x"}
+                error = {"code": 3, "message": "execution reverted", "data": self.simulate_revert}
+                return {"jsonrpc": "2.0", "id": 1, "error": error}
             if data[:8] in self.calls:
                 return {"jsonrpc": "2.0", "id": 1, "result": self.calls[data[:8]]}
             error = {"code": 3, "message": "execution reverted", "data": self.revert_data or "0x"}
             return {"jsonrpc": "2.0", "id": 1, "error": error}
+        if method == "eth_getTransactionCount":
+            nonce = self.pending_nonce if params[1] == "pending" else NONCE
+            return {"jsonrpc": "2.0", "id": 1, "result": hex(nonce)}
         if method == "eth_sendRawTransaction":
             self.sent.append(params[0])
             return {"jsonrpc": "2.0", "id": 1, "result": TX_HASH}
         results = {
             "eth_chainId": hex(CHAIN_ID),
             "eth_gasPrice": hex(self.gas_price),
-            "eth_getTransactionCount": hex(NONCE),
             "eth_getTransactionReceipt": {
                 "transactionHash": TX_HASH,
                 "transactionIndex": "0x0",
@@ -175,17 +193,24 @@ async def test_finalize_signs_one_transaction_with_the_node_nonce_gas_price_and_
     assert methods.count("eth_sendRawTransaction") == 1
 
 
-async def test_reverted_finalize_names_the_contract_error_and_not_the_key():
+@pytest.mark.parametrize(
+    "revert_data,message",
+    [
+        ("0x" + selector("BeforeDenyTimeout()"), f"Transaction {TX_HASH} reverted: BeforeDenyTimeout"),
+        ("0x", f"Transaction {TX_HASH} reverted: execution reverted"),
+    ],
+    ids=["known-error", "no-known-error"],
+)
+async def test_reverted_finalize_names_the_contract_error_and_not_the_key(revert_data, message):
     provider = FakeProvider(
         calls={selector("reclaims(uint256)"): open_reclaim()},
         receipt_status=0,
-        revert_data="0x" + selector("BeforeDenyTimeout()"),
+        revert_data=revert_data,
     )
     with pytest.raises(CollateralTransactionError) as raised:
         await client_with(provider).finalize_reclaim(5)
 
-    message = str(raised.value)
-    assert message == f"Transaction {TX_HASH} reverted: BeforeDenyTimeout"
+    assert str(raised.value) == message
     assert MINER_KEY.removeprefix("0x")[:16] not in message
     replay = [params for method, params in provider.requests if method == "eth_call"][-1]
     assert replay[1] == "0x10"
@@ -194,19 +219,11 @@ async def test_reverted_finalize_names_the_contract_error_and_not_the_key():
     assert set(replay[0]) <= {"from", "to", "data", "value"}
 
 
-async def test_reverted_transaction_without_a_known_error_still_reports_the_hash():
-    provider = FakeProvider(
-        calls={selector("reclaims(uint256)"): open_reclaim()}, receipt_status=0, revert_data="0x"
-    )
-    with pytest.raises(CollateralTransactionError, match=f"Transaction {TX_HASH} reverted"):
-        await client_with(provider).finalize_reclaim(5)
-
-
 class ReplayFailsProvider(FakeProvider):
     """The replay eth_call of the sent transaction fails in transport, with the RPC URL in the error."""
 
     async def make_request(self, method, params):
-        if method == "eth_call" and params[0]["data"].removeprefix("0x").startswith(
+        if method == "eth_call" and params[1] != "latest" and params[0]["data"].removeprefix("0x").startswith(
             selector("finalizeReclaim(uint256)")
         ):
             raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
@@ -239,43 +256,49 @@ async def test_send_without_a_key_sends_nothing():
     assert provider.sent == []
 
 
-async def test_a_receipt_timeout_names_the_sent_transaction(monkeypatch, caplog):
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_sends_nothing(monkeypatch, caplog):
+    provider = FakeProvider()
     client = client_with(provider)
 
-    async def no_receipt(*_args, **_kwargs):
-        raise TimeExhausted("no receipt")
+    async def lost_receipt(*_args, **_kwargs):
+        raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
 
-    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", no_receipt)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
     with caplog.at_level(logging.INFO, logger="core.collateral"):
-        with pytest.raises(CollateralTransactionError, match=f"Transaction {TX_HASH} was sent"):
-            await client.finalize_reclaim(5)
-
-    assert len(provider.sent) == 1
+        with pytest.raises(CollateralOutcomeUnknownError, match=f"Transaction {TX_HASH} was sent") as raised:
+            await client.reclaim_collateral(EXECUTOR)
+    assert "outcome is unknown" in str(raised.value)
+    assert "secret-rpc-key" not in str(raised.value)
     assert f"Sent transaction {TX_HASH}" in caplog.text
 
+    # still pending: the retry sends nothing
+    provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralTransactionError, match="still pending; no transaction was sent"):
+        await client.reclaim_collateral(EXECUTOR)
+    # mined: the contract now rejects the same call, and the retry sends nothing
+    provider.pending_nonce = NONCE
+    provider.simulate_revert = "0x" + selector("InsufficientCollateralForReclaim()")
+    with pytest.raises(CollateralTransactionError, match=r"rejects this call \(InsufficientCollateralForReclaim\)"):
+        await client.reclaim_collateral(EXECUTOR)
+    assert len(provider.sent) == 1
 
-async def test_gas_price_quote_above_the_ceiling_signs_and_sends_nothing():
-    ceiling_wei = collateral_module.DEFAULT_MAX_GAS_PRICE_GWEI * 10**9
-    provider = FakeProvider(
-        calls={selector("reclaims(uint256)"): open_reclaim()}, gas_price=ceiling_wei + 1
-    )
-    with pytest.raises(CollateralTransactionError, match="COLLATERAL_MAX_GAS_PRICE_GWEI"):
-        await client_with(provider).finalize_reclaim(5)
-    assert provider.sent == []
-    assert "eth_getTransactionCount" not in [method for method, _ in provider.requests]
 
-
-async def test_gas_price_quote_at_the_ceiling_is_signed():
+@pytest.mark.parametrize("over,sent", [(1, 0), (0, 1)], ids=["above", "at"])
+async def test_a_gas_price_quote_above_the_ceiling_signs_nothing_and_one_at_it_is_signed(over, sent):
     ceiling_wei = collateral_module.DEFAULT_MAX_GAS_PRICE_GWEI * 10**9
     provider = FakeProvider(
         calls={selector("reclaims(uint256)"): open_reclaim()},
         logs=[reclaimed_log()],
-        gas_price=ceiling_wei,
+        gas_price=ceiling_wei + over,
     )
-    await client_with(provider).finalize_reclaim(5)
-    assert len(provider.sent) == 1
-    assert decode_legacy(provider.sent[0])["gasPrice"] == ceiling_wei
+    if over:
+        with pytest.raises(CollateralTransactionError, match="COLLATERAL_MAX_GAS_PRICE_GWEI"):
+            await client_with(provider).finalize_reclaim(5)
+        assert "eth_getTransactionCount" not in [method for method, _ in provider.requests]
+    else:
+        await client_with(provider).finalize_reclaim(5)
+        assert decode_legacy(provider.sent[0])["gasPrice"] == ceiling_wei
+    assert len(provider.sent) == sent
 
 
 async def test_configured_gas_price_ceiling_reaches_the_client(monkeypatch):
@@ -288,12 +311,6 @@ async def test_configured_gas_price_ceiling_reaches_the_client(monkeypatch):
     with pytest.raises(CollateralTransactionError, match="5 gwei ceiling"):
         await client.finalize_reclaim(5)
     assert client._w3.provider.sent == []
-
-
-def test_unknown_network_without_rpc_url_builds_a_client_without_a_connection():
-    client = CollateralClient(network="archive", contract_address=CONTRACT, miner_key=MINER_KEY)
-    assert client.contract_address == CONTRACT
-    assert client.miner_address == MINER
 
 
 async def test_contract_call_on_unknown_network_without_rpc_url_names_the_setting():

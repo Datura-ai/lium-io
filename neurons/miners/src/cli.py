@@ -267,7 +267,7 @@ def remove_executor(address: str, port: int):
 def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: str | None):
     """Reclaim collateral for a specific executor from the contract that holds it"""
     if miner_account(private_key) is None:
-        return
+        sys.exit(1)
     detected = None
     if not contract_version:
         detected = run_contract_read(
@@ -386,7 +386,7 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
     """Finalize a reclaim request by its ID on the contract that holds it"""
     account = miner_account(private_key)
     if account is None:
-        return
+        sys.exit(1)
     detected = None
     if not contract_version:
         detected = run_contract_read(
