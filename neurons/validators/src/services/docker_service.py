@@ -730,7 +730,6 @@ class ImageExitedDuringKeyInjection(Exception):
 
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
 KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
-CONTAINER_GONE_KILL_CAUSES = frozenset({"oom", "killed", "removed"})
 
 
 def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
@@ -746,10 +745,31 @@ def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
     return "exited"
 
 
+def _killed_after_exec(state: ContainerStateSnapshot) -> bool:
+    return not state.running and container_gone_cause(state) != "exited"
+
+
+async def _raise_if_killed_after_exec(
+    docker_client: RentalDockerSdkClient, *, container_name: str, exit_status: int
+) -> None:
+    """A kill mid-exec ends the exec with a status (137) rather than a refused exec: read the State
+    now and raise the ContainerGoneBeforeExec the create path records as killed_during_bootstrap."""
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+    except Exception:  # noqa: BLE001 — the exec result is the one to report
+        return
+    if _killed_after_exec(state):
+        raise ContainerGoneBeforeExec(
+            f"exec exit_status={exit_status} and the container has stopped ({state.describe()})",
+            container_name=container_name,
+            state=state,
+        )
+
+
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
-    ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is one of
-    CONTAINER_GONE_KILL_CAUSES (see container_gone_cause); an image's own exit is never this.
+    ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed` or
+    `removed` (see container_gone_cause); an image's own exit is never this.
     """
 
     def __init__(
@@ -804,10 +824,11 @@ async def _explain_add_public_keys_failure(
     at the container, which cleanup has not removed yet — through the State a ContainerGoneBeforeExec
     already carries when it has one (a second inspect can 404 on a container being removed and would
     turn an own-exit at the key step into a kill). A gone container whose cause is a kill is returned
-    unchanged, so the create path records it as killed_during_bootstrap.
+    unchanged, and a failed exec whose container now reads as killed becomes one, so the create path
+    records both as killed_during_bootstrap.
     """
     if isinstance(cause, ContainerGoneBeforeExec):
-        if container_gone_cause(cause.state) in CONTAINER_GONE_KILL_CAUSES:
+        if container_gone_cause(cause.state) != "exited":
             return cause
         state = cause.state
     else:
@@ -825,6 +846,8 @@ async def _explain_add_public_keys_failure(
                 )
             )
             return cause
+        if _killed_after_exec(state):
+            return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=state)
     if not state.exited_since_start or state.killed_by_host:
         return cause
     if state.running:
@@ -3730,6 +3753,10 @@ class DockerService:
             return False
 
         if create_result.exit_status != 0:
+            if raise_if_container_gone:
+                await _raise_if_killed_after_exec(
+                    docker_client, container_name=container_name, exit_status=create_result.exit_status
+                )
             await self.stream_log(
                 "Failed to create SSH bootstrap script in container",
                 "error",
@@ -3757,6 +3784,10 @@ class DockerService:
             log_extra=log_extra,
         )
         if run_result.exit_status != 0:
+            if raise_if_container_gone:
+                await _raise_if_killed_after_exec(
+                    docker_client, container_name=container_name, exit_status=run_result.exit_status
+                )
             await self.stream_log(
                 run_result.stderr or run_result.stdout or "SSH bootstrap script failed",
                 "error",
@@ -6716,7 +6747,7 @@ class DockerService:
                         # _CreateCancelledByDelete here; otherwise the failure names the kill
                         # it was, not the exec it broke.
                         await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-                        if container_gone_cause(post_run_exc.state) not in CONTAINER_GONE_KILL_CAUSES:
+                        if container_gone_cause(post_run_exc.state) == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
                             raise
                         killed = self._explain_container_killed_during_bootstrap(
