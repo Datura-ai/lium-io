@@ -21,10 +21,25 @@ import pytest
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
+SCRIPT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh")
+)
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm"]
+REAL_TOOLS = [
+    "bash",
+    "grep",
+    "sed",
+    "awk",
+    "head",
+    "tail",
+    "cut",
+    "ls",
+    "dirname",
+    "cat",
+    "seq",
+    "rm",
+]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -127,6 +142,7 @@ STUBS = {
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
     "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
+    "fusermount3": "#!/bin/bash\nexit 0\n",
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -218,9 +234,7 @@ def run_check(
     """Source the installer's functions and run one check."""
     stubs = _bin_dir(tmp_path, with_jq=with_jq, without=without)
     root = _host_root(tmp_path, files)
-    bash_snippet = (
-        f"SYSBOX_SETUP_LIB=1 . {SCRIPT}\nset +e\n{function}\nrc=$?\necho \"RC=$rc FIX=$PREFLIGHT_FIX PASS=$PREFLIGHT_PASS SKIP=$PREFLIGHT_SKIP\"\n"
-    )
+    bash_snippet = f'SYSBOX_SETUP_LIB=1 . {SCRIPT}\nset +e\n{function}\nrc=$?\necho "RC=$rc FIX=$PREFLIGHT_FIX PASS=$PREFLIGHT_PASS SKIP=$PREFLIGHT_SKIP"\n'
     proc = subprocess.run(
         ["bash", "-c", bash_snippet],
         capture_output=True,
@@ -274,12 +288,18 @@ def test_kernel_5_15_on_22_04_names_the_hwe_kernel(tmp_path):
     assert "FIX  Kernel 5.15.0-91-generic is below 5.19" in out
     assert "sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot" in out
     # the override goes after sudo: sudo's env_reset drops a variable set in front of it (sourced here, so the curl form)
-    assert "backport: curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo SYSBOX_SKIP_KERNEL_CHECK=1 bash" in out
+    assert (
+        "backport: curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo SYSBOX_SKIP_KERNEL_CHECK=1 bash"
+        in out
+    )
 
 
 def test_kernel_5_15_on_20_04_says_upgrade_the_distro(tmp_path):
     rc, out, _ = run_check(
-        tmp_path, "check_kernel", env={"STUB_KERNEL": "5.15.0-91-generic"}, files={"etc/os-release": 'VERSION_ID="20.04"\n'}
+        tmp_path,
+        "check_kernel",
+        env={"STUB_KERNEL": "5.15.0-91-generic"},
+        files={"etc/os-release": 'VERSION_ID="20.04"\n'},
     )
     assert rc == 1
     assert "Ubuntu 20.04 tops out at 5.15" in out
@@ -288,7 +308,11 @@ def test_kernel_5_15_on_20_04_says_upgrade_the_distro(tmp_path):
 
 
 def test_kernel_override_is_honoured(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_kernel", env={"STUB_KERNEL": "5.15.0-91-generic", "SYSBOX_SKIP_KERNEL_CHECK": "1"})
+    rc, out, _ = run_check(
+        tmp_path,
+        "check_kernel",
+        env={"STUB_KERNEL": "5.15.0-91-generic", "SYSBOX_SKIP_KERNEL_CHECK": "1"},
+    )
     assert rc == 0
     assert "PASS Kernel 5.15.0-91-generic accepted because SYSBOX_SKIP_KERNEL_CHECK=1" in out
 
@@ -329,12 +353,16 @@ def test_docker_29_7_without_the_two_settings_names_both(tmp_path, with_jq):
         tmp_path,
         "check_docker_features",
         env={"STUB_DOCKER_VERSION": "29.7.0"},
-        files={"etc/docker/daemon.json": '{"runtimes": {"sysbox-runc": {"path": "/usr/bin/sysbox-runc"}}}\n'},
+        files={
+            "etc/docker/daemon.json": '{"runtimes": {"sysbox-runc": {"path": "/usr/bin/sysbox-runc"}}}\n'
+        },
         with_jq=with_jq,
     )
     assert rc == 1
     assert "FIX  Docker 29.7.0 without features.cdi, time-namespaces = false" in out
-    assert 'add {"features":{"cdi":false,"time-namespaces":false}} to /etc/docker/daemon.json' in out
+    assert (
+        'add {"features":{"cdi":false,"time-namespaces":false}} to /etc/docker/daemon.json' in out
+    )
 
 
 @pytest.mark.parametrize("with_jq", [False, True])
@@ -343,7 +371,9 @@ def test_docker_29_7_with_both_settings_passes(tmp_path, with_jq):
         tmp_path,
         "check_docker_features",
         env={"STUB_DOCKER_VERSION": "29.7.0"},
-        files={"etc/docker/daemon.json": '{"runtimes": {}, "features": {"cdi": false, "time-namespaces": false}}\n'},
+        files={
+            "etc/docker/daemon.json": '{"runtimes": {}, "features": {"cdi": false, "time-namespaces": false}}\n'
+        },
         with_jq=with_jq,
     )
     assert rc == 0, out
@@ -401,18 +431,28 @@ def test_nvidia_smi_missing_is_a_fix(tmp_path):
 
 
 def test_nvidia_driver_not_loaded_is_a_fix(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_nvidia_driver", files={"proc/driver/nvidia/version": None})
+    rc, out, _ = run_check(
+        tmp_path, "check_nvidia_driver", files={"proc/driver/nvidia/version": None}
+    )
     assert rc == 1
-    assert "FIX  NVIDIA driver is installed but not loaded" in out and "/proc/driver/nvidia missing" in out
+    assert (
+        "FIX  NVIDIA driver is installed but not loaded" in out
+        and "/proc/driver/nvidia missing" in out
+    )
 
 
 def test_nvidia_smi_error_text_is_not_read_as_a_version(tmp_path):
     # nvidia-smi prints this on stdout; it must land in the "not loaded" line with the reboot fix, not in "below 580.65.06"
     rc, out, _ = run_check(
-        tmp_path, "check_nvidia_driver", env={"STUB_NV_DRIVER": "Failed to initialize NVML: Driver/library version mismatch"}
+        tmp_path,
+        "check_nvidia_driver",
+        env={"STUB_NV_DRIVER": "Failed to initialize NVML: Driver/library version mismatch"},
     )
     assert rc == 1
-    assert "FIX  NVIDIA driver is installed but not loaded (nvidia-smi: Failed to initialize NVML" in out
+    assert (
+        "FIX  NVIDIA driver is installed but not loaded (nvidia-smi: Failed to initialize NVML"
+        in out
+    )
     assert "sudo reboot" in out and "below 580.65.06" not in out
 
 
@@ -446,7 +486,9 @@ def test_iptables_modules_loaded_pass(tmp_path):
 
 
 def test_iptables_modules_missing_name_modprobe_and_the_persistent_file(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_iptables_modules", files={"proc/modules": "nf_tables 311296 0\n"})
+    rc, out, _ = run_check(
+        tmp_path, "check_iptables_modules", files={"proc/modules": "nf_tables 311296 0\n"}
+    )
     assert rc == 1
     assert "FIX  Kernel modules ip_tables iptable_nat iptable_filter are not loaded" in out
     assert "sudo modprobe -a ip_tables iptable_nat iptable_filter" in out
@@ -473,7 +515,9 @@ def test_disk_rule_uses_total_size_of_dockers_filesystem(tmp_path):
 
 
 def test_disk_below_the_rule_is_a_fix_with_the_numbers(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env={"STUB_DF_TOTAL_KB": str(500 * 1024 * 1024)})
+    rc, out, _ = run_check(
+        tmp_path, "check_total_disk_for_vram", env={"STUB_DF_TOTAL_KB": str(500 * 1024 * 1024)}
+    )
     assert rc == 1
     assert "FIX  Disk 500.0 GB on " in out
     assert "is below 955.8 GB (1.5x of 637.2 GB VRAM)" in out
@@ -484,10 +528,18 @@ def test_disk_rule_compares_like_the_validator_at_the_boundary(tmp_path):
     # 1x 81613 MiB = 79.7 GB VRAM -> 119.55 GB needed. The validator compares 79.7 * 1.5 unrounded with the rounded
     # disk, so 119.5 GB fails; a compare against the displayed (rounded) 119.5 would have passed it.
     env = {"STUB_NV_GPUS": "1", "STUB_NV_MEM_MIB": "81613"}
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.5 * 1024 * 1024))})
+    rc, out, _ = run_check(
+        tmp_path,
+        "check_total_disk_for_vram",
+        env={**env, "STUB_DF_TOTAL_KB": str(int(119.5 * 1024 * 1024))},
+    )
     assert rc == 1, out
     assert "FIX  Disk 119.5 GB" in out and "(1.5x of 79.7 GB VRAM)" in out
-    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.6 * 1024 * 1024))})
+    rc, out, _ = run_check(
+        tmp_path,
+        "check_total_disk_for_vram",
+        env={**env, "STUB_DF_TOTAL_KB": str(int(119.6 * 1024 * 1024))},
+    )
     assert rc == 0, out
 
 
@@ -509,14 +561,18 @@ def test_ports_free_and_no_ufw_pass_with_the_outside_probe_hint(tmp_path):
 
 
 def test_port_held_by_another_process_is_a_fix(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "nginx"})
+    rc, out, _ = run_check(
+        tmp_path, "check_ports", env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "nginx"}
+    )
     assert rc == 1
     assert "FIX  TCP 8080 (executor port) is already in use by " in out and "nginx" in out
     assert "PASS TCP 2200 (SSH port)" in out
 
 
 def test_port_served_by_the_executor_container_passes(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "2200", "STUB_BUSY_PROC": "docker-proxy"})
+    rc, out, _ = run_check(
+        tmp_path, "check_ports", env={"STUB_BUSY_PORT": "2200", "STUB_BUSY_PROC": "docker-proxy"}
+    )
     assert rc == 0
     assert "PASS TCP 2200 (SSH port) is served by the executor (executor-1)" in out
 
@@ -526,7 +582,11 @@ def test_port_published_by_another_container_is_a_fix(tmp_path):
     rc, out, _ = run_check(
         tmp_path,
         "check_ports",
-        env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "docker-proxy", "STUB_PORT_CONTAINER": "nginx-proxy"},
+        env={
+            "STUB_BUSY_PORT": "8080",
+            "STUB_BUSY_PROC": "docker-proxy",
+            "STUB_PORT_CONTAINER": "nginx-proxy",
+        },
     )
     assert rc == 1
     assert "FIX  TCP 8080 (executor port) is published by container nginx-proxy" in out
@@ -571,14 +631,18 @@ def test_ufw_allow_out_row_does_not_open_an_inbound_port(tmp_path):
 
 
 def test_ports_come_from_env_then_the_env_file(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_ports", env={"EXECUTOR_PORT": "8001", "SSH_PORT": "2201"})
+    rc, out, _ = run_check(
+        tmp_path, "check_ports", env={"EXECUTOR_PORT": "8001", "SSH_PORT": "2201"}
+    )
     assert rc == 0
     assert "TCP 8001 (executor port)" in out and "TCP 2201 (SSH port)" in out
 
 
 def test_env_file_next_to_the_script_is_read(tmp_path):
     copy = _script_copy(tmp_path)
-    (copy.parent / ".env").write_text("INTERNAL_PORT=8001\nEXTERNAL_PORT=8123 # external\nSSH_PORT=2299\n")
+    (copy.parent / ".env").write_text(
+        "INTERNAL_PORT=8001\nEXTERNAL_PORT=8123 # external\nSSH_PORT=2299\n"
+    )
     proc = run_script(tmp_path, "--check")
     assert "TCP 8123 (executor port)" in proc.stdout and "TCP 2299 (SSH port)" in proc.stdout
 
@@ -680,8 +744,12 @@ def _plugin(tmp_path: Path) -> str:
 
 def _test_volumes_left(tmp_path: Path) -> set[str]:
     state = _stub_state(tmp_path)
-    created = set((state / "volumes").read_text().split()) if (state / "volumes").exists() else set()
-    removed = set((state / "removed").read_text().split()) if (state / "removed").exists() else set()
+    created = (
+        set((state / "volumes").read_text().split()) if (state / "volumes").exists() else set()
+    )
+    removed = (
+        set((state / "removed").read_text().split()) if (state / "removed").exists() else set()
+    )
     return created - removed
 
 
@@ -689,7 +757,10 @@ def test_vloopback_already_fixed_changes_nothing_and_mounts_a_volume(tmp_path):
     rc, out, _ = run_check(tmp_path, "setup_vloopback")
     assert rc == 0, out
     assert _plugin_changes(tmp_path) == []
-    assert "vloopback: a size-limited volume mounts, takes a write and unmounts in a sysbox container." in out
+    assert (
+        "vloopback: a size-limited volume mounts, takes a write and unmounts in a sysbox container."
+        in out
+    )
     runs = [call for call in _docker_calls(tmp_path) if call.startswith("run --rm ")]
     assert len(runs) == 1
     assert re.fullmatch(
@@ -710,7 +781,10 @@ def test_vloopback_missing_plugin_is_installed_like_the_validators_install_it(tm
     assert _plugin_changes(tmp_path) == [
         f"plugin install {PINNED_PLUGIN} --alias vloopback --grant-all-permissions DATA_DIR={root}/var/lib/docker/loopback"
     ]
-    assert f"vloopback: installed the vloopback plugin with DATA_DIR={root}/var/lib/docker/loopback." in out
+    assert (
+        f"vloopback: installed the vloopback plugin with DATA_DIR={root}/var/lib/docker/loopback."
+        in out
+    )
     assert _test_volumes_left(tmp_path) == set()
 
 
@@ -724,7 +798,10 @@ def test_vloopback_relative_data_dir_is_reset_to_the_data_root_then_mounts(tmp_p
         f"plugin set vloopback DATA_DIR={root}/var/lib/docker/loopback",
         "plugin enable vloopback",
     ]
-    assert f"set the vloopback plugin's DATA_DIR from 'loopback' to {root}/var/lib/docker/loopback" in out
+    assert (
+        f"set the vloopback plugin's DATA_DIR from 'loopback' to {root}/var/lib/docker/loopback"
+        in out
+    )
     assert _plugin(tmp_path) == f"true {root}/var/lib/docker/loopback"
 
 
@@ -744,34 +821,69 @@ def test_vloopback_fix_is_idempotent(tmp_path, seed):
     rc, out, _ = run_check(tmp_path, "setup_vloopback", env={"STUB_VLOOPBACK": seed})
     assert rc == 0, out
     assert _plugin_changes(tmp_path) == first
-    assert "vloopback: installed" not in out and "vloopback: set" not in out and "vloopback: enabled" not in out
+    assert (
+        "vloopback: installed" not in out
+        and "vloopback: set" not in out
+        and "vloopback: enabled" not in out
+    )
 
 
 @pytest.mark.parametrize(
     "env, reason",
     [
         # the host cannot mount it into sysbox at all: runc's error is the reason, not a guess
-        ({"STUB_VLOOPBACK_MOUNT_FAILS": "1"}, "a vloopback volume does not mount into a sysbox container: docker: Error response from daemon: failed to create task for container: OCI runtime create failed: error during container init: error setting up ID-mapped mount on path 206/fs"),
-        ({"STUB_VLOOPBACK": "absent", "STUB_PLUGIN_INSTALL_FAILS": "1"}, f"docker plugin install {PINNED_PLUGIN} failed: Error response from daemon: Head https://registry-1.docker.io"),
-        ({"STUB_VLOOPBACK_RUN_HANGS": "1"}, "a vloopback volume does not mount into a sysbox container: the container did not finish within 120s"),
-        ({"STUB_VOLUME_CREATE_HANGS": "1"}, "docker volume create -d vloopback -o size=1G failed: timed out after 30s"),
-        ({"STUB_VLOOPBACK": "relative", "STUB_PLUGIN_IN_USE": "1"}, "the vloopback plugin has DATA_DIR 'loopback' and cannot be disabled to change it: Error response from daemon: plugin vloopback:latest is in use"),
-        ({"STUB_VOLUME_CREATE_FAILS": "1"}, "docker volume create -d vloopback -o size=1G failed: Error response from daemon: create lium_vloopback_check_"),
+        (
+            {"STUB_VLOOPBACK_MOUNT_FAILS": "1"},
+            "a vloopback volume does not mount into a sysbox container: docker: Error response from daemon: failed to create task for container: OCI runtime create failed: error during container init: error setting up ID-mapped mount on path 206/fs",
+        ),
+        (
+            {"STUB_VLOOPBACK": "absent", "STUB_PLUGIN_INSTALL_FAILS": "1"},
+            f"docker plugin install {PINNED_PLUGIN} failed: Error response from daemon: Head https://registry-1.docker.io",
+        ),
+        (
+            {"STUB_VLOOPBACK_RUN_HANGS": "1"},
+            "a vloopback volume does not mount into a sysbox container: the container did not finish within 120s",
+        ),
+        (
+            {"STUB_VOLUME_CREATE_HANGS": "1"},
+            "docker volume create -d vloopback -o size=1G failed: timed out after 30s",
+        ),
+        (
+            {"STUB_VLOOPBACK": "relative", "STUB_PLUGIN_IN_USE": "1"},
+            "the vloopback plugin has DATA_DIR 'loopback' and cannot be disabled to change it: Error response from daemon: plugin vloopback:latest is in use",
+        ),
+        (
+            {"STUB_VOLUME_CREATE_FAILS": "1"},
+            "docker volume create -d vloopback -o size=1G failed: Error response from daemon: create lium_vloopback_check_",
+        ),
         ({"STUB_VOLUME_RM_FAILS": "1"}, "the test volume lium_vloopback_check_"),
-        ({"STUB_DOCKER_ROOT": "docker"}, "Docker reports the data-root 'docker', not an absolute path"),
+        (
+            {"STUB_DOCKER_ROOT": "docker"},
+            "Docker reports the data-root 'docker', not an absolute path",
+        ),
     ],
 )
 def test_vloopback_unfixable_host_fails_with_the_cause(tmp_path, env, reason):
     rc, out, _ = run_check(tmp_path, "setup_vloopback || fail_vloopback", env=env)
     assert rc == 0  # fail_vloopback's own status; the install-mode exit code is pinned below
     assert f"Size-limited volumes (vloopback) do not work on this host: {reason}" in out
-    assert "What to do: https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback" in out
+    assert (
+        "What to do: https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
+        in out
+    )
     assert "vloopback: a size-limited volume mounts" not in out
 
 
 def test_vloopback_volume_that_will_not_remove_names_the_unmount(tmp_path):
-    rc, out, _ = run_check(tmp_path, "vloopback_mount_test; echo \"REASON=$VLOOPBACK_REASON\"", env={"STUB_VOLUME_RM_FAILS": "1"})
-    assert re.search(r"REASON=the test volume lium_vloopback_check_\d+ did not unmount and remove: .*VolumeDriver.Unmount", out), out
+    rc, out, _ = run_check(
+        tmp_path,
+        'vloopback_mount_test; echo "REASON=$VLOOPBACK_REASON"',
+        env={"STUB_VOLUME_RM_FAILS": "1"},
+    )
+    assert re.search(
+        r"REASON=the test volume lium_vloopback_check_\d+ did not unmount and remove: .*VolumeDriver.Unmount",
+        out,
+    ), out
 
 
 def test_vloopback_mount_failure_still_removes_the_test_volume(tmp_path):
@@ -838,9 +950,13 @@ def test_interrupted_mount_test_is_cleaned_up_by_the_exit_trap(tmp_path):
 def test_vloopback_relative_mountpoint_fails_before_any_container_runs(tmp_path):
     # what `docker volume inspect t` showed on the ticket-0331 host; --check does not touch the plugin
     rc, out, _ = run_check(
-        tmp_path, "vloopback_mount_test; echo \"REASON=$VLOOPBACK_REASON\"", env={"STUB_VLOOPBACK": "relative"}
+        tmp_path,
+        'vloopback_mount_test; echo "REASON=$VLOOPBACK_REASON"',
+        env={"STUB_VLOOPBACK": "relative"},
     )
-    assert "REASON=the vloopback plugin reports the Mountpoint '206/fs', not an absolute path" in out
+    assert (
+        "REASON=the vloopback plugin reports the Mountpoint '206/fs', not an absolute path" in out
+    )
     assert not [call for call in _docker_calls(tmp_path) if " -v " in f" {call} "]
     assert _test_volumes_left(tmp_path) == set()
 
@@ -848,15 +964,30 @@ def test_vloopback_relative_mountpoint_fails_before_any_container_runs(tmp_path)
 def test_check_vloopback_passes_on_a_fixed_host(tmp_path):
     rc, out, fix = run_check(tmp_path, "check_vloopback")
     assert rc == 0 and fix == 0
-    assert f"PASS vloopback plugin (DATA_DIR={tmp_path / 'root'}/var/lib/docker/loopback): a 1 GB volume mounts" in out
+    assert (
+        f"PASS vloopback plugin (DATA_DIR={tmp_path / 'root'}/var/lib/docker/loopback): a 1 GB volume mounts"
+        in out
+    )
 
 
 @pytest.mark.parametrize(
     "seed, fix_line, command",
     [
-        ("absent", "FIX  The vloopback volume plugin is not installed", "bash   # installs it with DATA_DIR=<Docker data-root>/loopback"),
-        ("relative", "FIX  The vloopback plugin's DATA_DIR is 'loopback', not an absolute path", "bash   # sets DATA_DIR=<Docker data-root>/loopback"),
-        ("disabled", "FIX  The vloopback plugin is installed but disabled", "docker plugin enable vloopback"),
+        (
+            "absent",
+            "FIX  The vloopback volume plugin is not installed",
+            "bash   # installs it with DATA_DIR=<Docker data-root>/loopback",
+        ),
+        (
+            "relative",
+            "FIX  The vloopback plugin's DATA_DIR is 'loopback', not an absolute path",
+            "bash   # sets DATA_DIR=<Docker data-root>/loopback",
+        ),
+        (
+            "disabled",
+            "FIX  The vloopback plugin is installed but disabled",
+            "docker plugin enable vloopback",
+        ),
     ],
 )
 def test_check_vloopback_reports_the_fix_and_changes_nothing(tmp_path, seed, fix_line, command):
@@ -869,12 +1000,20 @@ def test_check_vloopback_reports_the_fix_and_changes_nothing(tmp_path, seed, fix
 def test_check_vloopback_mount_failure_is_a_fix_with_the_doc_link(tmp_path):
     rc, out, fix = run_check(tmp_path, "check_vloopback", env={"STUB_VLOOPBACK_MOUNT_FAILS": "1"})
     assert rc == 1 and fix == 1
-    assert "FIX  vloopback volumes fail on this host: a vloopback volume does not mount into a sysbox container" in out
-    assert "See https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback" in out
+    assert (
+        "FIX  vloopback volumes fail on this host: a vloopback volume does not mount into a sysbox container"
+        in out
+    )
+    assert (
+        "See https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
+        in out
+    )
 
 
 def test_check_vloopback_is_skipped_until_sysbox_is_registered(tmp_path):
-    rc, out, fix = run_check(tmp_path, "check_vloopback", env={"STUB_DOCKER_RUNTIMES": '{"runc":{}}'})
+    rc, out, fix = run_check(
+        tmp_path, "check_vloopback", env={"STUB_DOCKER_RUNTIMES": '{"runc":{}}'}
+    )
     assert rc == 0 and fix == 0
     assert "SKIP vloopback volumes — the test mounts one into a sysbox container" in out
     assert not [call for call in _docker_calls(tmp_path) if call.startswith("volume ")]
@@ -884,7 +1023,10 @@ def test_check_vloopback_is_skipped_until_the_test_image_is_pulled(tmp_path):
     # --check pulls nothing: a pull inside the mount test's timeout would read as a broken plugin
     rc, out, fix = run_check(tmp_path, "check_vloopback", env={"STUB_NO_VERIFY_IMAGE": "1"})
     assert rc == 0 and fix == 0
-    assert "SKIP vloopback volumes — the test runs daturaai/compute-subnet-executor:latest, which is not on this host yet" in out
+    assert (
+        "SKIP vloopback volumes — the test runs daturaai/compute-subnet-executor:latest, which is not on this host yet"
+        in out
+    )
     assert not [call for call in _docker_calls(tmp_path) if call.startswith("volume ")]
 
 
@@ -919,6 +1061,47 @@ def test_install_mode_does_not_change_the_plugin_under_a_rental(tmp_path):
     assert _plugin_changes(tmp_path) == []
 
 
+# ── fuse3 ───────────────────────────────────────────────────────────────────
+
+
+def test_fusermount3_present_passes(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_fuse3")
+    assert rc == 0
+    assert "PASS fusermount3 (fuse3), which sysbox-fs 0.7.1 needs." in out
+
+
+def test_fusermount3_missing_is_a_fix_that_names_fuse3(tmp_path):
+    # the sysbox-ce 0.7.1 .deb depends on fuse (v2) only; sysbox-fs calls fusermount3 and the postinst fails
+    rc, out, fixes = run_check(tmp_path, "check_fuse3", without=("fusermount3",))
+    assert rc == 1
+    assert fixes == 1
+    assert "FIX  fusermount3 is missing — sysbox-fs 0.7.1 needs fuse3" in out
+    assert "sudo apt-get install -y fuse3" in out
+
+
+def test_check_mode_reports_a_missing_fusermount3(tmp_path):
+    proc = run_script(tmp_path, "--check", without=("fusermount3",))
+    assert proc.returncode == 1
+    assert "FIX  fusermount3 is missing" in proc.stdout
+    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+
+
+def test_fuse3_is_installed_before_the_sysbox_deb():
+    with open(SCRIPT) as fh:
+        script = fh.read()
+    packages = script.index(
+        "apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1"
+    )
+    deb = script.index('apt_install install -y -qq "$SYSBOX_DEB" || exit 1')
+    assert packages < deb
+
+
+def test_diagnostics_name_a_missing_fusermount3(tmp_path):
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", without=("fusermount3",))
+    assert rc == 0
+    assert "fusermount3:         MISSING (apt-get install -y fuse3)" in out
+
+
 # ── the script as a provider runs it ─────────────────────────────────────────
 
 
@@ -938,7 +1121,10 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
     assert "Preflight: 10 PASS, 2 FIX, 1 SKIP." in proc.stdout
-    assert f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
+    assert (
+        f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check"
+        in proc.stdout
+    )
 
 
 @pytest.mark.parametrize(
@@ -955,7 +1141,10 @@ def test_install_mode_stops_before_installing_on_a_blocking_fix(tmp_path, env, f
     assert proc.returncode == 1
     assert fix_line in proc.stdout
     assert "Nothing was installed." in proc.stdout
-    assert "Sysbox is already working" not in proc.stdout and "Checking running containers" not in proc.stdout
+    assert (
+        "Sysbox is already working" not in proc.stdout
+        and "Checking running containers" not in proc.stdout
+    )
 
 
 def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
@@ -981,7 +1170,9 @@ def test_install_mode_upgrades_an_older_working_sysbox(tmp_path, installed):
 
 def test_install_mode_stops_on_a_stopped_rental(tmp_path):
     # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
-    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
+    proc = run_script(
+        tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"}
+    )
     assert proc.returncode == 1
     assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
     assert "docker ps -a --filter name=pod_" in proc.stdout
@@ -1002,8 +1193,16 @@ def test_install_mode_keeps_a_newer_sysbox(tmp_path):
         ({"STUB_NV_DRIVER": "575.57.08"}, (), "FIX  NVIDIA driver 575.57.08 is below 580.65.06"),
         ({}, ("nvidia-smi",), "FIX  nvidia-smi not found"),
         ({"STUB_DF_TOTAL_KB": str(500 * 1024 * 1024)}, (), "FIX  Disk 500.0 GB on "),
-        ({"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "nginx"}, (), "FIX  TCP 8080 (executor port) is already in use by "),
-        ({"STUB_UFW_STATUS": "Status: active"}, (), "FIX  TCP 2200 (SSH port) has no inbound allow rule in the active ufw"),
+        (
+            {"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "nginx"},
+            (),
+            "FIX  TCP 8080 (executor port) is already in use by ",
+        ),
+        (
+            {"STUB_UFW_STATUS": "Status: active"},
+            (),
+            "FIX  TCP 2200 (SSH port) has no inbound allow rule in the active ufw",
+        ),
     ],
 )
 def test_install_mode_goes_on_after_an_advisory_fix(tmp_path, env, without, fix_line):
@@ -1015,7 +1214,10 @@ def test_install_mode_goes_on_after_an_advisory_fix(tmp_path, env, without, fix_
     assert "The FIX lines above do not stop the install" in proc.stdout
     assert "Nothing was installed." not in proc.stdout
     assert "Sysbox is already working. Nothing to do." in proc.stdout
-    assert f"Run those commands, then: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
+    assert (
+        f"Run those commands, then: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check"
+        in proc.stdout
+    )
 
 
 def test_install_mode_goes_on_without_the_iptables_modules(tmp_path):
@@ -1045,7 +1247,10 @@ def test_not_root_is_a_fix_that_names_sudo(tmp_path, args):
     proc = run_script(tmp_path, *args, env={"STUB_UID": "1000"})
     assert proc.returncode == 1
     assert "FIX  Not running as root" in proc.stdout
-    assert f"sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'}{' --check' if args else ''}\n" in proc.stdout
+    assert (
+        f"sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'}{' --check' if args else ''}\n"
+        in proc.stdout
+    )
     # nothing else runs without root: the other checks would read the process table and Docker's socket as a user
     assert "Preflight: 0 PASS, 1 FIX, 0 SKIP." in proc.stdout
     if not args:
@@ -1074,7 +1279,10 @@ def test_fix_lines_name_the_curl_one_liner_when_piped_from_curl(tmp_path):
     out = ANSI.sub("", proc.stdout)
     assert proc.returncode == 1
     assert "FIX  sysbox-runc is not installed" in out
-    assert "curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash" in out
+    assert (
+        "curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash"
+        in out
+    )
     assert "sudo bash bash" not in out
 
 
@@ -1104,7 +1312,9 @@ def test_diagnostics_print_false_for_a_feature_the_installer_set_to_false(tmp_pa
 
 def test_diagnostics_say_when_there_is_no_daemon_json(tmp_path):
     """Regression: with no daemon.json the two lines were blank (jq's error went to /dev/null)."""
-    rc, out, _ = run_check(tmp_path, "failure_diagnostics", files={"etc/docker/daemon.json": None}, with_jq=True)
+    rc, out, _ = run_check(
+        tmp_path, "failure_diagnostics", files={"etc/docker/daemon.json": None}, with_jq=True
+    )
     assert rc == 0
     assert "daemon.json cdi:     no daemon.json" in out
     assert "daemon.json time-ns: no daemon.json" in out
