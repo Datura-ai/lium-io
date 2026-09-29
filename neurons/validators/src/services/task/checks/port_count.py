@@ -32,8 +32,9 @@ def hidden_from_renters_text(available_port_count: int) -> str:
 
 # The code the portal shows when it hides a node for too few verified ports; the listing reads
 # only `available_port_count`. It is the same string as this check's own failure reason, but
-# `listing_check` names the listing's verdict. A node with no free GPUs shows RENTED first, so a
-# partly rented node below the floor shows this code while its run passes.
+# `listing_check` is the port check's verdict; the portal shows it only when no earlier status
+# (RENTED, a new-rentals pause) applies, so a partly rented node below the floor shows it while
+# its run passes.
 LISTING_PORT_CHECK_CODE = "INSUFFICIENT_PORTS"
 
 
@@ -43,16 +44,11 @@ def declares_port_mappings(raw: Any) -> bool:
     Same rule as the platform's rent-path port-mapping parser: `[]`, `"[]"`, `"{}"` and
     unparsable text declare no mappings. The listing does not read mappings or the range.
     """
-    if not raw:
+    try:
+        raw = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
         return False
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return False
-    if not isinstance(raw, list):
-        return False
-    return any(isinstance(m, (list, tuple)) and len(m) >= 2 for m in raw)
+    return isinstance(raw, list) and any(isinstance(m, list) and len(m) >= 2 for m in raw)
 
 
 def port_floor_what(state: ContextState, available_port_count: int) -> dict[str, Any]:
@@ -73,7 +69,7 @@ def port_floor_what(state: ContextState, available_port_count: int) -> dict[str,
         else state.specs.get("port_range") or DEFAULT_PORT_RANGE_TEXT,
         "port_mappings_declared": port_mappings_declared,
         "probed_port_count": state.probed_port_count,
-        "no_ports_probed": state.probed_port_count == 0,
+        "no_ports_probed": not state.probed_port_count,
         "declared_port_count": state.declared_port_count,
     }
 
