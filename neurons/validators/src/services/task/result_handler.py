@@ -154,9 +154,7 @@ class ResultHandler:
                 "is_spot": is_spot,
             }
         )
-        specs = self._specs_with_verifyx_ema_hold(
-            context, specs, validation_event, executor_info.uuid
-        )
+        specs = self._specs_with_verifyx_ema_hold(context, specs, validation_event)
         # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
         # was actually performed (None → key omitted), mirroring gpu_metrics.
         # Rides executor.specs to the backend like tdx_attestation_passed.
@@ -240,7 +238,6 @@ class ResultHandler:
         context: Context,
         specs: dict[str, Any],
         validation_event: ValidationEvent | None,
-        executor_id: str,
     ) -> dict[str, Any]:
         """``specs`` with the VerifyX EMA held when this cycle must not move it and the flag is on."""
         # The pipeline names the fatal check that ended the run in the last event's summary.
@@ -260,7 +257,7 @@ class ResultHandler:
                     else "VerifyX EMA hold is off: this cycle's sample would not have moved it",
                     extra=get_extra_info(
                         {
-                            "executor_id": executor_id,
+                            "executor_id": context.executor.uuid,
                             "reason": ema_hold_reason,
                             "measured": specs.get("network"),
                             "published": held_specs.get("network"),
