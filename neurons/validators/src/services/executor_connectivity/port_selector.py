@@ -25,7 +25,6 @@ def tally_port_ranges(
     probed: Iterable[PortPair],
     answered: Iterable[PortPair],
     pass_number: int = 1,
-    answers_counted: bool = True,
 ) -> tuple[PortRangeResult, ...]:
     """Declared, probed and answered counts per declared range for one pass, ascending.
 
@@ -50,7 +49,6 @@ def tally_port_ranges(
             probed=sum(e in probed_ext for e in ports),
             answered=sum(e in answered_ext for e in ports),
             pass_number=pass_number,
-            answers_counted=answers_counted,
         )
 
     return tuple(tally(ports) for _, ports in sorted(buckets.items()))
@@ -75,9 +73,8 @@ class PortSelector:
     """Selects which ports to verify.
 
     Pass one (`select`) is the lowest `size` free declared ports, the check every host gets. Pass
-    two (`select_spread`) runs only when pass one verified fewer than MIN_PORT_COUNT, counted after
-    the DinD probe has taken its port, and never after a failed DinD probe: up to `size`
-    ports spread evenly over the free declared ports pass one did not test, always including the
+    two (`select_spread`) runs with PORT_PROBE_TOPUP_BELOW_FLOOR on, when fewer than MIN_PORT_COUNT
+    are verified after the top-up, which re-probes only pass one's ports: up to `size` ports spread evenly over the free declared ports pass one did not test, always including the
     highest. On 40000-65535 pass two probes every 84th or 85th port from 40300 up, so a block
     forwarded at the top verifies 3 ports when it is 170 ports or wider, and a block anywhere above
     pass one's ports when it is 254 ports or wider. For the same declaration and rental set both
@@ -114,3 +111,8 @@ class PortSelector:
             if p.external not in unavailable_ports and p.external not in pass_one_external
         ]
         return spread_ports(untested_free_ports, size)
+
+    def declared_count(self, executor_info: ExecutorSSHInfo) -> int:
+        """How many ports the executor declares, before rented, filler and batch-size limits."""
+        return len(get_all_ports(executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port))
+

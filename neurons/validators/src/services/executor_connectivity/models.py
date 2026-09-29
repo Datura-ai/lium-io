@@ -16,6 +16,8 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
+    # the tiers that produced `successful`, joined with "+" when a top-up merged two
+    tier: str = "batch"
     # False when every batch attempt failed to start, timed out or raised mid-test
     batch_completed: bool = False
 
@@ -73,37 +75,28 @@ class PortRangeResult:
     declared: int
     probed: int
     answered: int
-    # 1: the lowest-300 pass every host gets; 2: the spread pass run only when pass one verified < 3
+    # 1: the lowest-300 pass every host gets; 2: the spread pass run only when still below 3 after the top-up
     pass_number: int = 1
-    # False: the container check on one of these answers failed, so none is a verified port
-    answers_counted: bool = True
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
-        entry: dict[str, object] = {
+        return {
             "pass": self.pass_number,
             "range": label,
             "declared": self.declared,
             "probed": self.probed,
             "answered": self.answered,
         }
-        if not self.answers_counted:
-            entry["counted"] = False
-        return entry
 
 
 class SecondPass(StrEnum):
-    """Why pass two did or did not run. It restores the port count only: after a failed container
-    (DinD) check the result is the one-pass check's."""
+    """Why pass two did or did not run (PORT_PROBE_TOPUP_BELOW_FLOOR on)."""
 
-    NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more after DinD
-    SKIPPED_CONTAINER_FAILED = "skipped_container_failed"  # DinD failed on a pass-one port
+    NOT_NEEDED = "not_needed"  # MIN_PORT_COUNT or more verified after DinD and the top-up
     SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
     NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
     RAN = "ran"
     BATCH_FAILED = "batch_failed"  # pass two's own batch container didn't complete
-    # pass one had no answer and DinD failed on a pass-two answer, so none of pass two's answers count
-    DISCARDED_CONTAINER_FAILED = "discarded_container_failed"
 
 
 @dataclass(frozen=True)
@@ -112,12 +105,6 @@ class SecondPassRun:
     probed: list[PortPair] = field(default_factory=list)
     answered: list[PortPair] = field(default_factory=list)
     failed: list[PortPair] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class DindCheck:
-    port: PortPair
-    result: DindProbeResult
 
 
 @dataclass(frozen=True)
@@ -137,6 +124,9 @@ class PortVerificationResult:
     # one's tallies, then pass two's when it ran.
     port_ranges: tuple[PortRangeResult, ...] = ()
     second_pass: SecondPass | None = None
+    probe_tier: str | None = None
+    # len(get_all_ports(...)) for the executor's declared range or mappings; None when they could not be parsed
+    declared_port_count: int | None = None
 
 
 @dataclass(frozen=True)

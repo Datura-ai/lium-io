@@ -14,14 +14,6 @@ SECOND_PASS_NOTES: dict[SecondPass, str] = {
         "second port pass skipped: the first pass's batch container didn't complete "
         "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
     ),
-    SecondPass.SKIPPED_CONTAINER_FAILED: (
-        "second port pass skipped: the container (DinD) check failed, so the second pass "
-        "cannot add ports and the host keeps the first pass's result"
-    ),
-    SecondPass.DISCARDED_CONTAINER_FAILED: (
-        "second port pass not counted: the container (DinD) check on one of its ports failed, "
-        "so none of its answers count (tallied with counted=False)"
-    ),
 }
 
 
@@ -73,9 +65,15 @@ class PortConnectivityCheck:
             },
         )
         verified_port_count = len(result.successful_ports)
+        probed_port_count = len(result.selected_ports)
+        declared_port_count = result.declared_port_count
         extra_info: dict[str, object] = {
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
+            "probed_port_count": probed_port_count,
+            "declared_port_count": declared_port_count,
+            "probe_tier": result.probe_tier,
+            "dind_ok": result.dind_ok,
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
@@ -95,6 +93,8 @@ class PortConnectivityCheck:
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
+            probed_port_count=probed_port_count,
+            declared_port_count=declared_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
         )

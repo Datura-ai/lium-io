@@ -1,6 +1,7 @@
 import random
 
 import pytest
+from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services.const import BATCH_PORT_VERIFICATION_SIZE
@@ -160,7 +161,9 @@ def test_tally_nothing_declared():
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
+@pytest.mark.parametrize("topup", [False, True])
+async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker, monkeypatch, topup):
+    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", topup)
     info = _executor_info(port_range="9000-9001")
     port_probe = mocker.Mock(spec=PortProbe)
     dind_probe = mocker.Mock(spec=DindProbe)
@@ -175,7 +178,7 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
 
     assert result.status == "no_ports"
     assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)
-    assert result.second_pass == SecondPass.NO_PORTS_LEFT
+    assert result.second_pass == (SecondPass.NO_PORTS_LEFT if topup else None)
 
 
 @pytest.mark.asyncio

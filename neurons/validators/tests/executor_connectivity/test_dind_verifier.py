@@ -553,6 +553,52 @@ async def test_dind_verifier_diagnosis_read_failure_still_returns_a_cause(mocker
     assert any("docker rm -fv" in call.args[0] for call in ssh_client.run.await_args_list)
 
 
+@pytest.mark.asyncio
+async def test_dind_verifier_removes_the_container_when_cancelled_mid_probe(mocker):
+    # The validation fast path cancels this check when the sibling lane stops; the probe
+    # container must not stay behind with its port bound until the next wave's cleanup.
+    port = PortPair(9000, 9000)
+    verifier, ssh_client = _build_started_dind(mocker)
+    hang = asyncio.Event()
+
+    async def connect_forever(*args, **kwargs):
+        await hang.wait()
+
+    mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect", side_effect=connect_forever)
+
+    task = asyncio.ensure_future(
+        verifier.verify(port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert [("docker run" in c, "docker rm -fv" in c) for c in commands] == [(True, False), (False, True)], commands
+    assert "container_miner_9000" in commands[1]
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_removes_the_container_once_on_every_way_out(mocker):
+    port = PortPair(9000, 9000)
+    # docker run fails; docker run ok but the ssh connect raises
+    for docker_run_ok, connect_side_effect in ((False, None), (True, RuntimeError("ssh exploded"))):
+        verifier, ssh_client = _build_started_dind(mocker)
+        if not docker_run_ok:
+            ssh_client.run = mocker.AsyncMock(
+                side_effect=[_run_result(mocker, exit_status=1, stderr="boom"), _run_result(mocker, exit_status=0)]
+            )
+        if connect_side_effect is not None:
+            mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect", side_effect=connect_side_effect)
+        result = await verifier.verify(
+            port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True
+        )
+        assert result.success is False
+        removals = [c for c in ssh_client.run.await_args_list if "docker rm -fv" in str(c.args[0])]
+        assert len(removals) == 1, (docker_run_ok, connect_side_effect)
+
+
 # DAH-3634 — `docker run` refused by the NVIDIA container hook names the real cause.
 
 # verbatim from the validator log (`DinD creation failed`)

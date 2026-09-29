@@ -494,8 +494,6 @@ async def test_port_connectivity_event_carries_the_per_range_tallies(context_fac
         ("ran", False),
         ("batch_failed", False),
         ("skipped_batch_failed", "batch container didn't complete"),
-        ("skipped_container_failed", "container (DinD) check failed"),
-        ("discarded_container_failed", "none of its answers count"),
     ],
 )
 @pytest.mark.parametrize("success", [True, False])
