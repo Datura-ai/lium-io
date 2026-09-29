@@ -7,6 +7,7 @@ import os
 import pathlib
 import shlex
 import shutil
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -781,12 +782,15 @@ async def test_refresh_on_and_hash_match_runs_nothing_on_the_executor(refresh_on
 async def test_mismatch_fetches_installs_by_rename_and_the_check_passes(local_library):
     shell = LocalExecutor()
     ssh = FakeSSH()
+    old_inode = local_library.lib.stat().st_ino
     result = await _validate(shell, ssh, local_library.service)
     assert result.error is None
     assert result.report is not None
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_REPLACED"
     assert _kinds(shell) == ["write-check", "install"]
     assert local_library.lib.read_bytes() == local_library.source.read_bytes()
+    # a rename puts a new inode at the path; a copy would have rewritten the old one in place
+    assert local_library.lib.stat().st_ino != old_inode
     assert oct(local_library.lib.stat().st_mode & 0o777) == "0o644"
     # downloaded beside the library (same filesystem, so mv is a rename), and nothing left over
     assert shell.temp_used().parent == local_library.lib.parent
@@ -844,6 +848,37 @@ async def test_failed_install_is_a_fetch_failure(local_library):
 
 @needs_shell_tools
 @pytest.mark.asyncio
+async def test_a_curl_error_after_the_full_download_is_not_installed(local_library):
+    # curl wrote every byte (the hash matches) but reported an error, e.g. --max-time at the end
+    shell = LocalExecutor(limits='curl() { command curl "$@"; return 28; }; ')
+    result = await _validate(shell, service=local_library.service)
+    assert result.diagnostics["fetch_error"].startswith("curl exit 28: ")
+    assert local_library.lib.read_bytes() == STALE_BYTES
+    assert local_library.leftovers() == []
+
+
+@needs_shell_tools
+@pytest.mark.asyncio
+async def test_a_dropped_ssh_session_removes_the_download(local_library):
+    stalled = local_library.source.with_name("stalled.so")
+    os.mkfifo(stalled)  # curl blocks opening it: a download in flight
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/sh", "-c", local_library.service._install_command(stalled.as_uri()),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    for _ in range(250):
+        if local_library.leftovers():
+            break
+        await asyncio.sleep(0.02)
+    assert local_library.leftovers(), "the temp file exists while the download runs"
+    os.killpg(proc.pid, signal.SIGHUP)  # what the session's processes get when SSH drops
+    await asyncio.wait_for(proc.communicate(), 10)
+    assert local_library.leftovers() == []
+    assert local_library.lib.read_bytes() == STALE_BYTES
+
+
+@needs_shell_tools
+@pytest.mark.asyncio
 async def test_a_url_with_a_quote_and_command_substitution_is_one_word(local_library):
     source = local_library.source.with_name("lib'$(id).so")
     local_library.source.rename(source)
@@ -872,6 +907,13 @@ async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, f
     result = await _validate(shell)
     assert result.error is None
     assert _kinds(shell) == ["write-check", "install"]
+
+
+@pytest.mark.asyncio
+async def test_a_hash_marker_that_is_not_a_sha256_is_reported_as_none(refresh_on, full_sha_validator):
+    shell = refreshing_executor(install_stdout="TMP:/usr/lib/.libinspector.so.AbC123\nCURL_RC:0\nSHA256:sha256sum: not found\n")
+    result = await _validate(shell)
+    assert result.diagnostics["fetch_error"] == f"fetched sha256 None != validator {full_sha_validator}"
 
 
 @pytest.mark.asyncio
