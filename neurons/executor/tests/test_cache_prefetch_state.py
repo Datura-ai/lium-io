@@ -2,7 +2,8 @@
 
 The validator reads this document when it zeroes a node for a bad image digest, and it
 is the only thing a reader will have: the loop's log lines never leave the provider's
-machine. So every exit path must be named, every error text must survive, and neither
+machine. So every exit path must be named, every error text must survive (with any
+credentials in it removed), and neither
 the document nor a broken write may ever disturb the loop.
 """
 
@@ -24,6 +25,8 @@ from services.cache_prefetch_state import (  # noqa: E402
     CachePrefetchState,
     Outcome,
     _ImageRecord,
+    describe_error,
+    redact,
 )
 
 from services import cache_template_service  # noqa: E402
@@ -376,6 +379,66 @@ def test_error_text_is_clipped():
     state.record_image_outcome(IMAGE_REF, Outcome.PULL_FAILED, error="x" * 5_000)
 
     assert len(_image(state)["last_error"]) <= MAX_ERROR_CHARS + 1
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Cannot connect to https://provider:s3cret@backend.example:8443/api",
+            "Cannot connect to https://***@backend.example:8443/api",
+        ),
+        ("401, url='https://s3cret@backend.example/x'", "401, url='https://***@backend.example/x'"),
+        ("Authorization: Bearer s3cret.value", "Authorization: Bearer ***"),
+        ("basic s3cret", "basic ***"),
+        ("sent token abcdefghijklmnop0123 to backend.example", "sent token *** to backend.example"),
+        ("X-Api-Key: s3cret", "X-Api-Key: ***"),
+        (
+            "GET https://backend.example/x?gpu=H100&access_token=s3cret&sig=s3cret#top",
+            "GET https://backend.example/x?gpu=H100&access_token=***&sig=***#top",
+        ),
+        ("password=s3cret rejected", "password=*** rejected"),
+        ("pushed with ghp_" + "a" * 36, "pushed with ***"),
+    ],
+)
+def test_redact_removes_credentials_and_keeps_the_rest(text, expected):
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"manifest for {REPO}@{FRESH_DIGEST} not found",
+        "toomanyrequests: You have reached your pull rate limit",
+        "token expired",
+        "Cannot connect to host backend.example:443 ssl:default [Connection refused]",
+    ],
+)
+def test_redact_leaves_errors_without_credentials_unchanged(text):
+    assert redact(text) == text
+
+
+def test_an_error_is_described_by_its_class_and_redacted_text():
+    assert describe_error(RuntimeError("Bearer s3cret")) == "RuntimeError: Bearer ***"
+    assert describe_error(TimeoutError()) == "TimeoutError"
+    assert describe_error("HTTP 503") == "HTTP 503"
+
+
+def test_the_document_drops_credentials_from_every_error_and_the_backend_url():
+    state = CachePrefetchState(path=None, backend_url="https://provider:s3cret@backend.example")
+
+    state.note_docker(available=False, error=RuntimeError("Bearer s3cret"))
+    state.note_loop_error(ConnectionError("https://provider:s3cret@backend.example refused"))
+    state.record_loop_outcome(Outcome.LOOP_ERROR, error=ValueError("password=s3cret"))
+    state.record_image_outcome(IMAGE_REF, Outcome.PULL_FAILED, error="?token=s3cret")
+
+    payload = state.render()
+    assert "s3cret" not in payload
+    doc = json.loads(payload)
+    assert doc["backend_url"] == "https://***@backend.example"
+    assert doc["docker_error"] == "RuntimeError: Bearer ***"
+    assert doc["last_loop_error"] == "ConnectionError: https://***@backend.example refused"
+    assert doc["last_error"] == "ValueError: password=***"
 
 
 def test_document_is_capped_and_marked_truncated():

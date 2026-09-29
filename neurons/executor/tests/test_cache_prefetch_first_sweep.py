@@ -151,19 +151,46 @@ def test_an_unknown_gpu_at_boot_uses_none_of_the_fast_retries(monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize(
-    "error", [aiohttp.ClientError("Authorization: Bearer s3cret"), RuntimeError("Bearer s3cret")]
+    "error",
+    [
+        aiohttp.InvalidURL(
+            "https://provider:s3cret@backend.example/executors/default-docker-image"
+        ),
+        aiohttp.ClientError("GET https://backend.example/executors?api_token=s3cret failed"),
+        RuntimeError("backend.example answered 401 to Authorization: Bearer s3cret"),
+    ],
 )
-def test_a_loop_error_logs_its_class_not_its_text(monkeypatch, tmp_path, error):
+def test_a_loop_error_reaches_log_and_document_without_its_credentials(
+    monkeypatch, tmp_path, error
+):
     logger = MagicMock()
     monkeypatch.setattr(cache_template_service, "logger", logger)
 
     _, doc = _drive_loop(monkeypatch, [error], sleeps_before_stop=1, tmp_path=tmp_path)
 
     (message,), _ = logger.error.call_args
-    assert message.endswith(type(error).__name__)
-    assert "s3cret" not in message
-    # The state document, not the log, keeps the text.
-    assert "s3cret" in doc["last_loop_error"]
+    for text in (message, doc["last_loop_error"], doc["last_error"]):
+        assert "s3cret" not in text
+        assert type(error).__name__ in text
+        assert "backend.example" in text
+
+
+def test_the_backend_url_is_published_without_its_credentials(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cache_template_service.settings,
+        "COMPUTE_REST_API_URL",
+        "https://provider:s3cret@backend.example/api",
+    )
+    monkeypatch.setattr(
+        cache_template_service.docker, "from_env", MagicMock(side_effect=RuntimeError("no docker"))
+    )
+    path = tmp_path / "state.json"
+
+    asyncio.run(cache_template_service.run_cache_template_prefetch(str(path)))
+
+    backend_url = json.loads(path.read_text())["backend_url"]
+    assert "s3cret" not in backend_url
+    assert backend_url == "https://***@backend.example/api/executors/default-docker-image"
 
 
 def test_retry_jitter_stays_inside_its_bound():

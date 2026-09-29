@@ -28,7 +28,12 @@ import pynvml
 
 from core.config import settings
 from core.logger import get_logger
-from services.cache_prefetch_state import STATE_PATH, CachePrefetchState, Outcome
+from services.cache_prefetch_state import (
+    STATE_PATH,
+    CachePrefetchState,
+    Outcome,
+    describe_error,
+)
 from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller
 from services.pull_lock import cache_pull_lock
 
@@ -70,8 +75,8 @@ def _get_gpu_info() -> tuple[str, str, str | None]:
         if isinstance(driver_version, bytes):
             driver_version = driver_version.decode("utf-8")
     except Exception as e:
-        logger.error(f"Failed to get GPU info for cache pre-pull: {e}")
-        error = str(e)
+        logger.error(f"Failed to get GPU info for cache pre-pull: {describe_error(e)}")
+        error = describe_error(e)
     finally:
         try:
             pynvml.nvmlShutdown()
@@ -304,7 +309,7 @@ async def _run_pre_pull_sweep(
         raise
     except Exception as e:
         # Opportunistic: never let it change the default image's outcome.
-        logger.warning(f"pre-pull sweep failed: {e}")
+        logger.warning(f"pre-pull sweep failed: {describe_error(e)}")
 
 
 async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> None:
@@ -483,20 +488,20 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     logger.info("Cache template pre-pull cancelled")
                     raise
                 except aiohttp.ClientError as e:
-                    logger.error(f"Network error during cache pre-pull: {type(e).__name__}")
+                    logger.error(f"Network error during cache pre-pull: {describe_error(e)}")
                     state.note_loop_error(e)
                     state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                     state.flush()
                     await asyncio.sleep(next_error_sleep_seconds())
                 except Exception as e:
-                    logger.error(f"Unexpected error during cache pre-pull: {type(e).__name__}")
+                    logger.error(f"Unexpected error during cache pre-pull: {describe_error(e)}")
                     state.note_loop_error(e)
                     state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                     state.flush()
                     await asyncio.sleep(next_error_sleep_seconds())
         finally:
-            # However the loop ends (cancelled at shutdown, or a BaseException the handlers
-            # above let through), the sweep it started does not outlive it: an orphan sweep
+            # However the loop is cancelled (at shutdown, even inside an error backoff sleep),
+            # the sweep it started does not outlive it: an orphan sweep
             # would keep pulling and holding the pull lock with nothing left to read its
             # outcome. Cancelled, not awaited: a pull already in its thread runs to its
             # budget or read timeout either way, and awaiting it would hold shutdown that long.

@@ -24,6 +24,7 @@ import copy
 import functools
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,11 +80,53 @@ def _utcnow() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Credentials an error's text can carry: the user:password (or token) part of a URL such as
+# COMPUTE_REST_API_URL, a bearer/basic/token value, an API-key header, a known token shape, and
+# a secret-named query or key=value parameter. Hosts, paths, status codes and image digests are
+# kept: they are what a provider needs to act on the error.
+_REDACTIONS = (
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@'\"]+@"), r"\1***@"),
+    (re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s'\",;]+"), r"\1\2***"),
+    (re.compile(r"(?i)\b(token)(\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1\2***"),
+    (re.compile(r"(?i)\b((?:x-)?api[-_]?key|x-auth-token)(\s*:\s*)[^\s'\",;]+"), r"\1\2***"),
+    (
+        re.compile(
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+            r"|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
+        ),
+        "***",
+    ),
+    (
+        re.compile(
+            r"(?i)([?&;\s]|^)([\w.-]*(?:token|key|secret|passw(?:or)?d|pwd|auth|sig|credential)"
+            r"[\w.-]*=)[^&\s#'\",;]+"
+        ),
+        r"\1\2***",
+    ),
+)
+
+
+def redact(text: str) -> str:
+    """``text`` with any credentials in it replaced by ``***``."""
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def describe_error(error: object) -> str:
+    """How an error is shown in the log and in the document: its class and its redacted text."""
+    if isinstance(error, BaseException):
+        message = redact(str(error))
+        name = type(error).__name__
+        return f"{name}: {message}" if message else name
+    return redact(str(error))
+
+
 def _clip(value: object | None, limit: int = MAX_ERROR_CHARS) -> str | None:
-    """Stringify and bound one error message. ``None`` stays ``None``."""
+    """Describe and bound one error message. ``None`` stays ``None``."""
     if value is None:
         return None
-    text = str(value)
+    text = describe_error(value)
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -216,7 +259,7 @@ class CachePrefetchState:
         self._started_at = _utcnow()
         self._sweep_count = 0
         self._executor_version = _executor_version()
-        self._backend_url = backend_url
+        self._backend_url = redact(backend_url) if backend_url else None
         self._refresh_interval_seconds = refresh_interval_seconds
 
         self._gpu_model: str | None = None
