@@ -406,6 +406,13 @@ class Settings(BaseSettings):
     # one POST per outage stays the probe's.
     RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
     RENTED_POD_SSH_ENFORCE_AFTER_CYCLES: int | None = Field(env="RENTED_POD_SSH_ENFORCE_AFTER_CYCLES", default=None, ge=1)
+    # P320 — a rented node whose own scrape finds the GPU runtime dead on the host (NVML raised: driver
+    # not loaded, a card off the bus, a driver/library mismatch; or NVML listed zero cards) is reset the
+    # way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend marks the executor
+    # inactive and stops billing the renter for a pod that has no GPU. Only the validator's scrape on the
+    # host decides; nothing read from the renter's container does. A later clean scrape validates the
+    # node as usual. Off: the scrape failure halts the cycle without a reset, as before.
+    RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=True)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
