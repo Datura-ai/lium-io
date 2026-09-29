@@ -1083,7 +1083,7 @@ def test_check_mode_reports_a_missing_fusermount3(tmp_path):
     proc = run_script(tmp_path, "--check", without=("fusermount3",))
     assert proc.returncode == 1
     assert "FIX  fusermount3 is missing" in proc.stdout
-    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 13 PASS, 1 FIX, 0 SKIP." in proc.stdout
 
 
 def test_fuse3_is_installed_before_the_sysbox_deb():
@@ -1109,7 +1109,7 @@ def test_check_mode_on_a_good_host_exits_zero_with_a_summary(tmp_path):
     proc = run_script(tmp_path, "--check")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FIX  " not in proc.stdout
-    assert "Preflight: 13 PASS, 0 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 14 PASS, 0 FIX, 0 SKIP." in proc.stdout
 
 
 def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_path):
@@ -1120,7 +1120,7 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "FIX  NVIDIA container toolkit is not installed" in proc.stdout
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
-    assert "Preflight: 10 PASS, 2 FIX, 1 SKIP." in proc.stdout
+    assert "Preflight: 11 PASS, 2 FIX, 1 SKIP." in proc.stdout
     assert (
         f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check"
         in proc.stdout
@@ -1235,7 +1235,7 @@ def test_check_mode_still_exits_one_on_an_advisory_fix(tmp_path):
     proc = run_script(tmp_path, "--check", env={"STUB_NV_DRIVER": "575.57.08"})
     assert proc.returncode == 1
     assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in proc.stdout
-    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 13 PASS, 1 FIX, 0 SKIP." in proc.stdout
     assert "do not stop the install" not in proc.stdout
     # the installer never installs a driver: pointing at it is the reinstall loop of ticket-0309
     script = tmp_path / "executor" / "nvidia_docker_sysbox_setup.sh"
