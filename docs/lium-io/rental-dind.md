@@ -44,6 +44,10 @@ the host daemon reports them. A provider whose daemon hands out addresses inside
 Docker's own pools in the pod, and the validator logs `Inner Docker daemon address pools` with
 `outcome=skipped_pod_network_overlap: …`.
 
+The image's `daemon.json` is the renter's, so the validator reads at most 64 KiB of it. A larger
+one is refused before it is read, the pod gets Docker's own pools, and the log says
+`outcome=failed: … is larger than 65536 bytes`.
+
 ## The store across dockerd versions
 
 After a pod starts, the validator writes the pod's `dockerd --version` line to
