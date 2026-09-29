@@ -29,7 +29,8 @@ is False. A fault that rests only on detail rows cut short by a non-loss NVML er
 count still covers the rental and the anchor, or on an anchored UUID missing from a scrape that lists
 another card twice while its rows still cover every card (`confirm_first`), posts from its second
 consecutive cycle instead. The first clean cycle after a recorded incident posts
-`state=recovered` and deletes the mark once the backend answered. A backend that is down or older (404) is
+`state=recovered` and deletes the mark once the backend answered that it closed the incident (not
+`notify_failed` or `disabled`). A backend that is down or older (404) is
 no answer: the next cycle asks again. Redis down: the fault is still posted every cycle (the backend keeps
 one open incident per pod, so the renter is told once), except a `confirm_first` one, which cannot count
 cycles, and the recovery is not; the check's verdict never depends on Redis.
@@ -96,6 +97,8 @@ STATE_RECOVERED = "recovered"
 # A delivery that needs no retry of the fault report, and one that means the backend holds the incident.
 _NO_RETRY_DELIVERIES = frozenset({None, "notified", "recorded", GPU_DROP_DELIVERY_NOT_RENTED})
 _NOT_RECORDED_DELIVERIES = frozenset({GPU_DROP_DELIVERY_DISABLED, GPU_DROP_DELIVERY_NOT_RENTED})
+# A recovery answer that leaves the recorded incident open, so the mark stays and the next clean cycle asks again.
+_RECOVERY_RETRY_DELIVERIES = frozenset({GPU_DROP_DELIVERY_NOTIFY_FAILED, GPU_DROP_DELIVERY_DISABLED})
 
 
 @dataclass(frozen=True)
@@ -447,7 +450,7 @@ class RentedGpuDropCheck:
         done = not mark.recorded
         if mark.recorded and not settings.DRY_RUN:
             answer = await self._post(ctx, pod, STATE_RECOVERED, mark, None, totals)
-            done = answer is not None and answer.delivery != GPU_DROP_DELIVERY_NOTIFY_FAILED
+            done = answer is not None and answer.delivery not in _RECOVERY_RETRY_DELIVERIES
         if done and redis_ok:
             try:
                 await ctx.services.redis.delete(_key(pod.pod_id))

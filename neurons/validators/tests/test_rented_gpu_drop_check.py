@@ -443,6 +443,26 @@ async def test_a_refused_recovery_notice_is_posted_again(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_a_recovery_answered_disabled_is_posted_again_once_the_switch_is_back(context_factory):
+    services = _services()
+    await _run(context_factory, services, listed=UUIDS[:5])
+    services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
+        recorded=False, delivery="disabled"
+    )
+    await _run(context_factory, services, listed=UUIDS)
+    assert services.redis.store != {}
+    services.backend.report_rented_gpu_drop.return_value = NOTIFIED
+    await _run(context_factory, services, listed=UUIDS)
+    await _run(context_factory, services, listed=UUIDS)
+
+    states = [
+        call.kwargs["state"] for call in services.backend.report_rented_gpu_drop.await_args_list
+    ]
+    assert states == ["fault", "recovered", "recovered"]
+    assert services.redis.store == {}
+
+
+@pytest.mark.asyncio
 async def test_no_recovery_is_posted_for_an_incident_the_backend_never_recorded(context_factory):
     services = _services(answer=RentedGpuDropResponse(recorded=False, delivery="disabled"))
     await _run(context_factory, services, listed=UUIDS[:5])
