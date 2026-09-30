@@ -131,7 +131,7 @@ class DefaultIncentive(BaseIncentive):
     def _record_validation_failed_reason(result: JobResult) -> None:
         """A result whose run stopped at a failed check earns 0; record that check's code.
 
-        A run that passed every check and still scored 0 (collateral, CPU truth, an outdated
+        A run that passed every check and still scored 0 (CPU truth, an outdated
         image, a rented node's halt) records nothing here: it names no check to fix.
         """
         if result.is_successful:

@@ -253,15 +253,17 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-coll
 
 The command logs the reclaim request ID; keep it for the finalize step.
 
+If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known.
+
 ### Getting Miner Reclaim Requests
 
-To view all reclaim requests for the current miner, use the following command:
+To view open reclaim requests, use the following command:
 
 ```bash
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-reclaim-requests
 ```
 
-This will print a JSON list of all reclaim requests made by the miner, including their status and details.
+This prints the open reclaim requests started in the last ~1000 blocks (about 3 hours) for executors in this miner's database.
 
 ### Contract versions
 

@@ -2,6 +2,7 @@
 
 import logging
 import traceback
+from json import JSONDecodeError
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
@@ -47,7 +48,11 @@ SENDS = {selector("finalizeReclaim(uint256)"), selector("reclaimCollateral(bytes
 
 
 class FakeProvider(AsyncBaseProvider):
-    """Answers the JSON-RPC methods the client uses; eth_call is routed by function selector."""
+    """Answers the JSON-RPC methods the client uses; eth_call is routed by function selector.
+
+    A broadcast transaction is mined when `mine_sent` is on. Only mined hashes have a receipt, except TX_HASH, the
+    hash every broadcast answers with, whose receipt is the one a send waits for.
+    """
 
     SEND_ERRORS = {"refused": "insufficient funds", "known": "already known"}
 
@@ -75,6 +80,9 @@ class FakeProvider(AsyncBaseProvider):
         self.sent = []
         self.chain_id = CHAIN_ID
         self.send_error = None
+        self.nonce = NONCE
+        self.mine_sent = True
+        self.mined = set()
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -93,12 +101,14 @@ class FakeProvider(AsyncBaseProvider):
             error = {"code": 3, "message": "execution reverted", "data": self.revert_data or "0x"}
             return {"jsonrpc": "2.0", "id": 1, "error": error}
         if method == "eth_getTransactionCount":
-            nonce = self.pending_nonce if params[1] == "pending" else NONCE
+            nonce = self.pending_nonce if params[1] == "pending" else self.nonce
             return {"jsonrpc": "2.0", "id": 1, "result": hex(nonce)}
         if method == "eth_sendRawTransaction":
             if self.send_error in self.SEND_ERRORS:
                 return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": self.SEND_ERRORS[self.send_error]}}
             self.sent.append(params[0])
+            if self.mine_sent:
+                self.mined.add(AsyncWeb3.keccak(hexstr=params[0]).hex())
             if self.send_error == "lost":
                 raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
             return {"jsonrpc": "2.0", "id": 1, "result": TX_HASH}
@@ -122,6 +132,10 @@ class FakeProvider(AsyncBaseProvider):
                 "type": "0x0",
             },
         }
+        if method == "eth_getTransactionReceipt" and params[0] != TX_HASH:
+            if params[0] not in self.mined:
+                return {"jsonrpc": "2.0", "id": 1, "result": None}
+            results[method] = {**results[method], "transactionHash": params[0]}
         if method not in results:
             raise AssertionError(f"unexpected RPC call {method}")
         return {"jsonrpc": "2.0", "id": 1, "result": results[method]}
@@ -264,12 +278,16 @@ async def test_send_without_a_key_sends_nothing():
     assert provider.sent == []
 
 
-async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_sends_nothing(monkeypatch, caplog):
-    provider = FakeProvider()
-    client = client_with(provider)
+async def lost_receipt(*_args, **_kwargs):
+    raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
 
-    async def lost_receipt(*_args, **_kwargs):
-        raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
+
+async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_reads_it_and_sends_nothing_new(
+    monkeypatch, caplog
+):
+    provider = FakeProvider()
+    provider.mine_sent = False
+    client = client_with(provider)
 
     monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
     with caplog.at_level(logging.INFO, logger="core.collateral"):
@@ -279,40 +297,46 @@ async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_sends_nothing(
     assert "secret-rpc-key" not in str(raised.value)
     assert f"Sent transaction {TX_HASH}" in caplog.text
 
-    # still pending: the retry sends nothing
-    provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralTransactionError, match="still pending; no transaction was sent"):
+    # not mined, nonce unused: the same bytes go out again, and nothing new is signed
+    with pytest.raises(CollateralOutcomeUnknownError, match="broadcast again and no new transaction was sent"):
         await client.reclaim_collateral(EXECUTOR)
-    # mined: the contract now rejects the same call, and the retry sends nothing
-    provider.pending_nonce = NONCE
-    provider.simulate_revert = "0x" + selector("InsufficientCollateralForReclaim()")
-    with pytest.raises(CollateralTransactionError, match=r"rejects this call \(InsufficientCollateralForReclaim\)"):
+    assert provider.sent == [provider.sent[0]] * 2
+
+    # mined: the retry reports it and sends nothing
+    provider.mined.add(AsyncWeb3.keccak(hexstr=provider.sent[0]).hex())
+    provider.nonce = NONCE + 1
+    with pytest.raises(CollateralTransactionError, match="succeeded in block 16; no new transaction was sent"):
         await client.reclaim_collateral(EXECUTOR)
-    assert len(provider.sent) == 1
+    assert len(provider.sent) == 2
 
 
-async def test_a_send_the_mempool_dropped_is_replaced_on_the_same_nonce_and_nothing_blocks_later_sends(
+async def test_a_send_the_mempool_dropped_goes_out_again_as_the_same_bytes_and_later_work_is_not_blocked(
     monkeypatch,
 ):
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
+    provider.mine_sent = False
     client = client_with(provider)
 
-    async def lost_receipt(*_args, **_kwargs):
-        raise ConnectionError("receipt response lost")
-
+    wait_for_receipt = client.w3.eth.wait_for_transaction_receipt
     monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
     with pytest.raises(CollateralOutcomeUnknownError):
         await client.finalize_reclaim(5)
-    monkeypatch.undo()
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", wait_for_receipt)
 
-    # evicted unmined: the nonce never advanced and nothing is pending, so the retry goes out on the same nonce
-    await client.finalize_reclaim(5)
-    assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [NONCE, NONCE]
-    await client.finalize_reclaim(5)
-    assert len(provider.sent) == 3
+    # evicted unmined: the nonce never advanced and nothing is pending; the retry broadcasts the same bytes,
+    # which are mined this time, and reports that
+    provider.mine_sent = True
+    with pytest.raises(CollateralTransactionError, match="sent earlier, succeeded in block 16"):
+        await client.finalize_reclaim(5)
+    assert provider.sent == [provider.sent[0]] * 2
+
+    # request 5 is closed now; another request still goes out, on the next nonce
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    await client.finalize_reclaim(6)
+    assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [NONCE, NONCE, NONCE + 1]
 
 
-async def test_a_lost_broadcast_answer_names_the_hash_and_the_retry_sends_nothing():
+async def test_a_lost_broadcast_answer_names_the_hash_and_the_retry_reads_its_outcome():
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
     provider.send_error = "lost"
     client = client_with(provider)
@@ -324,26 +348,72 @@ async def test_a_lost_broadcast_answer_names_the_hash_and_the_retry_sends_nothin
     assert "secret-rpc-key" not in str(raised.value)
 
     provider.send_error = None
-    provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralTransactionError, match="still pending; no transaction was sent"):
+    provider.nonce = NONCE + 1
+    with pytest.raises(CollateralTransactionError, match=f"{signed_hash}, sent earlier, succeeded"):
         await client.finalize_reclaim(5)
     assert len(provider.sent) == 1
 
 
-async def test_an_already_known_answer_is_an_unknown_outcome_and_the_retry_sends_nothing():
+async def test_an_already_known_answer_is_an_unknown_outcome_and_the_retry_sends_the_same_bytes():
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
     provider.send_error = "known"
     client = client_with(provider)
 
-    with pytest.raises(CollateralOutcomeUnknownError, match=r"already holds transaction .*\(already known\)") as raised:
+    with pytest.raises(CollateralOutcomeUnknownError, match=r"may have been sent.*\(already known\)") as raised:
         await client.finalize_reclaim(5)
     assert "no transaction was sent" not in str(raised.value)
+    assert provider.sent == []
 
     provider.send_error = None
-    provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralTransactionError, match="still pending; no transaction was sent"):
+    with pytest.raises(CollateralTransactionError, match="sent earlier, succeeded"):
         await client.finalize_reclaim(5)
-    assert provider.sent == []
+    assert len(provider.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "failure,first_status",
+    [("lost_receipt", 0), ("bad_json", 0), ("lost_receipt", 1)],
+)
+async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_status, monkeypatch):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, receipt_status=first_status)
+    client = client_with(provider)
+    eth = client.w3.eth
+    original_send = eth.send_raw_transaction
+
+    async def unavailable(*_args, **_kwargs):
+        raise TimeoutError()
+
+    async def accepted_bad_reply(raw):
+        await original_send(raw)
+        raise JSONDecodeError("bad response", "x", 0)
+
+    if failure == "bad_json":
+        monkeypatch.setattr(eth, "send_raw_transaction", accepted_bad_reply)
+    monkeypatch.setattr(eth, "wait_for_transaction_receipt", unavailable)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+
+    monkeypatch.setattr(eth, "send_raw_transaction", original_send)
+    monkeypatch.setattr(eth, "get_transaction_receipt", unavailable)
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralTransactionError):
+        await client.finalize_reclaim(5)
+    assert {decode_legacy(raw)["nonce"] for raw in provider.sent} == {NONCE}
+
+
+async def test_a_used_nonce_with_no_receipt_yet_sends_nothing(monkeypatch):
+    """A lagging RPC can show the nonce used before it serves the receipt: that is not proof of a drop."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralOutcomeUnknownError, match=f"nonce {NONCE} is used; no transaction was sent"):
+        await client.finalize_reclaim(5)
+    assert len(provider.sent) == 1
 
 
 async def test_a_broadcast_the_rpc_refuses_is_not_sent_and_the_next_run_sends():
