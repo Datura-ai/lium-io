@@ -164,11 +164,13 @@ def replace_collateral_transaction(private_key: str):
     """Replace this key's unmined collateral transaction at the same nonce with a higher gas price."""
     if miner_account(private_key) is None:
         sys.exit(1)
-    run_contract_read(
+    outcome = run_contract_read(
         get_collateral_contract(miner_key=private_key).replace_earlier_send(),
         "❌ Stopped at the earlier collateral transaction from this key",
     )
-    sys.exit(1)
+    if outcome is None:
+        sys.exit(1)
+    logger.info(f"✅ {outcome}")
 
 
 @cli.command()

@@ -63,6 +63,8 @@ RECEIPT_POLL_SEC = 2
 # A replacement at the same nonce must outbid the transaction it replaces; pools refuse a smaller bump.
 REPLACEMENT_PRICE_BUMP = (9, 8)
 RECLAIM_LIST_ATTEMPTS = 3
+# The contract functions this client signs; a recorded transaction that calls anything else is not re-signed.
+SENT_FUNCTIONS = ("reclaimCollateral(bytes16,string,bytes16)", "finalizeReclaim(uint256)")
 
 GAS_LIMIT = 200_000
 # The RPC quotes the gas price; above this ceiling nothing is signed, so a faulty or hostile RPC
@@ -308,6 +310,8 @@ class CollateralClient:
                 f"({type(error).__name__}); its outcome is unknown. {RETRY_IS_SAFE}"
             ) from error
         self._check_receipt_hash(receipt, signed_hash)
+        if not await self._finalized_on_chain(signed_hash, receipt):
+            raise self._orphaned(signed_hash, receipt)
         self._clear_sent_record(chain_id, signed_hash)
         if receipt["status"] == 0:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
@@ -343,6 +347,9 @@ class CollateralClient:
 
     def _report_settled(self, chain_id: int, tx_hash: str, receipt, replaced: bool = False) -> None:
         self._clear_sent_record(chain_id, self._read_sent_record(chain_id)["hash"])
+        raise CollateralTransactionError(self._settled_message(tx_hash, receipt, replaced))
+
+    def _settled_message(self, tx_hash: str, receipt, replaced: bool) -> str:
         outcome = "succeeded" if receipt["status"] == 1 else "reverted"
         started = []
         if receipt["status"] == 1:
@@ -354,9 +361,7 @@ class CollateralClient:
             if replaced
             else "no new transaction was sent. Run this again if it still needs doing"
         )
-        raise CollateralTransactionError(
-            f"Transaction {tx_hash}, {sent}, {outcome} in block {receipt['blockNumber']}{request}; {tail}"
-        )
+        return f"Transaction {tx_hash}, {sent}, {outcome} in block {receipt['blockNumber']}{request}; {tail}"
 
     async def _receipt_of_earlier_send(self, record: dict):
         """(hash, receipt) of whichever signed transaction of the record has a receipt, or None."""
@@ -373,6 +378,9 @@ class CollateralClient:
             if receipt is None:
                 continue
             self._check_receipt_hash(receipt, tx_hash)
+            # a receipt from a block a reorganization dropped says nothing: the transaction may be back in a pool
+            if not await self._finalized_on_chain(tx_hash, receipt):
+                continue
             return tx_hash, receipt
         return None
 
@@ -384,6 +392,29 @@ class CollateralClient:
                 f"outcome is unknown; no transaction was sent. {RETRY_IS_SAFE}"
             )
 
+    async def _finalized_on_chain(self, tx_hash: str, receipt) -> bool:
+        """Whether the receipt's block is finalized and is the chain's block at its number. Waits for finality;
+        raises while it has not come, so no record is cleared on a receipt a reorganization can still drop."""
+        number = receipt["blockNumber"]
+        deadline = asyncio.get_running_loop().time() + RECEIPT_TIMEOUT_SEC
+        while (await self.w3.eth.get_block("finalized"))["number"] < number:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise CollateralOutcomeUnknownError(
+                    f"Transaction {tx_hash} is in block {number}, which is not finalized yet, so its outcome is "
+                    f"not settled; no transaction was sent. {RETRY_IS_SAFE}"
+                )
+            await asyncio.sleep(RECEIPT_POLL_SEC)
+        # every node serves the same finalized block at a number, so this read cannot come from another fork
+        return same_hash((await self.w3.eth.get_block(number))["hash"], receipt["blockHash"])
+
+    @staticmethod
+    def _orphaned(tx_hash: str, receipt) -> CollateralOutcomeUnknownError:
+        return CollateralOutcomeUnknownError(
+            f"The receipt of transaction {tx_hash} names block {receipt['blockNumber']} {receipt['blockHash']}, "
+            f"which is not the finalized block at that number, so its outcome is unknown; no transaction was sent. "
+            f"{RETRY_IS_SAFE}"
+        )
+
     async def _wait_for_earlier_send(self, record: dict):
         hashes = record_hashes(record)
         if len(hashes) == 1:
@@ -391,6 +422,8 @@ class CollateralClient:
                 hashes[0], timeout=RECEIPT_TIMEOUT_SEC, poll_latency=RECEIPT_POLL_SEC
             )
             self._check_receipt_hash(receipt, hashes[0])
+            if not await self._finalized_on_chain(hashes[0], receipt):
+                raise self._orphaned(hashes[0], receipt)
             return hashes[0], receipt
         deadline = asyncio.get_running_loop().time() + RECEIPT_TIMEOUT_SEC
         while True:
@@ -434,11 +467,12 @@ class CollateralClient:
             "two can be mined"
         )
 
-    async def replace_earlier_send(self):
+    async def replace_earlier_send(self) -> str:
         """Replace this key's unmined recorded send with the same call at the same nonce and a higher gas price.
 
         The replacement is recorded next to the transaction it replaces before it is broadcast, and a receipt of
-        either settles the record; no other nonce is signed meanwhile. Raises with the outcome, like a settle."""
+        either settles the record; no other nonce is signed meanwhile. Returns the outcome when a transaction of
+        the record succeeded; raises with it otherwise, like a settle."""
         chain_id = await self._pinned_chain_id()
         gas_quote = await self.w3.eth.gas_price
         with self._send_lock():
@@ -447,11 +481,11 @@ class CollateralClient:
                 raise CollateralTransactionError(
                     "No collateral transaction from this key is waiting for its outcome; nothing was replaced"
                 )
+            earlier = self._verified_earlier_send(record, chain_id)
             found = await self._receipt_of_earlier_send(record)
             if found is not None:
                 self._report_settled(chain_id, *found)
             await self._raise_if_nonce_used(record)
-            earlier = decode_legacy_transaction(record["raw"])
             bump, base = REPLACEMENT_PRICE_BUMP
             gas_price = max(gas_quote, -(-earlier["gasPrice"] * bump // base))
             if gas_price > AsyncWeb3.to_wei(self.max_gas_price_gwei, "gwei"):
@@ -477,7 +511,52 @@ class CollateralClient:
                 record["nonce"], signed_hash, AsyncWeb3.from_wei(gas_price, "gwei"),
             )
             tx_hash, receipt = await self._broadcast_again(record)
-            self._report_settled(chain_id, tx_hash, receipt, replaced=same_hash(tx_hash, signed_hash))
+            if receipt["status"] != 1:
+                self._report_settled(chain_id, tx_hash, receipt, replaced=same_hash(tx_hash, signed_hash))
+            self._clear_sent_record(chain_id, record["hash"])
+            return self._settled_message(tx_hash, receipt, replaced=same_hash(tx_hash, signed_hash))
+
+    def _verified_earlier_send(self, record: dict, chain_id: int) -> dict:
+        """The recorded transaction's fields, once its bytes prove this key signed them for a collateral call.
+
+        The record sits in a directory the miner service can write, so a replacement never copies a field from it
+        unchecked: the bytes must hash to the recorded hash, recover to this key's address, carry the recorded
+        nonce and this chain, and call a function this client sends on the configured contract with no value."""
+
+        def refuse(why: str) -> CollateralTransactionError:
+            return CollateralTransactionError(
+                f"The recorded transaction in {self.sent_record_path} is not a collateral call this key signed "
+                f"({why}); nothing was signed or broadcast. Check that file before running this again"
+            )
+
+        try:
+            raw = bytes.fromhex(str(record.get("raw", "")).removeprefix("0x"))
+            fields = rlp.decode(raw)
+            earlier = decode_legacy_transaction(record["raw"])
+            signer = Account.recover_transaction(raw)
+        except Exception as error:
+            raise refuse(f"its bytes do not decode as a signed legacy transaction ({type(error).__name__})") from error
+        if len(fields) != 9:
+            raise refuse("its bytes do not decode as a signed legacy transaction")
+        if not same_hash(AsyncWeb3.keccak(raw), record.get("hash")):
+            raise refuse("its bytes do not hash to the recorded hash")
+        if signer != self.miner_address:
+            raise refuse("another key signed it")
+        if earlier["nonce"] != record.get("nonce"):
+            raise refuse("its nonce is not the recorded one")
+        v = int.from_bytes(fields[6], "big")
+        if v < 35 or (v - 35) // 2 != chain_id:
+            raise refuse(f"it is not signed for chain {chain_id}")
+        if earlier["to"] != self.contract_address:
+            raise refuse("it is not sent to the collateral contract")
+        if earlier["value"] != 0:
+            raise refuse("it sends value")
+        if earlier["gas"] > GAS_LIMIT:
+            raise refuse("its gas limit is above the one this client signs")
+        sent = {AsyncWeb3.keccak(text=signature)[:4].hex().removeprefix("0x") for signature in SENT_FUNCTIONS}
+        if earlier["data"].removeprefix("0x")[:8].lower() not in sent:
+            raise refuse("it calls a function this client does not send")
+        return earlier
 
     def _sent_record_key(self, chain_id: int) -> str:
         return f"{chain_id}:{self.miner_address}"
@@ -638,12 +717,14 @@ class CollateralClient:
         return events[0] if events else None
 
     async def get_reclaim_events(self) -> list[ReclaimRequest]:
-        """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS blocks.
+        """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS finalized blocks.
 
-        The logs and each request's state are read at one block number, and the list is kept only if that number
-        still has the same block hash afterwards: across a reorg the two reads can come from different forks."""
+        The logs and each request's state are read at the finalized block's number. Every node serves the same
+        block at a finalized number, so a load-balanced RPC whose backends follow different forks at the head
+        still answers each read from one block; a request started after it is listed once its block is final.
+        The list is also kept only if that number still has the same block hash afterwards."""
         for _ in range(RECLAIM_LIST_ATTEMPTS):
-            head = await self.w3.eth.get_block("latest")
+            head = await self.w3.eth.get_block("finalized")
             requests = await self._reclaim_events_at(head["number"])
             if same_hash((await self.w3.eth.get_block(head["number"]))["hash"], head["hash"]):
                 return requests

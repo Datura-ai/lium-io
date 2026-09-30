@@ -92,6 +92,10 @@ class FakeProvider(AsyncBaseProvider):
         self.block_number = 16
         self.head_hashes = []
         self.logs_by_fork = []
+        # the "finalized" tag's number when it trails the head; the chain's block hash at a number, when it is
+        # not the one receipts name
+        self.finalized_number = None
+        self.canonical_hashes = {}
         # hashes whose receipt request is answered with TX_HASH's receipt
         self.receipts_of_another = set()
 
@@ -128,8 +132,12 @@ class FakeProvider(AsyncBaseProvider):
         if method == "eth_blockNumber":
             return {"jsonrpc": "2.0", "id": 1, "result": hex(self.block_number)}
         if method == "eth_getBlockByNumber":
+            tag = params[0]
+            if isinstance(tag, str) and tag.startswith("0x") and int(tag, 16) in self.canonical_hashes:
+                return {"jsonrpc": "2.0", "id": 1, "result": {"number": tag, "hash": self.canonical_hashes[int(tag, 16)]}}
+            number = self.finalized_number if tag == "finalized" and self.finalized_number is not None else self.block_number
             block_hash = self.head_hashes.pop(0) if self.head_hashes else BLOCK_HASH
-            return {"jsonrpc": "2.0", "id": 1, "result": {"number": hex(self.block_number), "hash": block_hash}}
+            return {"jsonrpc": "2.0", "id": 1, "result": {"number": hex(number), "hash": block_hash}}
         if method == "eth_getLogs":
             logs = self.logs_by_fork.pop(0) if self.logs_by_fork else self.logs
             return {"jsonrpc": "2.0", "id": 1, "result": logs}
@@ -596,8 +604,8 @@ async def test_an_unmined_send_is_replaced_at_its_own_nonce_and_its_record_is_ne
 
     first_hash = sent_hash(provider)
     provider.mine_sent = True
-    with pytest.raises(CollateralTransactionError, match="the replacement, succeeded in block 16"):
-        await client.replace_earlier_send()
+    outcome = await client.replace_earlier_send()
+    assert f"Transaction {sent_hash(provider, -1)}, the replacement, succeeded in block 16" in outcome
     replacement = decode_legacy(provider.sent[-1])
     assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [signed_nonce] * 3
     assert replacement["gasPrice"] == -(-GAS_PRICE * 9 // 8)
@@ -633,6 +641,107 @@ async def test_a_replacement_is_recorded_with_the_send_it_replaces_before_it_is_
     with pytest.raises(CollateralTransactionError, match=f"Transaction {first_hash}, sent earlier, succeeded"):
         await client.finalize_reclaim(5)
     assert client._read_sent_record(CHAIN_ID) is None
+
+
+ATTACKER_KEY = "0x" + "22" * 32
+ATTACKER = Account.from_key(ATTACKER_KEY).address
+
+
+def signed_record(key=MINER_KEY, to=CONTRACT, value=0, data=None, nonce=NONCE, chain_id=CHAIN_ID, **over) -> dict:
+    data = data or "0x" + selector("finalizeReclaim(uint256)") + f"{5:064x}"
+    signed = Account.sign_transaction(
+        {"nonce": nonce, "gasPrice": GAS_PRICE, "gas": 200_000, "to": to, "value": value, "data": data,
+         "chainId": chain_id},
+        key,
+    )
+    raw = AsyncWeb3.to_hex(getattr(signed, "raw_transaction", None) or signed.rawTransaction)
+    tx_hash = signed.hash.hex()
+    return {"nonce": nonce, "hash": tx_hash, "raw": raw, "hashes": [tx_hash], **over}
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        signed_record(key=ATTACKER_KEY, to=ATTACKER, value=10**18),
+        signed_record(to=ATTACKER, value=10**18),
+        signed_record(value=10**18),
+        signed_record(data="0x" + selector("transferOwnership(address)") + ATTACKER[2:].lower().rjust(64, "0")),
+        signed_record(chain_id=1),
+        {**signed_record(nonce=NONCE + 3), "nonce": NONCE},
+        signed_record(hash="0x" + "ee" * 32),
+        {**signed_record(), "raw": "0xdeadbeef"},
+    ],
+    ids=[
+        "another-key-sends-value-elsewhere", "value-to-another-address", "value-to-the-contract",
+        "another-function", "another-chain", "another-nonce", "another-hash", "not-a-transaction",
+    ],
+)
+async def test_a_forged_send_record_gets_nothing_signed_or_broadcast(record):
+    """The record sits in the wallet directory the miner service writes; the key is typed in only later, so a
+    record's bytes must prove this key signed a collateral call before a replacement copies anything from them."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.mine_sent = False
+    client = client_with(provider)
+    client._write_sent_record(CHAIN_ID, record)
+    signed = []
+    original_sign = client.miner_account.sign_transaction
+    client.miner_account.sign_transaction = lambda transaction: signed.append(transaction) or original_sign(transaction)
+
+    with pytest.raises(CollateralTransactionError, match="nothing was signed or broadcast"):
+        await client.replace_earlier_send()
+    assert signed == [] and provider.sent == []
+    assert "eth_sendRawTransaction" not in [method for method, _ in provider.requests]
+    assert client._read_sent_record(CHAIN_ID) == record
+
+
+async def test_a_record_this_key_signed_for_the_contract_is_replaced_from_its_verified_bytes():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    client = client_with(provider)
+    record = signed_record()
+    # loose fields next to the bytes are never what gets signed
+    client._write_sent_record(CHAIN_ID, {**record, "to": ATTACKER, "value": 10**18, "data": "0x"})
+
+    outcome = await client.replace_earlier_send()
+    assert "the replacement, succeeded" in outcome
+    replacement = decode_legacy(provider.sent[-1])
+    assert replacement["to"] == CONTRACT and replacement["value"] == 0 and replacement["nonce"] == NONCE
+    assert replacement["data"] == decode_legacy(record["raw"])["data"]
+
+
+@pytest.mark.parametrize("case", ["orphaned", "not-finalized"])
+async def test_a_receipt_that_is_not_final_on_chain_never_clears_the_send_record(monkeypatch, case):
+    """A receipt from a block a reorganization dropped (or may still drop) says nothing about the outcome: the
+    record stays and no other nonce is signed (review of 58f7221: receipt block 0xaaaa, canonical 0xbbbb)."""
+    monkeypatch.setattr(collateral_module, "RECEIPT_TIMEOUT_SEC", 0)
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+    record = client._read_sent_record(CHAIN_ID)
+
+    provider.mined.add(record["hash"])
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    if case == "orphaned":
+        provider.canonical_hashes[16] = "0x" + "bb" * 32
+    else:
+        provider.finalized_number = 15
+    with pytest.raises(CollateralOutcomeUnknownError) as raised:
+        await client.finalize_reclaim(5)
+    assert "succeeded" not in str(raised.value)
+    assert client._read_sent_record(CHAIN_ID) == record
+    assert len(provider.sent) == 1
+
+
+async def test_a_fresh_send_whose_receipt_block_is_orphaned_keeps_its_record():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
+    provider.canonical_hashes[16] = "0x" + "bb" * 32
+    client = client_with(provider)
+
+    with pytest.raises(CollateralOutcomeUnknownError, match="not the finalized block at that number"):
+        await client.finalize_reclaim(5)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
 
 
 async def test_nothing_is_replaced_without_a_recorded_send():
@@ -760,6 +869,23 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(hea
     assert [method for method, _ in provider.requests].count("eth_getLogs") == len(urls)
 
 
+async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head():
+    """A load-balanced RPC can answer the hash checks from one backend and the state read from another on a
+    different fork at the head (review of 58f7221: "detail block identifier: 5000 served by fork B"). At a
+    finalized number every backend serves the same block, so the logs and every reclaims(id) read there."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
+    provider.block_number, provider.finalized_number = 5003, 5000
+
+    requests = await client_with(provider).get_reclaim_events()
+
+    assert [request.reclaim_request_id for request in requests] == [5]
+    assert [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"][0] == "finalized"
+    (log_filter,) = [params[0] for method, params in provider.requests if method == "eth_getLogs"]
+    assert log_filter["toBlock"] == hex(5000)
+    details = [params for method, params in provider.requests if method == "eth_call"]
+    assert details and all(block == hex(5000) for _, block in details)
+
+
 async def test_the_open_reclaim_list_gives_up_on_a_head_that_keeps_moving():
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
     provider.head_hashes = ["0x" + f"{i:02x}" * 32 for i in range(1, 2 * collateral_module.RECLAIM_LIST_ATTEMPTS + 1)]
@@ -882,6 +1008,33 @@ def test_a_command_on_an_unknown_network_runs_or_names_the_setting(archive_netwo
     else:
         assert isinstance(result.exception, SystemExit)
         assert "SUBTENSOR_EVM_RPC_URL" in caplog.text
+    assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text + result.output
+
+
+@pytest.mark.parametrize(
+    "outcome,exit_code",
+    [
+        ("Transaction 0xab, the replacement, succeeded in block 16; Run the reclaim or finalize again", 0),
+        (CollateralOutcomeUnknownError("Transaction 0xab, sent earlier, is not mined yet"), 1),
+        (CollateralTransactionError("Transaction 0xab, the replacement, reverted in block 16"), 1),
+    ],
+    ids=["replacement-succeeded", "outcome-unknown", "replacement-reverted"],
+)
+def test_replace_collateral_transaction_exits_0_only_on_a_success(archive_network, monkeypatch, caplog, outcome, exit_code):
+    import cli as cli_module
+
+    async def replace_earlier_send():
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        cli_module, "get_collateral_contract", lambda **_: SimpleNamespace(replace_earlier_send=replace_earlier_send)
+    )
+    with caplog.at_level(logging.INFO):
+        result = CliRunner().invoke(cli_module.cli, ["replace-collateral-transaction", "--private-key", MINER_KEY])
+    assert result.exit_code == exit_code, result.output
+    assert ("✅" in caplog.text) is (exit_code == 0)
     assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text + result.output
 
 
