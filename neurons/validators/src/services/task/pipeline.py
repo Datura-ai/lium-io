@@ -159,10 +159,6 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
-    # Ports held by the platform's preemptible background jobs that PortCountCheck counted toward the
-    # floor of an unrented node; 0 when rented or none counted. Whether the platform lists a node that
-    # passed on them depends on the platform's count_preemptible_filler_ports_as_free setting.
-    preemptible_background_job_port_count: int = 0
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.

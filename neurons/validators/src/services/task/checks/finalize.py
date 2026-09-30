@@ -4,7 +4,7 @@ from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT, UNRENTE
 
 from ..messages import FinalizeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from .port_count import port_count_below_listing_floor, port_floor_impact_text, port_floor_what
+from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 
 class FinalizeCheck:
@@ -35,21 +35,16 @@ class FinalizeCheck:
             "unrented_multiplier": UNRENTED_MULTIPLIER,
             "sysbox_runtime": ctx.state.sysbox_runtime,
         }
-        # Two runs get here below the floor: one exempted from PortCountCheck by a pod that then proved stale
-        # (hidden from renters), and an unrented one that passed on background-job ports, which the platform
-        # lists only while its count_preemptible_filler_ports_as_free setting counts those ports, so neither
-        # hidden nor the fix is certain.
+        # Only a run exempted from PortCountCheck by a pod that then proved stale gets here below the floor.
         port_count_below_floor = port_count_below_listing_floor(ctx.state)
         if port_count_below_floor is not None:
-            impact = f"{port_floor_impact_text(ctx.state, port_count_below_floor)}. {impact}"
+            impact = f"{hidden_from_renters_text(port_count_below_floor)}. {impact}"
             what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
             port_floor_fix = (
                 f"Only ports that answer among the lowest {BATCH_PORT_VERIFICATION_SIZE} free ports of the "
                 f"declared range count: allow at least {MIN_PORT_COUNT} of them through the host firewall and "
                 "any port forwarding, or declare only open ports; the next cycle probes them again."
             )
-            if ctx.state.preemptible_background_job_port_count:
-                port_floor_fix = f"If the node is not listed for renters: {port_floor_fix}"
             remediation = f"{remediation} {port_floor_fix}" if ctx.score_warning else port_floor_fix
 
         event = render_message(
