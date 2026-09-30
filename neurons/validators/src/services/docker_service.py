@@ -109,6 +109,7 @@ from services.rental_dind import (
     dind_probe_cleanup_command,
     dind_store_reset_command,
     dind_store_reset_settle_command,
+    dind_store_reset_start_command,
     dind_store_version_probe_command,
     dind_store_version_record_command,
     dind_store_volume_name,
@@ -117,6 +118,7 @@ from services.rental_dind import (
     is_dind_store_downgrade,
     orphaned_dind_companion_volumes,
     parse_address_pools,
+    parse_dind_reset_helper_id,
     parse_dind_store_version_probe,
     parse_dockerd_version,
     with_dind_companion_volumes,
@@ -305,6 +307,7 @@ _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 _DIND_STORE_PROBE_TIMEOUT_SEC = 90
 _DIND_STORE_RESET_TIMEOUT_SEC = DIND_STORE_RESET_DEADLINE_SEC + 60
 _DIND_STORE_SETTLE_TIMEOUT_SEC = 90
+_DIND_STORE_RESET_CREATE_TIMEOUT_SEC = 30
 
 
 class DindStoreResetUnconfirmed(RuntimeError):
@@ -1837,19 +1840,30 @@ class DockerService:
             elif recorded_version is None or current_version is None:
                 outcome = "unknown_version"
             elif is_dind_store_downgrade(recorded, current):
-                outcome = "resetting"
-                reset = await ssh_client.run(
+                outcome = "reset_create"
+                created = await ssh_client.run(
                     dind_store_reset_command(
                         store_volume=store_volume, helper_image=ALPINE_HELPER_IMAGE, container_name=run_spec.name
                     ),
-                    timeout=_DIND_STORE_RESET_TIMEOUT_SEC,
+                    timeout=_DIND_STORE_RESET_CREATE_TIMEOUT_SEC,
                 )
-                exit_status = getattr(reset, "exit_status", 0)
-                outcome = "reset_on_downgrade" if exit_status == 0 else f"reset_failed: exit {exit_status}"
+                helper_id = parse_dind_reset_helper_id(getattr(created, "stdout", ""))
+                if getattr(created, "exit_status", 0) != 0 or helper_id is None:
+                    outcome = "reset_failed: helper not created"
+                else:
+                    outcome = "resetting"
+                    reset = await ssh_client.run(
+                        dind_store_reset_start_command(helper_id), timeout=_DIND_STORE_RESET_TIMEOUT_SEC
+                    )
+                    exit_status = getattr(reset, "exit_status", 0)
+                    outcome = "reset_on_downgrade" if exit_status == 0 else f"reset_failed: exit {exit_status}"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if outcome == "resetting":
+            if outcome == "reset_create":
+                # nothing was started: an inert helper at most, which the cleanup below removes
+                outcome = f"reset_failed: create: {type(exc).__name__}: {str(exc)[:200]}"
+            elif outcome == "resetting":
                 outcome = await self._settle_lost_dind_store_reset(
                     ssh_client, store_volume=store_volume, run_spec=run_spec, cause=exc, default_extra=default_extra
                 )

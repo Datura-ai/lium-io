@@ -338,8 +338,13 @@ def parse_dind_store_version_probe(stdout: str | None) -> tuple[str | None, str 
     return values.get("recorded"), values.get("current")
 
 
+_DOCKER_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def dind_store_reset_command(*, store_volume: str, helper_image: str, container_name: str) -> str:
-    """Empty the store volume, keeping the volume itself (a parked container may still name it).
+    """Create, stopped, the helper that empties the store volume, keeping the volume itself (a parked
+    container may still name it); prints the helper's container id. Nothing is deleted until
+    dind_store_reset_start_command starts that id, so this step is safe to lose or repeat.
 
     The version marker goes last, and only once everything else is gone: a reset that fails keeps the
     newer version recorded, so the next create sees the downgrade and resets again. A reset whose status
@@ -353,10 +358,27 @@ def dind_store_reset_command(*, store_volume: str, helper_image: str, container_
     )
     return (
         f"/usr/bin/docker rm -f {shlex.quote(reset_name)} >/dev/null 2>&1; "
-        f"/usr/bin/docker run --rm --name {shlex.quote(reset_name)} --network none "
+        f"/usr/bin/docker create --rm --name {shlex.quote(reset_name)} --network none "
         f"--label {DIND_PROBE_LABEL} {DIND_PROBE_RESOURCE_FLAGS} "
-        f"-v {shlex.quote(store_volume)}:/store {helper_image} sh -c {shlex.quote(script)} >/dev/null 2>&1"
+        f"-v {shlex.quote(store_volume)}:/store {helper_image} sh -c {shlex.quote(script)} 2>/dev/null"
     )
+
+
+def parse_dind_reset_helper_id(stdout: str | None) -> str | None:
+    """The container id dind_store_reset_command printed; None for anything but one full id."""
+    helper_id = (stdout or "")[:256].strip()
+    return helper_id if _DOCKER_CONTAINER_ID_RE.fullmatch(helper_id) else None
+
+
+def dind_store_reset_start_command(helper_id: str) -> str:
+    """Run the created reset helper by its id and wait for it; the exit status is the reset's.
+
+    Started by id, so a start that reaches the host after settlement removed the helper finds no
+    container and deletes nothing, even when a later create reused the helper's name.
+    """
+    if not _DOCKER_CONTAINER_ID_RE.fullmatch(helper_id):
+        raise ValueError(f"not a container id: {helper_id[:80]!r}")
+    return f"/usr/bin/docker start -a {helper_id} >/dev/null 2>&1"
 
 
 def dind_store_reset_settle_command(*, store_volume: str, helper_image: str, container_name: str) -> str:

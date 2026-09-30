@@ -25,12 +25,14 @@ from services.rental_dind import (
     dind_probe_cleanup_command,
     dind_store_reset_command,
     dind_store_reset_settle_command,
+    dind_store_reset_start_command,
     dind_store_version_probe_command,
     dind_store_version_record_command,
     is_dind_store_downgrade,
     merge_inner_daemon_config,
     orphaned_dind_companion_volumes,
     parse_address_pools,
+    parse_dind_reset_helper_id,
     parse_dind_store_version_probe,
     parse_dockerd_version,
     pool_network_conflicts,
@@ -849,12 +851,18 @@ def test_the_reset_empties_the_volume_and_the_record_writes_from_inside_the_pod(
         store_volume="volume_x_docker", helper_image="alpine:3.19", container_name="pod_x"
     ) == (
         "/usr/bin/docker rm -f lium-dind-probe-pod_x-reset >/dev/null 2>&1; "
-        "/usr/bin/docker run --rm --name lium-dind-probe-pod_x-reset --network none "
+        "/usr/bin/docker create --rm --name lium-dind-probe-pod_x-reset --network none "
         "--label io.lium.purpose=dind-store-probe --memory 128m --memory-swap 128m --cpus 0.5 "
         "--pids-limit 32 -v volume_x_docker:/store alpine:3.19 "
         "sh -c 'timeout 300 find /store -mindepth 1 -maxdepth 1 ! -name .lium-dockerd-version "
-        "-exec rm -rf {} + && rm -f /store/.lium-dockerd-version' >/dev/null 2>&1"
+        "-exec rm -rf {} + && rm -f /store/.lium-dockerd-version' 2>/dev/null"
     )
+    assert dind_store_reset_start_command(_HELPER_ID) == f"/usr/bin/docker start -a {_HELPER_ID} >/dev/null 2>&1"
+    assert parse_dind_reset_helper_id(f"{_HELPER_ID}\n") == _HELPER_ID
+    for printed in ("", "Error: no such image", _HELPER_ID[:12], f"{_HELPER_ID}\n{_HELPER_ID}", f"{_HELPER_ID}; rm"):
+        assert parse_dind_reset_helper_id(printed) is None
+    with pytest.raises(ValueError):
+        dind_store_reset_start_command("abc; rm -rf /")
     record = dind_store_version_record_command("pod_x")
     assert record.startswith("timeout 20 /usr/bin/docker exec pod_x sh -c ")
     assert record.endswith(" >/dev/null 2>&1")
@@ -891,23 +899,39 @@ class _Result:
 
 
 _RESET = "find /store -mindepth 1"
+_START = "docker start -a "
 _SETTLE = 'printf "stopped=1'
+_HELPER_ID = "c0ffee" * 10 + "abcd"
+_DOWNGRADE = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
 
 
 class _Ssh:
     def __init__(
-        self, probe_stdout="", reset_status=0, error=None, reset_error=None, settle=None, settle_error=None
+        self,
+        probe_stdout="",
+        reset_status=0,
+        error=None,
+        reset_error=None,
+        settle=None,
+        settle_error=None,
+        create=None,
+        create_error=None,
     ):
         self.commands: list[str] = []
         self.probe_stdout, self.reset_status, self.error = probe_stdout, reset_status, error
         self.reset_error = reset_error
         self.settle, self.settle_error = settle or _Result(exit_status=1), settle_error
+        self.create, self.create_error = create or _Result(stdout=_HELPER_ID + "\n"), create_error
 
     async def run(self, command, timeout=None):
         self.commands.append(command)
         if self.error is not None:
             raise self.error
         if _RESET in command:
+            if self.create_error is not None:
+                raise self.create_error
+            return self.create
+        if _START in command:
             if self.reset_error is not None:
                 raise self.reset_error
             return _Result(exit_status=self.reset_status)
@@ -1039,8 +1063,30 @@ async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_ser
     caplog.clear()
 
 
+@pytest.mark.parametrize(
+    ("ssh", "outcome"),
+    [
+        (_Ssh(probe_stdout=_DOWNGRADE, create=_Result(exit_status=1)), "reset_failed: helper not created"),
+        (_Ssh(probe_stdout=_DOWNGRADE, create=_Result(stdout="Error: no such image\n")), "reset_failed: helper not created"),
+        (
+            _Ssh(probe_stdout=_DOWNGRADE, create_error=TimeoutError("create timed out")),
+            "reset_failed: create: TimeoutError: create timed out",
+        ),
+    ],
+    ids=["create-fails", "no-container-id", "create-status-lost"],
+)
+@pytest.mark.asyncio
+async def test_a_reset_helper_that_was_not_created_is_never_started(docker_service, caplog, ssh, outcome):
+    recordable = await docker_service._reset_dind_store_on_downgrade(
+        ssh, run_spec=_store_spec(), local_volume="volume_x", default_extra={}
+    )
 
-_DOWNGRADE = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
+    assert _store_outcome(caplog) == outcome
+    assert recordable is False  # nothing was deleted: the newer marker stays, so the next create resets again
+    assert not any(_START in c or _SETTLE in c for c in ssh.commands)
+    assert ssh.commands[-1] == dind_probe_cleanup_command("pod_x")
+
+
 
 
 @pytest.mark.parametrize(
@@ -1124,6 +1170,34 @@ def test_settlement_needs_a_successful_listing_without_the_reset_helper(ps, exit
     assert shlex.quote("name=^/?lium\\-dind\\-probe\\-pod_x\\-reset$") in cmd
 
 
+@pytest.mark.parametrize("settled", [True, False], ids=["start-after-settlement", "start-in-time"])
+def test_a_reset_start_that_arrives_after_settlement_deletes_nothing(tmp_path, settled):
+    """The reset's start reaches the host late, after settlement removed the helper: it finds no container."""
+    names = {"store_volume": "volume_x_docker", "helper_image": "alpine", "container_name": "pod_x"}
+    stub = f"""D={shlex.quote(str(tmp_path))}; ID={_HELPER_ID}; docker() {{
+      case "$1" in
+        rm) shift 2; for n; do [ -e "$D/$n" ] && rm -f "$D/$n" "$D/id-$(cat "$D/$n")"; done; return 0 ;;
+        create) printf '%s\\n' "$ID" > "$D/lium-dind-probe-pod_x-reset"; : > "$D/id-$ID"; echo "$ID" ;;
+        start) [ -e "$D/id-$3" ] || return 1; : > "$D/store-emptied" ;;
+        ps) [ ! -e "$D/lium-dind-probe-pod_x-reset" ] || echo "$ID"; return 0 ;;
+        run) printf 'read\\nDocker version 28.1.0\\n' ;;
+      esac
+    }}; """
+
+    def host(command: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["sh", "-c", stub + command.replace("/usr/bin/docker", "docker")], capture_output=True, text=True
+        )
+
+    helper_id = parse_dind_reset_helper_id(host(dind_store_reset_command(**names)).stdout)
+    if settled:
+        assert host(dind_store_reset_settle_command(**names)).stdout.startswith("stopped=1\n")
+    started = host(dind_store_reset_start_command(helper_id))
+
+    assert (started.returncode == 0) is not settled
+    assert (tmp_path / "store-emptied").exists() is not settled
+
+
 @pytest.mark.parametrize("rm_fails", [False, True], ids=["reset", "reset-fails"])
 def test_the_reset_removes_the_marker_last_and_only_when_the_rest_is_gone(tmp_path, rm_fails):
     store = tmp_path / "store"
@@ -1131,7 +1205,7 @@ def test_the_reset_removes_the_marker_last_and_only_when_the_rest_is_gone(tmp_pa
     (store / ".hidden").write_text("x")
     (store / ".lium-dockerd-version").write_text("Docker version 28.1.0, build a\n")
     command = dind_store_reset_command(store_volume="v", helper_image="alpine", container_name="pod_x")
-    script = shlex.split(command.split(" sh -c ", 1)[1].rsplit(" >/dev/null", 1)[0])[0]
+    script = shlex.split(command.split(" sh -c ", 1)[1].rsplit(" 2>/dev/null", 1)[0])[0]
     script = script.replace("/store", str(store))
     if rm_fails:
         script = script.replace("-exec rm -rf {} +", "-exec false {} +")
@@ -1168,7 +1242,7 @@ async def test_each_store_check_call_has_its_own_bounded_timeout(docker_service)
         default_extra={},
     )
 
-    assert timeouts == [90, 360, 30, 30]  # probe, reset, cleanup, record
+    assert timeouts == [90, 30, 360, 30, 30]  # probe, reset create, reset start, cleanup, record
 
 
 @pytest.mark.asyncio

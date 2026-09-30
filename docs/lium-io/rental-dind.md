@@ -77,8 +77,8 @@ image is theirs), so:
 - The validator always removes the pod's helpers after the check, with its own 30 s timeout. The
   periodic stale-container cleanup removes any labeled helper older than 10 minutes by the host's
   clock (a validator that lost its SSH session mid-check).
-- The SSH calls are bounded: 90 s for the check, 360 s for a reset (the helper's delete has a 300 s
-  deadline), 30 s for recording the version, which also has a 20 s deadline on the host. An image whose
+- The SSH calls are bounded: 90 s for the check, 30 s to create the reset helper, 360 s to run it
+  (the helper's delete has a 300 s deadline), 30 s for recording the version, which also has a 20 s deadline on the host. An image whose
   dockerd never answers costs a reboot or edit up to 20 s at the check and 20 s at the record.
 
 If an edit fails after the reset, the restored container also finds an empty store. The reset
@@ -86,6 +86,12 @@ deletes the marker last, only once the rest of the store is gone. A reset whose 
 confirmed (`reset_failed`: its exit status came back nonzero, or it was stopped and the newer marker
 was read back) leaves the store partly emptied and the newer marker in place; the version is then
 not recorded, so the next reboot or edit tries the reset again.
+
+The reset runs in two steps. The validator first creates the helper, stopped, and reads back its
+container id; only then does it start that id. A create that fails or whose id does not come back
+deletes nothing: it is `reset_failed: helper not created` or `reset_failed: create: …`, and the newer
+marker stays. A start that reaches the host after the helper was removed finds no container, so a
+late start never deletes a live store.
 
 A reset whose status never comes back (an SSH timeout, a lost acknowledgement) has an unknown
 outcome. The validator removes its helper and reads the marker again: a marker still there is
