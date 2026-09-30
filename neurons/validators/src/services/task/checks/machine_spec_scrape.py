@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
@@ -182,23 +183,38 @@ def _classify_scrape_failure(
 HOST_GPU_RUNTIME_FAULT_REASONS = frozenset(
     {Msg.SCRAPE_FAILED_DRIVER.reason, Msg.SCRAPE_FAILED_NO_GPU.reason}
 )
+# The NVML return codes (nvml.h) under which the GPU runtime itself is dead: driver not loaded, GPU lost,
+# GPU requires reset, GPU not found. Anything else the scrape's NVML block raises stays a plain halt: the
+# library copied to a temp file that a full or read-only disk refuses (LIBRARY_NOT_FOUND), a driver/library
+# mismatch that leaves pods started before the upgrade working, a permission or memory error.
+HOST_GPU_RUNTIME_DEAD_NVML_CODES = frozenset({9, 15, 16, 28})
+_NVML_ERROR_CODE_RX = re.compile(r"^NVMLError\w*\((\d+)\)")
 HOST_GPU_RUNTIME_FAULT_IMPACT = (
     "Validation halted — GPU runtime dead on the host of a rented node: verified job cleared, "
     "executor marked inactive until a clean scrape"
 )
 
 
-def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
-    """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing (P320).
+def _gpu_runtime_is_dead(failure: ScrapeFailure) -> bool:
+    if failure.template.reason == Msg.SCRAPE_FAILED_NO_GPU.reason:
+        return True
+    if failure.template.reason != Msg.SCRAPE_FAILED_DRIVER.reason:
+        return False
+    match = _NVML_ERROR_CODE_RX.match(failure.gpu_scrape_error or "")
+    return match is not None and int(match.group(1)) in HOST_GPU_RUNTIME_DEAD_NVML_CODES
 
-    The same updates POD_NOT_RUNNING and GPU_MISSING set, so the backend marks the executor inactive and billing
-    stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
-    (penalty_trigger.py SCRAPE_FAILURE_REASONS, the backend companion change), which holds both codes here: the
-    provider penalty policy for them is unchanged. A node without a customer pod keeps the plain halt.
+
+def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
+    """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing (DAH-3964).
+
+    It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
+    and billing stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
+    (penalty_trigger.py SCRAPE_FAILURE_REASONS), which holds both codes here. A node without a customer pod keeps
+    the plain halt.
     """
     if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
         return {}
-    if failure.template.reason not in HOST_GPU_RUNTIME_FAULT_REASONS:
+    if not _gpu_runtime_is_dead(failure):
         return {}
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
@@ -215,9 +231,6 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
     if failure.gpu_scrape_error is not None:
         evidence["gpu_scrape_error"] = failure.gpu_scrape_error
     return {
-        "score": 0.0,
-        "job_score": 0.0,
-        "score_warning": "GPU runtime dead on the host (NVML)",
         "clear_verified_job_info": True,
         "clear_verified_job_evidence": evidence,
     }
