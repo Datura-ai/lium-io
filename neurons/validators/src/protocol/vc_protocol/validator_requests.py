@@ -105,6 +105,25 @@ class PodContainerState(pydantic.BaseModel):
     observed_at: datetime
 
 
+class PodSshResult(str, enum.Enum):
+    """What the once-per-cycle SSH probe of one rented pod read, without a key."""
+
+    BANNER = "banner"
+    REFUSED = "refused"
+    NO_BANNER = "no_banner"
+    TIMEOUT = "timeout"
+
+
+class PodSshObservation(pydantic.BaseModel):
+    """One rented pod's SSH probe in one cycle. `errno` is the OS error behind a failed connect;
+    `fleet_ok` is False when the cycle's non-banner share puts the outage on the validator's side."""
+
+    pod_id: str
+    result: PodSshResult
+    errno: int | None = None
+    fleet_ok: bool = True
+
+
 # The backend bounds ExecutorSpecRequest.pod_states at 256 entries (lium-platform#312,
 # `Field(max_length=256)`); a longer list fails its validation and the WHOLE spec is dropped, node
 # listing included. One PodStatesReport chunk holds the same number. With
@@ -203,6 +222,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # The answer to the backend's recheck request, run out of cycle: the backend lifts its hold on a
     # passing one and credits no uptime for it, since the cycle's own report does that.
     recheck: bool = False
+    # This cycle's SSH probe of each RUNNING pod rented on the node, successes included. None until
+    # the cycle probes; an older backend ignores the key.
+    pod_ssh: list[PodSshObservation] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):
