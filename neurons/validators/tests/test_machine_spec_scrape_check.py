@@ -787,7 +787,8 @@ def test_the_scrape_seals_its_no_gpu_report_with_the_key_the_validator_decrypts_
     [key_join] = [
         node
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Assign) and [target.id for target in node.targets] == ["no_gpu_key"]
+        if isinstance(node, ast.Assign)
+        and [getattr(target, "id", None) for target in node.targets] == ["no_gpu_key"]
     ]
     assert 'print(_encrypt(no_gpu_key, json.dumps({"error": "no_gpu_details", "data": data})))' in source
 
