@@ -1704,7 +1704,8 @@ class DockerService:
 
         volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
-        occupied_targets = {volume_target}
+        # an encrypted pod's plaintext path is where gocryptfs mounts later: nothing else may take it
+        occupied_targets = {volume_target, local_volume_path}
         if external_volume_name:
             volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
             occupied_targets.add("/mnt")
@@ -1759,7 +1760,7 @@ class DockerService:
         run_spec: ContainerRunSpec,
         local_volume: str | None,
         default_extra: dict,
-    ) -> None:
+    ) -> bool:
         """Empty the pod's inner Docker store when its image's dockerd is older than the
         one that last wrote it (an edit to an older template); an older dockerd may not start on a
         newer store. Best-effort: on any failure the pod keeps its store, as it would without this.
@@ -1768,10 +1769,13 @@ class DockerService:
         dockerd): only a strict version line, cut to a few hundred bytes, is acted on or logged;
         anything else is `unknown_version` and the store is kept. The helper containers are
         limited and deadlined in the command itself and always removed afterwards.
+
+        Returns whether the version may be recorded after the create: not when the check or a needed
+        reset failed, so the newer marker stays and the next create tries the reset again.
         """
         store_volume = _dind_store_volume(run_spec, local_volume)
         if store_volume is None:
-            return
+            return True
         recorded_version = current_version = None
         outcome = "kept"
         try:
@@ -1819,6 +1823,7 @@ class DockerService:
                 }),
             )
         )
+        return not outcome.startswith(("failed", "reset_failed"))
 
     async def _remove_dind_probe_containers(
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict
@@ -6562,7 +6567,7 @@ class DockerService:
 
                 try:
                     current_step = "dind_store_version"
-                    await self._reset_dind_store_on_downgrade(
+                    record_dind_version = await self._reset_dind_store_on_downgrade(
                         ssh_client, run_spec=run_spec, local_volume=local_volume, default_extra=default_extra
                     )
                     current_step = "docker_run"
@@ -6633,13 +6638,14 @@ class DockerService:
                             logger.error(_m("docker run failed", extra=log_extra))
 
                         raise Exception("Run docker run command but container is not running")
-                    await self._record_dind_store_version(
-                        ssh_client,
-                        run_spec=run_spec,
-                        local_volume=local_volume,
-                        container_name=container_name,
-                        default_extra=default_extra,
-                    )
+                    if record_dind_version:
+                        await self._record_dind_store_version(
+                            ssh_client,
+                            run_spec=run_spec,
+                            local_volume=local_volume,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                        )
                 except Exception:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,

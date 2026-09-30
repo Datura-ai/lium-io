@@ -1015,9 +1015,15 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
 # ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("running", [True, False], ids=["running", "not-running"])
+@pytest.mark.parametrize(
+    ("running", "reset_ok"),
+    [(True, True), (False, True), (True, False)],
+    ids=["running", "not-running", "reset-failed"],
+)
 @pytest.mark.asyncio
-async def test_the_store_is_checked_before_the_create_and_recorded_once_the_pod_runs(svc, monkeypatch, running):
+async def test_the_store_is_checked_before_the_create_and_recorded_once_the_pod_runs(
+    svc, monkeypatch, running, reset_ok
+):
     from core.config import settings
 
     monkeypatch.setattr(settings, "RENTAL_DIND_PERSISTENT_STORE_ENABLED", True)
@@ -1026,6 +1032,7 @@ async def test_the_store_is_checked_before_the_create_and_recorded_once_the_pod_
 
     async def _reset(ssh_client, *, run_spec, local_volume, default_extra):
         events.append(("reset_on_downgrade", local_volume))
+        return reset_ok
 
     async def _record(ssh_client, *, run_spec, local_volume, container_name, default_extra):
         events.append(("record_version", container_name))
@@ -1052,7 +1059,7 @@ async def test_the_store_is_checked_before_the_create_and_recorded_once_the_pod_
         ("docker_run", (f"{volume}_docker", "/var/lib/docker")),
         ("health_check", running),
     ]
-    if running:
+    if running and reset_ok:
         expected.append(("record_version", f"pod_{payload.pod_id}"))
     assert events[: len(expected)] == expected
     assert ("record_version", f"pod_{payload.pod_id}") not in events[len(expected) :]

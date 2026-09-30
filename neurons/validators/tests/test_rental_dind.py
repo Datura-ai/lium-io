@@ -192,6 +192,33 @@ def _tar_members(data: bytes) -> dict[str, tuple[str, int, bytes | None]]:
         }
 
 
+class _ClosableStream:
+    """The archive chunks, recording whether the reader closed the stream."""
+
+    def __init__(self, api, archive: bytes, chunk: int = 4096):
+        self._api = api
+        self._pieces = (archive[start : start + chunk] for start in range(0, len(archive), chunk))
+
+    def __iter__(self):
+        for piece in self._pieces:
+            self._api.streamed += len(piece)
+            yield piece
+
+    def close(self):
+        self._api.closed = True
+
+
+def _tar_of_kind(name: str, kind: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        entry = tarfile.TarInfo(name)
+        entry.type = kind
+        if kind == tarfile.SYMTYPE:
+            entry.linkname = "/etc/shadow"
+        archive.addfile(entry)
+    return buffer.getvalue()
+
+
 class _ArchiveApiClient:
     """What `_run_container_sync` calls: create, the archive endpoints, start — in that order."""
 
@@ -214,6 +241,7 @@ class _ArchiveApiClient:
         self.stat_size = stat_size
         self.archive = archive
         self.streamed = 0
+        self.closed = False
 
     def create_host_config(self, **kwargs):
         return kwargs
@@ -234,13 +262,7 @@ class _ArchiveApiClient:
         stat = {"name": "daemon.json"}
         if self.stat_size is not None:
             stat["size"] = self.stat_size
-        return self._stream(archive), stat
-
-    def _stream(self, archive: bytes, chunk: int = 4096):
-        for start in range(0, len(archive), chunk):
-            piece = archive[start : start + chunk]
-            self.streamed += len(piece)
-            yield piece
+        return _ClosableStream(self, archive), stat
 
     def put_archive(self, container, path, data):
         self.events.append(("put_archive", container, path))
@@ -318,7 +340,10 @@ async def test_an_image_that_names_its_own_pools_is_not_written():
     [
         _ArchiveApiClient(get_error=APIError("500 Server Error: archive read failed")),
         _ArchiveApiClient(put_error=APIError("500 Server Error: archive write failed")),
+        _ArchiveApiClient(archive=_tar_of_kind("daemon.json", tarfile.SYMTYPE)),
+        _ArchiveApiClient(archive=_tar_of_kind("daemon.json", tarfile.DIRTYPE)),
     ],
+    ids=["read-error", "write-error", "symlink", "directory"],
 )
 @pytest.mark.asyncio
 async def test_a_daemon_json_that_cannot_be_read_or_written_never_fails_the_create(api, caplog):
@@ -327,7 +352,13 @@ async def test_a_daemon_json_that_cannot_be_read_or_written_never_fails_the_crea
     assert api.events[-1] == "start"
     [record] = [r for r in caplog.records if r.getMessage() == "Inner Docker daemon address pools"]
     assert record.levelname == "WARNING"
-    assert record.msg.extra["outcome"].startswith("failed: APIError")
+    outcome = record.msg.extra["outcome"]
+    if api.archive is None:
+        assert outcome.startswith("failed: APIError")
+    else:
+        assert outcome == (
+            "failed: RentalDockerOperationError: /etc/docker/daemon.json in pod_x is not a regular file"
+        )
 
 
 def _daemon_json_of(size: int) -> bytes:
@@ -380,6 +411,7 @@ async def test_a_daemon_json_one_byte_over_the_limit_is_refused_and_the_pod_stil
     )
     if stat_has_size:
         assert api.streamed == 0
+        assert api.closed is True
 
 
 @pytest.mark.asyncio
@@ -392,6 +424,7 @@ async def test_a_huge_archive_is_cut_off_while_it_streams(caplog):
     assert api.events[-1] == "start"
     assert "is larger than" in _pools_outcome(caplog)
     assert api.streamed <= 2 * INNER_DAEMON_CONFIG_MAX_BYTES
+    assert api.closed is True
 
 
 @pytest.mark.asyncio
@@ -521,12 +554,24 @@ def test_the_encrypted_store_setting_alone_mounts_nothing(docker_service, dind_f
     assert _mounts(spec) == [("volume_pod", "/lium-cipher")]
 
 
-def test_a_pod_whose_own_volume_is_at_workspace_keeps_it(docker_service, dind_flags):
+@pytest.mark.parametrize(
+    ("encrypted", "expected"),
+    [
+        (False, [("volume_pod", "/workspace"), ("volume_pod_docker", "/var/lib/docker")]),
+        (True, [("volume_pod", "/lium-cipher")]),
+    ],
+    ids=["plain", "encrypted"],
+)
+def test_a_pod_whose_own_volume_is_at_workspace_keeps_it(
+    docker_service, dind_flags, encrypted, expected
+):
     dind_flags(store=True, workspace=True)
 
-    spec = _run_spec(docker_service, _payload(), local_volume_path="/workspace")
+    spec = _run_spec(
+        docker_service, _payload(), encrypted=encrypted, local_volume_path="/workspace"
+    )
 
-    assert _mounts(spec) == [("volume_pod", "/workspace"), ("volume_pod_docker", "/var/lib/docker")]
+    assert _mounts(spec) == expected
 
 
 @pytest.mark.parametrize(
@@ -779,7 +824,7 @@ def test_the_reset_empties_the_volume_and_the_record_writes_from_inside_the_pod(
         "sh -c 'timeout 300 rm -rf /store/* /store/.[!.]* /store/..?*' >/dev/null 2>&1"
     )
     record = dind_store_version_record_command("pod_x")
-    assert record.startswith("/usr/bin/docker exec pod_x sh -c ")
+    assert record.startswith("timeout 20 /usr/bin/docker exec pod_x sh -c ")
     assert record.endswith(" >/dev/null 2>&1")
     assert "command -v dockerd >/dev/null 2>&1 || exit 0" in record
     assert "dockerd --version 2>/dev/null | head -c 256 | head -n 1" in record
@@ -892,11 +937,12 @@ async def test_the_store_is_emptied_only_on_a_dockerd_downgrade(
 ):
     ssh = _Ssh(probe_stdout=probe_stdout)
 
-    await docker_service._reset_dind_store_on_downgrade(
+    recordable = await docker_service._reset_dind_store_on_downgrade(
         ssh, run_spec=_store_spec(), local_volume="volume_x", default_extra={}
     )
 
     assert _store_outcome(caplog) == outcome
+    assert recordable is True
     assert any("rm -rf /store" in c for c in ssh.commands) is reset
     assert "--runtime sysbox-runc --entrypoint dockerd img:1 --version" in ssh.commands[0]
     # the helpers are removed whatever happened, as the last command
@@ -921,26 +967,28 @@ async def test_only_parsed_versions_reach_the_log(docker_service, caplog):
 @pytest.mark.asyncio
 async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_service, caplog):
     failing = _Ssh(error=OSError("ssh channel died"))
-    await docker_service._reset_dind_store_on_downgrade(
+    recordable = await docker_service._reset_dind_store_on_downgrade(
         failing,
         run_spec=_store_spec(),
         local_volume="volume_x",
         default_extra={},
     )
     assert _store_outcome(caplog) == "failed: OSError: ssh channel died"
+    assert recordable is False
     # the cleanup is still attempted, and its own failure is only logged
     assert failing.commands[-1] == dind_probe_cleanup_command("pod_x")
     assert "Inner Docker store probe containers not removed" in caplog.text
     caplog.clear()
 
     downgrade = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
-    await docker_service._reset_dind_store_on_downgrade(
+    recordable = await docker_service._reset_dind_store_on_downgrade(
         _Ssh(probe_stdout=downgrade, reset_status=1),
         run_spec=_store_spec(),
         local_volume="volume_x",
         default_extra={},
     )
     assert _store_outcome(caplog) == "reset_failed: exit 1"
+    assert recordable is False  # the newer marker stays, so the next create resets again
 
 
 @pytest.mark.asyncio

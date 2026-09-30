@@ -12,7 +12,7 @@ edit); a running container is never changed.
 | `RENTAL_DIND_ADDRESS_POOLS_ENABLED` | `default-address-pools` from `RENTAL_DIND_ADDRESS_POOLS` (default `10.200.0.0/14` in /24s, 1024 networks) is merged into the pod's `/etc/docker/daemon.json` before its first start. Without it the inner dockerd stops at 29 networks. |
 | `RENTAL_DIND_PERSISTENT_STORE_ENABLED` | A per-pod volume `volume_<pod>_docker` at `/var/lib/docker`: inner images, containers and volumes survive a reboot or an edit. Plain (unencrypted) pods only, unless the next setting is on too. |
 | `RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED` | Also give encrypted pods the store volume. Read the plaintext note below first. |
-| `RENTAL_DIND_WORKSPACE_VOLUME_ENABLED` | Encrypted pods get a per-pod volume `volume_<pod>_workspace` at `/workspace`, a path whose bind mounts work in inner containers (the gocryptfs `/root` cannot be bind-mounted under sysbox). |
+| `RENTAL_DIND_WORKSPACE_VOLUME_ENABLED` | Encrypted pods get a per-pod volume `volume_<pod>_workspace` at `/workspace`, a path whose bind mounts work in inner containers (the gocryptfs `/root` cannot be bind-mounted under sysbox). A pod whose own volume path is `/workspace` gets none: gocryptfs mounts its plaintext there. |
 
 ## Encrypted pods: these volumes are plaintext
 
@@ -24,6 +24,9 @@ pod (gocryptfs at `/root`). The two volumes above are ordinary local volumes on 
   host, but it disappeared at every reboot or edit.
 - `volume_<pod>_docker`, if enabled for encrypted pods, holds the inner images, containers and
   their volumes in plaintext until the pod is deleted.
+
+Neither volume counts against the pod's sized volume or its rootfs storage cap: both grow on the
+host disk with no per-pod limit.
 
 A renter who needs everything encrypted at rest keeps their data under `/root` and uses
 `/workspace` only for what inner containers must bind-mount.
@@ -45,7 +48,8 @@ Docker's own pools in the pod, and the validator logs `Inner Docker daemon addre
 `outcome=skipped_pod_network_overlap: …`.
 
 The image's `daemon.json` is the renter's, so the validator reads at most 64 KiB of it. A larger
-one is refused before it is read, the pod gets Docker's own pools, and the log says
+one is refused from its archive size when Docker reports one, and otherwise stopped at the bound
+while it is streamed; the pod gets Docker's own pools, and the log says
 `outcome=failed: … is larger than 65536 bytes`.
 
 ## The store across dockerd versions
@@ -74,11 +78,12 @@ image is theirs), so:
   periodic stale-container cleanup removes any labeled helper older than 10 minutes by the host's
   clock (a validator that lost its SSH session mid-check).
 - The SSH calls are bounded: 90 s for the check, 360 s for a reset (`rm -rf` has a 300 s deadline
-  inside the helper), 30 s for recording the version. An image whose dockerd never answers costs
-  a reboot or edit 20 s.
+  inside the helper), 30 s for recording the version, which also has a 20 s deadline on the host. An image whose
+  dockerd never answers costs a reboot or edit up to 20 s at the check and 20 s at the record.
 
 If an edit fails after the reset, the restored container also finds an empty store. A reset that
-hits its deadline leaves the store partly emptied (`reset_failed`).
+hits its deadline leaves the store partly emptied (`reset_failed`); the version is then not recorded,
+so the newer marker stays and the next reboot or edit tries the reset again.
 
 ## Removal
 

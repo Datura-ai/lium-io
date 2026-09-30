@@ -352,14 +352,18 @@ def dind_store_reset_command(*, store_volume: str, helper_image: str, container_
 
 def dind_store_version_record_command(container_name: str) -> str:
     """Record the pod's dockerd version in its store, from inside the pod; an image without dockerd
-    records nothing and succeeds. The pod's output is discarded; only docker exec's status counts."""
+    records nothing and succeeds. The pod's output is discarded; only docker exec's status counts. The host's
+    `timeout` bounds it, so a dockerd that never answers costs DIND_PROBE_DOCKERD_DEADLINE_SEC, not the SSH timeout."""
     marker = f"{DIND_STORE_TARGET}/{DIND_STORE_VERSION_MARKER}"
     script = (
         "command -v dockerd >/dev/null 2>&1 || exit 0; "
         f"v=$(dockerd --version 2>/dev/null | head -c {DIND_VERSION_MAX_BYTES} | head -n 1) && "
         f'[ -n "$v" ] && printf "%s\\n" "$v" > {marker}'
     )
-    return f"/usr/bin/docker exec {shlex.quote(container_name)} sh -c {shlex.quote(script)} >/dev/null 2>&1"
+    return (
+        f"timeout {DIND_PROBE_DOCKERD_DEADLINE_SEC} /usr/bin/docker exec {shlex.quote(container_name)} "
+        f"sh -c {shlex.quote(script)} >/dev/null 2>&1"
+    )
 
 
 _DOCKER_CREATED_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z")
