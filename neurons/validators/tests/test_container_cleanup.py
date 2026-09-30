@@ -730,3 +730,11 @@ async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
     for msg in cleanup_logs:
         assert msg.extra["rented_container_count"] == len(listed_container_names(rented_data))
         assert "pod_fleet-" not in msg.to_full_string()
+
+
+@pytest.mark.parametrize("rented_data", [None, _listed(), _rented_data("twin-executor-id", ["pod_on_twin"])])
+def test_get_rented_containers_answers_the_dind_volume_sweep_like_listed_container_names(rented_data):
+    # #1448's prune_orphaned_dind_volumes calls it with this signature
+    names = ContainerCleanup()._get_rented_containers(rented_data, EXECUTOR_UUID)
+
+    assert names == listed_container_names(rented_data)

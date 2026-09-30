@@ -104,6 +104,12 @@ class ContainerCleanup:
         self.stale_threshold_minutes = stale_threshold_minutes
         self.dry_run = dry_run
 
+    def _get_rented_containers(
+        self, rented_data: Optional[RentedExecutorsResponse], executor_uuid: str
+    ) -> set[str]:
+        """Kept for callers outside this file (#1448's DinD volume sweep); the executor id is unused."""
+        return listed_container_names(rented_data)
+
     async def cleanup(
         self,
         ssh_client,
