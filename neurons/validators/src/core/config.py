@@ -574,7 +574,8 @@ class Settings(BaseSettings):
 
     # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
     # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
-    # results are merged. It can raise many hosts' verified_port_count at once, so it ships off.
+    # results are merged; still below the floor, one more batch probes up to 300 declared ports
+    # above those. It can raise many hosts' verified_port_count at once, so it ships off.
     PORT_PROBE_TOPUP_BELOW_FLOOR: bool = Field(env="PORT_PROBE_TOPUP_BELOW_FLOOR", default=False)
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an

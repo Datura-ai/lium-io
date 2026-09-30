@@ -30,12 +30,13 @@ class PortProbe:
         log_ctx: dict | None = None,
     ) -> PortProbeResult:
         log_ctx = log_ctx or {}
-        successful, failed = await self.batch_verifier.verify(
+        batch = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
             log_ctx=log_ctx,
         )
+        successful, failed = batch.successful, batch.failed
         tier = "batch"
 
         if not successful:
@@ -65,7 +66,7 @@ class PortProbe:
             )
             tier = "fallback"
 
-        return PortProbeResult(tuple(successful), tuple(failed), tier)
+        return PortProbeResult(tuple(successful), tuple(failed), tier, batch_completed=batch.completed)
 
     async def top_up(
         self,
@@ -110,3 +111,21 @@ class PortProbe:
                 successful = successful + recovered
                 failed = [p for p in failed if p not in recovered_set]
         return PortProbeResult(tuple(successful), tuple(failed), "+".join(tiers))
+
+    async def probe_spread(
+        self,
+        ports: list[PortPair],
+        *,
+        ssh_client,
+        host: str,
+        log_ctx: dict | None = None,
+    ) -> PortProbeResult:
+        """The second pass: the batch tier only, one attempt, so it costs at most one container."""
+        batch = await self.batch_verifier.verify(
+            ports,
+            ssh_client=ssh_client,
+            host=host,
+            log_ctx={**(log_ctx or {}), "port_pass": 2},
+            max_attempts=1,
+        )
+        return PortProbeResult(tuple(batch.successful), tuple(batch.failed), batch_completed=batch.completed)
