@@ -17,6 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Build before the login: the base images (python, docker) are public docker.io images, and once
+      # the OIDC token is the docker.io credential every pull uses it. It covers only the daturaai push
+      # repositories, so a build after the login fails with `insufficient scope` (run 36727847745).
+      - name: Build the images
+        run: |
+          cd neurons/miners
+          bash ./docker_build.sh
+          bash ./docker_runner_build.sh
+
       - name: Log in to Docker Hub (OIDC, no stored token)
         uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
         env:
@@ -27,17 +36,7 @@ jobs:
         with:
           username: daturaai
 
-      - name: Make scripts executable
+      - name: Push the images
         run: |
-          chmod +x neurons/miners/docker_publish.sh
-          chmod +x neurons/miners/docker_runner_publish.sh
-          
-      - name: Run docker_publish.sh
-        run: |
-          cd neurons/miners
-          ./docker_publish.sh
-          
-      - name: Run docker_runner_publish.sh
-        run: |
-          cd neurons/miners
-          ./docker_runner_publish.sh
+          docker push "daturaai/compute-subnet-miner:$TAG"
+          docker push "daturaai/compute-subnet-miner-runner:$TAG"

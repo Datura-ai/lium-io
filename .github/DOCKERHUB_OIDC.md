@@ -23,9 +23,17 @@ Per job: `permissions: id-token: write` (plus `contents: read` for the checkout)
 `DOCKERHUB_OIDC_CONNECTIONID` is a repository **variable** (Settings → Secrets and variables →
 Actions → Variables), not a secret — the id is not sensitive. `DOCKERHUB_OIDC_EXPIREIN` is the
 lifetime of the exchanged Docker Hub token, which is the docker password for every later `docker
-push` in the job (the action allows 300–21600 s, default 300). The login runs before the build, and
-the longest measured build+push window is about 140 s (`executor_cd_prod`: executor + runner images);
-1800 s keeps a cold cache or a slow runner from ending in an `unauthorized` push after a green build. The `docker_publish.sh` scripts under
+push` in the job (the action allows 300–21600 s, default 300). 1800 s keeps a slow runner from ending
+in an `unauthorized` push; the longest measured build+push window is about 140 s (`executor_cd_prod`:
+executor + runner images).
+
+The login step comes after the `docker build` steps, never before: the base images (`python:*-slim`,
+`docker:26-cli`) are public docker.io images, and once the exchanged token is the docker.io credential
+every pull uses it. It covers only the repositories in the ruleset, so a build after the login fails
+with `401 Unauthorized: access token has insufficient scope` (run 36727847745, `validator_cd_dev`).
+The executor runner image needs the executor digest from its push, so `executor_cd_*` log out
+(`docker logout docker.io`) before the runner build and log in again for the runner push.
+`test_dockerhub_oidc_login.py` fails on a workflow that builds while logged in. The `docker_publish.sh` scripts under
 `neurons/*/` log in themselves only when a caller passes `DOCKERHUB_PAT`, so a caller in another
 repository that still holds a token keeps working.
 
