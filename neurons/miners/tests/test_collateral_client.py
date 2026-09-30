@@ -90,6 +90,10 @@ class FakeProvider(AsyncBaseProvider):
         self.mine_sent = True
         self.mined = set()
         self.block_number = 16
+        self.head_hashes = []
+        self.logs_by_fork = []
+        # hashes whose receipt request is answered with TX_HASH's receipt
+        self.receipts_of_another = set()
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -118,11 +122,17 @@ class FakeProvider(AsyncBaseProvider):
                 self.mined.add(AsyncWeb3.keccak(hexstr=params[0]).hex())
             if self.send_error == "lost":
                 raise ConnectionError(f"Could not reach {RPC_URL}/?apikey=secret-rpc-key")
-            return {"jsonrpc": "2.0", "id": 1, "result": TX_HASH}
+            # a gateway that broadcast the bytes and answers with another transaction's hash
+            answered = TX_HASH if self.send_error == "wrong_hash" else AsyncWeb3.keccak(hexstr=params[0]).hex()
+            return {"jsonrpc": "2.0", "id": 1, "result": answered}
         if method == "eth_blockNumber":
             return {"jsonrpc": "2.0", "id": 1, "result": hex(self.block_number)}
+        if method == "eth_getBlockByNumber":
+            block_hash = self.head_hashes.pop(0) if self.head_hashes else BLOCK_HASH
+            return {"jsonrpc": "2.0", "id": 1, "result": {"number": hex(self.block_number), "hash": block_hash}}
         if method == "eth_getLogs":
-            return {"jsonrpc": "2.0", "id": 1, "result": self.logs}
+            logs = self.logs_by_fork.pop(0) if self.logs_by_fork else self.logs
+            return {"jsonrpc": "2.0", "id": 1, "result": logs}
         results = {
             "eth_chainId": hex(self.chain_id),
             "eth_gasPrice": hex(self.gas_price),
@@ -143,6 +153,8 @@ class FakeProvider(AsyncBaseProvider):
                 "type": "0x0",
             },
         }
+        if method == "eth_getTransactionReceipt" and params[0] in self.receipts_of_another:
+            return {"jsonrpc": "2.0", "id": 1, "result": results[method]}
         if method == "eth_getTransactionReceipt" and params[0] != TX_HASH:
             if params[0] not in self.mined:
                 return {"jsonrpc": "2.0", "id": 1, "result": None}
@@ -180,7 +192,7 @@ def reclaimed_log(reclaim_request_id=5, amount=10**17):
     }
 
 
-def started_log(reclaim_request_id=5, amount=10**17):
+def started_log(reclaim_request_id=5, amount=10**17, url="Manual reclaim"):
     return {
         "address": CONTRACT,
         "topics": [
@@ -192,7 +204,7 @@ def started_log(reclaim_request_id=5, amount=10**17):
             "0x" + UUID(EXECUTOR).bytes.hex().ljust(64, "0"),
             "0x" + MINER.lower().removeprefix("0x").rjust(64, "0"),
         ],
-        "data": hex_encode(["uint256", "uint64", "string", "bytes16"], [amount, 0, "Manual reclaim", bytes(16)]),
+        "data": hex_encode(["uint256", "uint64", "string", "bytes16"], [amount, 0, url, bytes(16)]),
         "blockNumber": "0x10",
         "blockHash": BLOCK_HASH,
         "transactionHash": TX_HASH,
@@ -200,6 +212,10 @@ def started_log(reclaim_request_id=5, amount=10**17):
         "logIndex": "0x0",
         "removed": False,
     }
+
+
+def sent_hash(provider, index=0) -> str:
+    return AsyncWeb3.keccak(hexstr=provider.sent[index]).hex()
 
 
 def client_with(provider, miner_key=MINER_KEY):
@@ -251,8 +267,8 @@ async def test_finalize_signs_one_transaction_with_the_node_nonce_gas_price_and_
 @pytest.mark.parametrize(
     "revert_data,message",
     [
-        ("0x" + selector("BeforeDenyTimeout()"), f"Transaction {TX_HASH} reverted: BeforeDenyTimeout"),
-        ("0x", f"Transaction {TX_HASH} reverted: execution reverted"),
+        ("0x" + selector("BeforeDenyTimeout()"), "Transaction {} reverted: BeforeDenyTimeout"),
+        ("0x", "Transaction {} reverted: execution reverted"),
     ],
     ids=["known-error", "no-known-error"],
 )
@@ -265,6 +281,7 @@ async def test_reverted_finalize_names_the_contract_error_and_not_the_key(revert
     with pytest.raises(CollateralTransactionError) as raised:
         await client_with(provider).finalize_reclaim(5)
 
+    message = message.format(sent_hash(provider))
     assert str(raised.value) == message
     assert MINER_KEY.removeprefix("0x")[:16] not in message
     replay = [params for method, params in provider.requests if method == "eth_call"][-1]
@@ -293,7 +310,7 @@ async def test_a_failed_replay_logs_its_error_class_and_not_the_url_or_the_key(c
         with pytest.raises(CollateralTransactionError) as raised:
             await client_with(provider).finalize_reclaim(5)
 
-    assert str(raised.value) == f"Transaction {TX_HASH} reverted"
+    assert str(raised.value) == f"Transaction {sent_hash(provider)} reverted"
     logged = [r.getMessage() for r in caplog.records if r.name == "core.collateral"]
     assert logged == [
         "Could not replay the reverted transaction at block 16 to read its revert reason: "
@@ -324,11 +341,12 @@ async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_reads_it_and_s
 
     monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
     with caplog.at_level(logging.INFO, logger="core.collateral"):
-        with pytest.raises(CollateralOutcomeUnknownError, match=f"Transaction {TX_HASH} was sent") as raised:
+        with pytest.raises(CollateralOutcomeUnknownError, match="was sent but its receipt") as raised:
             await client.reclaim_collateral(EXECUTOR)
+    assert f"Transaction {sent_hash(provider)} was sent" in str(raised.value)
     assert "outcome is unknown" in str(raised.value)
     assert "secret-rpc-key" not in str(raised.value)
-    assert f"Sent transaction {TX_HASH}" in caplog.text
+    assert f"Sent transaction {sent_hash(provider)}" in caplog.text
 
     # not mined, nonce unused: the same bytes go out again, and nothing new is signed
     with pytest.raises(CollateralOutcomeUnknownError, match="broadcast again and no new transaction was sent"):
@@ -398,6 +416,7 @@ async def test_an_already_known_answer_is_an_unknown_outcome_and_the_retry_sends
         ("replacement_underpriced", 1),
         ("below_base_fee", 1),
         ("insufficient_funds", 1),
+        ("wrong_hash_reply", 1),
     ],
 )
 async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_status, monkeypatch):
@@ -408,6 +427,17 @@ async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_statu
 
     async def unavailable(*_args, **_kwargs):
         raise TimeoutError()
+
+    async def receipt_or_timeout(tx_hash, **_kwargs):
+        # the answered hash (TX_HASH) has a mined receipt; the signed transaction has none
+        receipt = await eth.get_transaction_receipt(tx_hash)
+        if receipt is None:
+            raise TimeoutError()
+        return receipt
+
+    if failure == "wrong_hash_reply":
+        provider.send_error = "wrong_hash"
+        provider.mine_sent = False
 
     def accepted_then(error):
         async def send(raw):
@@ -431,12 +461,14 @@ async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_statu
     }
     if failure in answers:
         monkeypatch.setattr(eth, "send_raw_transaction", accepted_then(answers[failure]))
-    monkeypatch.setattr(eth, "wait_for_transaction_receipt", unavailable)
+    wait = receipt_or_timeout if failure == "wrong_hash_reply" else unavailable
+    monkeypatch.setattr(eth, "wait_for_transaction_receipt", wait)
     with pytest.raises(CollateralOutcomeUnknownError) as raised:
         await client.finalize_reclaim(5)
-    # after a lost receipt the error names the hash the RPC answered; after a lost answer, the signed one
-    named = TX_HASH if failure == "lost_receipt" else AsyncWeb3.keccak(hexstr=provider.sent[0]).hex()
-    assert named.removeprefix("0x") in str(raised.value)
+    # the error names the signed hash, whatever hash the RPC answered with
+    assert sent_hash(provider).removeprefix("0x") in str(raised.value)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+    provider.send_error = None
     assert "no transaction was sent" not in str(raised.value)
     assert_no_rpc_secret(str(raised.value))
 
@@ -518,9 +550,96 @@ async def test_an_unmined_send_whose_rebroadcast_is_not_accepted_stops_at_once_w
     provider.send_error = "unknown account"
     with pytest.raises(CollateralOutcomeUnknownError, match="broadcasting it again failed") as raised:
         await client.finalize_reclaim(5)
-    assert f"delete {client.sent_record_path}" in str(raised.value)
-    assert f"reuses nonce {NONCE}" in str(raised.value)
+    assert "delete" not in str(raised.value)
+    assert f"replace-collateral-transaction`: it signs a replacement at the same nonce {NONCE}" in str(raised.value)
     assert len(provider.sent) == 1
+
+
+async def test_a_receipt_that_names_another_transaction_is_an_unknown_outcome(monkeypatch):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+    signed_hash = client._read_sent_record(CHAIN_ID)["hash"]
+    provider.receipts_of_another.add(signed_hash)
+    with pytest.raises(CollateralOutcomeUnknownError, match="another transaction's receipt"):
+        await client.finalize_reclaim(5)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == signed_hash
+    assert len(provider.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "signed_nonce,latest_after,pending_after",
+    [(NONCE, NONCE, NONCE + 1), (NONCE + 1, NONCE, NONCE)],
+    ids=["still-pending-at-a-low-price", "lagging-rpc"],
+)
+async def test_an_unmined_send_is_replaced_at_its_own_nonce_and_its_record_is_never_dropped(
+    monkeypatch, signed_nonce, latest_after, pending_after
+):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
+    provider.nonce = provider.pending_nonce = signed_nonce
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+
+    provider.nonce, provider.pending_nonce = latest_after, pending_after
+    provider.gas_price = GAS_PRICE + 1
+    with pytest.raises(CollateralOutcomeUnknownError, match="broadcast again and no new transaction was sent") as raised:
+        await client.finalize_reclaim(5)
+    assert "delete" not in str(raised.value)
+    assert "replace-collateral-transaction" in str(raised.value)
+    assert {decode_legacy(raw)["nonce"] for raw in provider.sent} == {signed_nonce}
+
+    first_hash = sent_hash(provider)
+    provider.mine_sent = True
+    with pytest.raises(CollateralTransactionError, match="the replacement, succeeded in block 16"):
+        await client.replace_earlier_send()
+    replacement = decode_legacy(provider.sent[-1])
+    assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [signed_nonce] * 3
+    assert replacement["gasPrice"] == -(-GAS_PRICE * 9 // 8)
+    assert replacement["data"] == decode_legacy(provider.sent[0])["data"]
+    assert client._read_sent_record(CHAIN_ID) is None
+    assert first_hash != sent_hash(provider, -1)
+
+
+async def test_a_replacement_is_recorded_with_the_send_it_replaces_before_it_is_broadcast(monkeypatch):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    monkeypatch.setattr(collateral_module, "RECEIPT_TIMEOUT_SEC", 0)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+    first_hash = sent_hash(provider)
+    recorded_at_broadcast = []
+    original_send = client.w3.eth.send_raw_transaction
+
+    async def send(raw):
+        recorded_at_broadcast.append(client._read_sent_record(CHAIN_ID))
+        return await original_send(raw)
+
+    monkeypatch.setattr(client.w3.eth, "send_raw_transaction", send)
+    with pytest.raises(CollateralOutcomeUnknownError, match="not mined yet"):
+        await client.replace_earlier_send()
+    replacement_hash = sent_hash(provider, -1)
+    assert recorded_at_broadcast[0]["hashes"] == [first_hash, replacement_hash]
+
+    # the first transaction is the one mined: its receipt settles the record
+    provider.mined.add(first_hash)
+    with pytest.raises(CollateralTransactionError, match=f"Transaction {first_hash}, sent earlier, succeeded"):
+        await client.finalize_reclaim(5)
+    assert client._read_sent_record(CHAIN_ID) is None
+
+
+async def test_nothing_is_replaced_without_a_recorded_send():
+    provider = FakeProvider()
+    with pytest.raises(CollateralTransactionError, match="nothing was replaced"):
+        await client_with(provider).replace_earlier_send()
+    assert provider.sent == []
 
 
 async def test_a_mined_reclaim_whose_answer_was_lost_reports_its_request_id(monkeypatch):
@@ -615,6 +734,38 @@ async def test_the_open_reclaim_list_reads_every_request_at_the_block_of_its_log
     assert [request.reclaim_request_id for request in requests] == [5]
     details = [params for method, params in provider.requests if method == "eth_call"]
     assert details and all(block == hex(5000) for _, block in details)
+
+
+OLD_FORK, NEW_FORK = "0x" + "01" * 32, "0x" + "02" * 32
+
+
+@pytest.mark.parametrize(
+    "head_hashes,urls",
+    [
+        # block 5000 changes between the log read and the state read: the old fork's list is thrown away
+        ([OLD_FORK, NEW_FORK, NEW_FORK, NEW_FORK], ["https://old.fork/reclaim", "https://new.fork/reclaim"]),
+        ([OLD_FORK, OLD_FORK], ["https://old.fork/reclaim"]),
+    ],
+    ids=["reorg", "no-reorg"],
+)
+async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(head_hashes, urls):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.block_number = 5000
+    provider.head_hashes = list(head_hashes)
+    provider.logs_by_fork = [[started_log(url=url)] for url in urls]
+
+    requests = await client_with(provider).get_reclaim_events()
+
+    assert [request.url for request in requests] == [urls[-1]]
+    assert [method for method, _ in provider.requests].count("eth_getLogs") == len(urls)
+
+
+async def test_the_open_reclaim_list_gives_up_on_a_head_that_keeps_moving():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
+    provider.head_hashes = ["0x" + f"{i:02x}" * 32 for i in range(1, 2 * collateral_module.RECLAIM_LIST_ATTEMPTS + 1)]
+
+    with pytest.raises(CollateralTransactionError, match="reorganized while the open reclaim requests were read"):
+        await client_with(provider).get_reclaim_events()
 
 
 async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():

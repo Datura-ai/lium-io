@@ -5,6 +5,7 @@ that still hold a deposit. It covers the contract calls the miner CLI makes: bal
 collateral reads, start a reclaim, list open reclaims, finalize a reclaim.
 """
 
+import asyncio
 import contextlib
 import fcntl
 import hashlib
@@ -17,6 +18,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
+import rlp
 from bittensor_wallet import Keypair
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
@@ -55,6 +57,12 @@ SEND_REFUSALS = {
     "invalid sender": "invalid signature",
 }
 ALREADY_KNOWN = {"already known", "known transaction"}
+
+RECEIPT_TIMEOUT_SEC = 300
+RECEIPT_POLL_SEC = 2
+# A replacement at the same nonce must outbid the transaction it replaces; pools refuse a smaller bump.
+REPLACEMENT_PRICE_BUMP = (9, 8)
+RECLAIM_LIST_ATTEMPTS = 3
 
 GAS_LIMIT = 200_000
 # The RPC quotes the gas price; above this ceiling nothing is signed, so a faulty or hostile RPC
@@ -118,6 +126,32 @@ def rpc_origin(rpc_url: str | None) -> str | None:
 
 def executor_uuid_bytes(executor_uuid: str) -> bytes:
     return UUID(executor_uuid).bytes
+
+
+def same_hash(a, b) -> bool:
+    def text(value) -> str:
+        if isinstance(value, bytes | bytearray):
+            value = value.hex()
+        return str(value or "").lower().removeprefix("0x")
+
+    return bool(text(a)) and text(a) == text(b)
+
+
+def record_hashes(record: dict) -> list[str]:
+    """Every signed transaction of a record at its nonce: the first send and each replacement."""
+    return list(record.get("hashes") or [record["hash"]])
+
+
+def decode_legacy_transaction(raw: str) -> dict:
+    nonce, gas_price, gas, to, value, data, *_ = rlp.decode(bytes.fromhex(raw.removeprefix("0x")))
+    return {
+        "nonce": int.from_bytes(nonce, "big"),
+        "gasPrice": int.from_bytes(gas_price, "big"),
+        "gas": int.from_bytes(gas, "big"),
+        "to": AsyncWeb3.to_checksum_address(to),
+        "value": int.from_bytes(value, "big"),
+        "data": AsyncWeb3.to_hex(data),
+    }
 
 
 class CollateralClient:
@@ -246,31 +280,38 @@ class CollateralClient:
         raw_transaction = getattr(signed, "raw_transaction", None) or signed.rawTransaction
         signed_hash = signed.hash.hex()
         self._write_sent_record(
-            chain_id, {"nonce": nonce, "hash": signed_hash, "raw": AsyncWeb3.to_hex(raw_transaction)}
+            chain_id,
+            {"nonce": nonce, "hash": signed_hash, "raw": AsyncWeb3.to_hex(raw_transaction), "hashes": [signed_hash]},
         )
         try:
-            tx_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
+            answered_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
         except Exception as error:
             answer = self._send_answer(error)
             raise CollateralOutcomeUnknownError(
                 f"Transaction {signed_hash} may have been sent: the RPC answered with an error ({answer}), which "
                 f"does not prove that no node took it, so its outcome is unknown. {RETRY_IS_SAFE}"
             ) from error
-        logger.info("Sent transaction %s; waiting for its receipt", tx_hash.hex())
+        # only the hash of the signed bytes names what was sent: a gateway can answer with any hash
+        if not same_hash(answered_hash, signed_hash):
+            logger.warning(
+                "The RPC answered transaction %s with another hash; waiting for the signed one's receipt", signed_hash
+            )
+        logger.info("Sent transaction %s; waiting for its receipt", signed_hash)
         try:
             receipt = await self.w3.eth.wait_for_transaction_receipt(
-                tx_hash, timeout=300, poll_latency=2
+                signed_hash, timeout=RECEIPT_TIMEOUT_SEC, poll_latency=RECEIPT_POLL_SEC
             )
         except Exception as error:
             # the class name only: a transport error's text can carry the RPC URL and its API key
             raise CollateralOutcomeUnknownError(
-                f"Transaction {tx_hash.hex()} was sent but its receipt could not be read "
+                f"Transaction {signed_hash} was sent but its receipt could not be read "
                 f"({type(error).__name__}); its outcome is unknown. {RETRY_IS_SAFE}"
             ) from error
+        self._check_receipt_hash(receipt, signed_hash)
         self._clear_sent_record(chain_id, signed_hash)
         if receipt["status"] == 0:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
-            message = f"Transaction {tx_hash.hex()} reverted"
+            message = f"Transaction {signed_hash} reverted"
             raise CollateralTransactionError(f"{message}: {reason}" if reason else message)
         return receipt
 
@@ -280,47 +321,89 @@ class CollateralClient:
         record = self._read_sent_record(chain_id)
         if record is None:
             return
-        tx_hash = record["hash"]
-        receipt = await self._receipt_of_earlier_send(tx_hash)
-        if receipt is None:
-            nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
-            if nonce > record["nonce"]:
-                # the nonce is used, but that does not say by which transaction or with what outcome, so the record
-                # stays until a receipt says so. The receipt may be late (a lagging RPC) or gone for good (an RPC
-                # that prunes old receipts): another RPC, or the person after checking the explorer, settles it
-                raise CollateralOutcomeUnknownError(
-                    f"Transaction {tx_hash}, sent earlier, has no receipt on this RPC and nonce {record['nonce']} "
-                    "is used, so its outcome is unknown; no transaction was sent. Run this again with "
-                    "SUBTENSOR_EVM_RPC_URL set to an RPC that serves its receipt, or look the transaction up on the "
-                    f"explorer and, once you know its outcome, delete {self.sent_record_path} and run this again "
-                    "if it still needs doing"
-                )
-            receipt = await self._broadcast_again(record)
-        self._clear_sent_record(chain_id, tx_hash)
+        found = await self._receipt_of_earlier_send(record)
+        if found is None:
+            await self._raise_if_nonce_used(record)
+            found = await self._broadcast_again(record)
+        self._report_settled(chain_id, *found)
+
+    async def _raise_if_nonce_used(self, record: dict) -> None:
+        nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
+        if nonce > record["nonce"]:
+            # the nonce is used, but that does not say by which transaction or with what outcome, so the record
+            # stays until a receipt says so. The receipt may be late (a lagging RPC) or gone for good (an RPC
+            # that prunes old receipts): another RPC, or the person after checking the explorer, settles it
+            raise CollateralOutcomeUnknownError(
+                f"Transaction {record['hash']}, sent earlier, has no receipt on this RPC and nonce {record['nonce']} "
+                "is used, so its outcome is unknown; no transaction was sent. Run this again with "
+                "SUBTENSOR_EVM_RPC_URL set to an RPC that serves its receipt, or look the transaction up on the "
+                f"explorer and, once you know its outcome, delete {self.sent_record_path} and run this again "
+                "if it still needs doing"
+            )
+
+    def _report_settled(self, chain_id: int, tx_hash: str, receipt, replaced: bool = False) -> None:
+        self._clear_sent_record(chain_id, self._read_sent_record(chain_id)["hash"])
         outcome = "succeeded" if receipt["status"] == 1 else "reverted"
         started = []
         if receipt["status"] == 1:
             started = self.contract.events.ReclaimProcessStarted().process_receipt(receipt, errors=DISCARD)
         request = f"; it started reclaim request {started[0]['args']['reclaimRequestId']}" if started else ""
+        sent = "the replacement" if replaced else "sent earlier"
+        tail = (
+            "Run the reclaim or finalize again if it still needs doing"
+            if replaced
+            else "no new transaction was sent. Run this again if it still needs doing"
+        )
         raise CollateralTransactionError(
-            f"Transaction {tx_hash}, sent earlier, {outcome} in block {receipt['blockNumber']}{request}; "
-            "no new transaction was sent. Run this again if it still needs doing"
+            f"Transaction {tx_hash}, {sent}, {outcome} in block {receipt['blockNumber']}{request}; {tail}"
         )
 
-    async def _receipt_of_earlier_send(self, tx_hash: str):
-        try:
-            return await self.w3.eth.get_transaction_receipt(tx_hash)
-        except TransactionNotFound:
-            return None
-        except Exception as error:
+    async def _receipt_of_earlier_send(self, record: dict):
+        """(hash, receipt) of whichever signed transaction of the record has a receipt, or None."""
+        for tx_hash in record_hashes(record):
+            try:
+                receipt = await self.w3.eth.get_transaction_receipt(tx_hash)
+            except TransactionNotFound:
+                continue
+            except Exception as error:
+                raise CollateralOutcomeUnknownError(
+                    f"The receipt of transaction {tx_hash}, sent earlier, could not be read "
+                    f"({type(error).__name__}); no transaction was sent. {RETRY_IS_SAFE}"
+                ) from error
+            if receipt is None:
+                continue
+            self._check_receipt_hash(receipt, tx_hash)
+            return tx_hash, receipt
+        return None
+
+    @staticmethod
+    def _check_receipt_hash(receipt, tx_hash: str) -> None:
+        if not same_hash(receipt.get("transactionHash"), tx_hash):
             raise CollateralOutcomeUnknownError(
-                f"The receipt of transaction {tx_hash}, sent earlier, could not be read ({type(error).__name__}); "
-                f"no transaction was sent. {RETRY_IS_SAFE}"
-            ) from error
+                f"The RPC answered the receipt of transaction {tx_hash} with another transaction's receipt, so its "
+                f"outcome is unknown; no transaction was sent. {RETRY_IS_SAFE}"
+            )
+
+    async def _wait_for_earlier_send(self, record: dict):
+        hashes = record_hashes(record)
+        if len(hashes) == 1:
+            receipt = await self.w3.eth.wait_for_transaction_receipt(
+                hashes[0], timeout=RECEIPT_TIMEOUT_SEC, poll_latency=RECEIPT_POLL_SEC
+            )
+            self._check_receipt_hash(receipt, hashes[0])
+            return hashes[0], receipt
+        deadline = asyncio.get_running_loop().time() + RECEIPT_TIMEOUT_SEC
+        while True:
+            found = await self._receipt_of_earlier_send(record)
+            if found is not None:
+                return found
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError()
+            await asyncio.sleep(RECEIPT_POLL_SEC)
 
     async def _broadcast_again(self, record: dict):
         """Broadcast an unmined earlier send again as the same bytes (a mempool may have dropped it) and wait
-        for its receipt. Its nonce is unused, so it and anything else on that nonce can't both be mined."""
+        for a receipt of it or of a transaction it replaced. Its nonce is unused, so only one of them can be mined."""
         tx_hash = record["hash"]
         try:
             await self.w3.eth.send_raw_transaction(record["raw"])
@@ -333,7 +416,9 @@ class CollateralClient:
                 ) from error
         logger.info("Broadcast transaction %s, sent earlier, again; waiting for its receipt", tx_hash)
         try:
-            return await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300, poll_latency=2)
+            return await self._wait_for_earlier_send(record)
+        except CollateralOutcomeUnknownError:
+            raise
         except Exception as error:
             raise CollateralOutcomeUnknownError(
                 f"Transaction {tx_hash}, sent earlier, is not mined yet; it was broadcast again and no new "
@@ -342,10 +427,57 @@ class CollateralClient:
             ) from error
 
     def _if_it_stays_unmined(self, record: dict) -> str:
+        # no receipt on this RPC does not prove it can't be mined, so the record is never dropped for that
         return (
-            f"If it stays unmined, delete {self.sent_record_path} and run this again: the next transaction reuses "
-            f"nonce {record['nonce']}, so only one of the two can be mined"
+            "If it stays unmined (a gas price the chain no longer takes), run `replace-collateral-transaction`: it "
+            f"signs a replacement at the same nonce {record['nonce']} with a higher gas price, so only one of the "
+            "two can be mined"
         )
+
+    async def replace_earlier_send(self):
+        """Replace this key's unmined recorded send with the same call at the same nonce and a higher gas price.
+
+        The replacement is recorded next to the transaction it replaces before it is broadcast, and a receipt of
+        either settles the record; no other nonce is signed meanwhile. Raises with the outcome, like a settle."""
+        chain_id = await self._pinned_chain_id()
+        gas_quote = await self.w3.eth.gas_price
+        with self._send_lock():
+            record = self._read_sent_record(chain_id)
+            if record is None:
+                raise CollateralTransactionError(
+                    "No collateral transaction from this key is waiting for its outcome; nothing was replaced"
+                )
+            found = await self._receipt_of_earlier_send(record)
+            if found is not None:
+                self._report_settled(chain_id, *found)
+            await self._raise_if_nonce_used(record)
+            earlier = decode_legacy_transaction(record["raw"])
+            bump, base = REPLACEMENT_PRICE_BUMP
+            gas_price = max(gas_quote, -(-earlier["gasPrice"] * bump // base))
+            if gas_price > AsyncWeb3.to_wei(self.max_gas_price_gwei, "gwei"):
+                raise CollateralTransactionError(
+                    f"A replacement needs a gas price of {AsyncWeb3.from_wei(gas_price, 'gwei')} gwei, above the "
+                    f"{self.max_gas_price_gwei} gwei ceiling (COLLATERAL_MAX_GAS_PRICE_GWEI); nothing was replaced"
+                )
+            signed = self.miner_account.sign_transaction(
+                {**{k: earlier[k] for k in ("to", "value", "data", "gas")}, "nonce": record["nonce"],
+                 "gasPrice": gas_price, "chainId": chain_id}
+            )
+            raw_transaction = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+            signed_hash = signed.hash.hex()
+            record = {
+                "nonce": record["nonce"],
+                "hash": signed_hash,
+                "raw": AsyncWeb3.to_hex(raw_transaction),
+                "hashes": [*record_hashes(record), signed_hash],
+            }
+            self._write_sent_record(chain_id, record)
+            logger.info(
+                "Replacing the transaction at nonce %s with %s at %s gwei",
+                record["nonce"], signed_hash, AsyncWeb3.from_wei(gas_price, "gwei"),
+            )
+            tx_hash, receipt = await self._broadcast_again(record)
+            self._report_settled(chain_id, tx_hash, receipt, replaced=same_hash(tx_hash, signed_hash))
 
     def _sent_record_key(self, chain_id: int) -> str:
         return f"{chain_id}:{self.miner_address}"
@@ -506,13 +638,28 @@ class CollateralClient:
         return events[0] if events else None
 
     async def get_reclaim_events(self) -> list[ReclaimRequest]:
-        """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS blocks."""
-        latest_block = await self.w3.eth.block_number
+        """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS blocks.
+
+        The logs and each request's state are read at one block number, and the list is kept only if that number
+        still has the same block hash afterwards: across a reorg the two reads can come from different forks."""
+        for _ in range(RECLAIM_LIST_ATTEMPTS):
+            head = await self.w3.eth.get_block("latest")
+            requests = await self._reclaim_events_at(head["number"])
+            if same_hash((await self.w3.eth.get_block(head["number"]))["hash"], head["hash"]):
+                return requests
+        raise CollateralTransactionError(
+            f"The chain reorganized while the open reclaim requests were read, {RECLAIM_LIST_ATTEMPTS} times; "
+            "run this again"
+        )
+
+    async def _reclaim_events_at(self, latest_block: int) -> list[ReclaimRequest]:
         logs = await self.contract.events.ReclaimProcessStarted().get_logs(
             fromBlock=max(latest_block - RECLAIM_LOOKBACK_BLOCKS, 0), toBlock=latest_block
         )
         requests = []
         for log in logs:
+            if log.get("removed"):
+                continue
             reclaim_request_id = log["args"]["reclaimRequestId"]
             executor_id, miner, amount, expiration_time = (
                 await self.contract.functions.reclaims(reclaim_request_id).call(block_identifier=latest_block)
