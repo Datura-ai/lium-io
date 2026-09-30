@@ -43,7 +43,7 @@ from services.nvidia_devices import (
 )
 from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
-    DOCKER_PS_ALL_NAMES_CMD,
+    DOCKER_PS_ALL_NAMES_IDS_CMD,
     DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
     PREFIX_FAILED_MARKER,
     PrerunHostProbe,
@@ -151,7 +151,7 @@ def test_probe_command_carries_every_section_and_the_per_command_texts():
     # shlex.quote wraps each section command; the quoted forms of the shared texts are inside
     import shlex
 
-    assert shlex.quote(DOCKER_PS_ALL_NAMES_CMD) in cmd
+    assert shlex.quote(DOCKER_PS_ALL_NAMES_IDS_CMD) in cmd
     assert shlex.quote(DOCKER_VOLUME_LS_NAME_DRIVER_CMD) in cmd
     assert shlex.quote(DOCKER_MOUNTED_VOLUME_NAMES_CMD) in cmd
     assert f"|| echo {PREFIX_FAILED_MARKER}" in cmd
@@ -203,6 +203,14 @@ def test_shared_device_nodes_command_whole_host_only_is_the_tail_of_the_whole_ho
 # ------------------------------------------------------------------
 # the parser
 # ------------------------------------------------------------------
+
+
+def test_parser_reads_the_full_container_ids_next_to_the_names():
+    full = "e" * 64
+    probe = parse_prerun_host_probe(_stdout(ps=(f"pod_a {full}", "other")), with_power=True)
+    assert probe.container_names == ("pod_a", "other")
+    assert probe.container_ids == {"pod_a": full}
+    assert parse_prerun_host_probe(_stdout(ps_rc=1), with_power=True).container_ids == {}
 
 
 def test_parser_reads_every_section():
@@ -517,11 +525,12 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
 ):
     ran: list[str] = []
 
-    async def _retry(ssh, command, _tag):
+    async def _retry(ssh, command, _tag, **_kwargs):
         ran.append(command)
 
     monkeypatch.setattr("services.docker_service.retry_ssh_command", _retry)
-    live = _ssh(_ssh_result(stdout="pod_new\npod_old\nfiller_x\nsomething\n"))
+    ids = {name: c * 64 for name, c in (("pod_new", "a"), ("pod_old", "b"), ("filler_x", "c"))}
+    live = _ssh(_ssh_result(stdout="".join(f"{n} {ids.get(n, 'f' * 64)}\n" for n in ("pod_new", "pod_old", "filler_x", "something"))))
     removed_live = await docker_service.clean_existing_containers(
         ssh_client=live,
         default_extra={},
@@ -531,7 +540,7 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
     )
     live_cmds = list(ran)
     ran.clear()
-    probe = _probe(container_names=("pod_new", "pod_old", "filler_x", "something"))
+    probe = _probe(container_names=("pod_new", "pod_old", "filler_x", "something"), container_ids=ids)
     probed = _ssh()
     removed_probed = await docker_service.clean_existing_containers(
         ssh_client=probed,
@@ -546,13 +555,12 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
         ran
         == live_cmds
         == [
-            "/usr/bin/docker rm -fv pod_new pod_old filler_x",
+            f"/usr/bin/docker rm -fv {ids['pod_new']} {ids['pod_old']} {ids['filler_x']}",
             "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
         ]
     )
-    inspect = "/usr/bin/docker inspect --format '{{.Name}} {{.Id}}' pod_new pod_old filler_x"
-    assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"', inspect]
-    assert _cmds(probed) == [inspect]  # the IDs the sweep records; no listing
+    assert _cmds(live) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
+    assert _cmds(probed) == []  # the probe carried the names and IDs: no SSH call before the rm
 
 
 @pytest.mark.asyncio
@@ -585,7 +593,7 @@ async def test_clean_existing_containers_failed_ps_section_lists_itself(docker_s
         )
         == []
     )
-    assert _cmds(ssh) == ['/usr/bin/docker ps -a --format "{{.Names}}"']
+    assert _cmds(ssh) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
 
 
 @pytest.mark.asyncio

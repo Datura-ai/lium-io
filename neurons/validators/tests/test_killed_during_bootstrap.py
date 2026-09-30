@@ -44,6 +44,7 @@ from test_deploy_optimizations import (
 from test_rental_docker_sdk import FakeApiClient, _container_state
 
 from services import rental_docker_sdk
+from services.prerun_host_probe import parse_container_listing
 
 
 def _oom_killed_state() -> dict:
@@ -255,6 +256,7 @@ def _exec_exits_then_gone(n: int, *codes: int):
 _RUNNING = _container_state()
 _REMOVING_0 = _container_state(status="removing", running=False, exit_code=0)
 _DEAD_137 = _container_state(status="dead", running=False, dead=True, exit_code=137)
+_DEAD_1 = _container_state(status="dead", running=False, dead=True, exit_code=1)
 _SIGINT = _container_state(status="exited", running=False, exit_code=130)
 _EXITED_137 = _container_state(status="exited", running=False, exit_code=137)
 _BY_NODE = "the container was stopped by the node before it was ready: "
@@ -281,6 +283,9 @@ _ENDED_ON = "the container stopped before it was ready: its command ended on "
         ("add_public_keys", [_oom_killed_state()], None, _BY_NODE + "it ran out of memory", {"cause": "oom"}),
         # a SIGTERM-handling CMD exits 0 on a host stop, then the node removes the container
         ("add_public_keys", [_REMOVING_0], None, _BY_NODE + "it was removed", {"cause": "removed"}),
+        # `dead`: a removal the daemon could not finish, whatever the exit code; not the image's exit
+        ("add_public_keys", [_DEAD_1], None, _BY_NODE + "it was removed",
+         {"cause": "removed", "exit_code": 1, "status": "dead"}),
         ("add_public_keys", [_RUNNING, _SIGINT], _exec_exits(130), _ENDED_ON + "SIGINT (exit 130)",
          {"cause": "signaled", "exit_code": 130, "signal": "SIGINT", "status": "exited"}),
         ("add_public_keys", [_RUNNING], _exec_exits_then_gone(2, 137), _BY_NODE + "it was removed",
@@ -291,7 +296,7 @@ _ENDED_ON = "the container stopped before it was ready: its command ended on "
          {"cause": "killed"}),
     ],
     ids=["ssh-oom", "ssh-sigkill", "ssh-exited-143", "ssh-exited-137", "ssh-exec-137-dead", "ssh-exec-137-404",
-         "keys-oom", "keys-removing-exit-0", "keys-exec-130", "keys-exec-137-404", "env-removed",
+         "keys-oom", "keys-removing-exit-0", "keys-dead-exit-1", "keys-exec-130", "keys-exec-137-404", "env-removed",
          "env-exec-137"],
 )  # fmt: skip
 async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
@@ -410,14 +415,21 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     assert any(getattr(r.msg, "extra", {}).get("reason") == "removed_by_own_sweep" for r in caplog.records)
 
 
-def _sweep_ssh(inspect_stdout: str) -> Mock:
-    async def run(command, **_kwargs):
-        if "docker inspect" in command:
-            return Mock(stdout=inspect_stdout, exit_status=0)
-        return Mock(stdout="filler_swept-1\npod_keep\n", exit_status=0)
-
+def _sweep_host(listing: str, rm_prints=None, rm_exit: int = 0) -> Mock:
+    """`docker ps -a` answers ``listing``; `docker rm` prints ``rm_prints(targets)`` and exits ``rm_exit``."""
     ssh = Mock()
+    rms: list[list[str]] = []
+
+    async def run(command, **_kwargs):
+        if command.startswith("/usr/bin/docker rm -fv "):
+            targets = command.removeprefix("/usr/bin/docker rm -fv ").split()
+            rms.append(targets)
+            printed = targets if rm_prints is None else rm_prints(targets)
+            return Mock(stdout="".join(f"{t}\n" for t in printed), stderr="", exit_status=rm_exit)
+        return Mock(stdout=listing, stderr="", exit_status=0)
+
     ssh.run = AsyncMock(side_effect=run)
+    ssh.rms = rms
     return ssh
 
 
@@ -430,9 +442,19 @@ def _sweep_ssh(inspect_stdout: str) -> Mock:
 )  # fmt: skip
 async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_probe, rm_error, survivors):
     swept_id = _container_id("filler_swept-1")
-    ssh = _sweep_ssh(f"/filler_swept-1 {swept_id}\n")
-    probe = Mock(container_names=("filler_swept-1", "pod_keep")) if from_probe else None
-    svc._remove_stale_containers = AsyncMock(side_effect=rm_error, return_value=survivors)
+    ssh = _sweep_host(f"filler_swept-1 {swept_id}\npod_keep {_container_id('pod_keep')}\n")
+    probe = (
+        Mock(container_names=("filler_swept-1", "pod_keep"), container_ids={"filler_swept-1": swept_id})
+        if from_probe else None
+    )  # fmt: skip
+
+    async def remove(_ssh, _extra, _pod, _names, targets, _every, acknowledged):
+        if rm_error is not None:
+            raise rm_error
+        acknowledged.update(targets)
+        return survivors
+
+    svc._remove_stale_containers = remove
     sweep = svc.clean_existing_containers(
         ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
         active_container_names=["pod_keep", "filler_swept-1"], remove_every_filler=True,
@@ -449,6 +471,77 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
     assert await own_sweep_removals.removed_by_us(swept_id) == (not survivors)
     assert not await own_sweep_removals.removed_by_us(_container_id("filler_swept-1", generation=1))
     assert not await own_sweep_removals.removed_by_us(None)
+    # the IDs come with the listing: no `docker inspect` round trip, from the probe or not
+    assert all("docker inspect" not in c.args[0] for c in ssh.run.await_args_list)
+    assert ssh.run.await_count == (0 if from_probe else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ["acknowledged", "node-removed-it-first", "replaced-by-a-new-same-name-container", "no-id-listed",
+     "acknowledged-then-a-later-target-failed"],
+)  # fmt: skip
+async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkeypatch, case):
+    """The sweep removes by the listed ID and records an ID only when `docker rm` printed it back:
+    an empty listing after a failed rm is not proof, and a same-name container created since the
+    listing is neither removed nor recorded."""
+    monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
+    old, new, other = _container_id("filler_a"), _container_id("filler_a", generation=1), _container_id("filler_b")
+    listing = f"filler_a {old}\nfiller_b {other}\n"
+    if case == "no-id-listed":
+        listing = "filler_a\n"
+    after = {  # what `docker ps -a` lists once the rm has run
+        "node-removed-it-first": "",
+        "replaced-by-a-new-same-name-container": f"filler_a {new}\n",
+        "acknowledged-then-a-later-target-failed": f"filler_b {other}\n",
+    }.get(case, "")
+    listings = iter([listing, after, after, after])
+    rms: list[list[str]] = []
+
+    async def run(command, **_kwargs):
+        if command.startswith("/usr/bin/docker rm -fv "):
+            targets = command.removeprefix("/usr/bin/docker rm -fv ").split()
+            rms.append(targets)
+            if case in ("node-removed-it-first", "replaced-by-a-new-same-name-container"):
+                printed, code = [t for t in targets if t != old], 1  # "No such container: <old>"
+            elif case == "acknowledged-then-a-later-target-failed":
+                printed, code = [t for t in targets if t != other], 1
+            else:
+                printed, code = targets, 0
+            return Mock(stdout="".join(f"{t}\n" for t in printed), stderr="err", exit_status=code)
+        text = next(listings)
+        if "--no-trunc" not in command:  # the names-only confirmation listing
+            text = "".join(f"{line.split()[0]}\n" for line in text.splitlines() if line.strip())
+        return Mock(stdout=text, stderr="", exit_status=0)
+
+    ssh = Mock()
+    ssh.run = AsyncMock(side_effect=run)
+    sweep = svc.clean_existing_containers(
+        ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
+        active_container_names=[], remove_every_filler=True,
+    )
+    if case == "acknowledged-then-a-later-target-failed":
+        with pytest.raises(Exception, match="exit_code 1"):
+            await sweep
+    else:
+        await sweep
+
+    assert all(new not in targets and "filler_a" not in targets for targets in rms[1:])
+    if case == "no-id-listed":
+        assert rms == [["filler_a"]]
+        assert not await own_sweep_removals.removed_by_us(old)
+        return
+    assert rms[0] == [old, other]
+    assert await own_sweep_removals.removed_by_us(old) == (case in ("acknowledged", "acknowledged-then-a-later-target-failed"))
+    assert not await own_sweep_removals.removed_by_us(new)
+    assert await own_sweep_removals.removed_by_us(other) == (case != "acknowledged-then-a-later-target-failed")
+
+
+def test_the_listing_maps_each_name_to_its_full_container_id():
+    good = _container_id("pod_a")
+    names, ids = parse_container_listing([f"pod_a {good}", "", "pod_b", f"pod_c {good[:12]}"])
+    assert names == ("pod_a", "pod_b", "pod_c") and ids == {"pod_a": good}
 
 
 @pytest.mark.asyncio
@@ -465,15 +558,6 @@ async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_not_ours(m
     assert await registry.removed_by_us(ok)
     assert not await registry.removed_by_us(failed)
     assert not await registry.removed_by_us(stuck)
-
-
-def test_the_inspect_output_maps_each_name_to_its_full_container_id():
-    good = _container_id("pod_a")
-    ssh = Mock()
-    stdout = f"/pod_a {good}\n\nError: No such object: pod_b\n/pod_other {_container_id('pod_other')}\n"
-    ssh.run = AsyncMock(return_value=Mock(stdout=stdout, exit_status=1))
-
-    assert asyncio.run(DockerService._container_ids(ssh, ["pod_a", "pod_b"])) == {"pod_a": good}
 
 
 @pytest.mark.asyncio

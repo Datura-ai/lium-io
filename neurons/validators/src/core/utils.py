@@ -282,11 +282,15 @@ async def retry_ssh_command(
     tag: str,
     max_attempts: int = 5,
     wait_seconds: int = 10,
+    stdout_sink: list[str] | None = None,
 ):
+    """``stdout_sink`` collects every attempt's stdout, the failed ones' too."""
     # reraise: the caller gets the last attempt's error (exit code, stderr), not RetryError[<Future>]
     @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds), reraise=True)
     async def execute_command():
         result = await ssh_client.run(command)
+        if stdout_sink is not None and isinstance(result.stdout, str):
+            stdout_sink.append(result.stdout)
         if result.exit_status != 0:
             raise Exception(f"[{tag}] command: {command} exit_code {result.exit_status}, stderr: {result.stderr.strip()}")
 

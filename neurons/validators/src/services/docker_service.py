@@ -87,9 +87,11 @@ from services.gpu_power_limit import (
 from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
     DOCKER_PS_ALL_NAMES_CMD,
+    DOCKER_PS_ALL_NAMES_IDS_CMD,
     DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
     PrerunHostProbe,
     image_label_command,
+    parse_container_listing,
     parse_prerun_host_probe,
     prerun_host_probe_command,
 )
@@ -843,13 +845,14 @@ KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
 
 def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
     """`oom`, `killed` (an exit code in HOST_KILL_EXIT_CODES while `removing` or `dead`), `removed`
-    (already gone, or `removing` without a host-signal exit code) — the three kills — `signaled`, or
+    (already gone, or `removing`/`dead` without a host-signal exit code: `dead` is a removal the
+    daemon could not finish, never the image's own exit) — the three kills — `signaled`, or
     `exited`, the image's own command ending.
 
     `signaled` is a plain `exited` State with a signal exit code (`docker stop` 143, `docker kill`
     137): the exit code alone cannot tell a stop on the node from an image whose CMD exits 137 or
     143 itself, so it keeps its own cause and neutral wording, apart from the node-kill counts."""
-    if state is None or (state.status == "removing" and not state.killed_by_host):
+    if state is None or (state.status in ("removing", "dead") and not state.killed_by_host):
         return "removed"
     if state.oom_killed:
         return "oom"
@@ -1199,12 +1202,12 @@ class _OwnSweepRegistry:
 
     A customer's create removes every `filler_*` on the node, including a filler whose own
     create is still bootstrapping. That create then finds its container gone; the validator removed
-    it, so it is not a node kill. A retry of the same pod reuses the name, so the sweep keys on the
-    container ID it inspected just before its `rm`: an older same-name container never matches the
-    ID this create's `docker run` made, whatever order the listing, the run and the `rm` land in.
-    An ID counts only once its `rm` succeeded and the container is not still on the host (a filler
-    that survives the `rm` is not ours); while that `rm` is in flight, `removed_by_us` waits for its
-    outcome (the host may drop the container before the `rm` returns to us).
+    it, so it is not a node kill. A retry of the same pod reuses the name, so the sweep lists full
+    IDs and removes by ID: an older same-name container never matches the ID this create's `docker
+    run` made, and a newer one is not removed, whatever order the listing, the run and the `rm` land
+    in. An ID counts only once `docker rm` printed it back as removed (an empty listing afterwards
+    is not proof) and its name is not still on the host; while that `rm` is in flight,
+    `removed_by_us` waits for its outcome (the host may drop the container before the `rm` returns).
     """
 
     TTL_SECONDS = 15 * 60
@@ -2841,12 +2844,18 @@ class DockerService:
         filler, and a backend whose stop did not confirm may still list one. The removal is then
         re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
         (typed fields, countable) and the create goes on.
+
+        A stale container whose full ID the listing carried is removed by that ID, so a same-name
+        container created after the listing is left alone; own_sweep_removals records only the IDs
+        `docker rm` printed back. A name listed without an ID is removed by name and not recorded.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
+            listed_ids = dict(host_probe.container_ids)
         else:
-            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
-            all_names = [name for name in (result.stdout or "").strip().split("\n") if name]
+            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_IDS_CMD)
+            names, listed_ids = parse_container_listing((result.stdout or "").splitlines())
+            all_names = list(names)
         if all_names:
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
             # deploy-path sleep; the port-race it hedged is now covered by
@@ -2888,16 +2897,19 @@ class DockerService:
                 ),
             )
 
+            swept = {name: listed_ids[name] for name in stale_containers if name in listed_ids}
+            targets = [swept.get(name, name) for name in stale_containers]
             # in flight before the rm: a create bootstrapping one of these may see it gone at once
-            swept = await self._container_ids(ssh_client, stale_containers)
             sweep = own_sweep_removals.begin(list(swept.values()))
-            survivors: set[str] | None = None
+            acknowledged: set[str] = set()
+            survivors: set[str] = set()
             try:
                 survivors = await self._remove_stale_containers(
-                    ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+                    ssh_client, default_extra, pod_name, stale_containers, targets, remove_every_filler,
+                    acknowledged,
                 )
             finally:
-                removed = [] if survivors is None else [i for n, i in swept.items() if n not in survivors]
+                removed = [i for n, i in swept.items() if i in acknowledged and n not in survivors]
                 own_sweep_removals.end(list(swept.values()), sweep, removed=removed)
 
             if clear_volume:
@@ -2924,16 +2936,19 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         stale_containers: list[str],
+        targets: list[str],
         remove_every_filler: bool,
+        acknowledged: set[str],
     ) -> set[str]:
-        """`docker rm -fv` the stale containers; returns the names seen still on the host after it.
-        A customer create (DAH-3706) uses the tolerant rm and then confirms that no filler survived."""
+        """`docker rm -fv` the ``targets`` (an ID, or the name when no ID was listed); adds each target
+        `docker rm` printed back to ``acknowledged``, even when a later target made it fail. Returns
+        the names seen still on the host after it. A customer create (DAH-3706) uses the tolerant rm
+        and then confirms that no filler survived."""
         if not remove_every_filler:
-            names = " ".join(shlex.quote(name) for name in stale_containers)
-            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+            await self._rm_containers(ssh_client, targets, acknowledged)
             return set()
 
-        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, targets, acknowledged)
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not removed_fillers:
             return set()
@@ -2991,7 +3006,8 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
-        stale_containers: list[str],
+        targets: list[str],
+        acknowledged: set[str],
     ) -> None:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
@@ -2999,23 +3015,21 @@ class DockerService:
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
         for nothing. So: one attempt; on an error re-read `docker ps -a`; names already gone are not an
         error; names still there get retry_ssh_command's full budget (and raise as before). A re-read
-        that cannot be made re-raises the rm error.
+        that cannot be made re-raises the rm error. A listed ID is looked for by that ID: a same-name
+        container created since the listing is not a stale one.
         """
-        names = " ".join(shlex.quote(name) for name in stale_containers)
         try:
-            await retry_ssh_command(
-                ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers', max_attempts=1
-            )
+            await self._rm_containers(ssh_client, targets, acknowledged, max_attempts=1)
             return
         except Exception:
-            still_present = await self._names_still_on_host(ssh_client, stale_containers)
+            still_present = await self._targets_still_on_host(ssh_client, targets)
             if still_present is None:
                 raise
         if not still_present:
             logger.info(
                 _m(
                     "docker rm -fv reported an error but every stale container is gone; continuing",
-                    extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                    extra=get_extra_info({**default_extra, "container_names": targets}),
                 ),
             )
             return
@@ -3025,8 +3039,28 @@ class DockerService:
                 extra=get_extra_info({**default_extra, "container_names": still_present}),
             ),
         )
-        names = " ".join(shlex.quote(name) for name in still_present)
-        await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+        await self._rm_containers(ssh_client, still_present, acknowledged)
+
+    @staticmethod
+    async def _rm_containers(
+        ssh_client: asyncssh.SSHClientConnection,
+        targets: list[str],
+        acknowledged: set[str],
+        max_attempts: int = 5,
+    ) -> None:
+        """`docker rm -fv <targets>`; `docker rm` prints each argument it removed, one per line."""
+        printed: list[str] = []
+        try:
+            await retry_ssh_command(
+                ssh_client,
+                "/usr/bin/docker rm -fv " + " ".join(shlex.quote(t) for t in targets),
+                'clean_existing_containers',
+                max_attempts=max_attempts,
+                stdout_sink=printed,
+            )
+        finally:
+            wanted = set(targets)
+            acknowledged.update(line.strip() for out in printed for line in out.splitlines() if line.strip() in wanted)
 
     @staticmethod
     async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
@@ -3053,35 +3087,25 @@ class DockerService:
             return None
         return [name for name in (result.stdout or "").strip().split("\n") if name]
 
-    @staticmethod
-    async def _container_ids(ssh_client: asyncssh.SSHClientConnection, names: list[str]) -> dict[str, str]:
-        """Name -> full ID from `docker inspect` for ``names`` (names already gone are skipped); {} when
-        the inspect could not be read, so the sweep then claims no removal."""
-        command = "/usr/bin/docker inspect --format '{{.Name}} {{.Id}}' " + " ".join(shlex.quote(n) for n in names)
+    async def _targets_still_on_host(
+        self, ssh_client: asyncssh.SSHClientConnection, targets: list[str]
+    ) -> list[str] | None:
+        """Which of ``targets`` (IDs or names) `docker ps -a` still lists; None when the listing could
+        not be read."""
         try:
-            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+            result = await ssh_client.run(
+                DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+            )
         except Exception as exc:
             logger.warning(
-                _m("docker inspect of the stale containers failed", extra={"error_type": exc.__class__.__name__})
+                _m("docker ps -a listing failed", extra={"error_type": exc.__class__.__name__, "timeout_s": _PRERUN_HOST_PROBE_TIMEOUT_SECONDS})
             )
-            return {}
-        stdout = result.stdout if isinstance(result.stdout, str) else ""
-        ids: dict[str, str] = {}
-        for line in stdout.splitlines():
-            match = re.fullmatch(r"/?(\S+) ([0-9a-f]{64})", line.strip())
-            if match and match.group(1) in names:
-                ids[match.group(1)] = match.group(2)
-        return ids
-
-    async def _names_still_on_host(
-        self, ssh_client: asyncssh.SSHClientConnection, names: list[str]
-    ) -> list[str] | None:
-        """Which of ``names`` `docker ps -a` still lists; None when the listing could not be read."""
-        all_names = await self._list_all_container_names(ssh_client)
-        if all_names is None:
             return None
-        wanted = set(names)
-        return [name for name in all_names if name in wanted]
+        if result.exit_status != 0 or not isinstance(result.stdout, str):
+            return None
+        names, ids = parse_container_listing(result.stdout.splitlines())
+        on_host = set(names) | set(ids.values())
+        return [target for target in targets if target in on_host]
 
     async def clean_stale_vloopback_volumes(
         self,

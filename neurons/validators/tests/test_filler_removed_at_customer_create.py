@@ -56,14 +56,11 @@ def _no_sweeps_from_other_tests():
     own_sweep_removals.clear()
 
 
-def _host(listings: list, inspect_stdout: str = "") -> AsyncMock:
-    """An SSH client whose `docker ps -a` calls return ``listings`` in turn; the sweep's `docker
-    inspect` of the stale names (the IDs it records) answers ``inspect_stdout`` (default: no ID)."""
+def _host(listings: list) -> AsyncMock:
+    """An SSH client whose `docker ps -a` calls return ``listings`` in turn."""
     listings = iter(listings)
 
     async def run(command, **_kwargs):
-        if command.startswith("/usr/bin/docker inspect"):
-            return _listing(inspect_stdout)
         result = next(listings)
         if isinstance(result, Exception):
             raise result
@@ -155,9 +152,9 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
     assert event.msg.extra["executor_uuid"] == "exec-1"
     assert event.msg.extra["pod_name"] == "pod_target"
     assert event.msg.extra["container_names"] == ["filler_stuck"]
-    assert ssh_client.run.await_count == 3  # the listing, the sweep's inspect, the confirmation
+    assert ssh_client.run.await_count == 2  # the listing (with the IDs), the confirmation
     # the confirmation is bounded like the prerun probe: a wedged dockerd cannot hang the create
-    confirm_call = ssh_client.run.await_args_list[2]
+    confirm_call = ssh_client.run.await_args_list[1]
     assert confirm_call.kwargs["timeout"] == ds_module._PRERUN_HOST_PROBE_TIMEOUT_SECONDS
     assert confirm_call.kwargs["check"] is False
 
@@ -168,9 +165,18 @@ async def test_a_filler_that_survives_the_removal_is_not_recorded_as_removed_by_
 ):
     stuck_id, gone_id, target_id = "a" * 64, "b" * 64, "c" * 64
     ssh_client = _host(
-        [_listing("pod_target\nfiller_stuck\nfiller_gone\n"), _listing("filler_stuck\n")],
-        inspect_stdout=f"/pod_target {target_id}\n/filler_stuck {stuck_id}\n/filler_gone {gone_id}\n",
+        [
+            _listing(f"pod_target {target_id}\nfiller_stuck {stuck_id}\nfiller_gone {gone_id}\n"),
+            _listing("filler_stuck\n"),
+        ]
     )
+
+    async def rm(_ssh, command, _tag, stdout_sink=None, **_kwargs):
+        # dockerd prints every ID back, the stuck one too; the confirmation listing still has it
+        if stdout_sink is not None:  # the volume rm passes none
+            stdout_sink.append("\n".join(command.split()[3:]) + "\n")
+
+    retry_ssh_mock.side_effect = rm
 
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
@@ -316,7 +322,7 @@ async def test_rm_retry_budget_goes_only_to_the_names_still_on_the_host(
     second_rm = retry_ssh_mock.call_args_list[1]
     assert "filler_busy" in second_rm[0][1]
     assert "filler_gone" not in second_rm[0][1]
-    assert "max_attempts" not in second_rm.kwargs  # the full budget, as before this PR
+    assert second_rm.kwargs["max_attempts"] == 5  # the full budget, as before this PR
 
 
 @pytest.mark.asyncio
@@ -369,7 +375,7 @@ async def test_rm_failure_on_a_filler_create_still_raises(docker_service, retry_
             pod_name="filler_bundle_2",
             active_container_names=[],
         )
-    assert ssh_client.run.await_count == 2  # the listing and the sweep's inspect
+    assert ssh_client.run.await_count == 1  # the listing; its IDs need no inspect
 
 
 @pytest.mark.asyncio
@@ -384,7 +390,7 @@ async def test_no_filler_on_the_host_skips_the_confirmation_listing(docker_servi
         remove_every_filler=True,
     )
 
-    assert ssh_client.run.await_count == 2  # the listing and the sweep's inspect
+    assert ssh_client.run.await_count == 1  # the listing; its IDs need no inspect
 
 
 @pytest.mark.asyncio

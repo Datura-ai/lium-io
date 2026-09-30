@@ -7766,11 +7766,6 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
             "is restarting",
             id="running-again-after-a-restart",
         ),
-        pytest.param(
-            _state(status="dead", running=False, exit_code=1, restart_count=0),
-            "is not running",
-            id="dead",
-        ),
     ],
 )
 @pytest.mark.asyncio
@@ -7809,6 +7804,8 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
     [
         pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
         pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+        # `dead` is a removal the daemon could not finish, not the image's exit, whatever the code
+        pytest.param(_state(status="dead", running=False, exit_code=1, restart_count=0), id="dead"),
     ],
 )
 @pytest.mark.asyncio
