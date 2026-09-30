@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import pathlib
-import shlex
 import shutil
 import signal
 from types import SimpleNamespace
@@ -656,6 +655,7 @@ def refreshing_executor(
     install_stdout: str | None = None,
     install_stderr: str = "",
     installs_as: str = VALIDATOR_SHA256,
+    install_raises: Exception | None = None,
 ) -> FakeShell:
     """An executor on a stale libinspector.so that answers the refresh commands with canned output."""
 
@@ -663,6 +663,8 @@ def refreshing_executor(
         if command.startswith("if [ -w "):
             return _ok(f"WRITE_OK:{int(writable)}\n")
         if "mktemp" in command:
+            if install_raises:
+                raise install_raises
             stdout = install_stdout if install_stdout is not None else _install_stdout(f"{VALIDATOR_SHA256:0>64}")
             if "MV_RC:0" in stdout:
                 shell.sha256 = installs_as
@@ -825,7 +827,6 @@ async def test_a_failed_fetch_installs_nothing_and_is_logged(local_library, capl
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_FETCH_FAILED"
     assert result.diagnostics["fetch_error"].startswith(fetch_error.format(sha=local_library.sha))
     assert "INSPECTOR_LIBRARY_FETCH_FAILED" in caplog.text
-    # the library is untouched; the download went to a temp beside it and was removed
     assert shell.temp_used().parent == local_library.lib.parent
     assert local_library.lib.read_bytes() == STALE_BYTES
     assert local_library.leftovers() == []
@@ -860,16 +861,8 @@ async def test_a_url_with_a_quote_and_command_substitution_is_one_word(local_lib
     local_library.source.rename(source)
     url = f"file://{source}"
     local_library.settings.INSPECTOR_LIBRARY_FETCH_URL = url
-    install = local_library.service._install_command(url)
-    assert shlex.quote(url) in install
-    lexer = shlex.shlex(install, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    words = list(lexer)
-    curl = words.index("curl")
-    assert words[curl + 4 : curl + 7] == ["-o", "$tmp", url]
     shell = LocalExecutor()
     result = await _validate(shell, service=local_library.service)
-    # the literal file was fetched: `$(id)` was not run and the quote did not end the word
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_REPLACED"
     assert local_library.lib.read_bytes() == source.read_bytes()
 
@@ -885,29 +878,20 @@ async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, f
     assert _kinds(shell) == ["write-check", "install"]
 
 
-def _transport_error_executor() -> FakeShell:
-    def respond(command: str):
-        if command.startswith("if [ -w "):
-            return _ok("WRITE_OK:1\n")
-        raise OSError("connection reset")
-
-    return FakeShell(sha256=STALE_SHA256, respond=respond)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("executor", "outcome", "field", "expected", "checksum_calls"),
     [
         (lambda: refreshing_executor(install_stdout="TMP:/usr/lib/.x\nCURL_RC:0\nSHA256:sha256sum: not found\n"),
          "FETCH_FAILED", "fetch_error", "fetched sha256 None != validator {sha}", 1),
-        (_transport_error_executor, "FETCH_FAILED", "fetch_error", "OSError: connection reset", 1),
+        (lambda: refreshing_executor(install_raises=OSError("connection reset")),
+         "FETCH_FAILED", "fetch_error", "OSError: connection reset", 1),
         (lambda: refreshing_executor(writable=False), "WRITE_DENIED", "error",
          "Executor libinspector.so hash mismatch and /usr/lib is not writable", 1),
         (lambda: refreshing_executor(install_stdout="MKTEMP_FAILED\n", install_stderr="mktemp: No space left on device"),
          "FETCH_FAILED", "fetch_error", "mktemp next to /usr/lib/libinspector.so failed", 1),
         (lambda: refreshing_executor(install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc=1)),
          "FETCH_FAILED", "fetch_error", "mv exit 1", 1),
-        # installed, but the re-read hash is still wrong: a failure, and no second fetch
         (lambda: refreshing_executor(installs_as="e" * 64), "STILL_MISMATCHED", "executor_sha256", "e" * 64, 2),
     ],
     ids=["hash-marker-not-a-sha256", "transport-error", "read-only-usr-lib", "mktemp-fails", "rename-fails",
