@@ -253,7 +253,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-coll
 
 The command logs the reclaim request ID; keep it for the finalize step.
 
-If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known. A mined reclaim is reported with its reclaim request ID. After that, a finalize that was mined shows up as "no open reclaim request".
+If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known. A mined reclaim is reported with its reclaim request ID. After that, a finalize that was mined shows up as "no open reclaim request". Any error answer to a send keeps that record, since a gateway can pass the transaction on and still answer with an error. If the RPC no longer serves the earlier transaction's receipt, run the command again with `SUBTENSOR_EVM_RPC_URL` set to an RPC that does, or look the transaction up on the explorer and, once you know its outcome, delete the file.
 
 ### Getting Miner Reclaim Requests
 

@@ -39,15 +39,14 @@ CHAIN_IDS = {"finney": 964, "archive": 964, "test": 945, "local": 42}
 # (the directory the miner container mounts from the host), so it survives a container rebuild. No other nonce
 # is signed while it is there: an unmined one is broadcast again as the same bytes, so at most one transaction
 # per nonce can ever be mined.
-SENT_RECORD_PATH = pathlib.Path(
-    os.environ.get("COLLATERAL_SENT_RECORD", "~/.bittensor/wallets/.lium-collateral-sent.json")
-).expanduser()
+DEFAULT_SENT_RECORD = "~/.bittensor/wallets/.lium-collateral-sent.json"
+SENT_RECORD_PATH = pathlib.Path(DEFAULT_SENT_RECORD).expanduser()
 RETRY_IS_SAFE = "Run this again: it reads this transaction's outcome first and sends nothing new until it is known"
-# JSON-RPC send answers that prove the node did not take the transaction, and the local text each is reported
-# with. Any other answer may come after the transaction was forwarded (a gateway's "upstream timeout", say), so it
-# is an unknown outcome. "nonce too low" is one of those: web3's retry middleware and gateways resend
-# eth_sendRawTransaction, and the retry of a transaction that landed gets that answer. The RPC's own text never
-# reaches an error: it can echo the keyed RPC URL.
+# JSON-RPC send refusals and the local text each is reported with. None of them clears the record: a gateway can
+# forward the bytes to one upstream, lose its answer and return another upstream's refusal, so every error answer
+# to a send is an unknown outcome, and the next run settles it from the same bytes. "nonce too low" is not listed:
+# web3's retry middleware and gateways resend eth_sendRawTransaction, and the retry of a transaction that landed
+# gets that answer. The RPC's own text never reaches an error: it can echo the keyed RPC URL.
 SEND_REFUSALS = {
     "insufficient funds": "insufficient funds for gas",
     "underpriced": "gas price too low",
@@ -129,8 +128,10 @@ class CollateralClient:
         rpc_url: str | None = None,
         miner_key: str | None = None,
         max_gas_price_gwei: float = DEFAULT_MAX_GAS_PRICE_GWEI,
+        sent_record_path: str | os.PathLike | None = None,
     ):
         self.network = network
+        self.sent_record_path = pathlib.Path(sent_record_path or SENT_RECORD_PATH).expanduser()
         self.max_gas_price_gwei = max_gas_price_gwei
         self.rpc_url = rpc_url or RPC_URLS.get(network)
         self.contract_address = AsyncWeb3.to_checksum_address(contract_address)
@@ -251,14 +252,9 @@ class CollateralClient:
             tx_hash = await self.w3.eth.send_raw_transaction(raw_transaction)
         except Exception as error:
             answer = self._send_answer(error)
-            if answer in SEND_REFUSALS.values():
-                self._clear_sent_record(chain_id, signed_hash)
-                raise CollateralTransactionError(
-                    f"The RPC refused the transaction ({answer}); no transaction was sent"
-                ) from error
             raise CollateralOutcomeUnknownError(
-                f"Transaction {signed_hash} may have been sent, but the RPC's answer was not a clear "
-                f"refusal ({answer}); its outcome is unknown. {RETRY_IS_SAFE}"
+                f"Transaction {signed_hash} may have been sent: the RPC answered with an error ({answer}), which "
+                f"does not prove that no node took it, so its outcome is unknown. {RETRY_IS_SAFE}"
             ) from error
         logger.info("Sent transaction %s; waiting for its receipt", tx_hash.hex())
         try:
@@ -289,16 +285,15 @@ class CollateralClient:
         if receipt is None:
             nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
             if nonce > record["nonce"]:
-                # the nonce is used, so these bytes can never be mined again and the record has done its job. The
-                # receipt may be late (a lagging RPC) or gone for good (an RPC that prunes old receipts), so the
-                # outcome is left to the explorer and this run sends nothing. A later run cannot repeat the call:
-                # an RPC that has the block rejects it in the simulation, and one that lags signs that
-                # nonce again, which cannot be mined
-                self._clear_sent_record(chain_id, tx_hash)
+                # the nonce is used, but that does not say by which transaction or with what outcome, so the record
+                # stays until a receipt says so. The receipt may be late (a lagging RPC) or gone for good (an RPC
+                # that prunes old receipts): another RPC, or the person after checking the explorer, settles it
                 raise CollateralOutcomeUnknownError(
-                    f"Transaction {tx_hash}, sent earlier, has no receipt on this RPC but nonce {record['nonce']} "
-                    "is used, so it cannot be mined again; check its outcome on the explorer. No transaction was "
-                    "sent. Run this again if it still needs doing"
+                    f"Transaction {tx_hash}, sent earlier, has no receipt on this RPC and nonce {record['nonce']} "
+                    "is used, so its outcome is unknown; no transaction was sent. Run this again with "
+                    "SUBTENSOR_EVM_RPC_URL set to an RPC that serves its receipt, or look the transaction up on the "
+                    f"explorer and, once you know its outcome, delete {self.sent_record_path} and run this again "
+                    "if it still needs doing"
                 )
             receipt = await self._broadcast_again(record)
         self._clear_sent_record(chain_id, tx_hash)
@@ -334,7 +329,7 @@ class CollateralClient:
             if answer != "already known":
                 raise CollateralOutcomeUnknownError(
                     f"Transaction {tx_hash}, sent earlier, is not mined and broadcasting it again failed "
-                    f"({answer}); no transaction was sent. If it stays unmined, delete {SENT_RECORD_PATH} and run "
+                    f"({answer}); no transaction was sent. If it stays unmined, delete {self.sent_record_path} and run "
                     f"this again: the next transaction reuses nonce {record['nonce']}, so only one of the two can "
                     "be mined"
                 ) from error
@@ -354,7 +349,7 @@ class CollateralClient:
     def _send_lock(self):
         """Hold the record file's lock from settling an earlier send until this one's record is cleared or
         left, so two runs never both find no record and each send on a new nonce."""
-        lock_path = SENT_RECORD_PATH.with_name(SENT_RECORD_PATH.name + ".lock")
+        lock_path = self.sent_record_path.with_name(self.sent_record_path.name + ".lock")
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             handle = open(lock_path, "a")
@@ -378,12 +373,12 @@ class CollateralClient:
 
     def _read_sent_record(self, chain_id: int) -> dict | None:
         try:
-            records = json.loads(SENT_RECORD_PATH.read_text())
+            records = json.loads(self.sent_record_path.read_text())
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:
             raise CollateralTransactionError(
-                f"The record of earlier sends ({SENT_RECORD_PATH}) could not be read ({type(error).__name__}); "
+                f"The record of earlier sends ({self.sent_record_path}) could not be read ({type(error).__name__}); "
                 "no transaction was sent"
             ) from error
         return records.get(self._sent_record_key(chain_id))
@@ -393,7 +388,7 @@ class CollateralClient:
             self._replace_sent_records(lambda records: {**records, self._sent_record_key(chain_id): record})
         except (OSError, ValueError) as error:
             raise CollateralTransactionError(
-                f"The record of earlier sends ({SENT_RECORD_PATH}) could not be written ({type(error).__name__}); "
+                f"The record of earlier sends ({self.sent_record_path}) could not be written ({type(error).__name__}); "
                 "no transaction was sent. Set COLLATERAL_SENT_RECORD to a writable path"
             ) from error
 
@@ -411,21 +406,21 @@ class CollateralClient:
         except (OSError, ValueError) as error:
             # the outcome is already known; the next run reads it again and reports it
             logger.warning(
-                "Could not clear the record of earlier sends (%s): %s", SENT_RECORD_PATH, type(error).__name__
+                "Could not clear the record of earlier sends (%s): %s", self.sent_record_path, type(error).__name__
             )
 
-    @staticmethod
-    def _replace_sent_records(change) -> None:
-        records = json.loads(SENT_RECORD_PATH.read_text()) if SENT_RECORD_PATH.exists() else {}
-        SENT_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary = SENT_RECORD_PATH.with_suffix(".tmp")
+    def _replace_sent_records(self, change) -> None:
+        path = self.sent_record_path
+        records = json.loads(path.read_text()) if path.exists() else {}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
         with open(temporary, "w") as handle:
             json.dump(change(records), handle)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.replace(SENT_RECORD_PATH)
+        temporary.replace(path)
         # the rename reaches the disk only once the directory is synced; before that a crash can lose the record
-        directory = os.open(SENT_RECORD_PATH.parent, os.O_RDONLY)
+        directory = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
         finally:

@@ -109,6 +109,7 @@ def get_collateral_contract(
         rpc_url=settings.SUBTENSOR_EVM_RPC_URL,
         miner_key=miner_key,
         max_gas_price_gwei=settings.COLLATERAL_MAX_GAS_PRICE_GWEI,
+        sent_record_path=settings.COLLATERAL_SENT_RECORD,
     )
 
 

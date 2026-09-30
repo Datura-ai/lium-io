@@ -8,7 +8,7 @@ from datura.chain import (
     ChainEndpoint,
     chain_endpoint_candidates,
 )
-from core.collateral import DEFAULT_MAX_GAS_PRICE_GWEI
+from core.collateral import DEFAULT_MAX_GAS_PRICE_GWEI, DEFAULT_SENT_RECORD
 from lium_core.shared_config import SharedConfigClient
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     COLLATERAL_MAX_GAS_PRICE_GWEI: float = Field(
         env="COLLATERAL_MAX_GAS_PRICE_GWEI", default=DEFAULT_MAX_GAS_PRICE_GWEI, gt=0
     )
+    # the collateral client's record of a send whose outcome is not known yet
+    COLLATERAL_SENT_RECORD: str = Field(env="COLLATERAL_SENT_RECORD", default=DEFAULT_SENT_RECORD)
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
 

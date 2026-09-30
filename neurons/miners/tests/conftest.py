@@ -44,5 +44,8 @@ if _src not in sys.path:
 @pytest.fixture(autouse=True)
 def _fresh_collateral_sent_record(tmp_path, monkeypatch):
     from core import collateral
+    from core.config import settings
 
-    monkeypatch.setattr(collateral, "SENT_RECORD_PATH", tmp_path / "collateral-sent.json")
+    path = tmp_path / "collateral-sent.json"
+    monkeypatch.setattr(collateral, "SENT_RECORD_PATH", path)
+    monkeypatch.setattr(settings, "COLLATERAL_SENT_RECORD", str(path))

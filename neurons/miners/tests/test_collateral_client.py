@@ -395,6 +395,9 @@ async def test_an_already_known_answer_is_an_unknown_outcome_and_the_retry_sends
         ("upstream_timeout", 1),
         ("unknown_account", 1),
         ("nonce_too_low", 1),
+        ("replacement_underpriced", 1),
+        ("below_base_fee", 1),
+        ("insufficient_funds", 1),
     ],
 )
 async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_status, monkeypatch):
@@ -421,6 +424,10 @@ async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_statu
         "unknown_account": ValueError({"code": -32000, "message": "unknown account"}),
         # a resend (web3's retry middleware, or a gateway's) of a transaction that already landed
         "nonce_too_low": ValueError({"code": -32000, "message": "nonce too low"}),
+        # a gateway that forwarded the bytes to one upstream and answers with another upstream's refusal
+        "replacement_underpriced": ValueError({"code": -32000, "message": "replacement transaction underpriced"}),
+        "below_base_fee": ValueError({"code": -32000, "message": "gas price less than block base fee"}),
+        "insufficient_funds": ValueError({"code": -32000, "message": "insufficient funds for gas * price + value"}),
     }
     if failure in answers:
         monkeypatch.setattr(eth, "send_raw_transaction", accepted_then(answers[failure]))
@@ -441,10 +448,10 @@ async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_statu
     assert {decode_legacy(raw)["nonce"] for raw in provider.sent} == {NONCE}
 
 
-async def test_a_used_nonce_with_no_receipt_sends_nothing_once_and_never_blocks_later_work(monkeypatch):
-    """A lagging RPC, or one that prunes old receipts, shows the nonce used with no receipt: that run sends
-    nothing and points to the explorer; the bytes can't be mined again, so the next run is not blocked."""
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+async def test_a_used_nonce_with_no_receipt_keeps_the_record_until_a_receipt_settles_it(monkeypatch):
+    """A lagging RPC, or one that prunes old receipts, shows the nonce used with no receipt. The nonce does not say
+    which transaction took it or how that ended, so nothing new is signed until an RPC serves the receipt."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
     provider.mine_sent = False
     client = client_with(provider)
     wait_for_receipt = client.w3.eth.wait_for_transaction_receipt
@@ -452,15 +459,39 @@ async def test_a_used_nonce_with_no_receipt_sends_nothing_once_and_never_blocks_
     with pytest.raises(CollateralOutcomeUnknownError):
         await client.finalize_reclaim(5)
     monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", wait_for_receipt)
+    signed_hash = client._read_sent_record(CHAIN_ID)["hash"]
 
     provider.nonce = provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralOutcomeUnknownError, match=f"nonce {NONCE} is used, so it cannot be mined again"):
-        await client.finalize_reclaim(5)
+    for _ in range(2):
+        with pytest.raises(CollateralOutcomeUnknownError, match=f"nonce {NONCE} is used, so its outcome is unknown"):
+            await client.finalize_reclaim(5)
     assert len(provider.sent) == 1
+    assert client._read_sent_record(CHAIN_ID)["hash"] == signed_hash
 
+    # an RPC that serves the receipt settles it, and only then is the next nonce signed
+    provider.mined.add(signed_hash)
+    with pytest.raises(CollateralTransactionError, match="sent earlier, succeeded in block 16"):
+        await client.finalize_reclaim(5)
+    assert client._read_sent_record(CHAIN_ID) is None
     provider.mine_sent = True
     await client.finalize_reclaim(5)
     assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [NONCE, NONCE + 1]
+
+
+async def test_a_used_nonce_with_no_receipt_names_the_two_ways_to_settle_it(monkeypatch):
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.finalize_reclaim(5)
+
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralOutcomeUnknownError) as raised:
+        await client.finalize_reclaim(5)
+    assert "SUBTENSOR_EVM_RPC_URL set to an RPC that serves its receipt" in str(raised.value)
+    assert f"delete {client.sent_record_path}" in str(raised.value)
+    assert "no transaction was sent" in str(raised.value)
 
 
 async def test_a_refusal_that_echoes_the_rpc_url_is_reported_in_local_words_only():
@@ -468,11 +499,11 @@ async def test_a_refusal_that_echoes_the_rpc_url_is_reported_in_local_words_only
     provider.send_error = "keyed refusal"
     client = client_with(provider)
 
-    with pytest.raises(CollateralTransactionError) as raised:
+    with pytest.raises(CollateralOutcomeUnknownError) as raised:
         await client.finalize_reclaim(5)
-    assert str(raised.value) == "The RPC refused the transaction (insufficient funds for gas); no transaction was sent"
+    assert "(insufficient funds for gas)" in str(raised.value)
     assert_no_rpc_secret(str(raised.value))
-    assert collateral_module.SENT_RECORD_PATH.read_text() == "{}"
+    assert client._read_sent_record(CHAIN_ID) is not None
 
 
 async def test_an_unmined_send_whose_rebroadcast_is_not_accepted_stops_at_once_with_the_way_out(monkeypatch):
@@ -487,7 +518,7 @@ async def test_an_unmined_send_whose_rebroadcast_is_not_accepted_stops_at_once_w
     provider.send_error = "unknown account"
     with pytest.raises(CollateralOutcomeUnknownError, match="broadcasting it again failed") as raised:
         await client.finalize_reclaim(5)
-    assert f"delete {collateral_module.SENT_RECORD_PATH}" in str(raised.value)
+    assert f"delete {client.sent_record_path}" in str(raised.value)
     assert f"reuses nonce {NONCE}" in str(raised.value)
     assert len(provider.sent) == 1
 
@@ -586,16 +617,20 @@ async def test_the_open_reclaim_list_reads_every_request_at_the_block_of_its_log
     assert details and all(block == hex(5000) for _, block in details)
 
 
-async def test_a_broadcast_the_rpc_refuses_is_not_sent_and_the_next_run_sends():
+async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():
+    """A refusal may be another upstream's answer after one took the bytes, so it proves nothing was sent only
+    once the same bytes are broadcast again; no second nonce is signed meanwhile."""
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
     provider.send_error = "refused"
     client = client_with(provider)
 
-    with pytest.raises(CollateralTransactionError, match=r"refused the transaction \(insufficient funds for gas\)"):
+    with pytest.raises(CollateralOutcomeUnknownError, match=r"answered with an error \(insufficient funds for gas\)"):
         await client.finalize_reclaim(5)
+    signed_hash = client._read_sent_record(CHAIN_ID)["hash"]
     provider.send_error = None
-    await client.finalize_reclaim(5)
-    assert len(provider.sent) == 1
+    with pytest.raises(CollateralTransactionError, match="sent earlier, succeeded in block 16"):
+        await client.finalize_reclaim(5)
+    assert [AsyncWeb3.keccak(hexstr=raw).hex() for raw in provider.sent] == [signed_hash]
 
 
 @pytest.mark.parametrize("network,rpc_chain_id", [("finney", 1), ("test", 964), ("archive", 945)])
