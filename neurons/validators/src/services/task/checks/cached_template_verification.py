@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import shlex
-from dataclasses import replace
-from datetime import datetime
+import time
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 
 from ..messages import CachedTemplateMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+logger = logging.getLogger(__name__)
 
 # DAH-2470 — the executor's cache-prefetch loop publishes its own state here, inside the
 # executor container. The validator's shell lands in that same container (run.sh starts
@@ -21,6 +27,60 @@ _PREFETCH_READ_BYTES = 8192
 _PREFETCH_MAX_BYTES = 6144
 # Enough of a bad file to recognise it, not enough to matter in the log.
 _PREFETCH_ERROR_CHARS = 200
+# How long the first sighting of a node without its image is remembered. Past it, a node that is
+# still uncached reopens the grace only while its executor's first sweep is also incomplete.
+_FIRST_UNCACHED_TTL_SECONDS = 30 * 24 * 3600
+# The executor's own error, quoted to the provider; the writer already caps it at 500.
+_QUOTED_ERROR_CHARS = 300
+# A failing NOT_CACHED whose prefetch document names no cause.
+_NOT_CACHED_NEXT_STEP = (
+    "Run `docker pull {ref}` on the host to see why the executor's pre-pull could not fetch it; "
+    "the executor retries on its own."
+)
+
+# First match wins, so the "No such image" of an executor that predates the stream-error capture
+# is read before the "404"/"not found" it also contains.
+_PULL_ERROR_NEXT_STEPS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("no such image",),
+        "The pull ended without the image and the registry's own error was not recorded (older "
+        "executor releases drop it): update the executor, then run `docker pull {ref}` on the "
+        "host to see it.",
+    ),
+    (
+        ("toomanyrequests", "rate limit"),
+        "Docker Hub is rate-limiting this host: log its Docker daemon in to Docker Hub "
+        "(`docker login`) or wait for the limit to reset.",
+    ),
+    (
+        ("no space left", "disk quota"),
+        "The Docker root is out of space: free disk there; the executor retries on its own.",
+    ),
+    (
+        ("unauthorized", "denied", "forbidden", "403"),
+        "The registry refused the pull: check the Docker login and any registry-mirrors entry in "
+        "/etc/docker/daemon.json.",
+    ),
+    (
+        ("manifest unknown", "not found", "404"),
+        "The registry, or a registry mirror in /etc/docker/daemon.json, does not serve this "
+        "digest: remove or fix the mirror.",
+    ),
+    (
+        (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "unexpected eof",
+            "tls",
+            "no such host",
+            "network is unreachable",
+        ),
+        "The host could not download from the registry: check its outbound connection to "
+        "registry-1.docker.io and production.cloudflare.docker.com.",
+    ),
+)
 
 
 def _repo_digest(stdout: str | None, repo: str) -> str | None:
@@ -38,6 +98,134 @@ def _repo_digest(stdout: str | None, repo: str) -> str | None:
         name, _, sha = str(entry).partition("@")
         if name == repo and sha:
             return sha
+    return None
+
+
+@dataclass(frozen=True)
+class FreshNodeGrace:
+    """Whether a node found without its image is still inside its fresh-node grace.
+
+    Attached to the event with `asdict`, so it serializes like the rest of `what_we_saw`.
+    """
+
+    pending: bool
+    first_uncached_at: str | None = None
+    seconds_since_first_uncached: int | None = None
+    grace_seconds: int | None = None
+    first_sweep_completed: bool | None = None
+    redis_error: str | None = None
+
+
+def _first_sweep_completed(state: dict | None) -> bool | None:
+    """Whether the executor's prefetch loop has finished a sweep; None when its document can't say.
+
+    ``first_sweep_ok_at`` is published by newer executors; older ones only have the ``sweep_ok``
+    count, which the writer sheds when the document runs over its size cap.
+    """
+    if not isinstance(state, dict) or "unavailable" in state:
+        return None
+    counts = state.get("outcome_counts")
+    if state.get("first_sweep_ok_at") or (isinstance(counts, dict) and counts.get("sweep_ok")):
+        return True
+    if "first_sweep_ok_at" in state or isinstance(counts, dict):
+        return False
+    return None
+
+
+def _quote(value: object) -> str:
+    text = " ".join(str(value).split())
+    if len(text) > _QUOTED_ERROR_CHARS:
+        text = text[:_QUOTED_ERROR_CHARS] + "…"
+    return f'"{text}"'
+
+
+def _error_mentions(lowered_error: str, needle: str) -> bool:
+    # A status code must stand alone: a digest's hex can hold "403" or "404".
+    if needle.isdigit():
+        return re.search(rf"\b{needle}\b", lowered_error) is not None
+    return needle in lowered_error
+
+
+def _pull_error_next_step(error: str, ref: str) -> str:
+    lowered = error.lower()
+    for needles, step in _PULL_ERROR_NEXT_STEPS:
+        if any(_error_mentions(lowered, needle) for needle in needles):
+            return step.format(ref=ref)
+    return f"Run `docker pull {ref}` on the host to reproduce it."
+
+
+def _gib(value: object) -> str:
+    return f"{value / 1024**3:.0f} GiB" if isinstance(value, int | float) else "unknown"
+
+
+def _remediation_from_prefetch_state(
+    state: dict | None, image_ref: str, pull_ref: str, cached: bool
+) -> str | None:
+    """The provider's next step, from what the executor's own prefetch loop recorded.
+
+    None when the document names no specific cause; the template's generic text is used then.
+    """
+    if not isinstance(state, dict):
+        return None
+    if "unavailable" in state:
+        why = "the image on the host is stale" if cached else "the image is missing"
+        return (
+            f"The executor published no pre-pull state ({state['unavailable']}): update the "
+            f"executor, then run `docker pull {pull_ref}` on the host to see why {why}."
+        )
+    # The document comes from the provider's host: a wrong shape names no cause, never raises.
+    images = state.get("images")
+    record = images.get(image_ref) if isinstance(images, dict) else None
+    if not isinstance(record, dict):
+        record = {}
+    pull_error = record.get("last_pull_error")
+    if record.get("last_outcome") == "insufficient_disk":
+        return (
+            f"The executor skipped the pull for lack of disk: it needs "
+            f"{_gib(record.get('last_disk_required_bytes'))} free and has "
+            f"{_gib(record.get('last_disk_available_bytes'))}. Free space on the Docker root; "
+            "the next sweep pulls it."
+        )
+    # A later up-to-date sweep or disk skip does not clear an older pull error.
+    if pull_error and record.get("last_outcome") not in ("pull_ok", "up_to_date"):
+        return (
+            f"The executor's last pull of {image_ref} failed: {_quote(pull_error)}. "
+            f"{_pull_error_next_step(str(pull_error), pull_ref)}"
+        )
+    loop_outcome = state.get("last_outcome")
+    if loop_outcome == "prefetch_disabled_no_backend_url":
+        return (
+            "The executor's pre-pull is off because COMPUTE_REST_API_URL is not set in its "
+            "environment: set it and restart the executor."
+        )
+    if loop_outcome == "docker_unavailable":
+        return (
+            f"The executor's pre-pull cannot reach Docker ({_quote(state.get('docker_error'))}): "
+            "check that /var/run/docker.sock is mounted into the executor container."
+        )
+    if loop_outcome == "gpu_unknown":
+        return (
+            f"The executor's pre-pull cannot read the GPU ({_quote(state.get('gpu_error'))}), so "
+            "it does not know which image to pull: check the NVIDIA driver and that the executor "
+            "container sees the GPUs."
+        )
+    if loop_outcome == "backend_no_templates":
+        return (
+            f"The executor's pre-pull got no image from the backend "
+            f"({_quote(state.get('last_backend_error'))}): check that the executor can reach "
+            f"{state.get('backend_url') or 'the backend'}."
+        )
+    if loop_outcome == "loop_error" and state.get("last_loop_error"):
+        return f"The executor's pre-pull loop failed: {_quote(state['last_loop_error'])}."
+    if not cached and record.get("last_pull_ok_at") and record.get("last_outcome") in (
+        "pull_ok",
+        "up_to_date",
+    ):
+        return (
+            f"The executor pulled {image_ref} (last at {record['last_pull_ok_at']}) but it is no "
+            "longer on the host: something removed it, e.g. `docker image prune -a` or "
+            "`docker system prune -a`. Stop pruning it; the executor re-pulls it on its next sweep."
+        )
     return None
 
 
@@ -68,7 +256,14 @@ class CachedTemplateVerificationCheck:
 
     DAH-2470: on the failure path only, the event also carries ``prefetch_state`` — the
     executor's own record of what its cache-prefetch loop was doing — so the reason a node
-    holds a stale image is readable in Grafana without SSHing anywhere.
+    holds a stale image is readable in Grafana without SSHing anywhere. The failure's remediation
+    quotes that document: the executor's own pull error and the step it points to.
+
+    With ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED``, a node this validator has only just
+    found without the image is held as PENDING (passed, score untouched by this check) while its
+    executor's first pre-pull sweep is still running, for at most
+    ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``). With it off
+    the node fails as before and the would-be hold is only logged.
     """
 
     check_id = "executor.validate.cached_template"
@@ -111,6 +306,55 @@ class CachedTemplateVerificationCheck:
         if not isinstance(state, dict):
             return {"unavailable": "unparseable", "raw_prefix": raw[:_PREFETCH_ERROR_CHARS]}
         return state
+
+    async def _fresh_node_grace(self, ctx: Context, prefetch_state: dict) -> FreshNodeGrace | None:
+        """Whether a node found without its image is still inside its fresh-node grace.
+
+        The window opens at this validator's first sighting of the node without the image (kept
+        in Redis, so the executor cannot move it) and closes CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS
+        later, or as soon as the executor reports that its first pre-pull sweep completed. An
+        executor whose document can't say gets the time bound alone. Never raises: a Redis error
+        means no grace, which is the verdict this check gave before the grace existed.
+        """
+        grace_seconds = settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS
+        if grace_seconds <= 0:
+            return None
+        now = time.time()
+        try:
+            first_uncached = await ctx.services.redis.first_uncached_at(
+                ctx.executor.uuid, now, _FIRST_UNCACHED_TTL_SECONDS
+            )
+        except Exception as exc:
+            return FreshNodeGrace(pending=False, redis_error=str(exc)[:_PREFETCH_ERROR_CHARS])
+        first_sweep_completed = _first_sweep_completed(prefetch_state)
+        elapsed = max(0.0, now - first_uncached)
+        return FreshNodeGrace(
+            pending=elapsed < grace_seconds and first_sweep_completed is not True,
+            first_uncached_at=datetime.fromtimestamp(first_uncached, UTC).isoformat(),
+            seconds_since_first_uncached=round(elapsed),
+            grace_seconds=grace_seconds,
+            first_sweep_completed=first_sweep_completed,
+        )
+
+    async def _apply_fresh_node_grace(self, ctx: Context, prefetch_state: dict, what: dict) -> bool:
+        """True when the grace holds this NOT_CACHED node as pending.
+
+        Flag on, the grace is added to ``what``. Flag off, a would-be hold is only logged.
+        """
+        grace = await self._fresh_node_grace(ctx, prefetch_state)
+        if grace is None:
+            return False
+        if settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED:
+            what["fresh_node_grace"] = asdict(grace)
+            return grace.pending
+        if grace.pending:
+            logger.info(
+                _m(
+                    "Fresh-node grace is off: this node would have been held as pending",
+                    extra=get_extra_info({**ctx.default_extra, "fresh_node_grace": asdict(grace)}),
+                )
+            )
+        return False
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model
@@ -224,8 +468,22 @@ class CachedTemplateVerificationCheck:
         # cause (registry rate-limits, disk, network) from ours (loop gave up, never
         # retried). Only on the failure path — a handful of nodes per cycle — so healthy
         # nodes add neither an SSH round trip nor log volume.
+        remediation: str | None = None
         if should_fail:
-            what["prefetch_state"] = await self._read_prefetch_state(ctx)
+            prefetch_state = await self._read_prefetch_state(ctx)
+            what["prefetch_state"] = prefetch_state
+            if template == Msg.NOT_CACHED and await self._apply_fresh_node_grace(
+                ctx, prefetch_state, what
+            ):
+                template = Msg.PENDING
+                should_fail = False
+            if should_fail:
+                pull_ref = f"{docker_image}@{backend_digest}" if backend_digest else image_ref
+                remediation = _remediation_from_prefetch_state(
+                    prefetch_state, image_ref, pull_ref, cached
+                )
+                if remediation is None and template == Msg.NOT_CACHED:
+                    remediation = _NOT_CACHED_NEXT_STEP.format(ref=pull_ref)
 
         event = render_message(
             template,
@@ -237,6 +495,7 @@ class CachedTemplateVerificationCheck:
                 if should_fail
                 else None
             ),
+            remediation=remediation,
             what=what,
         )
         return CheckResult(

@@ -38,7 +38,7 @@ from services.docker_service import (
     _CreateCancelledByDelete,
 )
 from services.executor_connectivity.dind_probe import DindVerifier
-from services.executor_connectivity.models import PortPair
+from services.executor_connectivity.models import BatchResult, PortPair
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_verifiers import BatchVerifier
 from services.inspector_validation_service import InspectorValidationService
@@ -593,9 +593,9 @@ async def test_port_attempts_that_fail_to_start_are_debug_only(caplog, monkeypat
     monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     verifier = BatchVerifier(port_tester=Mock(), runner=_Runner(start_ok=False))
 
-    successful, failed = await verifier.verify(_ports(3), ssh_client=Mock(), host="203.0.113.9")
+    result = await verifier.verify(_ports(3), ssh_client=Mock(), host="203.0.113.9")
 
-    assert successful == [] and len(failed) == 3
+    assert result.successful == [] and len(result.failed) == 3
     assert _records(caplog, "attempt 1 failed, retrying in 2s")[0].levelno == logging.DEBUG
     assert _records(caplog, "all 2 attempts failed")[0].levelno == logging.DEBUG
     assert not _levels(caplog) & {logging.WARNING, logging.ERROR}
@@ -623,8 +623,11 @@ async def test_tier_fallthrough_is_debug(caplog):
     async def nothing(ports, **kwargs):
         return [], list(ports)
 
+    async def no_batch(ports, **kwargs):
+        return BatchResult([], list(ports), completed=False)
+
     probe = PortProbe(
-        batch_verifier=Mock(verify=nothing),
+        batch_verifier=Mock(verify=no_batch),
         semi_batch_verifier=Mock(verify=nothing),
         fallback_verifier=Mock(verify=nothing),
     )

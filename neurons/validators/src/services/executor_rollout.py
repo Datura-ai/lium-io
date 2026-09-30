@@ -37,6 +37,8 @@ from services.task.messages import (
     MachineSpecMessages,
     PortCountMessages,
     RentalVerificationMessages,
+    SCRAPE_HOST_SIDE_FAILURE_REASONS,
+    SCRAPE_UNDETERMINED_FAILURE_REASONS,
     TenantEnforcementMessages,
     UploadFilesMessages,
 )
@@ -75,6 +77,9 @@ ROLLOUT_FAILURE_REASONS = frozenset(
         TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason,
         RentalVerificationMessages.FILLER_TRANSPORT_UNREACHABLE.reason,
         MachineSpecMessages.SCRAPE_FAILED.reason,
+        # the codes SCRAPE_FAILED split into keep the grace it had
+        *SCRAPE_HOST_SIDE_FAILURE_REASONS,
+        *SCRAPE_UNDETERMINED_FAILURE_REASONS,
         PortCountMessages.INSUFFICIENT_PORTS.reason,
         ExecutorImageMessages.OUTDATED.reason,
     }
@@ -83,7 +88,7 @@ _OUTDATED = ExecutorImageMessages.OUTDATED.reason
 # The ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
 # (RENTED); a run that reaches finalize ends on VALIDATION_COMPLETED.
-_RUN_ENDED_WITHOUT_FAILING = frozenset(
+RUN_ENDED_WITHOUT_FAILING = frozenset(
     {
         FinalizeMessages.COMPLETED.reason,
         TenantEnforcementMessages.ALREADY_RENTED.reason,
@@ -387,7 +392,7 @@ def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: in
         return None
     reason = result.failure_reason_code
     if reason not in ROLLOUT_FAILURE_REASONS:
-        ended_without_failing = reason in _RUN_ENDED_WITHOUT_FAILING
+        ended_without_failing = reason in RUN_ENDED_WITHOUT_FAILING
         outdated = (
             settings.EXECUTOR_IMAGE_CHECK_ENFORCE
             and (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value

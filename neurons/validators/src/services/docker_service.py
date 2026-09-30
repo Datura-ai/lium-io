@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import enum
 import ipaddress
 import logging
@@ -163,6 +164,33 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 # that hold GPUs and brick the executor.
 CONTAINER_STOP_GRACE_SECONDS = 30
 
+# DAH-3467: dockerd answers a force-remove only once the rw layer is unlinked, and that can outlive
+# the Docker SDK's 60 s read timeout (prod, 12-14 Sep: 13 deletes, all of them gone by the time the
+# backend retried 9-19 min later). A read timeout therefore says "no answer yet", not "failed": the
+# container is inspected by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS; only a 404 counts as gone.
+REMOVE_CONFIRM_TIMEOUT_SECONDS = 60.0
+REMOVE_CONFIRM_POLL_SECONDS = 5.0
+# one inspect over the same Docker-over-SSH client; shorter than the SDK's own 60 s read timeout
+REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS = 15.0
+# dockerd's State.Status while it tears the container down (kill is bounded to ~20 s inside dockerd
+# and fails loudly with "did not receive an exit event", so a >60 s remove is in this phase)
+_DOCKER_REMOVING_STATUS = "removing"
+# The inspect 404 can arrive before dockerd has released the container's named-volume references,
+# so the volume removes that follow can fail with "volume is in use" while the backend closes the
+# pod on our success. On that path a named volume still in use is retried this many times, this far
+# apart. Still in use after that, the volume is left on the host and logged, as any other volume
+# error is: the container is gone, and a DeletionInProgress here would count against the backend's
+# three delete attempts (POD_DELETE_MAX_ATTEMPTS) and end in a penalty for a node that did remove
+# the container (review round 4).
+REMOVE_CONFIRM_VOLUME_ATTEMPTS = 6
+REMOVE_CONFIRM_VOLUME_RETRY_SECONDS = 5.0
+_DOCKER_VOLUME_IN_USE_PHRASE = "volume is in use"
+# How long a pod stays in pending_deletions with no delete completing for it. The backend re-asks a
+# DeletionInProgress from its retry sweep every 10 min and gives up after three attempts, so a marker
+# older than this has no re-ask coming; a probe pod's delete (rental_probe._teardown, a fresh pod id
+# each run) is never re-asked at all. Evicted on the next mark or lookup.
+PENDING_DELETION_TTL_SECONDS = 3600.0
+
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
 # the backend) and starts the rent anyway on timeout. This grace must stay strictly below that
@@ -242,6 +270,96 @@ _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use"
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
 
+PORT_COLLISION_ERROR_CLASS = "port_collision"
+_PORT_COLLISION_CANDIDATE_CAP = 3
+_PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
+# `ss -Hltn` (iproute2) first, `netstat -ltn` where only net-tools is installed; either prints one
+# listening socket per line with the local address in one column.
+_LISTENING_PORTS_COMMAND = "ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null"
+# dockerd's two bind refusals name the host address the bind was for:
+#   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
+#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
+#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
+_BOUND_HOST_PORT_RE = re.compile(
+    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
+)
+
+
+class RentalPortCollisionError(RuntimeError):
+    """`docker run` could not bind a host port and no free mapped port of the executor's range took
+    the pod: the create fails as the `port_collision` class."""
+
+    error_class = PORT_COLLISION_ERROR_CLASS
+
+
+def _port_allocated_phrase(exc: BaseException) -> str | None:
+    """The `_PORT_ALLOCATED_PHRASES` entry the daemon's refusal carries, or None."""
+    text = str(exc)
+    return next((phrase for phrase in _PORT_ALLOCATED_PHRASES if phrase in text), None)
+
+
+def port_collision_error_class(exc: BaseException) -> str | None:
+    """`port_collision` when the create died on a host port bind, for the failure event's counter.
+
+    Flag or no flag: a typed `RentalPortCollisionError`, or any refusal text in the exception's
+    cause chain that names an already-bound host port.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RentalPortCollisionError) or _port_allocated_phrase(current):
+            return PORT_COLLISION_ERROR_CLASS
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _bound_host_port_from_error(exc: BaseException) -> int | None:
+    """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
+    match = _BOUND_HOST_PORT_RE.search(str(exc))
+    if match is None:
+        return None
+    port = int(match.group(1))
+    return port if 0 < port <= 65535 else None
+
+
+def _spare_port_pairs(
+    advertised: list[PayloadPortMapping] | None,
+    port_maps: list[tuple[int, int, int]],
+) -> list[PayloadPortMapping]:
+    """The executor's advertised (internal, external) pairs the pod is not using, by host port."""
+    used_internal = {internal for _, internal, _ in port_maps}
+    used_external = {external for _, _, external in port_maps}
+    spare = [
+        pair
+        for pair in advertised or ()
+        if pair.internal_port not in used_internal and pair.external_port not in used_external
+    ]
+    spare.sort(key=lambda pair: pair.internal_port)
+    return spare
+
+
+def _port_collision_candidates(
+    spare: list[PayloadPortMapping], *, after_host_port: int, cap: int = _PORT_COLLISION_CANDIDATE_CAP
+) -> list[PayloadPortMapping]:
+    """The next free pairs after the colliding host port, wrapping to the range's start; at most `cap`."""
+    later = [pair for pair in spare if pair.internal_port > after_host_port]
+    earlier = [pair for pair in spare if pair.internal_port <= after_host_port]
+    return (later + earlier)[:cap]
+
+
+def _parse_listening_ports(output: str) -> set[int]:
+    """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`)."""
+    ports: set[int] = set()
+    for line in output.splitlines():
+        for column in line.split():
+            if column.endswith("*") or ":" not in column:
+                continue
+            _, _, port_text = column.rpartition(":")
+            if port_text.isdigit() and 0 < int(port_text) <= 65535:
+                ports.add(int(port_text))
+    return ports
+
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "VolumeDriver.Mount",
     "cannot create mount point dir",
@@ -290,6 +408,8 @@ class _VolumeEncryptionState(enum.Enum):
 
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
+_DOCKER_READ_TIMEOUT_PHRASE = "read timed out"
+_DOCKER_READ_TIMEOUT_EXCEPTION_NAMES = frozenset({"ReadTimeout", "ReadTimeoutError"})
 # DAH-2991: dockerd sent SIGKILL but containerd never reported the task gone — the process is wedged
 # (uninterruptible I/O). `docker rm -f` fails the same way on every retry; only a direct kill of the
 # init and its shim over SSH gets past it (ticket-0287: 4 backend deletes, 5 h at score 0).
@@ -424,6 +544,24 @@ class VolumeSizingResult:
 _LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
 _LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
 _PROBE_OUTPUT_LOG_CAP = 512
+# a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
+# so only the last line is the state: true / false / absent
+_LOOPBACK_PLUGIN_STATE_COMMAND = (
+    "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+    f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1"
+)
+
+
+class LoopbackPluginDisabledError(Exception):
+    """The vloopback plugin is installed but disabled and `docker plugin enable` did not fix it.
+    The message keeps "plugin vloopback" and "disabled" so the platform classifier still files
+    it as volume.plugin_disabled."""
+
+    def __init__(self, detail: str):
+        super().__init__(
+            "vloopback plugin disabled on host and could not be enabled "
+            f"(plugin {_LOOPBACK_PLUGIN_ALIAS}: {detail})"
+        )
 
 
 @dataclass
@@ -437,6 +575,7 @@ class VolumeHostProbe:
     df_avail_bytes: int | None          # None when the probe was asked not to measure df
     vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
     loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
+    loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
 
 
 def _volume_host_probe_command(*, with_df: bool) -> str:
@@ -457,10 +596,8 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
         f"{df_part}"
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
-        # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
-        # so only the last line is the state: true / false / absent
-        "printf 'PLUGIN\\t%s\\n' \"$( (/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
-        f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1)\""
+        # the space keeps `$( (` from reading as arithmetic `$((`
+        f"printf 'PLUGIN\\t%s\\n' \"$( {_LOOPBACK_PLUGIN_STATE_COMMAND})\""
     )
 
 
@@ -506,6 +643,7 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
         df_avail_bytes=df_avail_bytes,
         vloopback_volume_names=volume_names,
         loopback_plugin_enabled=plugin_state == "true",
+        loopback_plugin_installed=plugin_state in ("true", "false"),
     )
 
 
@@ -946,6 +1084,51 @@ class _InflightCreateRegistry:
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
 
+
+class _PendingDeletionRegistry:
+    """Pods whose last delete answered DeletionInProgress and has not completed since.
+
+    DAH-3467 (review): the backend re-asks a delete that answered DeletionInProgress (the container
+    still removing after the read timeout). The re-ask finds the container already absent ("No such
+    container"), which is not the inspect-confirmed path, so without this marker a "volume is in use"
+    on the volume remove would get the one best-effort attempt and the pod would close over a volume
+    dockerd was about to release. A pod marked here keeps its volume cleanup on the retried path until
+    a delete for it completes.
+
+    Entries expire after PENDING_DELETION_TTL_SECONDS (review round 4): a delete the backend gave up
+    on, or a probe pod's, is never re-asked, and without the expiry every such pod id stayed for the
+    life of the process. Expired entries are dropped on the next ``mark`` or ``is_pending``.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._marked_at: dict[str, float] = {}
+
+    def _evict_expired(self) -> None:
+        cutoff = self._clock() - PENDING_DELETION_TTL_SECONDS
+        for pod_id in [pod_id for pod_id, at in self._marked_at.items() if at < cutoff]:
+            del self._marked_at[pod_id]
+
+    def mark(self, pod_id: str) -> None:
+        self._evict_expired()
+        self._marked_at[pod_id] = self._clock()
+
+    def is_pending(self, pod_id: str) -> bool:
+        self._evict_expired()
+        return pod_id in self._marked_at
+
+    def clear(self, pod_id: str) -> None:
+        self._marked_at.pop(pod_id, None)
+
+    def __len__(self) -> int:
+        self._evict_expired()
+        return len(self._marked_at)
+
+
+# In-process like inflight_creates: the backend re-asks the validator that owns the executor. A
+# validator restart forgets the marker, and the re-ask then runs the plain best-effort volume remove.
+pending_deletions = _PendingDeletionRegistry()
+
 # How long a delete waits for the create it just cancelled. The create reads the flag at its next
 # checkpoint, and the only checkpoint gap that can orphan a container is the short one before
 # `docker run` — a pull-length wait would hold the customer's delete for nothing.
@@ -961,6 +1144,23 @@ def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
         all(phrase in text.lower() for phrase in _DOCKER_REMOVAL_IN_PROGRESS_PHRASES)
         for text in _exception_texts(exc)
     )
+
+
+def _is_docker_read_timeout_error(exc: Exception) -> bool:
+    # requests.ReadTimeout / urllib3.ReadTimeoutError, wrapped by RentalDockerOperationError. Only a
+    # READ timeout: the request reached dockerd and no reply came back. A connect timeout ("Connection
+    # to ... timed out") never reached it and stays a failure.
+    cause: BaseException | None = exc
+    while cause is not None:
+        if cause.__class__.__name__ in _DOCKER_READ_TIMEOUT_EXCEPTION_NAMES:
+            return True
+        cause = cause.__cause__
+    return any(_DOCKER_READ_TIMEOUT_PHRASE in text.lower() for text in _exception_texts(exc))
+
+
+def _is_docker_volume_in_use_error(exc: Exception) -> bool:
+    # dockerd's 409 on `volume rm`: 'remove <name>: volume is in use - [<container id>]'
+    return any(_DOCKER_VOLUME_IN_USE_PHRASE in text.lower() for text in _exception_texts(exc))
 
 
 def _is_docker_could_not_kill_error(exc: Exception) -> bool:
@@ -1039,6 +1239,18 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
 
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
+
+
+def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str) -> str:
+    # the plugin's propagated-mount dir is root-only on the host, so the repair looks at it from a
+    # throwaway helper container that bind-mounts the dir at /mnt. `--mount type=bind` refuses a
+    # source that does not exist (exit 125) where `-v` would create it: a propagated-mount dir
+    # missing under a guessed docker root must read as "helper did not run", not as "volume dir gone".
+    return (
+        "/usr/bin/docker run --rm "
+        f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
+        f"{_VLOOPBACK_REPAIR_IMAGE} {helper_command}"
+    )
 
 
 def _should_repair_stale_mountpoint(
@@ -1353,10 +1565,23 @@ class DockerService:
         default_extra: dict,
         local_volume: str | None = None,
         log_tag: str = "container_creation",
+        port_maps: list[tuple[int, int, int]] | None = None,
+        spare_port_pairs: list[PayloadPortMapping] | None = None,
     ) -> None:
+        """`docker run` through the SDK with the same-command retry on known Docker races.
+
+        Port collision (PORT_COLLISION_RETRY_ENABLED): when dockerd refuses the bind of a host port
+        and `port_maps` / `spare_port_pairs` are given, the colliding mapping moves to the next
+        free pair of the executor's advertised range (at most `_PORT_COLLISION_CANDIDATE_CAP`
+        candidates, the host's listening sockets read once over `ssh_client`) and the run is
+        retried ONCE with the new mapping; `port_maps` is updated in place so the create's answer
+        carries the port the pod really got. No free candidate, or a second bind refusal, fails the
+        create as `RentalPortCollisionError`. Flag off: the DAH-1991 same-command wait as before.
+        """
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
         vloopback_mount_repair_attempted = False
+        remapped = False
         while True:
             try:
                 await run_logged_rental_docker_sdk_operation(
@@ -1389,10 +1614,39 @@ class DockerService:
                         )
                         continue
 
-                port_allocation_phrase = next(
-                    (phrase for phrase in _PORT_ALLOCATED_PHRASES if phrase in str(exc)),
-                    None,
-                )
+                port_allocation_phrase = _port_allocated_phrase(exc)
+                if port_allocation_phrase and remapped:
+                    # the one retry on the new mapping was refused too: no third candidate
+                    error_text = str(exc)
+                    await self.stream_log(error_text, "error", log_tag)
+                    raise RentalPortCollisionError(
+                        f"docker run could not bind a host port on the remapped port either: {exc}"
+                    ) from exc
+                if (
+                    port_allocation_phrase
+                    and settings.PORT_COLLISION_RETRY_ENABLED
+                    and port_maps is not None
+                    and spare_port_pairs
+                ):
+                    remapped_spec = await self._remap_colliding_port(
+                        exc=exc,
+                        ssh_client=ssh_client,
+                        run_spec=run_spec,
+                        port_maps=port_maps,
+                        spare_port_pairs=spare_port_pairs,
+                        default_extra=default_extra,
+                    )
+                    if remapped_spec is not None:
+                        run_spec = remapped_spec
+                        remapped = True
+                        attempt += 1
+                        await self._remove_failed_rental_container_for_retry(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="PORT_COLLISION_STALE_RM_FAILED",
+                        )
+                        continue
                 port_retry_deadline_expired = time.monotonic() >= deadline
                 port_retry_needed = bool(port_allocation_phrase) and not port_retry_deadline_expired
                 if port_retry_needed:
@@ -1469,6 +1723,105 @@ class DockerService:
                     }),
                 )
             )
+
+    async def _remap_colliding_port(
+        self,
+        *,
+        exc: Exception,
+        ssh_client: asyncssh.SSHClientConnection,
+        run_spec: ContainerRunSpec,
+        port_maps: list[tuple[int, int, int]],
+        spare_port_pairs: list[PayloadPortMapping],
+        default_extra: dict,
+    ) -> ContainerRunSpec | None:
+        """Move the mapping dockerd could not bind to the next free advertised pair.
+
+        Returns the run spec with the new host port, having rewritten `port_maps` in place and
+        taken the pair out of `spare_port_pairs`. Returns None when the refusal names no host port
+        of this pod (the caller keeps the same-command wait). Raises `RentalPortCollisionError`
+        when every candidate (≤ `_PORT_COLLISION_CANDIDATE_CAP`) is already listening on the host.
+        """
+        bound_port = _bound_host_port_from_error(exc)
+        index = next(
+            (i for i, (_, internal, _) in enumerate(port_maps) if internal == bound_port),
+            None,
+        )
+        if bound_port is None or index is None:
+            logger.warning(
+                _m(
+                    "PORT_COLLISION_UNMAPPED",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "bound_host_port": bound_port,
+                        "host_ports": [internal for _, internal, _ in port_maps],
+                    }),
+                )
+            )
+            return None
+        docker_port, old_internal, old_external = port_maps[index]
+        candidates = _port_collision_candidates(spare_port_pairs, after_host_port=bound_port)
+        listening = await self._listening_host_ports(ssh_client, default_extra)
+        chosen = next(
+            (pair for pair in candidates if listening is None or pair.internal_port not in listening),
+            None,
+        )
+        if chosen is None:
+            raise RentalPortCollisionError(
+                f"docker run could not bind host port {bound_port} and the next "
+                f"{len(candidates)} advertised port(s) "
+                f"{[pair.internal_port for pair in candidates]} are listening too: {exc}"
+            ) from exc
+        spare_port_pairs.remove(chosen)
+        port_maps[index] = (docker_port, chosen.internal_port, chosen.external_port)
+        logger.warning(
+            _m(
+                "PORT_COLLISION_REMAPPED",
+                extra=get_extra_info({
+                    **default_extra,
+                    "error_class": PORT_COLLISION_ERROR_CLASS,
+                    "docker_port": docker_port,
+                    "old_host_port": old_internal,
+                    "old_external_port": old_external,
+                    "new_host_port": chosen.internal_port,
+                    "new_external_port": chosen.external_port,
+                    "candidates": [pair.internal_port for pair in candidates],
+                    "probe": "listening" if listening is not None else "inconclusive",
+                }),
+            )
+        )
+        return dataclasses.replace(
+            run_spec,
+            ports=tuple(
+                dataclasses.replace(binding, host_port=chosen.internal_port)
+                if binding.protocol == "tcp" and binding.host_port == old_internal
+                else binding
+                for binding in run_spec.ports
+            ),
+        )
+
+    async def _listening_host_ports(
+        self, ssh_client: asyncssh.SSHClientConnection, default_extra: dict
+    ) -> set[int] | None:
+        """The host's listening TCP ports over the create's SSH session; None when unreadable
+        (then `docker run` itself is the probe of the first candidate)."""
+        try:
+            result = await asyncio.wait_for(
+                ssh_client.run(_LISTENING_PORTS_COMMAND, check=False),
+                timeout=_PORT_COLLISION_PROBE_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as probe_exc:
+            logger.warning(
+                _m(
+                    "PORT_COLLISION_PROBE_FAILED",
+                    extra=get_extra_info({**default_extra, "error": str(probe_exc)}),
+                )
+            )
+            return None
+        if result.exit_status != 0 or not (result.stdout or "").strip():
+            return None
+        return _parse_listening_ports(str(result.stdout))
 
     def _build_rental_container_run_spec(
         self,
@@ -1720,13 +2073,30 @@ class DockerService:
             return False
 
         # Repair by removing only the empty stale mountpoint directory.
-        helper_cmd = (
-            "/usr/bin/docker run --rm "
-            f"-v {shlex.quote(propagated_mount_dir)}:/mnt "
-            f"{_VLOOPBACK_REPAIR_IMAGE} rmdir /mnt/{shlex.quote(local_volume)}"
+        helper_cmd = _vloopback_repair_helper_cmd(
+            propagated_mount_dir, f"rmdir /mnt/{shlex.quote(local_volume)}"
         )
         repair_result = await ssh_client.run(helper_cmd, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
         if getattr(repair_result, "exit_status", 0) != 0:
+            # A directory that is already gone needs no rmdir: the provider removed it by hand, which
+            # is what the ticket replies ask for (DAH-3398 / ticket-0313: the stale dir was gone for
+            # 24 h and every cycle still counted the failed rmdir as a failed repair, so the
+            # container was never started). Only `test -e` exit 1 means absent; a helper that did
+            # not run (125+) stays a skipped repair.
+            absence_check_result = await ssh_client.run(
+                _vloopback_repair_helper_cmd(
+                    propagated_mount_dir, f"test -e /mnt/{shlex.quote(local_volume)}"
+                ),
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            if getattr(absence_check_result, "exit_status", 0) == 1:
+                logger.info(
+                    _m(
+                        "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT",
+                        extra=get_extra_info(log_extra),
+                    )
+                )
+                return True
             logger.warning(
                 _m(
                     "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED",
@@ -4039,6 +4409,51 @@ class DockerService:
         )
         return max(requested_timeout, min(scaled_timeout, _LOCAL_VOLUME_TIMEOUT_MAX_SEC))
 
+    async def _enable_loopback_plugin(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        timeout: int,
+        log_extra: dict,
+    ) -> None:
+        """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
+        again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
+        at volume creation with a clear reason instead of Docker's create error."""
+        run_kwargs = {"timeout": timeout} if timeout else {}
+        extra = {**log_extra, "loopback_plugin": _LOOPBACK_PLUGIN_ALIAS}
+        try:
+            result = await ssh_client.run(
+                f"/usr/bin/docker plugin enable {shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}", **run_kwargs
+            )
+            state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            error_type = exc.__class__.__name__
+            logger.warning(
+                _m(
+                    "Loopback plugin enable failed",
+                    extra=get_extra_info({**extra, "error_type": error_type}),
+                )
+            )
+            raise LoopbackPluginDisabledError(f"enable error: {error_type}") from exc
+        state = (state_result.stdout or "").strip()
+        if state != "true":
+            detail = (result.stderr or result.stdout or "").strip()[:_PROBE_OUTPUT_LOG_CAP]
+            logger.warning(
+                _m(
+                    "Loopback plugin still disabled after enable",
+                    extra=get_extra_info(
+                        {**extra, "enable_exit_status": result.exit_status, "state": state, "error": detail}
+                    ),
+                )
+            )
+            raise LoopbackPluginDisabledError(
+                f"enable exit {result.exit_status}, state {state or 'unknown'}"
+                + (f": {detail}" if detail else "")
+            )
+        logger.info(_m("Loopback plugin was disabled; enabled it", extra=get_extra_info(extra)))
+
     async def create_local_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -4077,6 +4492,10 @@ class DockerService:
                         extra=get_extra_info({**log_extra, "loopback_plugin": loopback_plugin_name}),
                     )
                 )
+            elif host_probe is not None and host_probe.loopback_plugin_installed:
+                # Installed but disabled: `docker plugin install` would fail with "already exists"
+                # and the volume create with "plugin vloopback found but disabled".
+                await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
             else:
                 loopback_plugin_arg = shlex.quote(loopback_plugin_name)
                 data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
@@ -6205,7 +6624,15 @@ class DockerService:
                         default_extra=default_extra,
                         local_volume=local_volume,
                         log_tag=log_tag,
+                        port_maps=port_maps,
+                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
                     )
+                    if jupyter_port_map:
+                        # a port collision may have moved the Jupyter mapping: the URL below
+                        # and the answer to the backend read the port the pod really got
+                        moved = self._find_mapping_by_docker_port(port_maps, jupyter_port_map[0])
+                        if moved is not None:
+                            jupyter_port_map = (moved[0], moved[2])
 
                     container_created = True
                     logger.info("Container creation step finished")
@@ -6555,6 +6982,9 @@ class DockerService:
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
+            # `error_class` (e.g. `port_collision`: dockerd could not bind the pod's host port)
+            # rides in the event's detail next to the stage so the backend can count the class
+            error_class = port_collision_error_class(e)
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
@@ -6562,6 +6992,7 @@ class DockerService:
                     # DAH-2740: a tenacity RetryError says nothing; the last attempt's text is the cause
                     "error": "; ".join(_exception_texts(e)),
                     "failure_step": current_step,
+                    **({"error_class": error_class} if error_class else {}),
                 }),
             )
             # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
@@ -7266,7 +7697,7 @@ class DockerService:
         # host instead of guessed from pod_id — a pod created through the edit path carries a
         # backend-supplied volume name that no convention derives. Every mount can be offered
         # blindly: repair_stale_vloopback_mountpoint accepts only a vloopback volume whose stale
-        # mountpoint dir is present and empty.
+        # mountpoint dir is unmounted and either empty (removed here) or already gone.
         inspect_result = await ssh_client.run(
             f"/usr/bin/docker inspect {shlex.quote(container_name)} "
             '--format \'{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}\'',
@@ -7325,6 +7756,81 @@ class DockerService:
             error_code=FailedContainerErrorCodes.UnknownError,
         )
 
+    @dataclass(frozen=True)
+    class _ForcedRemoval:
+        """What the forced removal established.
+
+        `failure` is the answer to return instead of going on (the container is not known to be
+        gone). `confirmed_by_inspect` (DAH-3467): the remove's reply outlived the read timeout and
+        an inspect 404 confirmed the container gone; dockerd may still hold its named-volume
+        references for a moment, so the volume removes that follow retry "volume is in use".
+        """
+
+        failure: FailedContainerRequest | None = None
+        confirmed_by_inspect: bool = False
+
+    def _deletion_in_progress(
+        self, payload: ContainerDeleteRequest, msg: str
+    ) -> FailedContainerRequest:
+        # the backend keeps the pod DELETING and re-asks from its retry sweep; no failure event
+        return FailedContainerRequest(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            msg=msg,
+            error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+            error_code=FailedContainerErrorCodes.DeletionInProgress,
+        )
+
+    async def _container_status_after_removal_timeout(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> str | None:
+        """What became of a force-remove whose reply outlived the SDK read timeout.
+
+        Polls ``inspect`` by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS. Returns None once dockerd
+        answers 404 (gone), ``"removing"`` when it is still tearing the container down at the end of
+        the window, any other ``State.Status`` as soon as it is seen (the container is not being
+        removed), or ``"unknown"`` when the inspect itself fails, times out or carries no state.
+        Only None lets the delete report success.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REMOVE_CONFIRM_TIMEOUT_SECONDS
+        while True:
+            # the window is checked between inspects, so the last inspect may run past the
+            # deadline by up to REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS (worst case ~75 s in all)
+            try:
+                status = await asyncio.wait_for(
+                    docker_client.container_status(container_name=payload.container_name),
+                    REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Could not inspect the container after the remove timed out",
+                    container_name=payload.container_name,
+                    error=str(exc),
+                )
+                return "unknown"
+            if status == "":
+                # an inspect body without State.Status: dockerd knows the name but says nothing
+                # usable about it — not proof of anything, the delete fails as before
+                log.warning(
+                    "Inspect after the remove timed out carried no container state",
+                    container_name=payload.container_name,
+                )
+                return "unknown"
+            if status is None or status != _DOCKER_REMOVING_STATUS:
+                return status
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return status
+            await asyncio.sleep(min(REMOVE_CONFIRM_POLL_SECONDS, remaining))
+
     async def _stop_container_gracefully(
         self,
         docker_client: RentalDockerSdkClient,
@@ -7371,12 +7877,57 @@ class DockerService:
             duration_ms=int((time.monotonic() - stop_started) * 1000),
         )
 
+    async def _removal_after_read_timeout(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        exc: Exception,
+    ) -> _ForcedRemoval | None:
+        """The forced removal's outcome once its reply outlived the SDK read timeout.
+
+        DAH-3467: dockerd took the force-remove and has not answered yet, so the container is
+        asked about instead of failing a delete that is most likely completing. Returns the
+        removal confirmed by inspect, DeletionInProgress while dockerd is still removing it, or
+        None when nothing proves the container gone (the caller re-raises the timeout).
+        """
+        status = await self._container_status_after_removal_timeout(docker_client, payload, log)
+        if status is None:
+            log.info(
+                "Container removal outlived the read timeout; inspect confirms it is gone",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+            return self._ForcedRemoval(confirmed_by_inspect=True)
+        if status == _DOCKER_REMOVING_STATUS:
+            log.info(
+                "Container deletion is still in progress after the read timeout",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+            return self._ForcedRemoval(
+                failure=self._deletion_in_progress(
+                    payload,
+                    msg=f"{exc}; container still '{status}' after "
+                    f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
+                )
+            )
+        # `unknown` (the inspect failed, hung or carried no state) or any other State.Status:
+        # none of them proves the container is gone
+        log.warning(
+            "Container not confirmed gone after the remove timed out",
+            container_name=payload.container_name,
+            container_status=status,
+            error=str(exc),
+        )
+        return None
+
     async def _force_remove_container(
         self,
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
-    ) -> FailedContainerRequest | None:
+    ) -> _ForcedRemoval:
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_container",
@@ -7400,15 +7951,15 @@ class DockerService:
                     container_name=payload.container_name,
                     error=error_msg,
                 )
-                return FailedContainerRequest(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    pod_id=payload.pod_id,
-                    workload_kind=payload.workload_kind,
-                    msg=error_msg,
-                    error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                    error_code=FailedContainerErrorCodes.DeletionInProgress,
+                return self._ForcedRemoval(
+                    failure=self._deletion_in_progress(payload, msg=error_msg)
                 )
+
+            if _is_docker_read_timeout_error(exc):
+                removal = await self._removal_after_read_timeout(docker_client, payload, log, exc)
+                if removal is None:
+                    raise
+                return removal
 
             # DAH-2345: deletion is idempotent for every workload kind — a container
             # that is already gone (e.g. removed by failed-create cleanup) must not
@@ -7421,7 +7972,62 @@ class DockerService:
                 container_name=payload.container_name,
                 error=str(exc),
             )
-        return None
+        return self._ForcedRemoval()
+
+    async def _remove_named_volume(
+        self,
+        docker_client: RentalDockerSdkClient,
+        volume_name: str,
+        volume_role: str,
+        log: _BoundLog,
+        *,
+        retry_in_use: bool,
+    ) -> None:
+        """Remove one named volume after the container is gone.
+
+        With `retry_in_use` (the removal was confirmed by an inspect 404 after a timed-out remove,
+        DAH-3467, or the pod carries a pending-deletion marker) a "volume is in use" answer is
+        retried REMOVE_CONFIRM_VOLUME_ATTEMPTS times, REMOVE_CONFIRM_VOLUME_RETRY_SECONDS apart:
+        dockerd can answer the inspect 404 before it has released the container's volume
+        references. Still in use after the last attempt, the error raises like any other volume
+        error, for the caller's best-effort step: the container is gone, and a DeletionInProgress
+        for a held volume would count against the backend's delete attempts and reach its penalty
+        path (review round 4). Every error without `retry_in_use` raises at once, as before.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="remove_volume",
+                    log_extra=log.base_extra,
+                    call=lambda: docker_client.remove_volume(volume_name=volume_name),
+                    volume_name=volume_name,
+                    volume_role=volume_role,
+                    attempt=attempt,
+                )
+                return
+            except Exception as exc:
+                if not retry_in_use or not _is_docker_volume_in_use_error(exc):
+                    raise
+                if attempt >= REMOVE_CONFIRM_VOLUME_ATTEMPTS:
+                    log.warning(
+                        "Named volume still in use after the container was confirmed gone; "
+                        "leaving it on the host",
+                        volume_name=volume_name,
+                        volume_role=volume_role,
+                        attempts=attempt,
+                        error=str(exc),
+                    )
+                    raise
+                log.info(
+                    "Named volume still in use after the container was confirmed gone; retrying",
+                    volume_name=volume_name,
+                    volume_role=volume_role,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                await asyncio.sleep(REMOVE_CONFIRM_VOLUME_RETRY_SECONDS)
 
     async def _force_remove_or_kill(
         self,
@@ -7429,7 +8035,7 @@ class DockerService:
         payload: ContainerDeleteRequest,
         ssh_client: asyncssh.SSHClientConnection,
         log: _BoundLog,
-    ) -> FailedContainerRequest | None:
+    ) -> _ForcedRemoval:
         """_force_remove_container, escalating once when dockerd cannot kill the process (DAH-2991).
 
         Retrying the same `rm -f` every 10 min failed 4 times in ticket-0287 and left the orphan
@@ -7529,9 +8135,17 @@ class DockerService:
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
-                    removal_failure = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
-                    if removal_failure is not None:
-                        return removal_failure
+                    removal = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
+                    if removal.failure is not None:
+                        # DeletionInProgress: the container is not gone yet and the backend will
+                        # re-ask. A filler's wedge sweep ran here when this path raised (below);
+                        # answering early must not skip it (DAH-3467, review). No-op while the
+                        # container's processes are still alive.
+                        if payload.workload_kind == WorkloadKind.FILLER:
+                            with _best_effort_delete_step(log, "sweep_wedged_gpus_before_in_progress"):
+                                await _sweep_wedged_gpus_after_teardown(ssh_client, log)
+                        pending_deletions.mark(payload.pod_id)
+                        return removal.failure
                 except Exception:
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
                     # classic wedge path — sweep before propagating so a wedged card does not
@@ -7570,36 +8184,48 @@ class DockerService:
                         call=docker_client.prune_images,
                     )
 
+                # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
+                # retried before the step gives it up; every volume failure stays best-effort. A
+                # re-ask after DeletionInProgress finds the container absent, not confirmed by
+                # inspect: the pod's marker keeps its volume cleanup on the retried path (review).
+                retry_volume_in_use = removal.confirmed_by_inspect
+                if pending_deletions.is_pending(payload.pod_id):
+                    retry_volume_in_use = True
+                    log.info(
+                        "Continuing a deletion answered in progress earlier; a volume still in use is retried",
+                        container_name=payload.container_name,
+                    )
+
                 if payload.local_volume:
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="remove_volume",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.remove_volume(
-                                volume_name=payload.local_volume
-                            ),
-                            volume_name=payload.local_volume,
-                            volume_role="local",
+                        await self._remove_named_volume(
+                            docker_client,
+                            payload.local_volume,
+                            "local",
+                            log,
+                            retry_in_use=retry_volume_in_use,
                         )
 
                 if payload.external_volume:
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="remove_volume",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.remove_volume(
-                                volume_name=payload.external_volume
-                            ),
-                            volume_name=payload.external_volume,
-                            volume_role="external",
+                        await self._remove_named_volume(
+                            docker_client,
+                            payload.external_volume,
+                            "external",
+                            log,
+                            retry_in_use=retry_volume_in_use,
                         )
                         await self.remove_s3fs_volume_plugin(
                             ssh_client=ssh_client, volume_name=payload.external_volume
                         )
+
+                # the delete completed (the volumes are gone or given up): the next delete for this
+                # pod starts clean
+                pending_deletions.clear(payload.pod_id)
 
                 log.info(
                     "Remove rented machine from redis",
