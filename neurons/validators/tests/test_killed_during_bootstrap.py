@@ -495,6 +495,29 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("after", ["gone", "still-listed", "listing-failed"])
+async def test_a_replacement_filler_counts_as_ours_only_once_confirmed_gone(svc, after):
+    """`docker rm` acknowledging the replacement's ID is not enough: the confirmation must no longer list it."""
+    replacement_id = _container_id("filler_swept-1", generation=1)
+    listing = f"filler_swept-1 {replacement_id}\n" if after == "still-listed" else ""
+    ssh = _sweep_host(listing)
+    if after == "listing-failed":
+        rm_only = ssh.run.side_effect
+
+        async def run(command, **kwargs):
+            if command.startswith("/usr/bin/docker rm -fv "):
+                return await rm_only(command, **kwargs)
+            return Mock(stdout="", stderr="daemon unreachable", exit_status=1)
+
+        ssh.run = AsyncMock(side_effect=run)
+
+    await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
+
+    assert await own_sweep_removals.removed_by_us(replacement_id) == (after == "gone")
+    assert not own_sweep_removals.maybe_removed_by_us(replacement_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     ["acknowledged", "node-removed-it-first", "replaced-by-a-new-same-name-container", "no-id-listed",
@@ -522,6 +545,8 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
         if command.startswith("/usr/bin/docker rm -fv "):
             targets = command.removeprefix("/usr/bin/docker rm -fv ").split()
             rms.append(targets)
+            if targets == [new]:
+                return Mock(stdout=f"{new}\n", stderr="", exit_status=0)
             if case == "rm-sent-answer-lost":
                 raise ConnectionResetError("SSH dropped after the rm was sent")
             if case in ("node-removed-it-first", "replaced-by-a-new-same-name-container"):
@@ -532,6 +557,8 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
                 printed, code = targets, 0
             return Mock(stdout="".join(f"{t}\n" for t in printed), stderr="err", exit_status=code)
         text = next(listings)
+        if [new] in rms:  # the replacement is gone once its own rm ran
+            text = "".join(line for line in text.splitlines(keepends=True) if new not in line)
         if "--no-trunc" not in command:  # the names-only confirmation listing
             text = "".join(f"{line.split()[0]}\n" for line in text.splitlines() if line.strip())
         return Mock(stdout=text, stderr="", exit_status=0)

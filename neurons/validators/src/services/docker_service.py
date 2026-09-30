@@ -3002,35 +3002,44 @@ class DockerService:
         replacements: dict[str, str],
     ) -> None:
         """A customer create's sweep found a filler retry's new container under a removed filler's name:
-        remove it by its own ID (one attempt, recorded like the sweep's), then confirm again. A failure is
-        logged; a filler that still survives is reported by the confirmation, and the create goes on."""
+        remove it by its own ID (one attempt), then confirm again. An ID is recorded as ours only when `docker
+        rm` acknowledged it and the confirmation no longer lists it, as in the sweep. A failure is logged; a
+        filler that still survives is reported by the confirmation, and the create goes on."""
         ids = list(replacements.values())
         sweep = own_sweep_removals.begin(ids)
         acknowledged: set[str] = set()
         unanswered: set[str] = set()
+        survivors: dict[str, str] | None = None
         try:
-            await self._rm_containers(ssh_client, ids, acknowledged, max_attempts=1, unanswered=unanswered)
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "docker rm -fv of a replacement filler failed",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "container_names": list(replacements),
-                        "error_type": exc.__class__.__name__,
-                    }),
+            try:
+                await self._rm_containers(ssh_client, ids, acknowledged, max_attempts=1, unanswered=unanswered)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "docker rm -fv of a replacement filler failed",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_names": list(replacements),
+                            "error_type": exc.__class__.__name__,
+                        }),
+                    )
                 )
+            survivors = await self._confirm_fillers_removed(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                pod_name=pod_name,
+                removed_fillers=list(replacements),
             )
         finally:
+            survivor_ids = (
+                set(ids) if survivors is None
+                else {i or replacements.get(n, "") for n, i in survivors.items()}
+            )  # fmt: skip
             own_sweep_removals.end(
-                ids, sweep, removed=[i for i in ids if i in acknowledged], unanswered=list(unanswered - acknowledged)
-            )
-        await self._confirm_fillers_removed(
-            ssh_client=ssh_client,
-            default_extra=default_extra,
-            pod_name=pod_name,
-            removed_fillers=list(replacements),
-        )
+                ids, sweep,
+                removed=[i for i in ids if i in acknowledged and i not in survivor_ids],
+                unanswered=[i for i in ids if i in unanswered and i not in acknowledged and i not in survivor_ids],
+            )  # fmt: skip
 
     async def _confirm_fillers_removed(
         self,
