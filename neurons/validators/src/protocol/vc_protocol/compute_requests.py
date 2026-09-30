@@ -252,7 +252,6 @@ class RentedGpuDropResponse(BaseModel):
     delivery: str | None = None
 
 
-GPU_DROP_DELIVERY_NOTIFY_FAILED = "notify_failed"
 GPU_DROP_DELIVERY_DISABLED = "disabled"
 GPU_DROP_DELIVERY_NOT_RENTED = "not_rented"
 

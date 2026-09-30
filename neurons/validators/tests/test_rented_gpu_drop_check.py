@@ -1,7 +1,5 @@
 """RENTED_GPU_DROP: a rented node that lost a GPU is reported the cycle it is seen, once per incident."""
 
-import importlib.util
-import sys
 from datetime import UTC, datetime
 from unittest.mock import patch
 
@@ -36,12 +34,15 @@ MODEL = "NVIDIA GeForce RTX 5090"
 UUIDS = [f"GPU-a0a{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
 POD_ID = "00000000-0000-4000-8000-000000000001"
 NOTIFIED = RentedGpuDropResponse(recorded=True, delivery="notified")
+DUPLICATED = UUIDS[:7] + [UUIDS[0]]
 
 
 @pytest.fixture(autouse=True)
 def _check_on():
+    rented_gpu_drop._LOCAL_MARKS.clear()
     with patch.object(rented_gpu_drop.settings, "RENTED_GPU_DROP_CHECK_ENABLED", True):
         yield
+    rented_gpu_drop._LOCAL_MARKS.clear()
 
 
 def _details(uuids: list[str]) -> list[dict]:
@@ -117,6 +118,12 @@ async def _run(context_factory, services, **kwargs):
     return await RentedGpuDropCheck().run(_ctx(context_factory, services, **kwargs))
 
 
+def _states(services) -> list[str]:
+    return [
+        call.kwargs["state"] for call in services.backend.report_rented_gpu_drop.await_args_list
+    ]
+
+
 # --- the pure rule ------------------------------------------------------------------------------------------------
 
 
@@ -127,171 +134,102 @@ def test_nvml_error_code_reads_the_scrape_repr():
     assert nvml_error_code(None) is None
 
 
-def test_a_count_drop_names_every_fault_and_the_unlisted_uuids():
+BR, DS, AM, NV = FAULT_BELOW_RENTED, FAULT_DETAILS_SHORT, FAULT_ANCHORED_MISSING, FAULT_NVML_ERROR
+
+
+@pytest.mark.parametrize(
+    ("rented", "anchor", "nvml", "listed", "error", "faults", "missing", "confirm_first"),
+    [
+        (8, UUIDS, 8, UUIDS[:5], "NVMLError(999)", [BR, DS, AM, NV], UUIDS[5:], False),
+        (8, UUIDS, 8, UUIDS, "NVMLError(15)", [NV], [], False),
+        (8, UUIDS, 8, UUIDS, "NVMLError(3)", None, None, None),
+        (8, UUIDS, 8, UUIDS[:5], "AttributeError('x')", [BR, DS, AM], UUIDS[5:], True),
+        (4, UUIDS, 7, UUIDS[:7], None, [AM], [UUIDS[7]], False),
+        (8, UUIDS[:7], 8, DUPLICATED, None, None, None, None),
+        (8, UUIDS, 8, DUPLICATED, None, [AM], [UUIDS[7]], True),
+        (8, UUIDS, 8, UUIDS[:6] + [UUIDS[0]], None, [BR, DS, AM], UUIDS[6:], False),
+        (8, UUIDS, 8, DUPLICATED, "NVMLError(15)", [AM, NV], [UUIDS[7]], False),
+        (8, UUIDS, 8, UUIDS[:3], "NVMLError_Timeout(10)", [BR, DS, AM, NV], UUIDS[3:], True),
+        (8, UUIDS, 7, UUIDS[:7], "NVMLError_NotSupported(3)", [BR, AM, NV], [UUIDS[7]], False),
+        (8, UUIDS, 7, UUIDS[:5], "NVMLError_Timeout(10)", [BR, DS, AM, NV], UUIDS[5:], False),
+        (8, UUIDS, 0, [], "NVMLError_DriverNotLoaded(9)", [BR, AM, NV], UUIDS, False),
+        (None, [], 0, [], "NVMLError_LibraryNotFound(12)", [BR, NV], [], False),
+        (None, [], 0, [], None, [BR], [], False),
+        (None, [], 2, UUIDS[:2], None, None, None, None),
+    ],
+    ids=[
+        "count_drop_names_every_fault",
+        "loss_code_with_every_card_listed",
+        "non_loss_code_with_every_card_listed_is_healthy",
+        "non_nvml_scrape_error_is_not_labelled_nvml",
+        "split_node_card_outside_the_rental_seen_by_the_anchor",
+        "card_listed_twice_counted_by_rows_is_healthy",
+        "card_listed_twice_against_a_full_anchor_is_held",
+        "card_listed_twice_with_rows_short_is_not_held",
+        "card_listed_twice_with_a_loss_code_is_not_held",
+        "scrape_cut_short_by_a_timeout_is_held",
+        "driver_count_below_the_rental_is_not_held",
+        "cut_short_and_driver_short_is_not_held",
+        "zero_cards_with_a_rental_count_and_anchor",
+        "zero_cards_with_no_rental_count_or_anchor",
+        "zero_cards_with_no_scrape_error",
+        "no_rental_count_or_anchor_healthy",
+    ],
+)
+def test_judge_rented_gpus(rented, anchor, nvml, listed, error, faults, missing, confirm_first):
     drop = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS[:5],
-        listed_count=5,
-        scrape_error="NVMLError(999)",
+        rented_gpu_count=rented,
+        anchor_uuids=anchor,
+        nvml_count=nvml,
+        listed_uuids=listed,
+        listed_count=len(listed),
+        scrape_error=error,
     )
 
-    assert drop is not None
-    assert drop.expected == 8 and drop.visible == 5
-    assert drop.faults == [
-        FAULT_BELOW_RENTED,
-        FAULT_DETAILS_SHORT,
-        FAULT_ANCHORED_MISSING,
-        FAULT_NVML_ERROR,
-    ]
-    assert drop.missing_uuids == UUIDS[5:]
-    assert drop.nvml_error_code == 999
-
-
-def test_an_nvml_loss_code_is_a_fault_even_with_every_card_listed():
-    drop = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS,
-        listed_count=8,
-        scrape_error="NVMLError(15)",
-    )
-
-    assert drop is not None and drop.faults == [FAULT_NVML_ERROR] and drop.visible == 8
-
-
-def test_an_nvml_error_that_is_not_a_loss_code_with_every_card_listed_is_not_a_fault():
-    assert (
-        judge_rented_gpus(
-            rented_gpu_count=8,
-            anchor_uuids=UUIDS,
-            nvml_count=8,
-            listed_uuids=UUIDS,
-            listed_count=8,
-            scrape_error="NVMLError(3)",
-        )
-        is None
-    )
-
-
-def test_a_scrape_error_that_is_not_an_nvml_error_is_not_labelled_one():
-    drop = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS[:5],
-        listed_count=5,
-        scrape_error="AttributeError('x')",
-    )
-
-    assert drop is not None and drop.nvml_error_code is None
-    assert drop.faults == [FAULT_BELOW_RENTED, FAULT_DETAILS_SHORT, FAULT_ANCHORED_MISSING]
-    assert drop.confirm_first
-
-
-def test_a_split_node_missing_a_card_outside_the_rental_is_still_reported_by_its_anchor():
-    drop = judge_rented_gpus(
-        rented_gpu_count=4,
-        anchor_uuids=UUIDS,
-        nvml_count=7,
-        listed_uuids=UUIDS[:7],
-        listed_count=7,
-        scrape_error=None,
-    )
-
-    assert (
-        drop is not None
-        and drop.faults == [FAULT_ANCHORED_MISSING]
-        and drop.missing_uuids == [UUIDS[7]]
-    )
-
-
-def test_a_card_listed_twice_is_counted_by_its_rows_not_its_distinct_uuids():
-    duplicated = UUIDS[:7] + [UUIDS[0]]
-
-    assert (
-        judge_rented_gpus(
-            rented_gpu_count=8,
-            anchor_uuids=UUIDS[:7],
-            nvml_count=8,
-            listed_uuids=duplicated,
-            listed_count=8,
-            scrape_error=None,
-        )
-        is None
-    )
-    drop = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=duplicated,
-        listed_count=8,
-        scrape_error=None,
-    )
-    assert drop is not None and drop.faults == [FAULT_ANCHORED_MISSING] and drop.visible == 8
-    assert drop.confirm_first is True
-
-
-def test_an_anchored_card_missing_without_a_duplicate_or_with_rows_short_is_not_held():
-    no_duplicate = judge_rented_gpus(
-        rented_gpu_count=4,
-        anchor_uuids=UUIDS,
-        nvml_count=7,
-        listed_uuids=UUIDS[:7],
-        listed_count=7,
-        scrape_error=None,
-    )
-    duplicate_rows_short = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS[:6] + [UUIDS[0]],
-        listed_count=7,
-        scrape_error=None,
-    )
-    duplicate_with_loss_code = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS[:7] + [UUIDS[0]],
-        listed_count=8,
-        scrape_error="NVMLError(15)",
-    )
-
-    assert no_duplicate is not None and no_duplicate.confirm_first is False
-    assert duplicate_rows_short is not None and duplicate_rows_short.confirm_first is False
-    assert duplicate_with_loss_code is not None and duplicate_with_loss_code.confirm_first is False
+    if faults is None:
+        assert drop is None
+        return
+    assert drop is not None and drop.visible == len(listed)
+    assert (drop.faults, drop.missing_uuids, drop.confirm_first) == (faults, missing, confirm_first)
 
 
 # --- the check ----------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_a_duplicate_listing_against_a_full_anchor_is_held_then_posted_if_it_persists(
-    context_factory,
-):
-    services = _services()
-    duplicated = UUIDS[:7] + [UUIDS[0]]
+GLITCHES = [
+    pytest.param({"listed": DUPLICATED}, id="card_listed_twice"),
+    pytest.param(
+        {"listed": UUIDS[:3], "scrape_error": "NVMLError_Timeout(10)"}, id="scrape_timeout"
+    ),
+]
 
-    first = await _run(context_factory, services, listed=duplicated)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("glitch", GLITCHES)
+async def test_a_possible_glitch_is_held_then_posted_if_it_persists(context_factory, glitch):
+    services = _services()
+
+    first = await _run(context_factory, services, **glitch)
     services.backend.report_rented_gpu_drop.assert_not_awaited()
-    assert first.event.what_we_saw["faults"] == [FAULT_ANCHORED_MISSING]
+    assert first.event.reason_code == Msg.DROP.reason
     assert first.event.what_we_saw["pods"][0]["held"] is True
 
-    await _run(context_factory, services, listed=duplicated)
+    await _run(context_factory, services, **glitch)
     services.backend.report_rented_gpu_drop.assert_awaited_once()
-    assert services.backend.report_rented_gpu_drop.await_args.kwargs["missing_uuids"] == [UUIDS[7]]
+    assert services.backend.report_rented_gpu_drop.await_args.kwargs["consecutive_cycles"] == 2
 
 
 @pytest.mark.asyncio
-async def test_a_held_duplicate_listing_that_clears_is_never_posted(context_factory):
+@pytest.mark.parametrize("glitch", GLITCHES)
+async def test_a_held_glitch_that_clears_is_never_posted_nor_called_recovered(
+    context_factory, glitch
+):
     services = _services()
 
-    await _run(context_factory, services, listed=UUIDS[:7] + [UUIDS[0]])
-    await _run(context_factory, services, listed=UUIDS)
+    await _run(context_factory, services, **glitch)
+    cleared = await _run(context_factory, services, listed=UUIDS)
 
+    assert cleared.event.reason_code == Msg.OK.reason
     services.backend.report_rented_gpu_drop.assert_not_awaited()
     assert services.redis.store == {}
 
@@ -317,6 +255,27 @@ async def test_a_count_drop_on_a_rented_node_is_reported_on_the_first_cycle(cont
     assert call.kwargs["executor_id"] == default_executor().uuid
     assert call.kwargs["pod_gpu_count"] == 8
     assert call.kwargs["rented_gpu_count"] == 8 and call.kwargs["nvml_gpu_count"] == 8
+
+
+@pytest.mark.asyncio
+async def test_a_zero_card_scrape_is_reported_when_the_pod_has_no_gpu_count_and_no_anchor(
+    context_factory,
+):
+    services = _services()
+
+    result = await _run(
+        context_factory,
+        services,
+        listed=[],
+        count=0,
+        scrape_error="NVMLError_LibraryNotFound(12)",
+        gpu_count=None,
+        anchor=[],
+    )
+
+    assert result.event.reason_code == Msg.DROP.reason
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert call.kwargs["visible_gpu_count"] == 0 and call.kwargs["expected_gpu_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -376,8 +335,9 @@ async def test_the_same_incident_is_posted_once(context_factory):
         None,
         RentedGpuDropResponse(recorded=True, delivery="notify_failed"),
         RentedGpuDropResponse(recorded=False, delivery="disabled"),
+        RentedGpuDropResponse(recorded=True, delivery="capped"),
     ],
-    ids=["no_answer", "notify_failed", "backend_flag_off"],
+    ids=["no_answer", "notify_failed", "backend_flag_off", "unknown_delivery"],
 )
 async def test_an_unacknowledged_report_is_posted_again_next_cycle(context_factory, first_answer):
     services = _services(answer=first_answer)
@@ -405,75 +365,75 @@ async def test_a_backend_error_does_not_fail_the_cycle_and_is_retried(context_fa
 
 
 @pytest.mark.asyncio
-async def test_recovery_is_posted_once_when_every_card_is_back(context_factory):
-    services = _services()
+@pytest.mark.parametrize(
+    ("fault_answer", "states", "second_reason"),
+    [
+        (NOTIFIED, ["fault", "recovered"], Msg.RECOVERED.reason),
+        (None, ["fault", "recovered"], Msg.RECOVERED.reason),
+        (RentedGpuDropResponse(recorded=False, delivery="disabled"), ["fault"], Msg.OK.reason),
+    ],
+    ids=["notified", "fault_answer_lost", "never_recorded"],
+)
+async def test_recovery_is_posted_once_for_an_incident_the_backend_may_hold(
+    context_factory, fault_answer, states, second_reason
+):
+    services = _services(answer=fault_answer)
     await _run(context_factory, services, listed=UUIDS[:5], scrape_error="NVMLError(999)")
-    services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
-        recorded=True, delivery="notified"
-    )
+    services.backend.report_rented_gpu_drop.return_value = NOTIFIED
 
-    recovered = await _run(context_factory, services, listed=UUIDS)
-    after = await _run(context_factory, services, listed=UUIDS)
+    second = await _run(context_factory, services, listed=UUIDS)
+    third = await _run(context_factory, services, listed=UUIDS)
 
-    assert recovered.event.reason_code == Msg.RECOVERED.reason
-    assert after.event.reason_code == Msg.OK.reason
-    states = [
-        call.kwargs["state"] for call in services.backend.report_rented_gpu_drop.await_args_list
-    ]
-    assert states == ["fault", "recovered"]
+    assert (second.event.reason_code, third.event.reason_code) == (second_reason, Msg.OK.reason)
+    assert _states(services) == states
     assert services.redis.store == {}
 
 
 @pytest.mark.asyncio
-async def test_a_refused_recovery_notice_is_posted_again(context_factory):
+@pytest.mark.parametrize(
+    "recovery_answer",
+    [
+        None,
+        RentedGpuDropResponse(recorded=True, delivery="notify_failed"),
+        RentedGpuDropResponse(recorded=False, delivery="disabled"),
+    ],
+    ids=["no_answer", "notify_failed", "disabled"],
+)
+async def test_an_unacknowledged_recovery_is_posted_again(context_factory, recovery_answer):
     services = _services()
     await _run(context_factory, services, listed=UUIDS[:5])
-    services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
-        recorded=True, delivery="notify_failed"
-    )
-    await _run(context_factory, services, listed=UUIDS)
-    services.backend.report_rented_gpu_drop.return_value = NOTIFIED
-    await _run(context_factory, services, listed=UUIDS)
-    await _run(context_factory, services, listed=UUIDS)
-
-    states = [
-        call.kwargs["state"] for call in services.backend.report_rented_gpu_drop.await_args_list
-    ]
-    assert states == ["fault", "recovered", "recovered"]
-
-
-@pytest.mark.asyncio
-async def test_a_recovery_answered_disabled_is_posted_again_once_the_switch_is_back(context_factory):
-    services = _services()
-    await _run(context_factory, services, listed=UUIDS[:5])
-    services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
-        recorded=False, delivery="disabled"
-    )
+    services.backend.report_rented_gpu_drop.return_value = recovery_answer
     await _run(context_factory, services, listed=UUIDS)
     assert services.redis.store != {}
     services.backend.report_rented_gpu_drop.return_value = NOTIFIED
     await _run(context_factory, services, listed=UUIDS)
     await _run(context_factory, services, listed=UUIDS)
 
-    states = [
-        call.kwargs["state"] for call in services.backend.report_rented_gpu_drop.await_args_list
-    ]
-    assert states == ["fault", "recovered", "recovered"]
+    assert _states(services) == ["fault", "recovered", "recovered"]
     assert services.redis.store == {}
 
 
 @pytest.mark.asyncio
-async def test_no_recovery_is_posted_for_an_incident_the_backend_never_recorded(context_factory):
-    services = _services(answer=RentedGpuDropResponse(recorded=False, delivery="disabled"))
-    await _run(context_factory, services, listed=UUIDS[:5])
+async def test_a_fault_after_a_posted_recovery_starts_a_new_incident(context_factory):
+    services = _services()
+    clock = _Clock()
 
-    await _run(context_factory, services, listed=UUIDS)
+    with patch.object(rented_gpu_drop, "datetime", clock):
+        await _run(context_factory, services, listed=UUIDS[:5])
+        services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
+            recorded=True, delivery="notify_failed"
+        )
+        clock.at = datetime(2026, 1, 1, 0, 15, tzinfo=UTC)
+        await _run(context_factory, services, listed=UUIDS)
+        services.backend.report_rented_gpu_drop.return_value = NOTIFIED
+        clock.at = datetime(2026, 1, 1, 0, 30, tzinfo=UTC)
+        await _run(context_factory, services, listed=UUIDS[:5])
 
-    states = [
-        call.kwargs["state"] for call in services.backend.report_rented_gpu_drop.await_args_list
-    ]
-    assert states == ["fault"]
-    assert services.redis.store == {}
+    assert _states(services) == ["fault", "recovered", "fault"]
+    first, _, again = services.backend.report_rented_gpu_drop.await_args_list
+    assert first.kwargs["first_seen_at"] == "2026-01-01T00:00:00+00:00"
+    assert again.kwargs["first_seen_at"] == "2026-01-01T00:30:00+00:00"
+    assert again.kwargs["consecutive_cycles"] == 1
 
 
 @pytest.mark.asyncio
@@ -482,132 +442,25 @@ async def test_dry_run_logs_the_drop_and_posts_nothing(context_factory):
 
     with patch.object(rented_gpu_drop.settings, "DRY_RUN", True):
         result = await _run(context_factory, services, listed=UUIDS[:5])
+        cleared = await _run(context_factory, services, listed=UUIDS)
 
     assert result.event.reason_code == Msg.DROP.reason
+    assert cleared.event.reason_code == Msg.OK.reason
     services.backend.report_rented_gpu_drop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_redis_down_still_reports_the_drop_every_cycle(context_factory):
+async def test_an_incident_through_a_redis_outage_is_posted_once_and_recovered(context_factory):
     services = _services(redis=FakeRedis(failing=True))
 
     first = await _run(context_factory, services, listed=UUIDS[:5])
     await _run(context_factory, services, listed=UUIDS[:5])
+    recovered = await _run(context_factory, services, listed=UUIDS)
 
     assert first.passed is True and first.event.reason_code == Msg.DROP.reason
-    assert services.backend.report_rented_gpu_drop.await_count == 2
-
-
-def test_a_scrape_cut_short_by_a_non_loss_nvml_error_waits_for_confirmation():
-    cut = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS[:3],
-        listed_count=3,
-        scrape_error="NVMLError_Timeout(10)",
-    )
-    lost = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=8,
-        listed_uuids=UUIDS[:5],
-        listed_count=5,
-        scrape_error="NVMLError(999)",
-    )
-    driver_short = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=7,
-        listed_uuids=UUIDS[:7],
-        listed_count=7,
-        scrape_error="NVMLError_NotSupported(3)",
-    )
-    cut_and_driver_short = judge_rented_gpus(
-        rented_gpu_count=8,
-        anchor_uuids=UUIDS,
-        nvml_count=7,
-        listed_uuids=UUIDS[:5],
-        listed_count=5,
-        scrape_error="NVMLError_Timeout(10)",
-    )
-
-    assert cut is not None and cut.confirm_first is True
-    assert lost is not None and lost.confirm_first is False
-    assert driver_short is not None and driver_short.confirm_first is False
-    assert cut_and_driver_short is not None and cut_and_driver_short.confirm_first is False
-
-
-@pytest.mark.asyncio
-async def test_a_one_off_scrape_timeout_posts_nothing_and_a_second_one_posts(context_factory):
-    services = _services()
-    timeout = {"listed": UUIDS[:3], "scrape_error": "NVMLError_Timeout(10)"}
-
-    first = await _run(context_factory, services, **timeout)
-    services.backend.report_rented_gpu_drop.assert_not_awaited()
-    assert first.event.reason_code == Msg.DROP.reason
-    assert first.event.what_we_saw["pods"][0]["held"] is True
-
-    await _run(context_factory, services, **timeout)
-    services.backend.report_rented_gpu_drop.assert_awaited_once()
-    assert services.backend.report_rented_gpu_drop.await_args.kwargs["consecutive_cycles"] == 2
-
-
-@pytest.mark.asyncio
-async def test_a_scrape_timeout_with_the_driver_count_below_the_rental_posts_on_the_first_cycle(
-    context_factory,
-):
-    services = _services()
-
-    result = await _run(
-        context_factory, services, listed=UUIDS[:5], count=7, scrape_error="NVMLError_Timeout(10)"
-    )
-
-    assert result.event.what_we_saw["pods"][0]["held"] is False
-    services.backend.report_rented_gpu_drop.assert_awaited_once()
-    call = services.backend.report_rented_gpu_drop.await_args
-    assert call.kwargs["consecutive_cycles"] == 1
-    assert call.kwargs["nvml_gpu_count"] == 7 and call.kwargs["visible_gpu_count"] == 5
-    assert call.kwargs["rented_gpu_count"] == 8
-
-
-@pytest.mark.asyncio
-async def test_a_one_off_scrape_timeout_that_clears_is_never_posted(context_factory):
-    services = _services()
-
-    await _run(context_factory, services, listed=UUIDS[:3], scrape_error="NVMLError_Timeout(10)")
-    await _run(context_factory, services, listed=UUIDS)
-
-    services.backend.report_rented_gpu_drop.assert_not_awaited()
-    assert services.redis.store == {}
-
-
-def test_the_check_loads_with_the_rented_pod_ssh_module_blocked():
-    package = rented_gpu_drop.__package__
-    blocked = {
-        name: None for name in (f"{package}.rented_pod_ssh", "services.task.checks.rented_pod_ssh")
-    }
-    spec = importlib.util.spec_from_file_location(
-        f"{package}._rented_gpu_drop_isolated", rented_gpu_drop.__file__
-    )
-    module = importlib.util.module_from_spec(spec)
-
-    with patch.dict(sys.modules, {**blocked, spec.name: module}):
-        spec.loader.exec_module(module)
-
-    assert module.RentedGpuDropCheck.check_id == RentedGpuDropCheck.check_id
-
-
-@pytest.mark.asyncio
-async def test_the_check_off_does_nothing(context_factory):
-    services = _services()
-
-    with patch.object(rented_gpu_drop.settings, "RENTED_GPU_DROP_CHECK_ENABLED", False):
-        result = await _run(context_factory, services, listed=UUIDS[:5])
-
-    assert result.event.reason_code == Msg.DISABLED.reason
-    services.backend.report_rented_gpu_drop.assert_not_awaited()
-    assert services.redis.calls == 0
+    assert recovered.event.reason_code == Msg.RECOVERED.reason
+    assert _states(services) == ["fault", "recovered"]
+    assert rented_gpu_drop._LOCAL_MARKS == {}
 
 
 @pytest.mark.asyncio
@@ -635,7 +488,7 @@ HEALTHY_CYCLES = [
     (UUIDS, None, UUIDS),
     (UUIDS, "NVMLError_NotSupported(3)", UUIDS),
     (list(reversed(UUIDS)), None, UUIDS),
-    (UUIDS[:7] + [UUIDS[0]], None, UUIDS[:7]),
+    (DUPLICATED, None, UUIDS[:7]),
     (UUIDS, None, UUIDS),
 ]
 
@@ -656,17 +509,20 @@ async def test_a_healthy_rented_node_stays_quiet_over_many_cycles(context_factor
     assert services.redis.store == {}
 
 
+def _split_pods() -> list[RentedPod]:
+    return [
+        RentedPod(pod_id=f"pod-{n}", container_name=f"container_{n}", gpu_count=n, status="RUNNING")
+        for n in (3, 5)
+    ]
+
+
 @pytest.mark.asyncio
 async def test_a_split_node_sends_each_pod_its_own_gpu_count_and_the_executor_totals(
     context_factory,
 ):
     services = _services()
-    pods = [
-        RentedPod(pod_id=f"pod-{n}", container_name=f"container_{n}", gpu_count=n, status="RUNNING")
-        for n in (3, 5)
-    ]
 
-    result = await _run(context_factory, services, listed=UUIDS[:7], pods=pods)
+    result = await _run(context_factory, services, listed=UUIDS[:7], pods=_split_pods())
 
     sent = {
         call.args[0]: call.kwargs
@@ -685,6 +541,24 @@ async def test_a_split_node_sends_each_pod_its_own_gpu_count_and_the_executor_to
     )
     assert result.event.what_we_saw["rented_gpu_count"] == 8
     assert [pod["gpu_count"] for pod in result.event.what_we_saw["pods"]] == [3, 5]
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_that_loses_another_card_is_reported_again(context_factory):
+    services = _services()
+
+    for listed in (UUIDS[:7], UUIDS[:7], UUIDS[:6], UUIDS[:6]):
+        await _run(context_factory, services, listed=listed, pods=_split_pods())
+
+    calls = services.backend.report_rented_gpu_drop.await_args_list
+    assert [(call.args[0], call.kwargs["visible_gpu_count"]) for call in calls] == [
+        ("pod-3", 7),
+        ("pod-5", 7),
+        ("pod-3", 6),
+        ("pod-5", 6),
+    ]
+    assert calls[-1].kwargs["missing_uuids"] == UUIDS[6:]
+    assert calls[0].kwargs["first_seen_at"] == calls[-1].kwargs["first_seen_at"]
 
 
 @pytest.mark.asyncio
