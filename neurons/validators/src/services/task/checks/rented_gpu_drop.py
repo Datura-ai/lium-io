@@ -25,7 +25,7 @@ a split node are affected.
 
 Per RUNNING pod a Redis mark `rented_gpu_drop:<pod_id>` holds the incident: `first_seen_at`,
 `consecutive_cycles`, `reported` (the backend answered with a delivery that needs no retry), `evidence`
-(the visible count and missing UUIDs of that acknowledged report), `recorded` (the backend accepted a
+(the expected and visible counts, fault names and missing UUIDs of that acknowledged report), `recorded` (the backend accepted a
 report), `unanswered` (a report got no answer, so the backend may hold it) and `recovering` (a recovery
 was posted). The first faulty cycle posts `POST /internal/pods/{pod_id}/gpu-drop` with `state=fault`;
 later cycles post again while `reported` is False or the evidence changed (on a split node another
@@ -36,7 +36,7 @@ its second consecutive cycle instead. The first clean cycle after an incident th
 never answered posts `state=recovered` and deletes the mark once the backend answered with a delivery
 that needs no retry; a fault after a posted recovery starts a new incident. A mark nothing was posted
 for is deleted without a post. A backend that is down or older (404) is no answer: the next cycle asks
-again. Every mark is also kept in this process, and a cycle that cannot read Redis uses that copy, so an
+again. A dry run judges and logs only: it reads and writes no mark. Every mark is also kept in this process, and a cycle that cannot read Redis uses that copy, so an
 incident that spans a Redis outage is still posted once and recovered; the check's verdict never depends
 on Redis.
 """
@@ -51,6 +51,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
+import redis.exceptions
 from protocol.vc_protocol.compute_requests import (
     GPU_DROP_DELIVERY_DISABLED,
     GPU_DROP_DELIVERY_NOT_RENTED,
@@ -66,11 +67,15 @@ from ..messages import RentedGpuDropMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import split_uuids
-from .rented_pod_ssh import POD_STATUS_RUNNING, REDIS_ERRORS
 
 logger = logging.getLogger(__name__)
 
 RENTED_GPU_DROP_KEY_PREFIX = "rented_gpu_drop"
+
+# The one pod status that holds a renter's cards; a backend that predates the field sends none.
+POD_STATUS_RUNNING = "RUNNING"
+# What a failing Redis raises through RedisService: the client's errors and the socket errors under them.
+REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
 
 FAULT_BELOW_RENTED = "below_rented_count"
 FAULT_DETAILS_SHORT = "details_short_of_count"
@@ -122,7 +127,7 @@ class GpuDrop:
     @property
     def evidence(self) -> list[Any]:
         """What decides which renters of a split node are affected; a change is reported again."""
-        return [self.visible, *self.missing_uuids]
+        return [self.expected, self.visible, self.faults, self.missing_uuids]
 
 
 def nvml_error_code(scrape_error: object) -> int | None:
@@ -226,7 +231,6 @@ class DropMark:
             self,
             reported=reported,
             recorded=self.recorded or answer.delivery not in _NOT_RECORDED_DELIVERIES,
-            unanswered=False,
             evidence=evidence if reported else self.evidence,
         )
 
@@ -303,12 +307,13 @@ class RentedGpuDropCheck:
         )
 
         now_iso = datetime.now(UTC).isoformat()
-        outcomes = [
-            outcome
-            for pod in pods
-            if (outcome := await self._track_pod(ctx, pod, drop, rented_total, nvml_count, now_iso))
-            is not None
-        ]
+        # A dry run shares Redis with the live validator, so it leaves the live incidents alone.
+        outcomes: list[dict[str, Any]] = []
+        if not settings.DRY_RUN:
+            for pod in pods:
+                outcome = await self._track_pod(ctx, pod, drop, rented_total, nvml_count, now_iso)
+                if outcome is not None:
+                    outcomes.append(outcome)
 
         if drop is not None:
             what = {
@@ -382,7 +387,7 @@ class RentedGpuDropCheck:
         posted = False
         held = drop.confirm_first and mark.consecutive_cycles < 2
         due = not mark.reported or mark.evidence != drop.evidence
-        if due and not held and not settings.DRY_RUN:
+        if due and not held:
             answer = await self._post(ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count)
             posted = True
             mark = mark.after_answer(answer, drop.evidence)
@@ -408,7 +413,7 @@ class RentedGpuDropCheck:
         nvml_count: int,
         redis_ok: bool,
     ) -> dict[str, Any] | None:
-        if not mark.needs_recovery or settings.DRY_RUN:
+        if not mark.needs_recovery:
             await self._forget(ctx, pod.pod_id)
             return None
         answer = await self._post(ctx, pod, STATE_RECOVERED, mark, None, rented_total, nvml_count)

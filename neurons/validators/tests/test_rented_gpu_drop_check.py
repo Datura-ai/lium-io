@@ -527,6 +527,33 @@ async def test_dry_run_logs_the_drop_and_posts_nothing(context_factory):
     assert result.event.reason_code == Msg.DROP.reason
     assert cleared.event.reason_code == Msg.OK.reason
     services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_leaves_a_live_incident_for_the_live_recovery(context_factory):
+    services = _services()
+    await _run(context_factory, services, listed=UUIDS[:5])
+
+    with patch.object(rented_gpu_drop.settings, "DRY_RUN", True):
+        await _run(context_factory, services, listed=UUIDS)
+    await _run(context_factory, services, listed=UUIDS)
+
+    assert _states(services) == ["fault", "recovered"]
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_answer_keeps_the_recovery_owed_for_an_unanswered_fault(context_factory):
+    services = _services(answer=None)
+    await _run(context_factory, services, listed=UUIDS[:5])
+    services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
+        recorded=False, delivery="disabled"
+    )
+    await _run(context_factory, services, listed=UUIDS[:5])
+    services.backend.report_rented_gpu_drop.return_value = NOTIFIED
+    await _run(context_factory, services, listed=UUIDS)
+
+    assert _states(services) == ["fault", "fault", "recovered"]
 
 
 @pytest.mark.asyncio
@@ -664,6 +691,20 @@ async def test_a_split_node_that_loses_another_card_is_reported_again(context_fa
     ]
     assert calls[-1].kwargs["missing_uuids"] == UUIDS[6:]
     assert calls[0].kwargs["first_seen_at"] == calls[-1].kwargs["first_seen_at"]
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_that_adds_an_nvml_loss_error_is_reported_again(context_factory):
+    services = _services()
+
+    for error in (None, None, "NVMLError(15)"):
+        await _run(
+            context_factory, services, listed=UUIDS[:7], count=7, scrape_error=error, pods=_split_pods()
+        )
+
+    calls = services.backend.report_rented_gpu_drop.await_args_list
+    assert [call.args[0] for call in calls] == ["pod-3", "pod-5", "pod-3", "pod-5"]
+    assert calls[-1].kwargs["nvml_error_code"] == 15
 
 
 @pytest.mark.asyncio
