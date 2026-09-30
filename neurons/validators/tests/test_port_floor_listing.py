@@ -25,7 +25,7 @@ from neurons.validators.src.services.task.messages import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
-from services.executor_connectivity.models import DindProbeResult, PortPair
+from services.executor_connectivity.models import BatchResult, DindProbeResult, PortPair
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
@@ -58,9 +58,9 @@ class HostNetworkBatch:
         self.reachable = reachable
         self.calls: list[list[PortPair]] = []
 
-    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None, max_attempts=2):
         self.calls.append(list(ports))
-        return list(ports[: self.reachable]), list(ports[self.reachable :])
+        return BatchResult(list(ports[: self.reachable]), list(ports[self.reachable :]), completed=True)
 
 
 class PublishedPorts:

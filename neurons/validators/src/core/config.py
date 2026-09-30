@@ -254,6 +254,12 @@ class Settings(BaseSettings):
     # single-stream CDN object) and passed the next cycle at 205–760 Mbps. The gate, the threshold
     # and known hosts (any prior EMA) are unchanged.
     VERIFYX_COLD_SAMPLE_RETRY_ENABLED: bool = Field(env="VERIFYX_COLD_SAMPLE_RETRY_ENABLED", default=False)
+    # A cycle that a check other than VerifyX failed publishes the VerifyX EMA the backend held
+    # before it (none for a never-measured node) instead of one moved by its sample. A passing
+    # cycle without the recommended image cached does not seed a never-measured node; a node with
+    # a stored EMA publishes its sample on every passing cycle. See verifyx_ema_hold_reason. Off:
+    # the EMA moves as before and the would-be hold is only logged.
+    VERIFYX_EMA_HOLD_ENABLED: bool = Field(env="VERIFYX_EMA_HOLD_ENABLED", default=False)
     ENABLE_INSPECTOR: bool = True
     # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
     # instead of freezing it into a ~13 MB onefile and uploading that every cycle.
@@ -261,6 +267,23 @@ class Settings(BaseSettings):
     INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK: bool = Field(
         env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
         default=True,
+    )
+    # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
+    # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
+    # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
+    # root write to /usr/lib on a renter's host, so it has its own switch, off by default and
+    # independent of VERIFYX_LIBRARY_REFRESH_ENABLED (which covers only unrented executors).
+    # Off stops later replacements and undoes none; restoring the replaced file (its hash is
+    # previous_sha256 in INSPECTOR_LIBRARY_REPLACED) is in .env.template.
+    INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
+    # Pinned to a commit whose neurons/executor/libinspector.so is the validator's build; a URL on
+    # main would start serving a different file with the next library bump.
+    INSPECTOR_LIBRARY_FETCH_URL: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/Datura-ai/lium-io/"
+            "38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
+        ),
+        description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
@@ -272,6 +295,13 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # On a rent, when dockerd refuses to bind a host port the backend handed the pod (a stale
+    # container or a provider process holds it), the pod moves to the next free pair of the
+    # executor's advertised range (≤ 3 candidates, the host's listening sockets read once over the
+    # create's SSH session) and `docker run` is retried ONCE; the create's answer carries the port
+    # the pod really got. Off: the 90 s same-mapping wait as before. Either way the failure event
+    # carries `error_class: port_collision`.
+    PORT_COLLISION_RETRY_ENABLED: bool = Field(env="PORT_COLLISION_RETRY_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -428,6 +458,9 @@ class Settings(BaseSettings):
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
     )
+    # On: a pod container on an unrented node whose rental just ended or just started ends the run
+    # at the GPU usage check, scored as idle, instead of the orphaned-container zero.
+    RENTAL_TEARDOWN_DEFERRAL_ENABLED: bool = Field(env="RENTAL_TEARDOWN_DEFERRAL_ENABLED", default=False)
     # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.
@@ -522,6 +555,10 @@ class Settings(BaseSettings):
     # real slow connects happen.
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging and per-connect phase timing")
 
+    # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
+    # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
+    LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
+
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
     # whose price_per_gpu exceeds market p90 * soft_limit_price_rate loses the unrented
     # rental incentive while staying active. When False, the breach is only logged
@@ -562,7 +599,8 @@ class Settings(BaseSettings):
 
     # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
     # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
-    # results are merged. It can raise many hosts' verified_port_count at once, so it ships off.
+    # results are merged; still below the floor, one more batch probes up to 300 declared ports
+    # above those. It can raise many hosts' verified_port_count at once, so it ships off.
     PORT_PROBE_TOPUP_BELOW_FLOOR: bool = Field(env="PORT_PROBE_TOPUP_BELOW_FLOOR", default=False)
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
