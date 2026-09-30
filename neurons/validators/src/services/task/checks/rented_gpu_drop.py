@@ -24,8 +24,8 @@ carries that pod's own `gpu_count` next to the executor totals so the backend ca
 a split node are affected.
 
 Per RUNNING pod a Redis mark `rented_gpu_drop:<pod_id>` holds the incident: `first_seen_at`,
-`consecutive_cycles`, `reported` (the backend answered with a delivery that needs no retry), `evidence`
-(the expected and visible counts, fault names and missing UUIDs of that acknowledged report), `recorded` (the backend accepted a
+`consecutive_cycles`, `reported` (the backend answered the last report with a delivery that needs no retry), `evidence`
+(the counts, fault names, missing UUIDs and NVML code of that acknowledged report), `recorded` (the backend accepted a
 report), `unanswered` (a report got no answer, so the backend may hold it) and `recovering` (a recovery
 was posted). The first faulty cycle posts `POST /internal/pods/{pod_id}/gpu-drop` with `state=fault`;
 later cycles post again while `reported` is False or the evidence changed (on a split node another
@@ -125,10 +125,18 @@ class GpuDrop:
     # still cover every rented and anchored card
     confirm_first: bool
 
-    @property
-    def evidence(self) -> list[Any]:
-        """What decides which renters of a split node are affected; a change is reported again."""
-        return [self.expected, self.visible, self.faults, self.missing_uuids]
+    def evidence(self, rented_total: int | None, pod_gpu_count: int | None) -> list[Any]:
+        """What the report tells the backend about this pod; a change is reported again."""
+        return [
+            self.expected,
+            self.visible,
+            self.faults,
+            self.missing_uuids,
+            self.nvml_error_code,
+            self.nvml_count,
+            rented_total,
+            pod_gpu_count,
+        ]
 
 
 def nvml_error_code(scrape_error: object) -> int | None:
@@ -226,7 +234,7 @@ class DropMark:
 
     def after_answer(self, answer: RentedGpuDropResponse | None, evidence: list[Any]) -> DropMark:
         if answer is None:
-            return replace(self, unanswered=True)
+            return replace(self, reported=False, unanswered=True)
         reported = answer.delivery in _NO_RETRY_DELIVERIES
         return replace(
             self,
@@ -283,6 +291,9 @@ class RentedGpuDropCheck:
 
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        # The executor UUID is miner-reported: a rental held under another miner's hotkey is not this node's.
+        if rented_executor is not None and rented_executor.miner_hotkey != ctx.miner_hotkey:
+            rented_executor = None
         all_pods = list(rented_executor.pods) if rented_executor else []
         pods = [pod for pod in all_pods if pod.status in (None, POD_STATUS_RUNNING)]
         if not pods:
@@ -389,11 +400,12 @@ class RentedGpuDropCheck:
         answer: RentedGpuDropResponse | None = None
         posted = False
         held = drop.confirm_first and mark.consecutive_cycles < 2
-        due = not mark.reported or mark.evidence != drop.evidence
+        evidence = drop.evidence(rented_total, pod.gpu_count)
+        due = not mark.reported or mark.evidence != evidence
         if due and not held:
             answer = await self._post(ctx, pod, STATE_FAULT, mark, drop, rented_total, nvml_count)
             posted = True
-            mark = mark.after_answer(answer, drop.evidence)
+            mark = mark.after_answer(answer, evidence)
         await self._save(ctx, pod.pod_id, mark, redis_ok)
         return {
             "pod_id": pod.pod_id,

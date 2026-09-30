@@ -65,11 +65,12 @@ def _rented(
     status: str | None = "RUNNING",
     gpu_count: int | None = 8,
     pods: list[RentedPod] | None = None,
+    owner: str = "miner-hotkey",
 ) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             executor_uuid: RentedExecutor(
-                miner_hotkey="miner-hotkey",
+                miner_hotkey=owner,
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="8001",
                 pods=pods
@@ -382,6 +383,28 @@ async def test_a_node_that_is_not_rented_is_ignored(context_factory):
     assert result.event.reason_code == Msg.NOT_RENTED.reason
     services.backend.report_rented_gpu_drop.assert_not_awaited()
     assert services.redis.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_rental_held_by_another_miner_is_ignored(context_factory):
+    services = _services()
+    services.redis.store[f"rented_gpu_drop:{POD_ID}"] = json.dumps(
+        {"first_seen_at": "2026-01-01T00:00:00+00:00", "reported": True, "recorded": True}
+    )
+    before = dict(services.redis.store)
+
+    for listed in (UUIDS[:5], UUIDS):
+        result = await _run(
+            context_factory,
+            services,
+            listed=listed,
+            scrape_error="NVMLError(999)",
+            owner="victim-hotkey",
+        )
+        assert result.event.reason_code == Msg.NOT_RENTED.reason
+
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.calls == 0 and services.redis.store == before
 
 
 @pytest.mark.asyncio
@@ -734,6 +757,67 @@ async def test_a_split_node_that_adds_an_nvml_loss_error_is_reported_again(conte
     calls = services.backend.report_rented_gpu_drop.await_args_list
     assert [call.args[0] for call in calls] == ["pod-3", "pod-5", "pod-3", "pod-5"]
     assert calls[-1].kwargs["nvml_error_code"] == 15
+
+
+def _pods(*counts: int) -> list[RentedPod]:
+    return [
+        RentedPod(pod_id=f"pod-{i}", container_name=f"container_{i}", gpu_count=n, status="RUNNING")
+        for i, n in enumerate(counts)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("before", "after", "field", "value"),
+    [
+        (
+            {"count": 7, "scrape_error": "NVMLError_Timeout(10)"},
+            {"count": 7, "scrape_error": "NVMLError_GpuIsLost(15)"},
+            "nvml_error_code",
+            15,
+        ),
+        ({"count": 8}, {"count": 7}, "nvml_gpu_count", 7),
+        ({"pods": _pods(3, 5)}, {"pods": _pods(3, 4)}, "rented_gpu_count", 7),
+        ({"pods": _pods(3, 5)}, {"pods": _pods(4, 4)}, "pod_gpu_count", 4),
+    ],
+    ids=["nvml_error_code", "driver_count", "rental_total", "split_pod_gpu_count"],
+)
+async def test_a_change_in_any_reported_field_is_reported_again(
+    context_factory, before, after, field, value
+):
+    services = _services()
+
+    for cycle in (before, before, after):
+        await _run(context_factory, services, listed=UUIDS[:5], **cycle)
+
+    calls = [
+        call
+        for call in services.backend.report_rented_gpu_drop.await_args_list
+        if call.args[0] in (POD_ID, "pod-0")
+    ]
+    assert len(calls) == 2
+    assert calls[0].kwargs["faults"] == calls[1].kwargs["faults"]
+    assert calls[-1].kwargs[field] == value
+    assert calls[0].kwargs["first_seen_at"] == calls[-1].kwargs["first_seen_at"]
+
+
+@pytest.mark.asyncio
+async def test_an_update_that_got_no_answer_is_posted_again_and_still_owes_recovery(
+    context_factory,
+):
+    services = _services()
+    backend = services.backend.report_rented_gpu_drop
+
+    await _run(context_factory, services, listed=UUIDS[:7])
+    backend.return_value = None
+    await _run(context_factory, services, listed=UUIDS[:6])
+    backend.return_value = NOTIFIED
+    await _run(context_factory, services, listed=UUIDS[:7])
+    await _run(context_factory, services, listed=UUIDS)
+
+    assert _states(services) == ["fault", "fault", "fault", "recovered"]
+    assert [call.kwargs["visible_gpu_count"] for call in backend.await_args_list[:3]] == [7, 6, 7]
+    assert services.redis.store == {}
 
 
 @pytest.mark.asyncio
