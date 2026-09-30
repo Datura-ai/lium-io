@@ -724,8 +724,17 @@ class RentalDockerSdkClient:
             if len(buffer) > archive_limit:
                 _close_stream(chunks)
                 raise too_large
-        with tarfile.open(fileobj=io.BytesIO(bytes(buffer))) as archive:
-            member = next(iter(archive.getmembers()), None)
+        # "r:" refuses a compressed archive (the host's Docker API could send a small one that
+        # expands), and next() reads only the first header, never the whole member list.
+        try:
+            archive = tarfile.open(fileobj=io.BytesIO(bytes(buffer)), mode="r:")
+        except tarfile.TarError as exc:
+            raise RentalDockerOperationError(f"{path} in {container_name} is not a plain tar archive") from exc
+        with archive:
+            try:
+                member = archive.next()
+            except tarfile.TarError as exc:
+                raise RentalDockerOperationError(f"{path} in {container_name} is not a plain tar archive") from exc
             if member is None or not member.isfile():
                 raise RentalDockerOperationError(f"{path} in {container_name} is not a regular file")
             if member.size > max_bytes:

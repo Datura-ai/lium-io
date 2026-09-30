@@ -3,6 +3,8 @@
 import io
 import ipaddress
 import json
+import shlex
+import subprocess
 import tarfile
 from unittest.mock import Mock
 
@@ -359,6 +361,33 @@ async def test_a_daemon_json_that_cannot_be_read_or_written_never_fails_the_crea
         assert outcome == (
             "failed: RentalDockerOperationError: /etc/docker/daemon.json in pod_x is not a regular file"
         )
+
+
+def _gzip_tar_of_many(count: int) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for i in range(count):
+            archive.addfile(tarfile.TarInfo(f"daemon.json.{i}"), io.BytesIO(b""))
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("count", [1, 10_000], ids=["one-member", "many-members"])
+@pytest.mark.asyncio
+async def test_a_compressed_archive_is_refused_before_it_expands(count, caplog, monkeypatch):
+    archive = _gzip_tar_of_many(count)
+    assert len(archive) < INNER_DAEMON_CONFIG_MAX_BYTES  # small on the wire
+    api = _ArchiveApiClient(archive=archive)
+    read = Mock(wraps=tarfile.TarFile.getmembers)
+    monkeypatch.setattr(tarfile.TarFile, "getmembers", read)
+
+    await RentalDockerSdkClient(api).run_container(_spec())
+
+    assert api.put == []
+    assert api.events[-1] == "start"
+    assert _pools_outcome(caplog) == (
+        "failed: RentalDockerOperationError: /etc/docker/daemon.json in pod_x is not a plain tar archive"
+    )
+    read.assert_not_called()
 
 
 def _daemon_json_of(size: int) -> bytes:
@@ -821,7 +850,8 @@ def test_the_reset_empties_the_volume_and_the_record_writes_from_inside_the_pod(
         "/usr/bin/docker run --rm --name lium-dind-probe-pod_x-reset --network none "
         "--label io.lium.purpose=dind-store-probe --memory 128m --memory-swap 128m --cpus 0.5 "
         "--pids-limit 32 -v volume_x_docker:/store alpine:3.19 "
-        "sh -c 'timeout 300 rm -rf /store/* /store/.[!.]* /store/..?*' >/dev/null 2>&1"
+        "sh -c 'timeout 300 find /store -mindepth 1 -maxdepth 1 ! -name .lium-dockerd-version "
+        "-exec rm -rf {} + && rm -f /store/.lium-dockerd-version' >/dev/null 2>&1"
     )
     record = dind_store_version_record_command("pod_x")
     assert record.startswith("timeout 20 /usr/bin/docker exec pod_x sh -c ")
@@ -858,16 +888,22 @@ class _Result:
         self.exit_status, self.stdout, self.stderr = exit_status, stdout, stderr
 
 
+_RESET = "find /store -mindepth 1"
+
+
 class _Ssh:
-    def __init__(self, probe_stdout="", reset_status=0, error=None):
+    def __init__(self, probe_stdout="", reset_status=0, error=None, reset_error=None):
         self.commands: list[str] = []
         self.probe_stdout, self.reset_status, self.error = probe_stdout, reset_status, error
+        self.reset_error = reset_error
 
     async def run(self, command, timeout=None):
         self.commands.append(command)
         if self.error is not None:
             raise self.error
-        if "rm -rf /store" in command:
+        if _RESET in command:
+            if self.reset_error is not None:
+                raise self.reset_error
             return _Result(exit_status=self.reset_status)
         if "volume inspect" in command:
             return _Result(stdout=self.probe_stdout)
@@ -943,7 +979,7 @@ async def test_the_store_is_emptied_only_on_a_dockerd_downgrade(
 
     assert _store_outcome(caplog) == outcome
     assert recordable is True
-    assert any("rm -rf /store" in c for c in ssh.commands) is reset
+    assert any(_RESET in c for c in ssh.commands) is reset
     assert "--runtime sysbox-runc --entrypoint dockerd img:1 --version" in ssh.commands[0]
     # the helpers are removed whatever happened, as the last command
     assert ssh.commands[-1] == dind_probe_cleanup_command("pod_x")
@@ -974,7 +1010,8 @@ async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_ser
         default_extra={},
     )
     assert _store_outcome(caplog) == "failed: OSError: ssh channel died"
-    assert recordable is False
+    # no reset ran: the pod's dockerd writes the store next, so its version is recorded
+    assert recordable is True
     # the cleanup is still attempted, and its own failure is only logged
     assert failing.commands[-1] == dind_probe_cleanup_command("pod_x")
     assert "Inner Docker store probe containers not removed" in caplog.text
@@ -989,6 +1026,36 @@ async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_ser
     )
     assert _store_outcome(caplog) == "reset_failed: exit 1"
     assert recordable is False  # the newer marker stays, so the next create resets again
+    caplog.clear()
+
+    recordable = await docker_service._reset_dind_store_on_downgrade(
+        _Ssh(probe_stdout=downgrade, reset_error=TimeoutError("reset timed out")),
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        default_extra={},
+    )
+    assert _store_outcome(caplog) == "reset_failed: TimeoutError: reset timed out"
+    assert recordable is False
+
+
+@pytest.mark.parametrize("rm_fails", [False, True], ids=["reset", "reset-fails"])
+def test_the_reset_removes_the_marker_last_and_only_when_the_rest_is_gone(tmp_path, rm_fails):
+    store = tmp_path / "store"
+    (store / "overlay2" / "layer").mkdir(parents=True)
+    (store / ".hidden").write_text("x")
+    (store / ".lium-dockerd-version").write_text("Docker version 28.1.0, build a\n")
+    command = dind_store_reset_command(store_volume="v", helper_image="alpine", container_name="pod_x")
+    script = shlex.split(command.split(" sh -c ", 1)[1].rsplit(" >/dev/null", 1)[0])[0]
+    script = script.replace("/store", str(store))
+    if rm_fails:
+        script = script.replace("-exec rm -rf {} +", "-exec false {} +")
+
+    exit_status = subprocess.run(["sh", "-c", script]).returncode
+
+    if rm_fails:
+        assert exit_status != 0 and (store / ".lium-dockerd-version").exists()
+    else:
+        assert exit_status == 0 and list(store.iterdir()) == []
 
 
 @pytest.mark.asyncio

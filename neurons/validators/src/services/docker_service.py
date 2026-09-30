@@ -1770,8 +1770,10 @@ class DockerService:
         anything else is `unknown_version` and the store is kept. The helper containers are
         limited and deadlined in the command itself and always removed afterwards.
 
-        Returns whether the version may be recorded after the create: not when the check or a needed
-        reset failed, so the newer marker stays and the next create tries the reset again.
+        Returns whether the version may be recorded after the create: not when a needed reset failed,
+        so the newer marker (which the reset removes last) stays and the next create tries the reset
+        again. A check that fails before any reset still records: the pod's dockerd is the store's
+        next writer, and the marker has to name it.
         """
         store_volume = _dind_store_volume(run_spec, local_volume)
         if store_volume is None:
@@ -1796,6 +1798,7 @@ class DockerService:
             elif recorded_version is None or current_version is None:
                 outcome = "unknown_version"
             elif is_dind_store_downgrade(recorded, current):
+                outcome = "resetting"
                 reset = await ssh_client.run(
                     dind_store_reset_command(
                         store_volume=store_volume, helper_image=ALPINE_HELPER_IMAGE, container_name=run_spec.name
@@ -1807,7 +1810,8 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            outcome = f"failed: {type(exc).__name__}: {str(exc)[:200]}"
+            failed = "reset_failed" if outcome == "resetting" else "failed"
+            outcome = f"{failed}: {type(exc).__name__}: {str(exc)[:200]}"
         finally:
             await self._remove_dind_probe_containers(ssh_client, run_spec.name, default_extra)
         log = logger.warning if outcome.startswith(("failed", "reset_failed")) else logger.info
@@ -1823,7 +1827,7 @@ class DockerService:
                 }),
             )
         )
-        return not outcome.startswith(("failed", "reset_failed"))
+        return not outcome.startswith("reset_failed")
 
     async def _remove_dind_probe_containers(
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict

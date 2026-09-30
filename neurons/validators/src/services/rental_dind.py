@@ -339,9 +339,17 @@ def parse_dind_store_version_probe(stdout: str | None) -> tuple[str | None, str 
 
 
 def dind_store_reset_command(*, store_volume: str, helper_image: str, container_name: str) -> str:
-    """Empty the store volume, keeping the volume itself (a parked container may still name it)."""
+    """Empty the store volume, keeping the volume itself (a parked container may still name it).
+
+    The version marker goes last, and only once everything else is gone: a reset that fails or
+    times out keeps the newer version recorded, so the next create sees the downgrade and resets again.
+    """
     _, _, reset_name = dind_probe_container_names(container_name)
-    script = f"timeout {DIND_STORE_RESET_DEADLINE_SEC} rm -rf /store/* /store/.[!.]* /store/..?*"
+    marker = shlex.quote(DIND_STORE_VERSION_MARKER)
+    script = (
+        f"timeout {DIND_STORE_RESET_DEADLINE_SEC} find /store -mindepth 1 -maxdepth 1 ! -name {marker} "
+        f"-exec rm -rf {{}} + && rm -f /store/{marker}"
+    )
     return (
         f"/usr/bin/docker rm -f {shlex.quote(reset_name)} >/dev/null 2>&1; "
         f"/usr/bin/docker run --rm --name {shlex.quote(reset_name)} --network none "
