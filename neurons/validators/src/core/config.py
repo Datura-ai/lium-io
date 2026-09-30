@@ -254,6 +254,12 @@ class Settings(BaseSettings):
     # single-stream CDN object) and passed the next cycle at 205–760 Mbps. The gate, the threshold
     # and known hosts (any prior EMA) are unchanged.
     VERIFYX_COLD_SAMPLE_RETRY_ENABLED: bool = Field(env="VERIFYX_COLD_SAMPLE_RETRY_ENABLED", default=False)
+    # A cycle that a check other than VerifyX failed publishes the VerifyX EMA the backend held
+    # before it (none for a never-measured node) instead of one moved by its sample. A passing
+    # cycle without the recommended image cached does not seed a never-measured node; a node with
+    # a stored EMA publishes its sample on every passing cycle. See verifyx_ema_hold_reason. Off:
+    # the EMA moves as before and the would-be hold is only logged.
+    VERIFYX_EMA_HOLD_ENABLED: bool = Field(env="VERIFYX_EMA_HOLD_ENABLED", default=False)
     ENABLE_INSPECTOR: bool = True
     # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
     # instead of freezing it into a ~13 MB onefile and uploading that every cycle.
@@ -277,6 +283,13 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # On a rent, when dockerd refuses to bind a host port the backend handed the pod (a stale
+    # container or a provider process holds it), the pod moves to the next free pair of the
+    # executor's advertised range (≤ 3 candidates, the host's listening sockets read once over the
+    # create's SSH session) and `docker run` is retried ONCE; the create's answer carries the port
+    # the pod really got. Off: the 90 s same-mapping wait as before. Either way the failure event
+    # carries `error_class: port_collision`.
+    PORT_COLLISION_RETRY_ENABLED: bool = Field(env="PORT_COLLISION_RETRY_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -433,6 +446,9 @@ class Settings(BaseSettings):
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
     )
+    # On: a pod container on an unrented node whose rental just ended or just started ends the run
+    # at the GPU usage check, scored as idle, instead of the orphaned-container zero.
+    RENTAL_TEARDOWN_DEFERRAL_ENABLED: bool = Field(env="RENTAL_TEARDOWN_DEFERRAL_ENABLED", default=False)
     # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.
@@ -527,6 +543,10 @@ class Settings(BaseSettings):
     # real slow connects happen.
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging and per-connect phase timing")
 
+    # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
+    # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
+    LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
+
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
     # whose price_per_gpu exceeds market p90 * soft_limit_price_rate loses the unrented
     # rental incentive while staying active. When False, the breach is only logged
@@ -567,7 +587,8 @@ class Settings(BaseSettings):
 
     # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
     # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
-    # results are merged. It can raise many hosts' verified_port_count at once, so it ships off.
+    # results are merged; still below the floor, one more batch probes up to 300 declared ports
+    # above those. It can raise many hosts' verified_port_count at once, so it ships off.
     PORT_PROBE_TOPUP_BELOW_FLOOR: bool = Field(env="PORT_PROBE_TOPUP_BELOW_FLOOR", default=False)
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
@@ -684,6 +705,33 @@ class Settings(BaseSettings):
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
+    # Validation fast path for a new node's first, unscored verification (the express lane's).
+    # Every check still runs and decides as it does today; only the waiting changes:
+    # - the checks with no data dependency run at once (`PipelineFactory.build_checks(fast_path=True)`:
+    #   the matmul chain beside the port/sysbox/rental-check chain, after VerifyX has measured the
+    #   network alone — the split and the order the executor's own one-call verification uses);
+    # - the collateral read starts under the pure-data GPU checks and is awaited where it is today
+    #   (`CollateralPrefetchCheck`); the fatal collateral gate and the score gate are unchanged;
+    # - the express lane ticks every EXPRESS_LANE_FAST_TICK_SECONDS and, when the miner's portal
+    #   snapshot does not list the node yet, asks again after EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
+    #   (the central miner refreshes that snapshot every 30 s); the 120-s retry stays for every other reason.
+    # Scored cycles never take this path: the wave passes first_pass=False. Off by default.
+    VALIDATION_FAST_PATH_ENABLED: bool = Field(env="VALIDATION_FAST_PATH_ENABLED", default=False)
+    EXPRESS_LANE_FAST_TICK_SECONDS: int = Field(env="EXPRESS_LANE_FAST_TICK_SECONDS", default=15, gt=0)
+    EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS: int = Field(
+        env="EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS", default=35, gt=0
+    )
+    # With the fast re-ask the lane asks this many times for a node the miner did not list yet, so
+    # the window it covers (7 × 35 s ≈ 245 s) stays at least the serial one (2 × 120 s = 240 s).
+    EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS: int = Field(
+        env="EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS", default=8, gt=0
+    )
+
+    def express_lane_tick_seconds(self) -> int:
+        """How often the express lane reads the portal snapshot: the fast tick with the fast path on."""
+        if self.VALIDATION_FAST_PATH_ENABLED:
+            return min(self.EXPRESS_LANE_TICK_SECONDS, self.EXPRESS_LANE_FAST_TICK_SECONDS)
+        return self.EXPRESS_LANE_TICK_SECONDS
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
