@@ -29,8 +29,8 @@ from protocol.vc_protocol.compute_requests import (
     RentedGpuDropResponse,
     RentedPod,
 )
-
 from redis import exceptions as redis_errors
+
 from tests.helpers import (
     FakeRedis,
     build_context_config,
