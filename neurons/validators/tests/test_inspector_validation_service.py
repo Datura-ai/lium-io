@@ -838,18 +838,15 @@ async def test_a_failed_fetch_installs_nothing_and_is_logged(local_library, capl
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGPIPE])
 async def test_a_dropped_ssh_session_removes_the_download(local_library, sig):
-    stalled = local_library.source.with_name("stalled.so")
-    os.mkfifo(stalled)
-    writer = os.open(stalled, os.O_RDWR)  # held open with no data: curl's read blocks, a download in flight
+    in_flight = "curl() { sleep 2; }; "  # a download that is still running when the signal lands
     proc = await asyncio.create_subprocess_exec(
-        "/bin/sh", "-c", local_library.service._install_command(stalled.as_uri()),
+        "/bin/sh", "-c", in_flight + local_library.service._install_command(local_library.source.as_uri()),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
     )
     assert (await asyncio.wait_for(proc.stdout.readline(), 10)).startswith(b"TMP:")  # traps are set
     assert local_library.leftovers(), "the temp file exists while the download runs"
     # SSH drop: SIGHUP to the session's processes, or SIGPIPE to the shell at its next echo
     os.killpg(proc.pid, sig) if sig == signal.SIGHUP else os.kill(proc.pid, sig)
-    os.close(writer)  # curl reads EOF and ends; a trapped signal runs its trap then
     await asyncio.wait_for(proc.communicate(), 10)
     assert local_library.leftovers() == []
     assert local_library.lib.read_bytes() == STALE_BYTES
