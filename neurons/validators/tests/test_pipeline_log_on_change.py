@@ -18,13 +18,18 @@ import pytest
 
 from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.task import pipeline_factory as pipeline_factory_module
-from services.task.pipeline import STEP_DURATION_LOGGER, LoggerSink, StatusChangeTracker
+from services.task.pipeline import (
+    STEP_DURATION_LOGGER,
+    LoggerSink,
+    StatusChangeTracker,
+    summarize_steps,
+)
 from services.task.pipeline_factory import PipelineFactory
 
 LOGGER = "test.sink.on_change"
 CHECK = "executor.validate.sysbox_required"
 PORTS = "executor.validate.port_connectivity"
-FINAL = {"steps": {"a": 0.1}, "steps_total_s": 0.1}
+FINAL = summarize_steps([("a", 100)], 100)
 
 
 def _event(
@@ -32,11 +37,12 @@ def _event(
     severity: str = "info",
     *,
     executor_uuid: str | None = "exec-1",
+    miner_hotkey: str = "miner-a",
     check_id: str | None = CHECK,
     what_we_saw: dict | None = None,
     ms: int | None = None,
 ) -> ValidationEvent:
-    context = {"executor_uuid": executor_uuid} if executor_uuid else {}
+    context = {"executor_uuid": executor_uuid, "miner_hotkey": miner_hotkey} if executor_uuid else {}
     if ms is not None:
         context["execution_time_ms"] = ms
     return ValidationEvent(
@@ -79,44 +85,44 @@ async def _levels(caplog, sink: LoggerSink, events) -> list[int]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("events", "expected"),
+    ("events", "expected", "tracked"),
     [
-        pytest.param([OK(), OK(what_we_saw={"ports": 3}), OK()], [INFO, DEBUG, DEBUG], id="repeat"),
-        pytest.param([OK(), SKIPPED(), SKIPPED(), OK()], [INFO, INFO, DEBUG, INFO], id="change"),
+        pytest.param([OK(), OK(what_we_saw={"ports": 3}), OK()], [INFO, DEBUG, DEBUG], True, id="repeat"),
+        pytest.param([OK(), SKIPPED(), SKIPPED(), OK()], [INFO, INFO, DEBUG, INFO], True, id="change"),
         pytest.param(
             [MISSING(), MISSING(), PORT_FAILED(), PORT_FAILED()],
             [WARNING, WARNING, ERROR, ERROR],
-            id="warn-error",
+            True, id="warn-error",
         ),
-        pytest.param([OK(), MISSING(), OK()], [INFO, WARNING, INFO], id="recovery"),
-        pytest.param([COLLATERAL(), COLLATERAL()], [INFO, DEBUG], id="provider-state"),
+        pytest.param([OK(), MISSING(), OK()], [INFO, WARNING, INFO], True, id="recovery"),
+        pytest.param([COLLATERAL(), COLLATERAL()], [INFO, DEBUG], True, id="provider-state"),
         pytest.param(
             [OK(), OK(executor_uuid="exec-2"), OK(check_id="gpu"), OK(executor_uuid="exec-2")],
             [INFO, INFO, INFO, DEBUG],
-            id="per-executor-and-check",
+            True, id="per-executor-and-check",
         ),
-        pytest.param([DONE(), DONE()], [INFO, INFO], id="run-summary"),
+        pytest.param([DONE(), DONE()], [INFO, INFO], True, id="run-summary"),
         pytest.param(
             [OK(executor_uuid=None), OK(executor_uuid=None), OK(check_id=None), OK(check_id=None)],
             [INFO] * 4,
+            True,
             id="no-identity",
         ),
+        pytest.param(
+            [OK(), OK(miner_hotkey="miner-b"), OK(miner_hotkey="miner-b"), OK()],
+            [INFO, INFO, DEBUG, DEBUG],
+            True,
+            id="same-uuid-two-miners",
+        ),
+        pytest.param([OK(), OK()], [INFO, INFO], False, id="no-tracker"),
     ],
 )
-async def test_sink_levels(caplog, durations, events, expected):
-    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker())
+async def test_sink_levels(caplog, durations, events, expected, tracked):
+    sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker() if tracked else None)
 
     assert await _levels(caplog, sink, events) == expected
     if events[-1].reason_code == "COLLATERAL_MISSING":
         assert caplog.records[-1].msg.extra["reason"] == "provider_state"
-
-
-@pytest.mark.asyncio
-async def test_sink_without_tracker_logs_every_event_at_info(caplog, durations):
-    assert await _levels(caplog, LoggerSink(logging.getLogger(LOGGER)), [OK(), OK()]) == [
-        INFO,
-        INFO,
-    ]
 
 
 @pytest.mark.asyncio
@@ -165,4 +171,4 @@ def test_tracker_forgets_the_oldest_entry_past_its_bound():
     tracker = StatusChangeTracker(max_entries=2)
     outcome = ("e", "R", "info")
 
-    assert [tracker.changed(e, CHECK, outcome) for e in "abcca"] == [True, True, True, False, True]
+    assert [tracker.changed("miner-a", e, CHECK, outcome) for e in "abcca"] == [True, True, True, False, True]

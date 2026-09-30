@@ -281,8 +281,9 @@ class EventSink(Protocol):
 # DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
 # the validator. They are emitted on every cycle for as long as the state lasts (no collateral,
 # an old image, a banned provider, a host-side workload) and were 135,000 WARNING lines in two
-# days. The event keeps its severity for the backend and the portal; only the log line is INFO
-# (DEBUG when it repeats the previous cycle, see StatusChangeTracker).
+# days. The event keeps its severity for the backend and the portal; when the event is a warning,
+# only the log line is INFO (DEBUG when it repeats the previous cycle, see StatusChangeTracker). An
+# error (an enforced EXECUTOR_IMAGE_OUTDATED, PROVIDER_SIDE_LOAD_ABOVE_LIMIT) stays ERROR every cycle.
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "COLLATERAL_MISSING",
@@ -303,10 +304,14 @@ class StatusChangeTracker:
 
     def __init__(self, max_entries: int = 200_000):
         self.max_entries = max_entries
-        self._last: OrderedDict[tuple[str, str], tuple[str, str, str]] = OrderedDict()
+        self._last: OrderedDict[tuple[str, str, str], tuple[str, str, str]] = OrderedDict()
 
-    def changed(self, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]) -> bool:
-        key = (executor_uuid, check_id)
+    def changed(
+        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]
+    ) -> bool:
+        # the miner reports its executor UUIDs: keyed without the hotkey, one miner could replay another
+        # provider's UUID and move that provider's lines between INFO and DEBUG
+        key = (miner_hotkey, executor_uuid, check_id)
         previous = self._last.pop(key, None)
         self._last[key] = outcome
         if len(self._last) > self.max_entries:
@@ -317,26 +322,18 @@ class StatusChangeTracker:
 STEP_DURATION_LOGGER = "services.task.step_duration"
 
 
-def step_duration_logger() -> logging.Logger:
-    """A logger that writes its message as the whole line, for the compact step-duration record.
-
-    The shared JSON formatter adds ~280 bytes of fixed fields to every line, which would cost more
-    than the step duration it carries on each repeated outcome.
-    """
-    lg = logging.getLogger(STEP_DURATION_LOGGER)
-    if not lg.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        lg.addHandler(handler)
-        lg.propagate = False
-    return lg
-
-
 class LoggerSink:
     def __init__(self, logger_: logging.Logger, tracker: StatusChangeTracker | None = None):
         self.logger = logger_
         self.tracker = tracker
-        self.duration_logger = step_duration_logger()
+        # writes its message as the whole line: the shared JSON formatter adds ~280 bytes of fixed
+        # fields, more than the step duration it carries on each repeated outcome
+        self.duration_logger = logging.getLogger(STEP_DURATION_LOGGER)
+        if not self.duration_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self.duration_logger.addHandler(handler)
+            self.duration_logger.propagate = False
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
@@ -368,7 +365,10 @@ class LoggerSink:
         if self.tracker is None or not executor_uuid or not event.check_id:
             return False
         changed = self.tracker.changed(
-            executor_uuid, event.check_id, (event.event, event.reason_code, event.severity)
+            str(event.context.get("miner_hotkey") or ""),
+            executor_uuid,
+            event.check_id,
+            (event.event, event.reason_code, event.severity),
         )
         # The run's last event carries the per-step summary; it stays at INFO as one line per run.
         return not changed and "steps_total_s" not in event.what_we_saw
