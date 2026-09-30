@@ -567,7 +567,8 @@ async def test_an_incident_through_a_redis_outage_is_posted_once_and_recovered(c
     assert first.passed is True and first.event.reason_code == Msg.DROP.reason
     assert recovered.event.reason_code == Msg.RECOVERED.reason
     assert _states(services) == ["fault", "recovered"]
-    assert rented_gpu_drop._LOCAL_MARKS == {}
+    ((closed, _),) = rented_gpu_drop._LOCAL_MARKS.values()
+    assert closed.recovering is True
 
 
 class _ReadBlipRedis(FakeRedis):
