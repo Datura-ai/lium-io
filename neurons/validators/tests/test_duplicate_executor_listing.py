@@ -5,9 +5,7 @@ every cycle (two pipeline ids 2 ms apart). The 1x B300 idle tier (cap 4) counted
 it held, and every node in the tier was paid a smaller share. `_claim_for_cycle` handed the
 miner's list to the wave as is, and each entry started its own task.
 
-The wave now keeps the first entry per executor uuid, with the express lane on and off, and the
-idle-tier count adds each executor uuid once per tier as a guard. Input without repeats is scored
-exactly as before (the table at the end).
+The wave now keeps the first entry per executor uuid, with the express lane on and off.
 """
 
 import logging
@@ -23,9 +21,6 @@ from services.miner_service import CYCLE_DONE, EXPRESS_LANE, MinerService
 from services.task.models import JobResult
 
 B300 = "NVIDIA B300 SXM6 AC"
-H100 = "NVIDIA H100 80GB HBM3"
-H200 = "NVIDIA H200"
-B200 = "NVIDIA B200"
 LISTED_TWICE = "Executor listed twice by miner; scored once"
 EXPRESS_LANE_ON_AND_OFF = pytest.mark.parametrize("express_lane", [False, True], ids=["lane-off", "lane-on"])
 
@@ -130,58 +125,49 @@ def _verified(service: MinerService) -> list[str]:
     return [c.kwargs["executor_info"].uuid for c in service.task_service.create_task.call_args_list]
 
 
-async def _score(job_results: dict[str, list[JobResult]], disable_guard: bool = False) -> RentalPriceIncentive:
+async def _score(job_results: dict[str, list[JobResult]]) -> RentalPriceIncentive:
     redis = AsyncMock()
     redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
     redis.get_executor_uptime = AsyncMock(return_value=9999)
     incentive = RentalPriceIncentive(
         IncentiveConfig(), redis, job_results,
-        total_gpu_model_count_map={
-            gpu_model: sum(j.gpu_count for jobs in job_results.values() for j in jobs if j.gpu_model == gpu_model)
-            for gpu_model in {j.gpu_model for jobs in job_results.values() for j in jobs}
-        },
+        total_gpu_model_count_map={B300: sum(j.gpu_count for jobs in job_results.values() for j in jobs)},
     )
     price_provider = AsyncMock()
     price_provider.get_tao_price.return_value = 500.0
     price_provider.get_alpha_rate.return_value = 0.5
     incentive.price_provider = price_provider
-    if disable_guard:
-        # the pre-guard scoring, for the table's baseline
-        incentive._mark_repeated_idle_copies = lambda: None
     await incentive.calculate_mining_scores()
     return incentive
 
 
-def _idle_pay(incentive: RentalPriceIncentive, jobs: dict[str, list[JobResult]]) -> float:
-    return sum(r.incentive or 0.0 for results in jobs.values() for r in results) / incentive.rental_share
-
-
-def _reasons(result: JobResult) -> list[str]:
-    return [reason.reason for reason in result.zero_incentive_reasons]
-
-
-# --- The wave: one validation task per executor uuid ------------------------------------------
-
-
 @EXPRESS_LANE_ON_AND_OFF
+@pytest.mark.parametrize(
+    ("listed", "verified", "listed_counts"),
+    [
+        (("exec-twin", "exec-twin", "exec-other"), ["exec-twin", "exec-other"], {"exec-twin": 2}),
+        (("exec-a", "exec-b", "exec-c"), ["exec-a", "exec-b", "exec-c"], {}),
+    ],
+    ids=["listed-twice", "distinct"],
+)
 @pytest.mark.asyncio
-async def test_an_executor_listed_twice_gets_one_validation_task(miner_service, monkeypatch, caplog, express_lane):
+async def test_each_executor_uuid_gets_one_validation_task(
+    miner_service, monkeypatch, caplog, express_lane, listed, verified, listed_counts
+):
     from core.config import settings
 
     monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", express_lane)
-    miner_service.miner_returns("exec-twin", "exec-twin", "exec-other")
+    miner_service.miner_returns(*listed)
 
     with caplog.at_level(logging.WARNING):
         job = await _request(miner_service)
 
-    assert _verified(miner_service) == ["exec-twin", "exec-other"]
-    assert [r.executor_info.uuid for r in job["results"]] == ["exec-twin", "exec-other"]
+    assert _verified(miner_service) == verified
+    assert [r.executor_info.uuid for r in job["results"]] == verified
     repeats = [r for r in caplog.records if LISTED_TWICE in r.getMessage()]
-    assert len(repeats) == 1
-    assert repeats[0].msg.extra["executor_uuid"] == "exec-twin"
-    assert repeats[0].msg.extra["listed_count"] == 2
+    assert {r.msg.extra["executor_uuid"]: r.msg.extra["listed_count"] for r in repeats} == listed_counts
     if express_lane:
-        assert miner_service.in_flight == {"exec-twin": CYCLE_DONE, "exec-other": CYCLE_DONE}
+        assert miner_service.in_flight == dict.fromkeys(verified, CYCLE_DONE)
     else:
         assert miner_service.in_flight == {}
 
@@ -201,24 +187,6 @@ async def test_an_executor_listed_twice_is_one_gpu_in_its_idle_tier(miner_servic
 
     assert incentive.unrented_count_by_bucket[("B300", 1)] == 4
     assert incentive.cap_multiplier_by_bucket[("B300", 1)] == pytest.approx(1.0)
-
-
-@EXPRESS_LANE_ON_AND_OFF
-@pytest.mark.asyncio
-async def test_distinct_executors_are_all_verified_and_nothing_is_logged(
-    miner_service, monkeypatch, caplog, express_lane
-):
-    from core.config import settings
-
-    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", express_lane)
-    miner_service.miner_returns("exec-a", "exec-b", "exec-c")
-
-    with caplog.at_level(logging.WARNING):
-        job = await _request(miner_service)
-
-    assert _verified(miner_service) == ["exec-a", "exec-b", "exec-c"]
-    assert [r.executor_info.uuid for r in job["results"]] == ["exec-a", "exec-b", "exec-c"]
-    assert LISTED_TWICE not in caplog.text
 
 
 @EXPRESS_LANE_ON_AND_OFF
@@ -254,196 +222,10 @@ def test_a_repeat_of_an_executor_the_express_lane_holds_stays_with_the_lane(mine
     assert miner_service.in_flight["exec-new"] == EXPRESS_LANE
 
 
-def test_flag_off_a_list_without_repeats_is_handed_on_as_is(miner_service, monkeypatch):
+def test_flag_off_a_list_without_repeats_is_handed_on_unchanged(miner_service, monkeypatch):
     from core.config import settings
 
     monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", False)
     listed = [_executor_info("exec-a"), _executor_info("exec-b")]
 
-    assert miner_service._claim_for_cycle(_payload(), listed, {}) is listed
-
-
-# --- The guard: an executor is counted and paid once per cycle -----------------------------------
-
-
-@pytest.mark.asyncio
-async def test_a_uuid_repeated_within_a_miner_is_paid_one_share_and_counted_once(caplog):
-    jobs = {
-        "miner-a": [_idle_b300_1x("exec-twin"), _idle_b300_1x("exec-twin"), _idle_b300_1x("exec-b")],
-        "miner-b": [_idle_b300_1x("exec-c"), _idle_b300_1x("exec-d")],
-    }
-
-    with caplog.at_level(logging.WARNING):
-        incentive = await _score(jobs)
-
-    first, repeat, distinct = jobs["miner-a"]
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == 4
-    assert incentive.cap_multiplier_by_bucket[("B300", 1)] == pytest.approx(1.0)
-    assert incentive._weighted_rate_sum_by_bucket[("B300", 1)] == pytest.approx(4 * distinct.hourly_rate)
-    assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
-    assert first.incentive == pytest.approx(distinct.incentive)
-    assert first.incentive == pytest.approx(incentive.rental_share / 4)
-    assert repeat.incentive == 0.0
-    assert repeat.eligible_for_rental_share is False
-    assert _reasons(repeat) == ["duplicate_executor_in_cycle"]
-    assert _reasons(first) == []
-    assert incentive.miner_incentives["miner-a"] == pytest.approx(2 * incentive.rental_share / 4)
-    assert "No unrented incentive for this copy" in caplog.text
-
-
-@pytest.mark.parametrize("listed_first", ["miner-a", "miner-b"])
-@pytest.mark.asyncio
-async def test_a_uuid_listed_by_two_hotkeys_is_paid_under_both_and_nothing_is_marked(listed_first):
-    """An executor serves one miner hotkey only, so the same uuid under two hotkeys is two machines."""
-    others = {"miner-c": [_idle_b300_1x(f"exec-{n}") for n in ("c", "d", "e", "f")]}
-    twins = {"miner-a": [_idle_b300_1x("exec-twin")], "miner-b": [_idle_b300_1x("exec-twin")]}
-    order = [listed_first, "miner-b" if listed_first == "miner-a" else "miner-a"]
-    jobs = {hotkey: twins[hotkey] for hotkey in order} | others
-
-    incentive = await _score(jobs)
-
-    distinct = others["miner-c"][0]
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == 6
-    assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
-    for twin in (jobs["miner-a"][0], jobs["miner-b"][0]):
-        assert twin.incentive == pytest.approx(distinct.incentive)
-        assert twin.incentive == pytest.approx(incentive.rental_share / 6)
-        assert _reasons(twin) == []
-    assert incentive._repeated_idle_copies == set()
-
-
-@pytest.mark.asyncio
-async def test_an_excluded_first_entry_does_not_block_the_eligible_repeat():
-    others = {"miner-c": [_idle_b300_1x(f"exec-{n}") for n in ("c", "d", "e", "f")]}
-    excluded = _idle_b300_1x("exec-twin")
-    excluded.is_spot = True
-    jobs = {"miner-a": [excluded, _idle_b300_1x("exec-twin")]} | others
-
-    incentive = await _score(jobs)
-
-    eligible = jobs["miner-a"][1]
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == 5
-    assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
-    assert eligible.incentive == pytest.approx(others["miner-c"][0].incentive)
-    assert eligible.incentive == pytest.approx(incentive.rental_share / 5)
-    assert _reasons(eligible) == []
-    assert excluded.incentive == 0.0
-    assert "duplicate_executor_in_cycle" not in _reasons(excluded)
-
-
-@pytest.mark.asyncio
-async def test_a_uuid_reported_with_two_gpu_counts_is_counted_and_paid_once():
-    jobs = {
-        "miner-a": [_idle_b300_1x("exec-twin"), _idle_b300_1x("exec-b"), _job("exec-twin", B300, 8)],
-    }
-
-    incentive = await _score(jobs)
-
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == 2
-    assert incentive.unrented_count_by_bucket.get(("B300", 8), 0) == 0
-    assert _idle_pay(incentive, jobs) == pytest.approx(1.0)
-    assert jobs["miner-a"][2].incentive == 0.0
-    assert _reasons(jobs["miner-a"][2]) == ["duplicate_executor_in_cycle"]
-
-
-@pytest.mark.asyncio
-async def test_a_split_nodes_rented_and_free_portions_are_not_duplicates():
-    jobs = {
-        "miner-a": [
-            _job(
-                "exec-split", B300, 4, is_rented=True, rented_gpu_count=2,
-                supports_gpu_splitting=True, gpu_splitting_min_count=1,
-            ),
-        ],
-    }
-
-    incentive = await _score(jobs)
-
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == 2
-    assert _reasons(jobs["miner-a"][0]) == []
-    assert jobs["miner-a"][0].incentive_idle > 0
-
-
-# --- Input without repeats: scores identical to the pre-guard counting ----------------------------
-
-
-def _job(executor_id: str, gpu_model: str, gpu_count: int, **fields) -> JobResult:
-    result = _idle_b300_1x(executor_id)
-    result.gpu_model = gpu_model
-    result.gpu_count = gpu_count
-    for name, value in fields.items():
-        setattr(result, name, value)
-    return result
-
-
-def _fleet_17_sep() -> dict[str, list[JobResult]]:
-    jobs = {f"miner-{i}": [_job(f"exec-1x-{i:02d}", B300, 1)] for i in range(12)}
-    jobs["miner-8x"] = [_job("exec-8x", B300, 8)]
-    return jobs
-
-
-def _fleet_rented_and_idle() -> dict[str, list[JobResult]]:
-    return {
-        "miner-a": [_job(f"exec-idle-{i}", B300, 1) for i in range(6)],
-        "miner-b": [_job(f"exec-rented-{i}", B300, 1, is_rented=True) for i in range(2)],
-    }
-
-
-def _fleet_mixed_models() -> dict[str, list[JobResult]]:
-    return {
-        "miner-a": [_job(f"exec-b300-{i}", B300, 1) for i in range(3)] + [_job("exec-h100", H100, 1)],
-        "miner-b": [_job("exec-h200-8x", H200, 8), _job("exec-b200-1x", B200, 1, sysbox_runtime=False)],
-    }
-
-
-def _fleet_split_nodes() -> dict[str, list[JobResult]]:
-    """A partially rented split node's free portion shares its executor uuid with the rented
-    portion; an idle split node may move to its split tier."""
-    return {
-        "miner-a": [
-            _job(
-                "exec-split-mixed", B300, 4, is_rented=True, rented_gpu_count=2,
-                supports_gpu_splitting=True, gpu_splitting_min_count=1,
-            ),
-            _job("exec-b300-1x", B300, 1),
-        ],
-        "miner-b": [
-            _job(
-                f"exec-split-idle-{i}", B200, 8,
-                supports_gpu_splitting=True, gpu_splitting_min_count=1,
-            )
-            for i in range(9)
-        ],
-    }
-
-
-@pytest.mark.parametrize(
-    ("fleet", "expected_counts"),
-    [
-        (_fleet_17_sep, {("B300", 1): 12, ("B300", 8): 8}),
-        (_fleet_rented_and_idle, {("B300", 1): 6}),
-        (_fleet_mixed_models, {("B300", 1): 3, ("H100", 1): 1, ("H200", 8): 8, ("B200", 1): 1}),
-        (_fleet_split_nodes, {("B300", 1): 3, ("B200", 8): 64, ("B200", 1): 8}),
-    ],
-    ids=["17-sep-b300", "rented-and-idle", "mixed-models", "split-nodes"],
-)
-@pytest.mark.asyncio
-async def test_input_without_repeats_scores_exactly_as_before(fleet, expected_counts):
-    guarded_jobs, baseline_jobs = fleet(), fleet()
-
-    guarded = await _score(guarded_jobs)
-    baseline = await _score(baseline_jobs, disable_guard=True)
-
-    assert {k: v for k, v in guarded.unrented_count_by_bucket.items() if v} == expected_counts
-    assert guarded.unrented_count_by_bucket == baseline.unrented_count_by_bucket
-    assert guarded.cap_multiplier_by_bucket == baseline.cap_multiplier_by_bucket
-    assert guarded.total_rental_cost == baseline.total_rental_cost
-    assert guarded.rental_share == baseline.rental_share
-    for hotkey, results in guarded_jobs.items():
-        for result, before in zip(results, baseline_jobs[hotkey], strict=True):
-            assert result.executor_info.uuid == before.executor_info.uuid
-            assert result.count_bucket == before.count_bucket
-            assert result.effective_rate == before.effective_rate
-            assert result.incentive == before.incentive
-            assert result.incentive_idle == before.incentive_idle
-            assert result.incentive_rented == before.incentive_rented
+    assert miner_service._claim_for_cycle(_payload(), listed, {}) == listed

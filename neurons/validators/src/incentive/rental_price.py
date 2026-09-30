@@ -222,9 +222,6 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unrented_count_by_bucket: dict[tuple[str, int], int] = {}
         self._weighted_rate_sum_by_bucket: dict[tuple[str, int], float] = {}
         self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
-        # id() of every idle result that repeats an executor already paid this cycle
-        # (`_mark_repeated_idle_copies`); such a copy is counted nowhere and paid 0.
-        self._repeated_idle_copies: set[int] = set()
         # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
         # revisited once per-bucket fill is known. Items: (base_model, result).
         self._split_fallback_candidates: list[tuple[str, JobResult]] = []
@@ -586,7 +583,6 @@ class RentalPriceIncentive(DefaultIncentive):
         consumers (machine-spec publish, backend accounting) expect one message per executor.
         """
         split_portions: list[_PartiallyRentedSplitPortions] = self._expand_partially_rented_split_results()
-        self._mark_repeated_idle_copies()
         await super().calculate_mining_scores()
         self._merge_partially_rented_split_results(split_portions)
 
@@ -623,43 +619,6 @@ class RentalPriceIncentive(DefaultIncentive):
                     )
                 )
         return split_portions
-
-    def _mark_repeated_idle_copies(self) -> None:
-        """One idle result per `(hotkey, base_model, executor uuid)` is counted and paid in a cycle.
-
-        Within a miner the first entry is paid; every later idle copy of that executor under the
-        same hotkey is marked and paid 0 with its reason. The same uuid under two hotkeys is not
-        touched here: an executor serves one miner hotkey only (`MINER_HOTKEY_SS58_ADDRESS`) and
-        the uuid comes from the miner's own DB, so those are two machines, and cross-miner
-        duplicates belong to `DuplicateExecutorCheck` and the backend duplicate list. Rented
-        results are not considered: a partly rented split node's rented portion shares its uuid
-        with its free portion. Nor are copies excluded from both pools (ban, spot, no Discord,
-        ...), so an excluded copy never takes the paid slot from an eligible one.
-        """
-        self._repeated_idle_copies = set()
-        copies: dict[tuple[str, str, str], list[JobResult]] = {}
-        for hotkey, results in self.job_results.items():
-            for result in results:
-                base_model: str | None = BASE_GPU_MAP.get(result.gpu_model)
-                if (
-                    not result.is_successful
-                    or result.is_rented
-                    or base_model not in self.config.rental_incentive_gpu_types
-                    or self._reasons_excluded_from_both_pools(result)
-                ):
-                    continue
-                key = (hotkey, base_model, str(result.executor_info.uuid))
-                copies.setdefault(key, []).append(result)
-        for found in copies.values():
-            self._repeated_idle_copies.update(id(result) for result in found[1:])
-
-    @staticmethod
-    def _pay_repeated_idle_copy_nothing(result: JobResult) -> None:
-        result.eligible_for_rental_share = False
-        result.mining_score = 0
-        line: MinerLogLine = MinerLogLine.no_payout_because_duplicate_executor_in_cycle(result)
-        result.record_incentive_log(line)
-        logger.warning(line.as_internal_log())
 
     @staticmethod
     def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
@@ -735,10 +694,6 @@ class RentalPriceIncentive(DefaultIncentive):
         # Check if GPU is eligible
         base_model = self.get_base_model_for_gpu(result.gpu_model)
         if base_model not in self.config.rental_incentive_gpu_types:
-            return
-
-        if result.eligible_for_rental_share and id(result) in self._repeated_idle_copies:
-            self._pay_repeated_idle_copy_nothing(result)
             return
 
         #  calculate unrented gpu count that's eligible for rental price incentive

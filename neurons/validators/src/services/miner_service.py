@@ -345,7 +345,7 @@ class MinerService:
                     ),
                 ),
             )
-        return list(unique.values()) if repeats else executors
+        return list(unique.values())
 
     def _only_requested(
         self, executors: list[ExecutorSSHInfo], executor_id: str, default_extra: dict
