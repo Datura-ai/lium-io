@@ -3,6 +3,7 @@ from .banned_provider import BannedProviderCheck
 from .cached_template_verification import CachedTemplateVerificationCheck
 from .capability import CapabilityCheck
 from .collateral import CollateralCheck
+from .collateral_prefetch import CollateralPrefetchCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
@@ -22,6 +23,7 @@ from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
+from .registry_pull import RegistryPullCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
@@ -41,6 +43,7 @@ __all__ = [
     "CachedTemplateVerificationCheck",
     "CapabilityCheck",
     "CollateralCheck",
+    "CollateralPrefetchCheck",
     "CpuTruthCheck",
     "DiskHealthCheck",
     "CustomBuildOrphanSweepCheck",
@@ -61,6 +64,7 @@ __all__ = [
     "PortConnectivityCheck",
     "PortCountCheck",
     "ProviderSideLoadCheck",
+    "RegistryPullCheck",
     "RentalProbeCheck",
     "RentalVerificationCheck",
     "TdxHostCheck",
