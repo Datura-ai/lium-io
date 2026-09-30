@@ -1197,7 +1197,7 @@ inflight_creates = _InflightCreateRegistry()
 class _OwnSweepRegistry:
     """Container IDs a create's stale sweep (clean_existing_containers) force-removed.
 
-    A customer's create removes every `filler_*` on the node (DAH-3706), including a filler whose own
+    A customer's create removes every `filler_*` on the node, including a filler whose own
     create is still bootstrapping. That create then finds its container gone; the validator removed
     it, so it is not a node kill. A retry of the same pod reuses the name, so the sweep keys on the
     container ID it inspected just before its `rm`: an older same-name container never matches the
