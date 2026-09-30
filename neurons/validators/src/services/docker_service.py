@@ -751,15 +751,19 @@ KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
 
 
 def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
-    """`oom`, `killed` (an exit code in HOST_KILL_EXIT_CODES), `removed` (already gone, or `removing`
-    without a host-signal exit code) — the three kills — or `exited`, the image's own command ending.
-    A CMD that itself exits 143 reads as a stop: the boundary fails toward the kill."""
+    """`oom`, `killed` (an exit code in HOST_KILL_EXIT_CODES while `removing` or `dead`), `removed`
+    (already gone, or `removing` without a host-signal exit code) — the three kills — `signaled`, or
+    `exited`, the image's own command ending.
+
+    `signaled` is a plain `exited` State with a signal exit code (`docker stop` 143, `docker kill`
+    137): the exit code alone cannot tell a stop on the node from an image whose CMD exits 137 or
+    143 itself, so it keeps its own cause and neutral wording, apart from the node-kill counts."""
     if state is None or (state.status == "removing" and not state.killed_by_host):
         return "removed"
     if state.oom_killed:
         return "oom"
     if state.exit_code in HOST_KILL_EXIT_CODES:
-        return "killed"
+        return "signaled" if state.status == "exited" else "killed"
     return "exited"
 
 
@@ -793,8 +797,8 @@ async def _raise_if_killed_after_exec(
 
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
-    ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed` or
-    `removed` (see container_gone_cause); an image's own exit is never this.
+    ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed`,
+    `removed` or `signaled` (see container_gone_cause); an image's own exit is never this.
     """
 
     def __init__(
@@ -827,6 +831,11 @@ class ContainerKilledDuringBootstrap(Exception):
             if self.signal == "SIGKILL":
                 return "the container was stopped by the node before it was ready: it was killed (SIGKILL)"
             return f"the container was stopped by the node before it was ready: it was stopped ({self.signal})"
+        if self.cause == "signaled":
+            return (
+                f"the container stopped before it was ready: its command ended on {self.signal} "
+                f"(exit {self.exit_code}), from a stop on the node or from the image itself"
+            )
         return "the container was stopped by the node before it was ready: it was removed"
 
 
@@ -1099,7 +1108,11 @@ class _OwnSweepRegistry:
 
     A customer's create removes every `filler_*` on the node (DAH-3706), including a filler whose own
     create is still bootstrapping. That create then finds its container gone; the validator removed
-    it, so it is not a node kill. Names carry the pod id, so a name is not reused by another pod.
+    it, so it is not a node kill. Names carry the pod id, so a name is not reused by another pod, but
+    a retry of the same pod reuses it: the sweep stamps a name before its `rm` and again once the
+    `rm` is done, and `removed_by_us(name, since=<that create's docker run>)` counts only a sweep
+    still removing at or after the create's own `docker run` — one that could have reached its
+    container, not an older one with the same name.
     """
 
     TTL_SECONDS = 15 * 60
@@ -1113,9 +1126,11 @@ class _OwnSweepRegistry:
         for name in container_names:
             self._removed_at[name] = now
 
-    def removed_by_us(self, container_name: str) -> bool:
+    def removed_by_us(self, container_name: str, *, since: float | None = None) -> bool:
         at = self._removed_at.get(container_name)
-        return at is not None and time.monotonic() - at < self.TTL_SECONDS
+        if at is None or time.monotonic() - at >= self.TTL_SECONDS:
+            return False
+        return since is None or at >= since
 
 
 own_sweep_removals = _OwnSweepRegistry()
@@ -2617,9 +2632,12 @@ class DockerService:
 
             # recorded before the rm: a create bootstrapping one of these may see it gone at once
             own_sweep_removals.record(stale_containers)
-            await self._remove_stale_containers(
-                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
-            )
+            try:
+                await self._remove_stale_containers(
+                    ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+                )
+            finally:
+                own_sweep_removals.record(stale_containers)
 
             if clear_volume:
                 volumes_to_remove = []
@@ -5667,6 +5685,7 @@ class DockerService:
         # signature. `container_created` keeps it honest: before `docker run` succeeds there is
         # nothing to remove, so a missing container there is an ordinary create failure.
         container_created = False
+        docker_run_started_at: float | None = None
         container_vanished = False
         login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
@@ -6568,6 +6587,7 @@ class DockerService:
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     await self.stream_log("Creating docker container", "success", log_tag)
+                    docker_run_started_at = time.monotonic()
                     await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
@@ -6858,7 +6878,7 @@ class DockerService:
                         if container_gone_cause(post_run_exc.state) == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
                             raise
-                        if own_sweep_removals.removed_by_us(container_name):
+                        if own_sweep_removals.removed_by_us(container_name, since=docker_run_started_at):
                             # Another create on this node swept it (a customer's create removes
                             # every filler): the validator removed it, not the node.
                             logger.warning(

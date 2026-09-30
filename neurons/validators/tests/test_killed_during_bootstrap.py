@@ -241,35 +241,41 @@ _RUNNING = _container_state()
 _REMOVING_0 = _container_state(status="removing", running=False, exit_code=0)
 _DEAD_137 = _container_state(status="dead", running=False, dead=True, exit_code=137)
 _SIGINT = _container_state(status="exited", running=False, exit_code=130)
+_EXITED_137 = _container_state(status="exited", running=False, exit_code=137)
+_BY_NODE = "the container was stopped by the node before it was ready: "
+_ENDED_ON = "the container stopped before it was ready: its command ended on "
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("step", "states", "setup", "sentence", "event"),
     [
-        ("ssh_bootstrap", [_RUNNING, _oom_killed_state()], None, "it ran out of memory",
+        ("ssh_bootstrap", [_RUNNING, _oom_killed_state()], None, _BY_NODE + "it ran out of memory",
          {"cause": "oom", "oom_killed": True, "exit_code": 137, "signal": "SIGKILL", "status": "removing"}),
-        ("ssh_bootstrap", [_RUNNING, _SIGKILLED], None, "it was killed (SIGKILL)",
+        ("ssh_bootstrap", [_RUNNING, _SIGKILLED], None, _BY_NODE + "it was killed (SIGKILL)",
          {"cause": "killed", "oom_killed": False, "exit_code": 137, "signal": "SIGKILL", "status": "removing"}),
-        ("ssh_bootstrap", [_RUNNING, _STOPPED], None, "it was stopped (SIGTERM)",
-         {"cause": "killed", "oom_killed": False, "exit_code": 143, "signal": "SIGTERM", "status": "exited"}),
+        ("ssh_bootstrap", [_RUNNING, _STOPPED], None, _ENDED_ON + "SIGTERM (exit 143)",
+         {"cause": "signaled", "oom_killed": False, "exit_code": 143, "signal": "SIGTERM", "status": "exited"}),
+        # an image whose CMD exits 137 itself reads the same as a `docker kill`: neutral, not the node
+        ("ssh_bootstrap", [_RUNNING, _EXITED_137], None, _ENDED_ON + "SIGKILL (exit 137)",
+         {"cause": "signaled", "oom_killed": False, "exit_code": 137, "signal": "SIGKILL", "status": "exited"}),
         ("ssh_bootstrap", [_RUNNING, _RUNNING, _RUNNING, _DEAD_137], _exec_exits(0, 0, 137),
-         "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "dead"}),
-        ("ssh_bootstrap", [_RUNNING] * 3, _exec_exits_then_gone(4, 0, 0, 137), "it was removed",
+         _BY_NODE + "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "dead"}),
+        ("ssh_bootstrap", [_RUNNING] * 3, _exec_exits_then_gone(4, 0, 0, 137), _BY_NODE + "it was removed",
          {"cause": "removed", "exit_code": None, "status": None}),
-        ("add_public_keys", [_oom_killed_state()], None, "it ran out of memory", {"cause": "oom"}),
+        ("add_public_keys", [_oom_killed_state()], None, _BY_NODE + "it ran out of memory", {"cause": "oom"}),
         # a SIGTERM-handling CMD exits 0 on a host stop, then the node removes the container
-        ("add_public_keys", [_REMOVING_0], None, "it was removed", {"cause": "removed"}),
-        ("add_public_keys", [_RUNNING, _SIGINT], _exec_exits(130), "it was stopped (SIGINT)",
-         {"cause": "killed", "exit_code": 130, "signal": "SIGINT", "status": "exited"}),
-        ("add_public_keys", [_RUNNING], _exec_exits_then_gone(2, 137), "it was removed",
+        ("add_public_keys", [_REMOVING_0], None, _BY_NODE + "it was removed", {"cause": "removed"}),
+        ("add_public_keys", [_RUNNING, _SIGINT], _exec_exits(130), _ENDED_ON + "SIGINT (exit 130)",
+         {"cause": "signaled", "exit_code": 130, "signal": "SIGINT", "status": "exited"}),
+        ("add_public_keys", [_RUNNING], _exec_exits_then_gone(2, 137), _BY_NODE + "it was removed",
          {"cause": "removed", "exit_code": None, "status": None}),
-        ("set_environment", [_RUNNING], lambda api: _gone_at_inspect(api, 2), "it was removed",
+        ("set_environment", [_RUNNING], lambda api: _gone_at_inspect(api, 2), _BY_NODE + "it was removed",
          {"cause": "removed", "exit_code": None}),
-        ("set_environment", [_RUNNING, _RUNNING, _SIGKILLED], _exec_exits(0, 137), "it was killed (SIGKILL)",
+        ("set_environment", [_RUNNING, _RUNNING, _SIGKILLED], _exec_exits(0, 137), _BY_NODE + "it was killed (SIGKILL)",
          {"cause": "killed"}),
     ],
-    ids=["ssh-oom", "ssh-sigkill", "ssh-docker-stop-143", "ssh-exec-137-dead", "ssh-exec-137-404",
+    ids=["ssh-oom", "ssh-sigkill", "ssh-exited-143", "ssh-exited-137", "ssh-exec-137-dead", "ssh-exec-137-404",
          "keys-oom", "keys-removing-exit-0", "keys-exec-130", "keys-exec-137-404", "env-removed",
          "env-exec-137"],
 )  # fmt: skip
@@ -290,7 +296,7 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP == "killed_during_bootstrap"
-    assert f"the container was stopped by the node before it was ready: {sentence}" in result.detail
+    assert sentence in result.detail
     assert f"during {step}" in result.detail and "has no long-running command" not in result.detail
     assert f"(cause={event['cause']} oom_killed=" in result.detail
     assert _failure_extra(caplog)["failure_step"] == "killed_during_bootstrap"
@@ -310,20 +316,45 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
         assert len(client.exec_specs) == 2 and api.events == _RACE
 
 
+def _swept_at_inspect(api: FakeApiClient, n: int, name: str) -> None:
+    """Another create's sweep removes `name` just before inspect call `n` (1-based)."""
+    real_inspect, looks = api.inspect_container, []
+
+    def inspect(container_name):
+        looks.append(container_name)
+        if len(looks) == n:
+            own_sweep_removals.record([name])
+        return real_inspect(container_name)
+
+    api.inspect_container = inspect
+
+
 @pytest.mark.asyncio
-async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypatch, caplog):
+@pytest.mark.parametrize("swept", ["during-bootstrap", "before-docker-run"])
+async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypatch, caplog, swept):
     """A customer's create removes every filler on the node, one still bootstrapping included: that
-    create finds its container gone, but the validator removed it, so no kill is filed."""
+    create finds its container gone, but the validator removed it, so no kill is filed. A sweep of
+    the same name before this create's `docker run` (a retry of the pod) removed an older container,
+    so a kill of this one is still filed."""
     api = FakeApiClient()
     api.container_states = [_RUNNING, _SIGKILLED]
     _bootstrapping_create(svc, monkeypatch, api)
     caplog.set_level(logging.WARNING)
     payload = _payload()
-    own_sweep_removals.record([f"pod_{payload.pod_id}"])
+    name = f"pod_{payload.pod_id}"
+    if swept == "before-docker-run":
+        own_sweep_removals.record([name])
+    else:
+        _swept_at_inspect(api, 2, name)
 
     result = await _create(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
+    if swept == "before-docker-run":
+        assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+        (logged,) = _events(caplog)
+        assert logged["container_name"] == name and logged["cause"] == "killed"
+        return
     assert result.failure_step == "ssh_bootstrap"
     assert "stopped by the node" not in result.detail
     assert _events(caplog) == []
@@ -344,6 +375,17 @@ async def test_the_stale_sweep_records_what_it_removes(svc):
     assert removed == ["filler_swept-1"]
     assert own_sweep_removals.removed_by_us("filler_swept-1")
     assert not own_sweep_removals.removed_by_us("pod_keep")
+
+
+def test_a_sweep_counts_only_for_a_container_started_before_its_rm_ended(monkeypatch):
+    clock = iter([100.0, 100.0, 105.0, 105.0, 105.0])
+    monkeypatch.setattr("services.docker_service.time.monotonic", lambda: next(clock))
+    registry = type(own_sweep_removals)()
+    registry.record(["pod_retry"])  # 100: the older container's rm
+
+    assert not registry.removed_by_us("pod_retry", since=101.0)  # docker run at 101, after it
+    assert registry.removed_by_us("pod_retry", since=100.0)
+    assert registry.removed_by_us("pod_retry")
 
 
 @pytest.mark.asyncio
