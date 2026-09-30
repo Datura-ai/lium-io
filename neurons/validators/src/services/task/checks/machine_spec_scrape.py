@@ -293,7 +293,7 @@ class MachineSpecScrapeCheck:
             retryable=False,
             stdin_text=ctx.config.machine_scrape_source,
         )
-        result = self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
+        result = await self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
         if result.passed:
             return result
 
@@ -340,7 +340,7 @@ class MachineSpecScrapeCheck:
             timeout=timeout,
             retryable=False,
         )
-        return self._check_result_from_scrape_run(
+        return await self._check_result_from_scrape_run(
             ctx, scrape_run, delivery="upload", fallback_from=fallback_from
         )
 
@@ -368,9 +368,9 @@ class MachineSpecScrapeCheck:
         scrape_run = await ctx.runner.run(
             _binary_command(remote_dir, script_filename), timeout=timeout, retryable=False
         )
-        return self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
+        return await self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
 
-    def _check_result_from_scrape_run(
+    async def _check_result_from_scrape_run(
         self,
         ctx: Context,
         scrape_run: SSHCommandResult,
