@@ -274,6 +274,13 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # On a rent, when dockerd refuses to bind a host port the backend handed the pod (a stale
+    # container or a provider process holds it), the pod moves to the next free pair of the
+    # executor's advertised range (≤ 3 candidates, the host's listening sockets read once over the
+    # create's SSH session) and `docker run` is retried ONCE; the create's answer carries the port
+    # the pod really got. Off: the 90 s same-mapping wait as before. Either way the failure event
+    # carries `error_class: port_collision`.
+    PORT_COLLISION_RETRY_ENABLED: bool = Field(env="PORT_COLLISION_RETRY_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -430,6 +437,9 @@ class Settings(BaseSettings):
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
     )
+    # On: a pod container on an unrented node whose rental just ended or just started ends the run
+    # at the GPU usage check, scored as idle, instead of the orphaned-container zero.
+    RENTAL_TEARDOWN_DEFERRAL_ENABLED: bool = Field(env="RENTAL_TEARDOWN_DEFERRAL_ENABLED", default=False)
     # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.
@@ -564,7 +574,8 @@ class Settings(BaseSettings):
 
     # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
     # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
-    # results are merged. It can raise many hosts' verified_port_count at once, so it ships off.
+    # results are merged; still below the floor, one more batch probes up to 300 declared ports
+    # above those. It can raise many hosts' verified_port_count at once, so it ships off.
     PORT_PROBE_TOPUP_BELOW_FLOOR: bool = Field(env="PORT_PROBE_TOPUP_BELOW_FLOOR", default=False)
 
     # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
