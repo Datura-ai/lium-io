@@ -156,10 +156,29 @@ def _apply_asyncssh_log_level(asyncssh_logger: logging.Logger | None = None) -> 
     return level
 
 
+_warned_log_levels: set[str] = set()
+
+
 def root_log_level() -> int:
-    """``settings.LOG_LEVEL`` as a logging level; an unknown name falls back to INFO."""
-    level = logging.getLevelName(str(settings.LOG_LEVEL).strip().upper())
-    return level if isinstance(level, int) else logging.INFO
+    """``settings.LOG_LEVEL`` as a logging level; an unknown name falls back to INFO, with one warning."""
+    value = str(settings.LOG_LEVEL)
+    level = logging.getLevelName(value.strip().upper())
+    if isinstance(level, int):
+        return level
+    if value not in _warned_log_levels:
+        _warned_log_levels.add(value)
+        logging.getLogger(__name__).warning("LOG_LEVEL=%r is not a level name; logging at INFO", value)
+    return logging.INFO
+
+
+# Third-party protocol loggers that write frames, headers or bodies at DEBUG. A websocket frame to a miner
+# can carry an SSH private key, a registry password or a token (ComputeClient.send_model), so LOG_LEVEL=DEBUG
+# stops at the validator's own loggers.
+PROTOCOL_LOGGERS = ("websockets", "aiohttp", "httpx", "httpcore", "urllib3")
+
+
+def protocol_log_level() -> int:
+    return max(root_log_level(), logging.INFO)
 
 
 def configure_logs_of_other_modules():
@@ -178,6 +197,9 @@ def configure_logs_of_other_modules():
 
     sqlalchemy_logger = logging.getLogger("sqlalchemy")
     sqlalchemy_logger.setLevel(logging.WARNING)
+
+    for name in PROTOCOL_LOGGERS:
+        logging.getLogger(name).setLevel(protocol_log_level())
 
     class ContextFilter(logging.Filter):
         """
@@ -225,6 +247,7 @@ def get_logger(name: str):
                 "level": "DEBUG" if settings.SSH_DEBUG_LOGGING else "WARNING",
                 "propagate": True,
             },
+            **{name: {"level": protocol_log_level(), "propagate": True} for name in PROTOCOL_LOGGERS},
         },
     }
 
