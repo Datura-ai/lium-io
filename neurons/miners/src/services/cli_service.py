@@ -57,6 +57,7 @@ class CliService:
         self.config = settings.get_bittensor_config()
         self.hotkey = self.wallet.get_hotkey().ss58_address
         self.private_key = private_key
+        self.version = version
         self.collateral_contract = (
             get_collateral_contract(miner_key=private_key, version=version)
             if private_key else get_collateral_contract(version=version)
@@ -366,7 +367,7 @@ class CliService:
     @require_executor_dao
     async def get_miner_collateral(self):
         """
-        Get the total miner collateral by summing up collateral from all registered executors.
+        Get the collateral of the registered executors on this client's contract version.
         :return: True if successful, False otherwise
         """
         try:
@@ -377,7 +378,11 @@ class CliService:
                 collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
                 total_collateral += float(collateral)
                 self.logger.info("Executor %s collateral: %f TAO", executor_uuid, collateral)
-            self.logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
+            self.logger.info(
+                "Collateral of the registered executors on contract version %s: %f TAO",
+                self.version,
+                total_collateral,
+            )
             return True
         except Exception as e:
             self.logger.error(_m(

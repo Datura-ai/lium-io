@@ -219,13 +219,13 @@ Deposits sit on one of two collateral contracts: version `1.0.2` (current) or `1
 
 ### Getting Miner Collateral
 
-To check the total collateral deposited by the miner, use the following command:
+To check the collateral of the registered executors on one contract version, use the following command:
 
 ```bash
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-miner-collateral
 ```
 
-This will display the total TAO collateral that miner has deposited.
+This will display the TAO collateral of the executors registered in this miner's database, on the selected contract version only. Run it once per version to see both.
 
 ### Getting Executor Collateral
 
@@ -253,7 +253,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-coll
 
 The command logs the reclaim request ID; keep it for the finalize step.
 
-If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known.
+If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known. A mined reclaim is reported with its reclaim request ID. After that, a finalize that was mined shows up as "no open reclaim request".
 
 ### Getting Miner Reclaim Requests
 

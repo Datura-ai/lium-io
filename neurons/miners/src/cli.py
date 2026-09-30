@@ -9,7 +9,7 @@ from rich.table import Table
 from services.cli_service import CliService, collateral_error
 from core.collateral import rpc_origin
 from core.config import settings
-from core.utils import _m, versions_holding_collateral, versions_with_open_reclaim
+from core.utils import _m, get_collateral_contract, versions_holding_collateral, versions_with_open_reclaim
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -137,6 +137,22 @@ def run_contract_read(coroutine, failure: str):
         return None
 
 
+async def _earlier_send_settled(private_key: str) -> bool:
+    await get_collateral_contract(miner_key=private_key).settle_earlier_send()
+    return True
+
+
+def settle_earlier_send(private_key: str) -> None:
+    """Exit 1 while this key's earlier send has an outcome to report or still unknown.
+
+    Runs before contract detection: a mined reclaim or finalize whose answer was lost leaves nothing to detect.
+    """
+    if run_contract_read(
+        _earlier_send_settled(private_key), "❌ Stopped at the earlier collateral transaction from this key"
+    ) is None:
+        sys.exit(1)
+
+
 @click.group()
 def cli():
     pass
@@ -147,7 +163,7 @@ def cli():
 def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
     if miner_account(private_key) is None:
-        return
+        sys.exit(1)
     cli_service = CliService(private_key=private_key)
     success = cli_service.associate_ethereum_address()
     if success:
@@ -174,7 +190,7 @@ def show_contract_versions():
 def get_eth_ss58_address(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
     if miner_account(private_key) is None:
-        return
+        sys.exit(1)
     cli_service = CliService(private_key=private_key)
     ss58_address = cli_service.get_eth_ss58_address()
     print(ss58_address)
@@ -188,7 +204,7 @@ def get_eth_ss58_address(private_key: str):
 def transfer_tao_to_eth_address(private_key: str, amount: float):
     """Associate a miner's ethereum address with their hotkey."""
     if miner_account(private_key) is None:
-        return
+        sys.exit(1)
     cli_service = CliService(private_key=private_key)
     cli_service.transfer_tao_to_eth_address(amount)
 
@@ -198,7 +214,7 @@ def transfer_tao_to_eth_address(private_key: str, amount: float):
 def get_balance_of_eth_address(private_key: str):
     """Get the balance of the Eth address for the Bittensor hotkey."""
     if miner_account(private_key) is None:
-        return
+        sys.exit(1)
     cli_service = CliService(private_key=private_key)
     if asyncio.run(cli_service.get_balance_of_eth_address()) is None:
         sys.exit(1)
@@ -268,6 +284,7 @@ def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: s
     """Reclaim collateral for a specific executor from the contract that holds it"""
     if miner_account(private_key) is None:
         sys.exit(1)
+    settle_earlier_send(private_key)
     detected = None
     if not contract_version:
         detected = run_contract_read(
@@ -340,7 +357,7 @@ def update_executor_price(address: str, port: int, price: float):
 @cli.command()
 @contract_option
 def get_miner_collateral(contract_version: str | None):
-    """Get miner collateral by summing up collateral from all registered executors"""
+    """Get the collateral of the registered executors on the selected contract version"""
     
     selected_version = resolve_contract_version(contract_version, "Contract Version Selection for Miner Collateral")
     
@@ -387,6 +404,7 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
     account = miner_account(private_key)
     if account is None:
         sys.exit(1)
+    settle_earlier_send(private_key)
     detected = None
     if not contract_version:
         detected = run_contract_read(

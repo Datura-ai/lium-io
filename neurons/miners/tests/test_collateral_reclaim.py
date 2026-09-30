@@ -24,7 +24,8 @@ def test_h160_to_ss58_maps_an_evm_address_to_its_mirror_account():
 
 def test_executor_uuid_bytes_is_the_16_byte_contract_key():
     assert executor_uuid_bytes(EXECUTOR) == UUID(EXECUTOR).bytes
-    assert executor_uuid_bytes("0xabcd") == bytes.fromhex("abcd") + b"\0" * 14
+    with pytest.raises(ValueError):
+        executor_uuid_bytes("0xabcd")
 
 
 def test_client_encodes_the_reclaim_and_finalize_calls():
@@ -190,8 +191,21 @@ MALFORMED_KEYS = ["0x" + "ab" * 8, "not-a-hex-private-key", "zq" * 32]
         ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--contract", "1.0.2"],
         ["finalize-reclaim-request", "--reclaim-request-id", "7"],
         ["finalize-reclaim-request", "--reclaim-request-id", "7", "--contract", "1.0.2"],
+        ["associate-eth"],
+        ["get-eth-ss58-address"],
+        ["transfer-tao-to-eth-address", "--amount", "1"],
+        ["get-balance-of-eth-address"],
     ],
-    ids=["reclaim", "reclaim-contract", "finalize", "finalize-contract"],
+    ids=[
+        "reclaim",
+        "reclaim-contract",
+        "finalize",
+        "finalize-contract",
+        "associate-eth",
+        "get-eth-ss58-address",
+        "transfer-tao",
+        "get-balance",
+    ],
 )
 def test_malformed_key_exits_1_and_logs_an_error_without_the_key(chain, cli_services, caplog, args, bad_key):
     from cli import cli

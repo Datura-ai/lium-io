@@ -198,8 +198,6 @@ class SubtensorClient:
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
-    uid_to_evm_address: dict[int, str] = {}
-    hotkey_to_evm_address: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls) -> Self:
@@ -444,32 +442,6 @@ class SubtensorClient:
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(hotkey)
-
-    def get_evm_address_for_hotkey(self, hotkey):
-        return self.hotkey_to_evm_address.get(hotkey, None)
-
-    def sync_evm_address_maps(self):
-        with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
-            node = self.get_node()
-            associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
-            for uid, evm_address in associated_evms:
-                # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
-                evm_address_hex = evm_address[0]
-                self.uid_to_evm_address[uid] = evm_address_hex
-
-            """Update the map of miner_hotkey -> evm_address for all miners."""
-            for miner in self.miners:
-                self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
-
-        logger.info(
-            _m(
-                "Synced ethereum addresses map",
-                extra=get_extra_info({
-                    **self.default_extra,
-                    "uid_to_evm_address": len(self.uid_to_evm_address),
-                }),
-            ),
-        )
 
     def get_my_uid(self):
         return self.get_uid_for_hotkey(self.wallet.hotkey.ss58_address)
@@ -1019,12 +991,10 @@ class SubtensorClient:
 
                 if count == 0:
                     await self.fetch_miners()
-                    self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
                     await self.fetch_miners()
-                    self.sync_evm_address_maps()
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
