@@ -30,6 +30,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
+from redis import exceptions as redis_errors
 from tests.helpers import (
     FakeRedis,
     build_context_config,
@@ -540,6 +541,31 @@ async def test_an_incident_through_a_redis_outage_is_posted_once_and_recovered(c
     assert recovered.event.reason_code == Msg.RECOVERED.reason
     assert _states(services) == ["fault", "recovered"]
     assert rented_gpu_drop._LOCAL_MARKS == {}
+
+
+class _ReadBlipRedis(FakeRedis):
+    """Redis whose reads fail while `reads_fail` is set; writes and deletes go through."""
+
+    reads_fail = False
+
+    async def get(self, key: str):
+        if self.reads_fail:
+            raise redis_errors.ConnectionError("Error 111 connecting to redis:6379")
+        return await super().get(key)
+
+
+@pytest.mark.asyncio
+async def test_a_read_blip_on_the_recovery_cycle_does_not_hide_the_next_incident(context_factory):
+    redis = _ReadBlipRedis()
+    services = _services(redis=redis)
+
+    await _run(context_factory, services, listed=UUIDS[:5])
+    redis.reads_fail = True
+    await _run(context_factory, services, listed=UUIDS)
+    redis.reads_fail = False
+    await _run(context_factory, services, listed=UUIDS[:5])
+
+    assert _states(services) == ["fault", "recovered", "fault"]
 
 
 @pytest.mark.asyncio

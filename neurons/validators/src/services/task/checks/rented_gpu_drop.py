@@ -409,12 +409,12 @@ class RentedGpuDropCheck:
         redis_ok: bool,
     ) -> dict[str, Any] | None:
         if not mark.needs_recovery or settings.DRY_RUN:
-            await self._forget(ctx, pod.pod_id, redis_ok)
+            await self._forget(ctx, pod.pod_id)
             return None
         answer = await self._post(ctx, pod, STATE_RECOVERED, mark, None, rented_total, nvml_count)
         done = answer is not None and answer.delivery in _NO_RETRY_DELIVERIES
         if done:
-            await self._forget(ctx, pod.pod_id, redis_ok)
+            await self._forget(ctx, pod.pod_id)
         elif not mark.recovering:
             await self._save(ctx, pod.pod_id, replace(mark, recovering=True), redis_ok)
         return {
@@ -441,14 +441,14 @@ class RentedGpuDropCheck:
             except REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod_id, "write")
 
-    async def _forget(self, ctx: Context, pod_id: str, redis_ok: bool) -> None:
+    async def _forget(self, ctx: Context, pod_id: str) -> None:
+        # Deleted even when this cycle's read failed: a mark left in Redis would pass the next incident off as this one.
         key = _key(pod_id)
         _LOCAL_MARKS.pop(key, None)
-        if redis_ok:
-            try:
-                await ctx.services.redis.delete(key)
-            except REDIS_ERRORS:
-                self._log_redis_unavailable(ctx, pod_id, "delete")
+        try:
+            await ctx.services.redis.delete(key)
+        except REDIS_ERRORS:
+            self._log_redis_unavailable(ctx, pod_id, "delete")
 
     async def _post(
         self,
