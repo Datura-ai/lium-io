@@ -866,29 +866,37 @@ def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
     return "exited"
 
 
+def _listed_ids(survivors: dict[str, str] | None) -> set[str]:
+    """The container IDs a filler-removal confirmation listed; none when it could not be read."""
+    return {i for i in (survivors or {}).values() if i}
+
+
 def _killed_after_exec(state: ContainerStateSnapshot) -> bool:
     return not state.running and container_gone_cause(state) != "exited"
 
 
 async def _raise_if_killed_after_exec(
-    docker_client: RentalDockerSdkClient, *, container_name: str, exit_status: int
+    docker_client: RentalDockerSdkClient, *, container_name: str, exit_status: int | None = None,
+    failure: str | None = None,
 ) -> None:
     """A kill mid-exec ends the exec with a status (137) rather than a refused exec: read the State
     now and raise the ContainerGoneBeforeExec the create path records as killed_during_bootstrap.
-    A 404 there means the node already removed it: the same error, with no State to carry."""
+    A 404 there means the node already removed it: the same error, with no State to carry.
+    ``failure`` names an exec that failed some other way (a shell `docker exec` over SSH)."""
+    failure = failure or f"exec exit_status={exit_status}"
     try:
         state = await docker_client.inspect_container_state(container_name=container_name)
     except Exception as inspect_exc:  # noqa: BLE001 — otherwise the exec result is the one to report
         if is_docker_not_found_error(inspect_exc):
             raise ContainerGoneBeforeExec(
-                f"exec exit_status={exit_status} and the container is gone",
+                f"{failure} and the container is gone",
                 container_name=container_name,
                 state=None,
             ) from inspect_exc
         return
     if _killed_after_exec(state):
         raise ContainerGoneBeforeExec(
-            f"exec exit_status={exit_status} and the container has stopped ({state.describe()})",
+            f"{failure} and the container has stopped ({state.describe()})",
             container_name=container_name,
             state=state,
         )
@@ -983,7 +991,7 @@ async def _explain_add_public_keys_failure(
             return cause
         if _killed_after_exec(state):
             return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=state)
-    if not state.exited_since_start or state.killed_by_host:
+    if not state.exited_since_start or (state.killed_by_host and container_gone_cause(state) != "exited"):
         return cause
     if state.running:
         # Docker's restart policy already brought it back; the exec landed in the gap.
@@ -2941,7 +2949,8 @@ class DockerService:
             finally:
                 # a survivor is compared by ID: a same-name container created after the rm does not undo
                 # the removal `docker rm` acknowledged; a survivor listed without an ID, or an unconfirmed
-                # listing (None), counts as the listed container still there
+                # listing (None), counts as the listed container still there. An unanswered rm stays maybe
+                # ours unless the confirmation lists that same ID.
                 survivor_ids = (
                     set(swept.values()) if survivors is None
                     else {i or swept.get(n, "") for n, i in survivors.items()}
@@ -2949,7 +2958,7 @@ class DockerService:
                 removed = [i for i in swept.values() if i in acknowledged and i not in survivor_ids]
                 own_sweep_removals.end(
                     list(swept.values()), sweep, removed=removed,
-                    unanswered=[i for i in swept.values() if i in unanswered and i not in survivor_ids],
+                    unanswered=[i for i in swept.values() if i in unanswered and i not in _listed_ids(survivors)],
                 )
             if remove_every_filler and survivors:
                 replacements = {n: i for n, i in survivors.items() if n in swept and i and i != swept[n]}
@@ -3052,7 +3061,9 @@ class DockerService:
             own_sweep_removals.end(
                 ids, sweep,
                 removed=[i for i in ids if i in acknowledged and i not in survivor_ids],
-                unanswered=[i for i in ids if i in unanswered and i not in acknowledged and i not in survivor_ids],
+                unanswered=[
+                    i for i in ids if i in unanswered and i not in acknowledged and i not in _listed_ids(survivors)
+                ],
             )  # fmt: skip
 
     async def _confirm_fillers_removed(
@@ -7209,17 +7220,27 @@ class DockerService:
                             jupyter_token = image_jupyter_token
                         else:
                             jupyter_token = secrets.token_hex(16)
-                            await self.run_jupyter(
-                                ssh_client=ssh_client,
-                                container_name=container_name,
-                                jupyter_token=jupyter_token,
-                                jupyter_port=jupyter_port_map[0],
-                                log_tag=log_tag,
-                                log_extra=default_extra,
-                                local_volume=local_volume,
-                                local_volume_path=local_volume_path,
-                                encrypted_local_volume=use_encrypted_volume,
-                            )
+                            try:
+                                await self.run_jupyter(
+                                    ssh_client=ssh_client,
+                                    container_name=container_name,
+                                    jupyter_token=jupyter_token,
+                                    jupyter_port=jupyter_port_map[0],
+                                    log_tag=log_tag,
+                                    log_extra=default_extra,
+                                    local_volume=local_volume,
+                                    local_volume_path=local_volume_path,
+                                    encrypted_local_volume=use_encrypted_volume,
+                                )
+                            except Exception as jupyter_exc:
+                                # run_jupyter's shell `docker exec` fails with a plain error when the
+                                # container is gone: read the State before cleanup removes it
+                                await _raise_if_killed_after_exec(
+                                    docker_client,
+                                    container_name=container_name,
+                                    failure=f"Jupyter setup failed ({jupyter_exc})",
+                                )
+                                raise
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation (covers key

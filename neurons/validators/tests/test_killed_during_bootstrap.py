@@ -510,33 +510,40 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("after", ["gone", "still-listed", "listing-failed"])
-async def test_a_replacement_filler_counts_as_ours_only_once_confirmed_gone(svc, after):
-    """`docker rm` acknowledging the replacement's ID is not enough: the confirmation must no longer list it."""
+@pytest.mark.parametrize(
+    "after", ["gone", "still-listed", "listing-failed", "rm-answer-lost-listing-failed", "rm-answer-lost-still-listed"]
+)
+async def test_a_replacement_filler_counts_as_ours_only_once_confirmed_gone(svc, monkeypatch, after):
+    """`docker rm` acknowledging the replacement's ID is not enough: the confirmation must no longer list it.
+    An rm whose answer was lost stays maybe ours unless the confirmation lists that same ID."""
+    monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
     replacement_id = _container_id("filler_swept-1", generation=1)
-    listing = f"filler_swept-1 {replacement_id}\n" if after == "still-listed" else ""
+    listing = f"filler_swept-1 {replacement_id}\n" if after.endswith("still-listed") else ""
     ssh = _sweep_host(listing)
-    if after == "listing-failed":
-        rm_only = ssh.run.side_effect
+    rm_ok = ssh.run.side_effect
 
-        async def run(command, **kwargs):
-            if command.startswith("/usr/bin/docker rm -fv "):
-                return await rm_only(command, **kwargs)
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker rm -fv "):
+            if after.startswith("rm-answer-lost"):
+                raise ConnectionResetError("SSH dropped after the rm was sent")
+            return await rm_ok(command, **kwargs)
+        if after.endswith("listing-failed"):
             return Mock(stdout="", stderr="daemon unreachable", exit_status=1)
+        return await rm_ok(command, **kwargs)
 
-        ssh.run = AsyncMock(side_effect=run)
+    ssh.run = AsyncMock(side_effect=run)
 
     await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
 
     assert await own_sweep_removals.removed_by_us(replacement_id) == (after == "gone")
-    assert not own_sweep_removals.maybe_removed_by_us(replacement_id)
+    assert own_sweep_removals.maybe_removed_by_us(replacement_id) == (after == "rm-answer-lost-listing-failed")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     ["acknowledged", "node-removed-it-first", "replaced-by-a-new-same-name-container", "no-id-listed",
-     "acknowledged-then-a-later-target-failed", "rm-sent-answer-lost"],
+     "acknowledged-then-a-later-target-failed", "rm-sent-answer-lost", "rm-sent-answer-lost-confirmation-failed"],
 )  # fmt: skip
 async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkeypatch, case):
     """The sweep removes by the listed ID and records an ID only when `docker rm` printed it back:
@@ -562,7 +569,7 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
             rms.append(targets)
             if targets == [new]:
                 return Mock(stdout=f"{new}\n", stderr="", exit_status=0)
-            if case == "rm-sent-answer-lost":
+            if case.startswith("rm-sent-answer-lost"):
                 raise ConnectionResetError("SSH dropped after the rm was sent")
             if case in ("node-removed-it-first", "replaced-by-a-new-same-name-container"):
                 printed, code = [t for t in targets if t != old], 1  # "No such container: <old>"
@@ -572,6 +579,8 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
                 printed, code = targets, 0
             return Mock(stdout="".join(f"{t}\n" for t in printed), stderr="err", exit_status=code)
         text = next(listings)
+        if case == "rm-sent-answer-lost-confirmation-failed" and text is not listing:
+            return Mock(stdout="", stderr="daemon unreachable", exit_status=1)
         if [new] in rms:  # the replacement is gone once its own rm ran
             text = "".join(line for line in text.splitlines(keepends=True) if new not in line)
         if "--no-trunc" not in command:  # the names-only confirmation listing
@@ -586,6 +595,10 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
     )
     if case == "acknowledged-then-a-later-target-failed":
         with pytest.raises(Exception, match="exit_code 1"):
+            await sweep
+    elif case == "rm-sent-answer-lost-confirmation-failed":
+        # nothing shows the rm took effect: the sweep fails, and its finalizer still records the IDs
+        with pytest.raises(ConnectionResetError):
             await sweep
     else:
         await sweep
@@ -602,9 +615,10 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
     assert await own_sweep_removals.removed_by_us(old) == (case in ("acknowledged", "acknowledged-then-a-later-target-failed"))
     assert await own_sweep_removals.removed_by_us(new) == replaced
     assert await own_sweep_removals.removed_by_us(other) == (
-        case not in ("acknowledged-then-a-later-target-failed", "rm-sent-answer-lost")
+        case not in ("acknowledged-then-a-later-target-failed", "rm-sent-answer-lost", "rm-sent-answer-lost-confirmation-failed")
     )
-    lost = case == "rm-sent-answer-lost"
+    # with the confirmation unavailable, an rm whose answer was lost still leaves its IDs maybe ours
+    lost = case.startswith("rm-sent-answer-lost")
     assert own_sweep_removals.maybe_removed_by_us(old) == lost and own_sweep_removals.maybe_removed_by_us(other) == lost
 
 
@@ -787,3 +801,39 @@ async def test_an_image_whose_command_exits_after_the_key_step_is_not_a_kill(
     assert "Docker container is not ready for exec" in result.detail
     assert f"exit_code={exit_code}" in result.detail
     assert _events(caplog) == []  # no KILLED_DURING_BOOTSTRAP event: nothing on the node killed it
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("after", "failure_step", "cause"),
+    [("sigkill", KILLED_DURING_BOOTSTRAP_STEP, "killed"), ("gone", KILLED_DURING_BOOTSTRAP_STEP, "removed"),
+     ("image-exited", "jupyter_setup", None), ("still-running", "jupyter_setup", None)],
+)  # fmt: skip
+async def test_a_kill_during_jupyter_setup_is_killed_during_bootstrap(svc, monkeypatch, caplog, after, failure_step, cause):
+    """run_jupyter's shell `docker exec` fails with a plain error when the container is gone: the State
+    read before cleanup names a kill; an image's own exit or a live container keeps the step."""
+    api = FakeApiClient()
+    later = {"sigkill": _SIGKILLED, "image-exited": _container_state(status="exited", running=False, exit_code=0)}
+    api.container_states = [_RUNNING, later.get(after, _RUNNING)]
+    _bootstrapping_create(svc, monkeypatch, api, skip_ssh_bootstrap=True)
+    if after == "gone":
+        _gone_at_inspect(api, 2)
+    # a Jupyter port off the image's 8888, so the validator runs run_jupyter
+    monkeypatch.setattr(
+        svc, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001), (8889, 20002, 20002)], (8889, 20002)))
+    )
+    monkeypatch.setattr(svc, "run_jupyter", AsyncMock(side_effect=Exception("Error response from daemon: container is not running")))
+    caplog.set_level(logging.WARNING)
+    payload = _payload(enable_jupyter=True)
+
+    result = await _create(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == failure_step
+    svc.run_jupyter.assert_awaited_once()
+    if cause is None:
+        assert _events(caplog) == []
+        return
+    (logged,) = _events(caplog)
+    assert logged["bootstrap_step"] == "jupyter_setup" and logged["cause"] == cause
+    assert "during jupyter_setup" in result.detail

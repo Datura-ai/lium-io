@@ -7761,6 +7761,17 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
             "is restarting",
             id="restarting",
         ),
+        # Docker restarts only a command that ended on its own: a SIGTERM-handling CMD's 143 is its own exit
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=143, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-143",
+        ),
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=137, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-137",
+        ),
         pytest.param(
             _state(status="running", running=True, restart_count=1),
             "is restarting",
