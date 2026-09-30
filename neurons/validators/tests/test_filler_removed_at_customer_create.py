@@ -51,6 +51,24 @@ def _listing(stdout: str, exit_status: int = 0, stderr: str = ""):
     return result
 
 
+def _host(listings: list) -> AsyncMock:
+    """An SSH client whose `docker ps -a` calls return ``listings`` in turn; the sweep's `docker
+    inspect` of the stale names (the IDs it records) answers with no ID."""
+    listings = iter(listings)
+
+    async def run(command, **_kwargs):
+        if command.startswith("/usr/bin/docker inspect"):
+            return _listing("")
+        result = next(listings)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    return ssh_client
+
+
 def _events(caplog) -> list[logging.LogRecord]:
     return [
         record
@@ -64,10 +82,9 @@ def _events(caplog) -> list[logging.LogRecord]:
 async def test_customer_create_removes_a_filler_the_backend_still_lists(
     docker_service, retry_ssh_mock
 ):
-    ssh_client = AsyncMock()
     # before: the host listing; after the removal: the confirmation listing, the filler is gone
-    ssh_client.run = AsyncMock(
-        side_effect=[
+    ssh_client = _host(
+        [
             _listing("pod_target\nfiller_unconfirmed\npod_sibling\n"),
             _listing("pod_target_new\npod_sibling\n"),
         ]
@@ -90,10 +107,7 @@ async def test_customer_create_removes_a_filler_the_backend_still_lists(
 @pytest.mark.asyncio
 async def test_filler_create_keeps_its_listed_sibling_bundle(docker_service, retry_ssh_mock):
     # DAH-2465: bundle #2's create must not wipe bundle #1 — the default stays the protecting one
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[_listing("filler_bundle_2\nfiller_bundle_1\n"), _listing("filler_bundle_1\n")]
-    )
+    ssh_client = _host([_listing("filler_bundle_2\nfiller_bundle_1\n"), _listing("filler_bundle_1\n")])
 
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
@@ -111,10 +125,9 @@ async def test_filler_create_keeps_its_listed_sibling_bundle(docker_service, ret
 async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_running(
     docker_service, retry_ssh_mock, caplog
 ):
-    ssh_client = AsyncMock()
     # the confirmation listing still names the filler: dockerd said removed, the host says otherwise
-    ssh_client.run = AsyncMock(
-        side_effect=[
+    ssh_client = _host(
+        [
             _listing("pod_target\nfiller_stuck\nfiller_gone\n"),
             _listing("filler_stuck\n"),
         ]
@@ -137,17 +150,16 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
     assert event.msg.extra["executor_uuid"] == "exec-1"
     assert event.msg.extra["pod_name"] == "pod_target"
     assert event.msg.extra["container_names"] == ["filler_stuck"]
-    assert ssh_client.run.await_count == 2
+    assert ssh_client.run.await_count == 3  # the listing, the sweep's inspect, the confirmation
     # the confirmation is bounded like the prerun probe: a wedged dockerd cannot hang the create
-    confirm_call = ssh_client.run.await_args_list[1]
+    confirm_call = ssh_client.run.await_args_list[2]
     assert confirm_call.kwargs["timeout"] == ds_module._PRERUN_HOST_PROBE_TIMEOUT_SECONDS
     assert confirm_call.kwargs["check"] is False
 
 
 @pytest.mark.asyncio
 async def test_a_confirmed_removal_writes_no_event(docker_service, retry_ssh_mock, caplog):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=[_listing("pod_target\nfiller_gone\n"), _listing("")])
+    ssh_client = _host([_listing("pod_target\nfiller_gone\n"), _listing("")])
 
     with caplog.at_level(logging.WARNING):
         await docker_service.clean_existing_containers(
@@ -165,10 +177,7 @@ async def test_a_confirmed_removal_writes_no_event(docker_service, retry_ssh_moc
 async def test_a_failed_confirmation_listing_does_not_fail_the_create(
     docker_service, retry_ssh_mock, caplog
 ):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[_listing("pod_target\nfiller_gone\n"), OSError("ssh dropped")]
-    )
+    ssh_client = _host([_listing("pod_target\nfiller_gone\n"), OSError("ssh dropped")])
 
     with caplog.at_level(logging.WARNING):
         removed = await docker_service.clean_existing_containers(
@@ -187,11 +196,10 @@ async def test_a_failed_confirmation_listing_does_not_fail_the_create(
 async def test_a_confirmation_listing_that_exits_non_zero_is_not_read_as_confirmed(
     docker_service, retry_ssh_mock, caplog
 ):
-    ssh_client = AsyncMock()
     # `check=False`: a non-zero `docker ps -a` returns instead of raising; empty stdout must not
     # pass as "no survivor"
-    ssh_client.run = AsyncMock(
-        side_effect=[
+    ssh_client = _host(
+        [
             _listing("pod_target\nfiller_gone\n"),
             _listing("", exit_status=1, stderr="Cannot connect to the Docker daemon"),
         ]
@@ -223,9 +231,8 @@ async def test_rm_that_fails_because_the_filler_is_already_gone_does_not_fail_th
         ),
         None,  # the volume rm
     ]
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[
+    ssh_client = _host(
+        [
             _listing("pod_target\nfiller_racing\n"),
             _listing("pod_other\n"),  # the re-read after the failed rm
             _listing("pod_other\n"),  # the confirmation
@@ -262,9 +269,8 @@ async def test_rm_retry_budget_goes_only_to_the_names_still_on_the_host(
         None,  # the retried rm of the survivor
         None,  # the volume rm
     ]
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[
+    ssh_client = _host(
+        [
             _listing("pod_target\nfiller_gone\nfiller_busy\n"),
             _listing("filler_busy\n"),  # the re-read: filler_gone left, filler_busy still there
             _listing(""),  # the confirmation
@@ -288,10 +294,7 @@ async def test_rm_retry_budget_goes_only_to_the_names_still_on_the_host(
 @pytest.mark.asyncio
 async def test_rm_that_fails_with_the_container_still_there_raises(docker_service, retry_ssh_mock):
     retry_ssh_mock.side_effect = Exception("[clean_existing_containers] exit_code 1, stderr: busy")
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[_listing("pod_target\nfiller_stuck\n"), _listing("filler_stuck\n")]
-    )
+    ssh_client = _host([_listing("pod_target\nfiller_stuck\n"), _listing("filler_stuck\n")])
 
     with pytest.raises(Exception, match="busy"):
         await docker_service.clean_existing_containers(
@@ -313,10 +316,7 @@ async def test_rm_that_fails_and_cannot_be_re_read_raises_the_rm_error(
     retry_ssh_mock.side_effect = Exception(
         "[clean_existing_containers] exit_code 1, stderr: rm failed"
     )
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[_listing("pod_target\nfiller_x\n"), OSError("ssh dropped")]
-    )
+    ssh_client = _host([_listing("pod_target\nfiller_x\n"), OSError("ssh dropped")])
 
     with pytest.raises(Exception, match="rm failed"):
         await docker_service.clean_existing_containers(
@@ -332,8 +332,7 @@ async def test_rm_that_fails_and_cannot_be_re_read_raises_the_rm_error(
 async def test_rm_failure_on_a_filler_create_still_raises(docker_service, retry_ssh_mock):
     # the tolerant re-read is the customer create's; a FILLER create keeps the old contract
     retry_ssh_mock.side_effect = Exception("[clean_existing_containers] exit_code 1")
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=[_listing("filler_bundle_2\nfiller_old\n")])
+    ssh_client = _host([_listing("filler_bundle_2\nfiller_old\n")])
 
     with pytest.raises(Exception, match="exit_code 1"):
         await docker_service.clean_existing_containers(
@@ -342,13 +341,12 @@ async def test_rm_failure_on_a_filler_create_still_raises(docker_service, retry_
             pod_name="filler_bundle_2",
             active_container_names=[],
         )
-    assert ssh_client.run.await_count == 1
+    assert ssh_client.run.await_count == 2  # the listing and the sweep's inspect
 
 
 @pytest.mark.asyncio
 async def test_no_filler_on_the_host_skips_the_confirmation_listing(docker_service, retry_ssh_mock):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=[_listing("pod_target\npod_stale\n")])
+    ssh_client = _host([_listing("pod_target\npod_stale\n")])
 
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
@@ -358,7 +356,7 @@ async def test_no_filler_on_the_host_skips_the_confirmation_listing(docker_servi
         remove_every_filler=True,
     )
 
-    assert ssh_client.run.await_count == 1
+    assert ssh_client.run.await_count == 2  # the listing and the sweep's inspect
 
 
 @pytest.mark.asyncio

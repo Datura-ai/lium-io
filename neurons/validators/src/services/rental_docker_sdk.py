@@ -336,9 +336,10 @@ class RentalDockerSdkClient:
             for repo_digest in local_image.get("RepoDigests") or ()
         )
 
-    async def run_container(self, spec: ContainerRunSpec) -> None:
+    async def run_container(self, spec: ContainerRunSpec) -> str | None:
+        """Creates and starts the container; returns its ID (None if Docker gave none)."""
         try:
-            await _in_docker_thread(self._run_container_sync, spec)
+            return await _in_docker_thread(self._run_container_sync, spec)
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK run container failed", exc)
@@ -656,13 +657,13 @@ class RentalDockerSdkClient:
                 return mount.get("Name") or mount.get("Source") or None
         return None
 
-    def _run_container_sync(self, spec: ContainerRunSpec) -> None:
+    def _run_container_sync(self, spec: ContainerRunSpec) -> str | None:
         if spec.network:
             self._ensure_rental_network_sync(spec.network)
         host_config = self._api_client.create_host_config(
             **_build_host_config_kwargs(spec)
         )
-        self._api_client.create_container(
+        created = self._api_client.create_container(
             image=spec.image,
             command=list(spec.command) or None,
             detach=True,
@@ -674,6 +675,8 @@ class RentalDockerSdkClient:
             host_config=host_config,
         )
         self._api_client.start(spec.name)
+        container_id = created.get("Id") if isinstance(created, dict) else None
+        return container_id if isinstance(container_id, str) and container_id else None
 
     def _ensure_rental_network_sync(self, name: str) -> None:
         """The container's network exists on the host and has inter-container traffic off.

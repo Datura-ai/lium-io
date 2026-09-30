@@ -105,7 +105,6 @@ class PrerunHostProbe:
         str | None
     )  # raw nvidia-smi CSV for `_parse_power_state_csv`; None when not asked
     image_label_value: str | None  # the label's value, stripped; None when inspect failed
-    listed_at: float | None = None  # time.monotonic() when the probe command was sent
 
     @property
     def volume_names(self) -> tuple[str, ...] | None:

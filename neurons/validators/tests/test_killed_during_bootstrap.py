@@ -8,8 +8,10 @@ names the failure `killed_during_bootstrap` with `oom_killed` and the exit code,
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import hashlib
 import logging
-import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -148,6 +150,10 @@ async def test_a_container_that_is_back_or_paused_is_the_plain_error(state, exec
     assert not isinstance(info.value, ContainerGoneBeforeExec)
 
 
+def _container_id(name: str, generation: int = 0) -> str:
+    return hashlib.sha256(f"{name}/{generation}".encode()).hexdigest()
+
+
 class _SdkExecClient(_FakeRentalDockerClient):
     """The deploy-flow fake, with `exec_in_container` going through the real SDK client (readiness
     inspect, exec, the 409 re-inspect) over a FakeApiClient scripted per test."""
@@ -167,7 +173,7 @@ class _SdkExecClient(_FakeRentalDockerClient):
 
 @pytest.fixture(autouse=True)
 def _no_sweeps_from_other_tests():
-    own_sweep_removals._listed_at.clear()
+    own_sweep_removals.clear()
 
 
 @pytest.fixture
@@ -181,6 +187,9 @@ def _bootstrapping_create(
     """The happy deploy flow with the real key injection, sshd bootstrap and environment steps."""
     ssh = _ssh_client()
     _patch_happy(svc, monkeypatch, ssh)
+    svc._run_rental_docker_create_with_port_retry.side_effect = (
+        lambda **kwargs: _container_id(kwargs["container_name"])
+    )
     client = _SdkExecClient(api)
     svc.rental_docker_client_factory = _FakeRentalDockerFactory(client)
     # the key and script execs stream stdin over an exec socket; the FakeApiClient has none, and
@@ -322,18 +331,26 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
         assert len(client.exec_specs) == 2 and api.events == _RACE
 
 
-def _swept_at_inspect(
-    api: FakeApiClient, n: int, name: str, *, listed_at: float | None = None
-) -> None:
-    """Another create's sweep removes `name` just before inspect call `n` (1-based). ``listed_at``
-    (default: then) is when that sweep listed the containers."""
+def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str, *, rm: str = "done") -> None:
+    """Another create's sweep takes ``container_id`` just before inspect call `n` (1-based). ``rm``:
+    "done" (its `rm` has returned), or "ok" / "failed" (still in flight; it ends that way a moment
+    later, while this create is classifying)."""
     real_inspect, looks = api.inspect_container, []
+    loop = asyncio.get_running_loop()
+
+    def sweep() -> None:
+        in_flight = own_sweep_removals.begin([container_id])
+        end = functools.partial(own_sweep_removals.end, [container_id], in_flight, removed=rm != "failed")
+        if rm == "done":
+            end()
+        else:
+            loop.call_later(0.05, end)
 
     def inspect(container_name):
+        # docker-py runs in a worker thread; the sweep lands on the loop before this inspect returns
         looks.append(container_name)
         if len(looks) == n:
-            at = time.monotonic() if listed_at is None else listed_at
-            own_sweep_removals.record([name], listed_at=at)
+            loop.call_soon_threadsafe(sweep)
         return real_inspect(container_name)
 
     api.inspect_container = inspect
@@ -344,34 +361,44 @@ def _swept_at_inspect(
     "swept",
     [
         "during-bootstrap",
-        "before-docker-run",
-        "listed-before-docker-run-rm-ended-after",
+        "listed-before-docker-run-returned",
+        "rm-in-flight-then-ok",
+        "older-same-name-container-before-docker-run",
+        "older-same-name-container-during-bootstrap",
+        "rm-in-flight-then-failed",
         "during-bootstrap-oom",
     ],
 )
 async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypatch, caplog, swept):
     """A customer's create removes every filler on the node, one still bootstrapping included: that
-    create finds its container gone, but the validator removed it, so no kill is filed. A sweep
-    that listed the same name before this create's `docker run` returned (a retry of the pod) saw
-    an older container, even when its `rm` ended later, so a kill of this one is still filed; so is
-    an OOM, which a sweep's `rm -f` never causes."""
+    create finds its container gone, but the validator removed it, so no kill is filed. The sweep is
+    matched by container ID, so it counts whenever it listed the containers (even before this
+    create's `docker run` returned, as long as it removed this very container) and waits for an
+    `rm` still in flight. A sweep of an older container with the same name (a retry of the pod), an
+    `rm` that failed, or an OOM (a sweep's `rm -f` never causes one) still files the kill."""
     api = FakeApiClient()
     api.container_states = [_RUNNING, _oom_killed_state() if swept.endswith("-oom") else _SIGKILLED]
     _bootstrapping_create(svc, monkeypatch, api)
     caplog.set_level(logging.WARNING)
     payload = _payload()
     name = f"pod_{payload.pod_id}"
-    if swept == "before-docker-run":
-        own_sweep_removals.record([name], listed_at=time.monotonic())
-    elif swept == "listed-before-docker-run-rm-ended-after":
-        _swept_at_inspect(api, 2, name, listed_at=time.monotonic())
+    this, older = _container_id(name), _container_id(name, generation=1)
+    if swept == "older-same-name-container-before-docker-run":
+        own_sweep_removals.end([older], own_sweep_removals.begin([older]), removed=True)
+    elif swept == "older-same-name-container-during-bootstrap":
+        _swept_at_inspect(api, 2, older)
+    elif swept == "rm-in-flight-then-ok":
+        _swept_at_inspect(api, 2, this, rm="ok")
+    elif swept == "rm-in-flight-then-failed":
+        _swept_at_inspect(api, 2, this, rm="failed")
     else:
-        _swept_at_inspect(api, 2, name)
+        # "listed-before-docker-run-returned": the ID match makes the listing time irrelevant
+        _swept_at_inspect(api, 2, this)
 
     result = await _create(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    if swept != "during-bootstrap":
+    if swept.startswith("older-") or swept.endswith(("-failed", "-oom")):
         assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
         (logged,) = _events(caplog)
         assert logged["container_name"] == name
@@ -383,41 +410,67 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     assert any(getattr(r.msg, "extra", {}).get("reason") == "removed_by_own_sweep" for r in caplog.records)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("from_probe", [False, True])
-async def test_the_stale_sweep_records_what_it_removes_and_when_it_listed_them(
-    svc, monkeypatch, from_probe
-):
-    clock = iter([200.0] + [300.0] * 10)
-    monkeypatch.setattr("services.docker_service.time.monotonic", lambda: next(clock))
-    ssh = Mock()
-    ssh.run = AsyncMock(return_value=Mock(stdout="filler_swept-1\npod_keep\n", exit_status=0))
-    probe = None
-    if from_probe:
-        probe = Mock(container_names=("filler_swept-1", "pod_keep"), listed_at=150.0)
-    svc._remove_stale_containers = AsyncMock()
+def _sweep_ssh(inspect_stdout: str) -> Mock:
+    async def run(command, **_kwargs):
+        if "docker inspect" in command:
+            return Mock(stdout=inspect_stdout, exit_status=0)
+        return Mock(stdout="filler_swept-1\npod_keep\n", exit_status=0)
 
-    removed = await svc.clean_existing_containers(
+    ssh = Mock()
+    ssh.run = AsyncMock(side_effect=run)
+    return ssh
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("from_probe", "rm_error"),
+    [(False, None), (True, None), (False, RuntimeError("rm never sent"))],
+    ids=["listed", "from-probe", "rm-failed"],
+)
+async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_probe, rm_error):
+    swept_id = _container_id("filler_swept-1")
+    ssh = _sweep_ssh(f"{swept_id}\n")
+    probe = Mock(container_names=("filler_swept-1", "pod_keep")) if from_probe else None
+    svc._remove_stale_containers = AsyncMock(side_effect=rm_error)
+    sweep = svc.clean_existing_containers(
         ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
         active_container_names=["pod_keep", "filler_swept-1"], remove_every_filler=True,
         host_probe=probe,
     )
 
-    listed_at = 150.0 if from_probe else 200.0
-    assert removed == ["filler_swept-1"]
-    assert own_sweep_removals.removed_by_us("filler_swept-1", since=listed_at)
-    assert not own_sweep_removals.removed_by_us("filler_swept-1", since=listed_at + 1)
-    assert not own_sweep_removals.removed_by_us("pod_keep")
+    if rm_error is not None:
+        with pytest.raises(RuntimeError, match="rm never sent"):
+            await sweep
+        assert not await own_sweep_removals.removed_by_us(swept_id)
+        return
+    assert await sweep == ["filler_swept-1"]
+    assert await own_sweep_removals.removed_by_us(swept_id)
+    assert not await own_sweep_removals.removed_by_us(_container_id("filler_swept-1", generation=1))
+    assert not await own_sweep_removals.removed_by_us(None)
 
 
-def test_a_sweep_counts_only_when_it_listed_after_the_containers_docker_run_returned(monkeypatch):
-    monkeypatch.setattr("services.docker_service.time.monotonic", lambda: 110.0)
+@pytest.mark.asyncio
+async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_not_ours(monkeypatch):
     registry = type(own_sweep_removals)()
-    registry.record(["pod_retry"], listed_at=100.0)  # the older container; its rm ends at 110
+    ok, failed, stuck = (_container_id(n) for n in ("pod_ok", "pod_failed", "pod_stuck"))
+    for container_id, removed in ((ok, True), (failed, False)):
+        sweep = registry.begin([container_id])
+        end = functools.partial(registry.end, [container_id], sweep, removed=removed)
+        asyncio.get_running_loop().call_later(0.01, end)
+    registry.begin([stuck])
+    monkeypatch.setattr(registry, "IN_FLIGHT_WAIT_SECONDS", 0.05)
 
-    assert not registry.removed_by_us("pod_retry", since=105.0)  # docker run returned at 105
-    assert registry.removed_by_us("pod_retry", since=100.0)
-    assert registry.removed_by_us("pod_retry")
+    assert await registry.removed_by_us(ok)
+    assert not await registry.removed_by_us(failed)
+    assert not await registry.removed_by_us(stuck)
+
+
+def test_the_inspect_output_keeps_only_full_container_ids():
+    good = _container_id("pod_a")
+    ssh = Mock()
+    ssh.run = AsyncMock(return_value=Mock(stdout=f"{good}\n\nError: No such object: pod_b\n", exit_status=1))
+
+    assert asyncio.run(DockerService._container_ids(ssh, ["pod_a", "pod_b"])) == [good]
 
 
 @pytest.mark.asyncio

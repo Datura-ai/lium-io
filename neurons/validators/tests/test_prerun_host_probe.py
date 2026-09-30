@@ -255,8 +255,7 @@ def test_parser_empty_sections_are_empty_not_none():
 def test_parser_failed_section_is_none_and_the_rest_survive(kwargs, attr):
     probe = parse_prerun_host_probe(_stdout(**kwargs), with_power=True)
     assert getattr(probe, attr) is None
-    # listed_at is set by the caller, not the parser
-    others = {f for f in probe.__dataclass_fields__ if f not in (attr, "listed_at")}
+    others = {f for f in probe.__dataclass_fields__ if f != attr}
     assert all(getattr(probe, f) is not None for f in others)
 
 
@@ -551,8 +550,9 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
             "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
         ]
     )
-    assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"']
-    assert _cmds(probed) == []
+    inspect = "/usr/bin/docker inspect --format '{{.Id}}' pod_new pod_old filler_x"
+    assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"', inspect]
+    assert _cmds(probed) == [inspect]  # the IDs the sweep records; no listing
 
 
 @pytest.mark.asyncio

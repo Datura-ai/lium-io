@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import dataclasses
 import enum
 import ipaddress
 import logging
@@ -1105,34 +1104,55 @@ inflight_creates = _InflightCreateRegistry()
 
 
 class _OwnSweepRegistry:
-    """Containers a create's stale sweep (clean_existing_containers) force-removed, and when.
+    """Container IDs a create's stale sweep (clean_existing_containers) force-removed.
 
     A customer's create removes every `filler_*` on the node (DAH-3706), including a filler whose own
     create is still bootstrapping. That create then finds its container gone; the validator removed
-    it, so it is not a node kill. Names carry the pod id, so a name is not reused by another pod, but
-    a retry of the same pod reuses it. A sweep is stamped with the time it listed the containers,
-    and `removed_by_us(name, since=<when that create's docker run returned>)` counts only a sweep
-    that listed them after the create's container existed: one that saw that container. A sweep
-    that listed an older container with the same name is not counted, even when its `rm` ends after
-    the create's `docker run` has started (the run cannot take the name until that `rm` is done).
+    it, so it is not a node kill. A retry of the same pod reuses the name, so the sweep keys on the
+    container ID it inspected just before its `rm`: an older same-name container never matches the
+    ID this create's `docker run` made, whatever order the listing, the run and the `rm` land in.
+    An ID counts only once its `rm` succeeded; while that `rm` is in flight, `removed_by_us` waits
+    for its outcome (the host may drop the container before the `rm` returns to us).
     """
 
     TTL_SECONDS = 15 * 60
+    IN_FLIGHT_WAIT_SECONDS = 90
 
     def __init__(self) -> None:
-        self._listed_at: dict[str, float] = {}
+        self._removed_at: dict[str, float] = {}
+        self._in_flight: dict[str, asyncio.Event] = {}
 
-    def record(self, container_names: list[str], *, listed_at: float) -> None:
+    def begin(self, container_ids: list[str]) -> asyncio.Event:
+        done = asyncio.Event()
+        for container_id in container_ids:
+            self._in_flight[container_id] = done
+        return done
+
+    def end(self, container_ids: list[str], done: asyncio.Event, *, removed: bool) -> None:
         now = time.monotonic()
-        self._listed_at = {n: t for n, t in self._listed_at.items() if now - t < self.TTL_SECONDS}
-        for name in container_names:
-            self._listed_at[name] = max(listed_at, self._listed_at.get(name, listed_at))
+        self._removed_at = {i: t for i, t in self._removed_at.items() if now - t < self.TTL_SECONDS}
+        for container_id in container_ids:
+            if self._in_flight.get(container_id) is done:
+                del self._in_flight[container_id]
+            if removed:
+                self._removed_at[container_id] = now
+        done.set()
 
-    def removed_by_us(self, container_name: str, *, since: float | None = None) -> bool:
-        at = self._listed_at.get(container_name)
-        if at is None or time.monotonic() - at >= self.TTL_SECONDS:
+    async def removed_by_us(self, container_id: str | None) -> bool:
+        if not container_id:
             return False
-        return since is None or at >= since
+        in_flight = self._in_flight.get(container_id)
+        if in_flight is not None:
+            try:
+                await asyncio.wait_for(in_flight.wait(), self.IN_FLIGHT_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                return False
+        at = self._removed_at.get(container_id)
+        return at is not None and time.monotonic() - at < self.TTL_SECONDS
+
+    def clear(self) -> None:
+        self._removed_at.clear()
+        self._in_flight.clear()
 
 
 own_sweep_removals = _OwnSweepRegistry()
@@ -1618,20 +1638,21 @@ class DockerService:
         default_extra: dict,
         local_volume: str | None = None,
         log_tag: str = "container_creation",
-    ) -> None:
+    ) -> str | None:
+        """Returns the container's ID, or None when the client gave none."""
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
         vloopback_mount_repair_attempted = False
         while True:
             try:
-                await run_logged_rental_docker_sdk_operation(
+                container_id = await run_logged_rental_docker_sdk_operation(
                     operation="run_container",
                     log_extra=default_extra,
                     call=lambda: docker_client.run_container(run_spec),
                     attempt=attempt + 1,
                     **rental_run_spec_log_fields(run_spec),
                 )
-                return
+                return container_id if isinstance(container_id, str) else None
             except Exception as exc:
                 if _should_repair_stale_mountpoint(
                     exc,
@@ -2586,11 +2607,8 @@ class DockerService:
         re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
         (typed fields, countable) and the create goes on.
         """
-        listed_at = time.monotonic()
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
-            if host_probe.listed_at is not None:
-                listed_at = host_probe.listed_at
         else:
             result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
             all_names = [name for name in (result.stdout or "").strip().split("\n") if name]
@@ -2635,11 +2653,17 @@ class DockerService:
                 ),
             )
 
-            # recorded before the rm: a create bootstrapping one of these may see it gone at once
-            own_sweep_removals.record(stale_containers, listed_at=listed_at)
-            await self._remove_stale_containers(
-                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
-            )
+            # in flight before the rm: a create bootstrapping one of these may see it gone at once
+            swept_ids = await self._container_ids(ssh_client, stale_containers)
+            sweep = own_sweep_removals.begin(swept_ids)
+            removed = False
+            try:
+                await self._remove_stale_containers(
+                    ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+                )
+                removed = True
+            finally:
+                own_sweep_removals.end(swept_ids, sweep, removed=removed)
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2790,6 +2814,21 @@ class DockerService:
             )
             return None
         return [name for name in (result.stdout or "").strip().split("\n") if name]
+
+    @staticmethod
+    async def _container_ids(ssh_client: asyncssh.SSHClientConnection, names: list[str]) -> list[str]:
+        """The full IDs `docker inspect` gives for ``names`` (names already gone are skipped); [] when
+        the inspect could not be read, so the sweep then claims no removal."""
+        command = "/usr/bin/docker inspect --format '{{.Id}}' " + " ".join(shlex.quote(n) for n in names)
+        try:
+            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.warning(
+                _m("docker inspect of the stale containers failed", extra={"error_type": exc.__class__.__name__})
+            )
+            return []
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        return [line.strip() for line in stdout.splitlines() if re.fullmatch(r"[0-9a-f]{64}", line.strip())]
 
     async def _names_still_on_host(
         self, ssh_client: asyncssh.SSHClientConnection, names: list[str]
@@ -3308,7 +3347,6 @@ class DockerService:
             # asyncio.TimeoutError lands in the except below → None → the per-command path.
             result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
             probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power)
-            probe = dataclasses.replace(probe, listed_at=started)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5688,7 +5726,7 @@ class DockerService:
         # signature. `container_created` keeps it honest: before `docker run` succeeds there is
         # nothing to remove, so a missing container there is an ordinary create failure.
         container_created = False
-        docker_run_returned_at: float | None = None
+        container_id: str | None = None
         container_vanished = False
         login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
@@ -6590,7 +6628,7 @@ class DockerService:
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     await self.stream_log("Creating docker container", "success", log_tag)
-                    await self._run_rental_docker_create_with_port_retry(
+                    container_id = await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
                         run_spec=run_spec,
@@ -6601,7 +6639,6 @@ class DockerService:
                     )
 
                     container_created = True
-                    docker_run_returned_at = time.monotonic()
                     logger.info("Container creation step finished")
 
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
@@ -6881,13 +6918,12 @@ class DockerService:
                         if container_gone_cause(post_run_exc.state) == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
                             raise
-                        swept = own_sweep_removals.removed_by_us(
-                            container_name, since=docker_run_returned_at
-                        )
-                        if swept and container_gone_cause(post_run_exc.state) != "oom":
-                            # Another create on this node swept it (a customer's create removes
-                            # every filler): the validator removed it, not the node. A sweep's
-                            # `rm -f` never sets OOMKilled, so an observed OOM is the node's.
+                        if container_gone_cause(
+                            post_run_exc.state
+                        ) != "oom" and await own_sweep_removals.removed_by_us(container_id):
+                            # Another create on this node swept this very container (a customer's
+                            # create removes every filler): the validator removed it, not the node.
+                            # A sweep's `rm -f` never sets OOMKilled, so an observed OOM is the node's.
                             logger.warning(
                                 _m(
                                     "Container removed by another create's sweep during bootstrap",
