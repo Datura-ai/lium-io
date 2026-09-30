@@ -10,6 +10,7 @@ from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
     MissingFlagshipCapability,
+    PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
 )
@@ -36,6 +37,8 @@ def test_reason_enum_pins_the_stable_code_contract():
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
+        "port_limited_remainder",
+        "validation_failed",
     }
 
 
@@ -144,6 +147,13 @@ def _job(**overrides) -> JobResult:
             "cannot_apply_gpu_power_cap",
             "CAP_SYS_ADMIN",
         ),
+        (
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(available_port_count=2, required_port_count=3)
+            ),
+            "port_limited_remainder",
+            "2 free port",
+        ),
     ],
 )
 def test_zero_reason_constructor_code_and_message(build, expected_code, message_fragment):
@@ -166,10 +176,9 @@ def test_banned_network_abuse_message():
 def test_provider_ban_is_excluded_from_both_pools():
     incentive = object.__new__(RentalPriceIncentive)
 
-    line = incentive._reason_excluded_from_both_pools(_job(is_provider_banned=True))
+    lines = incentive._reasons_excluded_from_both_pools(_job(is_provider_banned=True))
 
-    assert line is not None
-    assert line.reason is ZeroIncentiveReason.BANNED_NETWORK_ABUSE
+    assert [line.reason for line in lines] == [ZeroIncentiveReason.BANNED_NETWORK_ABUSE]
 
 
 def test_spot_tier_carries_internal_log_message():

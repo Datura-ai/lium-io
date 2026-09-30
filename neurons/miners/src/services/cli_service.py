@@ -67,10 +67,29 @@ class CliService:
     def get_node(self):
         """
         Get a SubstrateInterface node connection using the current config.
+        Tries each entry of the ordered endpoint list (our proxy first, the public
+        node last) so a down proxy does not fail the command.
         :return: SubstrateInterface instance
         """
-        self.subtensor = bt.Subtensor(config=self.config)
-        return self.subtensor.substrate
+        endpoints = settings.get_chain_endpoints()
+        for index, endpoint in enumerate(endpoints):
+            try:
+                self.subtensor = bt.Subtensor(network=endpoint.value, config=self.config)
+                return self.subtensor.substrate
+            except Exception as e:
+                if index == len(endpoints) - 1:
+                    raise
+                next_endpoint = endpoints[index + 1]
+                self.logger.warning(_m(
+                    f"Subtensor endpoint switched from={endpoint.value} to={next_endpoint.value}",
+                    extra={
+                        **self.default_extra,
+                        "from": endpoint.value,
+                        "to": next_endpoint.value,
+                        "reason": "connect failed",
+                        "error": str(e),
+                    },
+                ))
 
     def print_extrinsic_receipt(self, receipt) -> dict:
         """
@@ -365,7 +384,10 @@ class CliService:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = executor.uuid
             balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
             self.logger.info(f"Miner balance: {balance} TAO for miner hotkey {self.hotkey}")
@@ -456,7 +478,10 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = str(executor.uuid)
 
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
@@ -581,7 +606,10 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = str(executor.uuid)
 
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)

@@ -18,7 +18,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
-   Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
+   Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
      spot tier, Discord not connected, paused for new rentals, running own default job
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
@@ -27,8 +27,18 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
+     free remainder of a partially rented split node with fewer free ports than the
+       marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
+   Group C — a check failed this cycle: the failing check's reason code
+     (`validation_failed`, context.reason_code), so a zero from a failed check is never
+     reported without a reason. A run that passed every check and still scored 0 (the
+     score gate: collateral, CPU truth, an outdated image, a rented node's halt) is not a
+     failed check and gets no Group C reason
+   Every reason that applies is recorded, in the order above: a node blocked by Discord
+   still learns that its 8x flagship gate blocks it too. The first entry is the one the
+   old first-match evaluation reported.
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
@@ -56,7 +66,12 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
+    from incentive.rental_price import (
+        InsufficientDisk,
+        MissingFlagshipCapability,
+        PortLimitedRemainder,
+        PowerCapIncapable,
+    )
     from services.task_service import JobResult
 
 
@@ -83,6 +98,13 @@ class ZeroIncentiveReason(StrEnum):
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
+    PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    # Group C: the validation run itself did not pass; context.reason_code names the check
+    VALIDATION_FAILED = "validation_failed"
+
+
+# The reason code a failed run carries when no check produced one (an exception in the pipeline).
+UNCLASSIFIED_VALIDATION_FAILURE = "PIPELINE_VALIDATION_ERROR"
 
 
 class IncentiveReason(BaseModel):
@@ -348,7 +370,8 @@ class MinerLogLine(BaseModel):
             ),
             extra_fields={
                 "nvidia_driver_version": result.nvidia_driver_version,
-                "driver_multiplier": result.driver_multiplier,
+                # recorded only at multiplier 0; a node blocked before pricing never gets it set
+                "driver_multiplier": 0.0,
             },
         )
 
@@ -408,6 +431,59 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_port_limited_remainder(
+        result: JobResult, port_limited: PortLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion: gpu_count is the number of free GPUs the message names.
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+            message=(
+                f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
+                f"rented node: it has {port_limited.available_port_count} free port(s) and the "
+                f"marketplace needs at least {port_limited.required_port_count} to list and rent them, so nobody "
+                "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
+                "when the rental ends or the node gets more open ports."
+            ),
+            extra_fields={
+                "available_port_count": port_limited.available_port_count,
+                "required_port_count": port_limited.required_port_count,
+            },
+        )
+
+    # ── Group C: the validation run did not pass ─────────────────────────────
+
+    @staticmethod
+    def validation_failure_code(result: JobResult) -> str:
+        """The reason code of the event that ended the run; the fallback when there is none."""
+        event = result.validation_event
+        return (
+            result.failure_reason_code
+            or (event.reason_code if event is not None else None)
+            or UNCLASSIFIED_VALIDATION_FAILURE
+        )
+
+    @staticmethod
+    def no_payout_because_validation_failed(result: JobResult) -> MinerLogLine:
+        event = result.validation_event
+        reason_code: str = MinerLogLine.validation_failure_code(result)
+        # the event's check_id/remediation belong to it only when it is the one that ended the run
+        same_event: bool = event is not None and event.reason_code == reason_code
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.VALIDATION_FAILED,
+            message=(
+                f"No subnet incentive: validation did not pass this cycle ({reason_code}). "
+                "Fix the failed check to earn; the node's validation log names it."
+            ),
+            extra_fields={
+                "reason_code": reason_code,
+                "check_id": event.check_id if same_event else None,
+                "remediation": event.remediation if same_event else None,
             },
         )
 

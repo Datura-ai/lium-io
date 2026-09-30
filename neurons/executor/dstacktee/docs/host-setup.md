@@ -106,14 +106,17 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
    Required beyond the obvious (`MINER_HOTKEY_SS58_ADDRESS`, ports, `CVM_VCPUS/MEMORY/DISK`, `CVM_GPUS`):
 
    - `ENABLE_TDX_ATTESTATION=true`
-   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the release notes. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
+   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the "CVM attestation" section of the release notes of the tag you checked out. While the notes of your tag do not carry that section yet (no released tag has it before the first release after this change), `python3 scripts/compose_hash.py --release-notes` prints the same section for the checkout: the digest and the expected compose hash. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
 
-2. Create and boot (the OS image downloads once per host, then is reused):
+2. Create, check the measurement, boot (the OS image downloads once per host, then is reused):
 
    ```bash
    sudo ./lium-cvm.sh new my-executor
+   python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json
    sudo ./lium-cvm.sh run my-executor
    ```
+
+   `--check` prints the expected compose hash (the one in the release-notes section) and the hash of the file `new` wrote, and exits 1 when they differ, so there is nothing to compare by eye. `sha256sum run/vms/my-executor/shared/app-compose.json` prints the same actual hash on its own. A mismatch means the digest or a measured file differs from the release and the validator does not know the hash. What that costs depends on the validator's `ENABLE_ATTESTATION_WHITELIST`: on, the CVM scores zero; off (the default, and production today), the validator accepts the unknown hash and scores the node as before. Do not run a CVM that does not match the release either way: fix `.env` or `git checkout` the release tag, `sudo rm -rf run/vms/my-executor`, and run `new` again.
 
    Everything attestation-related inside the guest — sysbox force-install, digest-pinned runner, quote generation — is baked into the measured compose; there is nothing to configure in the guest.
 
@@ -130,9 +133,11 @@ Per release:
 ```bash
 sudo ./lium-cvm.sh stop my-executor
 git pull                                   # the release tag
-# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes
+# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes ("CVM attestation";
+# no section yet → python3 scripts/compose_hash.py --release-notes prints it for the checkout)
 sudo rm -rf run/vms/my-executor            # see warning below
 sudo ./lium-cvm.sh new my-executor
+python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json   # exit 1 = not the release's compose
 sudo ./lium-cvm.sh run my-executor
 ```
 
