@@ -146,7 +146,7 @@ class ContainerCleanup:
 
             # Get currently rented containers for this executor
             rented_containers = listed_container_names(rented_data)
-            extra["rented_containers"] = str(rented_containers)
+            extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
             for container_name in all_containers:

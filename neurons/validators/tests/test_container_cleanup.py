@@ -17,6 +17,7 @@ from services.container_cleanup import (
     RENTED_LIST_UNAVAILABLE,
     VOLUME_RM_MAX_PER_PASS,
     ContainerCleanup,
+    listed_container_names,
     rented_list_unknown_reason,
 )
 
@@ -710,3 +711,22 @@ async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_list
 
     assert rented_list_unknown_reason(rented_data) is None
     assert (removed_count, set(removed_names), unremovable) == (len(expected_removed), expected_removed, [])
+
+
+@pytest.mark.asyncio
+async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
+    fleet_pods = [f"pod_fleet-{i:04d}" for i in range(500)]
+    stale = [f"pod_stale-{i:02d}" for i in range(5)]
+    ssh, _ = _make_ssh_mock(containers=stale, ages_by_name={name: 60 for name in stale})
+    rented_data = _real_rented_data("another-node", fleet_pods)
+
+    with caplog.at_level(logging.INFO, logger="services.container_cleanup"):
+        removed_count, _, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+            ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+        )
+
+    cleanup_logs = [r.msg for r in caplog.records if hasattr(r.msg, "to_full_string")]
+    assert removed_count == len(stale) and len(cleanup_logs) == len(stale) + 1
+    for msg in cleanup_logs:
+        assert msg.extra["rented_container_count"] == len(listed_container_names(rented_data))
+        assert "pod_fleet-" not in msg.to_full_string()
