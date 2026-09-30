@@ -28,6 +28,7 @@ from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 from neurons.validators.src.services.task.runner import SSHCommandResult
 from services.redis_service import RESET_VERIFIED_JOB_CHANNEL, VERIFIED_JOB_COUNT_KEY, RedisService
+from services.ssh_service import SSHService
 from test_rented_machine_check import (
     DummyBackendClient,
     DummyScoreCalculator,
@@ -36,15 +37,21 @@ from test_rented_machine_check import (
     build_rented_data,
 )
 
-from helpers import FERNET_TOKEN, build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 EXECUTOR = "executor-123"
+ENCRYPT_KEY = "test-encrypt-key"
 POD_ID = "pod-1"
 # repr() of the shipped scrape's NVMLError (machine_scrape.py): the class name and the nvml.h return code
 NVML_DRIVER_ERROR = "NVMLError(9)"
 
 
-def _driver_report(gpu_scrape_error: str) -> str:
+def _sealed(report: str, key: str = ENCRYPT_KEY) -> str:
+    # what the shipped scrape prints: the plain report, then its Fernet token under the cycle's key
+    return f"{report}\n{SSHService()._encrypt(key, report)}"
+
+
+def _plain_driver_report(gpu_scrape_error: str) -> str:
     return json.dumps(
         {
             "error": "no_gpu_details",
@@ -53,7 +60,12 @@ def _driver_report(gpu_scrape_error: str) -> str:
     )
 
 
-NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
+def _driver_report(gpu_scrape_error: str) -> str:
+    return _sealed(_plain_driver_report(gpu_scrape_error))
+
+
+PLAIN_NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
+NO_GPU_REPORT = _sealed(PLAIN_NO_GPU_REPORT)
 HEALTHY_SPECS = {
     "gpu": {"count": 1, "details": [{"name": "NVIDIA RTX 4090", "uuid": "GPU-abc123"}]},
     "gpu_processes": [],
@@ -82,11 +94,6 @@ class _Runner:
         return self.result
 
 
-class _Decrypt:
-    def decrypt_payload(self, encrypt_key: str, payload: str) -> str:
-        return json.dumps(HEALTHY_SPECS)
-
-
 class _Sink:
     async def emit(self, event) -> None:
         return None
@@ -107,7 +114,7 @@ async def _cycle(context_factory, service, *, scrape: SSHCommandResult, rented: 
     containers = [{"name": "tenant-123", "pod_id": POD_ID}] if rented else []
     ctx = context_factory(
         services=build_services(
-            ssh=_Decrypt(),
+            ssh=SSHService(),
             score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
             container_cleanup=MockContainerCleanup(),
             backend=DummyBackendClient(active=True),
@@ -119,7 +126,7 @@ async def _cycle(context_factory, service, *, scrape: SSHCommandResult, rented: 
         ),
         runner=_Runner(scrape),
         ssh=DummySSHClient(pod_running=True),
-        encrypt_key="test-encrypt-key",
+        encrypt_key=ENCRYPT_KEY,
         verified=verified,
         collateral_deposited=True,
         is_rental_succeed=True,
@@ -145,7 +152,7 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR))
 
 
-HEALTHY = _scrape_result(stdout=FERNET_TOKEN, exit_code=0)
+HEALTHY = _scrape_result(stdout=SSHService()._encrypt(ENCRYPT_KEY, json.dumps(HEALTHY_SPECS)), exit_code=0)
 DEAD_NVML = _scrape_result(stdout=_driver_report(NVML_DRIVER_ERROR), exit_code=1)
 
 
@@ -229,6 +236,23 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
             _scrape_result(stdout=_driver_report("OSError(28, 'No space left on device')"), exit_code=1), {}, id="not-nvml"
         ),
         pytest.param(_scrape_result(stdout="", exit_code=127), {}, id="scrape-failed-on-host"),
+        # what anything that controls the executor's interpreter can print: the report without its sealed copy,
+        # with a copy sealed under another key, or with a replayed success payload
+        pytest.param(
+            _scrape_result(stdout=_plain_driver_report(NVML_DRIVER_ERROR), exit_code=1), {}, id="plain-driver-report"
+        ),
+        pytest.param(_scrape_result(stdout=PLAIN_NO_GPU_REPORT, exit_code=1), {}, id="plain-no-gpu-report"),
+        pytest.param(_scrape_result(stdout='{"error": "no_gpu_details"}', exit_code=1), {}, id="bare-no-gpu-report"),
+        pytest.param(
+            _scrape_result(stdout=_sealed(_plain_driver_report(NVML_DRIVER_ERROR), key="another-key"), exit_code=1),
+            {},
+            id="sealed-under-another-key",
+        ),
+        pytest.param(
+            _scrape_result(stdout=f"{_plain_driver_report(NVML_DRIVER_ERROR)}\n{HEALTHY.stdout}", exit_code=1),
+            {},
+            id="replayed-success-payload",
+        ),
         pytest.param(
             SSHCommandResult(
                 command="scrape.sh", command_id="cmd-1", exit_code=-1, stdout="", stderr="", duration_ms=300_000,

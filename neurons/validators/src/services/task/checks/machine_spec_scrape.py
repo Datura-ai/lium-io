@@ -127,6 +127,16 @@ def _scrape_reported_its_own_failure(stdout: str) -> bool:
     return _scrape_error_report(stdout) is not None
 
 
+def _sealed_scrape_error_report(ctx: Context, stdout: str) -> dict[str, Any] | None:
+    # the scrape prints its failure report twice: plain JSON, which anything that controls the executor's
+    # interpreter can print too, and a Fernet token of it under the cycle's key. Only the token is ours.
+    try:
+        report = json.loads(_decrypt_payload(ctx, stdout))
+    except Exception:
+        return None
+    return report if isinstance(report, dict) and "error" in report else None
+
+
 def _is_no_gpu_details_error(error: Any, obfuscation_keys: dict[str, str] | None) -> bool:
     # the key substitution that renames `gpu_details` in the shipped scrape (file_encrypt_service)
     # is a plain text replace, so it renames it inside this string literal too
@@ -142,8 +152,9 @@ class ScrapeFailure:
     error_type: str | None = None
     scrape_error: str | None = None
     gpu_scrape_error: str | None = None
+    report_sealed: bool | None = None
 
-    def cause_event_fields(self) -> dict[str, str]:
+    def cause_event_fields(self) -> dict[str, Any]:
         return {
             field.name: getattr(self, field.name)
             for field in fields(self)
@@ -151,9 +162,7 @@ class ScrapeFailure:
         }
 
 
-def _classify_scrape_failure(
-    scrape_run: SSHCommandResult, obfuscation_keys: dict[str, str] | None
-) -> ScrapeFailure:
+def _classify_scrape_failure(ctx: Context, scrape_run: SSHCommandResult) -> ScrapeFailure:
     # which side failed, from what came back: the runner sets error_type exactly when no exit status
     # came back from the host (timed out, raised, or the channel closed without one). Those stay
     # undetermined; only an exit status the host sent puts the failure on the host.
@@ -162,7 +171,15 @@ def _classify_scrape_failure(
     if scrape_run.error_type is not None:
         return ScrapeFailure(Msg.SCRAPE_TRANSPORT_FAILED, error_type=scrape_run.error_type)
 
-    report = _scrape_error_report(scrape_run.stdout)
+    sealed = _sealed_scrape_error_report(ctx, scrape_run.stdout)
+    if sealed is not None:
+        return replace(_classify_scrape_error_report(sealed, ctx.config.obfuscation_keys), report_sealed=True)
+    return _classify_scrape_error_report(_scrape_error_report(scrape_run.stdout), ctx.config.obfuscation_keys)
+
+
+def _classify_scrape_error_report(
+    report: dict[str, Any] | None, obfuscation_keys: dict[str, str] | None
+) -> ScrapeFailure:
     if report is None or not _is_no_gpu_details_error(report.get("error"), obfuscation_keys):
         return ScrapeFailure(Msg.SCRAPE_FAILED_ON_HOST)
 
@@ -207,11 +224,11 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
     It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
     and billing stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
     (penalty_trigger.py SCRAPE_FAILURE_REASONS), which holds both codes here. A node without a customer pod keeps
-    the plain halt.
+    the plain halt, and so does a report without the scrape's sealed copy: plain JSON on stdout is forgeable.
     """
     if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
         return {}
-    if not _gpu_runtime_is_dead(failure):
+    if not failure.report_sealed or not _gpu_runtime_is_dead(failure):
         return {}
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
@@ -406,7 +423,7 @@ class MachineSpecScrapeCheck:
             what["fallback_from"] = fallback_from.as_event_field()
 
         if not scrape_run.success or not scrape_run.stdout.strip():
-            failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            failure = _classify_scrape_failure(ctx, scrape_run)
             reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
             event = render_message(
                 failure.template,

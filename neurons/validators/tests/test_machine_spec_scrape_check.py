@@ -1,3 +1,4 @@
+import ast
 import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
@@ -16,6 +17,7 @@ from neurons.validators.src.services.task.messages import (
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
 )
 from neurons.validators.src.services.task.runner import NO_EXIT_STATUS, SSHCommandResult
+from services.ssh_service import SSHService
 
 from tests.helpers import (
     FERNET_TOKEN,
@@ -613,10 +615,10 @@ DRIVER_REPORT = json.dumps(
 )
 
 
-async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation_keys=None):
+async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation_keys=None, services=None):
     runner = DummySSHCommandRunner(result=scrape_run)
     ctx = context_factory(
-        services=build_services(),
+        services=services or build_services(),
         config=build_context_config(
             machine_scrape_filename="scrape.sh",
             machine_scrape_timeout=300,
@@ -774,6 +776,58 @@ def test_the_scrape_still_prints_the_no_gpu_report_the_validator_reads():
 
     assert 'print(json.dumps({"error": "no_gpu_details", "data": data}))' in source
     assert 'data["gpu_scrape_error"] = repr(exc)' in source
+
+
+def test_the_scrape_seals_its_no_gpu_report_with_the_key_the_validator_decrypts_with():
+    # The scrape has no card to derive the key from, so it spells the key names out; after the key
+    # substitution the shipped scrape goes through, they must join to the validator's encrypt_key.
+    from services.file_encrypt_service import FileEncryptService
+
+    source = (Path(__file__).parents[1] / "src" / "miner_jobs" / "machine_scrape.py").read_text()
+    [key_join] = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign) and [target.id for target in node.targets] == ["no_gpu_key"]
+    ]
+    assert 'print(_encrypt(no_gpu_key, json.dumps({"error": "no_gpu_details", "data": data})))' in source
+
+    all_keys, encrypt_key = FileEncryptService(ssh_service=None).generate_key_mappings()
+    shipped = ast.get_source_segment(source, key_join.value.args[0])
+    for key, value in all_keys.items():
+        shipped = shipped.replace(key, value)
+    assert "".join(ast.literal_eval(shipped)) == encrypt_key
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_marks_a_failure_read_from_the_sealed_report(context_factory):
+    # Arrange
+    sealed = SSHService()._encrypt("test-encrypt-key", DRIVER_REPORT)
+    plain_that_disagrees = '{"error": "something_else"}'
+
+    # Act
+    result = await _run_scrape(
+        context_factory,
+        make_command_result(success=False, exit_code=1, stdout=f"{sealed}\n{plain_that_disagrees}"),
+        services=build_services(ssh=SSHService()),
+    )
+
+    # Assert
+    assert result.event.reason_code == Msg.SCRAPE_FAILED_DRIVER.reason
+    assert result.event.what_we_saw["report_sealed"] is True
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_does_not_mark_a_plain_report_sealed(context_factory):
+    # Act
+    result = await _run_scrape(
+        context_factory,
+        make_command_result(success=False, exit_code=1, stdout=DRIVER_REPORT),
+        services=build_services(ssh=SSHService()),
+    )
+
+    # Assert
+    assert result.event.reason_code == Msg.SCRAPE_FAILED_DRIVER.reason
+    assert "report_sealed" not in result.event.what_we_saw
 
 
 @pytest.mark.asyncio

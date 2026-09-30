@@ -19,7 +19,8 @@ from services.ssh_service import SSHService
 JOB_FILES_ROOT = Path(__file__).parent / "temp"
 
 # ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
-# gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
+# gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order —
+# and of the literal list its no-GPU report is sealed with.
 KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
     "gpu.name",
     "gpu.uuid",

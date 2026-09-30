@@ -1993,6 +1993,14 @@ def get_machine_specs():
 
     if not data.get("data_gpu", {}).get("gpu_details", []):
         print(json.dumps({"error": "no_gpu_details", "data": data}))
+        # the key the success payload derives from gpu_details[0], spelled out because there is no card to
+        # read it from; the validator acts on a report only through this sealed copy of it
+        no_gpu_key = "".join([
+            "gpu.name", "gpu.uuid", "gpu.capacity", "gpu.memory_used_mb", "gpu.cuda", "gpu.power_limit",
+            "gpu.power_default_limit", "gpu.power_min_limit", "gpu.power_max_limit", "gpu.graphics_speed",
+            "gpu.memory_speed", "gpu.pcie", "gpu.speed_pcie", "gpu.utilization", "gpu.memory_utilization",
+        ])
+        print(_encrypt(no_gpu_key, json.dumps({"error": "no_gpu_details", "data": data})))
         sys.exit(1)
 
     return data
