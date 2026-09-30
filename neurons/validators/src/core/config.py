@@ -711,7 +711,7 @@ class Settings(BaseSettings):
         env="RECHECK_REQUEST_MAX_AGE_SECONDS", default=600, gt=0
     )
     # The wave waits on a recheck running on its node only while this much of the executor's budget
-    # is still left for its own pass, so a recheck that ends late with nothing cannot zero the node.
+    # is still left for its own pass; then it cancels the recheck and runs the node itself, alone.
     RECHECK_WAVE_PIPELINE_ROOM_SECONDS: int = Field(
         env="RECHECK_WAVE_PIPELINE_ROOM_SECONDS", default=480, gt=0
     )

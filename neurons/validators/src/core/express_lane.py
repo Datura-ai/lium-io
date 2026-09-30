@@ -415,6 +415,7 @@ class ExpressLane:
             task = asyncio.create_task(
                 self._recheck(request, miner, inputs, rented_data, now, cycle_done_at)
             )
+            self.miner_service.recheck_tasks[executor_id] = task
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             launched += 1
@@ -514,7 +515,10 @@ class ExpressLane:
                     )
                 )
                 return
-            await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey, recheck=True)
+            # one node under a clock-based batch id, not the miner's whole batch
+            await self.miner_service.publish_machine_specs(
+                results, miner.hotkey, miner.coldkey, recheck=True, is_whole_miner_batch=False
+            )
             result_for_cycle = results[0]
             requested = request.get("requested_at")
             logger.info(
@@ -550,6 +554,7 @@ class ExpressLane:
         finally:
             self.miner_service.release_recheck_claim(executor_id, cycle_done_at)
             self.miner_service.recheck_outcomes.pop(executor_id, None)
+            self.miner_service.recheck_tasks.pop(executor_id, None)
             if not outcome.done():
                 outcome.set_result(result_for_cycle)
             self._release_directory(directory)

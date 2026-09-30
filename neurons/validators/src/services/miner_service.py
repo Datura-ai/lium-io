@@ -280,6 +280,9 @@ class MinerService:
         # resolved when the recheck ends. A wave that reaches the node meanwhile takes that result
         # as the node's own: one pipeline per node at a time, and the node keeps its scored cycle.
         self.recheck_outcomes: dict[str, asyncio.Future] = {}
+        # Executor uuid -> the task running its recheck. A wave that stops waiting cancels it before
+        # its own run, so two pipelines never run on one node.
+        self.recheck_tasks: dict[str, asyncio.Task] = {}
         # miner hotkey -> job_batch_id of the wave that has not received that miner's executor
         # list yet. The express lane publishes under the cycle's job_batch_id; it waits for the
         # wave's list of the node's miner, or the wave could verify and publish the node again
@@ -389,7 +392,8 @@ class MinerService:
     ) -> JobResult | None:
         """The wave's result for one executor: the result of the recheck running on it, when there is
         one, stamped with this wave's batch id; otherwise the executor's own pipeline run. The wait is
-        capped so the pipeline still has RECHECK_WAVE_PIPELINE_ROOM_SECONDS of the executor's budget.
+        capped so the pipeline still has RECHECK_WAVE_PIPELINE_ROOM_SECONDS of the executor's
+        budget; at the cap the recheck is cancelled and the wave runs only once it has ended.
 
         A node with rented pods (`reuse_recheck` False) waits for the recheck and then runs its own
         pipeline: the rented-pod SSH probe counts its streak on cycle runs only.
@@ -398,15 +402,23 @@ class MinerService:
         if outcome is not None:
             wait_seconds = max(0, executor_budget_seconds() - settings.RECHECK_WAVE_PIPELINE_ROOM_SECONDS)
             try:
-                rechecked: JobResult | None = await asyncio.wait_for(asyncio.shield(outcome), timeout=wait_seconds)
-            except TimeoutError:
-                rechecked = None
-                logger.info(
-                    _m(
-                        "[recheck] Wave stopped waiting for the recheck; running the node itself",
-                        extra=get_extra_info({"executor_uuid": executor_id, "waited_s": wait_seconds}),
+                try:
+                    rechecked: JobResult | None = await asyncio.wait_for(
+                        asyncio.shield(outcome), timeout=wait_seconds
                     )
-                )
+                except TimeoutError:
+                    rechecked = None
+                    logger.info(
+                        _m(
+                            "[recheck] Wave stopped waiting for the recheck; cancelled it, "
+                            "running the node itself",
+                            extra=get_extra_info({"executor_uuid": executor_id, "waited_s": wait_seconds}),
+                        )
+                    )
+                    recheck = self.recheck_tasks.get(executor_id)
+                    if recheck is not None and not recheck.done():
+                        recheck.cancel()
+                        await asyncio.wait([recheck])
             except BaseException:
                 pipeline.close()
                 raise

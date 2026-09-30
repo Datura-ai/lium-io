@@ -93,6 +93,7 @@ def _recheck_harness(monkeypatch, *, express: bool = False, miners=(MINER,)) -> 
     monkeypatch.setattr(harness.settings, "EXPRESS_LANE_ENABLED", express)
     monkeypatch.setattr(harness.settings, "RECHECK_ON_REQUEST_ENABLED", True)
     harness.miner_service.recheck_outcomes = {}
+    harness.miner_service.recheck_tasks = {}
     return harness
 
 
@@ -182,13 +183,15 @@ async def test_a_requested_node_is_rechecked_now_and_published_spec_only(
     (results, miner_hotkey, _), publish_kwargs = harness.miner_service.publish_machine_specs.await_args
     assert miner_hotkey == MINER and [r.executor_info.uuid for r in results] == [node]
     # the platform credits no uptime for a recheck: the cycle's own report does
-    assert publish_kwargs == {"recheck": True}
+    # one node under its own clock-based batch id: batch_total stays unset
+    assert publish_kwargs == {"recheck": True, "is_whole_miner_batch": False}
     assert results[0].scored_at is None and results[0].incentive is None
     # a known node: the lane's new-node bookkeeping is untouched, and the portal is not read
     assert await harness.redis_service.get_validated_executors() == set()
     harness.portal_api.get_all_executors.assert_not_awaited()
     assert await harness.redis_service.get_recheck_requests() == {}
     assert harness.miner_service.in_flight == {} and harness.miner_service.recheck_outcomes == {}
+    assert harness.miner_service.recheck_tasks == {}
     assert harness.lane.directories_in_use() == set()
 
     published = [r for r in caplog.records if r.getMessage() == RECHECK_PUBLISHED_EVENT]
@@ -424,6 +427,30 @@ async def test_a_recheck_that_raises_releases_everything(monkeypatch, wallet):
 
     harness.miner_service.publish_machine_specs.assert_not_awaited()
     assert harness.miner_service.in_flight == {} and harness.miner_service.recheck_outcomes == {}
+    assert harness.lane.directories_in_use() == set()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_recheck_releases_everything_and_publishes_nothing(monkeypatch, wallet):
+    """The wave cancels a recheck it stopped waiting for: the node, its outcome and the job files
+    are released, so the wave's own run is the only pipeline on the node."""
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch)
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+    harness.release.clear()
+
+    assert await harness.lane.tick() == 1
+    await asyncio.sleep(0)
+    recheck = harness.miner_service.recheck_tasks[node]
+    outcome = harness.miner_service.recheck_outcomes[node]
+    recheck.cancel()
+    await asyncio.wait([recheck])
+
+    assert recheck.cancelled()
+    assert outcome.done() and outcome.result() is None
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert harness.miner_service.in_flight == {} and harness.miner_service.recheck_outcomes == {}
+    assert harness.miner_service.recheck_tasks == {}
     assert harness.lane.directories_in_use() == set()
 
 
@@ -666,9 +693,9 @@ async def test_the_wave_runs_the_node_itself_when_the_recheck_produced_nothing(
 async def test_a_slow_recheck_leaves_the_wave_room_to_run_the_node_itself(
     rest_miner_service, monkeypatch
 ):
-    """The recheck outlasts the wave's wait and then produces nothing: the wave stops waiting at the
-    executor's budget minus the room a normal pass needs, runs the node's own pipeline, and leaves
-    the recheck running."""
+    """The recheck outlasts the wave's wait: the wave stops waiting at the executor's budget minus
+    the room a normal pass needs, cancels the recheck, and runs the node's own pipeline only once
+    the recheck has ended, so two pipelines never run on the node at once."""
     from core.config import settings
     from services.miner_service import executor_budget_seconds
 
@@ -682,20 +709,34 @@ async def test_a_slow_recheck_leaves_the_wave_room_to_run_the_node_itself(
     rest_miner_service.in_flight[node] = RECHECK_LANE
     rest_miner_service.miner_returns(node)
 
+    async def slow_recheck():
+        try:
+            await asyncio.sleep(60)
+        finally:  # what ExpressLane._recheck releases when it ends
+            rest_miner_service.release_recheck_claim(node, None)
+            rest_miner_service.recheck_tasks.pop(node, None)
+            outcome.set_result(None)
+
+    recheck = asyncio.create_task(slow_recheck())
+    rest_miner_service.recheck_tasks[node] = recheck
+    at_wave_start = []
+
+    async def create_task(miner_info, executor_info, **_):
+        at_wave_start.append((recheck.done(), rest_miner_service.in_flight[executor_info.uuid]))
+        return _job_result(executor_info.uuid)
+
+    rest_miner_service.task_service.create_task = AsyncMock(side_effect=create_task)
+
     started = time.monotonic()
     job = await asyncio.wait_for(_request(rest_miner_service), timeout=5)
     waited = time.monotonic() - started
 
     assert 1 <= waited < 3  # capped at 3 - 2 seconds, inside the 3-second budget
-    verified = [
-        c.kwargs["executor_info"].uuid
-        for c in rest_miner_service.task_service.create_task.call_args_list
-    ]
-    assert verified == [node]
+    assert recheck.cancelled()
+    assert at_wave_start == [(True, CYCLE_LANE)]  # the recheck ended before the wave's own run
     assert [r.executor_info.uuid for r in job["results"]] == [node]
     assert job["results"][0].job_batch_id == "2026-09-06 16:40:00"
-    assert not outcome.done()  # the recheck is not cancelled by the wave giving up
-    outcome.set_result(None)
+    assert rest_miner_service.recheck_tasks == {}
 
 
 @pytest.mark.asyncio
