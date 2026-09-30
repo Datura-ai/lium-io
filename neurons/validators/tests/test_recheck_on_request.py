@@ -433,7 +433,8 @@ async def test_a_recheck_that_raises_releases_everything(monkeypatch, wallet):
 @pytest.mark.asyncio
 async def test_a_cancelled_recheck_releases_everything_and_publishes_nothing(monkeypatch, wallet):
     """The wave cancels a recheck it stopped waiting for: the node, its outcome and the job files
-    are released, so the wave's own run is the only pipeline on the node."""
+    are released, so the wave's own run is the only pipeline on the node. The first cancel lands in
+    the recheck's Redis write, which can drop it."""
     node = str(uuid4())
     harness = _recheck_harness(monkeypatch)
     await harness.redis_service.queue_recheck_request(_request_for(node))
@@ -443,8 +444,7 @@ async def test_a_cancelled_recheck_releases_everything_and_publishes_nothing(mon
     await asyncio.sleep(0)
     recheck = harness.miner_service.recheck_tasks[node]
     outcome = harness.miner_service.recheck_outcomes[node]
-    recheck.cancel()
-    await asyncio.wait([recheck])
+    await asyncio.wait_for(harness.miner_service.stop_recheck(node), timeout=10)
 
     assert recheck.cancelled()
     assert outcome.done() and outcome.result() is None
@@ -737,6 +737,30 @@ async def test_a_slow_recheck_leaves_the_wave_room_to_run_the_node_itself(
     assert [r.executor_info.uuid for r in job["results"]] == [node]
     assert job["results"][0].job_batch_id == "2026-09-06 16:40:00"
     assert rest_miner_service.recheck_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_recheck_repeats_a_cancel_it_dropped(rest_miner_service):
+    """redis-py drops a cancel that lands inside a command; the next one ends the recheck."""
+    node = str(uuid4())
+    dropped = []
+
+    async def recheck_that_drops_a_cancel():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            dropped.append(True)
+        await asyncio.sleep(60)
+
+    recheck = asyncio.create_task(recheck_that_drops_a_cancel())
+    rest_miner_service.recheck_tasks[node] = recheck
+    await asyncio.sleep(0)
+
+    started = time.monotonic()
+    await asyncio.wait_for(rest_miner_service.stop_recheck(node), timeout=5)
+
+    assert recheck.cancelled() and dropped == [True]
+    assert time.monotonic() - started < 3
 
 
 @pytest.mark.asyncio

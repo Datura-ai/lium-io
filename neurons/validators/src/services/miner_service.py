@@ -252,6 +252,8 @@ RECHECK_LANE = "recheck"
 # seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
 # Kept in in_flight so the express lane does not run the same node a second time meanwhile.
 CYCLE_DONE = "cycle-done"
+# how long a wave waits for a recheck it cancelled to end before it runs the node anyway
+RECHECK_STOP_WAIT_SECONDS = 30
 
 
 def executor_budget_seconds() -> int:
@@ -415,10 +417,7 @@ class MinerService:
                             extra=get_extra_info({"executor_uuid": executor_id, "waited_s": wait_seconds}),
                         )
                     )
-                    recheck = self.recheck_tasks.get(executor_id)
-                    if recheck is not None and not recheck.done():
-                        recheck.cancel()
-                        await asyncio.wait([recheck])
+                    await self.stop_recheck(executor_id)
             except BaseException:
                 pipeline.close()
                 raise
@@ -429,6 +428,16 @@ class MinerService:
                 # the recheck handed the node back; the wave holds it for its own run
                 self.in_flight[executor_id] = CYCLE_LANE
         return await pipeline
+
+    async def stop_recheck(self, executor_id: str) -> None:
+        """Cancel the recheck running on the node and wait until it has ended, at most
+        RECHECK_STOP_WAIT_SECONDS. redis-py drops a cancel that lands inside a command, so the
+        cancel is repeated every second."""
+        recheck = self.recheck_tasks.get(executor_id)
+        deadline = time.monotonic() + RECHECK_STOP_WAIT_SECONDS
+        while recheck is not None and not recheck.done() and time.monotonic() < deadline:
+            recheck.cancel()
+            await asyncio.wait([recheck], timeout=1)
 
     def forget_cycle_done(self) -> None:
         """Called by the cycle right after it recorded its published executors as validated."""
