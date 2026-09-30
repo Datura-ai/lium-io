@@ -1994,7 +1994,7 @@ def get_machine_specs():
     if not data.get("data_gpu", {}).get("gpu_details", []):
         print(json.dumps({"error": "no_gpu_details", "data": data}))
         # the key the success payload derives from gpu_details[0], spelled out because there is no card to
-        # read it from; the validator acts on a report only through this sealed copy of it
+        # read it from; the validator resets a rented node only on this sealed copy of the report
         no_gpu_key = "".join([
             "gpu.name", "gpu.uuid", "gpu.capacity", "gpu.memory_used_mb", "gpu.cuda", "gpu.power_limit",
             "gpu.power_default_limit", "gpu.power_min_limit", "gpu.power_max_limit", "gpu.graphics_speed",

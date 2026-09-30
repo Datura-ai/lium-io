@@ -130,8 +130,10 @@ def _scrape_reported_its_own_failure(stdout: str) -> bool:
 
 
 def _sealed_scrape_error_report(ctx: Context, stdout: str) -> dict[str, Any] | None:
-    # the scrape prints its failure report twice: plain JSON, which anything that controls the executor's
-    # interpreter can print too, and a Fernet token of it under the cycle's key. Only the token is ours.
+    # the scrape prints its failure report twice: plain JSON, which any print in the executor's image can
+    # imitate, and a Fernet token of it under the cycle's key. The token carries the same trust as the spec
+    # payload's: a stray print, another cycle's token or a replayed payload fails it, but the key is in the
+    # shipped source, so a provider who extracts it can seal a report as he can a spec payload.
     try:
         report = json.loads(_decrypt_payload(ctx, stdout))
     except (InvalidToken, ValueError):
@@ -226,7 +228,7 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
     It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
     and billing stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
     (penalty_trigger.py SCRAPE_FAILURE_REASONS), which holds both codes here. A node without a customer pod keeps
-    the plain halt, and so does a report without the scrape's sealed copy: plain JSON on stdout is forgeable.
+    the plain halt, and so does a report without the scrape's sealed copy (see _sealed_scrape_error_report).
     """
     if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
         return {}
