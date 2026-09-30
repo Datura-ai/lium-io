@@ -73,17 +73,10 @@ class VerifyXSettings(BaseSettings):
     # When LIBRARY_REFRESH_ENABLED is on and the executor's libverifyx.so hash does not
     # match, curl this URL once, install, check the hash, and retry. The validator's own
     # file is the source of truth if the fetch hash differs. Off by default: a mismatch
-    # does not write /usr/lib on the provider host. The same switch covers libinspector.so
-    # (INSPECTOR_LIBRARY_FETCH_URL), which is installed only when the fetched hash matches.
-    # That refresh runs on RENTED executors, during the rental (the Inspector check), while the
-    # libverifyx.so one runs only on unrented executors: turning this on also allows root writes
-    # to /usr/lib on rented hosts.
+    # does not write /usr/lib on the provider host.
     LIBRARY_REFRESH_ENABLED: bool = Field(
         default=False,
-        description=(
-            "If true, a libverifyx.so or libinspector.so hash mismatch may replace the "
-            "library in /usr/lib on the executor"
-        ),
+        description="If true, a libverifyx.so hash mismatch may replace /usr/lib/libverifyx.so on the executor",
     )
     LIBRARY_FETCH_URL: str = Field(
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libverifyx.so",
@@ -274,13 +267,20 @@ class Settings(BaseSettings):
     # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
     # the inspector event, no renter is told, the score is untouched.
     INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
-    # The libinspector.so sibling of VERIFYX_LIBRARY_FETCH_URL, under the same switch
-    # (VERIFYX_LIBRARY_REFRESH_ENABLED): on a hash mismatch a RENTED executor, during the rental,
-    # curls this once into a temp file beside /usr/lib/libinspector.so, and the file replaces
-    # the library (one rename) only if its sha256 is the validator's own libinspector.so.
+    # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
+    # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
+    # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
+    # root write to /usr/lib on a renter's host, so it has its own switch, off by default and
+    # independent of VERIFYX_LIBRARY_REFRESH_ENABLED (which covers only unrented executors).
+    INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
+    # Pinned to a commit whose neurons/executor/libinspector.so is the validator's build; a URL on
+    # main would start serving a different file with the next library bump.
     INSPECTOR_LIBRARY_FETCH_URL: str = Field(
-        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
-        description="Raw GitHub URL the executor curls when library refresh is on and the libinspector.so hash does not match",
+        default=(
+            "https://raw.githubusercontent.com/Datura-ai/lium-io/"
+            "38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
+        ),
+        description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin

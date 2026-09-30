@@ -18,7 +18,7 @@ from neurons.validators.src.services.inspector_validation_service import (
 from neurons.validators.src.services.task.messages import InspectorMessages as Msg
 
 
-FETCH_URL = "https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so"
+FETCH_URL = "https://raw.githubusercontent.com/Datura-ai/lium-io/38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
 VALIDATOR_SHA256 = "abc123"
 
 
@@ -26,6 +26,7 @@ VALIDATOR_SHA256 = "abc123"
 def enable_collector_ensure(monkeypatch):
     fake_settings = SimpleNamespace(
         INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK=True,
+        INSPECTOR_LIBRARY_REFRESH_ENABLED=False,
         INSPECTOR_LIBRARY_FETCH_URL=FETCH_URL,
         verifyx=SimpleNamespace(LIBRARY_REFRESH_ENABLED=False),
     )
@@ -342,12 +343,9 @@ async def test_validate_rented_executor_returns_lib_mismatch_without_ssh_process
     assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
     assert result.diagnostics["local_sha256"] == "abc123"
     assert result.diagnostics["executor_sha256"] == "different"
-    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_MISMATCH_NO_REFRESH"
     assert ssh.command == ""
     assert shell.remote_checksum_calls == 1
     assert shell.scp_checksum_calls == 0
-    # the switch is off: nothing is run on the executor, so /usr/lib is never written
-    assert shell.ssh_client.commands == []
 
 
 @pytest.mark.asyncio
@@ -627,8 +625,8 @@ async def test_validate_rented_executor_marks_the_shell_checksum_unattested():
     assert result.diagnostics["sensor_integrity"] == "shell_sha256_unattested"
 
 
-# Library refresh for libinspector.so: the libverifyx.so mechanism, under the same
-# VERIFYX_LIBRARY_REFRESH_ENABLED switch, fetching INSPECTOR_LIBRARY_FETCH_URL.
+# Library refresh for libinspector.so: the libverifyx.so mechanism on RENTED hosts, under its own
+# INSPECTOR_LIBRARY_REFRESH_ENABLED switch, fetching INSPECTOR_LIBRARY_FETCH_URL.
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 STALE_SHA256 = "different"
@@ -708,7 +706,7 @@ class LocalExecutor:
 
 @pytest.fixture
 def refresh_on(enable_collector_ensure):
-    enable_collector_ensure.verifyx.LIBRARY_REFRESH_ENABLED = True
+    enable_collector_ensure.INSPECTOR_LIBRARY_REFRESH_ENABLED = True
     return enable_collector_ensure
 
 
@@ -759,24 +757,26 @@ async def _validate(shell, ssh: FakeSSH | None = None, service: InspectorValidat
     )
 
 
-def test_library_refresh_is_off_by_default_and_fetches_the_executors_libinspector_so():
+def test_both_refresh_switches_are_off_by_default_and_the_fetch_url_is_pinned():
     assert VerifyXSettings.model_fields["LIBRARY_REFRESH_ENABLED"].default is False
-    default_url = Settings.model_fields["INSPECTOR_LIBRARY_FETCH_URL"].default
-    assert default_url == FETCH_URL
-    # the default URL serves the executor's copy, which is the validator's file byte for byte
-    shipped = REPO / "neurons/executor/libinspector.so"
-    assert shipped.read_bytes() == (REPO / "neurons/validators/libinspector.so").read_bytes()
+    assert Settings.model_fields["INSPECTOR_LIBRARY_REFRESH_ENABLED"].default is False
+    assert Settings.model_fields["INSPECTOR_LIBRARY_FETCH_URL"].default == FETCH_URL
+    # FETCH_URL's commit holds executor/libinspector.so as git blob 8d5383a4: the validator's
+    # file must be that blob, so a library bump fails here until the pin moves with it
+    data = (REPO / "neurons/validators/libinspector.so").read_bytes()
+    assert hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() == "8d5383a40853f072139714023c25c148171aced1"
 
 
 @pytest.mark.asyncio
-async def test_refresh_on_and_hash_match_runs_nothing_on_the_executor(refresh_on):
+async def test_the_shared_verifyx_switch_on_writes_nothing_on_a_rented_host(enable_collector_ensure):
+    # prod sets VERIFYX_LIBRARY_REFRESH_ENABLED=true and leaves INSPECTOR_LIBRARY_REFRESH_ENABLED unset
+    enable_collector_ensure.verifyx.LIBRARY_REFRESH_ENABLED = True
+    enable_collector_ensure.INSPECTOR_LIBRARY_REFRESH_ENABLED = Settings.model_fields["INSPECTOR_LIBRARY_REFRESH_ENABLED"].default
     shell = refreshing_executor()
-    shell.sha256 = VALIDATOR_SHA256
     result = await _validate(shell)
-    assert result.error is None
-    assert shell.ssh_client.commands == []
-    assert "library_refresh" not in result.diagnostics
-    assert shell.remote_checksum_calls == 1
+    assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
+    assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_MISMATCH_NO_REFRESH"
+    assert shell.ssh_client.commands == []  # no write check, no curl, no rename: /usr/lib untouched
 
 
 @needs_shell_tools
@@ -836,19 +836,20 @@ async def test_a_failed_fetch_installs_nothing_and_is_logged(local_library, capl
 
 @needs_shell_tools
 @pytest.mark.asyncio
-async def test_a_dropped_ssh_session_removes_the_download(local_library):
+@pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGPIPE])
+async def test_a_dropped_ssh_session_removes_the_download(local_library, sig):
     stalled = local_library.source.with_name("stalled.so")
-    os.mkfifo(stalled)  # curl blocks opening it: a download in flight
+    os.mkfifo(stalled)
+    writer = os.open(stalled, os.O_RDWR)  # held open with no data: curl's read blocks, a download in flight
     proc = await asyncio.create_subprocess_exec(
         "/bin/sh", "-c", local_library.service._install_command(stalled.as_uri()),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
     )
-    for _ in range(250):
-        if local_library.leftovers():
-            break
-        await asyncio.sleep(0.02)
+    assert (await asyncio.wait_for(proc.stdout.readline(), 10)).startswith(b"TMP:")  # traps are set
     assert local_library.leftovers(), "the temp file exists while the download runs"
-    os.killpg(proc.pid, signal.SIGHUP)  # what the session's processes get when SSH drops
+    # SSH drop: SIGHUP to the session's processes, or SIGPIPE to the shell at its next echo
+    os.killpg(proc.pid, sig) if sig == signal.SIGHUP else os.kill(proc.pid, sig)
+    os.close(writer)  # curl reads EOF and ends; a trapped signal runs its trap then
     await asyncio.wait_for(proc.communicate(), 10)
     assert local_library.leftovers() == []
     assert local_library.lib.read_bytes() == STALE_BYTES
@@ -884,7 +885,7 @@ async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, f
     [
         (lambda: refreshing_executor(install_stdout="TMP:/usr/lib/.x\nCURL_RC:0\nSHA256:sha256sum: not found\n"),
          "FETCH_FAILED", "fetch_error", "fetched sha256 None != validator {sha}", 1),
-        (lambda: refreshing_executor(install_raises=OSError("connection reset")),
+        (lambda: refreshing_executor(install_raises=OSError("connection reset " + "x" * 5000)),
          "FETCH_FAILED", "fetch_error", "OSError: connection reset", 1),
         (lambda: refreshing_executor(writable=False), "WRITE_DENIED", "error",
          "Executor libinspector.so hash mismatch and /usr/lib is not writable", 1),
@@ -905,7 +906,7 @@ async def test_a_refresh_that_does_not_end_on_the_validators_hash_fails_the_chec
     assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
     assert result.diagnostics["library_refresh"] == f"INSPECTOR_LIBRARY_{outcome}"
     detail = result.error if field == "error" else result.diagnostics[field]
-    assert detail.startswith(expected.format(sha=full_sha_validator))
+    assert detail.startswith(expected.format(sha=full_sha_validator)) and len(detail) <= 420  # peer text is capped
     assert _kinds(shell) == (["write-check"] if outcome == "WRITE_DENIED" else ["write-check", "install"])
     assert shell.remote_checksum_calls == checksum_calls
     assert ssh.command == ""

@@ -294,7 +294,8 @@ class InspectorValidationService:
     ) -> InspectorValidationResponse | None:
         """None once the executor holds the validator's libinspector.so, else the mismatch failure.
 
-        With VERIFYX_LIBRARY_REFRESH_ENABLED off nothing is written. On, one write check, one
+        With INSPECTOR_LIBRARY_REFRESH_ENABLED off nothing is written, whatever
+        VERIFYX_LIBRARY_REFRESH_ENABLED says. On, one write check, one
         fetch of INSPECTOR_LIBRARY_FETCH_URL (installed only when its sha256 is the validator's)
         and one re-read of the executor's hash; no retry.
         """
@@ -307,7 +308,7 @@ class InspectorValidationService:
             "Executor using outdated libinspector library. "
             "Run docker compose restart to update to the latest executor image"
         )
-        if not settings.verifyx.LIBRARY_REFRESH_ENABLED:
+        if not settings.INSPECTOR_LIBRARY_REFRESH_ENABLED:
             return self._failure_response(
                 error=outdated,
                 message=Msg.FAILED_LIB_MISMATCH,
@@ -370,8 +371,8 @@ class InspectorValidationService:
         lib_dir, lib_name = os.path.split(self.lib_path)
         template = shlex.quote(os.path.join(lib_dir, f".{lib_name}.XXXXXX"))
         return (
-            f"tmp=$(mktemp {template}) || {{ echo MKTEMP_FAILED; exit 0; }}; echo TMP:$tmp; "
-            "trap 'rm -f -- \"$tmp\"' EXIT; trap 'exit 1' HUP INT TERM; "
+            f"tmp=$(mktemp {template}) || {{ echo MKTEMP_FAILED; exit 0; }}; "
+            "trap 'rm -f -- \"$tmp\"' EXIT; trap 'exit 1' HUP INT TERM PIPE; echo TMP:$tmp; "
             f"curl -fsSL --max-time 60 -o \"$tmp\" {shlex.quote(url)}; rc=$?; echo CURL_RC:$rc; "
             "got=$(sha256sum < \"$tmp\" | cut -d' ' -f1); echo SHA256:$got; "
             f"if [ \"$rc\" -eq 0 ] && [ \"$got\" = {shlex.quote(self.local_checksum)} ]; then "
@@ -432,7 +433,7 @@ class InspectorValidationService:
         try:
             result = await shell.ssh_client.run(command, timeout=timeout)
         except Exception as exc:
-            return _ShellCapture(transport_error=f"{type(exc).__name__}: {exc}")
+            return _ShellCapture(transport_error=f"{type(exc).__name__}: {str(exc)[:400]}")
         if result is None:
             return _ShellCapture(transport_error="SSH command returned no result")
         return _ShellCapture(
