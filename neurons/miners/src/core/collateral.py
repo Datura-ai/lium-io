@@ -71,6 +71,10 @@ GAS_LIMIT = 200_000
 # cannot spend the address balance on fees (at GAS_LIMIT, 100 gwei caps a transaction at 0.02 TAO).
 DEFAULT_MAX_GAS_PRICE_GWEI = 100
 RECLAIM_LOOKBACK_BLOCKS = 1000
+# A receipt's block counts as final only once it is linked by parent hashes to the finalized block, which takes one
+# read per block in between; a receipt further back than this is left to the explorer (about a day of blocks).
+FINALITY_CHECK_MAX_BLOCKS = 7200
+CHAIN_READ_BATCH = 50
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 
 SS58_FORMAT = 42
@@ -165,12 +169,17 @@ class CollateralClient:
         miner_key: str | None = None,
         max_gas_price_gwei: float = DEFAULT_MAX_GAS_PRICE_GWEI,
         sent_record_path: str | os.PathLike | None = None,
+        other_contract_addresses: tuple[str, ...] = (),
     ):
         self.network = network
         self.sent_record_path = pathlib.Path(sent_record_path or SENT_RECORD_PATH).expanduser()
         self.max_gas_price_gwei = max_gas_price_gwei
         self.rpc_url = rpc_url or RPC_URLS.get(network)
         self.contract_address = AsyncWeb3.to_checksum_address(contract_address)
+        # the record is per key, not per contract: a replacement may be for a send to another contract version
+        self.replaceable_contract_addresses = {
+            self.contract_address, *(AsyncWeb3.to_checksum_address(address) for address in other_contract_addresses)
+        }
         self.miner_account = Account.from_key(miner_key) if miner_key else None
         self.miner_address = self.miner_account.address if self.miner_account else None
         self._w3 = None
@@ -393,19 +402,54 @@ class CollateralClient:
             )
 
     async def _finalized_on_chain(self, tx_hash: str, receipt) -> bool:
-        """Whether the receipt's block is finalized and is the chain's block at its number. Waits for finality;
-        raises while it has not come, so no record is cleared on a receipt a reorganization can still drop."""
+        """Whether the receipt's block is an ancestor of the finalized block. Waits for finality; raises while it
+        has not come, so no record is cleared on a receipt a reorganization can still drop."""
         number = receipt["blockNumber"]
         deadline = asyncio.get_running_loop().time() + RECEIPT_TIMEOUT_SEC
-        while (await self.w3.eth.get_block("finalized"))["number"] < number:
+        while (finalized := await self.w3.eth.get_block("finalized"))["number"] < number:
             if asyncio.get_running_loop().time() >= deadline:
                 raise CollateralOutcomeUnknownError(
                     f"Transaction {tx_hash} is in block {number}, which is not finalized yet, so its outcome is "
                     f"not settled; no transaction was sent. {RETRY_IS_SAFE}"
                 )
             await asyncio.sleep(RECEIPT_POLL_SEC)
-        # every node serves the same finalized block at a number, so this read cannot come from another fork
-        return same_hash((await self.w3.eth.get_block(number))["hash"], receipt["blockHash"])
+        if finalized["number"] - number > FINALITY_CHECK_MAX_BLOCKS:
+            raise CollateralOutcomeUnknownError(
+                f"Transaction {tx_hash} is in block {number}, more than {FINALITY_CHECK_MAX_BLOCKS} blocks before "
+                "the finalized block, too far back to check that block against it, so its outcome is unknown; no "
+                "transaction was sent. Look the transaction up on the explorer and, once you know its outcome, "
+                f"delete {self.sent_record_path} and run this again if it still needs doing"
+            )
+        hashes = await self._canonical_hashes(finalized, number)
+        if hashes is None:
+            raise CollateralOutcomeUnknownError(
+                f"The chain from the finalized block down to block {number} of transaction {tx_hash} could not be "
+                f"read, so its outcome is unknown; no transaction was sent. {RETRY_IS_SAFE}"
+            )
+        return same_hash(hashes[number], receipt["blockHash"])
+
+    async def _canonical_hashes(self, finalized, lowest: int) -> dict[int, str] | None:
+        """The hash at each number from `lowest` up to the finalized block, following parent hashes down from it,
+        or None when that chain cannot be read. A load-balanced RPC can answer a read by number from a backend on
+        another fork, even at a finalized number; a block read by hash is that block on any backend, so a numeric
+        answer counts only when it is the parent of the block above, and one that is not is read again by hash."""
+        top = finalized["number"]
+        hashes = {top: finalized["hash"]}
+        parent = finalized["parentHash"]
+        for high in range(top - 1, lowest - 1, -CHAIN_READ_BATCH):
+            numbers = range(high, max(high - CHAIN_READ_BATCH, lowest - 1), -1)
+            blocks = await asyncio.gather(*(self.w3.eth.get_block(number) for number in numbers))
+            for number, block in zip(numbers, blocks):
+                if not same_hash(block["hash"], parent):
+                    try:
+                        block = await self.w3.eth.get_block(parent)
+                    except Exception:
+                        return None
+                if not same_hash(block["hash"], parent) or block["number"] != number:
+                    return None
+                hashes[number] = block["hash"]
+                parent = block["parentHash"]
+        return hashes
 
     @staticmethod
     def _orphaned(tx_hash: str, receipt) -> CollateralOutcomeUnknownError:
@@ -521,7 +565,8 @@ class CollateralClient:
 
         The record sits in a directory the miner service can write, so a replacement never copies a field from it
         unchecked: the bytes must hash to the recorded hash, recover to this key's address, carry the recorded
-        nonce and this chain, and call a function this client sends on the configured contract with no value."""
+        nonce and this chain, and call a function this client sends on a configured collateral contract with no
+        value."""
 
         def refuse(why: str) -> CollateralTransactionError:
             return CollateralTransactionError(
@@ -547,8 +592,8 @@ class CollateralClient:
         v = int.from_bytes(fields[6], "big")
         if v < 35 or (v - 35) // 2 != chain_id:
             raise refuse(f"it is not signed for chain {chain_id}")
-        if earlier["to"] != self.contract_address:
-            raise refuse("it is not sent to the collateral contract")
+        if earlier["to"] not in self.replaceable_contract_addresses:
+            raise refuse("it is not sent to a configured collateral contract")
         if earlier["value"] != 0:
             raise refuse("it sends value")
         if earlier["gas"] > GAS_LIMIT:
@@ -719,31 +764,48 @@ class CollateralClient:
     async def get_reclaim_events(self) -> list[ReclaimRequest]:
         """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS finalized blocks.
 
-        The logs and each request's state are read at the finalized block's number. Every node serves the same
-        block at a finalized number, so a load-balanced RPC whose backends follow different forks at the head
-        still answers each read from one block; a request started after it is listed once its block is final.
-        The list is also kept only if that number still has the same block hash afterwards."""
+        A load-balanced RPC can answer any read by number from a backend on another fork, so each request's state
+        is read at the finalized block's hash, and the logs are kept only when every one of them is in a block
+        linked by parent hashes to that block. A request started after it is listed once its block is final."""
         for _ in range(RECLAIM_LIST_ATTEMPTS):
-            head = await self.w3.eth.get_block("finalized")
-            requests = await self._reclaim_events_at(head["number"])
-            if same_hash((await self.w3.eth.get_block(head["number"]))["hash"], head["hash"]):
+            finalized = await self.w3.eth.get_block("finalized")
+            requests = await self._reclaim_events_at(finalized)
+            if requests is not None:
                 return requests
         raise CollateralTransactionError(
-            f"The chain reorganized while the open reclaim requests were read, {RECLAIM_LIST_ATTEMPTS} times; "
-            "run this again"
+            f"The RPC answered the open reclaim requests from blocks that are not on the finalized chain, "
+            f"{RECLAIM_LIST_ATTEMPTS} times; run this again"
         )
 
-    async def _reclaim_events_at(self, latest_block: int) -> list[ReclaimRequest]:
-        logs = await self.contract.events.ReclaimProcessStarted().get_logs(
-            fromBlock=max(latest_block - RECLAIM_LOOKBACK_BLOCKS, 0), toBlock=latest_block
+    async def _reclaim_at_block_hash(self, reclaim_request_id: int, block_hash) -> tuple:
+        """reclaims(id) at a block named by its hash. A contract function's call(block_identifier=<hash>) looks the
+        hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash."""
+        function = self.contract.functions.reclaims(reclaim_request_id)
+        result = await self.w3.eth.call(
+            {"to": self.contract_address, "data": function._encode_transaction_data()},
+            block_identifier={"blockHash": AsyncWeb3.to_hex(block_hash)},
         )
+        outputs = [output["type"] for output in function.abi["outputs"]]
+        return tuple(self.w3.codec.decode(outputs, result))
+
+    async def _reclaim_events_at(self, finalized) -> list[ReclaimRequest] | None:
+        """The open requests at the finalized block, or None when a log is not on its chain."""
+        top = finalized["number"]
+        logs = await self.contract.events.ReclaimProcessStarted().get_logs(
+            fromBlock=max(top - RECLAIM_LOOKBACK_BLOCKS, 0), toBlock=top
+        )
+        logs = [log for log in logs if not log.get("removed")]
+        if any(log["blockNumber"] > top for log in logs):
+            return None
+        if logs:
+            hashes = await self._canonical_hashes(finalized, min(log["blockNumber"] for log in logs))
+            if hashes is None or not all(same_hash(hashes[log["blockNumber"]], log["blockHash"]) for log in logs):
+                return None
         requests = []
         for log in logs:
-            if log.get("removed"):
-                continue
             reclaim_request_id = log["args"]["reclaimRequestId"]
             executor_id, miner, amount, expiration_time = (
-                await self.contract.functions.reclaims(reclaim_request_id).call(block_identifier=latest_block)
+                await self._reclaim_at_block_hash(reclaim_request_id, finalized["hash"])
             )[:4]
             if amount == 0:
                 continue

@@ -110,6 +110,7 @@ def get_collateral_contract(
         miner_key=miner_key,
         max_gas_price_gwei=settings.COLLATERAL_MAX_GAS_PRICE_GWEI,
         sent_record_path=settings.COLLATERAL_SENT_RECORD,
+        other_contract_addresses=tuple(entry["address"] for entry in settings.CONTRACT_VERSIONS.values()),
     )
 
 
