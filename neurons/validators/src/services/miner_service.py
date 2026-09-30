@@ -353,7 +353,8 @@ class MinerService:
         """The express lane asked the miner for one executor; run the pipeline on that one only.
         A miner that answers with more (an old miner ignoring the filter, or a misbehaving one)
         would otherwise get every extra executor verified here, concurrently with the wave that
-        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958)."""
+        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958).
+        Repeats of the requested uuid are dropped too: each entry would start its own pipeline."""
         requested = [executor for executor in executors if executor.uuid == executor_id]
         if len(requested) != len(executors):
             logger.warning(
@@ -368,7 +369,7 @@ class MinerService:
                     ),
                 )
             )
-        return requested
+        return self._first_entry_per_uuid(requested, default_extra)
 
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
