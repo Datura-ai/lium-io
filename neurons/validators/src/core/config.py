@@ -272,6 +272,8 @@ class Settings(BaseSettings):
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
     # root write to /usr/lib on a renter's host, so it has its own switch, off by default and
     # independent of VERIFYX_LIBRARY_REFRESH_ENABLED (which covers only unrented executors).
+    # Off stops later replacements and undoes none; restoring the replaced file (its hash is
+    # previous_sha256 in INSPECTOR_LIBRARY_REPLACED) is in .env.template.
     INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
     # Pinned to a commit whose neurons/executor/libinspector.so is the validator's build; a URL on
     # main would start serving a different file with the next library bump.

@@ -642,7 +642,7 @@ def _ok(stdout: str = "", stderr: str = "", exit_status: int = 0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, exit_status=exit_status)
 
 
-def _install_stdout(sha: str, *, curl_rc: int = 0, mv_rc: int | None = 0) -> str:
+def _install_stdout(sha: str, *, curl_rc: int = 0, mv_rc: int | str | None = 0) -> str:
     out = f"TMP:/usr/lib/.libinspector.so.AbC123\nCURL_RC:{curl_rc}\nSHA256:{sha}\n"
     return out + (f"MV_RC:{mv_rc}\n" if mv_rc is not None else "")
 
@@ -781,14 +781,19 @@ async def test_the_shared_verifyx_switch_on_writes_nothing_on_a_rented_host(enab
 
 @needs_shell_tools
 @pytest.mark.asyncio
-async def test_mismatch_fetches_installs_by_rename_and_the_check_passes(local_library):
+async def test_mismatch_fetches_installs_by_rename_and_the_check_passes(local_library, caplog):
     shell = LocalExecutor()
     ssh = FakeSSH()
     old_inode = local_library.lib.stat().st_ino
-    result = await _validate(shell, ssh, local_library.service)
+    with caplog.at_level("WARNING"):
+        result = await _validate(shell, ssh, local_library.service)
     assert result.error is None
     assert result.report is not None
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_REPLACED"
+    previous = hashlib.sha256(STALE_BYTES).hexdigest()
+    assert result.diagnostics["previous_sha256"] == previous
+    [replaced] = [r for r in caplog.records if "INSPECTOR_LIBRARY_REPLACED" in r.getMessage()]
+    assert replaced.msg.extra["previous_sha256"] == previous
     assert _kinds(shell) == ["write-check", "install"]
     assert local_library.lib.read_bytes() == local_library.source.read_bytes()
     # a rename puts a new inode at the path; a copy would have rewritten the old one in place
@@ -891,9 +896,15 @@ async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, f
         (lambda: refreshing_executor(install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc=1)),
          "FETCH_FAILED", "fetch_error", "mv exit 1", 1),
         (lambda: refreshing_executor(installs_as="e" * 64), "STILL_MISMATCHED", "executor_sha256", "e" * 64, 2),
+        (lambda: refreshing_executor(install_stdout=f"TMP:/usr/lib/.x\nCURL_RC:{'9' * 5000}\nSHA256:{VALIDATOR_SHA256:0>64}\n"),
+         "FETCH_FAILED", "fetch_error", "curl exit None: ", 1),
+        (lambda: refreshing_executor(install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc="0 " + "x" * 5000)),
+         "FETCH_FAILED", "fetch_error", "mv exit None: ", 1),
+        (lambda: refreshing_executor(install_stdout=_install_stdout("", curl_rc=22), install_stderr="y" * 100_000),
+         "FETCH_FAILED", "fetch_error", "curl exit 22: ", 1),
     ],
     ids=["hash-marker-not-a-sha256", "transport-error", "read-only-usr-lib", "mktemp-fails", "rename-fails",
-         "still-mismatched-after-install"],
+         "still-mismatched-after-install", "curl-rc-not-a-number", "mv-rc-not-a-number", "long-stderr"],
 )
 async def test_a_refresh_that_does_not_end_on_the_validators_hash_fails_the_check(
     refresh_on, full_sha_validator, executor, outcome, field, expected, checksum_calls
@@ -907,6 +918,13 @@ async def test_a_refresh_that_does_not_end_on_the_validators_hash_fails_the_chec
     assert _kinds(shell) == (["write-check"] if outcome == "WRITE_DENIED" else ["write-check", "install"])
     assert shell.remote_checksum_calls == checksum_calls
     assert ssh.command == ""
+
+
+@pytest.mark.asyncio
+async def test_the_hosts_output_is_capped_when_captured():
+    shell = FakeShell(sha256=STALE_SHA256, respond=lambda _command: _ok("S" * 1_000_000, "E" * 1_000_000))
+    capture = await InspectorValidationService._run_shell_command(shell, "anything", timeout=1)
+    assert len(capture.stdout) == len(capture.stderr) == 4096
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 INSPECTOR_LIB_PATH = "/usr/lib/libinspector.so"
 _SHA256_RX = re.compile(r"[0-9a-f]{64}")
+# an exit status is 0-255; anything else in a CURL_RC / MV_RC marker is the host's text, not curl's or mv's
+_EXIT_CODE_RX = re.compile(r"[0-9]{1,3}")
+# the refresh command's output is the host's: at most this much of each stream is kept, and at most
+# _REFRESH_DETAIL_CHARS of it reaches a published fetch_error
+_REFRESH_CAPTURE_MAX_CHARS = 4096
+_REFRESH_DETAIL_CHARS = 400
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 30
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
@@ -46,6 +52,14 @@ class _ShellCapture(NamedTuple):
     stderr: str = ""
     exit_status: int | None = None
     transport_error: str | None = None
+
+
+def _exit_code_or_none(value: str | None) -> str | None:
+    return value if value is not None and _EXIT_CODE_RX.fullmatch(value) else None
+
+
+def _sha256_or_none(value: str | None) -> str | None:
+    return value if value and _SHA256_RX.fullmatch(value) else None
 
 
 class InspectionFailed(Exception):
@@ -241,6 +255,7 @@ class InspectorValidationService:
                     if failure is not None:
                         return failure
                     diagnostics["library_refresh"] = "INSPECTOR_LIBRARY_REPLACED"
+                    diagnostics["previous_sha256"] = _sha256_or_none(executor_checksum)
 
             validator = InspectorValidator(self.inspector_lib)
             validator.start_session()
@@ -325,7 +340,7 @@ class InspectorValidationService:
                 diagnostics={**mismatch, "library_refresh": "INSPECTOR_LIBRARY_WRITE_DENIED"},
                 default_extra=default_extra,
             )
-        fetch_error = await self._refresh_executor_library(shell, default_extra)
+        fetch_error = await self._refresh_executor_library(shell, executor_checksum, default_extra)
         if fetch_error is not None:
             return self._failure_response(
                 error=outdated,
@@ -379,35 +394,47 @@ class InspectorValidationService:
             f"chmod 644 \"$tmp\" && mv -f -- \"$tmp\" {shlex.quote(self.lib_path)}; echo MV_RC:$?; fi"
         )
 
-    async def _refresh_executor_library(self, shell, default_extra: dict[str, Any]) -> str | None:
+    async def _refresh_executor_library(
+        self, shell, previous_sha256: str, default_extra: dict[str, Any]
+    ) -> str | None:
         """Curl INSPECTOR_LIBRARY_FETCH_URL once and install it only if its sha256 is the
-        validator's. Returns None when installed, else why not (also logged)."""
+        validator's. Returns None when installed, else why not (also logged). The replacement's
+        log line carries the hash of the library it replaced."""
         url = settings.INSPECTOR_LIBRARY_FETCH_URL
         capture = await self._run_shell_command(shell, self._install_command(url), timeout=90)
         markers: dict[str, str] = {}
         for line in capture.stdout.splitlines():
             key, sep, value = line.partition(":")
-            if sep and key in ("TMP", "CURL_RC", "SHA256", "MV_RC"):
+            if sep and key in ("CURL_RC", "SHA256", "MV_RC"):
                 markers[key] = value.strip()
         fetched_sha = markers.get("SHA256", "")
         if not _SHA256_RX.fullmatch(fetched_sha):
             fetched_sha = ""
+        curl_rc, mv_rc = (_exit_code_or_none(markers.get(key)) for key in ("CURL_RC", "MV_RC"))
+        detail = _REFRESH_DETAIL_CHARS
 
         if capture.transport_error is not None:
             fetch_error = capture.transport_error
         elif "MKTEMP_FAILED" in capture.stdout.splitlines():
-            fetch_error = f"mktemp next to {self.lib_path} failed: {capture.stderr[-400:]}"
-        elif markers.get("CURL_RC") != "0":
-            fetch_error = f"curl exit {markers.get('CURL_RC')}: {(capture.stderr or capture.stdout)[-400:]}"
+            fetch_error = f"mktemp next to {self.lib_path} failed: {capture.stderr[-detail:]}"
+        elif curl_rc != "0":
+            fetch_error = f"curl exit {curl_rc}: {(capture.stderr or capture.stdout)[-detail:]}"
         elif fetched_sha != self.local_checksum:
             fetch_error = f"fetched sha256 {fetched_sha or None} != validator {self.local_checksum}"
-        elif markers.get("MV_RC") != "0":
-            fetch_error = f"mv exit {markers.get('MV_RC')}: {capture.stderr[-400:]}"
+        elif mv_rc != "0":
+            fetch_error = f"mv exit {mv_rc}: {capture.stderr[-detail:]}"
         else:
             logger.warning(
                 _m(
                     "INSPECTOR_LIBRARY_REPLACED",
-                    extra=get_extra_info({**default_extra, "sha256": fetched_sha, "url": url}),
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "sha256": fetched_sha,
+                            "previous_sha256": _sha256_or_none(previous_sha256),
+                            "url": url,
+                        }
+                    ),
                 )
             )
             return None
@@ -433,12 +460,13 @@ class InspectorValidationService:
         try:
             result = await shell.ssh_client.run(command, timeout=timeout)
         except Exception as exc:
-            return _ShellCapture(transport_error=f"{type(exc).__name__}: {str(exc)[:400]}")
+            return _ShellCapture(transport_error=f"{type(exc).__name__}: {str(exc)[:_REFRESH_DETAIL_CHARS]}")
         if result is None:
             return _ShellCapture(transport_error="SSH command returned no result")
+        # the markers come first on stdout, and the reason a command failed is at the end of stderr
         return _ShellCapture(
-            stdout=str(getattr(result, "stdout", "") or ""),
-            stderr=str(getattr(result, "stderr", "") or ""),
+            stdout=str(getattr(result, "stdout", "") or "")[:_REFRESH_CAPTURE_MAX_CHARS],
+            stderr=str(getattr(result, "stderr", "") or "")[-_REFRESH_CAPTURE_MAX_CHARS:],
             exit_status=getattr(result, "exit_status", None),
         )
 
