@@ -183,7 +183,7 @@ def test_spot_tier_message_lists_every_cause_of_spot_rating():
     assert message.startswith("No subnet incentive: this executor is rated as spot for this cycle")
     for cause in (
         "set to Spot",
-        "demoted",
+        "demoted for penalties or by Lium by hand",
         "Lium pinned the machine as spot",
         "open rental",
         "contracted under the spot tier",
