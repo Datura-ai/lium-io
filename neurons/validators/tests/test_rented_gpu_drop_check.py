@@ -596,6 +596,29 @@ async def test_a_read_blip_on_the_recovery_cycle_does_not_hide_the_next_incident
 
 
 @pytest.mark.asyncio
+async def test_a_failed_mark_write_still_gets_its_recovery(context_factory):
+    services = _services()
+    services.redis.fail_next_set_of.add(f"rented_gpu_drop:{POD_ID}")
+
+    await _run(context_factory, services, listed=UUIDS[:5])
+    await _run(context_factory, services, listed=UUIDS)
+
+    assert _states(services) == ["fault", "recovered"]
+    assert services.redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_mark_delete_does_not_hide_the_next_incident(context_factory):
+    services = _services()
+    await _run(context_factory, services, listed=UUIDS[:5])
+    services.redis.fail_delete_of.add(f"rented_gpu_drop:{POD_ID}")
+    await _run(context_factory, services, listed=UUIDS)
+    await _run(context_factory, services, listed=UUIDS[:5])
+
+    assert _states(services) == ["fault", "recovered", "fault"]
+
+
+@pytest.mark.asyncio
 async def test_the_pipeline_check_with_default_settings_posts_nothing(context_factory, monkeypatch):
     monkeypatch.delenv("RENTED_GPU_DROP_CHECK_ENABLED", raising=False)
     defaults = type(rented_gpu_drop.settings)(_env_file=None)

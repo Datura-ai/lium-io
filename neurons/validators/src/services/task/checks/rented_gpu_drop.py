@@ -36,7 +36,8 @@ its second consecutive cycle instead. The first clean cycle after an incident th
 never answered posts `state=recovered` and deletes the mark once the backend answered with a delivery
 that needs no retry; a fault after a posted recovery starts a new incident. A mark nothing was posted
 for is deleted without a post. A backend that is down or older (404) is no answer: the next cycle asks
-again. A dry run judges and logs only: it reads and writes no mark. Every mark is also kept in this process, and a cycle that cannot read Redis uses that copy, so an
+again. A dry run judges and logs only: it reads and writes no mark. Every mark is also kept in this process and preferred to
+the Redis copy (a failed write or delete leaves Redis behind), so an
 incident that spans a Redis outage is still posted once and recovered; the check's verdict never depends
 on Redis.
 """
@@ -367,12 +368,14 @@ class RentedGpuDropCheck:
     ) -> dict[str, Any] | None:
         key = _key(pod.pod_id)
         redis_ok = True
+        stored = None
         try:
-            mark = DropMark.load(await ctx.services.redis.get(key))
+            stored = DropMark.load(await ctx.services.redis.get(key))
         except REDIS_ERRORS:
             redis_ok = False
             self._log_redis_unavailable(ctx, pod.pod_id, "read")
-            mark = _local_mark(key)
+        # This process's own last write is never older than Redis: a write or delete that failed leaves Redis behind.
+        mark = _local_mark(key) or stored
 
         if drop is None:
             if mark is None:
@@ -454,6 +457,12 @@ class RentedGpuDropCheck:
             await ctx.services.redis.delete(key)
         except REDIS_ERRORS:
             self._log_redis_unavailable(ctx, pod_id, "delete")
+            # Redis still holds the closed incident: remember it as closed so a new fault starts a new one.
+            closed = DropMark(first_seen_at="", recovering=True)
+            _LOCAL_MARKS[key] = (
+                closed,
+                time.monotonic() + settings.RENTED_GPU_DROP_STATE_TTL_SECONDS,
+            )
 
     async def _post(
         self,
