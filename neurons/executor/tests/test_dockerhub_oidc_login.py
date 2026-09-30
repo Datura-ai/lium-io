@@ -24,7 +24,7 @@ ORG = "daturaai"
 CONNECTION_ID = "${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}"
 # docker/login-action: DOCKERHUB_OIDC_EXPIREIN must be between 300 and 21600 s; the token has to outlive the build+push.
 EXPIRE_MIN, EXPIRE_MAX = 300, 21600
-LONGEST_MEASURED_BUILD_AND_PUSH_S = 138  # executor_cd_prod, run 35682929949
+LONGEST_MEASURED_BUILD_AND_PUSH_S = 138
 
 STUB_DOCKER = """#!/bin/bash
 # records every call; `push` answers like the real client, `login` swallows stdin
@@ -146,10 +146,22 @@ def _step_builds(run: str) -> bool:
     return False
 
 
+def _logs_out_of_docker_hub(run: str) -> bool:
+    """The CLI stores a docker.io login under https://index.docker.io/v1/; `docker logout docker.io`
+    does not remove that entry, so only a logout with no server or with the index key clears it."""
+    for line in run.splitlines():
+        words = line.split()
+        if words[:2] == ["docker", "logout"] and (
+            words[2:] == [] or words[2:] == ["https://index.docker.io/v1/"]
+        ):
+            return True
+    return False
+
+
 def builds_after_login(workflow_text: str) -> list[str]:
     """Steps that run `docker build` (directly or through a script) while the Docker Hub OIDC token is the
     docker.io credential: the token covers only the daturaai push repositories, so the public base-image
-    pull fails with `insufficient scope` (run 36727847745)."""
+    pull fails with `insufficient scope`."""
     problems: list[str] = []
     for job_id, job in (yaml.safe_load(workflow_text).get("jobs") or {}).items():
         logged_in = False
@@ -158,7 +170,7 @@ def builds_after_login(workflow_text: str) -> list[str]:
                 logged_in = True
                 continue
             run = str(step.get("run") or "")
-            if "docker logout" in run:
+            if _logs_out_of_docker_hub(run):
                 logged_in = False
             elif logged_in and _step_builds(run):
                 problems.append(f"{job_id}: '{step.get('name')}' builds after the Docker Hub login")
@@ -166,7 +178,7 @@ def builds_after_login(workflow_text: str) -> list[str]:
 
 
 def test_the_checker_flags_a_build_after_the_login() -> None:
-    """Negative control: the shape run 36727847745 failed on — login first, then a script that builds."""
+    """Negative controls: login first, then a script that builds; and a logout that leaves the login stored."""
     login = (
         "      - uses: docker/login-action@v4\n        env:\n"
         "          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}\n"
@@ -176,7 +188,9 @@ def test_the_checker_flags_a_build_after_the_login() -> None:
     publish = "      - name: Run docker_publish.sh\n        run: |\n          cd neurons/validators\n          ./docker_publish.sh\n"
     build = "      - name: Build\n        run: |\n          cd neurons/validators\n          bash ./docker_build.sh\n"
     push = '      - name: Push\n        run: docker push "daturaai/compute-subnet-validator:$TAG"\n'
-    logout = "      - name: Log out\n        run: docker logout docker.io\n"
+    logout = "      - name: Log out\n        run: docker logout\n"
+    index_logout = "      - name: Log out\n        run: docker logout https://index.docker.io/v1/\n"
+    noop_logout = "      - name: Log out\n        run: docker logout docker.io\n"
     assert builds_after_login(head + login + publish) == [
         "deploy: 'Run docker_publish.sh' builds after the Docker Hub login"
     ]
@@ -185,6 +199,10 @@ def test_the_checker_flags_a_build_after_the_login() -> None:
     ]
     assert builds_after_login(head + build + login + push) == []
     assert builds_after_login(head + login + push + logout + build + login + push) == []
+    assert builds_after_login(head + login + push + index_logout + build + login + push) == []
+    assert builds_after_login(head + login + push + noop_logout + build + login + push) == [
+        "deploy: 'Build' builds after the Docker Hub login"
+    ]
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)

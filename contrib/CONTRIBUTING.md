@@ -244,7 +244,7 @@ Tests follow Arrange-Act-Assert, one behavior per function; `ruff format` (pre-c
 
 ## Releases
 
-Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` workflows from each neuron's `docker_build.sh` / `docker_publish.sh` (and the `*_runner_*` pair for the auto-updating runner image):
+Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` workflows. Each neuron's `docker_build.sh` (and `docker_runner_build.sh` for the auto-updating runner image) builds before the Docker Hub login; the miner and validator jobs then push with `docker push`, and only the executor jobs source `docker_publish.sh` / `docker_runner_publish.sh`:
 
 | Tag pushed | Workflow | Images |
 |---|---|---|

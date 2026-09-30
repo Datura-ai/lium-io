@@ -19,7 +19,7 @@ jobs:
 
       # Build before the login: the base images (python, docker) are public docker.io images, and once
       # the OIDC token is the docker.io credential every pull uses it. It covers only the daturaai push
-      # repositories, so a build after the login fails with `insufficient scope` (run 36727847745).
+      # repositories, so a build after the login fails with `insufficient scope`.
       - name: Build the images
         run: |
           cd neurons/validators
@@ -31,7 +31,7 @@ jobs:
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           # The exchanged token is the docker password for the rest of the job (default 300 s);
-          # build+push here takes up to ~140 s, so 30 min leaves room for a cold cache or a slow runner.
+          # the pushes must finish inside it, so 30 min leaves room for a cold cache or a slow runner.
           DOCKERHUB_OIDC_EXPIREIN: "1800"
         with:
           username: daturaai

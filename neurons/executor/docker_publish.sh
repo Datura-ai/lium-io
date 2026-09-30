@@ -28,7 +28,7 @@ log_header "Lium Executor — Publish Image"
 
 # ── Login & push ───────────────────────────────────────────────────────────────
 # The lium-io workflows log in with docker/login-action (OIDC) before this script runs and pass no
-# token; a caller that still holds one (lium-io-deployment's staging publish) logs in here.
+# token; a caller in another repository that still passes DOCKERHUB_PAT logs in here.
 if [[ -n "${DOCKERHUB_PAT:-}" ]]; then
   log_step "Logging in to Docker Hub"
   echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
