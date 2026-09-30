@@ -1,5 +1,6 @@
 """RENTED_GPU_DROP: a rented node that lost a GPU is reported the cycle it is seen, once per incident."""
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ from neurons.validators.src.services.task.checks.rented_gpu_drop import (
     judge_rented_gpus,
     nvml_error_code,
 )
+from neurons.validators.src.services.task.messages import MachineSpecMessages
 from neurons.validators.src.services.task.messages import RentedGpuDropMessages as Msg
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from protocol.vc_protocol.compute_requests import (
@@ -28,7 +30,14 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
-from tests.helpers import FakeRedis, build_services, build_state, default_executor
+from tests.helpers import (
+    FakeRedis,
+    build_context_config,
+    build_services,
+    build_state,
+    default_executor,
+)
+from tests.test_machine_spec_scrape_check import DummySSHCommandRunner, make_command_result
 
 MODEL = "NVIDIA GeForce RTX 5090"
 UUIDS = [f"GPU-a0a{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
@@ -276,6 +285,76 @@ async def test_a_zero_card_scrape_is_reported_when_the_pod_has_no_gpu_count_and_
     assert result.event.reason_code == Msg.DROP.reason
     call = services.backend.report_rented_gpu_drop.await_args
     assert call.kwargs["visible_gpu_count"] == 0 and call.kwargs["expected_gpu_count"] == 1
+
+
+async def _scrape_listing_no_gpu(
+    context_factory, services, *, count, scrape_error, anchor=UUIDS, **rented_kwargs
+):
+    data: dict = {"data_gpu": {"gpu_count": count, "gpu_details": []}}
+    if scrape_error:
+        data["gpu_scrape_error"] = scrape_error
+    report = json.dumps({"error": "no_gpu_details", "data": data})
+    executor = default_executor()
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(
+            machine_scrape_filename="scrape.sh", machine_scrape_timeout=300, obfuscation_keys={}
+        ),
+        state=build_state(
+            remote_dir="/remote/path", rented_data=_rented(executor.uuid, **rented_kwargs)
+        ),
+        runner=DummySSHCommandRunner(
+            result=make_command_result(success=False, exit_code=1, stdout=report)
+        ),
+        executor=executor,
+        verified={"uuids": ",".join(anchor)},
+        encrypt_key="test-encrypt-key",
+    )
+    return await MachineSpecScrapeCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("count", "scrape_error", "anchor", "pod_gpus", "faults"),
+    [
+        (8, "NVMLError_GpuIsLost(15)", UUIDS, 8, [BR, DS, AM, NV]),
+        (0, "NVMLError_DriverNotLoaded(9)", [], None, [BR, NV]),
+    ],
+    ids=["card_0_lost", "driver_down_no_rental_count_no_anchor"],
+)
+async def test_a_scrape_that_lists_no_gpu_fails_as_before_and_reports_the_rented_node(
+    context_factory, count, scrape_error, anchor, pod_gpus, faults
+):
+    services = _services()
+
+    result = await _scrape_listing_no_gpu(
+        context_factory,
+        services,
+        count=count,
+        scrape_error=scrape_error,
+        anchor=anchor,
+        gpu_count=pod_gpus,
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == MachineSpecMessages.SCRAPE_FAILED_DRIVER.reason
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert call.kwargs["state"] == "fault" and call.kwargs["faults"] == faults
+    assert call.kwargs["visible_gpu_count"] == 0 and call.kwargs["nvml_gpu_count"] == count
+    services.backend.report_rented_gpu_drop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_that_lists_no_gpu_on_an_idle_node_posts_nothing(context_factory):
+    services = _services()
+
+    result = await _scrape_listing_no_gpu(
+        context_factory, services, count=8, scrape_error="NVMLError(999)", status="STOPPED"
+    )
+
+    assert result.passed is False
+    services.backend.report_rented_gpu_drop.assert_not_awaited()
+    assert services.redis.calls == 0
 
 
 @pytest.mark.asyncio

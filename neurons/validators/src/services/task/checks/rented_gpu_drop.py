@@ -10,7 +10,8 @@ cycle long before TenantEnforcementCheck, so this check runs right after Machine
 fails the cycle. For a rented executor it compares what the scrape listed with:
 
 - the GPUs the rental holds (sum of the pods' `gpu_count`, when the backend sent every one; at least one,
-  so a scrape that lists no card at all is a fault on any rented node),
+  so a scrape that lists no card at all is a fault on any rented node; such a scrape fails
+  MachineSpecScrapeCheck, which runs this check on it before the cycle halts),
 - the driver's own count (`gpu.count`),
 - the anchored UUID set of the verified-job record (`missing_uuids` is the anchor minus the listed set),
 
