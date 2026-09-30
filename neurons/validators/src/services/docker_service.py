@@ -851,11 +851,16 @@ def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
 
     `signaled` is a plain `exited` State with a signal exit code (`docker stop` 143, `docker kill`
     137): the exit code alone cannot tell a stop on the node from an image whose CMD exits 137 or
-    143 itself, so it keeps its own cause and neutral wording, apart from the node-kill counts."""
+    143 itself, so it keeps its own cause and neutral wording, apart from the node-kill counts.
+
+    `restarting` is `exited` whatever the exit code: Docker's restart policy reruns only a command
+    that ended on its own (`docker kill` and `docker stop` turn the restart off)."""
     if state is None or (state.status in ("removing", "dead") and not state.killed_by_host):
         return "removed"
     if state.oom_killed:
         return "oom"
+    if state.restarting or state.status == "restarting":
+        return "exited"
     if state.exit_code in HOST_KILL_EXIT_CODES:
         return "signaled" if state.status == "exited" else "killed"
     return "exited"
@@ -1206,10 +1211,11 @@ class _OwnSweepRegistry:
     IDs and removes by ID: an older same-name container never matches the ID this create's `docker
     run` made, and a newer one is not removed, whatever order the listing, the run and the `rm` land
     in. An ID counts only once `docker rm` printed it back as removed (an empty listing afterwards
-    is not proof) and that ID is not still on the host; while that `rm` is in flight,
+    is not proof) and that ID is not still on the host; while an `rm` of it is in flight,
     `removed_by_us` waits for its outcome (the host may drop the container before the `rm` returns).
-    An `rm` whose SSH call got no answer may have run: its IDs are `maybe_removed_by_us`, neither
-    ours nor the node's.
+    Two creates can sweep the same filler at once, so every open sweep of an ID is waited for, not
+    only the latest. An `rm` whose SSH call got no answer may have run, and so may one still in
+    flight when the wait runs out: those IDs are `maybe_removed_by_us`, neither ours nor the node's.
     """
 
     TTL_SECONDS = 15 * 60
@@ -1218,12 +1224,12 @@ class _OwnSweepRegistry:
     def __init__(self) -> None:
         self._removed_at: dict[str, float] = {}
         self._maybe_removed_at: dict[str, float] = {}
-        self._in_flight: dict[str, asyncio.Event] = {}
+        self._in_flight: dict[str, list[asyncio.Event]] = {}
 
     def begin(self, container_ids: list[str]) -> asyncio.Event:
         done = asyncio.Event()
         for container_id in container_ids:
-            self._in_flight[container_id] = done
+            self._in_flight.setdefault(container_id, []).append(done)
         return done
 
     def end(
@@ -1235,8 +1241,11 @@ class _OwnSweepRegistry:
         self._removed_at = {i: t for i, t in self._removed_at.items() if now - t < self.TTL_SECONDS}
         self._maybe_removed_at = {i: t for i, t in self._maybe_removed_at.items() if now - t < self.TTL_SECONDS}
         for container_id in container_ids:
-            if self._in_flight.get(container_id) is done:
-                del self._in_flight[container_id]
+            sweeps = [s for s in self._in_flight.get(container_id, ()) if s is not done]
+            if sweeps:
+                self._in_flight[container_id] = sweeps
+            else:
+                self._in_flight.pop(container_id, None)
             if container_id in removed:
                 self._removed_at[container_id] = now
             elif container_id in unanswered:
@@ -1246,17 +1255,22 @@ class _OwnSweepRegistry:
     async def removed_by_us(self, container_id: str | None) -> bool:
         if not container_id:
             return False
-        in_flight = self._in_flight.get(container_id)
-        if in_flight is not None:
+        sweeps = list(self._in_flight.get(container_id, ()))
+        if sweeps and container_id not in self._removed_at:
             try:
-                await asyncio.wait_for(in_flight.wait(), self.IN_FLIGHT_WAIT_SECONDS)
+                await asyncio.wait_for(
+                    asyncio.gather(*(sweep.wait() for sweep in sweeps)), self.IN_FLIGHT_WAIT_SECONDS
+                )
             except asyncio.TimeoutError:
-                return False
+                pass
         at = self._removed_at.get(container_id)
         return at is not None and time.monotonic() - at < self.TTL_SECONDS
 
     def maybe_removed_by_us(self, container_id: str | None) -> bool:
-        """An `rm` of this ID was sent and got no answer (read after ``removed_by_us``, which waits for it)."""
+        """An `rm` of this ID was sent and got no answer, or is still in flight (read after
+        ``removed_by_us``, which waits for it)."""
+        if container_id and self._in_flight.get(container_id):
+            return True
         at = self._maybe_removed_at.get(container_id) if container_id else None
         return at is not None and time.monotonic() - at < self.TTL_SECONDS
 

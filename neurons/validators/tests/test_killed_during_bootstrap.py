@@ -339,12 +339,19 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
 def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str, *, rm: str = "done") -> None:
     """Another create's sweep takes ``container_id`` just before inspect call `n` (1-based). ``rm``:
     "done" (its `rm` has returned), or "ok" / "failed" (still in flight; it ends that way a moment
-    later, while this create is classifying), or "unanswered" (its SSH call got no answer)."""
+    later, while this create is classifying), "unanswered" (its SSH call got no answer), "stuck"
+    (still in flight when the wait runs out), or "overlap" (a second create sweeps the same ID and
+    finds it already gone at once, while the first sweep's acknowledgement comes a moment later)."""
     real_inspect, looks = api.inspect_container, []
     loop = asyncio.get_running_loop()
 
     def sweep() -> None:
         in_flight = own_sweep_removals.begin([container_id])
+        if rm == "stuck":
+            return
+        if rm == "overlap":
+            second = own_sweep_removals.begin([container_id])
+            own_sweep_removals.end([container_id], second, removed=[])
         end = functools.partial(
             own_sweep_removals.end, [container_id], in_flight,
             removed=[] if rm in ("failed", "unanswered") else [container_id],
@@ -376,6 +383,8 @@ def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str, *, rm: str 
         "older-same-name-container-during-bootstrap",
         "rm-in-flight-then-failed",
         "rm-sent-answer-lost",
+        "rm-still-in-flight-after-the-wait",
+        "second-sweep-found-it-gone-first-acknowledged-later",
         "during-bootstrap-oom",
     ],
 )
@@ -404,6 +413,11 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     elif swept == "rm-sent-answer-lost":
         # `rm -fv` reached Docker (SIGKILL, removing/137) but SSH dropped before its stdout came back
         _swept_at_inspect(api, 2, this, rm="unanswered")
+    elif swept == "rm-still-in-flight-after-the-wait":
+        monkeypatch.setattr(own_sweep_removals, "IN_FLIGHT_WAIT_SECONDS", 0.01)
+        _swept_at_inspect(api, 2, this, rm="stuck")
+    elif swept == "second-sweep-found-it-gone-first-acknowledged-later":
+        _swept_at_inspect(api, 2, this, rm="overlap")
     else:
         # "listed-before-docker-run-returned": the ID match makes the listing time irrelevant
         _swept_at_inspect(api, 2, this)
@@ -420,7 +434,8 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     assert result.failure_step == "ssh_bootstrap"
     assert "stopped by the node" not in result.detail
     assert _events(caplog) == []
-    reason = "maybe_removed_by_own_sweep" if swept == "rm-sent-answer-lost" else "removed_by_own_sweep"
+    maybe = swept in ("rm-sent-answer-lost", "rm-still-in-flight-after-the-wait")
+    reason = "maybe_removed_by_own_sweep" if maybe else "removed_by_own_sweep"
     assert any(getattr(r.msg, "extra", {}).get("reason") == reason for r in caplog.records)
 
 
@@ -600,7 +615,7 @@ def test_the_listing_maps_each_name_to_its_full_container_id():
 
 
 @pytest.mark.asyncio
-async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_not_ours(monkeypatch):
+async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_only_maybe_ours(monkeypatch):
     registry = type(own_sweep_removals)()
     ok, failed, stuck = (_container_id(n) for n in ("pod_ok", "pod_failed", "pod_stuck"))
     for container_id, removed in ((ok, True), (failed, False)):
@@ -611,8 +626,25 @@ async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_not_ours(m
     monkeypatch.setattr(registry, "IN_FLIGHT_WAIT_SECONDS", 0.05)
 
     assert await registry.removed_by_us(ok)
-    assert not await registry.removed_by_us(failed)
-    assert not await registry.removed_by_us(stuck)
+    assert not await registry.removed_by_us(failed) and not registry.maybe_removed_by_us(failed)
+    assert not await registry.removed_by_us(stuck) and registry.maybe_removed_by_us(stuck)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["acknowledged", "failed", "stuck"])
+async def test_every_open_sweep_of_an_id_is_waited_for(monkeypatch, first):
+    """Two creates sweep the same filler; the second finds it already gone while the first `rm` runs."""
+    registry = type(own_sweep_removals)()
+    monkeypatch.setattr(registry, "IN_FLIGHT_WAIT_SECONDS", 0.05)
+    filler = _container_id("filler_a")
+    first_sweep = registry.begin([filler])
+    registry.end([filler], registry.begin([filler]), removed=[])
+    if first != "stuck":
+        removed = [filler] if first == "acknowledged" else []
+        asyncio.get_running_loop().call_later(0.01, lambda: registry.end([filler], first_sweep, removed=removed))
+
+    assert await registry.removed_by_us(filler) is (first == "acknowledged")
+    assert registry.maybe_removed_by_us(filler) is (first == "stuck")
 
 
 @pytest.mark.asyncio
@@ -704,6 +736,35 @@ async def test_a_healthy_container_bootstraps_as_before(svc, monkeypatch, caplog
     assert api.events == ["inspect_container", "exec_create"] * 4
     assert len(client.exec_specs) == 4
     svc.redis_service.add_rented_pod.assert_awaited_once()
+
+
+@pytest.mark.parametrize("exit_code", [137, 143, 1])
+def test_a_restarting_container_is_the_images_own_exit(exit_code):
+    state = rental_docker_sdk.ContainerStateSnapshot(
+        status="restarting", running=False, restarting=True, exit_code=exit_code, restart_count=1,
+        error=None, oom_killed=False,
+    )  # fmt: skip
+    assert container_gone_cause(state) == "exited"
+    state.oom_killed = True
+    assert container_gone_cause(state) == "oom"
+
+
+@pytest.mark.asyncio
+async def test_a_bootstrap_exec_killed_while_docker_restarts_the_image_is_not_a_node_kill(svc, monkeypatch, caplog):
+    api = FakeApiClient()
+    restarting = _container_state(status="restarting", running=False, restarting=True, exit_code=137)
+    api.container_states = [_RUNNING, _RUNNING, _RUNNING, restarting]
+    _bootstrapping_create(svc, monkeypatch, api)
+    _exec_exits(0, 0, 137)(api)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    # a failed bootstrap exec on a container that was not killed stays the soft failure it was
+    assert getattr(result, "failure_step", None) != KILLED_DURING_BOOTSTRAP_STEP
+    assert "stopped by the node" not in getattr(result, "detail", "")
+    assert _events(caplog) == []
+    assert api.exec_created and len(api.exec_created) >= 3
 
 
 @pytest.mark.asyncio
