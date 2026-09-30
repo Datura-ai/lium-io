@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import enum
 import ipaddress
 import logging
@@ -1109,25 +1110,26 @@ class _OwnSweepRegistry:
     A customer's create removes every `filler_*` on the node (DAH-3706), including a filler whose own
     create is still bootstrapping. That create then finds its container gone; the validator removed
     it, so it is not a node kill. Names carry the pod id, so a name is not reused by another pod, but
-    a retry of the same pod reuses it: the sweep stamps a name before its `rm` and again once the
-    `rm` is done, and `removed_by_us(name, since=<that create's docker run>)` counts only a sweep
-    still removing at or after the create's own `docker run` — one that could have reached its
-    container, not an older one with the same name.
+    a retry of the same pod reuses it. A sweep is stamped with the time it listed the containers,
+    and `removed_by_us(name, since=<when that create's docker run returned>)` counts only a sweep
+    that listed them after the create's container existed: one that saw that container. A sweep
+    that listed an older container with the same name is not counted, even when its `rm` ends after
+    the create's `docker run` has started (the run cannot take the name until that `rm` is done).
     """
 
     TTL_SECONDS = 15 * 60
 
     def __init__(self) -> None:
-        self._removed_at: dict[str, float] = {}
+        self._listed_at: dict[str, float] = {}
 
-    def record(self, container_names: list[str]) -> None:
+    def record(self, container_names: list[str], *, listed_at: float) -> None:
         now = time.monotonic()
-        self._removed_at = {n: t for n, t in self._removed_at.items() if now - t < self.TTL_SECONDS}
+        self._listed_at = {n: t for n, t in self._listed_at.items() if now - t < self.TTL_SECONDS}
         for name in container_names:
-            self._removed_at[name] = now
+            self._listed_at[name] = max(listed_at, self._listed_at.get(name, listed_at))
 
     def removed_by_us(self, container_name: str, *, since: float | None = None) -> bool:
-        at = self._removed_at.get(container_name)
+        at = self._listed_at.get(container_name)
         if at is None or time.monotonic() - at >= self.TTL_SECONDS:
             return False
         return since is None or at >= since
@@ -2584,8 +2586,11 @@ class DockerService:
         re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
         (typed fields, countable) and the create goes on.
         """
+        listed_at = time.monotonic()
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
+            if host_probe.listed_at is not None:
+                listed_at = host_probe.listed_at
         else:
             result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
             all_names = [name for name in (result.stdout or "").strip().split("\n") if name]
@@ -2631,13 +2636,10 @@ class DockerService:
             )
 
             # recorded before the rm: a create bootstrapping one of these may see it gone at once
-            own_sweep_removals.record(stale_containers)
-            try:
-                await self._remove_stale_containers(
-                    ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
-                )
-            finally:
-                own_sweep_removals.record(stale_containers)
+            own_sweep_removals.record(stale_containers, listed_at=listed_at)
+            await self._remove_stale_containers(
+                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+            )
 
             if clear_volume:
                 volumes_to_remove = []
@@ -3306,6 +3308,7 @@ class DockerService:
             # asyncio.TimeoutError lands in the except below → None → the per-command path.
             result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
             probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power)
+            probe = dataclasses.replace(probe, listed_at=started)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5685,7 +5688,7 @@ class DockerService:
         # signature. `container_created` keeps it honest: before `docker run` succeeds there is
         # nothing to remove, so a missing container there is an ordinary create failure.
         container_created = False
-        docker_run_started_at: float | None = None
+        docker_run_returned_at: float | None = None
         container_vanished = False
         login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
@@ -6587,7 +6590,6 @@ class DockerService:
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     await self.stream_log("Creating docker container", "success", log_tag)
-                    docker_run_started_at = time.monotonic()
                     await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
@@ -6599,6 +6601,7 @@ class DockerService:
                     )
 
                     container_created = True
+                    docker_run_returned_at = time.monotonic()
                     logger.info("Container creation step finished")
 
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
@@ -6878,9 +6881,13 @@ class DockerService:
                         if container_gone_cause(post_run_exc.state) == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
                             raise
-                        if own_sweep_removals.removed_by_us(container_name, since=docker_run_started_at):
+                        swept = own_sweep_removals.removed_by_us(
+                            container_name, since=docker_run_returned_at
+                        )
+                        if swept and container_gone_cause(post_run_exc.state) != "oom":
                             # Another create on this node swept it (a customer's create removes
-                            # every filler): the validator removed it, not the node.
+                            # every filler): the validator removed it, not the node. A sweep's
+                            # `rm -f` never sets OOMKilled, so an observed OOM is the node's.
                             logger.warning(
                                 _m(
                                     "Container removed by another create's sweep during bootstrap",

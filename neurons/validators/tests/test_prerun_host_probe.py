@@ -255,7 +255,8 @@ def test_parser_empty_sections_are_empty_not_none():
 def test_parser_failed_section_is_none_and_the_rest_survive(kwargs, attr):
     probe = parse_prerun_host_probe(_stdout(**kwargs), with_power=True)
     assert getattr(probe, attr) is None
-    others = {f for f in probe.__dataclass_fields__ if f != attr}
+    # listed_at is set by the caller, not the parser
+    others = {f for f in probe.__dataclass_fields__ if f not in (attr, "listed_at")}
     assert all(getattr(probe, f) is not None for f in others)
 
 

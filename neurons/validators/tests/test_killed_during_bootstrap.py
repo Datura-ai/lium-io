@@ -9,6 +9,7 @@ names the failure `killed_during_bootstrap` with `oom_killed` and the exit code,
 from __future__ import annotations
 
 import logging
+import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -164,6 +165,11 @@ class _SdkExecClient(_FakeRentalDockerClient):
         return await self.sdk.inspect_container_state(container_name=container_name)
 
 
+@pytest.fixture(autouse=True)
+def _no_sweeps_from_other_tests():
+    own_sweep_removals._listed_at.clear()
+
+
 @pytest.fixture
 def svc():
     return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
@@ -316,44 +322,60 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
         assert len(client.exec_specs) == 2 and api.events == _RACE
 
 
-def _swept_at_inspect(api: FakeApiClient, n: int, name: str) -> None:
-    """Another create's sweep removes `name` just before inspect call `n` (1-based)."""
+def _swept_at_inspect(
+    api: FakeApiClient, n: int, name: str, *, listed_at: float | None = None
+) -> None:
+    """Another create's sweep removes `name` just before inspect call `n` (1-based). ``listed_at``
+    (default: then) is when that sweep listed the containers."""
     real_inspect, looks = api.inspect_container, []
 
     def inspect(container_name):
         looks.append(container_name)
         if len(looks) == n:
-            own_sweep_removals.record([name])
+            at = time.monotonic() if listed_at is None else listed_at
+            own_sweep_removals.record([name], listed_at=at)
         return real_inspect(container_name)
 
     api.inspect_container = inspect
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("swept", ["during-bootstrap", "before-docker-run"])
+@pytest.mark.parametrize(
+    "swept",
+    [
+        "during-bootstrap",
+        "before-docker-run",
+        "listed-before-docker-run-rm-ended-after",
+        "during-bootstrap-oom",
+    ],
+)
 async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypatch, caplog, swept):
     """A customer's create removes every filler on the node, one still bootstrapping included: that
-    create finds its container gone, but the validator removed it, so no kill is filed. A sweep of
-    the same name before this create's `docker run` (a retry of the pod) removed an older container,
-    so a kill of this one is still filed."""
+    create finds its container gone, but the validator removed it, so no kill is filed. A sweep
+    that listed the same name before this create's `docker run` returned (a retry of the pod) saw
+    an older container, even when its `rm` ended later, so a kill of this one is still filed; so is
+    an OOM, which a sweep's `rm -f` never causes."""
     api = FakeApiClient()
-    api.container_states = [_RUNNING, _SIGKILLED]
+    api.container_states = [_RUNNING, _oom_killed_state() if swept.endswith("-oom") else _SIGKILLED]
     _bootstrapping_create(svc, monkeypatch, api)
     caplog.set_level(logging.WARNING)
     payload = _payload()
     name = f"pod_{payload.pod_id}"
     if swept == "before-docker-run":
-        own_sweep_removals.record([name])
+        own_sweep_removals.record([name], listed_at=time.monotonic())
+    elif swept == "listed-before-docker-run-rm-ended-after":
+        _swept_at_inspect(api, 2, name, listed_at=time.monotonic())
     else:
         _swept_at_inspect(api, 2, name)
 
     result = await _create(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    if swept == "before-docker-run":
+    if swept != "during-bootstrap":
         assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
         (logged,) = _events(caplog)
-        assert logged["container_name"] == name and logged["cause"] == "killed"
+        assert logged["container_name"] == name
+        assert logged["cause"] == ("oom" if swept.endswith("-oom") else "killed")
         return
     assert result.failure_step == "ssh_bootstrap"
     assert "stopped by the node" not in result.detail
@@ -362,28 +384,38 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_the_stale_sweep_records_what_it_removes(svc):
+@pytest.mark.parametrize("from_probe", [False, True])
+async def test_the_stale_sweep_records_what_it_removes_and_when_it_listed_them(
+    svc, monkeypatch, from_probe
+):
+    clock = iter([200.0] + [300.0] * 10)
+    monkeypatch.setattr("services.docker_service.time.monotonic", lambda: next(clock))
     ssh = Mock()
     ssh.run = AsyncMock(return_value=Mock(stdout="filler_swept-1\npod_keep\n", exit_status=0))
+    probe = None
+    if from_probe:
+        probe = Mock(container_names=("filler_swept-1", "pod_keep"), listed_at=150.0)
     svc._remove_stale_containers = AsyncMock()
 
     removed = await svc.clean_existing_containers(
         ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
         active_container_names=["pod_keep", "filler_swept-1"], remove_every_filler=True,
+        host_probe=probe,
     )
 
+    listed_at = 150.0 if from_probe else 200.0
     assert removed == ["filler_swept-1"]
-    assert own_sweep_removals.removed_by_us("filler_swept-1")
+    assert own_sweep_removals.removed_by_us("filler_swept-1", since=listed_at)
+    assert not own_sweep_removals.removed_by_us("filler_swept-1", since=listed_at + 1)
     assert not own_sweep_removals.removed_by_us("pod_keep")
 
 
-def test_a_sweep_counts_only_for_a_container_started_before_its_rm_ended(monkeypatch):
-    clock = iter([100.0, 100.0, 105.0, 105.0, 105.0])
-    monkeypatch.setattr("services.docker_service.time.monotonic", lambda: next(clock))
+def test_a_sweep_counts_only_when_it_listed_after_the_containers_docker_run_returned(monkeypatch):
+    monkeypatch.setattr("services.docker_service.time.monotonic", lambda: 110.0)
     registry = type(own_sweep_removals)()
-    registry.record(["pod_retry"])  # 100: the older container's rm
+    registry.record(["pod_retry"], listed_at=100.0)  # the older container; its rm ends at 110
 
-    assert not registry.removed_by_us("pod_retry", since=101.0)  # docker run at 101, after it
+    assert not registry.removed_by_us("pod_retry", since=105.0)  # docker run returned at 105
     assert registry.removed_by_us("pod_retry", since=100.0)
     assert registry.removed_by_us("pod_retry")
 
