@@ -71,11 +71,11 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
     names: set[str] = set()
     for executor in rented_data.executors.values():
         names.update(pod.container_name for pod in executor.pods)
-        # DAH-2740: an edit parks the pod's current container under <name>__prev while the
-        # replacement is created; it is the customer's only copy until then, whatever its age
+        # An edit parks the pod's current container under <name>__prev while the replacement
+        # is created; it is the customer's only copy until then, whatever its age
         names.update(f"{pod.container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
-    # Every filler is protected — a GPU-split node runs one per VRAM bundle (DAH-2465), and
-    # reaping a sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
+    # Every filler is protected — a GPU-split node runs one per VRAM bundle, and reaping a
+    # sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
     for fillers in rented_data.all_filler_containers_by_executor.values():
         names.update(fillers)
     names.update(name for name in rented_data.filler_containers_by_executor.values() if name)
@@ -87,7 +87,7 @@ def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -
 
     Only a snapshot that is missing or lists nothing anywhere in the fleet is untrusted: that is the
     one shape a backend hiccup takes. An executor absent from a non-empty snapshot is an idle node,
-    and its orphans must still go, or they hold the rental ports and the node scores 0 (DAH-2164).
+    and its orphans must still go, or they hold the rental ports and the node scores 0 every cycle.
     The scheduled paths skip the cycle when the fetch fails, so None is a defensive branch.
     """
     if rented_data is None:
