@@ -7,6 +7,7 @@ printing the value under ``set -x``.
 """
 
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -114,6 +115,81 @@ def test_the_checker_flags_the_token_login_shape() -> None:
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)
 def test_every_docker_hub_login_is_oidc_and_no_workflow_names_the_token(workflow: Path) -> None:
     assert docker_hub_login_problems(workflow.read_text()) == []
+
+
+def _is_docker_hub_login(step: dict) -> bool:
+    return str(step.get("uses", "")).startswith(LOGIN_ACTION) and (step.get("with") or {}).get(
+        "registry", "docker.io"
+    ) in ("docker.io", "registry-1.docker.io")
+
+
+def _script_builds(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    text = path.read_text()
+    return "docker build" in text or re.search(r"source \./\S*build\.sh", text) is not None
+
+
+def _step_builds(run: str) -> bool:
+    cwd = REPO
+    for line in run.splitlines():
+        line = line.strip()
+        if line.startswith("chmod"):
+            continue
+        if cd := re.match(r"cd (\S+)$", line):
+            cwd = REPO / cd.group(1)
+        if "docker build" in line:
+            return True
+        for script in re.findall(r"(?:^|\s)(\S+\.sh)\b", line):
+            if _script_builds(cwd / script):
+                return True
+    return False
+
+
+def builds_after_login(workflow_text: str) -> list[str]:
+    """Steps that run `docker build` (directly or through a script) while the Docker Hub OIDC token is the
+    docker.io credential: the token covers only the daturaai push repositories, so the public base-image
+    pull fails with `insufficient scope` (run 36727847745)."""
+    problems: list[str] = []
+    for job_id, job in (yaml.safe_load(workflow_text).get("jobs") or {}).items():
+        logged_in = False
+        for step in job.get("steps") or []:
+            if _is_docker_hub_login(step):
+                logged_in = True
+                continue
+            run = str(step.get("run") or "")
+            if "docker logout" in run:
+                logged_in = False
+            elif logged_in and _step_builds(run):
+                problems.append(f"{job_id}: '{step.get('name')}' builds after the Docker Hub login")
+    return problems
+
+
+def test_the_checker_flags_a_build_after_the_login() -> None:
+    """Negative control: the shape run 36727847745 failed on — login first, then a script that builds."""
+    login = (
+        "      - uses: docker/login-action@v4\n        env:\n"
+        "          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}\n"
+        "        with:\n          username: daturaai\n"
+    )
+    head = "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
+    publish = "      - name: Run docker_publish.sh\n        run: |\n          cd neurons/validators\n          ./docker_publish.sh\n"
+    build = "      - name: Build\n        run: |\n          cd neurons/validators\n          bash ./docker_build.sh\n"
+    push = '      - name: Push\n        run: docker push "daturaai/compute-subnet-validator:$TAG"\n'
+    logout = "      - name: Log out\n        run: docker logout docker.io\n"
+    assert builds_after_login(head + login + publish) == [
+        "deploy: 'Run docker_publish.sh' builds after the Docker Hub login"
+    ]
+    assert builds_after_login(head + login + build) == [
+        "deploy: 'Build' builds after the Docker Hub login"
+    ]
+    assert builds_after_login(head + build + login + push) == []
+    assert builds_after_login(head + login + push + logout + build + login + push) == []
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)
+def test_no_workflow_builds_while_logged_in_to_docker_hub(workflow: Path) -> None:
+    assert builds_after_login(workflow.read_text()) == []
 
 
 def test_the_seven_publish_workflows_log_in_with_the_action() -> None:
