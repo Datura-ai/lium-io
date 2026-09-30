@@ -1,8 +1,8 @@
 """The once-per-cycle SSH probe of every rented pod (observe only).
 
-At the start of each cycle ``probe_rented_pods`` connects to the mapped SSH port of every RUNNING pod
-of every rented node in the backend's rented list (manual rentals excluded: the renter holds those
-at root) and reads the SSH identification line. Each pod gives one ``PodSshObservation``: ``banner``,
+At the start of each cycle ``probe_rented_pods`` connects to the mapped SSH port of every pod the
+backend's rented list sends with an ``ssh_port``, whatever its status (the backend decides what gets
+probed; manual rentals excluded: the renter holds those at root) and reads the SSH identification line. Each pod gives one ``PodSshObservation``: ``banner``,
 ``refused`` (with the errno), ``no_banner`` or ``timeout``. The probe needs no key and never touches
 the container, and nothing here changes a score or a verdict.
 
@@ -38,12 +38,11 @@ from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
 
-POD_STATUS_RUNNING = "RUNNING"
 EXECUTOR_RESULT_MISSING = "EXECUTOR_RESULT_MISSING"
 
 
 def _targets(rented: RentedExecutorsResponse) -> list[tuple[str, str, str, int]]:
-    """(executor uuid, pod id, host, port) for every RUNNING pod with a mapped SSH port."""
+    """(executor uuid, pod id, host, port) for every listed pod with a mapped SSH port, any status."""
     manual = {str(uuid).lower() for uuid in (rented.manual_rental_executors or {})}
     targets = []
     for raw_uuid, executor in rented.executors.items():
@@ -51,7 +50,7 @@ def _targets(rented: RentedExecutorsResponse) -> list[tuple[str, str, str, int]]
         if executor_uuid in manual:
             continue
         for pod in executor.pods:
-            if pod.status == POD_STATUS_RUNNING and pod.ssh_port:
+            if pod.ssh_port:
                 targets.append(
                     (executor_uuid, pod.pod_id, executor.executor_ip_address, pod.ssh_port)
                 )

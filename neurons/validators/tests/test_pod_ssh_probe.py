@@ -236,10 +236,10 @@ def _probe_with(outcomes: dict[tuple[str, int], ConnectOutcome]):
 
 
 @pytest.mark.asyncio
-async def test_only_running_pods_with_a_port_on_non_manual_nodes_are_probed():
+async def test_every_pod_with_a_port_on_non_manual_nodes_is_probed_whatever_its_status():
     rented = _rented(
         {
-            "E1": [_pod("p1"), _pod("p2", status="STOPPED"), _pod("p3", ssh_port=None)],
+            "E1": [_pod("p1"), _pod("p2", ssh_port=40101, status="REBOOT_FAILED"), _pod("p3", ssh_port=None)],
             "E2": [_pod("p4", ssh_port=40200)],
             "MANUAL": [_pod("p5")],
         },
@@ -253,10 +253,11 @@ async def test_only_running_pods_with_a_port_on_non_manual_nodes_are_probed():
             rented, timeout=1, concurrency=4, job_batch_id=JOB_BATCH_ID
         )
 
-    assert sorted(calls) == [("198.51.100.1", 40100), ("198.51.100.2", 40200)]
+    assert sorted(calls) == [("198.51.100.1", 40100), ("198.51.100.1", 40101), ("198.51.100.2", 40200)]
     assert observations == {
         "e1": [
-            PodSshObservation(pod_id="p1", result=PodSshResult.BANNER, errno=None, fleet_ok=True)
+            PodSshObservation(pod_id="p1", result=PodSshResult.BANNER, errno=None, fleet_ok=True),
+            PodSshObservation(pod_id="p2", result=PodSshResult.BANNER, errno=None, fleet_ok=True),
         ],
         "e2": [
             PodSshObservation(pod_id="p4", result=PodSshResult.REFUSED, errno=111, fleet_ok=True)
