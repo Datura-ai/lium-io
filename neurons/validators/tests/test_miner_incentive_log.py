@@ -189,6 +189,7 @@ def test_spot_tier_message_lists_every_cause_of_spot_rating():
         "contracted under the spot tier",
     ):
         assert cause in message
+    assert "banned" not in message
     assert message.endswith("spot-rated executors do not earn subnet incentive.")
 
 

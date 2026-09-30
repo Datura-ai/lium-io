@@ -194,7 +194,7 @@ class MinerLogLine(BaseModel):
             # The spot list does not say why, so name every cause.
             message=(
                 "No subnet incentive: this executor is rated as spot for this cycle (the node "
-                "is set to Spot, its account is demoted or banned, Lium pinned the machine as "
+                "is set to Spot, its account is demoted, Lium pinned the machine as "
                 "spot, or an open rental on it was contracted under the spot tier), and "
                 "spot-rated executors do not earn subnet incentive."
             ),
