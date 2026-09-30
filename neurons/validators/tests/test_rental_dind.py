@@ -12,8 +12,9 @@ import pytest
 from docker.errors import APIError, NotFound
 
 from core.config import settings
+from core.docker_utils import ALPINE_HELPER_IMAGE
 from payload_models.payloads import ContainerCreateRequest, CustomOptions, WorkloadKind
-from services.docker_service import DockerService
+from services.docker_service import DindStoreResetUnconfirmed, DockerService
 from services.rental_dind import (
     DIND_VERSION_MAX_BYTES,
     INNER_DAEMON_CONFIG_MAX_BYTES,
@@ -23,6 +24,7 @@ from services.rental_dind import (
     dind_companion_volume_names,
     dind_probe_cleanup_command,
     dind_store_reset_command,
+    dind_store_reset_settle_command,
     dind_store_version_probe_command,
     dind_store_version_record_command,
     is_dind_store_downgrade,
@@ -889,13 +891,17 @@ class _Result:
 
 
 _RESET = "find /store -mindepth 1"
+_SETTLE = 'printf "stopped=1'
 
 
 class _Ssh:
-    def __init__(self, probe_stdout="", reset_status=0, error=None, reset_error=None):
+    def __init__(
+        self, probe_stdout="", reset_status=0, error=None, reset_error=None, settle=None, settle_error=None
+    ):
         self.commands: list[str] = []
         self.probe_stdout, self.reset_status, self.error = probe_stdout, reset_status, error
         self.reset_error = reset_error
+        self.settle, self.settle_error = settle or _Result(exit_status=1), settle_error
 
     async def run(self, command, timeout=None):
         self.commands.append(command)
@@ -905,6 +911,10 @@ class _Ssh:
             if self.reset_error is not None:
                 raise self.reset_error
             return _Result(exit_status=self.reset_status)
+        if _SETTLE in command:
+            if self.settle_error is not None:
+                raise self.settle_error
+            return self.settle
         if "volume inspect" in command:
             return _Result(stdout=self.probe_stdout)
         return _Result()
@@ -1028,14 +1038,60 @@ async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_ser
     assert recordable is False  # the newer marker stays, so the next create resets again
     caplog.clear()
 
-    recordable = await docker_service._reset_dind_store_on_downgrade(
-        _Ssh(probe_stdout=downgrade, reset_error=TimeoutError("reset timed out")),
-        run_spec=_store_spec(),
-        local_volume="volume_x",
-        default_extra={},
+
+
+_DOWNGRADE = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
+
+
+@pytest.mark.parametrize(
+    ("settle_stdout", "outcome", "recordable"),
+    [
+        # the host finished the reset and deleted the marker, but SSH timed out before its status came back
+        ("stopped=1\nrecorded=\n", "reset_on_downgrade: acknowledgement lost (TimeoutError: reset timed out)", True),
+        # the helper was stopped mid-reset: the newer marker is still there, so the next create resets again
+        ("stopped=1\nrecorded=Docker version 28.1.0, build a\n", "reset_failed: TimeoutError: reset timed out", False),
+    ],
+    ids=["acknowledgement-lost", "stopped-mid-reset"],
+)
+@pytest.mark.asyncio
+async def test_a_reset_whose_status_is_lost_is_settled_by_rereading_the_marker(
+    docker_service, caplog, settle_stdout, outcome, recordable
+):
+    ssh = _Ssh(
+        probe_stdout=_DOWNGRADE,
+        reset_error=TimeoutError("reset timed out"),
+        settle=_Result(stdout=settle_stdout),
     )
-    assert _store_outcome(caplog) == "reset_failed: TimeoutError: reset timed out"
-    assert recordable is False
+
+    result = await docker_service._reset_dind_store_on_downgrade(
+        ssh, run_spec=_store_spec(), local_volume="volume_x", default_extra={}
+    )
+
+    assert _store_outcome(caplog) == outcome
+    assert result is recordable
+    assert ssh.commands[-2] == dind_store_reset_settle_command(
+        store_volume="volume_x_docker", helper_image=ALPINE_HELPER_IMAGE, container_name="pod_x"
+    )
+    assert ssh.commands[-1] == dind_probe_cleanup_command("pod_x")
+
+
+@pytest.mark.parametrize(
+    "ssh",
+    [
+        _Ssh(probe_stdout=_DOWNGRADE, reset_error=TimeoutError("reset timed out"), settle=_Result(exit_status=1)),
+        _Ssh(probe_stdout=_DOWNGRADE, reset_error=TimeoutError("reset timed out"), settle=_Result(stdout="recorded=\n")),
+        _Ssh(probe_stdout=_DOWNGRADE, reset_error=TimeoutError("reset timed out"), settle_error=OSError("gone")),
+    ],
+    ids=["helper-still-there", "no-stopped-line", "settle-ssh-fails"],
+)
+@pytest.mark.asyncio
+async def test_a_lost_reset_that_cannot_be_settled_does_not_start_the_pod(docker_service, caplog, ssh):
+    with pytest.raises(DindStoreResetUnconfirmed):
+        await docker_service._reset_dind_store_on_downgrade(
+            ssh, run_spec=_store_spec(), local_volume="volume_x", default_extra={}
+        )
+    assert "Inner Docker store reset outcome unknown; not starting the pod" in caplog.text
+    assert ssh.commands[-1] == dind_probe_cleanup_command("pod_x")
 
 
 @pytest.mark.parametrize("rm_fails", [False, True], ids=["reset", "reset-fails"])

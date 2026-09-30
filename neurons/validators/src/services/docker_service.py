@@ -108,6 +108,7 @@ from services.rental_dind import (
     dind_companion_volume_names,
     dind_probe_cleanup_command,
     dind_store_reset_command,
+    dind_store_reset_settle_command,
     dind_store_version_probe_command,
     dind_store_version_record_command,
     dind_store_volume_name,
@@ -303,6 +304,12 @@ _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 # image's dockerd) fit well inside its timeout; the finally removes its containers either way.
 _DIND_STORE_PROBE_TIMEOUT_SEC = 90
 _DIND_STORE_RESET_TIMEOUT_SEC = DIND_STORE_RESET_DEADLINE_SEC + 60
+_DIND_STORE_SETTLE_TIMEOUT_SEC = 90
+
+
+class DindStoreResetUnconfirmed(RuntimeError):
+    """A store reset's outcome was lost and its helper could not be confirmed stopped: the pod must not
+    start on a store that may still be being deleted."""
 _DIND_PROBE_CLEANUP_TIMEOUT_SEC = 30
 _DIND_STORE_RECORD_TIMEOUT_SEC = 30
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
@@ -1773,7 +1780,8 @@ class DockerService:
         Returns whether the version may be recorded after the create: not when a needed reset failed,
         so the newer marker (which the reset removes last) stays and the next create tries the reset
         again. A check that fails before any reset still records: the pod's dockerd is the store's
-        next writer, and the marker has to name it.
+        next writer, and the marker has to name it. A reset whose status is lost is settled by
+        _settle_lost_dind_store_reset, which raises rather than let the pod start while the reset may still run.
         """
         store_volume = _dind_store_volume(run_spec, local_volume)
         if store_volume is None:
@@ -1810,8 +1818,12 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            failed = "reset_failed" if outcome == "resetting" else "failed"
-            outcome = f"{failed}: {type(exc).__name__}: {str(exc)[:200]}"
+            if outcome == "resetting":
+                outcome = await self._settle_lost_dind_store_reset(
+                    ssh_client, store_volume=store_volume, run_spec=run_spec, cause=exc, default_extra=default_extra
+                )
+            else:
+                outcome = f"failed: {type(exc).__name__}: {str(exc)[:200]}"
         finally:
             await self._remove_dind_probe_containers(ssh_client, run_spec.name, default_extra)
         log = logger.warning if outcome.startswith(("failed", "reset_failed")) else logger.info
@@ -1828,6 +1840,47 @@ class DockerService:
             )
         )
         return not outcome.startswith("reset_failed")
+
+    async def _settle_lost_dind_store_reset(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        store_volume: str,
+        run_spec: ContainerRunSpec,
+        cause: BaseException,
+        default_extra: dict,
+    ) -> str:
+        """The reset's status never came back (an SSH timeout, a lost acknowledgement): stop its helper and
+        read the marker again. The reset deletes the marker last, so no marker means it finished and the new
+        dockerd is recorded; a marker still there means it did not, and the next create resets again. Raises
+        DindStoreResetUnconfirmed when the helper cannot be confirmed stopped."""
+        lost = f"{type(cause).__name__}: {str(cause)[:200]}"
+        try:
+            settle = await ssh_client.run(
+                dind_store_reset_settle_command(
+                    store_volume=store_volume, helper_image=ALPINE_HELPER_IMAGE, container_name=run_spec.name
+                ),
+                timeout=_DIND_STORE_SETTLE_TIMEOUT_SEC,
+            )
+            stdout = getattr(settle, "stdout", "") or ""
+            stopped = getattr(settle, "exit_status", 0) == 0 and "stopped=1" in stdout.splitlines()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stopped, stdout = False, ""
+            lost = f"{lost}; settle: {type(exc).__name__}: {str(exc)[:200]}"
+        if not stopped:
+            logger.warning(
+                _m(
+                    "Inner Docker store reset outcome unknown; not starting the pod",
+                    extra=get_extra_info({**default_extra, "store_volume": store_volume, "error": lost}),
+                )
+            )
+            raise DindStoreResetUnconfirmed(f"inner Docker store reset outcome unknown ({lost})") from cause
+        recorded, _ = parse_dind_store_version_probe(stdout)
+        if recorded is None:
+            return f"reset_on_downgrade: acknowledgement lost ({lost})"
+        return f"reset_failed: {lost}"
 
     async def _remove_dind_probe_containers(
         self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict

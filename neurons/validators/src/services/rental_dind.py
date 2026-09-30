@@ -358,6 +358,33 @@ def dind_store_reset_command(*, store_volume: str, helper_image: str, container_
     )
 
 
+def dind_store_reset_settle_command(*, store_volume: str, helper_image: str, container_name: str) -> str:
+    """After a reset whose status never came back: stop its helper, then read the marker again.
+
+    Prints `stopped=1` only once the reset helper is gone, then `recorded=<marker>` (empty when the
+    reset got as far as deleting it, which it does last). No `stopped=1` means the reset may still be
+    deleting the store.
+    """
+    marker_name, _, reset_name = (shlex.quote(name) for name in dind_probe_container_names(container_name))
+    marker = f"/store/{DIND_STORE_VERSION_MARKER}"
+    # the helper's first line proves it ran, so a failed read is never taken for a deleted marker
+    read_marker = (
+        f'echo read; m={marker}; [ -f "$m" ] && [ ! -h "$m" ] || exit 0; '
+        f'timeout {DIND_PROBE_MARKER_DEADLINE_SEC} head -c {DIND_VERSION_MAX_BYTES} "$m"'
+    )
+    cut = f"head -c {DIND_VERSION_MAX_BYTES} | head -n 1 | tr -cd '[:print:]'"
+    return (
+        f"/usr/bin/docker rm -f {reset_name} {marker_name} >/dev/null 2>&1; "
+        f"/usr/bin/docker inspect {reset_name} >/dev/null 2>&1 && exit 1; "
+        f"out=$(/usr/bin/docker run --rm --name {marker_name} --network none --label {DIND_PROBE_LABEL} "
+        f"{DIND_PROBE_RESOURCE_FLAGS} -v {shlex.quote(store_volume)}:/store:ro {helper_image} "
+        f"sh -c {shlex.quote(read_marker)} 2>/dev/null) || exit 1; "
+        '[ "$(printf "%s\\n" "$out" | head -n 1)" = read ] || exit 1; '
+        f'recorded=$(printf "%s\\n" "$out" | sed -n 2p | {cut}); '
+        'printf "stopped=1\\nrecorded=%s\\n" "$recorded"'
+    )
+
+
 def dind_store_version_record_command(container_name: str) -> str:
     """Record the pod's dockerd version in its store, from inside the pod; an image without dockerd
     records nothing and succeeds. The pod's output is discarded; only docker exec's status counts. The host's
