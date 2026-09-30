@@ -116,7 +116,7 @@ class InspectorRentedCheck:
             sensor_attested=sensor_attested,
         )
         if verdict.provider_origin:
-            return await self._record_provider_origin(
+            return self._record_provider_origin(
                 ctx,
                 verdict=verdict,
                 report=report,
@@ -199,7 +199,7 @@ class InspectorRentedCheck:
             },
         )
 
-    async def _record_provider_origin(
+    def _record_provider_origin(
         self,
         ctx: Context,
         *,

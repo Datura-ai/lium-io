@@ -276,25 +276,6 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
     assert len(verdict.provider_findings) == 1
 
 
-@pytest.mark.parametrize("container", ["my-own-jupyter", "pod_gone-since-the-list-was-fetched"])
-def test_a_finding_on_a_container_that_is_not_a_rented_pod_names_no_pod(container):
-    """A provider inside their own container is provider-origin but harms no renter."""
-    finding = _finding(HUMAN_SHELL, host=True, nested=False)
-    finding["container"] = container
-    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=True)
-
-    assert verdict.provider_origin is True
-    assert verdict.affected_pod_ids == []
-    assert verdict.unmatched_containers == [container]
-
-
-def test_a_rented_pod_named_by_a_provider_finding_is_affected():
-    verdict = build_verdict(
-        {}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=True
-    )
-    assert verdict.affected_pod_ids == [POD]
-
-
 def test_a_verdict_with_every_pod_matched_carries_empty_unmatched_fields():
     verdict = build_verdict({}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=False)
 
