@@ -303,8 +303,8 @@ class RentedGpuDropMessages:
         reason="RENTED_GPU_DROP",
         severity="error",
         category="env",
-        impact="Proceed; score not changed here. Reported to the backend this cycle (provider, support and renter "
-        "are told once per incident)",
+        impact="Proceed; score not changed here. Reported to the backend unless held for a second cycle or a dry "
+        "run (see pods[].posted, held and delivery); provider, support and renter are told once per incident",
         remediation="A card fell out of NVML on a rented node (see faults, missing_uuids, nvml_error_code). Check "
         "`nvidia-smi` and `dmesg` for Xid 79 / 'fallen off the bus', then reset or reboot the host; the renter's "
         "workload on the missing card is already broken.",
@@ -314,7 +314,8 @@ class RentedGpuDropMessages:
         reason="RENTED_GPU_RECOVERED",
         severity="info",
         category="env",
-        impact="Proceed; the backend is told the incident ended",
+        impact="Proceed; the end of the incident is reported to the backend (see pods[].delivery; one with no "
+        "answer is sent again next cycle)",
     )
     OK = MessageTemplate(
         event="Rented node shows every rented GPU",
