@@ -185,7 +185,7 @@ def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -
     report = _scrape_error_report(stdout) or {}
     data = report.get("data")
     if not isinstance(data, dict):
-        return {}
+        return {"gpu": {}}
     specs = _update_keys(_deobfuscate(data, obfuscation_keys), ORIGINAL_KEYS)
     return specs if isinstance(specs.get("gpu"), dict) else {**specs, "gpu": {}}
 
