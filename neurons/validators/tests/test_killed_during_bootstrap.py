@@ -21,6 +21,7 @@ from services.docker_service import (
     DockerService,
     container_gone_cause,
     inflight_creates,
+    own_sweep_removals,
 )
 from services.rental_docker_sdk import (
     ContainerExecSpec,
@@ -265,9 +266,12 @@ _SIGINT = _container_state(status="exited", running=False, exit_code=130)
          {"cause": "removed", "exit_code": None, "status": None}),
         ("set_environment", [_RUNNING], lambda api: _gone_at_inspect(api, 2), "it was removed",
          {"cause": "removed", "exit_code": None}),
+        ("set_environment", [_RUNNING, _RUNNING, _SIGKILLED], _exec_exits(0, 137), "it was killed (SIGKILL)",
+         {"cause": "killed"}),
     ],
     ids=["ssh-oom", "ssh-sigkill", "ssh-docker-stop-143", "ssh-exec-137-dead", "ssh-exec-137-404",
-         "keys-oom", "keys-removing-exit-0", "keys-exec-130", "keys-exec-137-404", "env-removed"],
+         "keys-oom", "keys-removing-exit-0", "keys-exec-130", "keys-exec-137-404", "env-removed",
+         "env-exec-137"],
 )  # fmt: skip
 async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     svc, monkeypatch, caplog, step, states, setup, sentence, event
@@ -290,6 +294,9 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     assert f"during {step}" in result.detail and "has no long-running command" not in result.detail
     assert f"(cause={event['cause']} oom_killed=" in result.detail
     assert _failure_extra(caplog)["failure_step"] == "killed_during_bootstrap"
+    failure = next(r for r in caplog.records if str(r.msg) == "Failed create_container")
+    assert failure.levelno == logging.ERROR and failure.exc_info is None
+    assert failure.msg.extra["reason"] == "killed_during_bootstrap"
     (logged,) = _events(caplog)
     assert logged["container_name"] == f"pod_{payload.pod_id}" and logged["bootstrap_step"] == step
     assert {k: logged[k] for k in event} == event
@@ -301,6 +308,42 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     elif step == "ssh_bootstrap":
         # the keys went in; the bootstrap's one exec got none against the dying container
         assert len(client.exec_specs) == 2 and api.events == _RACE
+
+
+@pytest.mark.asyncio
+async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypatch, caplog):
+    """A customer's create removes every filler on the node, one still bootstrapping included: that
+    create finds its container gone, but the validator removed it, so no kill is filed."""
+    api = FakeApiClient()
+    api.container_states = [_RUNNING, _SIGKILLED]
+    _bootstrapping_create(svc, monkeypatch, api)
+    caplog.set_level(logging.WARNING)
+    payload = _payload()
+    own_sweep_removals.record([f"pod_{payload.pod_id}"])
+
+    result = await _create(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "ssh_bootstrap"
+    assert "stopped by the node" not in result.detail
+    assert _events(caplog) == []
+    assert any(getattr(r.msg, "extra", {}).get("reason") == "removed_by_own_sweep" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_the_stale_sweep_records_what_it_removes(svc):
+    ssh = Mock()
+    ssh.run = AsyncMock(return_value=Mock(stdout="filler_swept-1\npod_keep\n", exit_status=0))
+    svc._remove_stale_containers = AsyncMock()
+
+    removed = await svc.clean_existing_containers(
+        ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
+        active_container_names=["pod_keep", "filler_swept-1"], remove_every_filler=True,
+    )
+
+    assert removed == ["filler_swept-1"]
+    assert own_sweep_removals.removed_by_us("filler_swept-1")
+    assert not own_sweep_removals.removed_by_us("pod_keep")
 
 
 @pytest.mark.asyncio

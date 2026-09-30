@@ -1094,6 +1094,33 @@ class _InflightCreateRegistry:
 inflight_creates = _InflightCreateRegistry()
 
 
+class _OwnSweepRegistry:
+    """Containers a create's stale sweep (clean_existing_containers) force-removed, and when.
+
+    A customer's create removes every `filler_*` on the node (DAH-3706), including a filler whose own
+    create is still bootstrapping. That create then finds its container gone; the validator removed
+    it, so it is not a node kill. Names carry the pod id, so a name is not reused by another pod.
+    """
+
+    TTL_SECONDS = 15 * 60
+
+    def __init__(self) -> None:
+        self._removed_at: dict[str, float] = {}
+
+    def record(self, container_names: list[str]) -> None:
+        now = time.monotonic()
+        self._removed_at = {n: t for n, t in self._removed_at.items() if now - t < self.TTL_SECONDS}
+        for name in container_names:
+            self._removed_at[name] = now
+
+    def removed_by_us(self, container_name: str) -> bool:
+        at = self._removed_at.get(container_name)
+        return at is not None and time.monotonic() - at < self.TTL_SECONDS
+
+
+own_sweep_removals = _OwnSweepRegistry()
+
+
 class _PendingDeletionRegistry:
     """Pods whose last delete answered DeletionInProgress and has not completed since.
 
@@ -2588,6 +2615,8 @@ class DockerService:
                 ),
             )
 
+            # recorded before the rm: a create bootstrapping one of these may see it gone at once
+            own_sweep_removals.record(stale_containers)
             await self._remove_stale_containers(
                 ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
             )
@@ -3965,6 +3994,9 @@ class DockerService:
             return str(exc)
 
         if result.exit_status != 0:
+            await _raise_if_killed_after_exec(
+                docker_client, container_name=container_name, exit_status=result.exit_status
+            )
             await self.stream_log(
                 result.stderr or result.stdout or "Failed to set environment variables",
                 "error",
@@ -6826,6 +6858,21 @@ class DockerService:
                         if container_gone_cause(post_run_exc.state) == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
                             raise
+                        if own_sweep_removals.removed_by_us(container_name):
+                            # Another create on this node swept it (a customer's create removes
+                            # every filler): the validator removed it, not the node.
+                            logger.warning(
+                                _m(
+                                    "Container removed by another create's sweep during bootstrap",
+                                    extra=get_extra_info({
+                                        **default_extra,
+                                        "container_name": container_name,
+                                        "reason": "removed_by_own_sweep",
+                                        "bootstrap_step": current_step,
+                                    }),
+                                )
+                            )
+                            raise
                         killed = self._explain_container_killed_during_bootstrap(
                             post_run_exc,
                             container_name=container_name,
@@ -6940,7 +6987,7 @@ class DockerService:
                 )
             elif isinstance(
                 _last_attempt_exception(e),
-                (RentalDockerContainerRestartingError, ImageExitedDuringKeyInjection),
+                (RentalDockerContainerRestartingError, ImageExitedDuringKeyInjection, ContainerKilledDuringBootstrap),
             ):
                 # add_public_keys re-raises the restart error wrapped in ImageExitedDuringKeyInjection
                 logger.error(
@@ -6953,6 +7000,8 @@ class DockerService:
                             "reason": (
                                 "image_exited_during_key_injection"
                                 if isinstance(_last_attempt_exception(e), ImageExitedDuringKeyInjection)
+                                else "killed_during_bootstrap"
+                                if isinstance(_last_attempt_exception(e), ContainerKilledDuringBootstrap)
                                 else "workload_container_restarting"
                             ),
                         }),
