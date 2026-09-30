@@ -21,7 +21,7 @@ from payload_models.payloads import ContainerCreated, WorkloadKind
 from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_client
 
 import services.docker_service as ds_module
-from services.docker_service import FILLER_STILL_RUNNING_EVENT, DockerService
+from services.docker_service import FILLER_STILL_RUNNING_EVENT, DockerService, own_sweep_removals
 
 
 @pytest.fixture
@@ -51,14 +51,19 @@ def _listing(stdout: str, exit_status: int = 0, stderr: str = ""):
     return result
 
 
-def _host(listings: list) -> AsyncMock:
+@pytest.fixture(autouse=True)
+def _no_sweeps_from_other_tests():
+    own_sweep_removals.clear()
+
+
+def _host(listings: list, inspect_stdout: str = "") -> AsyncMock:
     """An SSH client whose `docker ps -a` calls return ``listings`` in turn; the sweep's `docker
-    inspect` of the stale names (the IDs it records) answers with no ID."""
+    inspect` of the stale names (the IDs it records) answers ``inspect_stdout`` (default: no ID)."""
     listings = iter(listings)
 
     async def run(command, **_kwargs):
         if command.startswith("/usr/bin/docker inspect"):
-            return _listing("")
+            return _listing(inspect_stdout)
         result = next(listings)
         if isinstance(result, Exception):
             raise result
@@ -155,6 +160,29 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
     confirm_call = ssh_client.run.await_args_list[2]
     assert confirm_call.kwargs["timeout"] == ds_module._PRERUN_HOST_PROBE_TIMEOUT_SECONDS
     assert confirm_call.kwargs["check"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_filler_that_survives_the_removal_is_not_recorded_as_removed_by_our_sweep(
+    docker_service, retry_ssh_mock
+):
+    stuck_id, gone_id, target_id = "a" * 64, "b" * 64, "c" * 64
+    ssh_client = _host(
+        [_listing("pod_target\nfiller_stuck\nfiller_gone\n"), _listing("filler_stuck\n")],
+        inspect_stdout=f"/pod_target {target_id}\n/filler_stuck {stuck_id}\n/filler_gone {gone_id}\n",
+    )
+
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={"executor_uuid": "exec-1"},
+        pod_name="pod_target",
+        active_container_names=[],
+        remove_every_filler=True,
+    )
+
+    assert not await own_sweep_removals.removed_by_us(stuck_id)
+    assert await own_sweep_removals.removed_by_us(gone_id)
+    assert await own_sweep_removals.removed_by_us(target_id)
 
 
 @pytest.mark.asyncio

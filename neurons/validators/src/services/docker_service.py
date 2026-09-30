@@ -1202,8 +1202,9 @@ class _OwnSweepRegistry:
     it, so it is not a node kill. A retry of the same pod reuses the name, so the sweep keys on the
     container ID it inspected just before its `rm`: an older same-name container never matches the
     ID this create's `docker run` made, whatever order the listing, the run and the `rm` land in.
-    An ID counts only once its `rm` succeeded; while that `rm` is in flight, `removed_by_us` waits
-    for its outcome (the host may drop the container before the `rm` returns to us).
+    An ID counts only once its `rm` succeeded and the container is not still on the host (a filler
+    that survives the `rm` is not ours); while that `rm` is in flight, `removed_by_us` waits for its
+    outcome (the host may drop the container before the `rm` returns to us).
     """
 
     TTL_SECONDS = 15 * 60
@@ -1219,13 +1220,14 @@ class _OwnSweepRegistry:
             self._in_flight[container_id] = done
         return done
 
-    def end(self, container_ids: list[str], done: asyncio.Event, *, removed: bool) -> None:
+    def end(self, container_ids: list[str], done: asyncio.Event, *, removed: list[str]) -> None:
+        """Closes the sweep ``begin`` opened for ``container_ids``; ``removed``: the ones confirmed gone."""
         now = time.monotonic()
         self._removed_at = {i: t for i, t in self._removed_at.items() if now - t < self.TTL_SECONDS}
         for container_id in container_ids:
             if self._in_flight.get(container_id) is done:
                 del self._in_flight[container_id]
-            if removed:
+            if container_id in removed:
                 self._removed_at[container_id] = now
         done.set()
 
@@ -2887,16 +2889,16 @@ class DockerService:
             )
 
             # in flight before the rm: a create bootstrapping one of these may see it gone at once
-            swept_ids = await self._container_ids(ssh_client, stale_containers)
-            sweep = own_sweep_removals.begin(swept_ids)
-            removed = False
+            swept = await self._container_ids(ssh_client, stale_containers)
+            sweep = own_sweep_removals.begin(list(swept.values()))
+            survivors: set[str] | None = None
             try:
-                await self._remove_stale_containers(
+                survivors = await self._remove_stale_containers(
                     ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
                 )
-                removed = True
             finally:
-                own_sweep_removals.end(swept_ids, sweep, removed=removed)
+                removed = [] if survivors is None else [i for n, i in swept.items() if n not in survivors]
+                own_sweep_removals.end(list(swept.values()), sweep, removed=removed)
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2923,23 +2925,25 @@ class DockerService:
         pod_name: str,
         stale_containers: list[str],
         remove_every_filler: bool,
-    ) -> None:
-        """`docker rm -fv` the stale containers. A customer create (DAH-3706) uses the tolerant rm
-        and then confirms that no filler survived."""
+    ) -> set[str]:
+        """`docker rm -fv` the stale containers; returns the names seen still on the host after it.
+        A customer create (DAH-3706) uses the tolerant rm and then confirms that no filler survived."""
         if not remove_every_filler:
             names = " ".join(shlex.quote(name) for name in stale_containers)
             await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
-            return
+            return set()
 
         await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
-        if removed_fillers:
-            await self._confirm_fillers_removed(
-                ssh_client=ssh_client,
-                default_extra=default_extra,
-                pod_name=pod_name,
-                removed_fillers=removed_fillers,
-            )
+        if not removed_fillers:
+            return set()
+        survivors = await self._confirm_fillers_removed(
+            ssh_client=ssh_client,
+            default_extra=default_extra,
+            pod_name=pod_name,
+            removed_fillers=removed_fillers,
+        )
+        return set(removed_fillers) if survivors is None else set(survivors) & set(removed_fillers)
 
     async def _confirm_fillers_removed(
         self,
@@ -2947,11 +2951,11 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         removed_fillers: list[str],
-    ) -> None:
-        """Re-read `docker ps -a` after a customer create's filler removal; log any survivor.
+    ) -> list[str] | None:
+        """Re-read `docker ps -a` after a customer create's filler removal; log and return any survivor.
 
-        A listing that fails, times out or exits non-zero is logged as well -- the confirmation
-        never fails the create.
+        A listing that fails, times out or exits non-zero is logged as well and returns None -- the
+        confirmation never fails the create.
         """
         names_after = await self._list_all_container_names(ssh_client)
         if names_after is None:
@@ -2965,7 +2969,7 @@ class DockerService:
                     }),
                 )
             )
-            return
+            return None
         survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
         if survivors:
             logger.warning(
@@ -2981,6 +2985,7 @@ class DockerService:
                     }),
                 )
             )
+        return survivors
 
     async def _remove_stale_containers_tolerantly(
         self,
@@ -3049,19 +3054,24 @@ class DockerService:
         return [name for name in (result.stdout or "").strip().split("\n") if name]
 
     @staticmethod
-    async def _container_ids(ssh_client: asyncssh.SSHClientConnection, names: list[str]) -> list[str]:
-        """The full IDs `docker inspect` gives for ``names`` (names already gone are skipped); [] when
+    async def _container_ids(ssh_client: asyncssh.SSHClientConnection, names: list[str]) -> dict[str, str]:
+        """Name -> full ID from `docker inspect` for ``names`` (names already gone are skipped); {} when
         the inspect could not be read, so the sweep then claims no removal."""
-        command = "/usr/bin/docker inspect --format '{{.Id}}' " + " ".join(shlex.quote(n) for n in names)
+        command = "/usr/bin/docker inspect --format '{{.Name}} {{.Id}}' " + " ".join(shlex.quote(n) for n in names)
         try:
             result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
         except Exception as exc:
             logger.warning(
                 _m("docker inspect of the stale containers failed", extra={"error_type": exc.__class__.__name__})
             )
-            return []
+            return {}
         stdout = result.stdout if isinstance(result.stdout, str) else ""
-        return [line.strip() for line in stdout.splitlines() if re.fullmatch(r"[0-9a-f]{64}", line.strip())]
+        ids: dict[str, str] = {}
+        for line in stdout.splitlines():
+            match = re.fullmatch(r"/?(\S+) ([0-9a-f]{64})", line.strip())
+            if match and match.group(1) in names:
+                ids[match.group(1)] = match.group(2)
+        return ids
 
     async def _names_still_on_host(
         self, ssh_client: asyncssh.SSHClientConnection, names: list[str]

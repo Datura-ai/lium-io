@@ -550,7 +550,7 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
             "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
         ]
     )
-    inspect = "/usr/bin/docker inspect --format '{{.Id}}' pod_new pod_old filler_x"
+    inspect = "/usr/bin/docker inspect --format '{{.Name}} {{.Id}}' pod_new pod_old filler_x"
     assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"', inspect]
     assert _cmds(probed) == [inspect]  # the IDs the sweep records; no listing
 

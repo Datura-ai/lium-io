@@ -340,7 +340,7 @@ def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str, *, rm: str 
 
     def sweep() -> None:
         in_flight = own_sweep_removals.begin([container_id])
-        end = functools.partial(own_sweep_removals.end, [container_id], in_flight, removed=rm != "failed")
+        end = functools.partial(own_sweep_removals.end, [container_id], in_flight, removed=[] if rm == "failed" else [container_id])
         if rm == "done":
             end()
         else:
@@ -384,7 +384,7 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     name = f"pod_{payload.pod_id}"
     this, older = _container_id(name), _container_id(name, generation=1)
     if swept == "older-same-name-container-before-docker-run":
-        own_sweep_removals.end([older], own_sweep_removals.begin([older]), removed=True)
+        own_sweep_removals.end([older], own_sweep_removals.begin([older]), removed=[older])
     elif swept == "older-same-name-container-during-bootstrap":
         _swept_at_inspect(api, 2, older)
     elif swept == "rm-in-flight-then-ok":
@@ -423,15 +423,16 @@ def _sweep_ssh(inspect_stdout: str) -> Mock:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("from_probe", "rm_error"),
-    [(False, None), (True, None), (False, RuntimeError("rm never sent"))],
-    ids=["listed", "from-probe", "rm-failed"],
-)
-async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_probe, rm_error):
+    ("from_probe", "rm_error", "survivors"),
+    [(False, None, set()), (True, None, set()), (False, RuntimeError("rm never sent"), set()),
+     (False, None, {"filler_swept-1"})],
+    ids=["listed", "from-probe", "rm-failed", "filler-survived-the-rm"],
+)  # fmt: skip
+async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_probe, rm_error, survivors):
     swept_id = _container_id("filler_swept-1")
-    ssh = _sweep_ssh(f"{swept_id}\n")
+    ssh = _sweep_ssh(f"/filler_swept-1 {swept_id}\n")
     probe = Mock(container_names=("filler_swept-1", "pod_keep")) if from_probe else None
-    svc._remove_stale_containers = AsyncMock(side_effect=rm_error)
+    svc._remove_stale_containers = AsyncMock(side_effect=rm_error, return_value=survivors)
     sweep = svc.clean_existing_containers(
         ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
         active_container_names=["pod_keep", "filler_swept-1"], remove_every_filler=True,
@@ -444,7 +445,8 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
         assert not await own_sweep_removals.removed_by_us(swept_id)
         return
     assert await sweep == ["filler_swept-1"]
-    assert await own_sweep_removals.removed_by_us(swept_id)
+    # a filler still on the host after the rm (_confirm_fillers_removed saw it) was not removed by us
+    assert await own_sweep_removals.removed_by_us(swept_id) == (not survivors)
     assert not await own_sweep_removals.removed_by_us(_container_id("filler_swept-1", generation=1))
     assert not await own_sweep_removals.removed_by_us(None)
 
@@ -455,7 +457,7 @@ async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_not_ours(m
     ok, failed, stuck = (_container_id(n) for n in ("pod_ok", "pod_failed", "pod_stuck"))
     for container_id, removed in ((ok, True), (failed, False)):
         sweep = registry.begin([container_id])
-        end = functools.partial(registry.end, [container_id], sweep, removed=removed)
+        end = functools.partial(registry.end, [container_id], sweep, removed=[container_id] if removed else [])
         asyncio.get_running_loop().call_later(0.01, end)
     registry.begin([stuck])
     monkeypatch.setattr(registry, "IN_FLIGHT_WAIT_SECONDS", 0.05)
@@ -465,12 +467,13 @@ async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_not_ours(m
     assert not await registry.removed_by_us(stuck)
 
 
-def test_the_inspect_output_keeps_only_full_container_ids():
+def test_the_inspect_output_maps_each_name_to_its_full_container_id():
     good = _container_id("pod_a")
     ssh = Mock()
-    ssh.run = AsyncMock(return_value=Mock(stdout=f"{good}\n\nError: No such object: pod_b\n", exit_status=1))
+    stdout = f"/pod_a {good}\n\nError: No such object: pod_b\n/pod_other {_container_id('pod_other')}\n"
+    ssh.run = AsyncMock(return_value=Mock(stdout=stdout, exit_status=1))
 
-    assert asyncio.run(DockerService._container_ids(ssh, ["pod_a", "pod_b"])) == [good]
+    assert asyncio.run(DockerService._container_ids(ssh, ["pod_a", "pod_b"])) == {"pod_a": good}
 
 
 @pytest.mark.asyncio
