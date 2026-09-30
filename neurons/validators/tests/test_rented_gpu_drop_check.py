@@ -699,7 +699,12 @@ async def test_a_split_node_that_adds_an_nvml_loss_error_is_reported_again(conte
 
     for error in (None, None, "NVMLError(15)"):
         await _run(
-            context_factory, services, listed=UUIDS[:7], count=7, scrape_error=error, pods=_split_pods()
+            context_factory,
+            services,
+            listed=UUIDS[:7],
+            count=7,
+            scrape_error=error,
+            pods=_split_pods(),
         )
 
     calls = services.backend.report_rented_gpu_drop.await_args_list
