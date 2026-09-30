@@ -50,7 +50,6 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-import redis.exceptions
 from protocol.vc_protocol.compute_requests import (
     GPU_DROP_DELIVERY_DISABLED,
     GPU_DROP_DELIVERY_NOT_RENTED,
@@ -66,14 +65,11 @@ from ..messages import RentedGpuDropMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import split_uuids
+from .rented_pod_ssh import POD_STATUS_RUNNING, REDIS_ERRORS
 
 logger = logging.getLogger(__name__)
 
 RENTED_GPU_DROP_KEY_PREFIX = "rented_gpu_drop"
-# the backend's pod status (RentedPod.status) for a pod the renter is using
-POD_STATUS_RUNNING = "RUNNING"
-# a Redis outage surfaces as RedisError or, below the client, as a socket OSError
-GPU_DROP_REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
 
 FAULT_BELOW_RENTED = "below_rented_count"
 FAULT_DETAILS_SHORT = "details_short_of_count"
@@ -367,7 +363,7 @@ class RentedGpuDropCheck:
         redis_ok = True
         try:
             mark = DropMark.load(await ctx.services.redis.get(key))
-        except GPU_DROP_REDIS_ERRORS:
+        except REDIS_ERRORS:
             redis_ok = False
             self._log_redis_unavailable(ctx, pod.pod_id, "read")
             mark = _local_mark(key)
@@ -441,7 +437,7 @@ class RentedGpuDropCheck:
         if redis_ok:
             try:
                 await ctx.services.redis.set(key, mark.dump(), ex=ttl)
-            except GPU_DROP_REDIS_ERRORS:
+            except REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod_id, "write")
 
     async def _forget(self, ctx: Context, pod_id: str, redis_ok: bool) -> None:
@@ -450,7 +446,7 @@ class RentedGpuDropCheck:
         if redis_ok:
             try:
                 await ctx.services.redis.delete(key)
-            except GPU_DROP_REDIS_ERRORS:
+            except REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod_id, "delete")
 
     async def _post(
