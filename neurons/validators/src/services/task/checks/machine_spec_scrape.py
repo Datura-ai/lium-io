@@ -178,15 +178,12 @@ def _classify_scrape_failure(
     return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
 
 
-# The scrape's own NVML reading on the host says the node cannot serve a GPU: NVML raised, or answered with
-# zero cards. SCRAPE_FAILED_ON_HOST is left out: a missing interpreter or a traceback says nothing of the GPU.
-HOST_GPU_RUNTIME_FAULT_REASONS = frozenset(
-    {Msg.SCRAPE_FAILED_DRIVER.reason, Msg.SCRAPE_FAILED_NO_GPU.reason}
-)
-# The NVML return codes (nvml.h) under which the GPU runtime itself is dead: driver not loaded, GPU lost,
-# GPU requires reset, GPU not found. Anything else the scrape's NVML block raises stays a plain halt: the
-# library copied to a temp file that a full or read-only disk refuses (LIBRARY_NOT_FOUND), a driver/library
-# mismatch that leaves pods started before the upgrade working, a permission or memory error.
+# The scrape's own NVML reading on the host says the node cannot serve a GPU: NVML answered with zero cards
+# (SCRAPE_FAILED_NO_GPU), or raised one of these nvml.h return codes (SCRAPE_FAILED_DRIVER): driver not
+# loaded, GPU lost, GPU requires reset, GPU not found. Anything else stays a plain halt: the library copied
+# to a temp file that a full or read-only disk refuses (LIBRARY_NOT_FOUND), a driver/library mismatch that
+# leaves pods started before the upgrade working, a permission or memory error, UNKNOWN (999, which names
+# no fault), and SCRAPE_FAILED_ON_HOST (a missing interpreter or a traceback says nothing of the GPU).
 HOST_GPU_RUNTIME_DEAD_NVML_CODES = frozenset({9, 15, 16, 28})
 _NVML_ERROR_CODE_RX = re.compile(r"^NVMLError\w*\((\d+)\)")
 HOST_GPU_RUNTIME_FAULT_IMPACT = (
