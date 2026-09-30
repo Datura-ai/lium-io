@@ -31,6 +31,7 @@ from services.rental_docker_sdk import (
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
+    RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC,
     _build_rental_ssh_http_adapter_class,
 )
 
@@ -87,6 +88,10 @@ class FakeApiClient:
         self.inspected_images = []
         self.missing_images = set()
         self.inspect_image_error = None
+        self.repo_digests = []
+        self.remote_digest = "sha256:remote"
+        self.inspect_distribution_error = None
+        self.distribution_calls = []
         self.host_config_kwargs = None
         self.created_container = None
         self.started = []
@@ -96,6 +101,7 @@ class FakeApiClient:
         self.exec_inspected = []
         self.containers_inspected = []
         self.container_states = None
+        self.inspect_container_error = None
         self.events = []
         self.pruned_images = False
         self.created_volumes = []
@@ -139,7 +145,13 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id"}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+
+    def inspect_distribution(self, image, auth_config=None):
+        self.distribution_calls.append({"image": image, "auth_config": auth_config})
+        if self.inspect_distribution_error is not None:
+            raise self.inspect_distribution_error
+        return {"Descriptor": {"digest": self.remote_digest}}
 
     def create_container(self, **kwargs):
         self.events.append("create_container")
@@ -169,6 +181,8 @@ class FakeApiClient:
     def inspect_container(self, container_name):
         self.events.append("inspect_container")
         self.containers_inspected.append(container_name)
+        if self.inspect_container_error is not None:
+            raise self.inspect_container_error
         if self.container_states is not None:
             if len(self.container_states) > 1:
                 return self.container_states.pop(0)
@@ -495,6 +509,47 @@ async def test_image_exists_returns_false_for_missing_image():
     assert await client.image_exists(image="registry.example/missing:tag") is False
 
     assert api_client.inspected_images == ["registry.example/missing:tag"]
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_when_a_repo_digest_matches_the_registry():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["ghcr.io/org/app@sha256:old", "ghcr.io/org/app@sha256:remote"]
+    client = RentalDockerSdkClient(api_client)
+    auth_config = {"username": "renter", "password": "secret"}
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app:prod", auth_config=auth_config) is True
+
+    assert api_client.distribution_calls == [{"image": "ghcr.io/org/app:prod", "auth_config": auth_config}]
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_stale_when_the_registry_tag_moved():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["ghcr.io/org/app@sha256:old"]
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app:prod") is False
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_raises_when_the_registry_check_fails():
+    api_client = FakeApiClient()
+    api_client.inspect_distribution_error = APIError("toomanyrequests")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="toomanyrequests"):
+        await client.local_image_is_current(image="ghcr.io/org/app:prod")
+
+
+@pytest.mark.asyncio
+async def test_local_image_is_current_skips_the_registry_for_a_digest_reference():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_is_current(image="ghcr.io/org/app@sha256:pinned") is True
+
+    assert api_client.distribution_calls == []
 
 
 @pytest.mark.asyncio
@@ -968,10 +1023,8 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
     api_client.remaining_restarts = 10
     client = RentalDockerSdkClient(api_client)
 
-    with pytest.raises(
-        RentalDockerOperationError,
-        match="Container abc123 is restarting, wait until the container is running",
-    ):
+    # DAH-3593: the message names the container state; Docker's 409 text rides as the cause
+    with pytest.raises(RentalDockerOperationError, match="^container restarting, exit_code=") as raised:
         await client.exec_in_container(
             ContainerExecSpec(
                 container_name="pod_exec",
@@ -979,9 +1032,15 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
             )
         )
 
+    assert "Container abc123 is restarting, wait until the container is running" in str(
+        raised.value.__cause__
+    )
+    # and in the message itself: the backend's IMAGE_EXITED_MARKERS match `is restarting` there
+    assert "Container abc123 is restarting" in str(raised.value)
     assert len(api_client.exec_created) == 3
     assert api_client.exec_started == []
-    assert api_client.containers_inspected == ["pod_exec", "pod_exec", "pod_exec"]
+    # three readiness inspects, then one more to read the exit code for the message
+    assert api_client.containers_inspected == ["pod_exec", "pod_exec", "pod_exec", "pod_exec"]
 
 
 @pytest.mark.asyncio
@@ -1400,3 +1459,124 @@ async def test_inspect_container_state_without_a_state_block_is_an_error():
 
     with pytest.raises(RentalDockerOperationError, match="did not include container State"):
         await client.inspect_container_state(container_name="pod_exec")
+
+
+def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_path):
+    """The SDK's paramiko session idles through a long build, so the adapter arms its keepalive
+    right after every connect."""
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+    keepalives = []
+
+    class FakeTransport:
+        def set_keepalive(self, interval):
+            keepalives.append(interval)
+
+    class FakeSSHClient:
+        def __init__(self):
+            self.connected_with = None
+            self._transport = None
+
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            self.connected_with = params
+            self._transport = FakeTransport()
+
+        def get_transport(self):
+            return self._transport
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    # Through docker-py's own constructor: SSHHTTPAdapter.__init__ is what calls _connect, so the
+    # hook the fix relies on is pinned here, not assumed.
+    adapter = adapter_class("ssh://root@127.0.0.1:2222")
+
+    assert adapter.ssh_client.connected_with["hostname"] == "127.0.0.1"
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC]
+    assert 0 < RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC <= 60
+
+    # docker-py reconnects a closed transport through the same hook.
+    adapter._connect()
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC] * 2
+
+
+def test_rental_ssh_adapter_connect_without_transport_does_not_fail(monkeypatch, tmp_path):
+    """A connect that leaves no transport (a stub client, or docker-py's shell-out mode) must not
+    turn into an AttributeError of our own."""
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            pass
+
+        def get_transport(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
+
+    adapter._connect()
+
+
+# DAH-3467: container_status is what the delete path asks after a remove read timeout. A 404 is the
+# only answer that may report the container gone; every other failure has to surface as an error.
+@pytest.mark.asyncio
+async def test_container_status_returns_none_when_dockerd_no_longer_knows_the_name():
+    api_client = FakeApiClient()
+    api_client.inspect_container_error = NotFound(
+        '404 Client Error for http+docker://ssh/v1.52/containers/pod_gone/json: '
+        'Not Found ("No such container: pod_gone")'
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_status(container_name="pod_gone") is None
+    assert api_client.containers_inspected == ["pod_gone"]
+
+
+@pytest.mark.asyncio
+async def test_container_status_returns_the_lowercased_state_status():
+    api_client = FakeApiClient()
+    api_client.container_states = [_container_state(status="Removing", running=False)]
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_status(container_name="pod_slow") == "removing"
+
+
+@pytest.mark.asyncio
+async def test_container_status_raises_on_any_other_inspect_failure():
+    api_client = FakeApiClient()
+    api_client.inspect_container_error = APIError("500 Server Error: daemon exploded")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="inspect container failed.*daemon exploded"):
+        await client.container_status(container_name="pod_slow")

@@ -19,6 +19,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import HostPolicyResult
 from services.executor_image_policy import ExecutorImageReport, ImageVerdict
 from services.executor_rollout import (
+    ROLLOUT_FAILURE_REASONS,
     ROLLOUT_STATE_KEY,
     ExecutorRolloutTracker,
     RolloutWindow,
@@ -371,6 +372,26 @@ def test_a_failure_on_an_executor_already_running_the_new_image_is_a_real_failur
     assert rollout_grace_reason(still_on_old, window, J1) == reason
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "SCRAPE_FAILED",
+        "SCRAPE_FAILED_NO_GPU",
+        "SCRAPE_FAILED_DRIVER",
+        "SCRAPE_FAILED_ON_HOST",
+        "SCRAPE_TIMEOUT",
+        "SCRAPE_TRANSPORT_FAILED",
+    ],
+)
+def test_every_scrape_failure_code_keeps_the_rollout_grace_scrape_failed_had(reason: str) -> None:
+    """Regression: a code SCRAPE_FAILED split into falling out of the set, so a scrape a watchtower
+    recreate ended inside the window would stand as a verdict."""
+    still_on_old = _failed("node-2", reason, observed_digest=OLD)
+
+    assert reason in ROLLOUT_FAILURE_REASONS
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == reason
+
+
 def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monkeypatch) -> None:
     """The 70 EXECUTOR_IMAGE_OUTDATED rows of 11 Sep, with the image check enforced as it was that
     day. Unrented, the fatal check ends the run with that reason; rented, the run completes with
@@ -388,6 +409,19 @@ def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monke
     assert rollout_grace_reason(unrented, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
     assert rollout_grace_reason(rented, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
     assert rollout_grace_reason(validator_snapshot_was_stale, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
+
+
+def test_a_rented_run_reporting_its_pods_ssh_is_still_the_rented_halt(monkeypatch) -> None:
+    """DAH-2870: when the renter's SSH is being reported, the tenant-enforcement halt ends the run
+    on RENTED_POD_SSH_UNREACHABLE instead of RENTED. It is the same halt (passed, score kept), so an
+    OUTDATED image inside the window is withheld exactly as it is for RENTED."""
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
+    window = _open_window()
+    rented_reporting = _failed(
+        "node-2", "RENTED_POD_SSH_UNREACHABLE", observed_digest=OLD, image_status="OUTDATED"
+    )
+
+    assert rollout_grace_reason(rented_reporting, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
 
 
 def test_a_rented_zero_under_an_unenforced_outdated_report_stands(monkeypatch) -> None:

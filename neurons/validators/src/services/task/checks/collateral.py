@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ..messages import CollateralMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .collateral_prefetch import collateral_read_args
 
 
 class CollateralCheck:
@@ -20,21 +21,25 @@ class CollateralCheck:
         enable_no_collateral = ctx.config.enable_no_collateral
         self.fatal = not enable_no_collateral
 
-        specs = ctx.state.specs
-        gpu_count = ctx.state.gpu_count
-        if gpu_count is None:
-            gpu_count = specs.get("gpu", {}).get("count", 0)
-        gpu_details = ctx.state.gpu_details
-        if not gpu_details:
-            gpu_details = specs.get("gpu", {}).get("details", [])
-        gpu_model = gpu_details[0].get("name") if gpu_details else None
+        args = collateral_read_args(ctx)
+        gpu_count = args.gpu_count
+        gpu_model = args.gpu_model
 
-        collateral_deposited, error_message, contract_version = await collateral_service.is_eligible_executor(
-            miner_hotkey=ctx.miner_hotkey,
-            executor_uuid=ctx.executor.uuid,
-            gpu_model=gpu_model,
-            gpu_count=gpu_count,
-        )
+        # Validation fast path: CollateralPrefetchCheck started this same read earlier; its answer
+        # is used only when it was asked the same question this check would ask now.
+        prefetch = ctx.state.collateral_prefetch
+        prefetched = prefetch is not None and prefetch.args == args
+        if prefetched:
+            collateral_deposited, error_message, contract_version = await prefetch.task
+        else:
+            if prefetch is not None:
+                prefetch.task.cancel()
+            collateral_deposited, error_message, contract_version = await collateral_service.is_eligible_executor(
+                miner_hotkey=ctx.miner_hotkey,
+                executor_uuid=ctx.executor.uuid,
+                gpu_model=gpu_model,
+                gpu_count=gpu_count,
+            )
 
         if collateral_deposited:
             event = render_message(
@@ -58,6 +63,8 @@ class CollateralCheck:
             )
 
         passed = collateral_deposited or not self.fatal
+        if prefetched:
+            event.what_we_saw["prefetched"] = True
 
         return CheckResult(
             passed=passed,

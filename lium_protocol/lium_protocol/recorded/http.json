@@ -19,7 +19,9 @@
                   40002
                 ],
                 "created_at": "2026-09-08T20:33:00Z",
-                "gpu_count": 2
+                "gpu_count": 2,
+                "ssh_port": 40001,
+                "status": "RUNNING"
               }
             ]
           }
@@ -94,6 +96,13 @@
       "expect": "PodHostRebootRecoveredResponse",
       "message": {
         "recorded": true
+      }
+    },
+    {
+      "expect": "PodSshUnreachableResponse",
+      "message": {
+        "recorded": true,
+        "delivery": "notified"
       }
     },
     {

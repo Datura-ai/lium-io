@@ -48,7 +48,7 @@ async def _bridge_machine_spec(payload: dict[str, Any]) -> ExecutorSpecRequest:
     return client.message_queue[0]
 
 
-async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
+async def _published_payloads(jobs: list[Any], **kwargs: Any) -> list[dict[str, Any]]:
     redis_service = MagicMock()
     redis_service.publish = AsyncMock()
     service = MinerService(
@@ -57,7 +57,7 @@ async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
         redis_service=redis_service,
         attestation_service=MagicMock(),
     )
-    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck")
+    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck", **kwargs)
     return [call.args[1] for call in redis_service.publish.await_args_list]
 
 
@@ -72,6 +72,17 @@ async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_
     # Assert
     assert [payload["batch_total"] for payload in payloads] == [2, 2]
     assert all(isinstance(payload["sent_at"], float) for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_a_spec_that_is_not_the_miners_batch_sets_no_batch_total(
+    create_job_result, mock_settings
+) -> None:
+    # The backend takes the expected count once per (validator, job_batch_id, miner), from the
+    # first spec: an express spec under the cycle's id arrives before the wave's.
+    payloads = await _published_payloads([create_job_result()], is_whole_miner_batch=False)
+
+    assert [payload["batch_total"] for payload in payloads] == [None]
 
 
 @pytest.mark.asyncio
