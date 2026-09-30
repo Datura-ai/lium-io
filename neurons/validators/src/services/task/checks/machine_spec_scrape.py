@@ -7,6 +7,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
+from cryptography.fernet import InvalidToken
+
 from core.config import settings
 
 from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
@@ -132,7 +134,7 @@ def _sealed_scrape_error_report(ctx: Context, stdout: str) -> dict[str, Any] | N
     # interpreter can print too, and a Fernet token of it under the cycle's key. Only the token is ours.
     try:
         report = json.loads(_decrypt_payload(ctx, stdout))
-    except Exception:
+    except (InvalidToken, ValueError):
         return None
     return report if isinstance(report, dict) and "error" in report else None
 
