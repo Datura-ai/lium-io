@@ -7234,11 +7234,23 @@ class DockerService:
                                 )
                             except Exception as jupyter_exc:
                                 # run_jupyter's shell `docker exec` fails with a plain error when the
-                                # container is gone: read the State before cleanup removes it
+                                # container is gone: read the State before cleanup removes it. Docker's
+                                # text ("is not running") stays out of a kill's detail: the backend reads
+                                # it as the renter's image exiting (creation_failure_run.NOT_THE_HOSTS_MARKERS).
+                                logger.warning(
+                                    _m(
+                                        "Jupyter setup failed",
+                                        extra=get_extra_info({
+                                            **default_extra,
+                                            "container_name": container_name,
+                                            "error": str(jupyter_exc),
+                                        }),
+                                    )
+                                )
                                 await _raise_if_killed_after_exec(
                                     docker_client,
                                     container_name=container_name,
-                                    failure=f"Jupyter setup failed ({jupyter_exc})",
+                                    failure="Jupyter setup's docker exec failed",
                                 )
                                 raise
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"

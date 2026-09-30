@@ -837,3 +837,5 @@ async def test_a_kill_during_jupyter_setup_is_killed_during_bootstrap(svc, monke
     (logged,) = _events(caplog)
     assert logged["bootstrap_step"] == "jupyter_setup" and logged["cause"] == cause
     assert "during jupyter_setup" in result.detail
+    # the backend reads Docker's "is not running" as the renter's image exiting, not a kill on the node
+    assert "is not running" not in result.detail
