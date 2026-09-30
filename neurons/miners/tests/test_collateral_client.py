@@ -394,6 +394,7 @@ async def test_an_already_known_answer_is_an_unknown_outcome_and_the_retry_sends
         ("lost_answer", 1),
         ("upstream_timeout", 1),
         ("unknown_account", 1),
+        ("nonce_too_low", 1),
     ],
 )
 async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_status, monkeypatch):
@@ -418,6 +419,8 @@ async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_statu
         # a gateway that forwarded the transaction and then timed out upstream
         "upstream_timeout": ValueError({"code": -32000, "message": f"upstream timeout at {KEYED_RPC_URL}"}),
         "unknown_account": ValueError({"code": -32000, "message": "unknown account"}),
+        # a resend (web3's retry middleware, or a gateway's) of a transaction that already landed
+        "nonce_too_low": ValueError({"code": -32000, "message": "nonce too low"}),
     }
     if failure in answers:
         monkeypatch.setattr(eth, "send_raw_transaction", accepted_then(answers[failure]))
@@ -438,19 +441,26 @@ async def test_an_unknown_outcome_never_uses_the_next_nonce(failure, first_statu
     assert {decode_legacy(raw)["nonce"] for raw in provider.sent} == {NONCE}
 
 
-async def test_a_used_nonce_with_no_receipt_yet_sends_nothing(monkeypatch):
-    """A lagging RPC can show the nonce used before it serves the receipt: that is not proof of a drop."""
+async def test_a_used_nonce_with_no_receipt_sends_nothing_once_and_never_blocks_later_work(monkeypatch):
+    """A lagging RPC, or one that prunes old receipts, shows the nonce used with no receipt: that run sends
+    nothing and points to the explorer; the bytes can't be mined again, so the next run is not blocked."""
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
     provider.mine_sent = False
     client = client_with(provider)
+    wait_for_receipt = client.w3.eth.wait_for_transaction_receipt
     monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
     with pytest.raises(CollateralOutcomeUnknownError):
         await client.finalize_reclaim(5)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", wait_for_receipt)
 
     provider.nonce = provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralOutcomeUnknownError, match=f"nonce {NONCE} is used; no transaction was sent"):
+    with pytest.raises(CollateralOutcomeUnknownError, match=f"nonce {NONCE} is used, so it cannot be mined again"):
         await client.finalize_reclaim(5)
     assert len(provider.sent) == 1
+
+    provider.mine_sent = True
+    await client.finalize_reclaim(5)
+    assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [NONCE, NONCE + 1]
 
 
 async def test_a_refusal_that_echoes_the_rpc_url_is_reported_in_local_words_only():

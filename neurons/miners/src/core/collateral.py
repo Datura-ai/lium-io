@@ -45,10 +45,11 @@ SENT_RECORD_PATH = pathlib.Path(
 RETRY_IS_SAFE = "Run this again: it reads this transaction's outcome first and sends nothing new until it is known"
 # JSON-RPC send answers that prove the node did not take the transaction, and the local text each is reported
 # with. Any other answer may come after the transaction was forwarded (a gateway's "upstream timeout", say), so it
-# is an unknown outcome. The RPC's own text never reaches an error: it can echo the keyed RPC URL.
+# is an unknown outcome. "nonce too low" is one of those: web3's retry middleware and gateways resend
+# eth_sendRawTransaction, and the retry of a transaction that landed gets that answer. The RPC's own text never
+# reaches an error: it can echo the keyed RPC URL.
 SEND_REFUSALS = {
     "insufficient funds": "insufficient funds for gas",
-    "nonce too low": "nonce too low",
     "underpriced": "gas price too low",
     "intrinsic gas too low": "gas limit too low",
     "exceeds block gas limit": "gas limit above the block limit",
@@ -288,12 +289,16 @@ class CollateralClient:
         if receipt is None:
             nonce = await self.w3.eth.get_transaction_count(self.miner_address, "latest")
             if nonce > record["nonce"]:
-                # a lagging RPC can show the nonce used before it serves the receipt, so this is not proof that
-                # the transaction was dropped
+                # the nonce is used, so these bytes can never be mined again and the record has done its job. The
+                # receipt may be late (a lagging RPC) or gone for good (an RPC that prunes old receipts), so the
+                # outcome is left to the explorer and this run sends nothing. A later run cannot repeat the call:
+                # an RPC that has the block rejects it in the simulation, and one that lags signs that
+                # nonce again, which cannot be mined
+                self._clear_sent_record(chain_id, tx_hash)
                 raise CollateralOutcomeUnknownError(
-                    f"Transaction {tx_hash}, sent earlier, has no receipt yet but nonce {record['nonce']} is used; "
-                    f"no transaction was sent. Run this again in a few minutes. If the explorer shows another "
-                    f"transaction took nonce {record['nonce']}, delete {SENT_RECORD_PATH} and run this again"
+                    f"Transaction {tx_hash}, sent earlier, has no receipt on this RPC but nonce {record['nonce']} "
+                    "is used, so it cannot be mined again; check its outcome on the explorer. No transaction was "
+                    "sent. Run this again if it still needs doing"
                 )
             receipt = await self._broadcast_again(record)
         self._clear_sent_record(chain_id, tx_hash)
@@ -356,7 +361,7 @@ class CollateralClient:
         except OSError as error:
             raise CollateralTransactionError(
                 f"The lock of the record of earlier sends ({lock_path}) could not be opened "
-                f"({type(error).__name__}); no transaction was sent"
+                f"({type(error).__name__}); no transaction was sent. Set COLLATERAL_SENT_RECORD to a writable path"
             ) from error
         with handle:
             try:
@@ -389,7 +394,7 @@ class CollateralClient:
         except (OSError, ValueError) as error:
             raise CollateralTransactionError(
                 f"The record of earlier sends ({SENT_RECORD_PATH}) could not be written ({type(error).__name__}); "
-                "no transaction was sent"
+                "no transaction was sent. Set COLLATERAL_SENT_RECORD to a writable path"
             ) from error
 
     def _clear_sent_record(self, chain_id: int, tx_hash: str) -> None:

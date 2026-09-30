@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -83,6 +84,8 @@ def chain(monkeypatch):
 
     monkeypatch.setattr(CollateralClient, "get_executor_collateral", get_executor_collateral)
     monkeypatch.setattr(CollateralClient, "get_reclaim_request", get_reclaim_request)
+    # the earlier-send check still runs, lock and temp record included, without asking finney for its chain ID
+    monkeypatch.setattr(CollateralClient, "_pinned_chain_id", AsyncMock(return_value=964))
     return state
 
 
