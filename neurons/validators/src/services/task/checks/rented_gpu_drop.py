@@ -76,7 +76,7 @@ RENTED_GPU_DROP_KEY_PREFIX = "rented_gpu_drop"
 # The one pod status that holds a renter's cards; a backend that predates the field sends none.
 POD_STATUS_RUNNING = "RUNNING"
 # What a failing Redis raises through RedisService: the client's errors and the socket errors under them.
-REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
+GPU_DROP_REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
 
 FAULT_BELOW_RENTED = "below_rented_count"
 FAULT_DETAILS_SHORT = "details_short_of_count"
@@ -371,7 +371,7 @@ class RentedGpuDropCheck:
         stored = None
         try:
             stored = DropMark.load(await ctx.services.redis.get(key))
-        except REDIS_ERRORS:
+        except GPU_DROP_REDIS_ERRORS:
             redis_ok = False
             self._log_redis_unavailable(ctx, pod.pod_id, "read")
         # This process's own last write is never older than Redis: a write or delete that failed leaves Redis behind.
@@ -446,7 +446,7 @@ class RentedGpuDropCheck:
         if redis_ok:
             try:
                 await ctx.services.redis.set(key, mark.dump(), ex=ttl)
-            except REDIS_ERRORS:
+            except GPU_DROP_REDIS_ERRORS:
                 self._log_redis_unavailable(ctx, pod_id, "write")
 
     async def _forget(self, ctx: Context, pod_id: str) -> None:
@@ -455,7 +455,7 @@ class RentedGpuDropCheck:
         _LOCAL_MARKS.pop(key, None)
         try:
             await ctx.services.redis.delete(key)
-        except REDIS_ERRORS:
+        except GPU_DROP_REDIS_ERRORS:
             self._log_redis_unavailable(ctx, pod_id, "delete")
             # Redis still holds the closed incident: remember it as closed so a new fault starts a new one.
             closed = DropMark(first_seen_at="", recovering=True)
