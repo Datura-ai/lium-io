@@ -273,6 +273,23 @@ class Settings(BaseSettings):
     # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
     # the inspector event, no renter is told, the score is untouched.
     INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
+    # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
+    # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
+    # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
+    # root write to /usr/lib on a renter's host, so it has its own switch, off by default and
+    # independent of VERIFYX_LIBRARY_REFRESH_ENABLED (which covers only unrented executors).
+    # Off stops later replacements and undoes none; restoring the replaced file (its hash is
+    # previous_sha256 in INSPECTOR_LIBRARY_REPLACED) is in .env.template.
+    INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
+    # Pinned to a commit whose neurons/executor/libinspector.so is the validator's build; a URL on
+    # main would start serving a different file with the next library bump.
+    INSPECTOR_LIBRARY_FETCH_URL: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/Datura-ai/lium-io/"
+            "38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
+        ),
+        description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
+    )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
     # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
