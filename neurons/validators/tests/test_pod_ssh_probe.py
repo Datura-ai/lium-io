@@ -281,6 +281,29 @@ async def test_most_of_the_fleet_silent_marks_every_observation_as_our_outage():
     assert observations["e5"][0].result is PodSshResult.BANNER
 
 
+@pytest.mark.asyncio
+async def test_silent_pods_that_are_not_running_do_not_mark_our_outage():
+    rented = _rented(
+        {
+            "E0": [_pod(f"r{i}", ssh_port=40100 + i) for i in range(5)],
+            "E1": [_pod(f"s{i}", ssh_port=40200 + i, status="STOPPED") for i in range(6)],
+        }
+    )
+    refused = {
+        ("198.51.100.2", 40200 + i): ConnectOutcome(PodSshResult.REFUSED, errno.ECONNREFUSED)
+        for i in range(6)
+    }
+    fake, calls = _probe_with(refused)
+    with fake:
+        observations = await probe_rented_pods(
+            rented, timeout=1, concurrency=4, job_batch_id=JOB_BATCH_ID
+        )
+
+    assert len(calls) == 11
+    assert {o.fleet_ok for obs in observations.values() for o in obs} == {True}
+    assert {o.result for o in observations["e1"]} == {PodSshResult.REFUSED}
+
+
 @pytest.mark.parametrize(
     ("results", "ok"),
     [

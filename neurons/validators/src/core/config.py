@@ -382,7 +382,7 @@ class Settings(BaseSettings):
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
     # Rented pod SSH, observe only: at the start of each cycle the validator
-    # reads the SSH identification line of every RUNNING rented pod's mapped port, from outside the
+    # reads the SSH identification line of every rented pod listed with an ssh_port, from outside the
     # container (services/pod_ssh_probe.py), and reports each result with the node's result. The
     # score is not changed by it. TIMEOUT bounds one probe (connect and read); CONCURRENCY bounds how
     # many run at once, so a fleet of N pods takes at most ceil(N / CONCURRENCY) * TIMEOUT.

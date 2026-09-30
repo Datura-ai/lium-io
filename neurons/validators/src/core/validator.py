@@ -384,7 +384,7 @@ class Validator:
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
-                # every RUNNING rented pod's SSH, probed once while the miners work
+                # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
                 task_info = {}

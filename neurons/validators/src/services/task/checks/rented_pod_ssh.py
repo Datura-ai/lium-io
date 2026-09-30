@@ -1,6 +1,6 @@
 """One SSH probe of a rented pod's mapped port, from outside the container.
 
-``services/pod_ssh_probe.py`` calls it once per RUNNING rented pod at the start of each cycle. The
+``services/pod_ssh_probe.py`` calls it once per listed rented pod with an ssh_port at the start of each cycle. The
 result is an observation the validator reports with the node's result, never a verdict: nothing here
 changes a score.
 """

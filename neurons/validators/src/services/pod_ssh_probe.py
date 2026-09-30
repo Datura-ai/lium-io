@@ -10,7 +10,9 @@ The fleet decides whether the observations say anything about the pods. When at 
 ``FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE`` of a fleet of at least
 ``SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE`` pods fails to send a banner, the validator's own network
 is the suspect: every observation of the cycle carries ``fleet_ok=False`` and the backend reads it
-as no observation. The share is computed right here, since the probe holds the whole cycle.
+as no observation. The share is computed right here, since the probe holds the whole cycle, over the
+RUNNING pods only (and pods the backend sent no status for): a stopped or rebooting pod is silent for
+its own reason and says nothing about our network.
 
 Each node's observations ride on its ``JobResult`` (``attach_pod_ssh``). A rented node the cycle
 has no result for (the miner timed out, failed, or left it out of its answer) gets a minimal result
@@ -41,8 +43,11 @@ logger = logging.getLogger(__name__)
 EXECUTOR_RESULT_MISSING = "EXECUTOR_RESULT_MISSING"
 
 
-def _targets(rented: RentedExecutorsResponse) -> list[tuple[str, str, str, int]]:
-    """(executor uuid, pod id, host, port) for every listed pod with a mapped SSH port, any status."""
+POD_STATUS_RUNNING = "RUNNING"
+
+
+def _targets(rented: RentedExecutorsResponse) -> list[tuple[str, str, str, int, str | None]]:
+    """(executor uuid, pod id, host, port, status) for every listed pod with a mapped SSH port, any status."""
     manual = {str(uuid).lower() for uuid in (rented.manual_rental_executors or {})}
     targets = []
     for raw_uuid, executor in rented.executors.items():
@@ -52,7 +57,7 @@ def _targets(rented: RentedExecutorsResponse) -> list[tuple[str, str, str, int]]
         for pod in executor.pods:
             if pod.ssh_port:
                 targets.append(
-                    (executor_uuid, pod.pod_id, executor.executor_ip_address, pod.ssh_port)
+                    (executor_uuid, pod.pod_id, executor.executor_ip_address, pod.ssh_port, pod.status)
                 )
     return targets
 
@@ -81,10 +86,14 @@ async def probe_rented_pods(
         async with limit:
             return await tcp_connect_fault(host, port, timeout)
 
-    outcomes = await asyncio.gather(*(probe(host, port) for _, _, host, port in targets))
-    fleet_ok = fleet_is_ok(outcome.result for outcome in outcomes)
+    outcomes = await asyncio.gather(*(probe(host, port) for _, _, host, port, _ in targets))
+    fleet_ok = fleet_is_ok(
+        outcome.result
+        for (*_, status), outcome in zip(targets, outcomes, strict=True)
+        if status in (POD_STATUS_RUNNING, None)
+    )
     observations: dict[str, list[PodSshObservation]] = {}
-    for (executor_uuid, pod_id, _, _), outcome in zip(targets, outcomes, strict=True):
+    for (executor_uuid, pod_id, _, _, _), outcome in zip(targets, outcomes, strict=True):
         observations.setdefault(executor_uuid, []).append(
             PodSshObservation(
                 pod_id=pod_id, result=outcome.result, errno=outcome.errno, fleet_ok=fleet_ok

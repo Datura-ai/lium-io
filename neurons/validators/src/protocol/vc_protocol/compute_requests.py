@@ -42,13 +42,13 @@ class RentedPod(BaseModel):
     # treats the whole executor as rented (no per-GPU split scoring).
     gpu_count: int | None = None
     # DAH-2870: the external port the renter's `ssh -p` uses (container port 22 in the pod's port
-    # map). None = backend predates the field or the pod maps no port 22; the renter-side probe then
-    # judges the pod by its authorized_keys read alone.
+    # map). None = backend predates the field or the pod maps no port 22; the cycle's SSH probe then
+    # skips the pod.
     ssh_port: int | None = None
     # DAH-2870: the pod's status as the backend records it (`RUNNING`, `REBOOT_PENDING`, ...). The
-    # rented list carries every status but BROKEN and DELETING, and the renter-side probe judges
-    # RUNNING pods only (the backend's ssh-unreachable route answers 409 for any other). None =
-    # backend predates the field; the probe then judges every listed pod.
+    # rented list carries every status but BROKEN and DELETING; the cycle's SSH probe dials every
+    # pod with an ssh_port whatever its status, and counts only RUNNING (or None = backend predates
+    # the field) pods towards the our-own-outage share.
     status: str | None = None
 
     @field_validator("ssh_port")

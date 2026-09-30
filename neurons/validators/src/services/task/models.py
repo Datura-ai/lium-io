@@ -78,7 +78,7 @@ class JobResult(BaseModel):
     # observed any (not reached the rented-state check, nothing reaped).
     pod_states: list[PodContainerState] | None = None
     # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
-    # None when the node has no RUNNING rented pod or the probe did not run.
+    # None when the node has no rented pod with an ssh_port or the probe did not run.
     pod_ssh: list[PodSshObservation] | None = None
 
     inspector_outcome: str = "SKIPPED"
