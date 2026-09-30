@@ -1,4 +1,4 @@
-"""DAH-3964: a rented node whose own scrape finds the GPU runtime dead on the host is reset (marked inactive).
+"""A rented node whose own scrape finds the GPU runtime dead on the host is reset (marked inactive).
 
 Node bcf6eb87 (28 Sep): NVML dead on the host, every cycle halted at the scrape with SCRAPE_FAILED_DRIVER, which
 carried no reset, so the executor stayed active and the renter's pod kept billing. The cycle never reached

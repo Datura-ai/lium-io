@@ -406,7 +406,7 @@ class Settings(BaseSettings):
     # one POST per outage stays the probe's.
     RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
     RENTED_POD_SSH_ENFORCE_AFTER_CYCLES: int | None = Field(env="RENTED_POD_SSH_ENFORCE_AFTER_CYCLES", default=None, ge=1)
-    # DAH-3964 — a rented node whose scrape, run in the already-running executor, finds the GPU runtime
+    # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
     # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
     # marks the executor inactive and stops billing the renter. Only the validator's scrape on the host

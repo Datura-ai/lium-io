@@ -205,7 +205,7 @@ def _gpu_runtime_is_dead(failure: ScrapeFailure) -> bool:
 
 
 def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
-    """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing (DAH-3964).
+    """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing.
 
     It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
     and billing stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
