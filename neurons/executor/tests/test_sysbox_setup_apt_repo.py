@@ -89,7 +89,7 @@ def _run_package_step(tmp_path, env=None):
         + _functions("ok", "warn", "fail", "apt_install", "ensure_nvidia_container_toolkit_repo")
         + "\nensure_nvidia_container_toolkit_repo || exit 1\n"
         "apt_install update -qq || exit 1\n"
-        "apt_install install -y -qq nvidia-container-toolkit jq || exit 1\n"
+        "apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1\n"
         'echo INSTALLED\n'
     )
     proc = subprocess.run(
@@ -115,7 +115,7 @@ def test_repo_is_added_before_the_toolkit_is_installed(tmp_path):
     assert keyring.read_text().strip() == "FAKE-PGP-KEY"
     assert list_file.read_text().startswith(f"deb [signed-by={keyring}] https://nvidia.github.io/libnvidia-container/")
     apt_log = (root / "apt.log").read_text().splitlines()
-    assert apt_log == ["apt-get update -qq", "apt-get install -y -qq nvidia-container-toolkit jq"]
+    assert apt_log == ["apt-get update -qq", "apt-get install -y -qq nvidia-container-toolkit jq fuse3"]
 
 
 def test_rerun_on_a_host_that_has_the_repo_is_a_no_op(tmp_path):

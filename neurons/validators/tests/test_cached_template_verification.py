@@ -10,16 +10,23 @@ An autouse fixture pins the cutoff to the future by default so the advisory-mode
 are wall-clock-independent; cutoff-enforcement tests opt in with ``_set_cutoff(active=True)``.
 """
 
+import asyncio
 import json
+import logging
+import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 
-from core.config import settings
+from core.config import Settings, settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
+    _remediation_from_prefetch_state,
 )
+from services.redis_service import RedisService
 from neurons.validators.src.services.task.messages import CachedTemplateMessages as Msg
 
 from protocol.vc_protocol.compute_requests import DefaultDockerImage
@@ -562,3 +569,419 @@ async def test_not_cached_stays_advisory_before_cutoff(context_factory, monkeypa
     assert result.event.reason_code == Msg.NOT_CACHED.reason
     assert result.event.severity != "error"
     assert result.updates["state"].recommended_image_cached is False
+
+
+# --- fresh-node grace and the remediation quote ------------------------------------------
+#
+# A new node was verified 5 s after it was added, while its executor's first pinned pull of a
+# multi-GB image had just failed and the loop was backing off; it was zeroed on NOT_CACHED and
+# passed a batch later. A node this validator has just found without the image is held as
+# PENDING until the executor's first sweep completes or the grace ends; after that it fails as
+# before, and the remediation quotes the executor's own pull error.
+
+_PULL_ERROR = "Get https://registry-1.docker.io/v2/: net/http: TLS handshake timeout"
+
+
+def _prefetch_doc(*, first_sweep_ok_at=None, pull_error=_PULL_ERROR, last_outcome="loop_error"):
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "sweep_count": 1,
+            "last_outcome": last_outcome,
+            "outcome_counts": {last_outcome: 1},
+            "first_sweep_ok_at": first_sweep_ok_at,
+            "images": {
+                _IMAGE_REF: {
+                    "last_outcome": "pull_failed" if pull_error else "up_to_date",
+                    "last_pull_error": pull_error,
+                }
+            },
+        }
+    )
+
+
+def _fake_redis_service():
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis(server=FakeServer())
+    service.lock = asyncio.Lock()
+    return service
+
+
+def _uncached_ctx(
+    context_factory, monkeypatch, redis, prefetch_doc, *, digests=None, grace_enabled=True
+):
+    _set_cutoff(monkeypatch, active=True)
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", grace_enabled)
+    return context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
+        config=_config_with_digests(digests or {}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh_seq(_result(exit_status=1), _result(stdout=prefetch_doc)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_node_is_pending_inside_the_grace(context_factory, monkeypatch):
+    redis = _fake_redis_service()
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc())
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PENDING.reason
+    assert result.event.severity == "info"
+    grace = result.event.what_we_saw["fresh_node_grace"]
+    assert grace["pending"] is True
+    assert grace["first_sweep_completed"] is False
+    assert grace["seconds_since_first_uncached"] < 5
+    # Still published as not cached: the grace changes the verdict, not the observation.
+    assert result.updates["state"].recommended_image_cached is False
+
+
+@pytest.mark.asyncio
+async def test_uncached_node_fails_once_the_grace_has_passed(context_factory, monkeypatch):
+    redis = _fake_redis_service()
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc())
+    first_seen = time.time() - settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS - 60
+    await redis.redis.set(f"cached_template_first_uncached:{ctx.executor.uuid}", repr(first_seen))
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    assert result.event.severity == "error"
+    assert result.event.what_we_saw["fresh_node_grace"]["pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_grace_window_is_kept_from_the_first_sighting(context_factory, monkeypatch):
+    # A second cycle inside the window reads the first sighting, not its own clock: an executor
+    # cannot move the window, and a node that stays uncached is failed once it closes.
+    redis = _fake_redis_service()
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc())
+    first = await redis.first_uncached_at(ctx.executor.uuid, 1_000.0, 3600)
+    again = await redis.first_uncached_at(ctx.executor.uuid, 2_000.0, 3600)
+
+    assert first == again == 1_000.0
+
+
+@pytest.mark.asyncio
+async def test_fresh_node_fails_once_its_first_sweep_completed(context_factory, monkeypatch):
+    # The executor finished a sweep and the image is still missing: nothing is in flight, so the
+    # grace has nothing to wait for.
+    redis = _fake_redis_service()
+    doc = _prefetch_doc(first_sweep_ok_at="2026-09-20T10:00:00Z", last_outcome="sweep_ok")
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, doc)
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    grace = result.event.what_we_saw["fresh_node_grace"]
+    assert grace == {**grace, "pending": False, "first_sweep_completed": True}
+
+
+@pytest.mark.asyncio
+async def test_older_executor_counts_a_sweep_ok_as_the_first_sweep(context_factory, monkeypatch):
+    redis = _fake_redis_service()
+    doc = json.loads(_prefetch_doc(last_outcome="sweep_ok"))
+    del doc["first_sweep_ok_at"]
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, json.dumps(doc))
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["fresh_node_grace"]["first_sweep_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_redis_error_means_no_grace(context_factory, monkeypatch):
+    redis = Mock()
+    redis.first_uncached_at = AsyncMock(side_effect=RuntimeError("redis down"))
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc())
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    assert "redis down" in result.event.what_we_saw["fresh_node_grace"]["redis_error"]
+
+
+@pytest.mark.asyncio
+async def test_grace_disabled_fails_a_fresh_node(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS", 0)
+    ctx = _uncached_ctx(context_factory, monkeypatch, _fake_redis_service(), _prefetch_doc())
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert "fresh_node_grace" not in result.event.what_we_saw
+
+
+def test_fresh_node_grace_flag_is_off_by_default():
+    assert Settings.model_fields["CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_grace_flag_off_fails_a_fresh_node_as_before_and_logs_the_hold(
+    context_factory, monkeypatch, caplog
+):
+    ctx = _uncached_ctx(
+        context_factory, monkeypatch, _fake_redis_service(), _prefetch_doc(), grace_enabled=False
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    assert result.event.severity == "error"
+    assert set(result.event.what_we_saw) == {
+        "recommended_image",
+        "cached",
+        "digest_match",
+        "backend_digest",
+        "local_digest",
+        "gpu_model",
+        "driver_version",
+        "after_cutoff",
+        "prefetch_state",
+    }
+    assert any("would have been held as pending" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_grace_flag_off_logs_nothing_for_a_node_past_its_grace(
+    context_factory, monkeypatch, caplog
+):
+    redis = _fake_redis_service()
+    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc(), grace_enabled=False)
+    first_seen = time.time() - settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS - 60
+    await redis.redis.set(f"cached_template_first_uncached:{ctx.executor.uuid}", repr(first_seen))
+
+    with caplog.at_level(logging.INFO):
+        result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert not any("would have been held" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_pending_without_a_prefetch_document_says_only_the_time_bound_applies(
+    context_factory, monkeypatch
+):
+    ctx = _uncached_ctx(context_factory, monkeypatch, _fake_redis_service(), "")
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.PENDING.reason
+    assert result.event.what_we_saw["fresh_node_grace"]["first_sweep_completed"] is None
+    assert "may still be fetching" in result.event.remediation
+    assert "does not report its pre-pull state" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_not_cached_with_no_named_cause_names_the_image_to_pull(context_factory, monkeypatch):
+    doc = _prefetch_doc(
+        first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=None, last_outcome="sweep_ok"
+    )
+    ctx = _uncached_ctx(context_factory, monkeypatch, _fake_redis_service(), doc)
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert f"docker pull {_IMAGE_REF}`" in result.event.remediation
+    assert "<image>" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_not_cached_with_no_named_cause_names_the_pinned_image_to_pull(
+    context_factory, monkeypatch
+):
+    doc = _prefetch_doc(
+        first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=None, last_outcome="sweep_ok"
+    )
+    ctx = _uncached_ctx(
+        context_factory,
+        monkeypatch,
+        _fake_redis_service(),
+        doc,
+        digests={_IMAGE_REF: _IMAGE_DIGEST},
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert "docker pull daturaai/torch@sha256:aaa`" in result.event.remediation
+
+
+def _mismatch_ctx(context_factory, monkeypatch, prefetch_read):
+    _set_cutoff(monkeypatch, active=True)
+    return context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE]), redis=_fake_redis_service()),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh_seq(_result(stdout=_LOCAL_MISMATCH), prefetch_read),
+    )
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_with_no_named_cause_keeps_its_own_remediation_from_prefetch_state(
+    context_factory, monkeypatch
+):
+    doc = _prefetch_doc(
+        first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=None, last_outcome="sweep_ok"
+    )
+    ctx = _mismatch_ctx(context_factory, monkeypatch, _result(stdout=doc))
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert result.event.remediation == Msg.DIGEST_MISMATCH.remediation
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_without_a_prefetch_document_calls_the_image_stale(
+    context_factory, monkeypatch
+):
+    ctx = _mismatch_ctx(context_factory, monkeypatch, _result(exit_status=1))
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert "to see why the image on the host is stale." in result.event.remediation
+    assert "why the image is missing" not in result.event.remediation
+
+
+def test_cached_template_messages_carry_no_placeholder():
+    for template in (Msg.NOT_CACHED, Msg.PENDING, Msg.DIGEST_MISMATCH):
+        assert "<" not in (template.remediation or ""), template.reason
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_gets_no_fresh_node_grace(context_factory, monkeypatch):
+    redis = _fake_redis_service()
+    _set_cutoff(monkeypatch, active=True)
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", True)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh_seq(_result(stdout=_LOCAL_MISMATCH), _result(stdout=_prefetch_doc())),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert "fresh_node_grace" not in result.event.what_we_saw
+
+
+@pytest.mark.asyncio
+async def test_remediation_quotes_the_executors_pull_error(context_factory, monkeypatch):
+    redis = _fake_redis_service()
+    doc = _prefetch_doc(first_sweep_ok_at="2026-09-20T10:00:00Z")
+    ctx = _uncached_ctx(
+        context_factory, monkeypatch, redis, doc, digests={_IMAGE_REF: _IMAGE_DIGEST}
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    remediation = result.event.remediation
+    assert _PULL_ERROR in remediation
+    assert "registry-1.docker.io and production.cloudflare.docker.com" in remediation
+    assert "cache_template_service" not in remediation
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            '404 Client Error: Not Found ("No such image: daturaai/torch@sha256:aaa")',
+            "update the executor",
+        ),
+        ("toomanyrequests: You have reached your pull rate limit", "docker login"),
+        ("write /var/lib/docker/tmp/x: no space left on device", "free disk"),
+        ("manifest for daturaai/torch@sha256:aaa not found: manifest unknown", "registry mirror"),
+        ("unauthorized: authentication required", "Docker login"),
+        # A status code inside a digest is not the registry's answer.
+        (
+            "Get https://registry-1.docker.io/v2/daturaai/torch/manifests/sha256:ab403f: "
+            "net/http: TLS handshake timeout",
+            "outbound connection",
+        ),
+        ("pull daturaai/torch@sha256:c404e failed: connection reset by peer", "outbound connection"),
+        ("something new", "docker pull daturaai/torch@sha256:aaa"),
+    ],
+)
+def test_remediation_names_the_next_step_for_the_error(error, expected):
+    state = json.loads(_prefetch_doc(pull_error=error))
+
+    text = _remediation_from_prefetch_state(state, _IMAGE_REF, "daturaai/torch@sha256:aaa", cached=False)
+
+    assert error[:40] in text
+    assert expected in text
+
+
+@pytest.mark.parametrize("images", [["x"], {_IMAGE_REF: "x"}])
+def test_a_malformed_images_map_names_no_cause(images):
+    state = {"last_outcome": "sweep_ok", "images": images}
+
+    assert _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False) is None
+
+
+def test_a_later_disk_shortage_wins_over_an_older_pull_error():
+    state = {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
+        "last_outcome": "insufficient_disk", "last_pull_error": _PULL_ERROR,
+        "last_disk_required_bytes": 40 * 1024**3, "last_disk_available_bytes": 10 * 1024**3,
+    }}}
+
+    text = _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False)
+
+    assert "lack of disk" in text
+    assert _PULL_ERROR not in text
+
+
+def test_remediation_does_not_quote_an_error_a_later_sweep_moved_past():
+    state = {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
+        "last_outcome": "up_to_date", "last_pull_error": _PULL_ERROR,
+    }}}
+
+    assert _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False) is None
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ({"unavailable": "missing"}, "published no pre-pull state (missing)"),
+        (
+            {"last_outcome": "prefetch_disabled_no_backend_url", "images": {}},
+            "COMPUTE_REST_API_URL",
+        ),
+        (
+            {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
+                "last_outcome": "insufficient_disk",
+                "last_disk_required_bytes": 90 * 1024**3,
+                "last_disk_available_bytes": 20 * 1024**3,
+            }}},
+            "needs 90 GiB free and has 20 GiB",
+        ),
+        (
+            {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
+                "last_outcome": "pull_ok", "last_pull_ok_at": "2026-09-20T10:00:00Z",
+            }}},
+            "no longer on the host",
+        ),
+    ],
+)
+def test_remediation_reads_the_loop_and_disk_outcomes(state, expected):
+    assert expected in _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False)
+
+
+def test_remediation_without_a_prefetch_document_says_why_the_image_fails():
+    missing = _remediation_from_prefetch_state({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=False)
+    stale = _remediation_from_prefetch_state({"unavailable": "empty"}, _IMAGE_REF, _IMAGE_REF, cached=True)
+
+    assert missing.endswith("to see why the image is missing.")
+    assert stale.endswith("to see why the image on the host is stale.")
