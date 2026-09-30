@@ -341,8 +341,9 @@ def parse_dind_store_version_probe(stdout: str | None) -> tuple[str | None, str 
 def dind_store_reset_command(*, store_volume: str, helper_image: str, container_name: str) -> str:
     """Empty the store volume, keeping the volume itself (a parked container may still name it).
 
-    The version marker goes last, and only once everything else is gone: a reset that fails or
-    times out keeps the newer version recorded, so the next create sees the downgrade and resets again.
+    The version marker goes last, and only once everything else is gone: a reset that fails keeps the
+    newer version recorded, so the next create sees the downgrade and resets again. A reset whose status
+    is lost may or may not have got that far; dind_store_reset_settle_command finds out which.
     """
     _, _, reset_name = dind_probe_container_names(container_name)
     marker = shlex.quote(DIND_STORE_VERSION_MARKER)
@@ -361,10 +362,12 @@ def dind_store_reset_command(*, store_volume: str, helper_image: str, container_
 def dind_store_reset_settle_command(*, store_volume: str, helper_image: str, container_name: str) -> str:
     """After a reset whose status never came back: stop its helper, then read the marker again.
 
-    Prints `stopped=1` only once the reset helper is gone, then `recorded=<marker>` (empty when the
-    reset got as far as deleting it, which it does last). No `stopped=1` means the reset may still be
-    deleting the store.
+    Prints `stopped=1` only once a successful container listing shows no reset helper, then
+    `recorded=<marker>` (empty when the reset got as far as deleting it, which it does last). A failed
+    listing, like any other failure, prints no `stopped=1`: the reset may still be deleting the store.
     """
+    _, _, raw_reset_name = dind_probe_container_names(container_name)
+    reset_filter = shlex.quote(f"name=^/?{re.escape(raw_reset_name)}$")
     marker_name, _, reset_name = (shlex.quote(name) for name in dind_probe_container_names(container_name))
     marker = f"/store/{DIND_STORE_VERSION_MARKER}"
     # the helper's first line proves it ran, so a failed read is never taken for a deleted marker
@@ -375,7 +378,8 @@ def dind_store_reset_settle_command(*, store_volume: str, helper_image: str, con
     cut = f"head -c {DIND_VERSION_MAX_BYTES} | head -n 1 | tr -cd '[:print:]'"
     return (
         f"/usr/bin/docker rm -f {reset_name} {marker_name} >/dev/null 2>&1; "
-        f"/usr/bin/docker inspect {reset_name} >/dev/null 2>&1 && exit 1; "
+        f"left=$(/usr/bin/docker ps -aq --filter {reset_filter} 2>/dev/null) || exit 1; "
+        '[ -z "$left" ] || exit 1; '
         f"out=$(/usr/bin/docker run --rm --name {marker_name} --network none --label {DIND_PROBE_LABEL} "
         f"{DIND_PROBE_RESOURCE_FLAGS} -v {shlex.quote(store_volume)}:/store:ro {helper_image} "
         f"sh -c {shlex.quote(read_marker)} 2>/dev/null) || exit 1; "

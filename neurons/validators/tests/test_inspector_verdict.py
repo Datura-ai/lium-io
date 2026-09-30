@@ -182,6 +182,8 @@ def _path_finding(kind: str, path: str) -> dict:
         ("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}/_data/.ssh/id_ed25519"),
         ("OverlayFsWrite", f"/var/lib/docker/volumes/volume_{POD}/_data/.bashrc"),
         ("DockerVolumeMount", f"/var/lib/docker/plugins/<eight hex characters>/propagated-mount/volume_{POD}"),
+        ("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}_docker/_data/x"),
+        ("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}_workspace/_data/x"),
     ],
 )
 def test_a_read_of_the_pods_volume_names_the_pod_and_only_that_pod(kind, path):
@@ -193,10 +195,11 @@ def test_a_read_of_the_pods_volume_names_the_pod_and_only_that_pod(kind, path):
     assert verdict.as_payload().unmatched_containers == []
 
 
-def test_a_volume_named_in_the_container_field_names_the_pod_too():
+@pytest.mark.parametrize("suffix", ["", "_docker", "_workspace"])
+def test_a_volume_named_in_the_container_field_names_the_pod_too(suffix):
     # DockerVolumeRm carries the volume as the container name
     finding = _finding("/usr/bin/docker volume rm volume_x", host=True, nested=False, kind="DockerVolumeRm")
-    finding["container"] = f"volume_{POD}"
+    finding["container"] = f"volume_{POD}{suffix}"
     verdict = build_verdict({}, [finding], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
 
     assert verdict.affected_pod_ids == [POD]

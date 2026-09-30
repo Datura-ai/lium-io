@@ -1063,3 +1063,57 @@ async def test_the_store_is_checked_before_the_create_and_recorded_once_the_pod_
         expected.append(("record_version", f"pod_{payload.pod_id}"))
     assert events[: len(expected)] == expected
     assert ("record_version", f"pod_{payload.pod_id}") not in events[len(expected) :]
+
+
+@pytest.mark.parametrize("same_pod", [True, False], ids=["same-pod", "other-pod"])
+@pytest.mark.asyncio
+async def test_a_second_create_on_the_same_pod_waits_for_the_first_to_record(svc, monkeypatch, same_pod):
+    import asyncio
+
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "RENTAL_DIND_PERSISTENT_STORE_ENABLED", True)
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    first_reset_entered, second_reset_entered = asyncio.Event(), asyncio.Event()
+    release_first_reset = asyncio.Event()
+    events: list[str] = []
+    resets = 0
+
+    async def _reset(ssh_client, *, run_spec, local_volume, default_extra):
+        nonlocal resets
+        resets += 1
+        if resets == 1:
+            first_reset_entered.set()
+            await release_first_reset.wait()
+        else:
+            second_reset_entered.set()
+        events.append(f"reset {run_spec.name}")
+        return True
+
+    async def _record(ssh_client, *, run_spec, local_volume, container_name, default_extra):
+        events.append(f"record {container_name}")
+
+    monkeypatch.setattr(svc, "_reset_dind_store_on_downgrade", _reset)
+    monkeypatch.setattr(svc, "_record_dind_store_version", _record)
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(svc, "check_container_running", AsyncMock(return_value=True))
+    first = _payload(is_sysbox=True)
+    second = first.model_copy() if same_pod else _payload(is_sysbox=True)
+
+    first_create = asyncio.create_task(_run(svc, first))
+    await asyncio.wait_for(first_reset_entered.wait(), 5)
+    second_create = asyncio.create_task(_run(svc, second))
+    try:
+        if same_pod:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(second_reset_entered.wait(), 0.1)
+        else:
+            await asyncio.wait_for(second_reset_entered.wait(), 5)
+    finally:
+        release_first_reset.set()
+        await asyncio.gather(first_create, second_create)
+
+    if same_pod:
+        name = f"pod_{first.pod_id}"
+        assert events == [f"reset {name}", f"record {name}", f"reset {name}", f"record {name}"]
+    assert ds_module.dind_store_create_locks._locks == {}

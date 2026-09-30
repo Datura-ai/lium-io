@@ -1094,6 +1094,36 @@ async def test_a_lost_reset_that_cannot_be_settled_does_not_start_the_pod(docker
     assert ssh.commands[-1] == dind_probe_cleanup_command("pod_x")
 
 
+@pytest.mark.parametrize(
+    ("ps", "exit_ok", "stdout"),
+    [
+        # a degraded daemon: rm and inspect fail, the listing still shows the reset helper
+        ("printf 'reset-id\\n'; return 0", False, ""),
+        # the listing itself fails: the helper may still be running
+        ("return 1", False, ""),
+        ("return 0", True, "stopped=1\nrecorded=Docker version 28.1.0\n"),
+    ],
+    ids=["helper-listed", "listing-fails", "helper-gone"],
+)
+def test_settlement_needs_a_successful_listing_without_the_reset_helper(ps, exit_ok, stdout):
+    cmd = dind_store_reset_settle_command(
+        store_volume="volume_x_docker", helper_image="alpine", container_name="pod_x"
+    ).replace("/usr/bin/docker", "docker")
+    stub = f"""docker() {{
+      case "$1" in
+        rm|inspect) return 1 ;;
+        ps) {ps} ;;
+        run) printf 'read\\nDocker version 28.1.0\\n'; return 0 ;;
+      esac
+    }}; """
+
+    result = subprocess.run(["sh", "-c", stub + cmd], capture_output=True, text=True)
+
+    assert (result.returncode == 0) is exit_ok
+    assert result.stdout == stdout
+    assert shlex.quote("name=^/?lium\\-dind\\-probe\\-pod_x\\-reset$") in cmd
+
+
 @pytest.mark.parametrize("rm_fails", [False, True], ids=["reset", "reset-fails"])
 def test_the_reset_removes_the_marker_last_and_only_when_the_rest_is_gone(tmp_path, rm_fails):
     store = tmp_path / "store"

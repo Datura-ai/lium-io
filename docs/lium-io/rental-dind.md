@@ -82,9 +82,19 @@ image is theirs), so:
   dockerd never answers costs a reboot or edit up to 20 s at the check and 20 s at the record.
 
 If an edit fails after the reset, the restored container also finds an empty store. The reset
-deletes the marker last, only once the rest of the store is gone. A reset that fails or hits its
-deadline (`reset_failed`) leaves the store partly emptied and the newer marker in place; the version
-is then not recorded, so the next reboot or edit tries the reset again. A check that fails before
+deletes the marker last, only once the rest of the store is gone. A reset whose failure is
+confirmed (`reset_failed`: its exit status came back nonzero, or it was stopped and the newer marker
+was read back) leaves the store partly emptied and the newer marker in place; the version is then
+not recorded, so the next reboot or edit tries the reset again.
+
+A reset whose status never comes back (an SSH timeout, a lost acknowledgement) has an unknown
+outcome. The validator removes its helper and reads the marker again: a marker still there is
+`reset_failed` as above; no marker means the reset finished (`reset_on_downgrade: acknowledgement
+lost`), and the new version is recorded. If a successful container listing cannot show that the
+helper is gone, or the marker cannot be read, the reboot or edit fails before `docker run`
+(`Inner Docker store reset outcome unknown; not starting the pod`), because the reset may still be
+deleting the store. The marker may already be gone then, so the next create may see `no_marker` and
+keep the store as the reset left it. A check that fails before
 any reset (`failed: …`) keeps the store, and the pod's version is recorded after the create, since
 its dockerd is the store's next writer.
 

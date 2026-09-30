@@ -9,7 +9,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1008,6 +1008,37 @@ class _InflightCreateRegistry:
 # In-process: a pod's create and delete are driven by the same validator event loop. Move it to
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
+
+
+class _PodCreateLocks:
+    """One lock per pod for creates that share its inner Docker store.
+
+    Two creates on the same pod share the store volume and the reset helper's name: the second
+    reset force-removes the first one's helper, and the first create goes on to `docker run` while
+    the second may still be emptying the store. Holding the lock from the park through the version
+    record (and a failed edit's restore) runs them one after the other.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._holders: dict[str, int] = {}
+
+    @contextlib.asynccontextmanager
+    async def hold(self, pod_id: str) -> AsyncIterator[None]:
+        lock = self._locks.setdefault(pod_id, asyncio.Lock())
+        self._holders[pod_id] = self._holders.get(pod_id, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._holders[pod_id] -= 1
+            if self._holders[pod_id] <= 0:
+                self._holders.pop(pod_id, None)
+                self._locks.pop(pod_id, None)
+
+
+# In-process like inflight_creates: a pod's creates are driven by the validator that owns the executor.
+dind_store_create_locks = _PodCreateLocks()
 
 
 class _PendingDeletionRegistry:
@@ -5910,6 +5941,9 @@ class DockerService:
                         private_key=private_key,
                     ),
                 )
+                if settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED:
+                    # entered before the swap, so it is released after a failed edit's restore
+                    await connections.enter_async_context(dind_store_create_locks.hold(payload.pod_id))
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
                     _EditSwap(ssh_client, self.get_container_name(payload), default_extra)

@@ -39,6 +39,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from ..rental_dind import dind_base_volume_name
+
 NESTED_FROM_TAG_PREFIX = "nested_from:"
 POD_CONTAINER_PREFIX = "pod_"
 # the pod's volume is `volume_<pod_id>` (docker_service.py create flow; the sensor's
@@ -286,7 +288,9 @@ def _named_container(finding: dict[str, Any]) -> str | None:
 
 
 def pod_id_of(name: str) -> str | None:
-    """`pod_<id>` and `volume_<id>` both belong to pod `<id>`."""
+    """`pod_<id>` and `volume_<id>` both belong to pod `<id>`, and so do the DinD companions
+    `volume_<id>_docker` / `volume_<id>_workspace`."""
+    name = dind_base_volume_name(name) or name
     for prefix in (POD_CONTAINER_PREFIX, VOLUME_CONTAINER_PREFIX):
         if name.startswith(prefix) and len(name) > len(prefix):
             return name[len(prefix) :]
