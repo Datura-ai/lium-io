@@ -59,25 +59,42 @@ RENTED_LIST_UNAVAILABLE = "rented_list_unavailable"
 RENTED_LIST_EMPTY = "rented_list_empty"
 
 
-def rented_list_unknown_reason(
-    rented_data: Optional[RentedExecutorsResponse], executor_uuid: str
-) -> Optional[str]:
-    """Why the rented list for this executor cannot be trusted to authorise a removal, or None.
+def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> set[str]:
+    """Every container name the fleet snapshot lists, under any executor id.
 
-    The backend's answer carries no explicit "this executor has no rentals" signal: an executor
-    missing from `executors` with no fillers is also what a failed fetch, a backend hiccup or a
-    node row keyed on another executor id looks like. Reaping on that deleted live renter pods and
-    fillers (a provider ticket: 5 in 24 h, every one logged with `rented_containers: set()`), so an
-    empty list means "don't know", never "nothing is rented".
+    Pod names carry a UUID and filler names a run id, so a listed name is unique across the fleet
+    and protecting it on every host costs nothing. Reading only this executor's entry deleted live
+    pods whose node row the backend keyed on a twin executor id (one IP:port registered twice).
+    """
+    if not rented_data:
+        return set()
+    names: set[str] = set()
+    for executor in rented_data.executors.values():
+        names.update(pod.container_name for pod in executor.pods)
+        # DAH-2740: an edit parks the pod's current container under <name>__prev while the
+        # replacement is created; it is the customer's only copy until then, whatever its age
+        names.update(f"{pod.container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
+    # Every filler is protected — a GPU-split node runs one per VRAM bundle (DAH-2465), and
+    # reaping a sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
+    for fillers in rented_data.all_filler_containers_by_executor.values():
+        names.update(fillers)
+    names.update(name for name in rented_data.filler_containers_by_executor.values() if name)
+    return names
+
+
+def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -> Optional[str]:
+    """Why the snapshot cannot be trusted to authorise a removal, or None.
+
+    Only a snapshot that is missing or lists nothing anywhere in the fleet is untrusted: that is the
+    one shape a backend hiccup takes. An executor absent from a non-empty snapshot is an idle node,
+    and its orphans must still go, or they hold the rental ports and the node scores 0 (DAH-2164).
+    The scheduled paths skip the cycle when the fetch fails, so None is a defensive branch.
     """
     if rented_data is None:
         return RENTED_LIST_UNAVAILABLE
-    executor = rented_data.executors.get(executor_uuid)
-    if executor is not None and executor.pods:
-        return None
-    if rented_data.get_filler_containers(executor_uuid):
-        return None
-    return RENTED_LIST_EMPTY
+    if not listed_container_names(rented_data):
+        return RENTED_LIST_EMPTY
+    return None
 
 
 class ContainerCleanup:
@@ -111,11 +128,11 @@ class ContainerCleanup:
             "threshold_minutes": self.stale_threshold_minutes,
         }
 
-        unknown_reason = rented_list_unknown_reason(rented_data, executor_uuid)
+        unknown_reason = rented_list_unknown_reason(rented_data)
         if unknown_reason is not None:
             logger.warning(
                 _m(
-                    "Skipping stale container removal: rented list is empty or unknown",
+                    "Skipping stale container removal: the fleet rented snapshot is empty or unknown",
                     extra={**extra, "skip_reason": unknown_reason},
                 )
             )
@@ -128,7 +145,7 @@ class ContainerCleanup:
             extra["total_containers"] = len(all_containers)
 
             # Get currently rented containers for this executor
-            rented_containers = self._get_rented_containers(rented_data, executor_uuid)
+            rented_containers = listed_container_names(rented_data)
             extra["rented_containers"] = str(rented_containers)
 
             # Check each container
@@ -516,29 +533,6 @@ class ContainerCleanup:
             )
 
         return []
-
-    def _get_rented_containers(
-        self,
-        rented_data: Optional[RentedExecutorsResponse],
-        executor_uuid: str
-    ) -> set[str]:
-        """Get currently rented container names for this executor."""
-        if not rented_data:
-            return set()
-
-        rented_containers = set()
-        executor = rented_data.executors.get(executor_uuid)
-        if executor:
-            rented_containers.update(pod.container_name for pod in executor.pods)
-            # DAH-2740: an edit parks the pod's current container under <name>__prev while the
-            # replacement is created; it is the customer's only copy until then, whatever its age
-            rented_containers.update(f"{pod.container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
-
-        # Every filler container on the node is protected — a GPU-split node runs one per VRAM
-        # bundle (DAH-2465), and reaping a sibling kills a live worker mid-cycle.
-        rented_containers.update(rented_data.get_filler_containers(executor_uuid))
-
-        return rented_containers
 
     async def _get_container_age_minutes(self, ssh_client, container_name: str) -> Optional[float]:
         """Get container age in minutes, returns None if unable to determine."""

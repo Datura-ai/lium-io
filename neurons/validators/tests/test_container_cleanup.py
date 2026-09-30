@@ -73,7 +73,7 @@ def _rented_data(executor_uuid: str, pods: list[str]):
     resp = MagicMock()
     resp.executors = {executor_uuid: executor_mock}
     resp.filler_containers_by_executor = {}
-    resp.get_filler_containers.side_effect = lambda key: resp.filler_containers_by_executor.get(str(key), [])
+    resp.all_filler_containers_by_executor = {}
     return resp
 
 
@@ -287,7 +287,7 @@ async def test_cleanup_preserves_active_filler_container():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     rented_data = _rented_data(EXECUTOR_UUID, [])
-    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [name]}
+    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: name}
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
@@ -550,7 +550,7 @@ async def test_cleanup_preserves_every_filler_bundle_on_split_node():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     rented_data = _rented_data(EXECUTOR_UUID, [])
-    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [bundle_a, bundle_b]}
+    rented_data.all_filler_containers_by_executor = {EXECUTOR_UUID: [bundle_a, bundle_b]}
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
@@ -629,12 +629,13 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
 
 
 # ---------------------------------------------------------------------------
-# An empty or unknown rented list means "don't know", never "nothing is rented"
+# Only an empty or missing fleet snapshot means "don't know"; any listed name is protected on every host
 # ---------------------------------------------------------------------------
 
 LIVE_POD = "pod_live-0000-4000-8000-000000000001"
 LIVE_FILLER = "filler_live_bundle"
 STRAY_POD = "pod_stray-0000-4000-8000-000000000002"
+ELSEWHERE_POD = "pod_elsewhere-0000-4000-8000-000000000003"
 
 
 def _real_rented_data(executor_uuid: str, pods: list[str], fillers: list[str] | None = None, key: str | None = None):
@@ -663,16 +664,11 @@ def _host_with_live_and_stray():
     "rented_data, reason",
     [
         pytest.param(None, RENTED_LIST_UNAVAILABLE, id="fetch-failed-none"),
-        pytest.param(RentedExecutorsResponse(executors={}), RENTED_LIST_EMPTY, id="executor-absent"),
-        pytest.param(
-            _real_rented_data(EXECUTOR_UUID, [LIVE_POD], key="other-executor-id"),
-            RENTED_LIST_EMPTY,
-            id="rental-listed-under-another-executor-id",
-        ),
-        pytest.param(_real_rented_data(EXECUTOR_UUID, []), RENTED_LIST_EMPTY, id="executor-listed-with-no-pods"),
+        pytest.param(RentedExecutorsResponse(executors={}), RENTED_LIST_EMPTY, id="fleet-snapshot-empty"),
+        pytest.param(_real_rented_data(EXECUTOR_UUID, []), RENTED_LIST_EMPTY, id="only-executor-listed-with-no-pods"),
     ],
 )
-async def test_an_empty_or_unknown_rented_list_removes_nothing_and_warns(rented_data, reason, caplog):
+async def test_an_empty_or_unknown_fleet_snapshot_removes_nothing_and_warns(rented_data, reason, caplog):
     ssh, rm_calls = _host_with_live_and_stray()
 
     with caplog.at_level(logging.WARNING, logger="services.container_cleanup"):
@@ -683,35 +679,34 @@ async def test_an_empty_or_unknown_rented_list_removes_nothing_and_warns(rented_
     assert result == (0, [], [])
     assert not any("docker rm -f" in c for c in rm_calls)
     assert not any("docker ps -a" in c for c in (call.args[0] for call in ssh.run.call_args_list))
-    assert rented_list_unknown_reason(rented_data, EXECUTOR_UUID) == reason
-    assert any("rented list is empty or unknown" in r.getMessage() for r in caplog.records)
+    assert rented_list_unknown_reason(rented_data) == reason
+    assert any("snapshot is empty or unknown" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_a_valid_rented_list_removes_only_the_stray_never_listed_pods_or_fillers():
+@pytest.mark.parametrize(
+    "rented_data, expected_removed",
+    [
+        pytest.param(_real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER]), {STRAY_POD}, id="own-pod-and-filler"),
+        pytest.param(_real_rented_data(EXECUTOR_UUID, [], fillers=[LIVE_FILLER]), {LIVE_POD, STRAY_POD}, id="own-filler-only"),
+        pytest.param(
+            _real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER], key="twin-executor-id"),
+            {STRAY_POD},
+            id="pod-listed-under-twin-id-filler-under-this-id",
+        ),
+        pytest.param(
+            _real_rented_data("another-node", [ELSEWHERE_POD]),
+            {LIVE_POD, LIVE_FILLER, STRAY_POD},
+            id="idle-node-orphans-still-reaped",
+        ),
+    ],
+)
+async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_listed_one(rented_data, expected_removed):
     ssh, rm_calls = _host_with_live_and_stray()
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh,
-        rented_data=_real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER]),
-        executor_uuid=EXECUTOR_UUID,
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
     )
 
-    assert (removed_count, removed_names, unremovable) == (1, [STRAY_POD], [])
-    removed = " ".join(c for c in rm_calls if "docker rm -f" in c)
-    assert STRAY_POD in removed
-    assert LIVE_POD not in removed and LIVE_FILLER not in removed
-
-
-@pytest.mark.asyncio
-async def test_a_filler_only_rented_list_is_authoritative_and_protects_the_filler():
-    ssh, rm_calls = _host_with_live_and_stray()
-
-    _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh,
-        rented_data=_real_rented_data(EXECUTOR_UUID, [], fillers=[LIVE_FILLER]),
-        executor_uuid=EXECUTOR_UUID,
-    )
-
-    assert LIVE_FILLER not in removed_names
-    assert STRAY_POD in removed_names
+    assert rented_list_unknown_reason(rented_data) is None
+    assert (removed_count, set(removed_names), unremovable) == (len(expected_removed), expected_removed, [])
