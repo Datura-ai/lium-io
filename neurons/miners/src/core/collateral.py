@@ -329,9 +329,7 @@ class CollateralClient:
             if answer != "already known":
                 raise CollateralOutcomeUnknownError(
                     f"Transaction {tx_hash}, sent earlier, is not mined and broadcasting it again failed "
-                    f"({answer}); no transaction was sent. If it stays unmined, delete {self.sent_record_path} and run "
-                    f"this again: the next transaction reuses nonce {record['nonce']}, so only one of the two can "
-                    "be mined"
+                    f"({answer}); no transaction was sent. {self._if_it_stays_unmined(record)}"
                 ) from error
         logger.info("Broadcast transaction %s, sent earlier, again; waiting for its receipt", tx_hash)
         try:
@@ -339,8 +337,15 @@ class CollateralClient:
         except Exception as error:
             raise CollateralOutcomeUnknownError(
                 f"Transaction {tx_hash}, sent earlier, is not mined yet; it was broadcast again and no new "
-                f"transaction was sent ({type(error).__name__}). {RETRY_IS_SAFE}"
+                f"transaction was sent ({type(error).__name__}). {RETRY_IS_SAFE}. "
+                f"{self._if_it_stays_unmined(record)}"
             ) from error
+
+    def _if_it_stays_unmined(self, record: dict) -> str:
+        return (
+            f"If it stays unmined, delete {self.sent_record_path} and run this again: the next transaction reuses "
+            f"nonce {record['nonce']}, so only one of the two can be mined"
+        )
 
     def _sent_record_key(self, chain_id: int) -> str:
         return f"{chain_id}:{self.miner_address}"
