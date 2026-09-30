@@ -430,6 +430,7 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                RentedGpuDropCheck(),
                 CollateralPrefetchCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),

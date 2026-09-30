@@ -579,7 +579,12 @@ async def test_counts_above_the_backend_cap_are_clamped(context_factory):
 
 
 @pytest.mark.parametrize(
-    "build", [PipelineFactory.build_checks, PipelineFactory.build_dry_run_checks]
+    "build",
+    [
+        PipelineFactory.build_checks,
+        PipelineFactory.build_dry_run_checks,
+        PipelineFactory.build_fast_path_checks,
+    ],
 )
 def test_the_check_runs_after_the_scrape_and_before_the_fatal_gpu_checks(build):
     kinds = [type(check) for check in build()]
