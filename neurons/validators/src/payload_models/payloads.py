@@ -664,7 +664,8 @@ class ContainerCreated(ContainerBaseResponse):
     backup_log_id: str | None = None
     restore_path: str | None = None
     restore_log_id: str | None = None
-    jupyter_url: str | None = None
+    # carries the Jupyter token: kept out of str(), which the connector logs for every create
+    jupyter_url: str | None = Field(default=None, repr=False)
     warnings: list[ContainerWarningCode] | None = None
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
