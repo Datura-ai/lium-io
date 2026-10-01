@@ -1013,6 +1013,8 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
 
 FORK_B = "0x" + "0b" * 32
+# the batches of one listing: the headers below the finalized block, then the logs of the one block with a log
+LIST_BATCHES = collateral_module.RECLAIM_LOOKBACK_BLOCKS // collateral_module.CHAIN_READ_BATCH + 1
 
 
 def fork_b_log(url="https://fork-b/reclaim"):
@@ -1030,9 +1032,9 @@ def fork_b_log(url="https://fork-b/reclaim"):
         # a gateway that splits a batch: the log's amount is not the state at the finalized block
         ([], 2 * 10**17, None),
         # review of 7a226f9: the batch's blocks reach A and its logs a lagging backend, which knows no such block
-        (["logs-lagging"] * 5, 10**17, None),
+        (["logs-lagging"] * LIST_BATCHES, 10**17, None),
         # review of 12d1599: the logs reach a backend that knows the block's hash but answers it with no logs
-        (["logs-empty"] * 5 * collateral_module.RECLAIM_LIST_ATTEMPTS, 10**17, None),
+        (["logs-empty"] * LIST_BATCHES * collateral_module.RECLAIM_LIST_ATTEMPTS, 10**17, None),
     ],
     ids=["b-then-a", "lagging-then-a", "b-every-time", "log-and-state-disagree", "split-empty-logs", "known-block-no-logs"],
 )
