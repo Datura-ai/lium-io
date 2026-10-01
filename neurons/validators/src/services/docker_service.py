@@ -971,12 +971,7 @@ async def _explain_add_public_keys_failure(
             state = await docker_client.inspect_container_state(container_name=container_name)
         except Exception as inspect_exc:
             if is_docker_not_found_error(inspect_exc):
-                return ContainerGoneBeforeExec(
-                    str(cause),
-                    container_name=container_name,
-                    state=None,
-                    kill_detail="SSH-key exec failed and the container is gone",
-                )
+                return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=None)
             logger.warning(
                 _m(
                     "Could not inspect the container after a failed SSH-key injection",
@@ -989,12 +984,7 @@ async def _explain_add_public_keys_failure(
             )
             return cause
         if _killed_after_exec(state):
-            return ContainerGoneBeforeExec(
-                str(cause),
-                container_name=container_name,
-                state=state,
-                kill_detail=f"SSH-key exec failed and the container has stopped ({state.describe()})",
-            )
+            return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=state)
     if not state.exited_since_start or (state.killed_by_host and container_gone_cause(state) != "exited"):
         return cause
     if state.running:
