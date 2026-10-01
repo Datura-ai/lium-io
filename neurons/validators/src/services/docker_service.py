@@ -1201,6 +1201,46 @@ class _InflightCreateRegistry:
 inflight_creates = _InflightCreateRegistry()
 
 
+class _CreateStepsAfterReplyRegistry:
+    """Create steps the backend's reply does not wait for, by pod.
+
+    DAH-3980: the inspector start, the create's session close and the validator key removal run
+    after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
+    them first: an inspector start landing after the delete's stop would leave the collector running.
+    Each step logs its own failure.
+    """
+
+    def __init__(self) -> None:
+        self._tasks_by_pod_id: dict[str, set[asyncio.Task]] = {}
+
+    def start(self, pod_id: str, steps: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(steps)
+        self._tasks_by_pod_id.setdefault(pod_id, set()).add(task)
+        task.add_done_callback(lambda done: self._forget(pod_id, done))
+
+    def _forget(self, pod_id: str, task: asyncio.Task) -> None:
+        tasks = self._tasks_by_pod_id.get(pod_id, set())
+        tasks.discard(task)
+        if not tasks:
+            self._tasks_by_pod_id.pop(pod_id, None)
+
+    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
+        """Wait for this pod's steps; cancel what is left after the timeout. False on a cancel."""
+        tasks = set(self._tasks_by_pod_id.get(pod_id, ()))
+        if not tasks:
+            return True
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        # a cancelled step still closes its sessions before the delete opens its own
+        await asyncio.gather(*pending, return_exceptions=True)
+        return not pending
+
+
+# In-process like inflight_creates.
+create_steps_after_reply = _CreateStepsAfterReplyRegistry()
+
+
 class _PendingDeletionRegistry:
     """Pods whose last delete answered DeletionInProgress and has not completed since.
 
@@ -6029,6 +6069,45 @@ class DockerService:
             concurrency=concurrency,
         )
 
+    async def _run_create_steps_after_reply(
+        self,
+        connections: AsyncExitStack,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        log_extra: dict,
+    ) -> None:
+        # the create's steps a renter's first login does not need; closes the create's sessions
+        try:
+            async with connections:
+                if settings.ENABLE_INSPECTOR:
+                    started_ms = now_ms()
+                    # logs its own failure as "Inspector collector start failed"
+                    await self._run_inspector_collector_lifecycle(
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        action="start",
+                        default_extra=log_extra,
+                    )
+                    logger.info(
+                        _m(
+                            "Create step after reply finished",
+                            extra=get_extra_info({
+                                **log_extra,
+                                "step": ProfilerStepName.INSPECTOR_START.value,
+                                "duration_ms": now_ms() - started_ms,
+                            }),
+                        )
+                    )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Create steps after reply failed",
+                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -7396,24 +7475,13 @@ class DockerService:
                         container_name=container_name,
                         default_extra=default_extra,
                     )
-                    if settings.ENABLE_INSPECTOR:
-                        await self._run_inspector_collector_lifecycle(
-                            ssh_client=ssh_client,
-                            executor_info=executor_info,
-                            action="start",
-                            default_extra={
-                                **default_extra,
-                                "container_name": container_name,
-                            },
-                        )
+                    # no duration: the collector starts after the reply, its time is logged there
                     profilers.append(
-                        ProfilerStep.since(
-                            ProfilerStepName.INSPECTOR_START,
-                            prev_timestamp,
+                        ProfilerStep(
+                            name=ProfilerStepName.INSPECTOR_START_AFTER_REPLY,
                             skipped=not settings.ENABLE_INSPECTOR,
                         )
                     )
-                    prev_timestamp = now_ms()
                 except Exception:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
@@ -7487,7 +7555,7 @@ class DockerService:
                     )
                 )
 
-                return ContainerCreated(
+                container_created_reply = ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
@@ -7508,6 +7576,18 @@ class DockerService:
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
                 )
+                # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
+                # the steps after it take over this create's sessions and close them.
+                create_steps_after_reply.start(
+                    payload.pod_id,
+                    self._run_create_steps_after_reply(
+                        connections.pop_all(),
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        log_extra={**default_extra, "container_name": container_name},
+                    ),
+                )
+                return container_created_reply
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
@@ -8624,6 +8704,12 @@ class DockerService:
             )
             if not create_aborted:
                 log.warning("The cancelled create is still running; deleting without it")
+        # DAH-3980: the create's steps after its reply (inspector start, session close) end before
+        # this teardown, so its inspector stop is the last word on the host.
+        if not await create_steps_after_reply.wait_until_done(
+            payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+        ):
+            log.warning("Cancelled the create's steps after its reply; deleting without them")
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
