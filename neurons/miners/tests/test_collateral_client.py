@@ -1024,8 +1024,10 @@ async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_block
     requests = await client_with(provider).get_reclaim_events()
 
     assert [request.reclaim_request_id for request in requests] == [5]
-    # the finalized block, the two ends of the range, the log range, the one request's state
-    assert [method for method, _ in provider.requests] == ["eth_getBlockByNumber"] * 3 + ["eth_getLogs", "eth_call"]
+    # the finalized block, the two ends of the range, the log range, and the one request's state (web3 asks the
+    # chain ID before an eth_call)
+    methods = ["eth_getBlockByNumber"] * 3 + ["eth_getLogs", "eth_chainId", "eth_call"]
+    assert [method for method, _ in provider.requests] == methods
     assert "no longer keeps block 4000" in caplog.text
 
     provider.batch_backends = ["429"] * 4
