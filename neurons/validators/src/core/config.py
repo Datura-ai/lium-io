@@ -281,13 +281,9 @@ class Settings(BaseSettings):
     # Off stops later replacements and undoes none; restoring the replaced file (its hash is
     # previous_sha256 in INSPECTOR_LIBRARY_REPLACED) is in .env.template.
     INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
-    # Pinned to a commit whose neurons/executor/libinspector.so is the validator's build; a URL on
-    # main would start serving a different file with the next library bump.
+    # Tracks main, like verifyx.LIBRARY_FETCH_URL, so executors on older images still get the current build.
     INSPECTOR_LIBRARY_FETCH_URL: str = Field(
-        default=(
-            "https://raw.githubusercontent.com/Datura-ai/lium-io/"
-            "38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
-        ),
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)

@@ -18,7 +18,7 @@ from neurons.validators.src.services.inspector_validation_service import (
 from neurons.validators.src.services.task.messages import InspectorMessages as Msg
 
 
-FETCH_URL = "https://raw.githubusercontent.com/Datura-ai/lium-io/38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
+FETCH_URL = "https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so"
 VALIDATOR_SHA256 = "abc123"
 
 
@@ -757,14 +757,14 @@ async def _validate(shell, ssh: FakeSSH | None = None, service: InspectorValidat
     )
 
 
-def test_both_refresh_switches_are_off_by_default_and_the_fetch_url_is_pinned():
+def test_both_refresh_switches_are_off_by_default_and_the_fetch_url_tracks_main():
     assert VerifyXSettings.model_fields["LIBRARY_REFRESH_ENABLED"].default is False
     assert Settings.model_fields["INSPECTOR_LIBRARY_REFRESH_ENABLED"].default is False
     assert Settings.model_fields["INSPECTOR_LIBRARY_FETCH_URL"].default == FETCH_URL
-    # FETCH_URL's commit holds executor/libinspector.so as git blob 8d5383a4: the validator's
-    # file must be that blob, so a library bump fails here until the pin moves with it
-    data = (REPO / "neurons/validators/libinspector.so").read_bytes()
-    assert hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() == "8d5383a40853f072139714023c25c148171aced1"
+    assert FETCH_URL.replace("libinspector.so", "libverifyx.so") == VerifyXSettings.model_fields["LIBRARY_FETCH_URL"].default
+    # the default serves main's executor copy, which is installed only if it matches the validator's
+    validator_lib = (REPO / "neurons/validators/libinspector.so").read_bytes()
+    assert (REPO / "neurons/executor/libinspector.so").read_bytes() == validator_lib
 
 
 @pytest.mark.asyncio
