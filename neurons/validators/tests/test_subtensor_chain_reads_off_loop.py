@@ -91,3 +91,53 @@ async def test_rent_during_the_warm_up_first_load_joins_it_with_one_metagraph_re
 
     assert miner is serving_miner
     assert len(metagraph_reads) == 1
+
+
+def _make_main_validator_subtensor_client() -> SubtensorClient:
+    client = _make_connector_subtensor_client()
+    client._chain_reads_in_thread = False
+    return client
+
+
+@pytest.mark.asyncio
+async def test_main_validator_concurrent_empty_get_miners_each_fetch_as_on_main() -> None:
+    client = _make_main_validator_subtensor_client()
+    fetches: list[int] = []
+
+    async def _fetch_miners_yielding_to_the_loop() -> None:
+        fetches.append(1)
+        await asyncio.sleep(0.01)
+        client.miners = [MagicMock()]
+
+    client.fetch_miners = _fetch_miners_yielding_to_the_loop
+
+    await asyncio.gather(client.get_miners(), client.get_miners())
+
+    assert len(fetches) == 2
+
+
+@pytest.mark.asyncio
+async def test_main_validator_warm_up_retry_after_failed_evm_sync_fetches_miners_again() -> None:
+    client = _make_main_validator_subtensor_client()
+    client._return_to_first_endpoint = MagicMock()
+    client.set_subtensor = MagicMock()
+    client._switch_endpoint_after_read_failure = MagicMock()
+    fetches: list[int] = []
+
+    async def _fetch_miners() -> None:
+        fetches.append(1)
+        client.miners = [MagicMock()]
+
+    client.fetch_miners = _fetch_miners
+    client.sync_evm_address_maps = AsyncMock(side_effect=[RuntimeError("evm sync failed"), None])
+
+    with (
+        patch.object(SubtensorClient, "_subtensor", MagicMock()),
+        patch("clients.subtensor_client.SUBTENSOR_BACKOFF_INITIAL", 0),
+    ):
+        warm_up = asyncio.create_task(client._warm_up_subtensor())
+        while client.sync_evm_address_maps.await_count < 2:
+            await asyncio.sleep(0.01)
+        warm_up.cancel()
+
+    assert len(fetches) == 2
