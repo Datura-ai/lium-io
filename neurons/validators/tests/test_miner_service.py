@@ -22,6 +22,7 @@ from payload_models.payloads import (
     CustomOptions,
     PayloadPortMapping,
 )
+from services import docker_service as docker_service_module
 from services.miner_service import MinerService
 
 
@@ -144,6 +145,25 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
     assert order == ["lock", "create", "unlock"]
     # No pre-flag port-check removal in miner_service anymore.
     wait_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, miner_service, caplog):
+    executor_id = str(uuid4())
+    payload = _make_create_payload(executor_id)
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    created = Mock()
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=created))
+    remove_key = mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", AsyncMock(return_value=True))
+
+    with caplog.at_level("INFO"):
+        result = await miner_service._handle_container(payload)
+        remove_key.assert_not_awaited()
+        assert await docker_service_module.create_steps_after_reply.wait_until_done(payload.pod_id, 5)
+
+    assert result is created
+    remove_key.assert_awaited_once()
+    assert any("Validator SSH key removal after reply finished" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
