@@ -268,11 +268,6 @@ class Settings(BaseSettings):
         env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
         default=True,
     )
-    # DAH-3275: a provider-origin Inspector finding on a rented pod fails the check, zeroes the
-    # score and asks the backend for an inspector_auto quarantine (off the marketplace + renters
-    # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
-    # the inspector event, no renter is told, the score is untouched.
-    INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -281,13 +276,9 @@ class Settings(BaseSettings):
     # Off stops later replacements and undoes none; restoring the replaced file (its hash is
     # previous_sha256 in INSPECTOR_LIBRARY_REPLACED) is in .env.template.
     INSPECTOR_LIBRARY_REFRESH_ENABLED: bool = Field(env="INSPECTOR_LIBRARY_REFRESH_ENABLED", default=False)
-    # Pinned to a commit whose neurons/executor/libinspector.so is the validator's build; a URL on
-    # main would start serving a different file with the next library bump.
+    # Tracks main, like verifyx.LIBRARY_FETCH_URL, so executors on older images still get the current build.
     INSPECTOR_LIBRARY_FETCH_URL: str = Field(
-        default=(
-            "https://raw.githubusercontent.com/Datura-ai/lium-io/"
-            "38736b58d33885df4e56d6bd1b6cdc3f9ca5e1fe/neurons/executor/libinspector.so"
-        ),
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
@@ -398,44 +389,21 @@ class Settings(BaseSettings):
     # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
-    # DAH-2870 — a RUNNING rented pod whose SSH port refuses, or whose authorized_keys cannot be
-    # read, after this validator saw it healthy once. Judged from outside the container every cycle;
-    # CYCLES consecutive unhealthy cycles (2 ≈ 30 min) raise RENTED_POD_SSH_UNREACHABLE and one
-    # report to the backend per outage. Observation only: the score is not changed here.
+    # Rented pod SSH, observe only: at the start of each cycle the validator
+    # reads the SSH identification line of every rented pod listed with an ssh_port, from outside the
+    # container (services/pod_ssh_probe.py), and reports each result with the node's result. The
+    # score is not changed by it. TIMEOUT bounds one probe (connect and read); CONCURRENCY bounds how
+    # many run at once, so a fleet of N pods takes at most ceil(N / CONCURRENCY) * TIMEOUT.
     RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
-    # CYCLES 0 would report on the first unhealthy cycle and a timeout of 0 would time every connect
-    # out: both are refused at startup, like the TTL below.
-    RENTED_POD_SSH_PROBE_CYCLES: int = Field(env="RENTED_POD_SSH_PROBE_CYCLES", default=2, ge=1)
     RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0, gt=0)
-    # Off: the mapped port is judged by the TCP connect alone (refused / timeout). On: the port must
-    # also greet with an `SSH-2.0-` identification line, and a port that accepts without one is the
-    # `ssh_banner_missing` fault. The backend learns that fault name in lium-platform#429; a validator
-    # that sends it to an older backend gets a 422 and the outage is never recorded. Turn on only
-    # after lium-platform#429 is deployed.
-    RENTED_POD_SSH_BANNER_FAULT_ENABLED: bool = Field(env="RENTED_POD_SSH_BANNER_FAULT_ENABLED", default=False)
-    # Both per-pod Redis marks expire this long after the last cycle that probed the pod (every probe
-    # renews them) and are deleted when the backend says the rental closed, so a pod that left the
-    # rented list leaves no key behind. 24 h ≈ 96 cycles of margin for a validator that was down.
-    RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS: int = Field(env="RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", default=86400, gt=0)
-    # The cycle-end fleet gate: when more than this share of the cycle's probed pods fail the
-    # mapped-port check, the validator's own network is the suspect and the cycle's reports are held
-    # back (logged, not posted). 0.5 is the DAH-2748 executor-SSH threshold: half the fleet losing
-    # SSH in one cycle is our side, not theirs. Fleets under SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
-    # pods are gated by the executor-SSH verdict alone.
-    RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX: float = Field(env="RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", default=0.5, ge=0.0, le=1.0)
-    # DAH-2255 — the enforcement half of the probe above. Off (the default): RENTED_POD_SSH_UNREACHABLE
-    # is recorded and reported and the rented score stands (DAH-2870's behaviour). On: a pod whose
-    # streak reaches ENFORCE_AFTER_CYCLES and whose outage the backend has accepted makes the
-    # rented-state check FAIL for the cycle — score 0, verified job cleared — the way the rental
-    # probe fails an unreachable unrented node; the next healthy cycle scores as rented again.
-    # ENFORCE_AFTER_CYCLES unset means RENTED_POD_SSH_PROBE_CYCLES (the notify threshold); a value
-    # below it is refused at startup, so a provider is never zeroed for an outage the backend did
-    # not accept. With the defaults (notify at 2, then wait for the backend accept) enforcement
-    # starts at streak 3, not 2: the notify cycle queues the report, and the next cycle can fail
-    # the check. One blip (a streak of 1) never costs a cycle. Enforcement adds no report: the
-    # one POST per outage stays the probe's.
-    RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
-    RENTED_POD_SSH_ENFORCE_AFTER_CYCLES: int | None = Field(env="RENTED_POD_SSH_ENFORCE_AFTER_CYCLES", default=None, ge=1)
+    RENTED_POD_SSH_PROBE_CONCURRENCY: int = Field(env="RENTED_POD_SSH_PROBE_CONCURRENCY", default=64, ge=1)
+    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
+    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
+    # stores such a report as evidence only (lium-platform) is deployed:
+    # an older backend would score it as a failed validation.
+    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
+        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
+    )
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -601,6 +569,23 @@ class Settings(BaseSettings):
     ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
         env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
+
+    # Spot-node pay. True: an unrented spot node whose provider chose Spot (the backend's
+    # provider_spot_executor_ids) and that runs Lium fillers earns
+    # min(0.95 x its GPU configuration's average filler revenue, its secure idle rate before
+    # bucket-cap dilution), with no bucket cap (0.95 = FILLER_REVENUE_PAY_FACTOR); a spot node without a filler, or whose configuration
+    # has no usable average, earns 0, and a demoted, force-spot, pinned or no-incentive-rental one
+    # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
+    # False: every spot node earns 0, as before.
+    ENABLE_SPOT_NODE_PAY: bool = Field(env="ENABLE_SPOT_NODE_PAY", default=False)
+    # Secure-node floor, independent of the flag above. True: an idle secure node's rate after
+    # bucket-cap dilution is raised to 0.95 x its configuration's average filler revenue, even above
+    # its listed rate (0.95 = SECURE_FILLER_REVENUE_FLOOR_FACTOR, set apart from the spot factor).
+    # False: dilution applies as before.
+    ENABLE_SECURE_FILLER_REVENUE_FLOOR: bool = Field(env="ENABLE_SECURE_FILLER_REVENUE_FLOOR", default=False)
+    # A configuration's filler average is used only when it was taken over at least this many
+    # filler GPU-hours; a thinner sample reads as no average.
+    FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=24.0)
 
     # True: when the --network=host batch verifies fewer than MIN_PORT_COUNT ports, the ports it
     # failed are re-probed through the published-port (-p) tiers renters' pods use, and the two
@@ -832,17 +817,6 @@ class Settings(BaseSettings):
                     "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
                     "of at least 32 characters"
                 )
-        return self
-
-    @model_validator(mode="after")
-    def validate_rented_pod_ssh_enforce_threshold(self) -> "Settings":
-        # DAH-2255: enforcing before notifying would zero a provider for an outage no renter was
-        # told about; the enforce threshold is the notify threshold or later.
-        after = self.RENTED_POD_SSH_ENFORCE_AFTER_CYCLES
-        if after is not None and after < self.RENTED_POD_SSH_PROBE_CYCLES:
-            raise ValueError(
-                "RENTED_POD_SSH_ENFORCE_AFTER_CYCLES must not be below RENTED_POD_SSH_PROBE_CYCLES"
-            )
         return self
 
     def get_bittensor_wallet(self) -> "Wallet":

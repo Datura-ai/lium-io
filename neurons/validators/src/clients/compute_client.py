@@ -354,6 +354,7 @@ class ComputeClient:
                             batch_total=data.get("batch_total"),
                             availability_errors=data.get("availability_errors"),
                             pod_states=data.get("pod_states"),
+                            pod_ssh=data.get("pod_ssh"),
                         )
 
                         async with self.lock:
