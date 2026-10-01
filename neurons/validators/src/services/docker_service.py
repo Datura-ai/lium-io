@@ -7208,6 +7208,15 @@ class DockerService:
                     if environment_error:
                         raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
+                    # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
+                    # the validator, no environment and ships_sshd, no exec runs after the key step.
+                    current_step = "final_state_check"
+                    await _raise_if_killed_after_exec(
+                        docker_client,
+                        container_name=container_name,
+                        failure="the bootstrap's last exec ended",
+                    )
+
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))

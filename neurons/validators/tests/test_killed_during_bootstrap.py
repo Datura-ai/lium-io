@@ -757,8 +757,9 @@ async def test_a_healthy_container_bootstraps_as_before(svc, monkeypatch, caplog
 
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     assert _events(caplog) == []
-    # keys, bootstrap script written, bootstrap script run, environment: one inspect, one exec each
-    assert api.events == ["inspect_container", "exec_create"] * 4
+    # keys, bootstrap script written, bootstrap script run, environment: one inspect, one exec each;
+    # then the State read before the pod is cached
+    assert api.events == ["inspect_container", "exec_create"] * 4 + ["inspect_container"]
     assert len(client.exec_specs) == 4
     svc.redis_service.add_rented_pod.assert_awaited_once()
 
@@ -875,3 +876,36 @@ async def test_a_silent_kill_during_jupyter_setup_is_killed_during_bootstrap(svc
     svc.run_jupyter.assert_awaited_once()
     (logged,) = _events(caplog)
     assert logged["bootstrap_step"] == "jupyter_setup" and logged["cause"] == cause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("after", "cause"),
+    [("sigkill", "killed"), ("oom", "oom"), ("gone", "removed"), ("still-running", None), ("image-exited", None)],
+)
+async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(svc, monkeypatch, caplog, after, cause):
+    """No Jupyter, no environment and a skipped SSH bootstrap (ships_sshd) run no exec after the key step:
+    the State read before the pod is cached still names a kill instead of a ContainerCreated."""
+    api = FakeApiClient()
+    later = {
+        "sigkill": _SIGKILLED,
+        "oom": _oom_killed_state(),
+        "image-exited": _container_state(status="exited", running=False, exit_code=0),
+    }
+    api.container_states = [_RUNNING, later.get(after, _RUNNING)]
+    _bootstrapping_create(svc, monkeypatch, api, skip_ssh_bootstrap=True)
+    if after == "gone":
+        _gone_at_inspect(api, 2)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    if cause is None:
+        assert isinstance(result, ContainerCreated)
+        assert _events(caplog) == []
+        return
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+    (logged,) = _events(caplog)
+    assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == cause
+    assert "is not running" not in result.detail
