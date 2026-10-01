@@ -62,6 +62,8 @@ class FakeProvider(AsyncBaseProvider):
         "unknown account": "unknown account",
         "keyed refusal": f"insufficient funds for gas * price + value at {KEYED_RPC_URL}",
     }
+    # the default finney RPC answers a larger batch with one -32010 error object
+    BATCH_LIMIT = 50
 
     def __init__(
         self,
@@ -111,6 +113,9 @@ class FakeProvider(AsyncBaseProvider):
         return True
 
     async def make_batch_request(self, requests):
+        if len(requests) > self.BATCH_LIMIT:
+            error = {"code": -32010, "message": "The batch request was too large", "data": "Exceeded max limit of 50"}
+            return {"jsonrpc": "2.0", "id": None, "error": error}
         backend = self.batch_backends.pop(0) if self.batch_backends else "a"
         if backend == "429":
             raise aiohttp.ClientResponseError(None, (), status=429, message="Too Many Requests")
@@ -800,12 +805,16 @@ async def test_a_receipt_that_is_not_final_on_chain_never_clears_the_send_record
         ("rate-limited", "could not be read \\(HTTP 429.*SUBTENSOR_EVM_RPC_URL"),
         # review of 7a226f9: a gateway answers the finalized block from fork A and the receipt's block from fork B
         ("split-batch", "from more than one chain"),
+        # reads of a7a2820: a receipt 120 blocks below the finalized block is read in batches the RPC accepts
+        ("deep", None),
     ],
 )
 async def test_a_fresh_send_record_clears_only_on_a_receipt_on_the_finalized_chain(monkeypatch, case, error):
     monkeypatch.setattr(collateral_module, "RATE_LIMIT_RETRY_SEC", (0, 0, 0))
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
-    if case != "orphaned":
+    if case == "deep":
+        provider.block_number = provider.finalized_number = 16 + 120
+    elif case != "orphaned":
         provider.block_number = provider.finalized_number = 20
     if case == "orphaned":
         provider.canonical_hashes[16] = "0x" + "bb" * 32
@@ -1038,6 +1047,16 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
 
 
+async def test_a_batch_above_the_rpc_limit_fails_the_list(monkeypatch):
+    """Reads of a7a2820: the default finney RPC refuses a batch of more than 50 items, and the fake RPC does too."""
+    monkeypatch.setattr(collateral_module, "CHAIN_READ_BATCH", FakeProvider.BATCH_LIMIT + 1)
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.block_number = provider.finalized_number = 5000
+
+    with pytest.raises(CollateralTransactionError, match="did not answer the batch"):
+        await client_with(provider).get_reclaim_events()
+
+
 async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_blocks(monkeypatch, caplog):
     """Read a of a5079c9: the listing read every one of 1000 headers, and the default finney RPC answers HTTP 429
     after about 100 reads and keeps only about 256 blocks."""
@@ -1051,10 +1070,11 @@ async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_block
     requests = await client_with(provider).get_reclaim_events()
 
     assert [request.reclaim_request_id for request in requests] == [5]
-    # the finalized block, two batches of headers (the second reaches the pruned blocks), the logs of the one
-    # block whose bloom may hold the event, and the one request's state
+    # the finalized block, batches of headers down to the first pruned one (4744), the logs of the one block whose
+    # bloom may hold the event, and the one request's state
     methods = [method for method, _ in provider.requests]
-    assert methods.count("eth_getBlockByNumber") == 1 + 2 * collateral_module.CHAIN_READ_BATCH
+    header_batches = -(-(5000 - provider.oldest_kept + 1) // collateral_module.CHAIN_READ_BATCH)
+    assert methods.count("eth_getBlockByNumber") == 1 + header_batches * collateral_module.CHAIN_READ_BATCH
     assert methods.count("eth_getLogs") == methods.count("eth_call") == 1
     assert "no longer keeps block 4000" in caplog.text
 

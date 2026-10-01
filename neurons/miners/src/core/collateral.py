@@ -75,8 +75,8 @@ GAS_LIMIT = 200_000
 # cannot spend the address balance on fees (at GAS_LIMIT, 100 gwei caps a transaction at 0.02 TAO).
 DEFAULT_MAX_GAS_PRICE_GWEI = 100
 RECLAIM_LOOKBACK_BLOCKS = 1000
-# Headers read per JSON-RPC batch when the chain below the finalized block is checked.
-CHAIN_READ_BATCH = 250
+# Reads per JSON-RPC batch. The default finney RPC refuses a batch of more than 50 (-32010).
+CHAIN_READ_BATCH = 50
 # A pruning RPC keeps at least this many blocks below its finalized one (the default finney RPC about 256); a block
 # missing nearer the top is a backend that lags behind, not pruning.
 KEPT_BLOCKS_MIN = 128
