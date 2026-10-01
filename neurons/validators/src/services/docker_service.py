@@ -2559,15 +2559,21 @@ class DockerService:
             await self.log_task
 
     async def check_container_running(
-        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, timeout: int = 10
+        self, docker_client: RentalDockerSdkClient, container_name: str, timeout: int = 10
     ):
         """Check if the container is running"""
+        # one inspect on the open SDK connection, not a `docker ps` exec over SSH (~0.25 s)
         start_time = time.time()
-        name_filter = shlex.quote(f"name={container_name}")
         while time.time() - start_time < timeout:
-            result = await ssh_client.run(f"/usr/bin/docker ps -q --filter {name_filter}")
-            if result.stdout.strip():
-                return True
+            try:
+                state = await docker_client.inspect_container_state(container_name=container_name)
+            except RentalDockerOperationError as exc:
+                # a missing container is "not running", as an empty `docker ps` was
+                if not is_docker_not_found_error(exc):
+                    raise
+            else:
+                if state.running:
+                    return True
             await asyncio.sleep(1)
         return False
 
@@ -6774,7 +6780,7 @@ class DockerService:
 
                     # check if the container is running correctly
                     current_step = "container_health_check"
-                    if not await self.check_container_running(ssh_client, container_name):
+                    if not await self.check_container_running(docker_client, container_name):
                         # Capture the failure reason and check whether it points to our
                         # --device flags (DAH-1987). State.Error covers cgroup / device
                         # failures; logs --tail covers entrypoint failures.

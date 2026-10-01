@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
+from docker.errors import NotFound
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import (
@@ -1033,22 +1034,41 @@ async def test_delete_container_rejects_unsafe_volume_names_before_shell(
 
 
 @pytest.mark.asyncio
-async def test_check_container_running_quotes_hostile_container_name_filter(
+async def test_check_container_running_asks_the_sdk_for_the_exact_name_without_a_shell(
     docker_service,
 ):
-    ssh_client = RecordingSSHClient(stdout="container-id\n")
-
-    assert await docker_service.check_container_running(
-        ssh_client,
-        HOSTILE_CONTAINER_NAME,
+    # Arrange
+    docker_client = SimpleNamespace(
+        inspect_container_state=AsyncMock(return_value=SimpleNamespace(running=True))
     )
 
-    assert len(ssh_client.commands) == 1
-    _assert_shell_arg_is_single_token(
-        ssh_client.commands[0],
-        f"name={HOSTILE_CONTAINER_NAME}",
+    # Act
+    running = await docker_service.check_container_running(docker_client, HOSTILE_CONTAINER_NAME)
+
+    # Assert
+    assert running
+    docker_client.inspect_container_state.assert_awaited_once_with(
+        container_name=HOSTILE_CONTAINER_NAME
     )
-    assert "echo" not in shlex.split(ssh_client.commands[0])
+
+
+@pytest.mark.asyncio
+async def test_check_container_running_reads_a_missing_container_as_not_running(
+    docker_service, monkeypatch
+):
+    # Arrange: dockerd answers 404 on every poll
+    not_found = RentalDockerOperationError("Docker SDK inspect container failed")
+    not_found.__cause__ = NotFound("No such container: pod_gone")
+    docker_client = SimpleNamespace(inspect_container_state=AsyncMock(side_effect=not_found))
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("services.docker_service.time.time", Mock(side_effect=[0, 0, 0, 11]))
+
+    # Act
+    running = await docker_service.check_container_running(docker_client, "pod_gone")
+
+    # Assert: polled until the timeout, then "not running" for the failure path to explain
+    assert not running
+    assert docker_client.inspect_container_state.await_count == 2
 
 
 @pytest.mark.asyncio
