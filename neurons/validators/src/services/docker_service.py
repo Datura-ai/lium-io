@@ -76,6 +76,7 @@ from services.const import (
     PREFERRED_POD_PORTS,
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
+from services.default_docker_image_digest_service import fetch_docker_hub_digest
 from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
     apply_filler_gpu_power_limits,
@@ -5872,6 +5873,14 @@ class DockerService:
             # Keep this immediately before the guard; the broad except uses it as failure_step.
             require_rental_docker_ssh_host_key(executor_info)
 
+            # DAH-3980: the registry digest a present image is checked against (DAH-3873), asked from
+            # here while the SSH connects; the host's daemon took ~2 s for the same answer
+            docker_hub_digest_lookup = (
+                None
+                if is_custom_build
+                else asyncio.create_task(fetch_docker_hub_digest(payload.docker_image))
+            )
+
             current_step = "ssh_connect"
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
@@ -5936,11 +5945,12 @@ class DockerService:
                 image_present = False
                 if not is_custom_build:
                     current_step = "docker_image_inspect"
+                    local_repo_digests: tuple[str, ...] | None = None
                     try:
-                        image_present = await run_logged_rental_docker_sdk_operation(
+                        local_repo_digests = await run_logged_rental_docker_sdk_operation(
                             operation="inspect_image",
                             log_extra=default_extra,
-                            call=lambda: docker_client.image_exists(
+                            call=lambda: docker_client.local_image_repo_digests(
                                 image=payload.docker_image
                             ),
                             image=payload.docker_image,
@@ -5952,9 +5962,27 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "error": str(exc)}),
                             )
                         )
+                    image_present = local_repo_digests is not None
                     # DAH-3873: a mutable tag (`:prod`) on the host can be an old build. Pull when the
                     # registry tag moved. When the registry does not answer, use the local image.
-                    if image_present:
+                    if not image_present:
+                        docker_hub_digest_lookup.cancel()
+                    elif (docker_hub_digest := await docker_hub_digest_lookup) is not None:
+                        image_present = any(
+                            repo_digest.endswith(f"@{docker_hub_digest}")
+                            for repo_digest in local_repo_digests
+                        )
+                        logger.info(
+                            _m(
+                                "Registry digest checked from the connector",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "registry_digest": docker_hub_digest,
+                                    "local_image_current": image_present,
+                                }),
+                            )
+                        )
+                    else:
                         auth_config = (
                             {"username": payload.docker_username, "password": payload.docker_password}
                             if has_credentials

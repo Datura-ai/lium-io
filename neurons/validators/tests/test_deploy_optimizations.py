@@ -94,6 +94,7 @@ class _FakeRentalDockerClient:
         self.image_exists_result = image_exists_result
         self.image_exists_error = image_exists_error
         self.image_exists_calls = []
+        self.repo_digests = ()
         self.local_image_current = True
         self.local_image_current_error = None
         self.freshness_calls = []
@@ -114,6 +115,9 @@ class _FakeRentalDockerClient:
         if self.image_exists_error is not None:
             raise self.image_exists_error
         return self.image_exists_result
+
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return self.repo_digests if await self.image_exists(image=image) else None
 
     async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
         self.freshness_calls.append({"image": image, "auth_config": auth_config})
@@ -337,6 +341,37 @@ async def test_present_image_is_used_when_the_registry_check_fails(svc, monkeypa
 
     assert isinstance(result, ContainerCreated)
     assert _pulled_images(svc) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("docker_hub_digest", "pulled"),
+    [("sha256:current", []), ("sha256:moved", ["daturaai/pytorch:prod"])],
+)
+async def test_docker_hub_digest_from_the_connector_replaces_the_daemon_registry_check(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path, docker_hub_digest, pulled
+):
+    """DAH-3980: the connector's own Docker Hub answer decides, the daemon is not asked (~2 s)."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
+    no_docker_hub_digest_on_rent_path.return_value = docker_hub_digest
+
+    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
+    assert _docker_client(svc).freshness_calls == []
+    assert _pulled_images(svc) == pulled
+
+
+@pytest.mark.asyncio
+async def test_daemon_checks_the_registry_when_docker_hub_gives_no_digest(svc, monkeypatch):
+    """No connector answer (another registry, a private image, Hub down) keeps the DAH-3873 path."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert [call["image"] for call in _docker_client(svc).freshness_calls] == ["daturaai/pytorch:prod"]
 
 
 @pytest.mark.asyncio
