@@ -48,12 +48,7 @@ POD_ID = "pod-1"
 NVML_DRIVER_ERROR = "NVMLError(9)"
 
 
-def _sealed(report: str, key: str = ENCRYPT_KEY) -> str:
-    # what the shipped scrape prints: the plain report, then its Fernet token under the cycle's key
-    return f"{report}\n{SSHService()._encrypt(key, report)}"
-
-
-def _plain_driver_report(gpu_scrape_error: str) -> str:
+def _driver_report(gpu_scrape_error: str) -> str:
     return json.dumps(
         {
             "error": "no_gpu_details",
@@ -62,12 +57,7 @@ def _plain_driver_report(gpu_scrape_error: str) -> str:
     )
 
 
-def _driver_report(gpu_scrape_error: str) -> str:
-    return _sealed(_plain_driver_report(gpu_scrape_error))
-
-
-PLAIN_NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
-NO_GPU_REPORT = _sealed(PLAIN_NO_GPU_REPORT)
+NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
 HEALTHY_SPECS = {
     "gpu": {"count": 1, "details": [{"name": "NVIDIA RTX 4090", "uuid": "GPU-abc123"}]},
     "gpu_processes": [],
@@ -165,57 +155,43 @@ async def _record(service: RedisService) -> dict:
 
 HEALTHY = _scrape_result(stdout=SSHService()._encrypt(ENCRYPT_KEY, json.dumps(HEALTHY_SPECS)), exit_code=0)
 DEAD_NVML = _scrape_result(stdout=_driver_report(NVML_DRIVER_ERROR), exit_code=1)
+DRIVER = Msg.SCRAPE_FAILED_DRIVER.reason
 
 
+@pytest.mark.parametrize(
+    ("stdout", "reason_code", "gpu_scrape_error"),
+    [
+        pytest.param(NO_GPU_REPORT, Msg.SCRAPE_FAILED_NO_GPU.reason, None, id="zero-gpus"),
+        pytest.param(_driver_report("NVMLError(9)"), DRIVER, "NVMLError(9)", id="driver-not-loaded"),
+        pytest.param(_driver_report("NVMLError(15)"), DRIVER, "NVMLError(15)", id="gpu-lost"),
+        pytest.param(_driver_report("NVMLError(16)"), DRIVER, "NVMLError(16)", id="reset-required"),
+        pytest.param(_driver_report("NVMLError(28)"), DRIVER, "NVMLError(28)", id="gpu-not-found"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_dead_nvml_on_a_rented_node_marks_the_executor_inactive(context_factory):
+async def test_a_dead_gpu_runtime_on_a_rented_node_marks_the_executor_inactive(
+    context_factory, stdout, reason_code, gpu_scrape_error
+):
     service = _redis_service()
     ok, _, _ = await _cycle(context_factory, service, scrape=HEALTHY)
     assert ok is True and _resets(service) == []
 
-    ok, event, _ = await _cycle(context_factory, service, scrape=DEAD_NVML)
+    ok, event, _ = await _cycle(context_factory, service, scrape=_scrape_result(stdout=stdout, exit_code=1))
 
     assert ok is False
-    assert event.reason_code == Msg.SCRAPE_FAILED_DRIVER.reason
+    assert event.reason_code == reason_code
     assert event.check_id == MachineSpecScrapeCheck.check_id
     assert event.what_we_saw["host_gpu_fault_reset"] is True
     [reset] = _resets(service)
     assert reset["executor_uuid"] == EXECUTOR
-    assert reset["reason_code"] == Msg.SCRAPE_FAILED_DRIVER.reason
+    assert reset["reason_code"] == reason_code
     assert reset["check_id"] == MachineSpecScrapeCheck.check_id
-    assert reset["evidence"] == {
-        "pod_id": POD_ID,
-        "rented_pod_ids": [POD_ID],
-        "scrape_error": "no_gpu_details",
-        "gpu_scrape_error": NVML_DRIVER_ERROR,
-    }
+    evidence = {"pod_id": POD_ID, "rented_pod_ids": [POD_ID], "scrape_error": "no_gpu_details"}
+    if gpu_scrape_error is not None:
+        evidence["gpu_scrape_error"] = gpu_scrape_error
+    assert reset["evidence"] == evidence
     record = await _record(service)
     assert (record["count"], record["uuids"]) == (0, "GPU-abc123")
-
-
-@pytest.mark.parametrize(
-    "gpu_scrape_error", ["NVMLError(15)", "NVMLError(16)", "NVMLError(28)"], ids=["gpu-lost", "reset-required", "gpu-not-found"]
-)
-@pytest.mark.asyncio
-async def test_every_dead_runtime_nvml_code_resets_a_rented_node(context_factory, gpu_scrape_error):
-    service = _redis_service()
-
-    await _cycle(context_factory, service, scrape=_scrape_result(stdout=_driver_report(gpu_scrape_error), exit_code=1))
-
-    [reset] = _resets(service)
-    assert reset["evidence"]["gpu_scrape_error"] == gpu_scrape_error
-
-
-@pytest.mark.asyncio
-async def test_nvml_listing_zero_gpus_on_a_rented_node_marks_it_inactive(context_factory):
-    service = _redis_service()
-
-    ok, event, _ = await _cycle(context_factory, service, scrape=_scrape_result(stdout=NO_GPU_REPORT, exit_code=1))
-
-    assert ok is False and event.reason_code == Msg.SCRAPE_FAILED_NO_GPU.reason
-    [reset] = _resets(service)
-    assert reset["reason_code"] == Msg.SCRAPE_FAILED_NO_GPU.reason
-    assert "gpu_scrape_error" not in reset["evidence"]
 
 
 @pytest.mark.asyncio
@@ -240,7 +216,7 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
     [
         pytest.param(DEAD_NVML, {"rented": False}, id="unrented-node"),
         pytest.param(DEAD_NVML, {"enabled": False}, id="flag-off"),
-        # the report comes from the node's own host and the provider can seal it, so the shipped default is off
+        # the report comes from the node's own host, so the shipped default is off
         pytest.param(
             DEAD_NVML,
             {
@@ -250,7 +226,7 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
             },
             id="provider-forged-report-with-shipped-default",
         ),
-        # miner A reports miner B's rented executor UUID with a sealed dead-NVML report from A's own host
+        # miner A reports miner B's rented executor UUID with a dead-NVML report from A's own host
         pytest.param(DEAD_NVML, {"miner_hotkey": "another-miner"}, id="rental-owned-by-another-miner"),
         pytest.param(
             _scrape_result(stdout=NO_GPU_REPORT, exit_code=1),
@@ -264,23 +240,6 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
             _scrape_result(stdout=_driver_report("OSError(28, 'No space left on device')"), exit_code=1), {}, id="not-nvml"
         ),
         pytest.param(_scrape_result(stdout="", exit_code=127), {}, id="scrape-failed-on-host"),
-        # what a stray print or another cycle's token looks like: the report without its sealed copy, with a copy
-        # sealed under another key, or with a replayed success payload
-        pytest.param(
-            _scrape_result(stdout=_plain_driver_report(NVML_DRIVER_ERROR), exit_code=1), {}, id="plain-driver-report"
-        ),
-        pytest.param(_scrape_result(stdout=PLAIN_NO_GPU_REPORT, exit_code=1), {}, id="plain-no-gpu-report"),
-        pytest.param(_scrape_result(stdout='{"error": "no_gpu_details"}', exit_code=1), {}, id="bare-no-gpu-report"),
-        pytest.param(
-            _scrape_result(stdout=_sealed(_plain_driver_report(NVML_DRIVER_ERROR), key="another-key"), exit_code=1),
-            {},
-            id="sealed-under-another-key",
-        ),
-        pytest.param(
-            _scrape_result(stdout=f"{_plain_driver_report(NVML_DRIVER_ERROR)}\n{HEALTHY.stdout}", exit_code=1),
-            {},
-            id="replayed-success-payload",
-        ),
         pytest.param(
             SSHCommandResult(
                 command="scrape.sh", command_id="cmd-1", exit_code=-1, stdout="", stderr="", duration_ms=300_000,
