@@ -877,8 +877,8 @@ class CollateralClient:
             )[:4]
             if amount == 0:
                 continue
-            if (executor_id, miner, amount, expiration_time) != (
-                args["executorId"], args["miner"], args["amount"], args["expirationTime"]
+            if (executor_id, AsyncWeb3.to_checksum_address(miner), amount, expiration_time) != (
+                args["executorId"], AsyncWeb3.to_checksum_address(args["miner"]), args["amount"], args["expirationTime"]
             ):
                 return None
             requests.append(
