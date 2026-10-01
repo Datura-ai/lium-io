@@ -637,7 +637,7 @@ async def test_cleanup_drops_a_stale_pods_dind_volumes_with_its_volume():
     ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
 
     removed_count, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert removed_names == [name]
@@ -713,7 +713,7 @@ async def test_cleanup_runs_the_dind_orphan_sweep(monkeypatch):
     ssh, calls = _dind_volume_ssh_mock(all_volumes=[f"{_GONE}_docker"], dangling=[f"{_GONE}_docker"])
 
     await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, []), executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls
@@ -732,7 +732,7 @@ async def test_cleanup_runs_only_the_dind_sweeps_its_flags_need(monkeypatch, sto
     ssh, calls = _dind_volume_ssh_mock(all_volumes=[f"{_GONE}_docker"], dangling=[f"{_GONE}_docker"])
 
     await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, []), executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert (f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls) is orphan_sweep
