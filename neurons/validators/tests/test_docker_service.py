@@ -7547,7 +7547,7 @@ def test_gocryptfs_script_still_initialises_at_create_time():
         passfile_path="/tmp/pf",
     )
 
-    assert "gocryptfs -init /lium-cipher" in script
+    assert "gocryptfs -init /lium-cipher -scryptn 10 " in script
 
 
 @pytest.mark.asyncio
