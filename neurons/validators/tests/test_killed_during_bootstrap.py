@@ -467,9 +467,9 @@ async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, fr
 @pytest.mark.parametrize(
     "after", ["gone", "still-listed", "listing-failed", "rm-answer-lost-listing-failed", "rm-answer-lost-still-listed"]
 )
-async def test_a_replacement_filler_is_ours_once_its_rm_is_sent(svc, monkeypatch, after):
-    """An `rm` can finish after its answer is lost and after a listing still shows the ID, so neither the
-    answer nor the confirmation decides: the ID is ours from before its `rm` was sent."""
+async def test_a_replacement_filler_is_ours_only_once_its_rm_is_confirmed(svc, monkeypatch, after):
+    """The ID is ours only when its `rm` answered and the confirmation no longer lists it; a lost answer or a
+    failed listing records none."""
     monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
     replacement_id = _container_id("filler_swept-1", generation=1)
     listing = f"filler_swept-1 {replacement_id}\n" if after.endswith("still-listed") else ""
@@ -489,7 +489,7 @@ async def test_a_replacement_filler_is_ours_once_its_rm_is_sent(svc, monkeypatch
 
     await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
 
-    assert own_sweep_removals.sent_rm_for(replacement_id)
+    assert own_sweep_removals.sent_rm_for(replacement_id) == (after == "gone")
 
 
 @pytest.mark.asyncio
