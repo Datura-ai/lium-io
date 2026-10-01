@@ -6282,6 +6282,33 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
 
 
 @pytest.mark.asyncio
+async def test_create_container_streams_the_ssh_port_once_for_the_ui(docker_service, monkeypatch):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(22, 20020, 40022), (8888, 20021, 40023)], None)),
+    )
+    payload = _create_payload(str(uuid4()), encrypted=False).model_copy(update={"bootstrap_restore": None})
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    port_lines = [
+        call.args
+        for call in docker_service.stream_log.await_args_list
+        if call.args[0].startswith("Port mappings ready")
+    ]
+    assert port_lines == [("Port mappings ready: 22->40022", "success", "container_creation")]
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_keys_ride_in_the_volume_setup_exec(docker_service, monkeypatch):
     # without a restore between mount and keys, the keys go in with the mount: no second exec
     monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
