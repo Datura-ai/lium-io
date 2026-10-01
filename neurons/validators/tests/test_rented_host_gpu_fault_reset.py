@@ -40,6 +40,8 @@ from test_rented_machine_check import (
 from helpers import build_context_config, build_services, build_state
 
 EXECUTOR = "executor-123"
+# build_rented_data's owner of the rental
+RENTAL_OWNER = "test-miner"
 ENCRYPT_KEY = "test-encrypt-key"
 POD_ID = "pod-1"
 # repr() of the shipped scrape's NVMLError (machine_scrape.py): the class name and the nvml.h return code
@@ -107,12 +109,21 @@ def _redis_service() -> RedisService:
     return service
 
 
-async def _cycle(context_factory, service, *, scrape: SSHCommandResult, rented: bool = True, enabled=True):
+async def _cycle(
+    context_factory,
+    service,
+    *,
+    scrape: SSHCommandResult,
+    rented: bool = True,
+    enabled=True,
+    miner_hotkey: str = RENTAL_OWNER,
+):
     """One validation cycle as the service runs it: the record from Redis, the checks through the Pipeline, the
     outcome persisted by the ResultHandler."""
     verified = await service.get_verified_job_info(EXECUTOR)
     containers = [{"name": "tenant-123", "pod_id": POD_ID}] if rented else []
     ctx = context_factory(
+        miner_hotkey=miner_hotkey,
         services=build_services(
             ssh=SSHService(),
             score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
@@ -229,6 +240,13 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
     [
         pytest.param(DEAD_NVML, {"rented": False}, id="unrented-node"),
         pytest.param(DEAD_NVML, {"enabled": False}, id="flag-off"),
+        # miner A reports miner B's rented executor UUID with a sealed dead-NVML report from A's own host
+        pytest.param(DEAD_NVML, {"miner_hotkey": "another-miner"}, id="rental-owned-by-another-miner"),
+        pytest.param(
+            _scrape_result(stdout=NO_GPU_REPORT, exit_code=1),
+            {"miner_hotkey": "another-miner"},
+            id="no-gpu-on-a-rental-owned-by-another-miner",
+        ),
         # the scrape copies libnvidia-ml to a temp file before loading it; a full or read-only disk fails that write
         pytest.param(_scrape_result(stdout=_driver_report("NVMLError(12)"), exit_code=1), {}, id="library-not-loadable"),
         pytest.param(_scrape_result(stdout=_driver_report("NVMLError(18)"), exit_code=1), {}, id="driver-library-mismatch"),

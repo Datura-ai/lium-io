@@ -238,6 +238,10 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
     if not rented_executor or not rented_executor.pods:
         return {}
+    # The executor UUID is the miner's word and the backend resets by UUID alone, so a rental another miner
+    # owns must never be cleared on this miner's report.
+    if rented_executor.miner_hotkey != ctx.miner_hotkey:
+        return {}
     pod_ids = [pod.pod_id for pod in rented_executor.pods]
     evidence: dict[str, Any] = {
         "reason_code": failure.template.reason,
