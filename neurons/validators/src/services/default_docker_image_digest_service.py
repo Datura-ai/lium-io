@@ -15,6 +15,7 @@ pipeline context, so there is no shared mutable cache to keep in sync.
 from __future__ import annotations
 
 import logging
+import re
 
 import aiohttp
 
@@ -28,6 +29,13 @@ _MANIFEST_ACCEPT = (
 )
 _REGISTRY_AUTH_URL = "https://auth.docker.io/token"
 _REGISTRY_API = "https://registry-1.docker.io/v2"
+# `[docker.io/][namespace/]name:tag` with Docker Hub's own charset: a namespace has no dot, so a
+# registry host (`ghcr.io/app`, `localhost:5000/app`) never matches
+_DOCKER_HUB_TAGGED_REFERENCE = re.compile(
+    r"(?:docker\.io/)?((?:[a-z0-9]+(?:[_-][a-z0-9]+)*/)?[a-z0-9]+(?:[._-][a-z0-9]+)*)"
+    r":([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
+)
+_RENT_PATH_DIGEST_TIMEOUT_SECONDS = 10
 
 
 def _shared_config_image_refs() -> tuple[str, ...]:
@@ -117,6 +125,26 @@ async def fetch_default_image_digests() -> dict[str, str]:
             len(digests),
         )
     return digests
+
+
+async def fetch_docker_hub_digest(image: str) -> str | None:
+    """Registry digest of a Docker Hub `repository:tag` image; None for any other reference or error.
+
+    Used on the rent path: the connector answers in ~0.2 s what the host's daemon answers in ~2 s.
+    The renter writes the image name, so only a plain Docker Hub reference reaches the URL — any
+    other registry, a digest reference or an odd name stays with the host's daemon.
+    """
+    match = _DOCKER_HUB_TAGGED_REFERENCE.fullmatch(image)
+    if match is None:
+        return None
+    repository, tag = match.groups()
+    if repository.startswith("localhost/"):  # docker reads `localhost/` as a registry host
+        return None
+    if "/" not in repository:
+        repository = f"library/{repository}"
+    timeout = aiohttp.ClientTimeout(total=_RENT_PATH_DIGEST_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await fetch_registry_digest(session, f"{repository}:{tag}")
 
 
 async def fetch_executor_image_digest() -> str | None:
