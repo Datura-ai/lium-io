@@ -189,7 +189,7 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        self.subtensor_client = await SubtensorClient.initialize()
+        self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
 
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
