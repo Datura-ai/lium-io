@@ -858,7 +858,9 @@ class CollateralClient:
         for start in range(0, len(candidates), CHAIN_READ_BATCH):
             batch = candidates[start : start + CHAIN_READ_BATCH]
             try:
-                answers = await asyncio.gather(*(event.get_logs(block_hash=block["hash"]) for block in batch))
+                answers = await asyncio.gather(
+                    *(event.get_logs(block_hash=AsyncWeb3.to_hex(block["hash"])) for block in batch)
+                )
             except Exception:
                 return None
             for block, answer in zip(batch, answers):
