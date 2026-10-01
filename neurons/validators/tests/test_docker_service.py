@@ -2635,6 +2635,9 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
+    ssh_session = RecordingSSHConnectionManager(ssh_client)
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(return_value=ssh_session))
+
     result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
@@ -2642,16 +2645,117 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         private_key="encrypted",
     )
 
+    # the reply does not wait for the collector or the session close: both come after the return
+    lifecycle_spy.assert_not_awaited()
+    assert ssh_session.closed is False
+    await _drain_create_steps_after_reply(pod_id)
     lifecycle_spy.assert_awaited_once()
+    assert ssh_session.closed is True
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
     assert lifecycle_spy.await_args.kwargs["executor_info"] == executor_info
     assert lifecycle_spy.await_args.kwargs["default_extra"]["container_name"] == f"pod_{pod_id}"
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is False
-    assert inspector_step.duration is not None and inspector_step.duration >= 0
+    # its time is outside the create's window, so no duration rather than a fake 0
+    assert inspector_step.duration is None
+    assert all(p.name != ProfilerStepName.INSPECTOR_START for p in result.profilers)
+
+
+class RecordingSSHConnectionManager(DummySSHConnectionManager):
+    closed = False
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.closed = True
+
+
+async def _drain_create_steps_after_reply(pod_id: str) -> None:
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 5)
+
+
+@pytest.mark.asyncio
+async def test_create_steps_after_reply_failure_is_logged_with_the_pod(docker_service, monkeypatch, caplog):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_run_inspector_collector_lifecycle",
+        AsyncMock(side_effect=RuntimeError("host went away")),
+    )
+    payload = _create_payload(str(uuid4()), encrypted=False).model_copy(update={"bootstrap_restore": None})
+
+    with caplog.at_level("ERROR"):
+        result = await docker_service.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload, tdx_quote=None),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+        await _drain_create_steps_after_reply(payload.pod_id)
+
+    assert isinstance(result, ContainerCreated)
+    failures = [r for r in caplog.records if "Create steps after reply failed" in r.getMessage()]
+    assert len(failures) == 1
+    assert str(failures[0].exc_info[1]) == "host went away"
+    assert failures[0].msg.extra["pod_id"] == payload.pod_id
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_the_create_steps_after_reply_before_its_teardown(
+    docker_service, retry_ssh_mock, monkeypatch
+):
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    pod_id = str(uuid4())
+    events: list[str] = []
+
+    async def inspector_start_after_reply() -> None:
+        await asyncio.sleep(0.05)
+        events.append("create steps after reply done")
+
+    def connect_for_delete(**_):
+        events.append("delete connected")
+        return DummySSHConnectionManager(AsyncMock(run=AsyncMock(return_value=_make_ssh_command_result())))
+
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=connect_for_delete))
+    docker_service_module.create_steps_after_reply.start(pod_id, inspector_start_after_reply())
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name=f"pod_{pod_id}",
+    )
+
+    await docker_service.delete_container(
+        payload=payload,
+        executor_info=_executor_info_for(_create_payload(pod_id, encrypted=False), tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert events[:2] == ["create steps after reply done", "delete connected"]
+
+
+@pytest.mark.asyncio
+async def test_create_steps_after_reply_past_the_timeout_are_cancelled_and_closed():
+    pod_id = str(uuid4())
+    closed = asyncio.Event()
+
+    async def hung_inspector_start() -> None:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            closed.set()
+
+    docker_service_module.create_steps_after_reply.start(pod_id, hung_inspector_start())
+
+    finished = await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01)
+
+    assert finished is False
+    assert closed.is_set()
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01) is True
 
 
 @pytest.mark.asyncio
@@ -2700,9 +2804,10 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
         private_key="encrypted",
     )
 
+    await _drain_create_steps_after_reply(payload.pod_id)
     lifecycle_spy.assert_not_awaited()
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is True
 
@@ -2874,10 +2979,11 @@ async def test_create_filler_starts_inspector_collector(docker_service, monkeypa
         private_key="encrypted",
     )
 
+    await _drain_create_steps_after_reply(payload.pod_id)
     lifecycle_spy.assert_awaited_once()
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is False
 

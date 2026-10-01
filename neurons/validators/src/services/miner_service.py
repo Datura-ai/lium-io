@@ -4,7 +4,7 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -53,6 +53,7 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
     WorkloadKind,
+    now_ms,
 )
 from tenacity import RetryError
 
@@ -61,7 +62,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, inflight_creates
+from services.docker_service import DockerService, create_steps_after_reply, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
@@ -2378,6 +2379,17 @@ class MinerService:
             )
             return False
 
+    async def _log_ssh_key_removal_after_reply(self, remove_ssh_key: Awaitable[bool], log_extra: dict) -> None:
+        # the removal logs its own failure; this line puts it after the reply in the log
+        started_ms = now_ms()
+        removed = await remove_ssh_key
+        logger.info(
+            _m(
+                "Validator SSH key removal after reply finished",
+                extra=get_extra_info({**log_extra, "removed": removed, "duration_ms": now_ms() - started_ms}),
+            )
+        )
+
     def _serialize_request(self, request) -> dict:
         """Serialize a Pydantic request model to dict for JSON serialization.
         
@@ -2863,7 +2875,7 @@ class MinerService:
 
                 # Remove SSH key after operation only if it was accepted
                 if ssh_key_accepted:
-                    await self._remove_ssh_key_via_rest(
+                    remove_ssh_key = self._remove_ssh_key_via_rest(
                         base_url=base_url,
                         my_key=my_key,
                         public_key=public_key,
@@ -2871,6 +2883,13 @@ class MinerService:
                         executor_id=payload.executor_id,
                         log_extra=default_extra,
                     )
+                    if isinstance(payload, ContainerCreateRequest):
+                        # DAH-3980: a create's reply does not wait for the miner
+                        create_steps_after_reply.start(
+                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                        )
+                    else:
+                        await remove_ssh_key
 
                 return result
 
