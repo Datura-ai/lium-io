@@ -6,6 +6,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 
@@ -2642,16 +2643,67 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         private_key="encrypted",
     )
 
+    # the reply does not wait for the collector: it starts after the create returned
+    lifecycle_spy.assert_not_awaited()
+    await _drain_after_reply_tasks()
     lifecycle_spy.assert_awaited_once()
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
     assert lifecycle_spy.await_args.kwargs["executor_info"] == executor_info
     assert lifecycle_spy.await_args.kwargs["default_extra"]["container_name"] == f"pod_{pod_id}"
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is False
-    assert inspector_step.duration is not None and inspector_step.duration >= 0
+    # its time is not in the create's window, so no duration rather than a fake 0
+    assert inspector_step.duration is None
+    assert all(p.name != ProfilerStepName.INSPECTOR_START for p in result.profilers)
+
+
+@pytest.mark.asyncio
+async def test_finish_stream_logs_flushes_the_last_batch_without_waiting_a_tick(docker_service):
+    docker_service.redis_service.publish = AsyncMock()
+    docker_service.log_task = asyncio.create_task(
+        docker_service.handle_stream_logs(miner_hotkey="m", executor_id="e", pod_id="p")
+    )
+    await asyncio.sleep(0)
+    await docker_service.stream_log("keys in", "success", "container_creation")
+
+    started = time.monotonic()
+    await docker_service.finish_stream_logs()
+
+    assert time.monotonic() - started < docker_service_module.LOG_STREAM_INTERVAL / 2
+    published_logs = docker_service.redis_service.publish.await_args.args[1]["logs"]
+    assert [entry["log_text"] for entry in published_logs] == ["keys in"]
+
+
+async def _drain_after_reply_tasks() -> None:
+    await asyncio.gather(*list(docker_service_module._AFTER_REPLY_TASKS))
+
+
+@pytest.mark.asyncio
+async def test_create_after_reply_failure_is_logged(docker_service, monkeypatch, caplog):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_run_inspector_collector_lifecycle",
+        AsyncMock(side_effect=RuntimeError("host went away")),
+    )
+    payload = _create_payload(str(uuid4()), encrypted=False).model_copy(update={"bootstrap_restore": None})
+
+    with caplog.at_level("ERROR"):
+        result = await docker_service.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload, tdx_quote=None),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+        await _drain_after_reply_tasks()
+
+    assert isinstance(result, ContainerCreated)
+    failures = [r for r in caplog.records if "Create steps after reply failed" in r.getMessage()]
+    assert failures and str(failures[0].exc_info[1]) == "host went away"
 
 
 @pytest.mark.asyncio
@@ -2700,9 +2752,10 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
         private_key="encrypted",
     )
 
+    await _drain_after_reply_tasks()
     lifecycle_spy.assert_not_awaited()
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is True
 
@@ -2874,10 +2927,11 @@ async def test_create_filler_starts_inspector_collector(docker_service, monkeypa
         private_key="encrypted",
     )
 
+    await _drain_after_reply_tasks()
     lifecycle_spy.assert_awaited_once()
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
     )
     assert inspector_step.skipped is False
 

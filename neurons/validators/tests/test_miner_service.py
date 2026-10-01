@@ -11,6 +11,7 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from payload_models.payloads import (
     CustomOptions,
     PayloadPortMapping,
 )
+from services import docker_service as docker_service_module
 from services.miner_service import MinerService
 
 
@@ -144,6 +146,23 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
     assert order == ["lock", "create", "unlock"]
     # No pre-flag port-check removal in miner_service anymore.
     wait_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, miner_service):
+    executor_id = str(uuid4())
+    payload = _make_create_payload(executor_id)
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    created = Mock()
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=created))
+    remove_key = mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", AsyncMock())
+
+    result = await miner_service._handle_container(payload)
+
+    assert result is created
+    remove_key.assert_not_awaited()
+    await asyncio.gather(*list(docker_service_module._AFTER_REPLY_TASKS))
+    remove_key.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

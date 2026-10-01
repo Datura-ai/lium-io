@@ -555,6 +555,9 @@ class ProfilerStepName(str, enum.Enum):
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
+    # the collector now starts after the reply: this row has no duration, the log line
+    # "Create step after reply finished" carries it
+    INSPECTOR_START_AFTER_REPLY = "Inspector collector start runs after the reply"
     FINISHED_IN_SUBNET = "Finished in subnet."
     # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
     # appends these to its own profiler and passes the pre-dispatch ones in
