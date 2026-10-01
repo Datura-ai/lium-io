@@ -24,6 +24,7 @@ import inspect
 import os
 import stat
 import subprocess
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -54,6 +55,7 @@ from services.prerun_host_probe import (
     prerun_host_probe_command,
 )
 from test_deploy_optimizations import (
+    _docker_client,
     _patch_happy,
     _payload as _deploy_payload,
     _run as _run_create_container,
@@ -978,6 +980,68 @@ async def test_create_container_pearl_filler_does_not_ask_for_power(svc_fixture,
     result = await _run_create_container(svc, payload)
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert svc.probe_prerun_host.await_args.kwargs["with_power"] is False
+
+
+def _wire_early_probes(svc, monkeypatch, *, image_present: bool) -> list[int]:
+    """Both probes on; returns how many host probes had started when the image inspect answered."""
+    monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
+    monkeypatch.setattr(settings, "RENTAL_VOLUME_FAST_PATH_ENABLED", True)
+    _wire(svc, monkeypatch, _deploy_ssh_client(inspect_exit=0 if image_present else 1), probe_result=_probe())
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(return_value=False))
+    docker_client = _docker_client(svc)
+    inspect_image = docker_client.local_image_repo_digests
+    host_probes_started_at_inspect: list[int] = []
+
+    async def slow_inspect(*, image):
+        await asyncio.sleep(0.01)
+        host_probes_started_at_inspect.append(svc.probe_prerun_host.await_count)
+        return await inspect_image(image=image)
+
+    docker_client.local_image_repo_digests = slow_inspect
+    return host_probes_started_at_inspect
+
+
+@pytest.mark.asyncio
+async def test_cached_create_runs_each_host_probe_once_beside_the_image_inspect(svc_fixture, monkeypatch):
+    """DAH-3980: on the cached path the probes cost no round trip of their own."""
+    svc = svc_fixture
+    host_probes_started_at_inspect = _wire_early_probes(svc, monkeypatch, image_present=True)
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert host_probes_started_at_inspect == [1]
+    svc.probe_prerun_host.assert_awaited_once()
+    svc.probe_volume_host.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pulled_image_probes_the_host_again_after_the_pull(svc_fixture, monkeypatch):
+    """The early label section read no image, and a pull can take minutes: both probes run again."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=False)
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert _docker_client(svc).pulled_images == [_IMAGE]
+    assert svc.probe_prerun_host.await_count == 2
+    assert svc.probe_volume_host.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cleanup_that_removed_a_volume_measures_the_volume_facts_again(svc_fixture, monkeypatch):
+    """df and the volume list read before the removal would size the new volume on stale facts."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    svc.probe_prerun_host.assert_awaited_once()
+    assert svc.probe_volume_host.await_count == 2
 
 
 @pytest.fixture

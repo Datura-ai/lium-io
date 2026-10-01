@@ -3030,8 +3030,9 @@ class DockerService:
         payload: ContainerCreateRequest,
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
-    ) -> None:
-        """Free the DPHN filler cache when a customer rental needs the disk it occupies.
+    ) -> bool:
+        """Free the DPHN filler cache when a customer rental needs the disk it occupies; True when
+        volumes may have been removed.
 
         DAH-2475: the cache is filler property worth ~37 GB. Once a customer rents the node the disk
         belongs to the renter, so if what they asked for does not fit next to the cache, the cache
@@ -3043,14 +3044,14 @@ class DockerService:
         failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
-            return
+            return False
         requested_gb: int | None = payload.volume_limit_gb
         try:
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
                 ssh_client, set(), default_extra, host_probe=host_probe
             )
             if not cache_volumes:
-                return
+                return False
 
             # The backend sends volume_limit_gb=None for every executor whose docker lacks
             # --storage-opt support (calc_volume_storage_limit), so "no limit" does NOT mean "no disk
@@ -3062,7 +3063,7 @@ class DockerService:
                 free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 free_gb = free_bytes / (1024**3)
                 if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
-                    return
+                    return False
 
             logger.info(
                 _m(
@@ -3078,6 +3079,7 @@ class DockerService:
             await retry_ssh_command(
                 ssh_client, DockerCommand.volume_remove(*cache_volumes), "reclaim_dphn_cache_for_rental"
             )
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3088,6 +3090,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+            return True  # the removal may have run before the failure
 
     async def select_affordable_cache_volumes(
         self,
@@ -5922,6 +5925,43 @@ class DockerService:
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
 
+                # DAH-3980: the host probes do not read the image; started here they run beside the
+                # image inspect. Their answers are used only when no pull or build ran in between
+                # (the image label, and listings minutes old), and the volume facts only when the
+                # cleanup below changed nothing; otherwise each probe runs again at its own step.
+                early_probes_allowed = not is_custom_build and not local_volume
+                measures_host = self.measures_host_for_volume_sizing(payload)
+                wants_volume_probe = settings.RENTAL_VOLUME_FAST_PATH_ENABLED and bool(
+                    measures_host or payload.volume_limit_gb
+                )
+                probe_with_power = not (
+                    payload.workload_kind == WorkloadKind.FILLER and bool(payload.gpu_power_limits)
+                )
+                early_host_probe = (
+                    asyncio.create_task(
+                        self.probe_prerun_host(
+                            ssh_client,
+                            docker_image=payload.docker_image,
+                            with_power=probe_with_power,
+                            log_extra=default_extra,
+                        )
+                    )
+                    if early_probes_allowed and settings.RENTAL_PRERUN_HOST_PROBE_ENABLED
+                    else None
+                )
+                early_volume_probe = (
+                    asyncio.create_task(
+                        self.probe_volume_host(
+                            ssh_client, with_df=measures_host, log_extra=default_extra
+                        )
+                    )
+                    if early_probes_allowed and wants_volume_probe
+                    else None
+                )
+                for early_probe in (early_host_probe, early_volume_probe):
+                    if early_probe is not None:
+                        connections.callback(early_probe.cancel)
+
                 # set real-time logging
                 self.log_task = asyncio.create_task(
                     self.handle_stream_logs(
@@ -6237,16 +6277,17 @@ class DockerService:
                 host_probe: PrerunHostProbe | None = None
                 if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
                     current_step = "prerun_host_probe"
-                    host_probe = await self.probe_prerun_host(
-                        ssh_client,
-                        docker_image=payload.docker_image,
-                        # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
-                        # (apply_filler_gpu_power_limits) and never reads the probe's power state.
-                        with_power=not (
-                            payload.workload_kind == WorkloadKind.FILLER and bool(payload.gpu_power_limits)
-                        ),
-                        log_extra=default_extra,
-                    )
+                    if early_host_probe is not None and image_present:
+                        host_probe = await early_host_probe
+                    else:
+                        host_probe = await self.probe_prerun_host(
+                            ssh_client,
+                            docker_image=payload.docker_image,
+                            # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
+                            # (apply_filler_gpu_power_limits) and never reads the probe's power state.
+                            with_power=probe_with_power,
+                            log_extra=default_extra,
+                        )
                 # The probe is a snapshot. Once a step below removes a container or a volume, the
                 # container/volume listings are stale (a removed volume would still read as present,
                 # a removed container as still mounting its volume), so the later sweeps go back to
@@ -6313,11 +6354,17 @@ class DockerService:
                     host_probe=docker_listing_probe,
                 )
 
-                await self.reclaim_dphn_cache_for_rental(
+                reclaimed_cache_volumes = await self.reclaim_dphn_cache_for_rental(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
                     host_probe=docker_listing_probe,
+                )
+                cleanup_changed_host = bool(
+                    removed_containers
+                    or removed_vloopback_volumes
+                    or swept_cache_volumes
+                    or reclaimed_cache_volumes
                 )
 
                 # Add profiler for docker volume creation
@@ -6402,17 +6449,19 @@ class DockerService:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
                     volume_probe: VolumeHostProbe | None = None
-                    measures_host = self.measures_host_for_volume_sizing(payload)
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
-                    if settings.RENTAL_VOLUME_FAST_PATH_ENABLED and (measures_host or payload.volume_limit_gb):
+                    if wants_volume_probe:
                         current_step = "volume_host_probe"
-                        volume_probe = await self.probe_volume_host(
-                            ssh_client,
-                            with_df=measures_host,
-                            log_extra=default_extra,
-                        )
+                        if early_volume_probe is not None and image_present and not cleanup_changed_host:
+                            volume_probe = await early_volume_probe
+                        else:
+                            volume_probe = await self.probe_volume_host(
+                                ssh_client,
+                                with_df=measures_host,
+                                log_extra=default_extra,
+                            )
 
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
