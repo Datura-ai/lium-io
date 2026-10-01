@@ -285,10 +285,13 @@ class CollateralClient:
         balance = await self.w3.eth.get_balance(AsyncWeb3.to_checksum_address(address))
         return AsyncWeb3.from_wei(balance, "ether")
 
-    async def get_executor_collateral(self, executor_uuid: str):
-        amount = await self.contract.functions.collaterals(
-            executor_uuid_bytes(executor_uuid)
-        ).call()
+    async def get_executor_collateral(self, executor_uuid: str, block_hash=None):
+        """The executor's collateral in TAO, at the block named by `block_hash` when one is given, else at latest."""
+        function = self.contract.functions.collaterals(executor_uuid_bytes(executor_uuid))
+        if block_hash is None:
+            amount = await function.call()
+        else:
+            amount = await self._call_at_block_hash(function, block_hash)
         return AsyncWeb3.from_wei(amount, "ether")
 
     async def get_reclaim_request(self, reclaim_request_id: int, block_hash=None) -> tuple:
@@ -300,6 +303,9 @@ class CollateralClient:
 
     async def finalized_block_hash(self):
         return (await self.w3.eth.get_block("finalized"))["hash"]
+
+    async def latest_block_hash(self):
+        return (await self.w3.eth.get_block("latest"))["hash"]
 
     async def _pinned_chain_id(self) -> int:
         if self.miner_account is None:
@@ -876,8 +882,8 @@ class CollateralClient:
         """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS finalized blocks.
 
         A load-balanced RPC can answer any read from a backend on another fork or one that lags behind, so the
-        blocks are kept only when they link by parent hashes to the finalized block, and their logs are read by
-        block hash (see `_reclaim_events_at`). Each request's state is read at the finalized block's hash and must
+        blocks are kept only when they link by parent hashes to the finalized block, and their logs are read from
+        the receipts of their transactions (see `_reclaim_events_at`). Each request's state is read at the finalized block's hash and must
         match its log. A request started after the finalized block is listed once its block is final."""
         for _ in range(RECLAIM_LIST_ATTEMPTS):
             finalized = await self.w3.eth.get_block("finalized")
@@ -890,23 +896,27 @@ class CollateralClient:
         )
 
     async def _reclaim_at_block_hash(self, reclaim_request_id: int, block_hash) -> tuple:
-        """reclaims(id) at a block named by its hash. A contract function's call(block_identifier=<hash>) looks the
-        hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash."""
-        function = self.contract.functions.reclaims(reclaim_request_id)
+        return await self._call_at_block_hash(self.contract.functions.reclaims(reclaim_request_id), block_hash)
+
+    async def _call_at_block_hash(self, function, block_hash):
+        """A view function's result at a block named by its hash. A contract function's call(block_identifier=<hash>)
+        looks the hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash."""
         result = await self.w3.eth.call(
             {"to": self.contract_address, "data": function._encode_transaction_data()},
             block_identifier={"blockHash": AsyncWeb3.to_hex(block_hash)},
         )
         outputs = [output["type"] for output in function.abi["outputs"]]
-        return tuple(self.w3.codec.decode(outputs, result))
+        decoded = self.w3.codec.decode(outputs, result)
+        return decoded[0] if len(outputs) == 1 else tuple(decoded)
 
     async def _reclaim_events_at(self, finalized) -> list[ReclaimRequest] | None:
         """The open requests at the finalized block, or None when a block or log is not on its chain, or a block's
         logs are answered only in part.
 
         A range eth_getLogs can reach a lagging backend whose empty answer looks like no request. So every log of
-        each block on the finalized chain whose logs bloom may hold this contract's ReclaimProcessStarted is read by
-        block hash, and the answer is kept only when those logs make up the header's bloom exactly."""
+        each block on the finalized chain whose logs bloom may hold this contract's ReclaimProcessStarted is read
+        from the receipts of all of that block's transactions, and kept only when every receipt names that block and
+        their logs make up the header's bloom exactly."""
         top = finalized["number"]
         lowest = max(top - RECLAIM_LOOKBACK_BLOCKS, 0)
         event = self.contract.events.ReclaimProcessStarted()
@@ -917,23 +927,40 @@ class CollateralClient:
             if chain is None or (min(chain) > lowest and top - min(chain) < KEPT_BLOCKS_MIN):
                 return None
             candidates = [block for block in chain.values() if bloom_may_hold(block.get("logsBloom"), address, topic)]
+            # Blooms OR the bits of every address and topic, so an answer that makes up the header's bloom can still
+            # leave out a log whose bits other logs set. Each candidate block's logs come from the receipt of every
+            # transaction the block names, and a missing receipt makes the list indeterminate.
+            receipts_of = []
+            for block in candidates:
+                transactions = block.get("transactions")
+                if transactions is None:
+                    return None
+                receipts_of.extend((block, hash_text(tx)) for tx in transactions)
+            logs_of = {hash_text(block["hash"]): [] for block in candidates}
+            for start in range(0, len(receipts_of), CHAIN_READ_BATCH):
+                batch = receipts_of[start : start + CHAIN_READ_BATCH]
+                answers = await self._read_together(
+                    *(("eth_getTransactionReceipt", ["0x" + tx]) for _, tx in batch)
+                )
+                for (block, tx), receipt in zip(batch, answers):
+                    if (
+                        not isinstance(receipt, dict)
+                        or not same_hash(receipt.get("transactionHash"), tx)
+                        or not same_hash(receipt.get("blockHash"), block["hash"])
+                    ):
+                        return None
+                    logs_of[hash_text(block["hash"])].extend(receipt.get("logs") or [])
             raw_logs = []
-            for start in range(0, len(candidates), CHAIN_READ_BATCH):
-                batch = candidates[start : start + CHAIN_READ_BATCH]
-                filters = [{"blockHash": AsyncWeb3.to_hex(hexstr=hash_text(block["hash"]))} for block in batch]
-                answers = await self._read_together(*(("eth_getLogs", [log_filter]) for log_filter in filters))
-                for block, answer in zip(batch, answers):
-                    if any(log.get("removed") or not same_hash(log["blockHash"], block["hash"]) for log in answer):
-                        return None
-                    # A Frontier node answers [] for a block hash it knows but whose receipts it cannot load. The
-                    # header's bloom is made of every log in the block, so an answer that makes it up is complete,
-                    # including one that holds another contract's event and none of this one's.
-                    if logs_bloom(answer) != hash_text(block.get("logsBloom")):
-                        return None
-                    raw_logs.extend(
-                        log for log in answer
-                        if same_hash(log["address"], address) and log["topics"] and same_hash(log["topics"][0], topic)
-                    )
+            for block in candidates:
+                answer = logs_of[hash_text(block["hash"])]
+                if any(log.get("removed") or not same_hash(log["blockHash"], block["hash"]) for log in answer):
+                    return None
+                if logs_bloom(answer) != hash_text(block.get("logsBloom")):
+                    return None
+                raw_logs.extend(
+                    log for log in answer
+                    if same_hash(log["address"], address) and log["topics"] and same_hash(log["topics"][0], topic)
+                )
         except RpcReadError as error:
             raise CollateralTransactionError(
                 f"The RPC did not answer the reclaim request list ({error}); run this again, or set "

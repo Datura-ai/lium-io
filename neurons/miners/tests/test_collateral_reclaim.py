@@ -18,6 +18,7 @@ EXECUTOR = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
 # A random well-formed key; it signs nothing in these tests.
 MINER_KEY = "0x" + "11" * 32
 FINALIZED_HASH = "0x" + "f1" * 32
+LATEST_HASH = "0x" + "1a" * 32
 
 
 def test_h160_to_ss58_maps_an_evm_address_to_its_mirror_account():
@@ -75,11 +76,19 @@ def chain(monkeypatch):
     state = SimpleNamespace(
         collateral={}, reclaims={}, reads=[], reclaims_at={}, reclaim_blocks=[],
         finalized_hash=FINALIZED_HASH, after_reclaim_read=lambda: None,
+        collateral_at={}, collateral_blocks=[], latest_hash=LATEST_HASH, after_collateral_read=lambda: None,
     )
 
-    async def get_executor_collateral(self, executor_uuid):
+    async def get_executor_collateral(self, executor_uuid, block_hash=None):
         state.reads.append(self.contract_address)
-        return Decimal(state.collateral.get(self.contract_address, 0))
+        state.collateral_blocks.append(block_hash)
+        collateral = state.collateral if block_hash is None else state.collateral_at.get(block_hash, state.collateral)
+        found = Decimal(collateral.get(self.contract_address, 0))
+        state.after_collateral_read()
+        return found
+
+    async def latest_block_hash(self):
+        return state.latest_hash
 
     async def get_reclaim_request(self, reclaim_request_id, block_hash=None):
         state.reads.append(self.contract_address)
@@ -96,6 +105,7 @@ def chain(monkeypatch):
     monkeypatch.setattr(CollateralClient, "get_executor_collateral", get_executor_collateral)
     monkeypatch.setattr(CollateralClient, "get_reclaim_request", get_reclaim_request)
     monkeypatch.setattr(CollateralClient, "finalized_block_hash", finalized_block_hash)
+    monkeypatch.setattr(CollateralClient, "latest_block_hash", latest_block_hash)
     # the earlier-send check still runs, lock and temp record included, without asking finney for its chain ID
     monkeypatch.setattr(CollateralClient, "_pinned_chain_id", AsyncMock(return_value=964))
     return state
@@ -278,3 +288,30 @@ async def test_remove_executor_checks_every_contract_version(chain, holder, remo
     )
     assert await service.remove_executor("192.0.2.10", 8001) is removed
     assert bool(deleted) is removed
+
+
+async def test_remove_executor_reads_every_contract_at_one_block(chain):
+    """Review of e6f4b88: the old contract holds 0.01 TAO and the current one none. After the first read a deposit
+    lands on the current contract and the old reclaim finalizes, so reads at latest one after another see zero on
+    both and the executor's record is deleted while the current contract holds its collateral."""
+    import logging
+
+    from core.utils import versions_holding_collateral
+    from services.cli_service import CliService
+
+    chain.collateral = {OLD_CONTRACT: "0.01"}
+    chain.collateral_at[LATEST_HASH] = {OLD_CONTRACT: "0.01"}
+    chain.after_collateral_read = lambda: chain.collateral.update({CONTRACT: "0.01", OLD_CONTRACT: "0"})
+
+    assert await versions_holding_collateral(EXECUTOR) == ["1.0.0"]
+    assert chain.collateral_blocks == [LATEST_HASH, LATEST_HASH]
+
+    deleted = []
+    service = CliService.__new__(CliService)
+    service.logger = logging.getLogger("test")
+    service.executor_dao = SimpleNamespace(
+        find_one=lambda address, port: SimpleNamespace(uuid=UUID(EXECUTOR)),
+        delete_by_address_port=lambda address, port: deleted.append((address, port)),
+    )
+    assert await service.remove_executor("192.0.2.10", 8001) is False
+    assert deleted == []

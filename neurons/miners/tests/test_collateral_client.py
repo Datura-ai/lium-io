@@ -49,6 +49,10 @@ def hex_encode(types, values) -> str:
 SENDS = {selector("finalizeReclaim(uint256)"), selector("reclaimCollateral(bytes16,string,bytes16)")}
 
 
+def listed_tx(block_hash: str, tx_hash: str) -> str:
+    return "0x" + AsyncWeb3.keccak(hexstr=block_hash + tx_hash.removeprefix("0x")).hex().removeprefix("0x")
+
+
 def bloom_of(logs) -> str:
     """The 2048-bit logs bloom of a block holding `logs`: three bits from the keccak of each address and topic."""
     bits = 0
@@ -115,10 +119,12 @@ class FakeProvider(AsyncBaseProvider):
         # blocks below this number are pruned: a read of one answers null
         self.oldest_kept = 0
         # who answers each next batch: "b" a backend on fork B, "lagging" one without these blocks, "429" none,
-        # "logs-lagging" a gateway that sends the batch's blocks to A and its logs to a lagging backend,
-        # "logs-empty" one that sends the logs to a backend that knows each block hash and answers it with no logs
+        # "logs-lagging" a gateway that sends the batch's blocks to A and its receipts to a lagging backend,
+        # "logs-empty" one that sends the receipts to a backend that knows each block but answers each with null
         self.batch_backends = []
         self.fork_b_hash = FORK_B
+        # transactions of a listed block whose receipt is answered with null, as by a partly synced backend
+        self.withheld_receipts = set()
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -133,19 +139,18 @@ class FakeProvider(AsyncBaseProvider):
         answers = []
         for i, (method, params) in enumerate(requests):
             logs_elsewhere = backend in ("logs-lagging", "logs-empty")
-            if backend == "a" or params[0] == "finalized" or (logs_elsewhere and method != "eth_getLogs"):
+            if backend == "a" or params[0] == "finalized" or (logs_elsewhere and method != "eth_getTransactionReceipt"):
                 answer = await self.make_request(method, params)
             elif backend == "logs-empty":
                 self.requests.append((method, params))
-                answer = {"result": []}
+                answer = {"result": None}
             elif backend == "logs-lagging":
                 self.requests.append((method, params))
-                unknown = {"error": {"code": -32000, "message": "unknown block"}}
-                answer = unknown if "blockHash" in params[0] else {"result": []}
+                answer = {"error": {"code": -32000, "message": "unknown block"}}
             else:
                 self.requests.append((method, params))
                 fork_b = {"eth_getLogs": [fork_b_log()], "eth_getBlockByNumber": {**self.block(16), "hash": self.fork_b_hash}}
-                answer = {"result": fork_b[method] if backend == "b" else ([] if method == "eth_getLogs" else None)}
+                answer = {"result": fork_b.get(method) if backend == "b" else ([] if method == "eth_getLogs" else None)}
             answers.append({**answer, "id": i})
         return answers[::-1]
 
@@ -162,6 +167,21 @@ class FakeProvider(AsyncBaseProvider):
             "hash": block_hash,
             "parentHash": self.chain_hash(number - 1),
             "logsBloom": bloom_of(logs),
+            "transactions": list(dict.fromkeys(listed_tx(block_hash, log["transactionHash"]) for log in logs)),
+        }
+
+    def listed_receipt(self, tx_hash: str) -> dict | None:
+        """The receipt of a transaction a listed block names: its logs are the fake logs of that block and
+        transaction. A log's own transactionHash is TX_HASH, the send's, so a listed block names another hash."""
+        logs = [log for log in self.logs if listed_tx(log["blockHash"], log["transactionHash"]) == tx_hash]
+        if not logs:
+            return None
+        return {
+            "transactionHash": tx_hash,
+            "blockHash": logs[0]["blockHash"],
+            "blockNumber": logs[0]["blockNumber"],
+            "status": "0x1",
+            "logs": logs,
         }
 
     def fork_block(self, number: int) -> dict:
@@ -239,6 +259,9 @@ class FakeProvider(AsyncBaseProvider):
                 "type": "0x0",
             },
         }
+        if method == "eth_getTransactionReceipt" and self.listed_receipt(params[0]) is not None:
+            withheld = params[0] in self.withheld_receipts
+            return {"jsonrpc": "2.0", "id": 1, "result": None if withheld else self.listed_receipt(params[0])}
         if method == "eth_getTransactionReceipt" and params[0] in self.receipts_of_another:
             return {"jsonrpc": "2.0", "id": 1, "result": results[method]}
         if method == "eth_getTransactionReceipt" and params[0] != TX_HASH:
@@ -1013,7 +1036,7 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
 
 FORK_B = "0x" + "0b" * 32
-# the batches of one listing: the headers below the finalized block, then the logs of the one block with a log
+# the batches of one listing: the headers below the finalized block, then the receipts of the one block with a log
 LIST_BATCHES = collateral_module.RECLAIM_LOOKBACK_BLOCKS // collateral_module.CHAIN_READ_BATCH + 1
 
 
@@ -1035,8 +1058,15 @@ def fork_b_log(url="https://fork-b/reclaim"):
         (["logs-lagging"] * LIST_BATCHES, 10**17, None),
         # review of 12d1599: the logs reach a backend that knows the block's hash but answers it with no logs
         (["logs-empty"] * LIST_BATCHES * collateral_module.RECLAIM_LIST_ATTEMPTS, 10**17, None),
+        # review of e6f4b88: a partly synced backend leaves out the one transaction holding this contract's started
+        # log, and the block's other logs (this contract's Reclaimed, the old contract's started log with the same
+        # indexed values) set every bloom bit the left-out log sets
+        ("partial-covered-bloom", 10**17, None),
     ],
-    ids=["b-then-a", "lagging-then-a", "b-every-time", "log-and-state-disagree", "split-empty-logs", "known-block-no-logs"],
+    ids=[
+        "b-then-a", "lagging-then-a", "b-every-time", "log-and-state-disagree", "split-empty-logs",
+        "known-block-no-logs", "partial-covered-bloom",
+    ],
 )
 async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(backends, amount, urls):
     """A load-balanced RPC answers the finalized block from backend A and other reads from a lagging backend B or
@@ -1044,9 +1074,18 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
     error."""
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim(amount)})
     provider.block_number = provider.finalized_number = 5000
-    provider.logs = [
-        {**started_log(url="https://fork-a/reclaim"), "blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}
-    ]
+    at = {"blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}
+    started = {**started_log(url="https://fork-a/reclaim"), **at}
+    provider.logs = [started]
+    if backends == "partial-covered-bloom":
+        others = [
+            {**reclaimed_log(), **at, "transactionHash": "0x" + "02" * 32, "logIndex": "0x1"},
+            {**started_log(), **at, "address": OLD_CONTRACT, "transactionHash": "0x" + "03" * 32, "logIndex": "0x2"},
+        ]
+        provider.logs = [started, *others]
+        assert collateral_module.logs_bloom(others) == collateral_module.logs_bloom(provider.logs)
+        provider.withheld_receipts = {listed_tx(at["blockHash"], started["transactionHash"])}
+        backends = []
     provider.batch_backends = list(backends)
 
     if urls is None:
@@ -1102,7 +1141,8 @@ async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_block
     methods = [method for method, _ in provider.requests]
     header_batches = -(-(5000 - provider.oldest_kept + 1) // collateral_module.CHAIN_READ_BATCH)
     assert methods.count("eth_getBlockByNumber") == 1 + header_batches * collateral_module.CHAIN_READ_BATCH
-    assert methods.count("eth_getLogs") == methods.count("eth_call") == 1
+    assert methods.count("eth_getTransactionReceipt") == methods.count("eth_call") == 1
+    assert "eth_getLogs" not in methods
     assert "no longer keeps block 4000" in caplog.text
 
     provider.batch_backends = ["429"] * 4

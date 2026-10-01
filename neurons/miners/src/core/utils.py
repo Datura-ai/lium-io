@@ -115,10 +115,18 @@ def get_collateral_contract(
 
 
 async def versions_holding_collateral(executor_uuid: str) -> list[str]:
-    """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor."""
+    """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor.
+
+    Every contract is read at one latest block named by its hash. Reads at `latest` one after another can straddle
+    a deposit landing on one contract and a reclaim finalizing on the other, and report neither; removing the
+    executor then drops the record of collateral that is still held. Latest, not finalized: a deposit that is mined
+    but not yet final must still count."""
+    block_hash = await get_collateral_contract().latest_block_hash()
     versions = []
     for version in settings.CONTRACT_VERSIONS:
-        collateral = await get_collateral_contract(version=version).get_executor_collateral(executor_uuid)
+        collateral = await get_collateral_contract(version=version).get_executor_collateral(
+            executor_uuid, block_hash=block_hash
+        )
         if collateral > 0:
             versions.append(version)
     return versions
