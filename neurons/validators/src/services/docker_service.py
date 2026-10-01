@@ -32,6 +32,7 @@ from core.docker_utils import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
+    PARALLEL_PROFILER_STEP_NAMES,
     AddSshPublicKeyRequest,
     BootstrapRestoreSpec,
     CacheVolume,
@@ -1240,6 +1241,15 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
         and in_cvm
         and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
     )
+
+
+async def _with_own_duration(
+    operation: Awaitable[Any], step_name: ProfilerStepName
+) -> tuple[Any, ProfilerStep]:
+    # an early task's own start->end; the caller records it only if it uses the answer
+    started_ms = now_ms()
+    answer = await operation
+    return answer, ProfilerStep.since(step_name, started_ms)
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -5968,18 +5978,24 @@ class DockerService:
                     return
                 if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
                     early_host_probe = asyncio.create_task(
-                        self.probe_prerun_host(
-                            connected_ssh_client,
-                            docker_image=payload.docker_image,
-                            with_power=probe_with_power,
-                            log_extra=default_extra,
+                        _with_own_duration(
+                            self.probe_prerun_host(
+                                connected_ssh_client,
+                                docker_image=payload.docker_image,
+                                with_power=probe_with_power,
+                                log_extra=default_extra,
+                            ),
+                            ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
                         )
                     )
                     connections.callback(early_host_probe.cancel)
                 if wants_volume_probe:
                     early_volume_probe = asyncio.create_task(
-                        self.probe_volume_host(
-                            connected_ssh_client, with_df=measures_host, log_extra=default_extra
+                        _with_own_duration(
+                            self.probe_volume_host(
+                                connected_ssh_client, with_df=measures_host, log_extra=default_extra
+                            ),
+                            ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
                         )
                     )
                     connections.callback(early_volume_probe.cancel)
@@ -6337,7 +6353,8 @@ class DockerService:
                 if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
                     current_step = "prerun_host_probe"
                     if early_host_probe is not None and image_present:
-                        host_probe = await early_host_probe
+                        host_probe, early_host_probe_step = await early_host_probe
+                        profilers.append(early_host_probe_step)
                     else:
                         host_probe = await self.probe_prerun_host(
                             ssh_client,
@@ -6430,8 +6447,11 @@ class DockerService:
                 # cap is lifted) and never before a bootstrap restore (minutes would age the query).
                 early_gpu_power_restore = (
                     asyncio.create_task(
-                        self._restore_gpu_power_for_uncapped_pod(
-                            ssh_client, payload, host_probe, default_extra
+                        _with_own_duration(
+                            self._restore_gpu_power_for_uncapped_pod(
+                                ssh_client, payload, host_probe, default_extra
+                            ),
+                            ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
                         )
                     )
                     if not (payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits)
@@ -6529,7 +6549,8 @@ class DockerService:
                     if wants_volume_probe:
                         current_step = "volume_host_probe"
                         if early_volume_probe is not None and image_present and not cleanup_changed_host:
-                            volume_probe = await early_volume_probe
+                            volume_probe, early_volume_probe_step = await early_volume_probe
+                            profilers.append(early_volume_probe_step)
                         else:
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
@@ -6662,12 +6683,12 @@ class DockerService:
                     )
                     if not cap_applied:
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
+                elif early_gpu_power_restore is not None:
+                    _, early_gpu_power_restore_step = await early_gpu_power_restore
+                    profilers.append(early_gpu_power_restore_step)
                 else:
-                    await (
-                        early_gpu_power_restore
-                        or self._restore_gpu_power_for_uncapped_pod(
-                            ssh_client, payload, host_probe, default_extra
-                        )
+                    await self._restore_gpu_power_for_uncapped_pod(
+                        ssh_client, payload, host_probe, default_extra
                     )
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
@@ -7091,8 +7112,11 @@ class DockerService:
                 # `payload.timestamp`, the backend->subnet queue/transit leg is
                 # captured inside the "Started in subnet" step (now - timestamp),
                 # so this total is end-to-end; otherwise it is subnet-internal time.
-                # The "Requested from backend" anchor has no duration and is excluded.
-                total_duration_ms = sum(p.duration or 0 for p in profilers)
+                # The "Requested from backend" anchor has no duration and is excluded,
+                # and so are the "(parallel)" rows: they overlap the step rows.
+                total_duration_ms = sum(
+                    p.duration or 0 for p in profilers if p.name not in PARALLEL_PROFILER_STEP_NAMES
+                )
                 logger.info(
                     _m(
                         "Deployment profile summary",
