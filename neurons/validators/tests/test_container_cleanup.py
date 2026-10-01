@@ -708,7 +708,8 @@ async def test_the_dind_orphan_sweep_removes_nothing_when_it_cannot_be_sure(rent
 
 
 @pytest.mark.asyncio
-async def test_cleanup_runs_the_dind_orphan_sweep():
+async def test_cleanup_runs_the_dind_orphan_sweep(monkeypatch):
+    monkeypatch.setattr("services.container_cleanup.settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED", True)
     ssh, calls = _dind_volume_ssh_mock(all_volumes=[f"{_GONE}_docker"], dangling=[f"{_GONE}_docker"])
 
     await ContainerCleanup(stale_threshold_minutes=15).cleanup(
@@ -718,6 +719,24 @@ async def test_cleanup_runs_the_dind_orphan_sweep():
     assert f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls
     assert stale_dind_probe_list_command() in calls
 
+
+@pytest.mark.parametrize(
+    ("store", "workspace", "orphan_sweep", "probe_sweep"),
+    [(False, False, False, False), (False, True, True, False)],
+    ids=["all-off", "workspace-only"],
+)
+@pytest.mark.asyncio
+async def test_cleanup_runs_only_the_dind_sweeps_its_flags_need(monkeypatch, store, workspace, orphan_sweep, probe_sweep):
+    monkeypatch.setattr("services.container_cleanup.settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED", store)
+    monkeypatch.setattr("services.container_cleanup.settings.RENTAL_DIND_WORKSPACE_VOLUME_ENABLED", workspace)
+    ssh, calls = _dind_volume_ssh_mock(all_volumes=[f"{_GONE}_docker"], dangling=[f"{_GONE}_docker"])
+
+    await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, []), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert (f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls) is orphan_sweep
+    assert (stale_dind_probe_list_command() in calls) is probe_sweep
 
 
 def _probe_listing_ssh_mock(listing: str, list_status: int = 0):

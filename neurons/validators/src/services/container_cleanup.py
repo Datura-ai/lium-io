@@ -6,9 +6,11 @@ from typing import Awaitable, Callable, Optional
 import asyncssh
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
 from services.rental_dind import (
+    dind_volumes_enabled,
     orphaned_dind_companion_volumes,
     stale_dind_probe_containers,
     stale_dind_probe_list_command,
@@ -223,11 +225,13 @@ class ContainerCleanup:
                 )
             )
 
-        await self.prune_stale_dind_probe_containers(ssh_client, executor_uuid)
+        if settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED:
+            await self.prune_stale_dind_probe_containers(ssh_client, executor_uuid)
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
-        await self.prune_orphaned_dind_volumes(ssh_client, rented_data, executor_uuid)
+        if dind_volumes_enabled(settings):
+            await self.prune_orphaned_dind_volumes(ssh_client, rented_data, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
 

@@ -149,10 +149,18 @@ def dind_workspace_volume_name(local_volume: str) -> str:
 def dind_companion_volume_names(local_volume: str) -> tuple[str, ...]:
     """Every per-pod volume this module may have attached next to `local_volume`.
 
-    Teardown removes all of them whatever the flags are now: a pod created while a flag was on
-    still owns its volumes after the flag goes off.
+    A container removal names all of them whatever the flags are now: a pod created while a flag
+    was on still owns its volumes after the flag goes off.
     """
     return (dind_store_volume_name(local_volume), dind_workspace_volume_name(local_volume))
+
+
+def dind_volumes_enabled(settings) -> bool:
+    """Whether a new pod can get a store or /workspace volume. With both flags off, pod deletion and
+    the cleanup pass skip the commands that exist only for those volumes; a pod created while a flag
+    was on keeps its volumes until a flag is on again and the orphan sweep removes them.
+    """
+    return bool(settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED or settings.RENTAL_DIND_WORKSPACE_VOLUME_ENABLED)
 
 
 def with_dind_companion_volumes(volume_names: Iterable[str]) -> list[str]:

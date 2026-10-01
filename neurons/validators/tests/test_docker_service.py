@@ -1193,9 +1193,13 @@ def _dind_delete_payload() -> ContainerDeleteRequest:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "flag", ["RENTAL_DIND_PERSISTENT_STORE_ENABLED", "RENTAL_DIND_WORKSPACE_VOLUME_ENABLED"]
+)
 async def test_delete_container_removes_the_pods_inner_docker_store_and_workspace(
-    docker_service, monkeypatch, retry_ssh_mock
+    docker_service, monkeypatch, retry_ssh_mock, flag
 ):
+    monkeypatch.setattr(f"services.docker_service.settings.{flag}", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     payload = _dind_delete_payload()
 
@@ -1218,9 +1222,31 @@ async def test_delete_container_removes_the_pods_inner_docker_store_and_workspac
 
 
 @pytest.mark.asyncio
+async def test_delete_container_with_the_dind_volume_flags_off_runs_no_dind_volume_rm(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED", False)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_DIND_WORKSPACE_VOLUME_ENABLED", False)
+    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    payload = _dind_delete_payload()
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=_delete_container_executor_info(payload.executor_id),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("volume_dind_docker" in command for command in commands)
+
+
+@pytest.mark.asyncio
 async def test_delete_container_is_not_failed_by_a_dind_volume_removal_error(
     docker_service, monkeypatch, retry_ssh_mock
 ):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
 
     async def _run(command, *args, **kwargs):
