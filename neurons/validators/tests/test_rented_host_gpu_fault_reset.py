@@ -240,6 +240,16 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
     [
         pytest.param(DEAD_NVML, {"rented": False}, id="unrented-node"),
         pytest.param(DEAD_NVML, {"enabled": False}, id="flag-off"),
+        # the report comes from the node's own host and the provider can seal it, so the shipped default is off
+        pytest.param(
+            DEAD_NVML,
+            {
+                "enabled": type(machine_spec_scrape.settings).model_fields[
+                    "RENTED_HOST_GPU_FAULT_RESET_ENABLED"
+                ].default
+            },
+            id="provider-forged-report-with-shipped-default",
+        ),
         # miner A reports miner B's rented executor UUID with a sealed dead-NVML report from A's own host
         pytest.param(DEAD_NVML, {"miner_hotkey": "another-miner"}, id="rental-owned-by-another-miner"),
         pytest.param(
@@ -254,8 +264,8 @@ async def test_the_node_returns_through_normal_validation_once_the_host_is_healt
             _scrape_result(stdout=_driver_report("OSError(28, 'No space left on device')"), exit_code=1), {}, id="not-nvml"
         ),
         pytest.param(_scrape_result(stdout="", exit_code=127), {}, id="scrape-failed-on-host"),
-        # what anything that controls the executor's interpreter can print: the report without its sealed copy,
-        # with a copy sealed under another key, or with a replayed success payload
+        # what a stray print or another cycle's token looks like: the report without its sealed copy, with a copy
+        # sealed under another key, or with a replayed success payload
         pytest.param(
             _scrape_result(stdout=_plain_driver_report(NVML_DRIVER_ERROR), exit_code=1), {}, id="plain-driver-report"
         ),

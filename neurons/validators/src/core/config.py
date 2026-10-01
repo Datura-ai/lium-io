@@ -409,10 +409,12 @@ class Settings(BaseSettings):
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
     # marks the executor inactive and stops billing the renter. Only the validator's scrape on the host
     # decides; nothing read from the renter's container does. A later clean scrape validates the node as
-    # usual. Off: the scrape failure halts the cycle without a reset, as before. Turning it off stops
+    # usual. Off (the default): the scrape failure halts the cycle without a reset, as before. On only
+    # after a signal the provider cannot forge corroborates the fault: the report comes from the node's
+    # own host, so on its own it cannot prove the GPU is dead. Turning it off stops
     # future resets only: an executor already reset stays inactive until its next clean scrape, and
     # cycles already skipped are not billed or paid afterwards.
-    RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=True)
+    RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
