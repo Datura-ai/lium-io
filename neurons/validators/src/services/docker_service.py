@@ -1602,8 +1602,6 @@ def _warm_pod_mismatch(
             for repo_digest in (image or {}).get("RepoDigests") or []
         ),
         "gpus": gpu_uuids != set(payload.gpu_uuids),
-        # the root-fs quota is fixed at `docker run`
-        "storage_opt": bool(host_config.get("StorageOpt")),
         "ports": published_ports != requested_ports,
         "internal_ports": bool(custom_options.internal_ports)
         and set(custom_options.internal_ports) | {22, IMAGE_JUPYTER_DOCKER_PORT} != set(requested_ports),
@@ -1626,11 +1624,16 @@ async def _await_all_then_raise_first_error(*awaitables: Awaitable[Any]) -> list
     return outcomes
 
 
+class _WarmPodMismatch(Exception):
+    """A take-over check that found the warm pod unlike this rent; the message is the reason."""
+
+
 @dataclass(frozen=True)
 class _AdoptedWarmPod:
     port_maps: list[tuple[int, int]]
     jupyter_url: str
     volume_limit_gb: int
+    storage_limit_gb: int | None
     profilers: list[ProfilerStep]
 
 
@@ -6044,7 +6047,7 @@ class DockerService:
             mismatch = "container_listing_failed"
         if mismatch is None:
             try:
-                volume_limit_gb, profilers = await self._take_over_warm_pod(
+                sizing, profilers = await self._take_over_warm_pod(
                     ssh_client,
                     payload,
                     container,
@@ -6056,6 +6059,8 @@ class DockerService:
                     log_tag=log_tag,
                     default_extra=default_extra,
                 )
+            except _WarmPodMismatch as exc:
+                mismatch = str(exc)
             except Exception as exc:
                 mismatch = f"{type(exc).__name__}: {str(exc)[:300]}"
             else:
@@ -6072,7 +6077,8 @@ class DockerService:
                         extra=get_extra_info({
                             **default_extra,
                             "container_name": container_name,
-                            "volume_limit_gb": volume_limit_gb,
+                            "volume_limit_gb": sizing.volume_limit_gb,
+                            "storage_limit_gb": sizing.storage_limit_gb,
                             "step_timings_ms": {step.name.value: step.duration for step in profilers},
                             "total_ms": now_ms() - started_ms,
                         }),
@@ -6086,7 +6092,8 @@ class DockerService:
                         f"http://{executor_info.address}:{jupyter_mapping.external_port}"
                         f"/lab?token={jupyter_token}"
                     ),
-                    volume_limit_gb=volume_limit_gb,
+                    volume_limit_gb=sizing.volume_limit_gb,
+                    storage_limit_gb=sizing.storage_limit_gb,
                     profilers=profilers,
                 )
 
@@ -6104,7 +6111,7 @@ class DockerService:
         started_ms: int,
         log_tag: str,
         default_extra: dict,
-    ) -> tuple[int, list[ProfilerStep]]:
+    ) -> tuple[VolumeSizingResult, list[ProfilerStep]]:
         # a checked warm pod, made the renter's in the order of second opinion S5: fillers confirmed
         # gone, GPU power back, volume and limits grown and read back, keys last
         container_name = self.get_container_name(payload)
@@ -6144,11 +6151,16 @@ class DockerService:
         )
         if not sizing.volume_limit_gb:
             raise RuntimeError("the rent has no volume size to grow the warm pod's volume to")
+        host_config = container.get("HostConfig") or {}
+        # the root-fs quota is fixed at `docker run`: adopted only when it is the one this rent gets
+        warm_storage_bytes = _parse_volume_size_to_bytes((host_config.get("StorageOpt") or {}).get("size"))
+        rent_storage_bytes = sizing.storage_limit_gb * 1024**3 if sizing.storage_limit_gb else None
+        if warm_storage_bytes != rent_storage_bytes:
+            raise _WarmPodMismatch("storage_opt")
         profilers.append(ProfilerStep.since(ProfilerStepName.GPU_DEVICE_PROBE, step_started_ms))
         step_started_ms = now_ms()
 
         wanted_limits = [str(payload.cpu_count * 1_000_000_000), str(payload.memory_gb * 1024**3)]
-        host_config = container.get("HostConfig") or {}
         resource_commands = [
             _warm_pod_volume_grow_command(volume_name, sizing.volume_limit_gb)
         ]
@@ -6191,7 +6203,7 @@ class DockerService:
         if keys_result.exit_status != 0:
             raise RuntimeError(f"keys exec exited {keys_result.exit_status}")
         profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, step_started_ms))
-        return sizing.volume_limit_gb, profilers
+        return sizing, profilers
 
     @staticmethod
     async def _remove_warm_pod_for_normal_create(
@@ -6300,8 +6312,7 @@ class DockerService:
             restore_log_id=None,
             jupyter_url=adopted.jupyter_url,
             warnings=[],
-            # the warm pod runs without a root-fs quota (`StorageOpt` empty is an adoption check)
-            storage_limit_gb=None,
+            storage_limit_gb=adopted.storage_limit_gb,
             volume_limit_gb=adopted.volume_limit_gb,
             local_volume_path="/root",
             volume_encryption_status=VolumeEncryptionStatus.ENABLED,

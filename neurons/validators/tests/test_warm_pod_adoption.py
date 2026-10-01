@@ -1,7 +1,7 @@
 """DAH-3980: a customer create adopts the pre-started ("warm") pod of the same id.
 
 The fast path inspects `pod_<id>` once; only a running container with this pod's label, the rent's
-image, GPUs and ports, and no root-fs quota is adopted, in a fixed order: fillers removed and
+image, GPUs and ports, and the root-fs quota this rent gets is adopted, in a fixed order: fillers removed and
 confirmed gone, GPU power restored, volume grown and limits updated and read back, then one exec
 that checks the gocryptfs mount and writes the renter's keys. Anything else removes the warm pod
 (confirmed) and runs the normal create.
@@ -66,7 +66,8 @@ def _warm_container(payload) -> dict:
         },
         "HostConfig": {
             "DeviceRequests": [{"Driver": "", "DeviceIDs": ["GPU-a", "GPU-b"]}],
-            "StorageOpt": None,
+            # resolve_volume_sizing is stubbed to storage_limit_gb=20
+            "StorageOpt": {"size": "20g"},
             "PortBindings": {
                 "22/tcp": [{"HostIp": "", "HostPort": "40022"}],
                 "8888/tcp": [{"HostIp": "", "HostPort": "40888"}],
@@ -229,7 +230,7 @@ async def test_adoption_reply_has_every_field_of_the_normal_reply(svc, monkeypat
     assert result.local_volume_path == "/root"
     assert result.volume_encryption_status == VolumeEncryptionStatus.ENABLED
     assert result.volume_limit_gb == 10
-    assert result.storage_limit_gb is None  # the warm pod has no root-fs quota
+    assert result.storage_limit_gb == 20
     assert result.warnings == []
     assert result.profilers[-1].name.value == "Finished in subnet."
     svc.redis_service.add_rented_pod.assert_awaited_once()
@@ -329,12 +330,44 @@ async def test_warm_pod_with_another_gpu_set_is_not_adopted(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_warm_pod_with_a_root_fs_quota_is_not_adopted(svc, monkeypatch):
+async def test_warm_pod_with_the_rent_s_root_fs_quota_is_adopted_and_the_reply_carries_it(svc, monkeypatch):
     payload = _rent_payload()
     host = _adoptable(svc, monkeypatch, payload)
-    host.container["HostConfig"]["StorageOpt"] = {"size": "20g"}
+    host.container["HostConfig"]["StorageOpt"] = {"size": "3g"}
+    svc.resolve_volume_sizing.return_value = Mock(volume_limit_gb=10, storage_limit_gb=3)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    assert "remove_warm_pod" not in host.events
+    assert result.storage_limit_gb == 3
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_with_another_root_fs_quota_falls_back_with_reason_storage_opt(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["HostConfig"]["StorageOpt"] = {"size": "3g"}
+    log_not_adopted = Mock()
+    monkeypatch.setattr(svc, "_log_warm_pod_not_adopted", log_not_adopted)
 
     await _assert_normal_create_after_removal(svc, host, payload)
+    assert log_not_adopted.call_args.args[1] == "storage_opt"
+    assert not host.keys_exec_calls()
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_and_rent_both_without_a_root_fs_quota_is_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["HostConfig"]["StorageOpt"] = None
+    svc.resolve_volume_sizing.return_value = Mock(volume_limit_gb=10, storage_limit_gb=None)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    assert "remove_warm_pod" not in host.events
+    assert result.storage_limit_gb is None
 
 
 @pytest.mark.asyncio
