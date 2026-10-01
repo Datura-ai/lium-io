@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shlex
 import socket as socket_module
 import tempfile
 import threading
@@ -42,6 +44,30 @@ RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+# Renter secrets live on a tmpfs, so a value is never written to the container's disk — never in
+# an image layer, `docker commit`, a volume backup, `docker inspect` Env or /etc/environment. The
+# mount has no `noswap` (kernel 6.4+ only), so on a host with swap its pages may be swapped out. The
+# workload runs as the image's USER, which may be non-root, so the directory (0700) and every file
+# (0400) are chowned to the uid:gid that user resolves to inside the container — nobody else can read.
+POD_SECRETS_DIR = "/run/lium/secrets"
+# tmpfs charges whole pages per file
+_TMPFS_PAGE_BYTES = 4096
+# What a renter's secrets may use in total, each file counted in whole pages (the documented limit).
+POD_SECRETS_LIMIT_BYTES = 1024 * 1024
+# The mount adds room for `.ready.partial` (renamed to `.ready`) plus one spare page, so a set that
+# uses the whole limit still gets its marker.
+POD_SECRETS_TMPFS_SIZE_BYTES = POD_SECRETS_LIMIT_BYTES + 2 * _TMPFS_PAGE_BYTES
+POD_SECRETS_TMPFS_OPTIONS = f"rw,noexec,nosuid,nodev,size={POD_SECRETS_TMPFS_SIZE_BYTES},mode=0700"
+POD_SECRET_FILE_MODE = "0400"
+# Written only after every secret file is in place and handed over; the workload waits for it.
+# Secret names cannot start with a dot, so it never collides with one.
+POD_SECRETS_READY_MARKER = ".ready"
+POD_SECRETS_READY_MARKER_MODE = "0444"
+# None on a ContainerExecSpec: run as the container's configured USER, not pinned to root
+CONTAINER_DEFAULT_USER = None
+_NUMERIC_ID_PATTERN = re.compile(r"[0-9]{1,10}")
+# The name becomes a file name and appears in exec argv/logs; only the value is secret.
+POD_SECRET_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 logger = logging.getLogger(__name__)
 
 
@@ -158,6 +184,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # container path -> mount options; empty sends no `Tmpfs` key at all
+    tmpfs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -166,6 +194,8 @@ class ContainerExecSpec:
     argv: tuple[str, ...]
     stdin: str | bytes | None = None
     environment: dict[str, str] = field(default_factory=dict)
+    # "0" pins rental bootstrap to root; CONTAINER_DEFAULT_USER runs as the image's USER
+    user: str | None = "0"
 
 
 @dataclass(slots=True)
@@ -193,6 +223,9 @@ class ContainerStateSnapshot:
     restart_count: int
     error: str | None
     oom_killed: bool
+    container_id: str | None = None
+    started_at: str | None = None
+    has_secrets_tmpfs: bool = False
 
     @property
     def killed_by_host(self) -> bool:
@@ -593,6 +626,9 @@ class RentalDockerSdkClient:
             restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
             error=state.get("Error") or None,
             oom_killed=bool(state.get("OOMKilled")),
+            container_id=info.get("Id") or None,
+            started_at=state.get("StartedAt") or None,
+            has_secrets_tmpfs=POD_SECRETS_DIR in ((info.get("HostConfig") or {}).get("Tmpfs") or {}),
         )
 
     def _mount_source_for_destination_sync(
@@ -716,16 +752,17 @@ class RentalDockerSdkClient:
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
-        # Every spec routed here is rental bootstrap writing to /root or /etc, so
-        # it must not inherit a non-root image USER (DAH-2534). Numeric uid, so no
-        # root entry in the image's /etc/passwd is required. The renter's own
-        # workload still runs as the image's USER — only these execs are pinned.
+        # Rental bootstrap writes to /root or /etc, so by default a spec must not
+        # inherit a non-root image USER (DAH-2534). Numeric uid, so no root entry
+        # in the image's /etc/passwd is required. The renter's own workload still
+        # runs as the image's USER; a spec with user=CONTAINER_DEFAULT_USER (the
+        # pod-secrets owner probe) runs as that USER too ("" = Docker's default).
         exec_create_result = self._api_client.exec_create(
             container=spec.container_name,
             cmd=list(spec.argv),
             stdin=stdin_data is not None,
             environment=spec.environment or None,
-            user="0",
+            user="" if spec.user is None else spec.user,
         )
         exec_id = exec_create_result["Id"]
 
@@ -930,6 +967,254 @@ def build_environment_exec_spec(
     )
 
 
+def _tmpfs_bytes(value: str) -> int | None:
+    # None for a str that is not valid UTF-8 (a lone surrogate survives json.loads). The codec error
+    # quotes the offending character and its offset, so it must never leave this function.
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+    return -(-size // _TMPFS_PAGE_BYTES) * _TMPFS_PAGE_BYTES
+
+
+def _invalid_secret_name_message(name: object) -> str:
+    # A refused name may be a pasted value (`NAME=value`, or a token ending in base64 `=` padding), so
+    # no part of it is ever echoed.
+    return "invalid secret name: letters, digits and _ only, not starting with a digit, no '='"
+
+
+def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
+    """The secrets to deliver; raises ValueError naming (never showing) a bad entry.
+
+    Sizes are checked here, before the rent starts: each file counts as whole tmpfs pages and the set
+    may use at most POD_SECRETS_LIMIT_BYTES. The mount is that plus headroom for the `.ready` marker,
+    so an accepted set never fails inside the pod on a full mount.
+    """
+    valid: dict[str, str] = {}
+    total = 0
+    for name, value in (secrets or {}).items():
+        if not isinstance(name, str) or not POD_SECRET_NAME_PATTERN.fullmatch(name):
+            raise ValueError(_invalid_secret_name_message(name))
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"secret {name} has an empty value")
+        size = _tmpfs_bytes(value)
+        if size is None:
+            raise ValueError(f"secret {name} is not valid UTF-8 text") from None
+        if size > POD_SECRETS_LIMIT_BYTES:
+            raise ValueError(f"secret {name} is larger than the {POD_SECRETS_LIMIT_BYTES}-byte secrets limit")
+        total += size
+        if total > POD_SECRETS_LIMIT_BYTES:
+            raise ValueError(
+                f"secret {name} does not fit: with the secrets before it, the set needs over the "
+                f"{POD_SECRETS_LIMIT_BYTES}-byte secrets limit (each file counts as whole 4096-byte pages)"
+            )
+        valid[name] = value
+    return valid
+
+
+def build_pod_secrets_owner_probe_spec(*, container_name: str) -> ContainerExecSpec:
+    """`id -u; id -g` as the image's USER: Docker resolves names, uid[:gid] and empty (root) itself."""
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=("sh", "-c", "id -u && id -g"),
+        user=CONTAINER_DEFAULT_USER,
+    )
+
+
+def parse_pod_secrets_owner(stdout: str) -> tuple[int, int]:
+    """(uid, gid) from the probe's output; raises ValueError on anything but two numeric lines."""
+    lines = (stdout or "").split()
+    if len(lines) != 2 or not all(_NUMERIC_ID_PATTERN.fullmatch(line) for line in lines):
+        raise ValueError(f"could not resolve the container user's uid:gid (probe printed {len(lines)} fields)")
+    return int(lines[0]), int(lines[1])
+
+
+def build_pod_secrets_tmpfs(secrets: dict[str, str] | None) -> dict[str, str]:
+    return {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS} if secrets else {}
+
+
+def _pod_secrets_dir_guard(secrets_dir: str) -> str:
+    # the mount check and "still root-only": the workload (maybe non-root, running concurrently) must
+    # not be able to plant links in the directory while root writes into it
+    return (
+        f"[ ! -L {secrets_dir} ] && [ -d {secrets_dir} ] "
+        f"|| {{ echo {secrets_dir} is not a directory >&2; exit 1; }}; "
+        f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts "
+        f"|| {{ echo {secrets_dir} is not a tmpfs mount >&2; exit 1; }}; "
+        f"[ \"$(stat -c %u:%a {secrets_dir})\" = 0:700 ] "
+        f"|| {{ echo {secrets_dir} is not root-only >&2; exit 1; }}; "
+    )
+
+
+def build_secret_file_exec_specs(
+    *,
+    container_name: str,
+    secrets: dict[str, str] | None,
+) -> list[ContainerExecSpec]:
+    """One exec per secret; the value travels on stdin only, so it is never in argv or the exec logs.
+
+    The script refuses to write unless the directory is the tmpfs mount, so a missing mount can never
+    put a value on the container's disk layer, and unless it is still root-owned 0700. Each file is
+    created exclusively (noclobber) under a name nothing may already hold, as a link or otherwise, so
+    no write can be redirected. Files stay root's until build_pod_secrets_handover_spec().
+    """
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+    specs = []
+    for name, value in valid_pod_secrets(secrets).items():
+        target = shlex.quote(f"{POD_SECRETS_DIR}/{name}")
+        partial_target = shlex.quote(f"{POD_SECRETS_DIR}/.{name}.partial")
+        script = (
+            "set -euC; umask 077; "
+            + _pod_secrets_dir_guard(secrets_dir)
+            + f"for path in {partial_target} {target}; do "
+            "if [ -e \"$path\" ] || [ -L \"$path\" ]; then echo \"$path already exists\" >&2; exit 1; fi; "
+            "done; "
+            f"cat > {partial_target}; "
+            f"chmod {POD_SECRET_FILE_MODE} {partial_target}; "
+            f"mv -f {partial_target} {target}"
+        )
+        specs.append(
+            ContainerExecSpec(
+                container_name=container_name,
+                argv=("sh", "-c", script),
+                stdin=value,
+            )
+        )
+    return specs
+
+
+def build_pod_secrets_handover_spec(
+    *,
+    container_name: str,
+    secrets: dict[str, str] | None,
+    owner: tuple[int, int],
+) -> ContainerExecSpec:
+    """The one step, after every file is written, that gives the files and then the directory to
+    `owner` (the container user's uid, gid), keeping 0400/0700. Only regular, unlinked files are
+    touched and `chown -h` never follows a link; the directory is handed over last, so the user can
+    enter it only once nothing more is written as root.
+
+    Before that, the `.ready` marker (a UTC timestamp, root-owned 0444) is created exclusively under a
+    temp name and renamed into place, still inside the root-only directory. So the workload sees it
+    only when every file is there and its own, and a failure at any step leaves no marker.
+    """
+    uid, gid = owner
+    chown_to = f"{int(uid)}:{int(gid)}"
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+    targets = " ".join(shlex.quote(f"{POD_SECRETS_DIR}/{name}") for name in valid_pod_secrets(secrets))
+    marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
+    partial_marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}.partial")
+    script = (
+        "set -euC; umask 077; "
+        + _pod_secrets_dir_guard(secrets_dir)
+        + f"for path in {partial_marker} {marker}; do "
+        "if [ -e \"$path\" ] || [ -L \"$path\" ]; then echo \"$path already exists\" >&2; exit 1; fi; "
+        "done; "
+        f"for path in {targets}; do "
+        "if [ -L \"$path\" ] || [ ! -f \"$path\" ]; then echo \"$path is not a regular file\" >&2; exit 1; fi; "
+        f"chown -h {chown_to} \"$path\"; chmod {POD_SECRET_FILE_MODE} \"$path\"; "
+        "done; "
+        f"date -u +%Y-%m-%dT%H:%M:%SZ > {partial_marker}; "
+        # some `date`s exit 0 on a short write to a full tmpfs; an empty marker is never published
+        f"[ -s {partial_marker} ] || {{ rm -f {partial_marker}; echo could not write the ready marker >&2; exit 1; }}; "
+        f"chmod {POD_SECRETS_READY_MARKER_MODE} {partial_marker}; "
+        # plain `mv -f` (BusyBox before 1.34 has no `mv -T`): the directory is still root-only and neither
+        # name can exist, so nothing can turn the destination into a directory or a link
+        f"mv -f {partial_marker} {marker}; "
+        f"{{ chown -h {chown_to} {secrets_dir} && chmod 0700 {secrets_dir}; }} "
+        f"|| {{ rm -f {marker}; exit 1; }}"
+    )
+    return ContainerExecSpec(container_name=container_name, argv=("sh", "-c", script))
+
+
+# The tmpfs mount is in the container's HostConfig, so it comes back when Docker restarts the container
+# by itself (`unless-stopped`: host reboot, dockerd restart, the main process dying), but empty: no
+# ContainerCreateRequest is sent and the validator keeps no secret value to write again.
+# Ages count from the container's `Created`, never from the mount: every restart makes a new tmpfs, so a
+# workload that times out on `.ready` and exits (a crash loop) would keep a mount younger than the grace.
+# A container Docker restarted (`RestartCount` > 0) is flagged whatever the age unless `.ready` answers,
+# so one caught between restarts, where `docker exec` cannot reach it, is flagged too. The container
+# starts before delivery, so a workload that crashed once before `.ready` and then got its secrets on
+# the restarted run keeps `.ready` and is not flagged. Otherwise a container older than the grace
+# period with no `.ready` is that case; a younger one may still be mid-delivery.
+# The renter owns the directory after the handover and can delete `.ready`, but a restarted tmpfs is
+# always empty: a mount that still holds files is never flagged. A paused container gets no verdict.
+# A stopped container a Docker restart left behind gets no verdict either: the renter may have stopped it
+# after a delivered run, and exec into a stopped container cannot tell.
+# A start the platform made (a stop/start from the pod page, the undo of a failed edit) empties the
+# mount too: it records the run's `StartedAt` under POD_PLATFORM_STARTS_DIR, in a file named by the
+# container ID. That container never gets secrets again, so no run of it is flagged from then on,
+# whatever restarts it later: a workload that times out on `.ready` and exits is restarted by Docker
+# and must not blame the host. A container with no record (a host reboot, a Docker restart or a crash
+# with no platform start before it) is flagged as before; a reboot from the pod page re-creates the
+# container under a new ID, which has no record. A start request on a pod that was already running
+# records nothing, nor does a start whose state before it could not be read (see `_record_platform_start`).
+# Any future path that sends secrets again to an existing container must delete that container's record
+# first, or a later loss of those secrets is never flagged.
+# The validator's SSH lands in the executor container, whose /var/lib/lium is its writable layer and is
+# gone after every executor update. The record lives on the `reserve_data` named volume the executor
+# compose files mount at POD_PLATFORM_STARTS_VOLUME, which outlives a recreate and is mounted into no pod.
+POD_SECRETS_LOST_GRACE_SECONDS = 300
+POD_SECRETS_LOST_OUTPUT = "secrets-lost"
+POD_PLATFORM_STARTS_VOLUME = "/var/lium-reserve"
+POD_PLATFORM_STARTS_DIR = f"{POD_PLATFORM_STARTS_VOLUME}/pod-platform-starts"
+_POD_SECRETS_STATE_FORMAT = (
+    "{{.RestartCount}} {{.Created}} {{.State.Status}} {{.State.StartedAt}} {{.Id}} "
+    '{{if index .HostConfig.Tmpfs "' + POD_SECRETS_DIR + '"}}secrets{{end}}'
+)
+_CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+_DOCKER_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z")
+
+
+def build_record_platform_start_command(*, container_id: str, started_at: str) -> str:
+    """Host shell: records `started_at` as the run of `container_id` the platform started.
+
+    Takes only values read from dockerd and checked here, so no container name reaches the host shell.
+    Only the leaf directory is created: with no volume mounted there it fails, and the start is flagged.
+    Two starts recording at once may both try the mkdir; the loser's `File exists` is not a failure.
+    Each writer renames its own temp file, so two records of one container at once both succeed.
+    """
+    if not isinstance(container_id, str) or not _CONTAINER_ID_PATTERN.fullmatch(container_id):
+        raise ValueError("not a full container ID")
+    if not isinstance(started_at, str) or not _DOCKER_TIMESTAMP_PATTERN.fullmatch(started_at):
+        raise ValueError("not a Docker StartedAt timestamp")
+    starts_dir = shlex.quote(POD_PLATFORM_STARTS_DIR)
+    stamp = shlex.quote(f"{POD_PLATFORM_STARTS_DIR}/{container_id}")
+    return (
+        f"umask 077 && {{ mkdir {starts_dir} 2>/dev/null; [ -d {starts_dir} ]; }} && chmod 0700 {starts_dir} "
+        f"&& printf '%s\\n' {started_at} > {stamp}.partial.$$ && mv -f {stamp}.partial.$$ {stamp}"
+    )
+
+
+def build_pod_secrets_lost_probe_command(container_name: str) -> str:
+    """Host shell: prints POD_SECRETS_LOST_OUTPUT when the pod's secrets are gone."""
+    container = shlex.quote(container_name)
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+    marker = shlex.quote(f"{POD_SECRETS_DIR}/{POD_SECRETS_READY_MARKER}")
+    ready_check = shlex.quote(
+        f"if [ -e {marker} ]; then echo ready; "
+        f'elif [ -n "$(ls -A {secrets_dir})" ]; then echo files; '
+        "else echo missing; fi"
+    )
+    ready_answer = f"$(/usr/bin/docker exec -u 0 {container} sh -c {ready_check} 2>/dev/null)"
+    return (
+        f"state=$(/usr/bin/docker inspect --format {shlex.quote(_POD_SECRETS_STATE_FORMAT)} {container} "
+        "2>/dev/null) || exit 0; "
+        "set -- $state; "
+        '[ "$6" = secrets ] || exit 0; '
+        '[ "$3" = paused ] && exit 0; '
+        f'[ -s {shlex.quote(POD_PLATFORM_STARTS_DIR)}/"$5" ] && exit 0; '
+        'if [ "$1" -gt 0 ] 2>/dev/null; then '
+        'case "$3" in running|restarting) ;; *) exit 0 ;; esac; '
+        f'case "{ready_answer}" in ready|files) ;; *) echo {POD_SECRETS_LOST_OUTPUT} ;; esac; exit 0; fi; '
+        'created=$(date -d "$2" +%s 2>/dev/null) || exit 0; '
+        f'[ $(( $(date +%s) - created )) -gt {POD_SECRETS_LOST_GRACE_SECONDS} ] || exit 0; '
+        f'[ "{ready_answer}" = missing ] '
+        f"&& echo {POD_SECRETS_LOST_OUTPUT}; "
+        "exit 0"
+    )
+
+
 def _default_docker_api_client_factory(**kwargs):
     import docker
 
@@ -1031,6 +1316,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         ),
         "shm_size": spec.shm_size,
         "network_mode": spec.network,
+        "tmpfs": dict(spec.tmpfs) or None,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
 

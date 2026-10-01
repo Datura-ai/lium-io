@@ -411,17 +411,18 @@ def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monke
     assert rollout_grace_reason(validator_snapshot_was_stale, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
 
 
-def test_a_rented_run_reporting_its_pods_ssh_is_still_the_rented_halt(monkeypatch) -> None:
-    """DAH-2870: when the renter's SSH is being reported, the tenant-enforcement halt ends the run
-    on RENTED_POD_SSH_UNREACHABLE instead of RENTED. It is the same halt (passed, score kept), so an
-    OUTDATED image inside the window is withheld exactly as it is for RENTED."""
+@pytest.mark.parametrize("halt_reason", ["RENTED", "RENTED_POD_SSH_UNREACHABLE", "RENTED_POD_SECRETS_LOST"])
+def test_every_rented_halt_reason_withholds_an_outdated_zero_inside_the_window(monkeypatch, halt_reason: str) -> None:
+    """The tenant-enforcement halt ends a rented run on RENTED, or on RENTED_POD_SSH_UNREACHABLE when
+    the renter's SSH is being reported (DAH-2870), or on RENTED_POD_SECRETS_LOST when a pod's secrets
+    tmpfs came back empty. It is the same halt (passed, score kept) each time, so an OUTDATED image
+    inside the window is withheld for all three. Regression: a reason missing from
+    RUN_ENDED_WITHOUT_FAILING turns that halt's 0 into a verdict during the rollout."""
     monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
     window = _open_window()
-    rented_reporting = _failed(
-        "node-2", "RENTED_POD_SSH_UNREACHABLE", observed_digest=OLD, image_status="OUTDATED"
-    )
+    rented_halt = _failed("node-2", halt_reason, observed_digest=OLD, image_status="OUTDATED")
 
-    assert rollout_grace_reason(rented_reporting, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
+    assert rollout_grace_reason(rented_halt, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
 
 
 def test_a_rented_zero_under_an_unenforced_outdated_report_stands(monkeypatch) -> None:

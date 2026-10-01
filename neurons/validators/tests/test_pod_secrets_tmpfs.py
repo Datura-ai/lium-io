@@ -1,0 +1,1336 @@
+"""Renter secrets reach the pod as 0400 files on a tmpfs at /run/lium/secrets, behind
+POD_SECRETS_TMPFS_ENABLED — never in the container env, /etc/environment, exec argv or the logs; with
+the flag off a rent is exactly today's."""
+
+import dataclasses
+import json
+import logging
+import os
+import re
+import stat
+import subprocess
+import time
+import traceback
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
+
+import pytest
+
+from core.config import settings
+from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import ContainerCreateRequest
+from services import rental_docker_sdk
+from services.docker_service import DockerService
+from services.rental_docker_sdk import (
+    CONTAINER_DEFAULT_USER,
+    POD_SECRETS_DIR,
+    POD_SECRETS_TMPFS_OPTIONS,
+    POD_SECRETS_LIMIT_BYTES,
+    POD_SECRETS_TMPFS_SIZE_BYTES,
+    POD_SECRET_NAME_PATTERN,
+    ContainerExecResult,
+    ContainerExecSpec,
+    RentalDockerSdkClient,
+    _build_host_config_kwargs,
+    POD_PLATFORM_STARTS_DIR,
+    POD_PLATFORM_STARTS_VOLUME,
+    POD_SECRETS_LOST_GRACE_SECONDS,
+    POD_SECRETS_LOST_OUTPUT,
+    POD_SECRETS_READY_MARKER,
+    build_pod_secrets_lost_probe_command,
+    build_record_platform_start_command,
+    build_pod_secrets_owner_probe_spec,
+    build_pod_secrets_tmpfs,
+    build_secret_file_exec_specs,
+    parse_pod_secrets_owner,
+    valid_pod_secrets,
+)
+from payload_models.payloads import FailedContainerRequest
+from test_rental_docker_sdk import FakeApiClient
+from test_docker_service_rental_security import (
+    RecordingRentalDockerFactory,
+    RecordingSSHClient,
+    _base_create_payload,
+    _patch_create_harness,
+)
+
+SECRETS = {
+    "HF_TOKEN": "hf_SECRET_VALUE_MARKER",
+    "WANDB_API_KEY": "wandb'; echo SECRET_SHELL_MARKER; $(id)",
+}
+SECRET_VALUES = tuple(SECRETS.values())
+
+
+@pytest.fixture
+def docker_service():
+    lock = AsyncMock()
+    lock.__aenter__ = AsyncMock(return_value=lock)
+    lock.__aexit__ = AsyncMock(return_value=None)
+    redis_service = Mock()
+    redis_service.acquire_executor_lock = Mock(return_value=lock)
+    return DockerService(
+        ssh_service=Mock(),
+        redis_service=redis_service,
+        attestation_service=Mock(),
+        rental_docker_client_factory=RecordingRentalDockerFactory(),
+    )
+
+
+@pytest.fixture
+def executor_info():
+    return ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+    )
+
+
+@pytest.fixture
+def keypair():
+    return Mock(ss58_address="validator-hotkey")
+
+
+def _secret_specs(docker_client):
+    return [
+        spec
+        for spec in docker_client.exec_specs
+        if spec.stdin is not None and POD_SECRETS_DIR in " ".join(spec.argv)
+    ]
+
+
+def _handover_specs(docker_client):
+    return [
+        spec
+        for spec in docker_client.exec_specs
+        if spec.stdin is None and "chown -h" in " ".join(spec.argv)
+    ]
+
+
+# What `id -u && id -g` prints when Docker runs it as the image's Config.User; an unknown name fails
+# the exec the way Docker does ("unable to find user").
+IMAGE_USERS = {
+    "": "0\n0\n",
+    "root": "0\n0\n",
+    "1000": "1000\n0\n",
+    "1000:1000": "1000\n1000\n",
+    "app": "1001\n1002\n",
+    "app:staff": "1001\n50\n",
+}
+
+
+def _answer_owner_probe(monkeypatch, docker_client, image_user: str):
+    original_exec = docker_client.exec_in_container
+
+    async def exec_as(spec):
+        result = await original_exec(spec)
+        if spec.user is CONTAINER_DEFAULT_USER:
+            if image_user not in IMAGE_USERS:
+                return ContainerExecResult(exit_status=126, stderr=f"unable to find user {image_user}")
+            return ContainerExecResult(exit_status=0, stdout=IMAGE_USERS[image_user])
+        return result
+
+    monkeypatch.setattr(docker_client, "exec_in_container", exec_as)
+
+
+async def _create(
+    docker_service, executor_info, keypair, monkeypatch, *, flag: bool, secrets, image_user: str = ""
+):
+    monkeypatch.setattr(settings, "POD_SECRETS_TMPFS_ENABLED", flag)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.__init__()
+    _answer_owner_probe(monkeypatch, docker_client, image_user)
+    _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
+    payload = _base_create_payload(secrets=secrets)
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+    docker_client.last_result = result
+    return payload, docker_client
+
+
+def test_mount_spec_is_a_private_noexec_tmpfs_at_run_lium_secrets():
+    assert POD_SECRETS_DIR == "/run/lium/secrets"
+    assert build_pod_secrets_tmpfs(SECRETS) == {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}
+    options = POD_SECRETS_TMPFS_OPTIONS.split(",")
+    assert {"noexec", "nosuid", "nodev", "mode=0700"} <= set(options)
+    assert build_pod_secrets_tmpfs({}) == {}
+    assert build_pod_secrets_tmpfs(None) == {}
+
+
+def test_each_secret_is_one_exec_with_the_value_on_stdin_only():
+    specs = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)
+
+    assert [spec.stdin for spec in specs] == list(SECRET_VALUES)
+    for spec, name in zip(specs, SECRETS):
+        script = spec.argv[2]
+        assert spec.argv[:2] == ("sh", "-c")
+        assert f"{POD_SECRETS_DIR}/{name}" in script
+        assert "chmod 0400" in script and "umask 077" in script
+        assert "/etc/environment" not in script
+        assert spec.environment == {}
+        for value in SECRET_VALUES:
+            assert value not in " ".join(spec.argv)
+
+
+@pytest.mark.parametrize("name", ["", "1ABC", "A-B", "../etc/passwd", "A B", "A;id", "x" * 129])
+def test_a_name_that_is_not_a_plain_identifier_is_refused(name):
+    with pytest.raises(ValueError):
+        valid_pod_secrets({name: "value"})
+
+
+NAME_AS_VALUE_MARKER = "hfPASTEDASNAMEMARKER"
+# 64 base64-ish characters that also match the name pattern once any '=' padding is stripped
+RANDOM_TOKEN = "Zq3xK9vLmP2wR7tYbN4cJ8hG1sD6fA0eUoIiQyTrWxVz5B" + "k" * 18
+
+# (rejected name, the pasted value that must never be shown)
+PASTED_NAMES = [
+    (f"HF_TOKEN={NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    (f"HF TOKEN={NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    (f"={NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    (f"{NAME_AS_VALUE_MARKER}==", NAME_AS_VALUE_MARKER),
+    (f"{NAME_AS_VALUE_MARKER}=", NAME_AS_VALUE_MARKER),
+    (f"{RANDOM_TOKEN}==", RANDOM_TOKEN),
+    (f"{RANDOM_TOKEN}=", RANDOM_TOKEN),
+    (f"{RANDOM_TOKEN}-x", RANDOM_TOKEN),
+    (f"1{NAME_AS_VALUE_MARKER}", NAME_AS_VALUE_MARKER),
+    ("HF_TOKEN=", "HF_TOKEN"),
+    ("==", "=="),
+]
+
+
+@pytest.mark.parametrize("name, pasted", PASTED_NAMES)
+def test_no_part_of_a_refused_name_is_ever_echoed(name, pasted):
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({name: "value"})
+    message = str(excinfo.value)
+    assert pasted not in message
+    assert name not in message
+    assert message == rental_docker_sdk._invalid_secret_name_message(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name, pasted", PASTED_NAMES)
+async def test_a_value_typed_as_a_name_never_reaches_the_rent_result_or_logs(
+    docker_service, executor_info, keypair, monkeypatch, caplog, name, pasted
+):
+    caplog.set_level(logging.DEBUG)
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets={name: "value"},
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "validate_request"
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records
+    )
+    assert "Invalid pod secrets" in logged
+    for text in [result.msg, result.model_dump_json(), logged]:
+        assert pasted not in text
+        assert name not in text
+
+
+def test_an_empty_value_is_refused_without_echoing_other_values():
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"HF_TOKEN": "hf_SECRET_VALUE_MARKER", "EMPTY": ""})
+    assert "hf_SECRET_VALUE_MARKER" not in str(excinfo.value)
+
+
+def test_the_write_refuses_a_directory_that_is_not_a_tmpfs(tmp_path, monkeypatch):
+    """Negative control on a real shell: an ordinary directory stands in for a missing mount."""
+    plain_dir = tmp_path / "secrets"
+    plain_dir.mkdir()
+    monkeypatch.setattr(rental_docker_sdk, "POD_SECRETS_DIR", str(plain_dir))
+    spec = build_secret_file_exec_specs(
+        container_name="pod", secrets={"HF_TOKEN": "hf_SECRET_VALUE_MARKER"}
+    )[0]
+
+    run = subprocess.run(
+        list(spec.argv), input=spec.stdin, capture_output=True, text=True, timeout=30
+    )
+
+    assert run.returncode == 1
+    assert "is not a tmpfs mount" in run.stderr
+    assert list(plain_dir.iterdir()) == []
+
+
+def test_the_request_is_parsed_but_never_shown_or_dumped_with_a_value():
+    payload = ContainerCreateRequest.model_validate(
+        {**_base_create_payload().model_dump(), "secrets": SECRETS}
+    )
+    assert payload.secrets == SECRETS
+    for value in SECRET_VALUES:
+        assert value not in str(payload)
+        assert value not in repr(payload)
+        assert value not in payload.model_dump_json()
+    assert "secrets" not in payload.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_mounts_the_tmpfs_and_writes_files_with_no_env_leak(
+    docker_service, executor_info, keypair, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    payload, docker_client = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=True, secrets=SECRETS
+    )
+
+    run_spec = docker_client.run_specs[0]
+    assert run_spec.tmpfs == {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}
+    assert _build_host_config_kwargs(run_spec)["tmpfs"] == {
+        POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS
+    }
+    # `docker inspect` Env is exactly create_container's environment
+    assert not set(SECRETS) & set(run_spec.environment)
+    assert not set(SECRET_VALUES) & set(run_spec.environment.values())
+
+    env_specs = [
+        spec for spec in docker_client.exec_specs if "/etc/environment" in " ".join(spec.argv)
+    ]
+    assert len(env_specs) == 1
+    for value in SECRET_VALUES:
+        assert value not in env_specs[0].stdin
+
+    secret_specs = _secret_specs(docker_client)
+    assert [spec.stdin for spec in secret_specs] == list(SECRET_VALUES)
+    for spec in docker_client.exec_specs:
+        for value in SECRET_VALUES:
+            assert value not in " ".join(spec.argv)
+
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records
+    )
+    assert "exec_write_pod_secret" in logged
+    for value in SECRET_VALUES:
+        assert value not in logged
+    write_logs = [
+        record.msg.extra
+        for record in caplog.records
+        if (getattr(record.msg, "extra", None) or {}).get("docker_operation") == "exec_write_pod_secret"
+    ]
+    assert {extra["operation_status"] for extra in write_logs} == {"started", "succeeded"}
+    assert not any("stdin_bytes" in extra for extra in write_logs)
+
+
+@pytest.mark.asyncio
+async def test_flag_off_is_todays_rent_even_when_the_backend_sends_secrets(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    _, with_secrets = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=SECRETS
+    )
+    with_secrets_run = dataclasses.asdict(with_secrets.run_specs[0])
+    with_secrets_host = _build_host_config_kwargs(with_secrets.run_specs[0])
+    with_secrets_execs = [dataclasses.asdict(spec) for spec in with_secrets.exec_specs]
+
+    _, today = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=None
+    )
+
+    assert with_secrets_run == dataclasses.asdict(today.run_specs[0])
+    assert with_secrets_host == _build_host_config_kwargs(today.run_specs[0])
+    assert "tmpfs" not in with_secrets_host
+    assert with_secrets_execs == [dataclasses.asdict(spec) for spec in today.exec_specs]
+    assert _secret_specs(with_secrets) == []
+
+
+@pytest.mark.asyncio
+async def test_flag_on_without_secrets_adds_nothing(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    _, flag_on = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=True, secrets=None
+    )
+    flag_on_host = _build_host_config_kwargs(flag_on.run_specs[0])
+    flag_on_execs = [dataclasses.asdict(spec) for spec in flag_on.exec_specs]
+
+    _, flag_off = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=None
+    )
+
+    assert flag_on_host == _build_host_config_kwargs(flag_off.run_specs[0])
+    assert flag_on_execs == [dataclasses.asdict(spec) for spec in flag_off.exec_specs]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_secret_write_fails_the_rent_naming_only_the_secret(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    monkeypatch.setattr(settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.__init__()
+    _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
+    _answer_owner_probe(monkeypatch, docker_client, "")
+    original_exec = docker_client.exec_in_container
+
+    async def failing_secret_exec(spec):
+        result = await original_exec(spec)
+        if POD_SECRETS_DIR in " ".join(spec.argv):
+            return rental_docker_sdk.ContainerExecResult(
+                exit_status=1, stderr=f"{POD_SECRETS_DIR} is not a tmpfs mount"
+            )
+        return result
+
+    monkeypatch.setattr(docker_client, "exec_in_container", failing_secret_exec)
+    stream_messages = []
+
+    async def record_stream_log(message, *args, **kwargs):
+        stream_messages.append(message)
+
+    monkeypatch.setattr(docker_service, "stream_log", record_stream_log)
+    await docker_service.create_container(
+        payload=_base_create_payload(secrets=SECRETS),
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert "Failed to write secret HF_TOKEN" in stream_messages
+    assert len(_secret_specs(docker_client)) == 1
+    assert _handover_specs(docker_client) == []
+    for message in stream_messages:
+        for value in SECRET_VALUES:
+            assert value not in str(message)
+
+
+def test_the_owner_probe_runs_as_the_image_user_and_parses_uid_gid():
+    spec = build_pod_secrets_owner_probe_spec(container_name="pod")
+    assert spec.user is CONTAINER_DEFAULT_USER
+    assert spec.stdin is None
+    assert parse_pod_secrets_owner("1000\n1000\n") == (1000, 1000)
+    assert parse_pod_secrets_owner("0\n0") == (0, 0)
+
+
+@pytest.mark.parametrize("stdout", ["", "1000\n", "app\n1000\n", "1000\n1000\nextra\n", "-1\n0\n"])
+def test_an_owner_probe_that_is_not_two_numbers_is_refused(stdout):
+    with pytest.raises(ValueError):
+        parse_pod_secrets_owner(stdout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user, docker_user", [(CONTAINER_DEFAULT_USER, ""), ("0", "0")])
+async def test_exec_create_runs_the_probe_as_the_image_user_and_everything_else_as_root(
+    user, docker_user
+):
+    api_client = FakeApiClient()
+    await RentalDockerSdkClient(api_client).exec_in_container(
+        ContainerExecSpec(container_name="pod", argv=("id", "-u"), user=user)
+    )
+    assert api_client.exec_created[0]["user"] == docker_user
+    assert ContainerExecSpec(container_name="pod", argv=("true",)).user == "0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "image_user, owner",
+    [
+        ("1000", "1000:0"),
+        ("1000:1000", "1000:1000"),
+        ("app", "1001:1002"),
+        ("app:staff", "1001:50"),
+        ("", "0:0"),
+        ("root", "0:0"),
+    ],
+)
+async def test_secrets_are_owned_by_the_container_user_and_stay_0700_0400(
+    docker_service, executor_info, keypair, monkeypatch, image_user, owner
+):
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets=SECRETS,
+        image_user=image_user,
+    )
+
+    assert not isinstance(docker_client.last_result, FailedContainerRequest)
+    probes = [spec for spec in docker_client.exec_specs if spec.user is CONTAINER_DEFAULT_USER]
+    assert len(probes) == 1
+    secret_specs = _secret_specs(docker_client)
+    assert len(secret_specs) == len(SECRETS)
+    for spec, name in zip(secret_specs, SECRETS):
+        script = spec.argv[2]
+        assert spec.user == "0"
+        assert "chown" not in script
+        assert "set -euC" in script
+        assert f"chmod 0400 {POD_SECRETS_DIR}/.{name}.partial;" in script
+    handovers = _handover_specs(docker_client)
+    assert len(handovers) == 1 and handovers[0].user == "0"
+    assert docker_client.exec_specs.index(handovers[0]) > max(
+        docker_client.exec_specs.index(spec) for spec in secret_specs
+    )
+    script = handovers[0].argv[2]
+    assert f'chown -h {owner} "$path"; chmod 0400 "$path"' in script
+    assert f"{{ chown -h {owner} {POD_SECRETS_DIR} && chmod 0700 {POD_SECRETS_DIR}; }}" in script
+    assert script.index('chown -h') < script.index(f"mv -f {POD_SECRETS_DIR}/.ready.partial {POD_SECRETS_DIR}/.ready;") < script.index(f"chown -h {owner} {POD_SECRETS_DIR} ")
+    for name in SECRETS:
+        assert f"{POD_SECRETS_DIR}/{name}" in script
+    assert "mode=0700" in POD_SECRETS_TMPFS_OPTIONS.split(",")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_user", ["nosuchuser", "ghost:nogroup"])
+async def test_an_unresolvable_container_user_fails_the_rent_closed(
+    docker_service, executor_info, keypair, monkeypatch, caplog, image_user
+):
+    caplog.set_level(logging.DEBUG)
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets=SECRETS,
+        image_user=image_user,
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "write_pod_secrets"
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records
+    )
+    assert "Failed to resolve pod secrets owner" in logged
+    assert _secret_specs(docker_client) == []
+    for text in [result.msg, logged]:
+        for value in SECRET_VALUES:
+            assert value not in text
+
+
+def test_a_secret_bigger_than_the_tmpfs_is_refused_naming_only_the_secret():
+    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_LIMIT_BYTES
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"HF_TOKEN": "hf_SECRET_VALUE_MARKER", "BIG": huge})
+    assert "BIG" in str(excinfo.value)
+    assert "BIG_SECRET_VALUE_MARKER" not in str(excinfo.value)
+    assert "hf_SECRET_VALUE_MARKER" not in str(excinfo.value)
+
+
+def test_secrets_that_together_overflow_the_tmpfs_are_refused():
+    half = "HALF_VALUE_MARKER" + "x" * (POD_SECRETS_LIMIT_BYTES // 2)
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"A": half, "B": half})
+    assert "secret B " in str(excinfo.value)
+    assert "secret A" not in str(excinfo.value)
+    assert "HALF_VALUE_MARKER" not in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"SMALL": "s", "A": half, "OTHER": "o", "B": half})
+    message = str(excinfo.value)
+    assert "secret B " in message
+    for innocent in ("SMALL", "OTHER"):
+        assert innocent not in message
+
+
+PAGE = 4096
+
+
+def test_the_mount_has_room_for_the_marker_beyond_the_renter_limit():
+    assert POD_SECRETS_LIMIT_BYTES == 1024 * 1024
+    assert POD_SECRETS_TMPFS_SIZE_BYTES == POD_SECRETS_LIMIT_BYTES + 2 * PAGE
+    assert f"size={POD_SECRETS_TMPFS_SIZE_BYTES}" in POD_SECRETS_TMPFS_OPTIONS.split(",")
+
+
+@pytest.mark.parametrize(
+    "largest_accepted, one_more",
+    [
+        ({"A": "x" * POD_SECRETS_LIMIT_BYTES}, {"A": "x" * (POD_SECRETS_LIMIT_BYTES + 1)}),
+        (
+            {"A": "x" * (POD_SECRETS_LIMIT_BYTES // 2), "B": "y" * (POD_SECRETS_LIMIT_BYTES // 2)},
+            {"A": "x" * (POD_SECRETS_LIMIT_BYTES // 2), "B": "y" * (POD_SECRETS_LIMIT_BYTES // 2 + 1)},
+        ),
+        # page rounding: 256 one-byte secrets use the whole limit
+        ({f"S{i}": "s" for i in range(256)}, {f"S{i}": "s" for i in range(257)}),
+        (
+            {"A": "x" * (PAGE + 1), "B": "y" * (POD_SECRETS_LIMIT_BYTES - 2 * PAGE)},
+            {"A": "x" * (PAGE + 1), "B": "y" * (POD_SECRETS_LIMIT_BYTES - 2 * PAGE + 1)},
+        ),
+    ],
+)
+def test_the_size_boundary_is_the_page_rounded_limit(largest_accepted, one_more):
+    assert valid_pod_secrets(largest_accepted) == largest_accepted
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets(one_more)
+    assert "limit" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_an_oversize_secret_fails_the_rent_before_anything_is_created(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    huge = "BIG_SECRET_VALUE_MARKER" + "x" * POD_SECRETS_LIMIT_BYTES
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets={"BIG": huge},
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "validate_request"
+    assert "BIG" in result.msg and "BIG_SECRET_VALUE_MARKER" not in result.msg
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+    assert docker_client.run_specs == [] and docker_client.exec_specs == []
+
+
+# The request parser uses json.loads, which keeps a lone surrogate escape as a str
+LONE_SURROGATE = json.loads('"\\ud800"')
+NOT_UTF8_HEAD = "NOTUTF8HEADMARKER"
+NOT_UTF8_TAIL = "NOTUTF8TAILMARKER"
+NOT_UTF8_VALUE = NOT_UTF8_HEAD + LONE_SURROGATE + NOT_UTF8_TAIL
+NOT_UTF8_MESSAGE = "secret HF_TOKEN is not valid UTF-8 text"
+
+
+def _assert_nothing_of_the_not_utf8_value(text: str):
+    offset = str(len(NOT_UTF8_HEAD))
+    for fragment in (
+        LONE_SURROGATE,
+        "\\ud800",
+        "ud800",
+        "\\xed\\xa0\\x80",
+        NOT_UTF8_HEAD,
+        NOT_UTF8_TAIL,
+        "position",
+        "codec",
+        "surrogate",
+        f" {offset}",
+        f"{offset}:",
+    ):
+        assert fragment not in text
+
+
+def test_a_value_that_is_not_utf8_is_refused_naming_only_the_secret():
+    with pytest.raises(ValueError) as excinfo:
+        valid_pod_secrets({"OTHER": "o", "HF_TOKEN": NOT_UTF8_VALUE, "LATER": "l"})
+
+    error = excinfo.value
+    assert str(error) == NOT_UTF8_MESSAGE
+    assert error.__cause__ is None and error.__context__ is None and error.__suppress_context__
+    _assert_nothing_of_the_not_utf8_value(repr(error))
+    _assert_nothing_of_the_not_utf8_value("".join(traceback.format_exception(error)))
+
+
+@pytest.mark.asyncio
+async def test_a_value_that_is_not_utf8_never_reaches_the_rent_result_or_logs(
+    docker_service, executor_info, keypair, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    _, docker_client = await _create(
+        docker_service,
+        executor_info,
+        keypair,
+        monkeypatch,
+        flag=True,
+        secrets={"HF_TOKEN": NOT_UTF8_VALUE},
+    )
+
+    result = docker_client.last_result
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "validate_request"
+    assert result.msg == f"Invalid pod secrets: {NOT_UTF8_MESSAGE}"
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')} {record.exc_text or ''}"
+        + ("".join(traceback.format_exception(*record.exc_info)) if record.exc_info else "")
+        for record in caplog.records
+    )
+    assert NOT_UTF8_MESSAGE in logged
+    for text in [result.msg, result.model_dump_json(), logged]:
+        _assert_nothing_of_the_not_utf8_value(text)
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+    assert docker_client.run_specs == [] and docker_client.exec_specs == []
+
+
+def _run_script(spec):
+    return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, timeout=30)
+
+
+@pytest.fixture
+def plain_secrets_dir(tmp_path, monkeypatch):
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(mode=0o700)
+    victim = tmp_path / "victim"
+    victim.write_text("original\n")
+    victim.chmod(0o644)
+    monkeypatch.setattr(rental_docker_sdk, "POD_SECRETS_DIR", str(secrets_dir))
+    # a plain directory stands in for the mount; only the tmpfs/root-only guard is skipped
+    monkeypatch.setattr(rental_docker_sdk, "_pod_secrets_dir_guard", lambda secrets_dir: "")
+    return secrets_dir, victim
+
+
+def test_the_write_script_needs_a_root_only_tmpfs_dir_that_is_not_a_link():
+    script = build_secret_file_exec_specs(container_name="pod", secrets={"A": "v"})[0].argv[2]
+    handover = rental_docker_sdk.build_pod_secrets_handover_spec(
+        container_name="pod", secrets={"A": "v"}, owner=(1000, 1000)
+    ).argv[2]
+    for text in (script, handover):
+        assert f"[ ! -L {POD_SECRETS_DIR} ]" in text
+        assert f"grep -qs ' '{POD_SECRETS_DIR}' tmpfs ' /proc/mounts" in text
+        assert f'[ "$(stat -c %u:%a {POD_SECRETS_DIR})" = 0:700 ]' in text
+
+
+def test_a_clean_write_then_handover_gives_the_owner_0400_files_in_a_0700_dir(plain_secrets_dir, monkeypatch):
+    secrets_dir, _ = plain_secrets_dir
+    owner = (os.getuid(), os.getgid())
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert _run_script(spec).returncode == 0
+    handover = rental_docker_sdk.build_pod_secrets_handover_spec(container_name="pod", secrets=SECRETS, owner=owner)
+    assert _run_script(handover).returncode == 0
+    assert sorted(os.listdir(secrets_dir)) == sorted([*SECRETS, ".ready"])
+    for name, value in SECRETS.items():
+        info = (secrets_dir / name).lstat()
+        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o400
+        assert (info.st_uid, info.st_gid) == owner
+        assert (secrets_dir / name).read_text() == value
+    assert stat.S_IMODE(secrets_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("planted", [".HF_TOKEN.partial", "HF_TOKEN"])
+@pytest.mark.parametrize("kind", ["symlink", "dangling symlink", "file"])
+def test_a_planted_path_cannot_redirect_a_write_and_the_write_fails_closed(
+    plain_secrets_dir, monkeypatch, planted, kind
+):
+    secrets_dir, victim = plain_secrets_dir
+    path = secrets_dir / planted
+    if kind == "symlink":
+        path.symlink_to(victim)
+    elif kind == "dangling symlink":
+        path.symlink_to(secrets_dir.parent / "does-not-exist")
+    else:
+        path.write_text("planted")
+    spec = build_secret_file_exec_specs(container_name="pod", secrets={"HF_TOKEN": SECRETS["HF_TOKEN"]})[0]
+
+    run = _run_script(spec)
+
+    assert run.returncode != 0
+    assert "already exists" in run.stderr
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert not (secrets_dir.parent / "does-not-exist").exists()
+    for value in SECRET_VALUES:
+        assert value not in run.stderr
+
+
+def test_a_link_swapped_in_between_writes_fails_the_handover_without_touching_its_target(
+    plain_secrets_dir, monkeypatch
+):
+    secrets_dir, victim = plain_secrets_dir
+    specs = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)
+    assert _run_script(specs[0]).returncode == 0
+    (secrets_dir / "HF_TOKEN").unlink()
+    (secrets_dir / "HF_TOKEN").symlink_to(victim)
+    assert _run_script(specs[1]).returncode == 0
+    handover = rental_docker_sdk.build_pod_secrets_handover_spec(
+        container_name="pod", secrets=SECRETS, owner=(os.getuid(), os.getgid())
+    )
+
+    run = _run_script(handover)
+
+    assert run.returncode != 0
+    assert "is not a regular file" in run.stderr
+    assert not os.path.lexists(secrets_dir / ".ready")
+    assert not os.path.lexists(secrets_dir / ".ready.partial")
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(secrets_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_a_failed_handover_fails_the_rent(docker_service, executor_info, keypair, monkeypatch):
+    monkeypatch.setattr(settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.__init__()
+    _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
+    _answer_owner_probe(monkeypatch, docker_client, "1000")
+    original_exec = docker_client.exec_in_container
+
+    async def failing_handover(spec):
+        result = await original_exec(spec)
+        if "chown -h" in " ".join(spec.argv):
+            return ContainerExecResult(exit_status=1, stderr="HF_TOKEN is not a regular file")
+        return result
+
+    monkeypatch.setattr(docker_client, "exec_in_container", failing_handover)
+    result = await docker_service.create_container(
+        payload=_base_create_payload(secrets=SECRETS),
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "write_pod_secrets"
+    assert len(_handover_specs(docker_client)) == 1
+
+
+def _handover(secrets=SECRETS):
+    return rental_docker_sdk.build_pod_secrets_handover_spec(
+        container_name="pod", secrets=secrets, owner=(os.getuid(), os.getgid())
+    )
+
+
+def test_the_ready_marker_appears_only_after_every_file_is_written_and_handed_over(plain_secrets_dir):
+    secrets_dir, _ = plain_secrets_dir
+    specs = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)
+    for spec in specs:
+        assert _run_script(spec).returncode == 0
+        assert not os.path.lexists(secrets_dir / ".ready")
+    assert all(spec.argv[2].count(".ready") == 0 for spec in specs)
+
+    assert _run_script(_handover()).returncode == 0
+
+    marker = secrets_dir / ".ready"
+    info = marker.lstat()
+    assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o444
+    content = marker.read_text().strip()
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", content)
+    for value in SECRET_VALUES:
+        assert value not in content
+    assert sorted(os.listdir(secrets_dir)) == sorted([*SECRETS, ".ready"])
+
+
+def test_a_missing_secret_file_leaves_no_ready_marker(plain_secrets_dir):
+    secrets_dir, _ = plain_secrets_dir
+    first = build_secret_file_exec_specs(container_name="pod", secrets=SECRETS)[0]
+    assert _run_script(first).returncode == 0
+
+    run = _run_script(_handover())
+
+    assert run.returncode != 0
+    assert not os.path.lexists(secrets_dir / ".ready")
+    assert not os.path.lexists(secrets_dir / ".ready.partial")
+
+
+@pytest.mark.parametrize("planted", [".ready", ".ready.partial"])
+def test_a_planted_ready_marker_or_temp_fails_the_handover(plain_secrets_dir, planted):
+    secrets_dir, victim = plain_secrets_dir
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert _run_script(spec).returncode == 0
+    (secrets_dir / planted).symlink_to(victim)
+
+    run = _run_script(_handover())
+
+    assert run.returncode != 0
+    assert "already exists" in run.stderr
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert (secrets_dir / planted).is_symlink()
+    other = ".ready" if planted == ".ready.partial" else ".ready.partial"
+    assert not os.path.lexists(secrets_dir / other)
+
+
+def test_the_marker_is_removed_if_the_directory_handover_fails():
+    script = _handover().argv[2]
+    assert script.rstrip().endswith(f"|| {{ rm -f {POD_SECRETS_DIR}/.ready; exit 1; }}")
+    assert rental_docker_sdk.POD_SECRETS_READY_MARKER == ".ready"
+    # every rename is plain `mv -f`: BusyBox before 1.34 (Alpine 3.14 and older) has no `mv -T`
+    assert "mv -T" not in script
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert "mv -T" not in spec.argv[2]
+    assert not POD_SECRET_NAME_PATTERN.fullmatch(".ready")
+
+
+def test_an_empty_marker_is_never_published(plain_secrets_dir, tmp_path):
+    secrets_dir, _ = plain_secrets_dir
+    for spec in build_secret_file_exec_specs(container_name="pod", secrets=SECRETS):
+        assert _run_script(spec).returncode == 0
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # a `date` that exits 0 without writing, as BusyBox does on a full tmpfs
+    (fake_bin / "date").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "date").chmod(0o755)
+    spec = _handover()
+
+    run = subprocess.run(
+        list(spec.argv),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode != 0
+    assert "could not write the ready marker" in run.stderr
+    assert not os.path.lexists(secrets_dir / ".ready")
+    assert not os.path.lexists(secrets_dir / ".ready.partial")
+
+
+POD_CONTAINER_ID = "c0ffee" + "0" * 58
+PLATFORM_START = "2026-09-28T19:00:00.000000001Z"
+LATER_START = "2026-09-28T19:30:00.000000002Z"
+PAST_GRACE = POD_SECRETS_LOST_GRACE_SECONDS + 60
+
+
+def _run_lost_probe(
+    tmp_path,
+    *,
+    mounted: bool,
+    ready: bool,
+    age_seconds: int,
+    restart_count: int = 0,
+    exec_reachable: bool = True,
+    files_left: bool = False,
+    status: str = "running",
+    started_at: str = PLATFORM_START,
+    platform_started_at: str | None = None,
+    starts_dir: Path | None = None,
+) -> str:
+    """Runs the host probe against a fake `docker` that answers `inspect` and `exec` like dockerd.
+
+    `exec` runs the probe's real in-container check against a stand-in secrets directory.
+    """
+    created = time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - age_seconds))
+    tmpfs = "secrets" if mounted else ""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    if ready:
+        (secrets_dir / POD_SECRETS_READY_MARKER).write_text("2026-01-01T00:00:00Z\n")
+    if files_left:
+        (secrets_dir / "HF_TOKEN").write_text("value")
+    starts_dir = starts_dir or tmp_path / "platform-starts"
+    if platform_started_at is not None:
+        starts_dir.mkdir()
+        (starts_dir / POD_CONTAINER_ID).write_text(f"{platform_started_at}\n")
+    exec_answer = '"$@"' if exec_reachable else "echo 'container is restarting' >&2; exit 1"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$0.calls"\n'
+        'case "$1" in\n'
+        f'  inspect) echo "{restart_count} {created} {status} {started_at} {POD_CONTAINER_ID} {tmpfs}" ;;\n'
+        f"  exec) shift 4; {exec_answer} ;;\n"
+        "esac\n"
+    )
+    fake_docker.chmod(0o755)
+    script = (
+        build_pod_secrets_lost_probe_command("tenant-123")
+        .replace("/usr/bin/docker", str(fake_docker))
+        .replace(POD_SECRETS_DIR, str(secrets_dir))
+        .replace(POD_PLATFORM_STARTS_DIR, str(starts_dir))
+    )
+    run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0
+    return run.stdout.strip()
+
+
+def test_lost_probe_reads_the_pods_own_container():
+    command = build_pod_secrets_lost_probe_command("tenant-123")
+    assert "/usr/bin/docker inspect --format" in command
+    assert f'index .HostConfig.Tmpfs "{POD_SECRETS_DIR}"' in command
+    assert "/usr/bin/docker exec -u 0 tenant-123 " in command
+
+
+def test_lost_probe_flags_an_empty_secrets_mount_after_a_restart(tmp_path):
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("exec_reachable", [True, False], ids=["up-between-restarts", "restarting"])
+def test_lost_probe_flags_a_crash_looping_pod_before_the_grace(tmp_path, exec_reachable):
+    # The workload's 2-minute `.ready` timeout exits the main process, and `unless-stopped` brings it
+    # back with a new, empty tmpfs: the container is younger than the grace only on its first run.
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=130, restart_count=1, exec_reachable=exec_reachable
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("age_seconds", [130, POD_SECRETS_LOST_GRACE_SECONDS + 60])
+def test_lost_probe_flags_a_restarted_pod_without_the_ready_marker(tmp_path, age_seconds):
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=age_seconds, restart_count=1
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("age_seconds", [130, POD_SECRETS_LOST_GRACE_SECONDS + 60])
+def test_lost_probe_spares_a_pod_that_crashed_before_delivery(tmp_path, age_seconds):
+    # `unless-stopped` restarts a workload that died before the secrets step; the step then fills the
+    # restarted run's tmpfs, so `.ready` is there and RestartCount stays 1 for the life of the pod.
+    assert _run_lost_probe(tmp_path, mounted=True, ready=True, age_seconds=age_seconds, restart_count=1) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect", "exec"]
+
+
+def test_lost_probe_counts_the_age_from_the_container_not_the_mount(tmp_path):
+    # A restart Docker does not count (dockerd restart, host reboot) still leaves the old `Created`.
+    assert _run_lost_probe(
+        tmp_path, mounted=True, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 1, restart_count=0
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize(
+    "mounted,ready,age_seconds,restart_count,exec_reachable",
+    [
+        # the pod was created without secrets: no mount, even after restarts
+        (False, False, POD_SECRETS_LOST_GRACE_SECONDS + 60, 3, True),
+        # delivered and still there
+        (True, True, POD_SECRETS_LOST_GRACE_SECONDS + 60, 0, True),
+        # just created: delivery may still be running
+        (True, False, 5, 0, True),
+        # old, never restarted, but exec could not look: no verdict
+        (True, False, POD_SECRETS_LOST_GRACE_SECONDS + 60, 0, False),
+    ],
+)
+def test_lost_probe_stays_quiet_otherwise(tmp_path, mounted, ready, age_seconds, restart_count, exec_reachable):
+    assert (
+        _run_lost_probe(
+            tmp_path,
+            mounted=mounted,
+            ready=ready,
+            age_seconds=age_seconds,
+            restart_count=restart_count,
+            exec_reachable=exec_reachable,
+        )
+        == ""
+    )
+
+
+@pytest.mark.parametrize("restart_count", [0, 1], ids=["never-restarted", "restarted-before-delivery"])
+def test_lost_probe_spares_a_pod_whose_renter_deleted_the_ready_marker(tmp_path, restart_count):
+    # after the handover the renter owns the directory; a restarted tmpfs is always empty
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        files_left=True,
+        age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60,
+        restart_count=restart_count,
+    ) == ""
+
+
+@pytest.mark.parametrize("restart_count", [0, 1])
+def test_lost_probe_flags_a_restarted_pod_with_an_empty_mount(tmp_path, restart_count):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        files_left=False,
+        age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60,
+        restart_count=restart_count,
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_lost_probe_gives_no_verdict_on_a_paused_pod(tmp_path, ready):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=ready,
+        age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60,
+        restart_count=1,
+        exec_reachable=False,
+        status="paused",
+    ) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["delivered", "never-delivered"])
+def test_lost_probe_gives_no_verdict_on_a_stopped_pod_docker_restarted_before(tmp_path, ready):
+    # crashed once before delivery, delivered on the restarted run, then stopped by the renter:
+    # exec into a stopped container prints nothing, which must not read as an empty mount
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=ready,
+        age_seconds=PAST_GRACE,
+        restart_count=1,
+        exec_reachable=False,
+        status="exited",
+    ) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+def test_lost_probe_still_flags_a_pod_docker_is_restarting(tmp_path):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=130,
+        restart_count=2,
+        exec_reachable=False,
+        status="restarting",
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+def test_lost_probe_skips_exec_for_a_pod_without_secrets(tmp_path):
+    _run_lost_probe(tmp_path, mounted=False, ready=False, age_seconds=POD_SECRETS_LOST_GRACE_SECONDS + 60)
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+def test_lost_probe_spares_a_stop_and_start_the_platform_made(tmp_path):
+    # a stop/start from the pod page or an edit rollback: empty mount, RestartCount 0, old Created
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        started_at=PLATFORM_START,
+        platform_started_at=PLATFORM_START,
+    ) == ""
+
+
+@pytest.mark.parametrize(
+    "restart_count,exec_reachable,status",
+    [(0, True, "running"), (1, True, "running"), (2, True, "running"), (2, False, "restarting")],
+    ids=["host-reboot-or-dockerd-restart", "crash", "ready-timeout-twice", "restarting"],
+)
+def test_lost_probe_spares_every_restart_after_a_platform_start(tmp_path, restart_count, exec_reachable, status):
+    # the platform-started run never gets secrets again, so its `.ready` wait times out, the workload
+    # exits and Docker restarts it: a new run with a new StartedAt, still not the host's doing
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        restart_count=restart_count,
+        exec_reachable=exec_reachable,
+        status=status,
+        started_at=LATER_START,
+        platform_started_at=PLATFORM_START,
+    ) == ""
+    calls = (tmp_path / "docker.calls").read_text().splitlines()
+    assert [call.split()[0] for call in calls] == ["inspect"]
+
+
+def test_lost_probe_ignores_a_record_of_another_container(tmp_path):
+    starts_dir = tmp_path / "platform-starts"
+    starts_dir.mkdir()
+    (starts_dir / ("b" * 64)).write_text(f"{PLATFORM_START}\n")
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        restart_count=2,
+        started_at=LATER_START,
+        starts_dir=starts_dir,
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("restart_count", [0, 1], ids=["host-reboot", "crash"])
+def test_lost_probe_flags_a_restart_with_no_platform_start(tmp_path, restart_count):
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        restart_count=restart_count,
+        started_at=LATER_START,
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+def _run_record_platform_start(tmp_path, *, started_at: str = PLATFORM_START):
+    starts_dir = tmp_path / "platform-starts"
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=started_at).replace(
+        POD_PLATFORM_STARTS_DIR, str(starts_dir)
+    )
+    run = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return starts_dir
+
+
+def test_a_platform_start_records_the_runs_started_at_root_only(tmp_path):
+    starts_dir = _run_record_platform_start(tmp_path)
+    assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{PLATFORM_START}\n"
+    assert stat.S_IMODE(starts_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((starts_dir / POD_CONTAINER_ID).stat().st_mode) == 0o600
+    assert [path.name for path in starts_dir.iterdir()] == [POD_CONTAINER_ID]
+
+
+def test_a_later_platform_start_replaces_the_record(tmp_path):
+    _run_record_platform_start(tmp_path)
+    starts_dir = _run_record_platform_start(tmp_path, started_at=LATER_START)
+    assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{LATER_START}\n"
+
+
+@pytest.mark.parametrize(
+    "container_id,started_at",
+    [
+        ("tenant-123; echo MARKER", PLATFORM_START),
+        ("../" + "a" * 61, PLATFORM_START),
+        ("A" * 64, PLATFORM_START),
+        (POD_CONTAINER_ID, "2026-09-28T19:00:00Z; echo MARKER"),
+        (POD_CONTAINER_ID, ""),
+        (None, PLATFORM_START),
+    ],
+)
+def test_the_record_takes_only_a_container_id_and_a_docker_timestamp(container_id, started_at):
+    with pytest.raises(ValueError):
+        build_record_platform_start_command(container_id=container_id, started_at=started_at)
+
+
+def test_the_record_lives_on_the_executors_reserve_volume_and_the_probe_reads_it_by_id():
+    record = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START)
+    probe = build_pod_secrets_lost_probe_command("tenant-123")
+    assert f"{POD_PLATFORM_STARTS_DIR}/{POD_CONTAINER_ID}" in record
+    assert "docker" not in record and "tenant-123" not in record
+    assert "{{.Id}}" in probe and f'{POD_PLATFORM_STARTS_DIR}/"$5"' in probe
+
+
+def test_the_record_path_is_on_the_reserve_volume_every_executor_compose_file_mounts():
+    # the validator's SSH lands in the executor container; its /var/lib/lium is the writable layer,
+    # gone after every executor update, while the `reserve_data` named volume outlives a recreate
+    assert POD_PLATFORM_STARTS_VOLUME == "/var/lium-reserve"
+    assert POD_PLATFORM_STARTS_DIR == f"{POD_PLATFORM_STARTS_VOLUME}/pod-platform-starts"
+    executor_dir = Path(__file__).resolve().parents[2] / "executor"
+    compose_files = sorted(executor_dir.glob("docker-compose.app*.yml"))
+    assert [path.name for path in compose_files] == [
+        "docker-compose.app.dev.yml",
+        "docker-compose.app.local.yml",
+        "docker-compose.app.yml",
+    ]
+    for compose_file in compose_files:
+        compose = compose_file.read_text()
+        assert f"reserve_data:{POD_PLATFORM_STARTS_VOLUME}" in compose, compose_file.name
+
+
+def _record_on_volume(volume: Path, *, started_at: str = PLATFORM_START) -> subprocess.CompletedProcess:
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=started_at).replace(
+        POD_PLATFORM_STARTS_VOLUME, str(volume)
+    )
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
+
+
+def test_a_platform_start_record_survives_an_executor_recreate(tmp_path):
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    old_layer = tmp_path / "executor-writable-layer"
+    old_layer.mkdir()
+    assert _record_on_volume(volume).returncode == 0
+
+    # recreate: the old container's writable layer is gone, the named volume is mounted again
+    subprocess.run(["rm", "-rf", str(old_layer)], check=True)
+    recreated = tmp_path / "recreated"
+    recreated.mkdir()
+    remounted = recreated / "reserve_data"
+    os.rename(volume, remounted)
+
+    starts_dir = remounted / "pod-platform-starts"
+    assert stat.S_IMODE(starts_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((starts_dir / POD_CONTAINER_ID).stat().st_mode) == 0o600
+    assert _run_lost_probe(
+        recreated,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        started_at=PLATFORM_START,
+        starts_dir=starts_dir,
+    ) == ""
+
+
+def test_a_start_that_loses_the_first_record_mkdir_race_still_records(tmp_path):
+    # the other start creates the directory between this one's check and its mkdir: `File exists`
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "mkdir"
+    shim.write_text(
+        "#!/bin/sh\n"
+        '/bin/mkdir "$@"\n'
+        'echo "mkdir: cannot create directory \'$1\': File exists" >&2\n'
+        "exit 1\n"
+    )
+    shim.chmod(0o755)
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START).replace(
+        POD_PLATFORM_STARTS_VOLUME, str(volume)
+    )
+    run = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PATH": f"{shim_dir}:{os.environ['PATH']}"},
+    )
+
+    assert run.returncode == 0, run.stderr
+    starts_dir = volume / "pod-platform-starts"
+    assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{PLATFORM_START}\n"
+    assert stat.S_IMODE(starts_dir.stat().st_mode) == 0o700
+
+
+def test_two_platform_starts_recording_at_once_both_succeed(tmp_path):
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    for _ in range(20):
+        subprocess.run(["rm", "-rf", str(volume / "pod-platform-starts")], check=True)
+        scripts = [
+            build_record_platform_start_command(container_id=container_id, started_at=PLATFORM_START).replace(
+                POD_PLATFORM_STARTS_VOLUME, str(volume)
+            )
+            for container_id in (POD_CONTAINER_ID, "b" * 64)
+        ]
+        runs = [subprocess.Popen(["sh", "-c", script], stderr=subprocess.PIPE, text=True) for script in scripts]
+        results = [(run.wait(timeout=30), run.stderr.read()) for run in runs]
+        assert [code for code, _ in results] == [0, 0], results
+
+
+def test_two_records_of_one_container_at_once_both_succeed(tmp_path):
+    volume = tmp_path / "reserve_data"
+    volume.mkdir()
+    script = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=PLATFORM_START).replace(
+        POD_PLATFORM_STARTS_VOLUME, str(volume)
+    )
+    starts_dir = volume / "pod-platform-starts"
+    for _ in range(20):
+        runs = [subprocess.Popen(["sh", "-c", script], stderr=subprocess.PIPE, text=True) for _ in range(8)]
+        results = [(run.wait(timeout=30), run.stderr.read()) for run in runs]
+        assert [code for code, _ in results] == [0] * 8, results
+        assert [path.name for path in starts_dir.iterdir()] == [POD_CONTAINER_ID]
+        assert (starts_dir / POD_CONTAINER_ID).read_text() == f"{PLATFORM_START}\n"
+
+
+def test_with_no_reserve_volume_the_record_fails_and_the_start_is_flagged(tmp_path):
+    missing_volume = tmp_path / "reserve_data"
+    run = _record_on_volume(missing_volume)
+    assert run.returncode != 0
+    assert not missing_volume.exists()
+    assert _run_lost_probe(
+        tmp_path,
+        mounted=True,
+        ready=False,
+        age_seconds=PAST_GRACE,
+        started_at=PLATFORM_START,
+        starts_dir=missing_volume / "pod-platform-starts",
+    ) == POD_SECRETS_LOST_OUTPUT
+
+
+@pytest.mark.parametrize("tmpfs,expected", [({POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}, True), (None, False)])
+@pytest.mark.asyncio
+async def test_the_container_state_carries_what_the_platform_start_record_needs(tmpfs, expected):
+    api_client = FakeApiClient()
+    api_client.container_states = [
+        {
+            "Id": POD_CONTAINER_ID,
+            "State": {"Status": "running", "Running": True, "StartedAt": PLATFORM_START},
+            "HostConfig": {"Tmpfs": tmpfs},
+        }
+    ]
+
+    state = await RentalDockerSdkClient(api_client).inspect_container_state(container_name="tenant-123")
+
+    assert (state.container_id, state.started_at, state.has_secrets_tmpfs) == (
+        POD_CONTAINER_ID,
+        PLATFORM_START,
+        expected,
+    )

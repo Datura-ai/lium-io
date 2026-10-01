@@ -32,6 +32,7 @@ from neurons.validators.src.services.task.pipeline import (
 from protocol.vc_protocol.compute_requests import PodSshUnreachableResponse
 from pydantic import ValidationError
 from test_rented_pod_ssh_probe import KEYS, POD_ID, SSH_PORT, Harness
+from test_rented_machine_check import SecretsLostSSHClient
 
 ENFORCED_LOG = "RENTED_POD_SSH_UNREACHABLE_ENFORCED"
 CHECK_ID = rented_machine.TenantEnforcementCheck.check_id
@@ -153,6 +154,24 @@ async def test_flag_on_and_streak_at_the_threshold_fails_the_check(context_facto
         assert KEY_MATERIAL not in text and "ssh-ed25519" not in text
     # The failing result carries no keys either: POD_NOT_RUNNING, its sibling in this check, does not.
     assert "ssh_pub_keys" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_an_enforced_cycle_names_the_pods_that_lost_their_secrets(context_factory, monkeypatch):
+    monkeypatch.setattr(rented_machine.settings, "POD_SECRETS_TMPFS_ENABLED", True)
+    h = Harness(context_factory)
+    with enforcement(enabled=True):
+        await two_refused_cycles_after_a_healthy_one(h)
+        result = await h.cycle(
+            tcp_fault=FAULT_TCP_REFUSED,
+            ssh_keys=KEYS,
+            boot_id="boot-b",
+            ssh=SecretsLostSSHClient(pod_running=True, ssh_keys=KEYS),
+        )
+
+    assert result.passed is False
+    assert result.event.what_we_saw["enforced"] is True
+    assert result.event.what_we_saw["secrets_lost_pods"] == [{"pod_id": POD_ID, "container_name": "pod_1"}]
 
 
 @pytest.mark.asyncio

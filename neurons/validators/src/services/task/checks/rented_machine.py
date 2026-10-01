@@ -9,6 +9,7 @@ import asyncssh
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedPod
+from services.rental_docker_sdk import POD_SECRETS_LOST_OUTPUT, build_pod_secrets_lost_probe_command
 from protocol.vc_protocol.validator_requests import (
     ContainerState,
     PodContainerState,
@@ -187,9 +188,24 @@ class TenantEnforcementCheck:
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
         state_by_pod_id: dict[str, ContainerState] = {}
+        secrets_lost_pods: list[dict[str, str]] = []
 
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
+
+        def log_secrets_lost_pods() -> None:
+            if secrets_lost_pods:
+                logger.warning(
+                    _m(
+                        "Rented pod lost its secrets after a restart",
+                        extra=get_extra_info({**extra, "secrets_lost_pods": secrets_lost_pods}),
+                    )
+                )
+
+        def ended_in_loop(result: CheckResult) -> CheckResult:
+            # a later pod ends the cycle here, so the pods already found with lost secrets are named now
+            log_secrets_lost_pods()
+            return with_pod_states(result)
 
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.container_name
@@ -197,7 +213,7 @@ class TenantEnforcementCheck:
             try:
                 pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, pod_container_name)
             except (asyncssh.Error, OSError) as exc:
-                return with_pod_states(
+                return ended_in_loop(
                     _executor_transport_unreachable_result(
                         ctx=ctx,
                         check_id=self.check_id,
@@ -244,7 +260,7 @@ class TenantEnforcementCheck:
                             what={**port_floor_what(ctx.state, port_count_below_floor), "stale_pod": stale_what},
                             extra=extra,
                         )
-                        return with_pod_states(
+                        return ended_in_loop(
                             CheckResult(
                                 passed=False,
                                 event=event,
@@ -267,7 +283,7 @@ class TenantEnforcementCheck:
                         what=stale_what,
                         extra=extra,
                     )
-                    return with_pod_states(
+                    return ended_in_loop(
                         CheckResult(
                             passed=True,
                             event=event,
@@ -279,6 +295,11 @@ class TenantEnforcementCheck:
                         )
                     )
 
+                # Probed before recovery: a crash-looping pod is often caught between restarts, and the
+                # host-side probe flags a restarted container whose `.ready` exec does not answer.
+                secrets_lost = await _pod_secrets_lost(ctx.ssh, pod_container_name)
+                if secrets_lost:
+                    secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
                 outcome = await self._recover_downed_pod(
                     ctx=ctx,
                     container_name=pod_container_name,
@@ -286,14 +307,21 @@ class TenantEnforcementCheck:
                     diagnostics=diagnostics,
                     local_volume_path=rental_active.local_volume_path if rental_active else None,
                     extra=extra,
+                    secrets_lost=secrets_lost,
                 )
                 state_by_pod_id[pod_id] = outcome.container_state
                 if outcome.failure:
-                    return with_pod_states(outcome.failure)
+                    return ended_in_loop(outcome.failure)
                 ssh_pub_keys = outcome.ssh_pub_keys
+                # A pod down after a host reboot has RestartCount 0 and refuses exec while stopped, so
+                # the probe above could not tell; the started container answers `.ready` now.
+                if not secrets_lost and await _pod_secrets_lost(ctx.ssh, pod_container_name):
+                    secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
                 # Just recovered: judged from the renter's side next cycle, not on the way up.
                 continue
 
+            if await _pod_secrets_lost(ctx.ssh, pod_container_name):
+                secrets_lost_pods.append({"pod_id": pod_id, "container_name": pod_container_name})
             if ssh_pub_keys is None:
                 # dockerd refused the keys read: not judged from the renter's side this cycle.
                 ssh_pub_keys = []
@@ -301,6 +329,9 @@ class TenantEnforcementCheck:
             verdict = await probe_rented_pod_ssh(ctx, pod, ssh_pub_keys)
             if verdict is not None:
                 ssh_verdicts.append(verdict)
+
+        log_secrets_lost_pods()
+        lost_what = {"secrets_lost_pods": secrets_lost_pods} if secrets_lost_pods else {}
 
         container_names = [pod.container_name for pod in rented_pods]
         container_names.extend(filler_containers)
@@ -321,6 +352,7 @@ class TenantEnforcementCheck:
                         "gpu_utilization": observation["gpu_utilization"],
                         "vram_utilization": observation["vram_utilization"],
                         "gpu_processes": gpu_processes,
+                        **lost_what,
                     },
                     extra=extra
                 )
@@ -340,7 +372,7 @@ class TenantEnforcementCheck:
         enforced = [verdict for verdict in reported if is_enforced(verdict)]
         if enforced:
             return self._failed_result_for_enforced_ssh_outage(
-                ctx, reported=reported, enforced=enforced, extra=extra
+                ctx, reported=reported, enforced=enforced, extra=extra, lost_what=lost_what
             )
 
         score_calculator = ctx.services.score_calculator
@@ -352,6 +384,8 @@ class TenantEnforcementCheck:
             "actual_score": actual_score,
             "job_score": job_score,
         }
+        if secrets_lost_pods:
+            what["secrets_lost_pods"] = secrets_lost_pods
         # A pod that just crossed the unhealthy threshold owns this cycle's event, so the outage is
         # what the backend stores and the portal shows. The score is the rented score: with the
         # enforcement flag off (the default) this verdict is reported, not scored (DAH-2870).
@@ -375,6 +409,17 @@ class TenantEnforcementCheck:
                     **what,
                     "unreachable_pods": [verdict_log_fields(verdict) for verdict in reported],
                 },
+                extra=extra,
+            )
+        elif secrets_lost_pods:
+            event = render_message(
+                Msg.RENTED_POD_SECRETS_LOST,
+                ctx=ctx,
+                check_id=self.check_id,
+                remediation=(
+                    f"{Msg.RENTED_POD_SECRETS_LOST.remediation}{warning_message}" if warning_message else None
+                ),
+                what=what,
                 extra=extra,
             )
         else:
@@ -414,6 +459,7 @@ class TenantEnforcementCheck:
         reported: list[RentedPodSshVerdict],
         enforced: list[RentedPodSshVerdict],
         extra: dict[str, Any],
+        lost_what: dict[str, Any] | None = None,
     ) -> CheckResult:
         """The cycle's failing result when a rented pod's SSH outage is past the enforce threshold (DAH-2255).
 
@@ -436,6 +482,7 @@ class TenantEnforcementCheck:
                 "enforced": True,
                 "enforce_after_cycles": threshold,
                 "unreachable_pods": [verdict_log_fields(verdict) for verdict in reported],
+                **(lost_what or {}),
             },
             extra=extra,
         )
@@ -491,6 +538,7 @@ class TenantEnforcementCheck:
         diagnostics: dict[str, object],
         local_volume_path: str | None,
         extra: dict[str, Any],
+        secrets_lost: bool = False,
     ) -> _DownedPodOutcome:
         # a rented pod found not running: heal it when it carries the DAH-2306 reboot signature,
         # and report POD_NOT_RUNNING only if it is still down afterwards.
@@ -541,6 +589,11 @@ class TenantEnforcementCheck:
                 "container_name": container_name,
                 "executor_uuid": ctx.executor.uuid,
                 "diagnostics": diagnostics,
+                **(
+                    {"secrets_lost_pods": [{"pod_id": pod_id, "container_name": container_name}]}
+                    if secrets_lost
+                    else {}
+                ),
             },
             extra=extra,
         )
@@ -766,6 +819,17 @@ async def _check_pod_running_and_read_authorized_keys(
         ssh_keys = []
 
     return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys)
+
+
+async def _pod_secrets_lost(ssh_client, container_name: str) -> bool:
+    # Off: no pod has a secrets mount, so no extra command per pod. Any failure reads as "not lost".
+    if not settings.POD_SECRETS_TMPFS_ENABLED:
+        return False
+    try:
+        result = await ssh_client.run(build_pod_secrets_lost_probe_command(container_name))
+    except Exception:
+        return False
+    return (result.stdout or "").strip() == POD_SECRETS_LOST_OUTPUT
 
 
 # The diagnostics fields that decide whether a not-running container is the provider's fault (host lost the

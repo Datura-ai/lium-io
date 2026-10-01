@@ -36,6 +36,7 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     _wrap_error_message,
     build_gpu_docker_config,
+    build_record_platform_start_command,
 )
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
@@ -3155,6 +3156,243 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
             "executor_ssh_port": 2200,
         },
     )
+
+
+POD_CONTAINER_ID = "a" * 64
+POD_STARTED_AT = "2026-09-28T19:58:15.767828722Z"
+
+
+POD_EARLIER_STARTED_AT = "2026-09-28T18:02:41.120394861Z"
+
+
+def _start_request_harness(
+    docker_service,
+    monkeypatch,
+    *,
+    record_exit_status: int = 0,
+    secrets: bool = True,
+    already_running: bool = False,
+):
+    record_command = build_record_platform_start_command(container_id=POD_CONTAINER_ID, started_at=POD_STARTED_AT)
+    docker_client = docker_service.rental_docker_client_factory.client
+
+    async def _run(cmd, *args, **kwargs):
+        if cmd == record_command:
+            return _make_ssh_command_result(exit_status=record_exit_status, stderr="mkdir: permission denied")
+        return _make_ssh_command_result(stdout="")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=_run)
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
+    def _state(*, container_name: str) -> ContainerStateSnapshot:
+        # a stopped pod keeps its last run's StartedAt until `docker start` begins a new run
+        running = already_running or container_name in docker_client.started_containers
+        return ContainerStateSnapshot(
+            status="running" if running else "exited",
+            running=running,
+            restarting=False,
+            exit_code=0,
+            restart_count=0,
+            error=None,
+            oom_killed=False,
+            container_id=POD_CONTAINER_ID,
+            started_at=POD_STARTED_AT if running else POD_EARLIER_STARTED_AT,
+            has_secrets_tmpfs=secrets,
+        )
+
+    docker_client.inspect_container_state = AsyncMock(side_effect=_state)
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    return ssh_client, record_command, executor_info
+
+
+def _ran(ssh_client) -> list[str]:
+    return [call.args[0] for call in ssh_client.run.await_args_list]
+
+
+async def _start_existing(docker_service, executor_info, **kwargs):
+    await docker_service.start_existing_container(
+        executor_info=executor_info,
+        private_key="private-key",
+        known_hosts_policy=None,
+        container_name="pod_test",
+        local_volume_path="/root",
+        pod_id="pod-id",
+        default_extra={},
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("record_platform_start", [True, False], ids=["start-request", "reboot-recovery"])
+@pytest.mark.asyncio
+async def test_only_a_requested_start_is_recorded_as_a_platform_start(
+    docker_service, monkeypatch, record_platform_start
+):
+    # a stop/start from the pod page empties the secrets tmpfs by design; the recovery of a pod the
+    # host lost in a reboot must stay unrecorded, so the secrets probe still flags it
+    ssh_client, record_command, executor_info = _start_request_harness(docker_service, monkeypatch)
+
+    await _start_existing(docker_service, executor_info, record_platform_start=record_platform_start)
+
+    assert (record_command in _ran(ssh_client)) is record_platform_start
+
+
+@pytest.mark.asyncio
+async def test_a_start_request_records_the_platform_start(docker_service, monkeypatch):
+    ssh_client, record_command, executor_info = _start_request_harness(docker_service, monkeypatch)
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/root",
+    )
+
+    await docker_service.start_container(payload, executor_info, Mock(ss58_address="validator-hotkey"), "encrypted")
+
+    assert record_command in _ran(ssh_client)
+
+
+@pytest.mark.asyncio
+async def test_an_edit_rollback_records_the_platform_start(docker_service, monkeypatch):
+    ssh_client, record_command, _ = _start_request_harness(docker_service, monkeypatch)
+
+    await docker_service._bring_up_existing_container(
+        docker_client=docker_service.rental_docker_client_factory.client,
+        ssh_client=ssh_client,
+        container_name="pod_test",
+        local_volume_path="/root",
+        pod_id="pod-id",
+        default_extra={},
+    )
+
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert record_command in _ran(ssh_client)
+
+
+@pytest.mark.asyncio
+async def test_an_edit_rollback_on_a_pod_still_running_records_nothing(docker_service, monkeypatch):
+    # park's stop failed, so the undo's start is a 304 on the run already going
+    ssh_client, _, _ = _start_request_harness(docker_service, monkeypatch, already_running=True)
+
+    await docker_service._bring_up_existing_container(
+        docker_client=docker_service.rental_docker_client_factory.client,
+        ssh_client=ssh_client,
+        container_name="pod_test",
+        local_volume_path="/root",
+        pod_id="pod-id",
+        default_extra={},
+    )
+
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+
+
+@pytest.mark.asyncio
+async def test_a_platform_start_of_a_pod_without_secrets_records_nothing(docker_service, monkeypatch):
+    ssh_client, _, executor_info = _start_request_harness(docker_service, monkeypatch, secrets=False)
+
+    await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+
+
+@pytest.mark.asyncio
+async def test_a_start_request_on_a_running_pod_records_nothing(docker_service, monkeypatch):
+    # Docker answers 304 and the run is the one already going, maybe one a host restart began:
+    # recording it would stop the secrets probe from flagging that restart
+    ssh_client, _, executor_info = _start_request_harness(docker_service, monkeypatch, already_running=True)
+
+    await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+
+
+def _fail_the_read_before_the_start(docker_client) -> None:
+    read_after_start = docker_client.inspect_container_state.side_effect
+
+    async def _inspect(*, container_name: str):
+        if container_name not in docker_client.started_containers:
+            raise RuntimeError("dockerd did not answer")
+        return read_after_start(container_name=container_name)
+
+    docker_client.inspect_container_state = AsyncMock(side_effect=_inspect)
+
+
+@pytest.mark.asyncio
+async def test_a_start_request_is_not_recorded_when_the_state_before_it_cannot_be_read(
+    docker_service, monkeypatch, caplog
+):
+    # a record exempts the container for good, so an unsure start must flag rather than hide
+    ssh_client, _, executor_info = _start_request_harness(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    _fail_the_read_before_the_start(docker_client)
+
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert docker_client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    assert any("the platform start is not recorded" in str(record.msg) for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_an_edit_rollback_is_not_recorded_when_the_state_before_it_cannot_be_read(
+    docker_service, monkeypatch, caplog
+):
+    ssh_client, _, _ = _start_request_harness(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    _fail_the_read_before_the_start(docker_client)
+
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await docker_service._bring_up_existing_container(
+            docker_client=docker_client,
+            ssh_client=ssh_client,
+            container_name="pod_test",
+            local_volume_path="/root",
+            pod_id="pod-id",
+            default_extra={},
+        )
+
+    assert docker_client.started_containers == ["pod_test"]
+    assert not any("pod-platform-starts" in command for command in _ran(ssh_client))
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    assert any("the platform start is not recorded" in str(record.msg) for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_platform_start_record_only_warns(docker_service, monkeypatch, caplog):
+    ssh_client, record_command, executor_info = _start_request_harness(
+        docker_service, monkeypatch, record_exit_status=1
+    )
+
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await _start_existing(docker_service, executor_info, record_platform_start=True)
+
+    assert record_command in _ran(ssh_client)
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    assert any("Could not record a platform start" in str(record.msg) for record in caplog.records)
 
 
 @pytest.mark.asyncio

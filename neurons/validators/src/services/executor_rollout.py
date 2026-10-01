@@ -87,13 +87,15 @@ ROLLOUT_FAILURE_REASONS = frozenset(
 _OUTDATED = ExecutorImageMessages.OUTDATED.reason
 # The ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
-# (RENTED, or RENTED_POD_SSH_UNREACHABLE when the renter's SSH is being reported — DAH-2870, the
-# same halt with a different reason); a run that reaches finalize ends on VALIDATION_COMPLETED.
+# (RENTED, or RENTED_POD_SSH_UNREACHABLE when the renter's SSH is being reported — DAH-2870, or
+# RENTED_POD_SECRETS_LOST when a pod's secrets tmpfs came back empty: the same halt with a different
+# reason); a run that reaches finalize ends on VALIDATION_COMPLETED.
 RUN_ENDED_WITHOUT_FAILING = frozenset(
     {
         FinalizeMessages.COMPLETED.reason,
         TenantEnforcementMessages.ALREADY_RENTED.reason,
         TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason,
+        TenantEnforcementMessages.RENTED_POD_SECRETS_LOST.reason,
     }
 )
 

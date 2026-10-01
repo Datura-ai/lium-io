@@ -123,8 +123,15 @@ from services.rental_docker_sdk import (
     build_container_command_argv,
     is_docker_not_found_error,
     build_environment_exec_spec,
+    build_pod_secrets_handover_spec,
+    build_pod_secrets_owner_probe_spec,
+    build_pod_secrets_tmpfs,
+    build_record_platform_start_command,
     build_remove_authorized_keys_exec_spec,
+    build_secret_file_exec_specs,
+    parse_pod_secrets_owner,
     require_rental_docker_ssh_host_key,
+    valid_pod_secrets,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
@@ -881,6 +888,58 @@ async def _explain_add_public_keys_failure(
     )
 
 
+async def _record_platform_start(
+    docker_client: RentalDockerSdkClient,
+    ssh_client: asyncssh.SSHClientConnection,
+    container_name: str,
+    default_extra: dict,
+    started_at_before: str | None = None,
+) -> None:
+    """Best effort: without the record, the secrets probe flags this start as a lost-secrets restart.
+
+    `started_at_before` is the `StartedAt` read before the start: when it is unchanged the pod was
+    already running (Docker answers 304), the platform started nothing, and recording that run would
+    hide an earlier restart from the probe. A caller that could not read it records nothing.
+
+    A record exempts its container from the probe for good. Any future path that sends secrets again
+    to an existing container must delete that container's record first.
+    """
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+        if not state.has_secrets_tmpfs:
+            return
+        if started_at_before is not None and state.started_at == started_at_before:
+            return
+        recorded = await ssh_client.run(
+            build_record_platform_start_command(container_id=state.container_id, started_at=state.started_at)
+        )
+        error = (
+            None
+            if recorded.exit_status == 0
+            else (recorded.stderr or "").strip() or f"exit status {recorded.exit_status}"
+        )
+    except Exception as exc:  # noqa: BLE001 — the start itself already succeeded
+        error = f"{type(exc).__name__}: {exc}"
+    if error is not None:
+        logger.warning(
+            _m(
+                "Could not record a platform start of the pod container",
+                extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
+            )
+        )
+
+
+def _warn_platform_start_unrecorded(container_name: str, default_extra: dict, exc: Exception) -> None:
+    logger.warning(
+        _m(
+            "Could not read the pod container's state before the start; the platform start is not recorded",
+            extra=get_extra_info(
+                {**default_extra, "container_name": container_name, "error": f"{type(exc).__name__}: {exc}"}
+            ),
+        )
+    )
+
+
 class _EditSwap:
     """DAH-2740: keep the customer's container until its replacement runs, so a failed edit can be undone.
 
@@ -1235,6 +1294,13 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
         and in_cvm
         and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
     )
+
+
+def _pod_secrets(payload: ContainerCreateRequest) -> dict[str, str]:
+    # With the flag off a sent `secrets` is ignored, so the rent is exactly today's
+    if not settings.POD_SECRETS_TMPFS_ENABLED:
+        return {}
+    return valid_pod_secrets(payload.secrets)
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -1898,6 +1964,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            tmpfs=build_pod_secrets_tmpfs(_pod_secrets(payload)),
         )
 
     async def _ensure_pod_quote_socket(
@@ -4100,6 +4167,72 @@ class DockerService:
 
         return None
 
+    async def add_pod_secrets_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        secrets: dict[str, str],
+        log_tag: str,
+        log_extra: dict,
+    ) -> str | None:
+        # returns the failure cause, or None when every secret file was written; names only in logs
+        try:
+            probe = await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_resolve_pod_secrets_owner",
+                exec_spec=build_pod_secrets_owner_probe_spec(container_name=container_name),
+                log_extra=log_extra,
+            )
+            if probe.exit_status != 0:
+                raise ValueError(
+                    f"could not resolve the container user's uid:gid (exit_status={probe.exit_status})"
+                )
+            owner = parse_pod_secrets_owner(probe.stdout)
+        except Exception as exc:
+            cause = f"secrets owner: {exc}"
+            await self.stream_log("Failed to resolve the container user for secrets", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to resolve pod secrets owner",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": cause}),
+                )
+            )
+            return cause
+        exec_specs = build_secret_file_exec_specs(container_name=container_name, secrets=secrets)
+        steps = [(name, "exec_write_pod_secret", spec, f"secret {name}") for name, spec in zip(secrets, exec_specs)]
+        steps.append(
+            (
+                None,
+                "exec_hand_over_pod_secrets",
+                build_pod_secrets_handover_spec(container_name=container_name, secrets=secrets, owner=owner),
+                "secrets handover",
+            )
+        )
+        for name, operation, exec_spec, label in steps:
+            try:
+                result = await exec_logged_rental_docker_sdk_operation(
+                    docker_client=docker_client,
+                    operation=operation,
+                    exec_spec=exec_spec,
+                    log_extra={**log_extra, "secret_name": name} if name else log_extra,
+                )
+            except Exception as exc:
+                cause = f"{label}: {exc}"
+            else:
+                if result.exit_status == 0:
+                    continue
+                cause = f"{label}: exit_status={result.exit_status}; stderr={result.stderr}"
+            await self.stream_log(f"Failed to write {label}" if name else "Failed to hand over secrets", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to write pod secret",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": cause}),
+                )
+            )
+            return cause
+        return None
+
     async def resolve_sysbox_subuid_base(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -5835,6 +5968,25 @@ class DockerService:
                     failure_step=current_step,
                 )
 
+            try:
+                _pod_secrets(payload)
+            except ValueError as exc:
+                log_text = _m(
+                    "Invalid pod secrets",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+                logger.error(log_text)
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=f"Invalid pod secrets: {exc}",
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                    error_code=FailedContainerErrorCodes.UnknownError,
+                    failure_step=current_step,
+                )
+
             # add executor in pending status dict
             current_step = "pending_pod"
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -6852,6 +7004,19 @@ class DockerService:
                     if environment_error:
                         raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
+                    pod_secrets = _pod_secrets(payload)
+                    if pod_secrets:
+                        current_step = "write_pod_secrets"
+                        secrets_error = await self.add_pod_secrets_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            secrets=pod_secrets,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                        if secrets_error:
+                            raise RuntimeError(f"Failed to write pod secrets: {secrets_error}")
+
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
@@ -7394,6 +7559,7 @@ class DockerService:
                 local_volume_path=payload.local_volume_path,
                 pod_id=payload.pod_id,
                 default_extra=default_extra,
+                record_platform_start=True,
             )
         except Exception as exc:
             log_text = _m(
@@ -7427,6 +7593,7 @@ class DockerService:
         local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
+        record_platform_start: bool = False,
     ) -> None:
         # start a container that already exists and restore the two things a bare `docker start`
         # drops: the gocryptfs plaintext mount of an encrypted rental volume, and the sshd the
@@ -7435,11 +7602,22 @@ class DockerService:
         # A falsy local_volume_path means the caller does not know the plaintext path, which is only
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
+        # record_platform_start: a start the renter or the platform asked for, not the recovery of a
+        # pod the host lost, so the secrets probe does not blame the provider for the empty mount.
         pkey = asyncssh.import_private_key(private_key)
         async with self.rental_docker_client_factory.connect(
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
+            started_at_before = None
+            if record_platform_start:
+                try:
+                    started_at_before = (
+                        await docker_client.inspect_container_state(container_name=container_name)
+                    ).started_at
+                except Exception as exc:  # noqa: BLE001 — unread, the start goes unrecorded
+                    record_platform_start = False
+                    _warn_platform_start_unrecorded(container_name, default_extra, exc)
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start)
             await run_logged_rental_docker_sdk_operation(
@@ -7455,6 +7633,10 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
+                if record_platform_start:
+                    await _record_platform_start(
+                        docker_client, ssh_client, container_name, default_extra, started_at_before
+                    )
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
@@ -7476,12 +7658,26 @@ class DockerService:
     ) -> None:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
         holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
+        started_at_before = None
+        record_platform_start = True
+        try:
+            started_at_before = (
+                await docker_client.inspect_container_state(container_name=container_name)
+            ).started_at
+        except Exception as exc:  # noqa: BLE001 — unread, the start goes unrecorded
+            record_platform_start = False
+            _warn_platform_start_unrecorded(container_name, default_extra, exc)
         await run_logged_rental_docker_sdk_operation(
             operation="start_container",
             log_extra=default_extra,
             call=lambda: docker_client.start(container_name=container_name),
             container_name=container_name,
         )
+        # the undo empties the secrets tmpfs by design; recorded before the remount, which may still fail
+        if record_platform_start:
+            await _record_platform_start(
+                docker_client, ssh_client, container_name, default_extra, started_at_before
+            )
         await self._restore_mount_and_sshd_after_start(
             docker_client=docker_client,
             ssh_client=ssh_client,
