@@ -638,11 +638,11 @@ async def test_summary_emitted_on_success(svc, monkeypatch):
     assert isinstance(extra["total_duration_ms"], int)
     names = {s["name"] for s in extra["profile_steps"]}
     assert "Docker pull step finished" in names
-    assert "Inspector collector start step finished" in names
+    assert "Inspector collector start runs after the reply" in names
     assert "Finished in subnet." in names
     inspector = next(
         s for s in extra["profile_steps"]
-        if s["name"] == "Inspector collector start step finished"
+        if s["name"] == "Inspector collector start runs after the reply"
     )
     assert inspector["skipped"] is True
 
