@@ -822,12 +822,14 @@ class RentalDockerSdkClientFactory:
             if self.api_client_factory is not None:
                 return self.api_client_factory(
                     base_url=base_url,
+                    version=RENTAL_DOCKER_API_VERSION,
                     timeout=self.timeout,
                     use_ssh_client=False,
                 )
 
             return _default_docker_api_client_factory(
                 base_url=base_url,
+                version=RENTAL_DOCKER_API_VERSION,
                 timeout=self.timeout,
                 use_ssh_client=False,
                 key_path=key_path,
@@ -980,6 +982,11 @@ def _create_docker_api_client_with_rental_ssh_adapter(
     finally:
         docker_api_client.SSHHTTPAdapter = original_adapter
 
+
+# LIUM-57: a fixed version spares the `/version` request (its own SSH channel and `dial-stdio`,
+# ~3 round trips) that `version="auto"` makes while constructing the client. 1.44 = Docker 25.0,
+# the oldest API Docker 29 still accepts; a daemon older than 25.0 refuses it.
+RENTAL_DOCKER_API_VERSION = "1.44"
 
 # The Docker SDK SSH session idles through a long build, so it needs a keepalive.
 RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30

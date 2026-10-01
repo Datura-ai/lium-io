@@ -1277,6 +1277,7 @@ async def test_factory_does_not_mutate_home_and_closes_client(monkeypatch):
 
     assert created["kwargs"]["base_url"] == "ssh://root@127.0.0.1:2222"
     assert created["kwargs"]["use_ssh_client"] is False
+    assert created["kwargs"]["version"] == "1.44"
     assert "PRIVATE KEY" not in str(created["kwargs"])
     assert created["observed_home"] == original_home
     assert created["key_mode"] == 0o600
