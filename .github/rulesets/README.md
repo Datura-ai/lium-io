@@ -10,6 +10,14 @@ deployment policy names the only refs allowed to log in: `main` and the release 
 branch stops before the job's first step with "Branch … is not allowed to deploy to
 dockerhub-push" and never gets a Docker Hub token.
 
+The one exception is `executor_cd_dev.yml`, the dev build developers dispatch from feature
+branches: off `main` it runs in a second environment, `dockerhub-push-dev`, with no branch policy.
+Docker trusts that subject only for `daturaai/compute-subnet-executor-dev` and
+`…-executor-runner-dev` (ruleset `lium-io-dev`, `../DOCKERHUB_OIDC.md`), so a branch build
+gets a token that cannot push a release image, whatever its workflow file says. From `main` it
+keeps `dockerhub-push` and the release repositories' `dev` tag. `miner_cd_dev.yml` and
+`validator_cd_dev.yml` are dispatched from `main` only.
+
 The tag ruleset `release-tags` (`release-tags.json`) restricts who may create, move or delete
 those four tag patterns, so only the release role can start a production image push.
 
@@ -42,6 +50,16 @@ lists the five refs.
 
 Optional: "Required reviewers" on the environment makes every production image push a
 two-person action.
+
+The dev environment is created empty, with no branch policy and no secrets: its protection is
+the Docker Hub ruleset's repository list, not GitHub.
+
+```bash
+gh api -X PUT "repos/$R/environments/dockerhub-push-dev"
+```
+
+Check: `gh api "repos/$R/environments/dockerhub-push-dev" --jq '.deployment_branch_policy'` → `null`
+(every branch). Never add the dev subject to the `lium-io-publish` Docker ruleset.
 
 ## 2. Tag ruleset (admin, once)
 

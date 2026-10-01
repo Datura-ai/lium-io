@@ -6,8 +6,12 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: dockerhub-push
+    # From main: the release repositories' `dev` tag, which the dev and staging stacks pull. From any
+    # other branch: `dockerhub-push-dev` (no branch policy), whose Docker Hub ruleset covers only the
+    # `-dev` repositories, so a branch never gets a token for a release image (.github/rulesets/README.md).
+    environment: ${{ github.ref == 'refs/heads/main' && 'dockerhub-push' || 'dockerhub-push-dev' }}
     env:
+      IMAGE_REPO_SUFFIX: ${{ github.ref != 'refs/heads/main' && '-dev' || '' }}
       TAG: "dev" 
       VALIDATOR_HOTKEY_SS58: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
       TARGET_FILE: "docker-compose.app.dev.yml"
