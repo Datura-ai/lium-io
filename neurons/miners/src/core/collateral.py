@@ -75,6 +75,11 @@ GAS_LIMIT = 200_000
 # cannot spend the address balance on fees (at GAS_LIMIT, 100 gwei caps a transaction at 0.02 TAO).
 DEFAULT_MAX_GAS_PRICE_GWEI = 100
 RECLAIM_LOOKBACK_BLOCKS = 1000
+# Headers read per JSON-RPC batch when the chain below the finalized block is checked.
+CHAIN_READ_BATCH = 250
+# A pruning RPC keeps at least this many blocks below its finalized one (the default finney RPC about 256); a block
+# missing nearer the top is a backend that lags behind, not pruning.
+KEPT_BLOCKS_MIN = 128
 # The default finney RPC answers HTTP 429 after about 100 reads in 30 s; a batch waits this long before each retry.
 RATE_LIMIT_RETRY_SEC = (2, 5, 10)
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
@@ -154,6 +159,30 @@ def hash_text(value) -> str:
 
 def same_hash(a, b) -> bool:
     return bool(hash_text(a)) and hash_text(a) == hash_text(b)
+
+
+def block_number(block) -> int:
+    number = block["number"]
+    return int(number, 16) if isinstance(number, str) else number
+
+
+def bloom_may_hold(bloom, *values: bytes) -> bool:
+    """Whether a block's 2048-bit logs bloom may hold a log with every one of `values` (address, topics): False
+    only when the bloom proves it does not. A missing or malformed bloom proves nothing."""
+    if isinstance(bloom, str):
+        try:
+            bloom = bytes.fromhex(bloom.removeprefix("0x"))
+        except ValueError:
+            return True
+    if not isinstance(bloom, bytes | bytearray) or len(bloom) != 256:
+        return True
+    for value in values:
+        digest = AsyncWeb3.keccak(value)
+        for i in (0, 2, 4):
+            bit = int.from_bytes(digest[i : i + 2], "big") & 2047
+            if not bloom[255 - bit // 8] & (1 << (bit % 8)):
+                return False
+    return True
 
 
 def record_hashes(record: dict) -> list[str]:
@@ -459,16 +488,17 @@ class CollateralClient:
             )
 
     async def _finalized_on_chain(self, tx_hash: str, receipt) -> bool:
-        """Whether the receipt's block is the finalized chain's block at its number. The finalized block and the
-        block at that number are read in one batch, so one backend answers both, and below its finalized block a
-        node's chain is final. Waits for finality; raises while it has not come, so no record is cleared on a
-        receipt a reorganization can still drop."""
+        """Whether the receipt's block is an ancestor of the finalized block. Waits for finality; raises while it
+        has not come, so no record is cleared on a receipt a reorganization can still drop."""
         number = receipt["blockNumber"]
         deadline = asyncio.get_running_loop().time() + RECEIPT_TIMEOUT_SEC
         while True:
             try:
-                finalized, block = await self._read_together(
-                    ("eth_getBlockByNumber", ["finalized", False]), ("eth_getBlockByNumber", [hex(number), False])
+                (finalized,) = await self._read_together(("eth_getBlockByNumber", ["finalized", False]))
+                chain = (
+                    await self._chain_down_to(finalized, number)
+                    if finalized is not None and block_number(finalized) >= number
+                    else None
                 )
             except RpcReadError as error:
                 raise CollateralOutcomeUnknownError(
@@ -476,14 +506,21 @@ class CollateralClient:
                     f"so its outcome is unknown; no transaction was sent. {RETRY_IS_SAFE}. If the RPC keeps "
                     "refusing, set SUBTENSOR_EVM_RPC_URL to another RPC, or look the transaction up on the explorer"
                 ) from error
-            if finalized is not None and int(finalized["number"], 16) >= number:
+            if chain is not None:
                 break
+            if finalized is not None and block_number(finalized) >= number:
+                raise CollateralOutcomeUnknownError(
+                    f"The RPC answered the blocks from the finalized block down to block {number} of transaction "
+                    f"{tx_hash} from more than one chain, so its outcome is unknown; no transaction was sent. "
+                    f"{RETRY_IS_SAFE}"
+                )
             if asyncio.get_running_loop().time() >= deadline:
                 raise CollateralOutcomeUnknownError(
                     f"Transaction {tx_hash} is in block {number}, which is not finalized yet, so its outcome is "
                     f"not settled; no transaction was sent. {RETRY_IS_SAFE}"
                 )
             await asyncio.sleep(RECEIPT_POLL_SEC)
+        block = chain.get(number)
         if block is None:
             raise CollateralOutcomeUnknownError(
                 f"Transaction {tx_hash} is in block {number}, which this RPC no longer keeps, so its outcome cannot "
@@ -493,6 +530,26 @@ class CollateralClient:
                 "if it still needs doing"
             )
         return same_hash(block["hash"], receipt["blockHash"])
+
+    async def _chain_down_to(self, finalized, lowest: int) -> dict[int, dict] | None:
+        """The blocks from `lowest` up to the finalized block, read by number and kept only when each one's hash is
+        the parent hash of the block above. A gateway can send each item of a batch to another backend, so a read
+        by number can be another fork's block; one linked by parent hashes to the finalized block is its ancestor
+        whoever answered. Stops below a block the RPC does not answer; None when the hashes do not link."""
+        top = block_number(finalized)
+        chain = {top: finalized}
+        parent = finalized["parentHash"]
+        for high in range(top - 1, lowest - 1, -CHAIN_READ_BATCH):
+            numbers = range(high, max(high - CHAIN_READ_BATCH, lowest - 1), -1)
+            blocks = await self._read_together(*(("eth_getBlockByNumber", [hex(n), False]) for n in numbers))
+            for number, block in zip(numbers, blocks):
+                if block is None:
+                    return chain
+                if not same_hash(block["hash"], parent) or block_number(block) != number:
+                    return None
+                chain[number] = block
+                parent = block["parentHash"]
+        return chain
 
     @staticmethod
     def _orphaned(tx_hash: str, receipt) -> CollateralOutcomeUnknownError:
@@ -834,30 +891,40 @@ class CollateralClient:
         return tuple(self.w3.codec.decode(outputs, result))
 
     async def _reclaim_events_at(self, finalized) -> list[ReclaimRequest] | None:
-        """The open requests at the finalized block, or None when the logs are not from its chain."""
+        """The open requests at the finalized block, or None when a block or log is not on its chain.
+
+        A range eth_getLogs can reach a lagging backend whose empty answer looks like no request. So the logs are
+        read by block hash, which a backend answers for that block or refuses, for every block on the finalized
+        chain whose logs bloom may hold this contract's ReclaimProcessStarted."""
         top = finalized["number"]
         lowest = max(top - RECLAIM_LOOKBACK_BLOCKS, 0)
         event = self.contract.events.ReclaimProcessStarted()
-        log_filter = {
-            "address": self.contract_address,
-            "topics": [AsyncWeb3.to_hex(event_abi_to_log_topic(event.abi))],
-            "fromBlock": hex(lowest),
-            "toBlock": hex(top),
-        }
+        address = bytes.fromhex(self.contract_address.removeprefix("0x"))
+        topic = event_abi_to_log_topic(event.abi)
         try:
-            top_block, lowest_block, raw_logs = await self._read_together(
-                ("eth_getBlockByNumber", [hex(top), False]),
-                ("eth_getBlockByNumber", [hex(lowest), False]),
-                ("eth_getLogs", [log_filter]),
-            )
+            chain = await self._chain_down_to(finalized, lowest)
+            if chain is None or (min(chain) > lowest and top - min(chain) < KEPT_BLOCKS_MIN):
+                return None
+            candidates = [block for block in chain.values() if bloom_may_hold(block.get("logsBloom"), address, topic)]
+            raw_logs = []
+            for start in range(0, len(candidates), CHAIN_READ_BATCH):
+                batch = candidates[start : start + CHAIN_READ_BATCH]
+                filters = [
+                    {"address": self.contract_address, "topics": [AsyncWeb3.to_hex(topic)],
+                     "blockHash": AsyncWeb3.to_hex(hexstr=hash_text(block["hash"]))}
+                    for block in batch
+                ]
+                answers = await self._read_together(*(("eth_getLogs", [log_filter]) for log_filter in filters))
+                for block, answer in zip(batch, answers):
+                    if any(log.get("removed") or not same_hash(log["blockHash"], block["hash"]) for log in answer):
+                        return None
+                    raw_logs.extend(answer)
         except RpcReadError as error:
             raise CollateralTransactionError(
                 f"The RPC did not answer the reclaim request list ({error}); run this again, or set "
                 "SUBTENSOR_EVM_RPC_URL to another RPC"
             ) from error
-        if top_block is None or not same_hash(top_block["hash"], finalized["hash"]):
-            return None
-        if lowest_block is None:
+        if min(chain) > lowest:
             # a pruning RPC (the default finney one keeps about 256 blocks) answers the range from what it keeps
             logger.warning(
                 "The RPC %s no longer keeps block %s, so a reclaim request started before the blocks it keeps is "
@@ -865,9 +932,7 @@ class CollateralClient:
                 "set SUBTENSOR_EVM_RPC_URL to an RPC that keeps older blocks to list it",
                 rpc_origin(self.rpc_url), lowest,
             )
-        logs = [event.process_log(log_entry_formatter(log)) for log in raw_logs if not log.get("removed")]
-        if any(log["blockNumber"] > top for log in logs):
-            return None
+        logs = [event.process_log(log_entry_formatter(log)) for log in raw_logs]
         requests = []
         for log in sorted(logs, key=lambda log: (log["blockNumber"], log["logIndex"])):
             args = log["args"]
