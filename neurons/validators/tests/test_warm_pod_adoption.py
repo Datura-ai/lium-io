@@ -1,0 +1,409 @@
+"""DAH-3980: a customer create adopts the pre-started ("warm") pod of the same id.
+
+The fast path inspects `pod_<id>` once; only a running container with this pod's label, the rent's
+image, GPUs and ports, and no root-fs quota is adopted, in a fixed order: fillers removed and
+confirmed gone, GPU power restored, volume grown and limits updated and read back, then one exec
+that checks the gocryptfs mount and writes the renter's keys. Anything else removes the warm pod
+(confirmed) and runs the normal create.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+import services.docker_service as ds_module
+from payload_models.payloads import (
+    ContainerCreated,
+    CustomOptions,
+    PayloadPortMapping,
+    VolumeEncryptionStatus,
+)
+from services.docker_service import WARM_POD_LABEL, DockerService
+from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_CMD
+from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_result
+
+GIB = 1024**3
+JUPYTER_TOKEN = "warm-token"
+
+
+@pytest.fixture
+def svc():
+    return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+
+
+def _rent_payload(**over):
+    base = dict(
+        is_sysbox=True,
+        enable_volume_encryption=True,
+        enable_jupyter=True,
+        ships_sshd=True,
+        cpu_count=4,
+        memory_gb=16,
+        disk_share=1.0,
+        gpu_uuids=["GPU-a", "GPU-b"],
+        user_public_keys=["ssh-ed25519 renter-key-1", "ssh-ed25519 renter-key-2"],
+        pod_mapping=[
+            PayloadPortMapping(docker_port=22, internal_port=40022, external_port=50022),
+            PayloadPortMapping(docker_port=8888, internal_port=40888, external_port=50888),
+            PayloadPortMapping(docker_port=20000, internal_port=40000, external_port=50000),
+        ],
+    )
+    base.update(over)
+    return _payload(**base)
+
+
+def _warm_container(payload) -> dict:
+    return {
+        "Name": f"/pod_{payload.pod_id}",
+        "Image": "sha256:image",
+        "State": {"Running": True},
+        "Config": {
+            "Labels": {WARM_POD_LABEL: payload.pod_id},
+            "Env": [f"JUPYTER_PASSWORD={JUPYTER_TOKEN}", "NVIDIA_DRIVER_CAPABILITIES=all"],
+        },
+        "HostConfig": {
+            "DeviceRequests": [{"Driver": "", "DeviceIDs": ["GPU-a", "GPU-b"]}],
+            "StorageOpt": None,
+            "PortBindings": {
+                "22/tcp": [{"HostIp": "", "HostPort": "40022"}],
+                "8888/tcp": [{"HostIp": "", "HostPort": "40888"}],
+                "20000/tcp": [{"HostIp": "", "HostPort": "40000"}],
+            },
+            "NanoCpus": 4_000_000_000,
+            "Memory": 16 * GIB,
+        },
+    }
+
+
+class _FakeHost:
+    """The executor host behind the SSH session: a warm pod, fillers, and every command in order."""
+
+    def __init__(self, container: dict | None, fillers: tuple[str, ...] = ()):
+        self.container = container
+        self.image = {"Id": "sha256:image", "RepoTags": ["daturaai/pytorch:1.0.0"], "RepoDigests": []}
+        self.names = [*([container["Name"][1:]] if container else []), *fillers]
+        self.events: list[str] = []
+        self.keys_exit = 0
+        self.grow_exit = 0
+        self.slow_update = False
+        self.ssh_client = AsyncMock()
+        self.ssh_client.run = AsyncMock(side_effect=self.run)
+        self.ssh_client.image_exists_result = True
+        self.ssh_client.image_exists_error = None
+
+    async def run(self, cmd, *args, check=False, **kwargs):
+        if cmd.startswith("/usr/bin/docker inspect pod_") and " -f " not in cmd:
+            inspected = [obj for obj in (self.container, self.image) if obj]
+            return _ssh_result(exit_status=0 if self.container else 1, stdout=json.dumps(inspected))
+        if cmd == DOCKER_PS_ALL_NAMES_CMD:
+            return _ssh_result(stdout="\n".join(self.names))
+        if "nsenter -t 1 -m" in cmd:
+            return self._finish("grow", self.grow_exit, check)
+        if "docker update" in cmd:
+            if self.slow_update:
+                await asyncio.sleep(0.05)
+            return self._finish("update", 0, check)
+        if "size-max" in cmd:
+            return _ssh_result(stdout=f"{10 * GIB}\n{4_000_000_000} {16 * GIB}")
+        if "docker exec -u 0 -i" in cmd and "authorized_keys" in cmd:
+            self.events.append("keys")
+            return _ssh_result(exit_status=self.keys_exit)
+        if cmd.startswith("/usr/bin/docker rm -fv pod_"):
+            self.events.append("remove_warm_pod")
+            self.names = [name for name in self.names if not name.startswith("pod_")]
+        return _ssh_result()
+
+    def _finish(self, step: str, exit_status: int, check: bool):
+        self.events.append(f"{step} finished")
+        if check and exit_status:
+            raise RuntimeError(f"{step} exited {exit_status}")
+        return _ssh_result(exit_status=exit_status)
+
+    def commands(self) -> list[str]:
+        return [call.args[0] for call in self.ssh_client.run.await_args_list]
+
+    def keys_exec_calls(self):
+        return [
+            call for call in self.ssh_client.run.await_args_list
+            if "docker exec -u 0 -i" in call.args[0] and "authorized_keys" in call.args[0]
+        ]
+
+
+def _patch_host(svc, monkeypatch, host: _FakeHost) -> None:
+    _patch_happy(svc, monkeypatch, host.ssh_client)
+    # what the normal create's port step makes of the rent's pod_mapping
+    monkeypatch.setattr(
+        svc,
+        "generate_portMappings",
+        AsyncMock(return_value=(
+            [(22, 40022, 50022), (8888, 40888, 50888), (20000, 40000, 50000)],
+            (8888, 50888),
+        )),
+    )
+    monkeypatch.setattr(ds_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(svc, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(svc, "setup_encrypted_local_volume", AsyncMock())
+
+    async def restore_power(*args, **kwargs):
+        host.events.append("power restored")
+
+    monkeypatch.setattr(svc, "_restore_gpu_power_for_uncapped_pod", AsyncMock(side_effect=restore_power))
+
+    async def remove_fillers(*args, **kwargs):
+        host.events.append("fillers removed")
+        host.names = [name for name in host.names if not name.startswith("filler_")]
+        return []
+
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(side_effect=remove_fillers))
+
+
+def _adoptable(svc, monkeypatch, payload, fillers: tuple[str, ...] = ()) -> _FakeHost:
+    host = _FakeHost(_warm_container(payload), fillers)
+    _patch_host(svc, monkeypatch, host)
+    return host
+
+
+async def _assert_normal_create_after_removal(svc, host: _FakeHost, payload) -> None:
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    assert "remove_warm_pod" in host.events
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    svc.create_local_volume.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_matching_warm_pod_is_adopted_without_docker_run_or_volume_create(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    svc.create_local_volume.assert_not_awaited()
+    assert "remove_warm_pod" not in host.events
+
+
+@pytest.mark.asyncio
+async def test_adoption_grows_the_volume_to_the_size_from_resolve_volume_sizing(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+
+    await _run(svc, payload)
+
+    grow = next(cmd for cmd in host.commands() if "nsenter -t 1 -m" in cmd)
+    assert " grow 10G " in grow  # resolve_volume_sizing is stubbed to 10 GB
+    assert f"volume_{payload.pod_id}" in grow
+    svc.resolve_volume_sizing.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_adoption_keys_exec_writes_exactly_the_request_keys(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+
+    await _run(svc, payload)
+
+    (keys_exec,) = host.keys_exec_calls()
+    assert keys_exec.kwargs["input"] == "ssh-ed25519 renter-key-1\nssh-ed25519 renter-key-2\n"
+    assert "cat > /root/.ssh/authorized_keys" in keys_exec.args[0]
+    assert "fuse.gocryptfs" in keys_exec.args[0]
+    assert "renter-key" not in keys_exec.args[0]
+
+
+@pytest.mark.asyncio
+async def test_adoption_reply_has_every_field_of_the_normal_reply(svc, monkeypatch):
+    payload = _rent_payload()
+    _adoptable(svc, monkeypatch, payload)
+
+    result = await _run(svc, payload)
+
+    assert result.container_name == f"pod_{payload.pod_id}"
+    assert result.volume_name == f"volume_{payload.pod_id}"
+    assert result.port_maps == [(22, 50022), (8888, 50888), (20000, 50000)]
+    assert result.jupyter_url == f"http://127.0.0.1:50888/lab?token={JUPYTER_TOKEN}"
+    assert result.local_volume_path == "/root"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.ENABLED
+    assert result.volume_limit_gb == 10
+    assert result.storage_limit_gb is None  # the warm pod has no root-fs quota
+    assert result.warnings == []
+    assert result.profilers[-1].name.value == "Finished in subnet."
+    svc.redis_service.add_rented_pod.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_keys_exec_runs_after_fillers_power_grow_and_update(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload, fillers=("filler_x",))
+    host.container["HostConfig"]["Memory"] = 8 * GIB
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    keys_at = host.events.index("keys")
+    for earlier in ("fillers removed", "power restored", "grow finished", "update finished"):
+        assert host.events.index(earlier) < keys_at, host.events
+    assert host.events.index("fillers removed") < host.events.index("power restored")
+
+
+@pytest.mark.asyncio
+async def test_no_docker_update_when_the_limits_match(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+
+    await _run(svc, payload)
+
+    assert not any("docker update" in cmd for cmd in host.commands())
+
+
+@pytest.mark.asyncio
+async def test_docker_update_when_the_limits_differ(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["HostConfig"]["Memory"] = 8 * GIB
+
+    await _run(svc, payload)
+
+    (update,) = [cmd for cmd in host.commands() if "docker update" in cmd]
+    assert "--cpus 4 --memory 16g --memory-swap 32g" in update
+
+
+@pytest.mark.asyncio
+async def test_no_filler_removal_when_no_filler_runs(svc, monkeypatch):
+    payload = _rent_payload()
+    _adoptable(svc, monkeypatch, payload)
+
+    await _run(svc, payload)
+
+    svc.clean_existing_containers.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_without_the_label_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["Config"]["Labels"] = {}
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+    assert not host.keys_exec_calls()
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_labelled_for_another_pod_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["Config"]["Labels"] = {WARM_POD_LABEL: "another-pod"}
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+    assert not host.keys_exec_calls()
+
+
+@pytest.mark.asyncio
+async def test_stopped_warm_pod_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["State"]["Running"] = False
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_of_another_image_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["Image"] = "sha256:older-image"
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_with_another_gpu_set_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload(gpu_uuids=["GPU-a"])
+    host = _adoptable(svc, monkeypatch, payload)
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_with_a_root_fs_quota_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["HostConfig"]["StorageOpt"] = {"size": "20g"}
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_with_other_ports_than_pod_mapping_is_not_adopted(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["HostConfig"]["PortBindings"]["20000/tcp"] = [{"HostIp": "", "HostPort": "40999"}]
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+
+
+@pytest.mark.asyncio
+async def test_rent_with_a_startup_command_takes_the_normal_create(svc, monkeypatch):
+    payload = _rent_payload(custom_options=CustomOptions(startup_commands="python train.py"))
+    host = _adoptable(svc, monkeypatch, payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert not any(cmd.startswith("/usr/bin/docker inspect pod_") for cmd in host.commands())
+    assert not host.keys_exec_calls()
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_filler_removal_falls_back_without_writing_keys(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload, fillers=("filler_x",))
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(return_value=[]))  # filler survives
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+    assert not host.keys_exec_calls()
+    assert "grow finished" not in host.events
+
+
+@pytest.mark.asyncio
+async def test_lost_gocryptfs_mount_removes_the_warm_pod_and_runs_the_normal_create(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.keys_exit = 92
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+    assert host.events.index("keys") < host.events.index("remove_warm_pod")
+    removal = next(cmd for cmd in host.commands() if cmd.startswith("/usr/bin/docker rm -fv pod_"))
+    assert f"docker volume rm volume_{payload.pod_id}" in removal
+
+
+@pytest.mark.asyncio
+async def test_failed_grow_removes_the_warm_pod_only_after_the_update_finished(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["HostConfig"]["NanoCpus"] = 2_000_000_000
+    host.grow_exit = 1
+    host.slow_update = True
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+    assert host.events.index("update finished") < host.events.index("remove_warm_pod")
+    assert not host.keys_exec_calls()
+
+
+@pytest.mark.asyncio
+async def test_rent_without_a_warm_pod_takes_the_normal_create_after_one_inspect(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _FakeHost(container=None)
+    _patch_host(svc, monkeypatch, host)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert "remove_warm_pod" not in host.events
+    assert len([cmd for cmd in host.commands() if cmd.startswith("/usr/bin/docker inspect pod_")]) == 1

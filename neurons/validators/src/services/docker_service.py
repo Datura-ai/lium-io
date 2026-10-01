@@ -3,6 +3,7 @@ import contextlib
 import dataclasses
 import enum
 import ipaddress
+import json
 import logging
 import math
 import random
@@ -385,12 +386,12 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
-# DAH-3980 pre-started pod: the label `pod_<id>` carries (value = <id>), the trial env marker that
-# stands for WorkloadKind.WARM_POD when the backend cannot send it, and the volume size before a
-# rent grows it
+# DAH-3980 pre-started pod: the label `pod_<id>` carries (value = <id>), and the volume size before
+# a rent grows it
 WARM_POD_LABEL = "lium.warm_pod"
-WARM_POD_ENV_MARKER = "LIUM_WARM_POD"
 WARM_POD_VOLUME_GB = 1
+# each remote command of a warm pod's adoption; the grow and the keys exec take well under a second
+WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS = 30
 # Where the gocryptfs passphrase and the script that carries it live for the second they exist
 # inside the rental container. /dev/shm is the tmpfs Docker (and sysbox) mount into every
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
@@ -1327,16 +1328,7 @@ def _should_repair_stale_mountpoint(
 
 def is_warm_pod_create(payload: ContainerCreateRequest) -> bool:
     # a create of a pre-started pod with no renter yet
-    if payload.workload_kind == WorkloadKind.WARM_POD:
-        return True
-    # trial fallback: the marker counts only with no keys -- a renter's create always carries keys,
-    # so a renter's own environment cannot turn its rental into a keyless warm create
-    environment = (payload.custom_options.environment if payload.custom_options else None) or {}
-    return (
-        payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-        and not payload.user_public_keys
-        and environment.get(WARM_POD_ENV_MARKER) == "1"
-    )
+    return payload.workload_kind == WorkloadKind.WARM_POD
 
 
 def _should_encrypt_local_volume(
@@ -1474,16 +1466,12 @@ def _build_volume_setup_exec_script(
     # tmpfs and leaves the keys to the final `cat`: they stay data, never shell text.
     script = shlex.quote(setup_script_path)
     passfile = shlex.quote(passfile_path)
-    mount_check = (
-        f"awk -v target={shlex.quote(plaintext_path)} "
-        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
-    )
     lines = [
         "umask 077",
         f'trap "rm -f {script} {passfile}" EXIT',
         f"head -c {setup_script_size} > {script} && [ $(wc -c < {script}) -eq {setup_script_size} ] || exit 90",
         f"sh {script} || exit 91",
-        f"{mount_check} || {{ echo '--- /proc/mounts ---'; cat /proc/mounts;"
+        f"{_gocryptfs_mount_check(plaintext_path)} || {{ echo '--- /proc/mounts ---'; cat /proc/mounts;"
         " echo '--- gocryptfs ps ---'; ps aux | grep '[g]ocryptfs'; exit 92; }",
     ]
     if with_authorized_keys:
@@ -1492,6 +1480,158 @@ def _build_volume_setup_exec_script(
             "{ mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys; } || exit 93"
         )
     return "\n".join(lines)
+
+
+def _gocryptfs_mount_check(plaintext_path: str) -> str:
+    # shell test, true when plaintext_path is a gocryptfs mount
+    return (
+        f"awk -v target={shlex.quote(plaintext_path)} "
+        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
+    )
+
+
+def _build_warm_pod_keys_exec_script(plaintext_path: str) -> str:
+    # The adoption's one exec: a warm pod whose volume lost its gocryptfs mount (a docker restart
+    # brings the container back without it) is refused with 92; otherwise the renter's keys from
+    # stdin become the only ones in authorized_keys.
+    return "\n".join([
+        "umask 077",
+        f"{_gocryptfs_mount_check(plaintext_path)} || exit 92",
+        "{ mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat > /root/.ssh/authorized_keys; } || exit 93",
+    ])
+
+
+def _warm_pod_volume_grow_command(volume_name: str, size_gb: int) -> str:
+    # The vloopback backing file and mount exist only in the host's mount namespace; the executor
+    # container is privileged with the host's pid namespace, so nsenter into pid 1 reaches them.
+    # Paths as the validator installs the plugin: <root>/plugins/<id>/rootfs<DATA_DIR>/<volume>.
+    plugin = shlex.quote(_LOOPBACK_PLUGIN_ALIAS)
+    volume = shlex.quote(volume_name)
+    grow = shlex.quote(
+        'truncate -s "$1" "$2" && losetup -c "$(losetup -j "$2" | cut -d: -f1)" && xfs_growfs "$3" >/dev/null'
+    )
+    return (
+        "set -e; "
+        "root=$(/usr/bin/docker info -f '{{.DockerRootDir}}'); "
+        f"plugin=$(/usr/bin/docker plugin inspect {plugin} -f '{{{{.Id}}}}'); "
+        f"data_dir=$(/usr/bin/docker plugin inspect {plugin} "
+        "-f '{{range .Settings.Env}}{{println .}}{{end}}' | sed -n 's/^DATA_DIR=//p'); "
+        f"nsenter -t 1 -m -- sh -c {grow} grow {int(size_gb)}G "
+        f'"$root/plugins/$plugin/rootfs${{data_dir:?}}/"{volume} "$root/plugins/$plugin/propagated-mount/"{volume}'
+    )
+
+
+def _rent_unfit_for_warm_pod(
+    payload: ContainerCreateRequest, custom_options: CustomOptions, *, in_cvm: bool
+) -> str | None:
+    # the first thing this rent asks that a running container cannot take; None when it fits one
+    unfit_reasons = {
+        "edit": bool(payload.local_volume),
+        "startup_commands": bool(custom_options.startup_commands and custom_options.startup_commands.strip()),
+        "entrypoint": bool(custom_options.entrypoint and custom_options.entrypoint.strip()),
+        "custom_volumes": bool(custom_options.volumes),
+        "port_count": custom_options.initial_port_count is not None and not custom_options.internal_ports,
+        "s3_volume": payload.external_volume_info is not None,
+        "restore": bool(payload.bootstrap_restore or payload.backup_log_id or payload.restore_path),
+        "cluster": payload.cluster_membership is not None,
+        "dockerfile": payload.dockerfile_content is not None,
+        "registry_credentials": bool(payload.docker_username or payload.docker_password),
+        "encryption_off": not (payload.enable_volume_encryption and settings.ENABLE_VOLUME_ENCRYPTION),
+        "jupyter_off": not payload.enable_jupyter,
+        "not_sysbox": not payload.is_sysbox,
+        # sshd and Jupyter come from the image's own start.sh only on a default-template rent
+        "not_default_template": not payload.ships_sshd,
+        "cvm": in_cvm,
+        "no_pod_mapping": not payload.pod_mapping
+        or any(mapping.docker_port is None for mapping in payload.pod_mapping),
+        "no_limits": not (payload.cpu_count and payload.memory_gb),
+        "no_gpus": not payload.gpu_uuids,
+    }
+    return next((reason for reason, applies in unfit_reasons.items() if applies), None)
+
+
+def _inspected_container_and_image(
+    inspect_stdout: str | None, container_name: str
+) -> tuple[dict | None, dict | None]:
+    # `docker inspect <container> <image>` prints whichever of the two exists
+    try:
+        inspected = json.loads(inspect_stdout or "[]")
+    except ValueError:
+        return None, None
+    container = next((obj for obj in inspected if obj.get("Name") == f"/{container_name}"), None)
+    image = next((obj for obj in inspected if "RepoTags" in obj), None)
+    return container, image
+
+
+def _warm_pod_mismatch(
+    container: dict,
+    image: dict | None,
+    registry_digest: str | None,
+    payload: ContainerCreateRequest,
+    custom_options: CustomOptions,
+) -> str | None:
+    # the first way the inspected `pod_<id>` differs from what this rent asks; None = adoptable
+    config = container.get("Config") or {}
+    host_config = container.get("HostConfig") or {}
+    container_env = dict(entry.partition("=")[::2] for entry in config.get("Env") or [])
+    gpu_uuids = {
+        uuid
+        for device_request in host_config.get("DeviceRequests") or []
+        for uuid in device_request.get("DeviceIDs") or []
+    }
+    published_ports = {
+        int(container_port.split("/")[0]): int(bindings[0]["HostPort"])
+        for container_port, bindings in (host_config.get("PortBindings") or {}).items()
+        if bindings
+    }
+    requested_ports = {mapping.docker_port: mapping.internal_port for mapping in payload.pod_mapping}
+    requested_env = {
+        key: str(value)
+        for key, value in (custom_options.environment or {}).items()
+        if key and value and key.strip() and str(value).strip()
+    }
+    mismatches = {
+        # first: a container without this pod's label is never adopted
+        "label": (config.get("Labels") or {}).get(WARM_POD_LABEL) != payload.pod_id,
+        "not_running": not (container.get("State") or {}).get("Running"),
+        "image": image is None or container.get("Image") != image.get("Id"),
+        # DAH-3873: a mutable tag that moved in the registry makes the cold path pull
+        "image_outdated": registry_digest is not None
+        and not any(
+            repo_digest.endswith(f"@{registry_digest}")
+            for repo_digest in (image or {}).get("RepoDigests") or []
+        ),
+        "gpus": gpu_uuids != set(payload.gpu_uuids),
+        # the root-fs quota is fixed at `docker run`
+        "storage_opt": bool(host_config.get("StorageOpt")),
+        "ports": published_ports != requested_ports,
+        "internal_ports": bool(custom_options.internal_ports)
+        and set(custom_options.internal_ports) | {22, IMAGE_JUPYTER_DOCKER_PORT} != set(requested_ports),
+        "environment": any(container_env.get(key) != value for key, value in requested_env.items()),
+        "shm_size": bool(custom_options.shm_size)
+        and _parse_volume_size_to_bytes(custom_options.shm_size) != host_config.get("ShmSize"),
+        "jupyter": not container_env.get("JUPYTER_PASSWORD")
+        or IMAGE_JUPYTER_DOCKER_PORT not in requested_ports,
+    }
+    return next((reason for reason, differs in mismatches.items() if differs), None)
+
+
+async def _await_all_then_raise_first_error(*awaitables: Awaitable[Any]) -> list[Any]:
+    # every command ends before an error is raised: the fallback that follows removes the volume,
+    # and a grow still running would hit the one the normal create makes under the same name
+    outcomes = await asyncio.gather(*awaitables, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    return outcomes
+
+
+@dataclass(frozen=True)
+class _AdoptedWarmPod:
+    port_maps: list[tuple[int, int]]
+    jupyter_url: str
+    volume_limit_gb: int
+    profilers: list[ProfilerStep]
 
 
 class DockerService:
@@ -5852,6 +5992,321 @@ class DockerService:
                 exc_info=True,
             )
 
+    async def _adopt_warm_pod(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        custom_options: CustomOptions,
+        executor_info: ExecutorSSHInfo,
+        docker_hub_digest_lookup: asyncio.Task | None,
+        early_volume_probe: asyncio.Task | None,
+        log_tag: str,
+        default_extra: dict,
+    ) -> _AdoptedWarmPod | None:
+        # a customer create of a `pod_<id>` the validator pre-started for this rent (DAH-3980); None
+        # = the normal create runs, and a warm pod that failed any check is gone by then
+        unfit_reason = _rent_unfit_for_warm_pod(
+            payload, custom_options, in_cvm=bool(executor_info.tdx_quote)
+        )
+        if unfit_reason:
+            self._log_warm_pod_not_adopted(default_extra, unfit_reason, warm_pod_removed=False)
+            return None
+
+        started_ms = now_ms()
+        container_name = self.get_container_name(payload)
+        volume_name = f"volume_{payload.pod_id}"
+        try:
+            inspect_result, container_names = await asyncio.gather(
+                ssh_client.run(
+                    f"/usr/bin/docker inspect {shlex.quote(container_name)} {shlex.quote(payload.docker_image)}",
+                    check=False,
+                    timeout=WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS,
+                ),
+                self._list_all_container_names(ssh_client),
+            )
+        except Exception as exc:
+            # the normal create's own sweep removes a `pod_<id>` this could not see
+            self._log_warm_pod_not_adopted(
+                default_extra, f"inspect failed: {type(exc).__name__}", warm_pod_removed=False
+            )
+            return None
+        container, image = _inspected_container_and_image(inspect_result.stdout, container_name)
+        if container is None:
+            self._log_warm_pod_not_adopted(default_extra, "no_warm_pod", warm_pod_removed=False)
+            return None
+
+        registry_digest = await docker_hub_digest_lookup if docker_hub_digest_lookup else None
+        try:
+            mismatch = _warm_pod_mismatch(container, image, registry_digest, payload, custom_options)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            mismatch = f"inspect output unreadable: {type(exc).__name__}"
+        if mismatch is None and container_names is None:
+            mismatch = "container_listing_failed"
+        if mismatch is None:
+            try:
+                volume_limit_gb, profilers = await self._take_over_warm_pod(
+                    ssh_client,
+                    payload,
+                    container,
+                    filler_names=[
+                        name for name in container_names if name.startswith(FILLER_CONTAINER_PREFIX)
+                    ],
+                    early_volume_probe=early_volume_probe,
+                    started_ms=started_ms,
+                    log_tag=log_tag,
+                    default_extra=default_extra,
+                )
+            except Exception as exc:
+                mismatch = f"{type(exc).__name__}: {str(exc)[:300]}"
+            else:
+                jupyter_mapping = next(
+                    mapping for mapping in payload.pod_mapping
+                    if mapping.docker_port == IMAGE_JUPYTER_DOCKER_PORT
+                )
+                jupyter_token = dict(
+                    entry.partition("=")[::2] for entry in container["Config"]["Env"]
+                )["JUPYTER_PASSWORD"]
+                logger.info(
+                    _m(
+                        "Warm pod adopted",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": container_name,
+                            "volume_limit_gb": volume_limit_gb,
+                            "step_timings_ms": {step.name.value: step.duration for step in profilers},
+                            "total_ms": now_ms() - started_ms,
+                        }),
+                    )
+                )
+                return _AdoptedWarmPod(
+                    port_maps=[
+                        (mapping.docker_port, mapping.external_port) for mapping in payload.pod_mapping
+                    ],
+                    jupyter_url=(
+                        f"http://{executor_info.address}:{jupyter_mapping.external_port}"
+                        f"/lab?token={jupyter_token}"
+                    ),
+                    volume_limit_gb=volume_limit_gb,
+                    profilers=profilers,
+                )
+
+        await self._remove_warm_pod_for_normal_create(ssh_client, container_name, volume_name)
+        self._log_warm_pod_not_adopted(default_extra, mismatch, warm_pod_removed=True)
+        return None
+
+    async def _take_over_warm_pod(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        container: dict,
+        filler_names: list[str],
+        early_volume_probe: asyncio.Task | None,
+        started_ms: int,
+        log_tag: str,
+        default_extra: dict,
+    ) -> tuple[int, list[ProfilerStep]]:
+        # a checked warm pod, made the renter's in the order of second opinion S5: fillers confirmed
+        # gone, GPU power back, volume and limits grown and read back, keys last
+        container_name = self.get_container_name(payload)
+        container_q = shlex.quote(container_name)
+        volume_name = f"volume_{payload.pod_id}"
+        profilers: list[ProfilerStep] = []
+
+        if filler_names:
+            await self.clean_existing_containers(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                pod_name=container_name,
+                active_container_names=[*(payload.active_container_names or []), container_name],
+                active_volume_names=payload.active_volume_names,
+                remove_every_filler=True,
+            )
+            # the customer must not share the GPU: an unconfirmed removal is a failed adoption
+            survivors = await self._names_still_on_host(ssh_client, filler_names)
+            if survivors is None or survivors:
+                raise RuntimeError(f"filler removal not confirmed, still listed: {survivors}")
+        profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, started_ms))
+        step_started_ms = now_ms()
+
+        # the probe from the connect saw the fillers' volumes, so it is stale once they are removed
+        volume_probe = (
+            await early_volume_probe if early_volume_probe is not None and not filler_names else None
+        )
+        _, sizing = await _await_all_then_raise_first_error(
+            self._restore_gpu_power_for_uncapped_pod(ssh_client, payload, None, default_extra),
+            self.resolve_volume_sizing(
+                ssh_client=ssh_client,
+                payload=payload,
+                log_tag=log_tag,
+                log_extra=default_extra,
+                host_probe=volume_probe,
+            ),
+        )
+        if not sizing.volume_limit_gb:
+            raise RuntimeError("the rent has no volume size to grow the warm pod's volume to")
+        profilers.append(ProfilerStep.since(ProfilerStepName.GPU_DEVICE_PROBE, step_started_ms))
+        step_started_ms = now_ms()
+
+        wanted_limits = [str(payload.cpu_count * 1_000_000_000), str(payload.memory_gb * 1024**3)]
+        host_config = container.get("HostConfig") or {}
+        resource_commands = [
+            _warm_pod_volume_grow_command(volume_name, sizing.volume_limit_gb)
+        ]
+        if [str(host_config.get("NanoCpus")), str(host_config.get("Memory"))] != wanted_limits:
+            # the run left swap at its default, twice the memory limit
+            resource_commands.append(
+                f"/usr/bin/docker update --cpus {payload.cpu_count} --memory {payload.memory_gb}g "
+                f"--memory-swap {2 * payload.memory_gb}g {container_q}"
+            )
+        await _await_all_then_raise_first_error(*(
+            ssh_client.run(command, check=True, timeout=WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS)
+            for command in resource_commands
+        ))
+        resources_after = await ssh_client.run(
+            f"/usr/bin/docker volume inspect {shlex.quote(volume_name)} "
+            "-f '{{index .Status \"size-max\"}}' && "
+            f"/usr/bin/docker inspect {container_q} -f '{{{{.HostConfig.NanoCpus}}}} {{{{.HostConfig.Memory}}}}'",
+            check=True,
+            timeout=WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS,
+        )
+        volume_size_line, _, limits_line = (resources_after.stdout or "").strip().partition("\n")
+        volume_bytes = _parse_volume_size_to_bytes(volume_size_line) or 0
+        if volume_bytes < sizing.volume_limit_gb * 1024**3:
+            raise RuntimeError(f"volume is {volume_bytes} bytes after the grow, wanted {sizing.volume_limit_gb}g")
+        if limits_line.split() != wanted_limits:
+            raise RuntimeError(f"limits are {limits_line!r} after the update, wanted {wanted_limits}")
+        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, step_started_ms))
+        step_started_ms = now_ms()
+
+        # the keys are stdin, never shell text
+        keys_result = await ssh_client.run(
+            f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
+            + shlex.quote(_build_warm_pod_keys_exec_script("/root")),
+            input="".join(f"{public_key}\n" for public_key in payload.user_public_keys),
+            check=False,
+            timeout=WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS,
+        )
+        if keys_result.exit_status == 92:
+            raise RuntimeError("/root is not the gocryptfs mount")
+        if keys_result.exit_status != 0:
+            raise RuntimeError(f"keys exec exited {keys_result.exit_status}")
+        profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, step_started_ms))
+        return sizing.volume_limit_gb, profilers
+
+    @staticmethod
+    async def _remove_warm_pod_for_normal_create(
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        volume_name: str,
+    ) -> None:
+        # a warm pod that is not adopted goes whole, confirmed: the normal create must neither meet
+        # the old container nor reuse a volume left under the same name
+        await retry_ssh_command(
+            ssh_client,
+            f"/usr/bin/docker rm -fv {shlex.quote(container_name)} >/dev/null 2>&1; "
+            f"/usr/bin/docker volume rm {shlex.quote(volume_name)} >/dev/null 2>&1; "
+            f"test -z \"$(/usr/bin/docker ps -aq --filter 'name=^/{container_name}$')"
+            f"$(/usr/bin/docker volume ls -q --filter 'name=^{volume_name}$')\"",
+            "remove_warm_pod",
+            max_attempts=3,
+            wait_seconds=2,
+        )
+
+    @staticmethod
+    def _log_warm_pod_not_adopted(default_extra: dict, reason: str, *, warm_pod_removed: bool) -> None:
+        logger.info(
+            _m(
+                "Warm pod not adopted; normal create",
+                extra=get_extra_info({
+                    **default_extra,
+                    "reason": reason,
+                    "warm_pod_removed": warm_pod_removed,
+                }),
+            )
+        )
+
+    async def _finish_warm_pod_adoption(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        executor_info: ExecutorSSHInfo,
+        adopted: _AdoptedWarmPod,
+        profilers: list[ProfilerStep],
+        default_extra: dict,
+    ) -> ContainerCreated:
+        # the normal create's last steps and its full reply, for a warm pod the rent adopted
+        container_name = self.get_container_name(payload)
+        volume_name = f"volume_{payload.pod_id}"
+        profilers.extend(adopted.profilers)
+        await self.finish_stream_logs()
+        try:
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+        except _CreateCancelledByDelete:
+            await self.cleanup_failed_container_creation(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                container_name=container_name,
+                volume_name=volume_name,
+                remove_volume=True,
+            )
+            raise
+        await self._cache_rented_pod_best_effort(
+            executor_info=executor_info,
+            pod_id=payload.pod_id,
+            container_name=container_name,
+            default_extra=default_extra,
+        )
+        step_started_ms = now_ms()
+        if settings.ENABLE_INSPECTOR:
+            await self._run_inspector_collector_lifecycle(
+                ssh_client=ssh_client,
+                executor_info=executor_info,
+                action="start",
+                default_extra={**default_extra, "container_name": container_name},
+            )
+        profilers.append(
+            ProfilerStep.since(
+                ProfilerStepName.INSPECTOR_START, step_started_ms, skipped=not settings.ENABLE_INSPECTOR
+            )
+        )
+        profilers.append(
+            ProfilerStep(name=ProfilerStepName.FINISHED_IN_SUBNET, duration=0, timestamp=now_ms())
+        )
+        logger.info(
+            _m(
+                "Deployment profile summary",
+                extra=get_extra_info({
+                    **default_extra,
+                    "container_name": container_name,
+                    "profile_steps": [
+                        {"name": step.name.value, "duration_ms": step.duration, "skipped": step.skipped}
+                        for step in profilers
+                    ],
+                    "total_duration_ms": sum(step.duration or 0 for step in profilers),
+                }),
+            )
+        )
+        return ContainerCreated(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            container_name=container_name,
+            volume_name=volume_name,
+            port_maps=adopted.port_maps,
+            profilers=profilers,
+            backup_log_id=payload.backup_log_id,
+            restore_path=payload.restore_path,
+            restore_log_id=None,
+            jupyter_url=adopted.jupyter_url,
+            warnings=[],
+            # the warm pod runs without a root-fs quota (`StorageOpt` empty is an adoption check)
+            storage_limit_gb=None,
+            volume_limit_gb=adopted.volume_limit_gb,
+            local_volume_path="/root",
+            volume_encryption_status=VolumeEncryptionStatus.ENABLED,
+        )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -5948,8 +6403,6 @@ class DockerService:
         try:
             current_step = "prepare_request"
             custom_options = CustomOptions.sanitize(payload.custom_options)
-            if custom_options.environment:
-                custom_options.environment.pop(WARM_POD_ENV_MARKER, None)
             # generate port maps
             current_step = "port_mapping"
             port_maps, jupyter_port_map = await self.generate_portMappings(
@@ -6173,6 +6626,23 @@ class DockerService:
                         pod_id=payload.pod_id,
                     )
                 )
+
+                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL:
+                    current_step = "warm_pod_adoption"
+                    adopted_warm_pod = await self._adopt_warm_pod(
+                        ssh_client,
+                        payload,
+                        custom_options,
+                        executor_info,
+                        docker_hub_digest_lookup,
+                        early_volume_probe,
+                        log_tag,
+                        default_extra,
+                    )
+                    if adopted_warm_pod is not None:
+                        return await self._finish_warm_pod_adoption(
+                            ssh_client, payload, executor_info, adopted_warm_pod, profilers, default_extra
+                        )
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
                 # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
