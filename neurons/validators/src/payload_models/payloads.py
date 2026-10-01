@@ -212,6 +212,8 @@ class ForcedValidationCycleRequest(BaseModel):
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
+    # DAH-3980: a pre-started default-template pod with no renter yet; an eligible rent adopts it
+    WARM_POD = "WARM_POD"
 
 
 class BaseServerRequest(BaseRequest):

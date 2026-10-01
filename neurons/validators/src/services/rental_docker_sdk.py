@@ -158,6 +158,7 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -631,6 +632,7 @@ class RentalDockerSdkClient:
             volumes=_container_volumes(spec.volumes) or None,
             name=spec.name,
             entrypoint=spec.entrypoint or None,
+            labels=spec.labels or None,
             host_config=host_config,
         )
         self._api_client.start(spec.name)

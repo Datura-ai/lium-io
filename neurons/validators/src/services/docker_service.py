@@ -384,6 +384,12 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
+# DAH-3980 pre-started pod: the label `pod_<id>` carries (value = <id>), the trial env marker that
+# stands for WorkloadKind.WARM_POD when the backend cannot send it, and the volume size before a
+# rent grows it
+WARM_POD_LABEL = "lium.warm_pod"
+WARM_POD_ENV_MARKER = "LIUM_WARM_POD"
+WARM_POD_VOLUME_GB = 1
 # Where the gocryptfs passphrase and the script that carries it live for the second they exist
 # inside the rental container. /dev/shm is the tmpfs Docker (and sysbox) mount into every
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
@@ -1265,6 +1271,20 @@ def _should_repair_stale_mountpoint(
         and _is_stale_vloopback_mountpoint_error(str(exc))
     )
 
+def is_warm_pod_create(payload: ContainerCreateRequest) -> bool:
+    # a create of a pre-started pod with no renter yet
+    if payload.workload_kind == WorkloadKind.WARM_POD:
+        return True
+    # trial fallback: the marker counts only with no keys -- a renter's create always carries keys,
+    # so a renter's own environment cannot turn its rental into a keyless warm create
+    environment = (payload.custom_options.environment if payload.custom_options else None) or {}
+    return (
+        payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+        and not payload.user_public_keys
+        and environment.get(WARM_POD_ENV_MARKER) == "1"
+    )
+
+
 def _should_encrypt_local_volume(
     local_volume: str | None,
     workload_kind: WorkloadKind,
@@ -1945,6 +1965,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            labels={WARM_POD_LABEL: payload.pod_id} if is_warm_pod_create(payload) else {},
         )
 
     async def _ensure_pod_quote_socket(
@@ -5678,6 +5699,28 @@ class DockerService:
             raise docker_outcome
         return ssh_outcome, docker_outcome
 
+    @staticmethod
+    async def _refuse_warm_create_beside_customer_pod(
+        ssh_client: asyncssh.SSHClientConnection,
+    ) -> None:
+        # pod_* containers on the host that are not warm pods: a renter's, or an edit's parked copy
+        # The backend sends a warm create from an idle snapshot that can be stale by the time it
+        # runs; its sweep must never remove a renter's pod, nor may a warm pod sit beside one.
+        listing = await ssh_client.run(
+            f"/usr/bin/docker ps -a --format '{{{{.Names}}}} {{{{.Label \"{WARM_POD_LABEL}\"}}}}'",
+            check=True,
+        )
+        customer_pods = [
+            name
+            for name, _, warm_pod_id in (
+                line.strip().partition(" ") for line in (listing.stdout or "").splitlines()
+            )
+            if name.startswith(POD_CONTAINER_PREFIX)
+            and warm_pod_id.strip() != name.removeprefix(POD_CONTAINER_PREFIX)
+        ]
+        if customer_pods:
+            raise RuntimeError(f"warm pod create refused: customer pods on the host: {customer_pods}")
+
     async def _restore_gpu_power_for_uncapped_pod(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -5724,6 +5767,7 @@ class DockerService:
         warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
+        warm_create = is_warm_pod_create(payload)
 
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
@@ -5809,6 +5853,8 @@ class DockerService:
         try:
             current_step = "prepare_request"
             custom_options = CustomOptions.sanitize(payload.custom_options)
+            if custom_options.environment:
+                custom_options.environment.pop(WARM_POD_ENV_MARKER, None)
             # generate port maps
             current_step = "port_mapping"
             port_maps, jupyter_port_map = await self.generate_portMappings(
@@ -5875,7 +5921,7 @@ class DockerService:
                 )
 
             current_step = "validate_request"
-            if not payload.user_public_keys:
+            if not payload.user_public_keys and not warm_create:
                 log_text = _m(
                     "No public keys",
                     extra=get_extra_info(default_extra),
@@ -6348,6 +6394,10 @@ class DockerService:
                 # docker removal and stay in use.
                 docker_listing_probe: PrerunHostProbe | None = host_probe
 
+                if warm_create:
+                    current_step = "warm_pod_fence"
+                    await self._refuse_warm_create_beside_customer_pod(ssh_client)
+
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
                 # containers + their volumes that aren't in active_*) stays on the
@@ -6369,7 +6419,10 @@ class DockerService:
                     # DAH-3706: a customer's pod never shares the node with a filler, so its
                     # create removes every filler_* whatever the backend listed; a filler create
                     # keeps protecting its listed sibling bundle (DAH-2465).
-                    remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                    # A warm pod has no renter yet: fillers keep running beside it.
+                    remove_every_filler=(
+                        payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not warm_create
+                    ),
                 )
                 if removed_containers:
                     docker_listing_probe = None
@@ -6430,6 +6483,8 @@ class DockerService:
                     )
                     if not (payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits)
                     and not payload.bootstrap_restore
+                    # a warm pod runs beside fillers: lifting the power would uncap a running PEARL
+                    and not warm_create
                     else None
                 )
                 if early_gpu_power_restore is not None:
@@ -6533,15 +6588,19 @@ class DockerService:
 
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
-                    sizing = await self.resolve_volume_sizing(
-                        ssh_client=ssh_client,
-                        payload=payload,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                        host_probe=volume_probe,
-                    )
-                    effective_volume_limit_gb = sizing.volume_limit_gb
-                    effective_storage_limit_gb = sizing.storage_limit_gb
+                    if warm_create:
+                        # the rent that adopts the pod grows the volume to its own size
+                        effective_volume_limit_gb = WARM_POD_VOLUME_GB
+                    else:
+                        sizing = await self.resolve_volume_sizing(
+                            ssh_client=ssh_client,
+                            payload=payload,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                            host_probe=volume_probe,
+                        )
+                        effective_volume_limit_gb = sizing.volume_limit_gb
+                        effective_storage_limit_gb = sizing.storage_limit_gb
 
                     current_step = "volume_creation"
                     local_volume = f"volume_{payload.pod_id}"
@@ -6656,7 +6715,7 @@ class DockerService:
                     )
                     if not cap_applied:
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
-                else:
+                elif not warm_create:
                     await (
                         early_gpu_power_restore
                         or self._restore_gpu_power_for_uncapped_pod(
@@ -6897,7 +6956,8 @@ class DockerService:
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
                     try:
-                        if not keys_in_volume_setup:
+                        # a warm create has no keys to add
+                        if not keys_in_volume_setup and payload.user_public_keys:
                             await self.add_ssh_public_keys_with_rental_docker(
                                 docker_client=docker_client,
                                 container_name=container_name,
@@ -6998,12 +7058,14 @@ class DockerService:
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
 
                     current_step = "finalize"
-                    await self._cache_rented_pod_best_effort(
-                        executor_info=executor_info,
-                        pod_id=payload.pod_id,
-                        container_name=container_name,
-                        default_extra=default_extra,
-                    )
+                    # a warm pod is not rented: in the rented-machine cache it would read as a rental
+                    if not warm_create:
+                        await self._cache_rented_pod_best_effort(
+                            executor_info=executor_info,
+                            pod_id=payload.pod_id,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                        )
                     if settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
@@ -7053,7 +7115,9 @@ class DockerService:
                     )
                 )
 
-                if payload.workload_kind == WorkloadKind.FILLER:
+                # a warm pod's id is the one its renter later creates under: a pending mark left
+                # behind would decline that create as RentingInProgress
+                if payload.workload_kind == WorkloadKind.FILLER or warm_create:
                     await self.redis_service.remove_pending_pod(
                         payload.miner_hotkey,
                         payload.executor_id,
