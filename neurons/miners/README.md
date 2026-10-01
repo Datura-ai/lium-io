@@ -215,7 +215,7 @@ An executor that still holds collateral on the contract stays registered until i
 
 Executors run and earn without collateral. If an executor still holds a TAO deposit from earlier, withdraw it in two steps: start a reclaim request, then finalize it once the request's deny window has passed. Both steps are transactions from the Ethereum Address associated with your hotkey.
 
-Deposits sit on one of two collateral contracts: version `1.0.2` (current) or `1.0.0` (deposits made before 1.0.2). `reclaim-collateral` and `finalize-reclaim-request` find the contract that holds the executor's collateral or your reclaim request. Every collateral command also takes `--contract <version>` to pick one directly; the read commands ask for the version when it is left out.
+Deposits sit on one of two collateral contracts: version `1.0.2` (current) or `1.0.0` (deposits made before 1.0.2). `reclaim-collateral` and `finalize-reclaim-request` find the contract that holds the executor's collateral or your reclaim request. `reclaim-collateral`, `finalize-reclaim-request` and the three read commands (`get-miner-collateral`, `get-executor-collateral`, `get-reclaim-requests`) also take `--contract <version>` to pick one directly; the read commands ask for the version when it is left out.
 
 ### Getting Miner Collateral
 
@@ -253,7 +253,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-coll
 
 The command logs the reclaim request ID; keep it for the finalize step.
 
-If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known. A mined reclaim is reported with its reclaim request ID. After that, a finalize that was mined shows up as "no open reclaim request". Any error answer to a send keeps that record, since a gateway can pass the transaction on and still answer with an error. If the RPC no longer serves the earlier transaction's receipt, run the command again with `SUBTENSOR_EVM_RPC_URL` set to an RPC that does, or look the transaction up on the explorer and, once you know its outcome, delete the file. If the earlier transaction is still not mined after it is broadcast again, do not delete the file: no receipt on one RPC does not prove it can never be mined. Run `python src/cli.py replace-collateral-transaction --private-key <key>` instead. It signs the same call again at the same nonce with a gas price at least 12.5% higher (and never above `COLLATERAL_MAX_GAS_PRICE_GWEI`), adds it to the file before it broadcasts it, and waits for a receipt of either transaction. Only one of them can be mined, and no other nonce is signed until one of them has a receipt. Then run the reclaim or finalize again if it still needs doing.
+If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known. A mined reclaim is reported with its reclaim request ID. After that, a finalize that was mined shows up as "no open reclaim request". Any error answer to a send keeps that record, since a gateway can pass the transaction on and still answer with an error. If the RPC does not serve the earlier transaction's receipt or its block, run the command again with `SUBTENSOR_EVM_RPC_URL` set to an RPC that does, or look the transaction up on the explorer and, once you know its outcome, delete the file. If the earlier transaction is still not mined after it is broadcast again, do not delete the file: no receipt on one RPC does not prove it can never be mined. Run `docker exec -it <container-id or name> pdm run /root/app/src/cli.py replace-collateral-transaction --private-key <ethereum-private-key>` instead. It signs the same call again at the same nonce with a gas price at least 12.5% higher (and never above `COLLATERAL_MAX_GAS_PRICE_GWEI`), adds it to the file before it broadcasts it, and waits for a receipt of either transaction. Only one of them can be mined, and no other nonce is signed until one of them has a receipt. Then run the reclaim or finalize again if it still needs doing.
 
 ### Getting Miner Reclaim Requests
 
@@ -263,7 +263,7 @@ To view open reclaim requests, use the following command:
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-reclaim-requests
 ```
 
-This prints the open reclaim requests started in the last ~1000 blocks (about 3 hours) for executors in this miner's database.
+This prints the open reclaim requests started in the last ~1000 blocks (about 3 hours) for executors in this miner's database. The default finney RPC keeps only about the last 256 blocks (about 50 minutes); with it, the command warns that older requests are not listed. Their IDs are in the output of the reclaim command that started them, or set `SUBTENSOR_EVM_RPC_URL` to an RPC that keeps older blocks.
 
 ### Contract versions
 

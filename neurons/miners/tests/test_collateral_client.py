@@ -7,6 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
 
+import aiohttp
 import pytest
 import rlp
 from click.testing import CliRunner
@@ -46,17 +47,6 @@ def hex_encode(types, values) -> str:
 
 
 SENDS = {selector("finalizeReclaim(uint256)"), selector("reclaimCollateral(bytes16,string,bytes16)")}
-
-
-def bloom_of(logs) -> str:
-    """A block's logs bloom built as the yellow paper's M3:2048, as one 2048-bit big-endian integer."""
-    bits = 0
-    for log in logs:
-        for value in [log["address"], *log["topics"]]:
-            digest = AsyncWeb3.keccak(hexstr=value)
-            for i in (0, 2, 4):
-                bits |= 1 << (int.from_bytes(digest[i : i + 2], "big") & 2047)
-    return "0x" + bits.to_bytes(256, "big").hex()
 
 
 class FakeProvider(AsyncBaseProvider):
@@ -101,7 +91,6 @@ class FakeProvider(AsyncBaseProvider):
         self.mine_sent = True
         self.mined = set()
         self.block_number = 16
-        self.logs_by_fork = []
         # the "finalized" tag's number when it trails the head; the chain's block hash at a number, when it is
         # not the one receipts name
         self.finalized_number = None
@@ -110,19 +99,33 @@ class FakeProvider(AsyncBaseProvider):
         self.fork_hashes = {}
         # hashes whose receipt request is answered with TX_HASH's receipt
         self.receipts_of_another = set()
-        # block hashes a lagging backend answers a by-hash log read for with "unknown block"
-        self.unknown_block_hashes = set()
+        # blocks below this number are pruned: a read of one answers null
+        self.oldest_kept = 0
+        # who answers each next batch: "b" a backend on fork B, "lagging" one without these blocks, "429" none
+        self.batch_backends = []
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
+
+    async def make_batch_request(self, requests):
+        backend = self.batch_backends.pop(0) if self.batch_backends else "a"
+        if backend == "429":
+            raise aiohttp.ClientResponseError(None, (), status=429, message="Too Many Requests")
+        answers = []
+        for i, (method, params) in enumerate(requests):
+            if backend == "a" or params[0] == "finalized":
+                answer = await self.make_request(method, params)
+            else:
+                self.requests.append((method, params))
+                fork_b = {"eth_getLogs": [fork_b_log()], "eth_getBlockByNumber": {**self.block(16), "hash": FORK_B}}
+                answer = {"result": fork_b[method] if backend == "b" else ([] if method == "eth_getLogs" else None)}
+            answers.append({**answer, "id": i})
+        return answers[::-1]
 
     def chain_hash(self, number: int) -> str:
         if number in self.canonical_hashes:
             return self.canonical_hashes[number]
         return BLOCK_HASH if number == 16 else "0x" + f"{number:064x}"
-
-    def logs_in(self, block_hash: str) -> list:
-        return [log for log in self.logs if log["blockHash"] == block_hash]
 
     def block(self, number: int) -> dict:
         block_hash = self.chain_hash(number)
@@ -130,12 +133,11 @@ class FakeProvider(AsyncBaseProvider):
             "number": hex(number),
             "hash": block_hash,
             "parentHash": self.chain_hash(number - 1),
-            "logsBloom": bloom_of(self.logs_in(block_hash)),
         }
 
     def fork_block(self, number: int) -> dict:
         parent = self.fork_hashes.get(number - 1, self.chain_hash(number - 1))
-        return {"number": hex(number), "hash": self.fork_hashes[number], "parentHash": parent, "logsBloom": bloom_of([])}
+        return {"number": hex(number), "hash": self.fork_hashes[number], "parentHash": parent}
 
     async def make_request(self, method, params):
         self.requests.append((method, params))
@@ -172,6 +174,8 @@ class FakeProvider(AsyncBaseProvider):
                 return {"jsonrpc": "2.0", "id": 1, "result": self.block(self.finalized_number)}
             if isinstance(tag, str) and tag.startswith("0x"):
                 number = int(tag, 16)
+                if number < self.oldest_kept:
+                    return {"jsonrpc": "2.0", "id": 1, "result": None}
                 if number in self.fork_hashes:
                     return {"jsonrpc": "2.0", "id": 1, "result": self.fork_block(number)}
                 return {"jsonrpc": "2.0", "id": 1, "result": self.block(number)}
@@ -182,13 +186,8 @@ class FakeProvider(AsyncBaseProvider):
                 (self.block(n) for n in candidates if n <= self.block_number and self.chain_hash(n) == params[0]), None
             )
             return {"jsonrpc": "2.0", "id": 1, "result": found}
-        if method == "eth_getLogs" and "blockHash" in params[0]:
-            if params[0]["blockHash"] in self.unknown_block_hashes:
-                return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unknown block"}}
-            return {"jsonrpc": "2.0", "id": 1, "result": self.logs_in(params[0]["blockHash"])}
         if method == "eth_getLogs":
-            logs = self.logs_by_fork.pop(0) if self.logs_by_fork else self.logs
-            return {"jsonrpc": "2.0", "id": 1, "result": logs}
+            return {"jsonrpc": "2.0", "id": 1, "result": self.logs}
         results = {
             "eth_chainId": hex(self.chain_id),
             "eth_gasPrice": hex(self.gas_price),
@@ -780,25 +779,23 @@ async def test_a_receipt_that_is_not_final_on_chain_never_clears_the_send_record
     "case,error",
     [
         ("orphaned", "not the finalized block at that number"),
-        # backend A finalized block 20; a lagging backend B serves its own block 16 to a read by number
-        ("lagging-backend", "not the finalized block at that number"),
-        ("numeric-reads-on-another-fork", None),
-        ("too-far-back", "too far back"),
+        ("final", None),
+        # read a of a5079c9: the default finney RPC keeps about 256 blocks and answers HTTP 429 after about 100 reads
+        ("pruned", "no longer keeps.*SUBTENSOR_EVM_RPC_URL"),
+        ("rate-limited", "could not be read \\(HTTP 429.*SUBTENSOR_EVM_RPC_URL"),
     ],
 )
 async def test_a_fresh_send_record_clears_only_on_a_receipt_on_the_finalized_chain(monkeypatch, case, error):
+    monkeypatch.setattr(collateral_module, "RATE_LIMIT_RETRY_SEC", (0, 0, 0))
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
     if case != "orphaned":
         provider.block_number = provider.finalized_number = 20
     if case == "orphaned":
         provider.canonical_hashes[16] = "0x" + "bb" * 32
-    elif case == "lagging-backend":
-        provider.canonical_hashes[16] = "0x" + "aa" * 32
-        provider.fork_hashes[16] = BLOCK_HASH
-    elif case == "numeric-reads-on-another-fork":
-        provider.fork_hashes = {n: "0x" + f"{n:060x}0b0b" for n in range(16, 20)}
-    else:
-        monkeypatch.setattr(collateral_module, "FINALITY_CHECK_MAX_BLOCKS", 3)
+    elif case == "pruned":
+        provider.oldest_kept = 17
+    elif case == "rate-limited":
+        provider.batch_backends = ["429"] * 4
     client = client_with(provider)
 
     if error is None:
@@ -808,8 +805,6 @@ async def test_a_fresh_send_record_clears_only_on_a_receipt_on_the_finalized_cha
     with pytest.raises(CollateralOutcomeUnknownError, match=error):
         await client.finalize_reclaim(5)
     assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
-    if case == "lagging-backend":
-        assert ("eth_getBlockByHash", ["0x" + "aa" * 32, False]) in provider.requests
 
 
 OLD_CONTRACT = "0x999F9A49A85e9D6E981cad42f197349f50172bEB"
@@ -985,80 +980,56 @@ def fork_b_log(url="https://fork-b/reclaim"):
 
 
 @pytest.mark.parametrize(
-    "logs_by_fork,fork_reads,urls",
+    "backends,amount,urls",
     [
-        # the first log read reaches backend B, the second backend A: only A's list is kept
-        ([[fork_b_log()], [started_log(url="https://fork-a/reclaim")]], False, ["https://fork-a/reclaim"]),
-        # every read by number between the finalized block and the log reaches backend B
-        ([[started_log(url="https://fork-a/reclaim")]], True, ["https://fork-a/reclaim"]),
-        # both: B's log in B's block is still off the finalized chain
-        ([[fork_b_log()], [started_log(url="https://fork-a/reclaim")]], True, ["https://fork-a/reclaim"]),
-        ([[fork_b_log()]] * collateral_module.RECLAIM_LIST_ATTEMPTS, False, None),
+        # the first batch reaches backend B (its block at the finalized number is B's), the second backend A
+        (["b"], 10**17, ["https://fork-a/reclaim"]),
+        # a lagging backend has no block at the finalized number and answers the log range with []
+        (["lagging"], 10**17, ["https://fork-a/reclaim"]),
+        (["b"] * collateral_module.RECLAIM_LIST_ATTEMPTS, 10**17, None),
+        # a gateway that splits a batch: the log's amount is not the state at the finalized block
+        ([], 2 * 10**17, None),
     ],
-    ids=["log-from-b", "numeric-reads-from-b", "log-and-numeric-reads-from-b", "b-every-time"],
+    ids=["b-then-a", "lagging-then-a", "b-every-time", "log-and-state-disagree"],
 )
-async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(logs_by_fork, fork_reads, urls):
-    """A load-balanced RPC answers the finalized block from backend A and a read by number from a lagging backend
-    B on another fork (review of 21ec2fd: A's log with B's amount). The list is A's, or an error."""
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(backends, amount, urls):
+    """A load-balanced RPC answers the finalized block from backend A and other reads from a lagging backend B or
+    one on another fork (reviews of 21ec2fd: A's log with B's amount; B's empty log answer). The list is A's, or an
+    error."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim(amount)})
     provider.block_number = provider.finalized_number = 5000
-    provider.logs_by_fork = list(logs_by_fork)
-    if fork_reads:
-        provider.fork_hashes = {n: "0x" + f"{n:060x}0b0b" for n in range(16, 5000)}
-        provider.fork_hashes[16] = FORK_B
+    provider.logs = [{**started_log(url="https://fork-a/reclaim"), "blockNumber": hex(4500)}]
+    provider.batch_backends = list(backends)
 
     if urls is None:
         with pytest.raises(CollateralTransactionError, match="not on the finalized chain"):
             await client_with(provider).get_reclaim_events()
-        assert [method for method, _ in provider.requests].count("eth_call") == 0
         return
     requests = await client_with(provider).get_reclaim_events()
 
-    assert [request.url for request in requests] == urls
+    assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
 
 
-async def test_an_empty_log_answer_from_a_lagging_backend_still_lists_the_open_request():
-    """Review of 21ec2fd: backend A serves the finalized block, lagging backend B the numeric log range and
-    answers []. Block 4500's header, linked to the finalized block, has a bloom that may hold the event, so that
-    block's logs are read again by its hash."""
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_blocks(monkeypatch, caplog):
+    """Read a of a5079c9: the listing read every one of 1000 headers, and the default finney RPC answers HTTP 429
+    after about 100 reads and keeps only about 256 blocks."""
+    monkeypatch.setattr(collateral_module, "RATE_LIMIT_RETRY_SEC", (0, 0, 0))
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
     provider.block_number = provider.finalized_number = 5000
-    provider.logs = [{**started_log(), "blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}]
-    provider.logs_by_fork = [[]]
+    provider.oldest_kept = 5000 - 255
+    provider.batch_backends = ["429", "429"]
 
     requests = await client_with(provider).get_reclaim_events()
 
-    assert [(request.reclaim_request_id, request.block_number) for request in requests] == [(5, 4500)]
-    by_hash = [params[0] for method, params in provider.requests if method == "eth_getLogs" and "blockHash" in params[0]]
-    assert [log_filter["blockHash"] for log_filter in by_hash] == [provider.chain_hash(4500)]
+    assert [request.reclaim_request_id for request in requests] == [5]
+    assert len(provider.requests) == 5  # finalized, the two range ends, the log range, one request's state
+    assert "no longer keeps block 4000" in caplog.text
 
-
-async def test_a_block_whose_logs_a_backend_cannot_serve_by_hash_is_an_error_not_an_empty_list():
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    provider.block_number = provider.finalized_number = 5000
-    provider.logs = [{**started_log(), "blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}]
-    provider.logs_by_fork = [[]] * collateral_module.RECLAIM_LIST_ATTEMPTS
-    provider.unknown_block_hashes = {provider.chain_hash(4500)}
-
-    with pytest.raises(CollateralTransactionError, match="could not answer a block's logs"):
+    provider.batch_backends = ["429"] * 4
+    with pytest.raises(CollateralTransactionError, match="HTTP 429.*SUBTENSOR_EVM_RPC_URL"):
         await client_with(provider).get_reclaim_events()
-    assert [method for method, _ in provider.requests].count("eth_call") == 0
-
-
-def test_the_bloom_check_matches_a_bloom_built_from_the_log():
-    log = started_log()
-    bloom = bytes.fromhex(bloom_of([log]).removeprefix("0x"))
-    address, topic = bytes.fromhex(CONTRACT.removeprefix("0x")), bytes.fromhex(log["topics"][0].removeprefix("0x"))
-    other = bytes.fromhex("12" * 20)
-
-    assert collateral_module.bloom_may_hold(bloom, address, topic)
-    assert not collateral_module.bloom_may_hold(bytes(256), address, topic)
-    assert not collateral_module.bloom_may_hold(bloom, other, topic)
-    # a bloom that proves nothing never hides a block
-    assert collateral_module.bloom_may_hold(None, address, topic)
-    assert collateral_module.bloom_may_hold(b"\x00" * 10, address, topic)
 
 
 async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head():
@@ -1069,9 +1040,7 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
 
     assert [request.reclaim_request_id for request in requests] == [5]
     assert [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"][0] == "finalized"
-    (log_filter,) = [
-        params[0] for method, params in provider.requests if method == "eth_getLogs" and "blockHash" not in params[0]
-    ]
+    (log_filter,) = [params[0] for method, params in provider.requests if method == "eth_getLogs"]
     assert log_filter["toBlock"] == hex(5000)
     details = [params for method, params in provider.requests if method == "eth_call"]
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
@@ -1149,7 +1118,7 @@ async def test_contract_call_on_an_unknown_network_needs_and_uses_the_rpc_url(rp
         )
         return providers[-1]
 
-    monkeypatch.setattr(collateral_module, "AsyncHTTPProvider", fake_http_provider)
+    monkeypatch.setattr(collateral_module, "BatchHTTPProvider", fake_http_provider)
     client = CollateralClient(network="archive", contract_address=CONTRACT, rpc_url=rpc_url)
     if rpc_url is None:
         with pytest.raises(CollateralConfigError, match="SUBTENSOR_EVM_RPC_URL") as raised:
