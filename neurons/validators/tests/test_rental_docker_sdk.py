@@ -1286,6 +1286,27 @@ async def test_factory_does_not_mutate_home_and_closes_client(monkeypatch):
     assert api_client.closed is True
 
 
+def test_default_client_is_built_without_a_version_request(monkeypatch, tmp_path):
+    import docker
+    from docker.transport.sshconn import SSHHTTPAdapter
+
+    # no SSH session: construction must not reach the daemon at all
+    monkeypatch.setattr(SSHHTTPAdapter, "_connect", lambda self: None)
+    version_request = Mock(side_effect=AssertionError("/version requested"))
+    monkeypatch.setattr(docker.APIClient, "_retrieve_server_version", version_request)
+    key_path = tmp_path / "id_executor"
+    key_path.write_text("")
+    known_hosts_path = tmp_path / "known_hosts"
+    known_hosts_path.write_text("")
+
+    api_client = RentalDockerSdkClientFactory()._create_api_client(
+        "ssh://root@127.0.0.1:2222", key_path, known_hosts_path
+    )
+
+    version_request.assert_not_called()
+    assert api_client.api_version == rental_docker_sdk.RENTAL_DOCKER_API_VERSION == "1.44"
+
+
 @pytest.mark.asyncio
 async def test_factory_fails_closed_without_executor_host_key():
     api_client_factory = Mock()
