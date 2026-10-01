@@ -107,10 +107,14 @@ its dockerd is the store's next writer.
 ## Removal
 
 Every path that removes a pod's volume removes both companion volumes, whatever the settings are
-now: delete, the pre-create sweep, failed-create cleanup, the stale-container cleanup, the rental
-probe's shell fallback, and the vloopback volume sweep. Companions whose pod volume is already gone
-and that no container references are swept by the vloopback sweep at create and by the periodic
-stale-container cleanup, which skips pods the backend still lists on the executor. Only
+now: the pre-create sweep, failed-create cleanup, the stale-container cleanup, the rental probe's
+shell fallback, and the vloopback volume sweep. Pod deletion removes them only while the store or
+the `/workspace` volume setting is on; with both off it runs no extra command. Companions whose pod
+volume is already gone and that no container references are swept by the vloopback sweep at create
+and, while either setting is on, by the periodic stale-container cleanup, which skips pods the
+backend still lists on the executor. The cleanup lists leftover store-check helpers only while the
+store setting is on. A pod created while a setting was on keeps its companions after both go off,
+until a setting is on again. Only
 `volume_<pod uuid>_docker` / `volume_<pod uuid>_workspace` are read as companions, so a volume
 named like one is never taken for it; a companion of a pod volume that is not `volume_<uuid>`
 still goes with its pod but is never swept as an orphan.
