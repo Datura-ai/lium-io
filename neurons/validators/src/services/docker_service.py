@@ -125,6 +125,7 @@ from services.rental_docker_sdk import (
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_container_command_argv,
+    is_docker_container_not_running_error,
     is_docker_not_found_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
@@ -940,6 +941,14 @@ class ContainerKilledDuringBootstrap(Exception):
         return "the container was stopped by the node before it was ready: it was removed"
 
 
+def _refused_exec_kill_detail(cause: Exception, state_after: str) -> str | None:
+    """A kill's detail for an exec Docker refused with 409 "is not running", without that text: the backend reads
+    it as the image exiting. None for any other exec error, whose own text is the detail."""
+    if not is_docker_container_not_running_error(cause):
+        return None
+    return f"Docker refused the exec; {state_after}"
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -971,7 +980,12 @@ async def _explain_add_public_keys_failure(
             state = await docker_client.inspect_container_state(container_name=container_name)
         except Exception as inspect_exc:
             if is_docker_not_found_error(inspect_exc):
-                return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=None)
+                return ContainerGoneBeforeExec(
+                    str(cause),
+                    container_name=container_name,
+                    state=None,
+                    kill_detail=_refused_exec_kill_detail(cause, "the container is gone"),
+                )
             logger.warning(
                 _m(
                     "Could not inspect the container after a failed SSH-key injection",
@@ -984,7 +998,14 @@ async def _explain_add_public_keys_failure(
             )
             return cause
         if _killed_after_exec(state):
-            return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=state)
+            return ContainerGoneBeforeExec(
+                str(cause),
+                container_name=container_name,
+                state=state,
+                kill_detail=_refused_exec_kill_detail(
+                    cause, f"container state after the refused exec: {state.describe()}"
+                ),
+            )
     if not state.exited_since_start or (state.killed_by_host and container_gone_cause(state) != "exited"):
         return cause
     if state.running:

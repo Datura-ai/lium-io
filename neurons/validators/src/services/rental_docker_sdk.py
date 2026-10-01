@@ -108,6 +108,18 @@ def is_docker_not_found_error(exc: BaseException) -> bool:
     return False
 
 
+def is_docker_container_not_running_error(exc: BaseException) -> bool:
+    """True when the exception, or any cause under it, is Docker's 409 refusing an exec on a stopped container."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, Exception) and _is_docker_container_not_running_error(current):
+            return True
+        current = current.__cause__
+    return False
+
+
 def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
     """Return the host key required by rental Docker SDK SSH connections."""
     # ExecutorSSHInfo keeps this optional for non-connectable placeholder/error

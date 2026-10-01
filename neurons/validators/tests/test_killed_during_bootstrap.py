@@ -243,6 +243,27 @@ def _gone_at_inspect(api: FakeApiClient, n: int) -> list[str]:
     return looks
 
 
+def _inspect_fails_at(api: FakeApiClient, n: int) -> None:
+    """Inspect call `n` (1-based) fails once with a transient daemon error; the calls around it answer."""
+    real_inspect, looks = api.inspect_container, []
+
+    def inspect(container_name):
+        looks.append(container_name)
+        if len(looks) == n:
+            raise APIError("500 Server Error: Internal Server Error (\"context deadline exceeded\")")
+        return real_inspect(container_name)
+
+    api.inspect_container = inspect
+
+
+def _refused_then_reinspect_fails(api: FakeApiClient, *, gone_after: bool = False) -> None:
+    # Docker refuses the key exec with 409, the SDK's re-inspect of the State fails, and the next inspect reads it
+    api.exec_start = Mock(side_effect=_not_running_conflict(with_response=True))
+    _inspect_fails_at(api, 2)
+    if gone_after:
+        _gone_at_inspect(api, 3)
+
+
 def _exec_exits(*codes: int):
     # the kill lands while the exec runs: the exec ends with its status, not a refused exec
     exits = [{"ExitCode": c} for c in codes]
@@ -302,10 +323,15 @@ _ENDED_ON = "the container stopped before it was ready: its command ended on "
         ("ssh_bootstrap", [_RUNNING, _RUNNING, _SIGKILLED],
          lambda api: setattr(api, "exec_start", Mock(side_effect=[None, _not_running_conflict(with_response=True)])),
          _BY_NODE + "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "removing"}),
+        # review of e41ca1d: the re-inspect after the 409 fails once, so the key step's own inspect reads the kill
+        ("add_public_keys", [_RUNNING, _SIGKILLED], _refused_then_reinspect_fails,
+         _BY_NODE + "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "removing"}),
+        ("add_public_keys", [_RUNNING], lambda api: _refused_then_reinspect_fails(api, gone_after=True),
+         _BY_NODE + "it was removed", {"cause": "removed", "exit_code": None, "status": None}),
     ],
     ids=["ssh-oom", "ssh-sigkill", "ssh-exited-143", "ssh-exited-137", "ssh-exec-137-dead", "ssh-exec-137-404",
          "keys-oom", "keys-removing-exit-0", "keys-dead-exit-1", "keys-exec-130", "keys-exec-137-404", "env-removed",
-         "env-exec-137", "keys-exec-409", "ssh-exec-409"],
+         "env-exec-137", "keys-exec-409", "ssh-exec-409", "keys-409-reinspect-error", "keys-409-reinspect-error-404"],
 )  # fmt: skip
 async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     svc, monkeypatch, caplog, step, states, setup, sentence, event
