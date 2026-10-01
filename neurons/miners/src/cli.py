@@ -159,9 +159,9 @@ def cli():
 
 
 @cli.command()
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def replace_collateral_transaction(private_key: str):
+def replace_collateral_transaction():
     """Replace this key's unmined collateral transaction at the same nonce with a higher gas price."""
+    private_key = click.prompt("Ethereum Private Key", hide_input=True)
     if miner_account(private_key) is None:
         sys.exit(1)
     outcome = run_contract_read(

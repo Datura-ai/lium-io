@@ -1262,10 +1262,19 @@ def test_replace_collateral_transaction_exits_0_only_on_a_success(archive_networ
         cli_module, "get_collateral_contract", lambda **_: SimpleNamespace(replace_earlier_send=replace_earlier_send)
     )
     with caplog.at_level(logging.INFO):
-        result = CliRunner().invoke(cli_module.cli, ["replace-collateral-transaction", "--private-key", MINER_KEY])
+        result = CliRunner().invoke(cli_module.cli, ["replace-collateral-transaction"], input=f"{MINER_KEY}\n")
     assert result.exit_code == exit_code, result.output
     assert ("✅" in caplog.text) is (exit_code == 0)
     assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text + result.output
+
+
+def test_replace_collateral_transaction_takes_no_key_on_the_command_line(monkeypatch):
+    import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "get_collateral_contract", lambda **_: pytest.fail("nothing may be signed"))
+    result = CliRunner().invoke(cli_module.cli, ["replace-collateral-transaction", "--private-key", MINER_KEY])
+    assert result.exit_code == 2
+    assert "No such option" in result.output
 
 
 @pytest.mark.parametrize(
