@@ -470,3 +470,36 @@ async def test_warm_pod_adopted_is_not_logged_when_a_delete_cancelled_the_create
 
     assert not isinstance(result, ContainerCreated)
     assert not any("Warm pod adopted" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_adopted_rent_replies_before_the_inspector_start_and_a_delete_waits_for_it(svc, monkeypatch):
+    payload = _rent_payload()
+    _adoptable(svc, monkeypatch, payload)
+    monkeypatch.setattr(ds_module.settings, "ENABLE_INSPECTOR", True)
+    inspector_may_finish = asyncio.Event()
+
+    async def slow_inspector_start(**kwargs):
+        await inspector_may_finish.wait()
+
+    inspector_start = AsyncMock(side_effect=slow_inspector_start)
+    monkeypatch.setattr(svc, "_run_inspector_collector_lifecycle", inspector_start)
+
+    # a reply that waited for the inspector would never come
+    result = await asyncio.wait_for(_run(svc, payload), 1)
+    # what delete_container awaits before its teardown
+    delete_wait = asyncio.create_task(ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, 5))
+    await asyncio.sleep(0.01)
+    started_before_the_delete_went_on = inspector_start.await_count
+    delete_waited = not delete_wait.done()
+    inspector_may_finish.set()
+
+    assert isinstance(result, ContainerCreated), result
+    assert started_before_the_delete_went_on == 1
+    assert delete_waited
+    assert await delete_wait is True
+    assert inspector_start.await_args.kwargs["action"] == "start"
+    assert [step.name.value for step in result.profilers][-2:] == [
+        "Inspector collector start runs after the reply",
+        "Finished in subnet.",
+    ]

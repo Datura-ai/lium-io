@@ -6232,6 +6232,7 @@ class DockerService:
 
     async def _finish_warm_pod_adoption(
         self,
+        connections: AsyncExitStack,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         executor_info: ExecutorSSHInfo,
@@ -6274,17 +6275,11 @@ class DockerService:
             container_name=container_name,
             default_extra=default_extra,
         )
-        step_started_ms = now_ms()
-        if settings.ENABLE_INSPECTOR:
-            await self._run_inspector_collector_lifecycle(
-                ssh_client=ssh_client,
-                executor_info=executor_info,
-                action="start",
-                default_extra={**default_extra, "container_name": container_name},
-            )
+        # no duration: the collector starts after the reply, its time is logged there
         profilers.append(
-            ProfilerStep.since(
-                ProfilerStepName.INSPECTOR_START, step_started_ms, skipped=not settings.ENABLE_INSPECTOR
+            ProfilerStep(
+                name=ProfilerStepName.INSPECTOR_START_AFTER_REPLY,
+                skipped=not settings.ENABLE_INSPECTOR,
             )
         )
         profilers.append(
@@ -6304,7 +6299,7 @@ class DockerService:
                 }),
             )
         )
-        return ContainerCreated(
+        container_created_reply = ContainerCreated(
             miner_hotkey=payload.miner_hotkey,
             executor_id=payload.executor_id,
             pod_id=payload.pod_id,
@@ -6323,6 +6318,18 @@ class DockerService:
             local_volume_path="/root",
             volume_encryption_status=VolumeEncryptionStatus.ENABLED,
         )
+        # last, so nothing fails after it: the reply goes now, and the steps after it take over this
+        # create's sessions and close them; a delete of the pod waits for them
+        create_steps_after_reply.start(
+            payload.pod_id,
+            self._run_create_steps_after_reply(
+                connections.pop_all(),
+                ssh_client=ssh_client,
+                executor_info=executor_info,
+                log_extra={**default_extra, "container_name": container_name},
+            ),
+        )
+        return container_created_reply
 
     async def create_container(
         self,
@@ -6658,7 +6665,13 @@ class DockerService:
                     )
                     if adopted_warm_pod is not None:
                         return await self._finish_warm_pod_adoption(
-                            ssh_client, payload, executor_info, adopted_warm_pod, profilers, default_extra
+                            connections,
+                            ssh_client,
+                            payload,
+                            executor_info,
+                            adopted_warm_pod,
+                            profilers,
+                            default_extra,
                         )
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
