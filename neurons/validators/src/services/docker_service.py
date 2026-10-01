@@ -5645,6 +5645,7 @@ class DockerService:
         connections: AsyncExitStack,
         ssh_connect: AbstractAsyncContextManager[asyncssh.SSHClientConnection],
         docker_connect: AbstractAsyncContextManager[RentalDockerSdkClient],
+        on_ssh_connected: Callable[[asyncssh.SSHClientConnection], None] | None = None,
     ) -> tuple[asyncssh.SSHClientConnection, RentalDockerSdkClient]:
         """DAH-3004: enter both connection contexts at once on the caller's exit stack.
 
@@ -5652,9 +5653,17 @@ class DockerService:
         ``connections`` when the SSH failure, or the Docker failure if SSH succeeded, is re-raised —
         the stack closes it on the way out and nothing is leaked, which a bare ``gather`` (one
         coroutine still connecting while the exception propagates) would not guarantee.
+        ``on_ssh_connected`` runs as soon as the SSH session is up, while Docker still connects.
         """
+
+        async def enter_ssh() -> asyncssh.SSHClientConnection:
+            ssh_client = await connections.enter_async_context(ssh_connect)
+            if on_ssh_connected is not None:
+                on_ssh_connected(ssh_client)
+            return ssh_client
+
         ssh_outcome, docker_outcome = await asyncio.gather(
-            connections.enter_async_context(ssh_connect),
+            enter_ssh(),
             connections.enter_async_context(docker_connect),
             return_exceptions=True,
         )
@@ -5929,6 +5938,44 @@ class DockerService:
                 else asyncio.create_task(fetch_docker_hub_digest(payload.docker_image))
             )
 
+            # DAH-3980: the host probes do not read the image; started as soon as the SSH session is
+            # up they run while Docker connects and the image is inspected. Their answers are used
+            # only when no pull or build ran in between (the image label, and listings minutes
+            # old), and the volume facts only when the cleanup changed nothing; otherwise each
+            # probe runs again at its own step.
+            early_probes_allowed = not is_custom_build and not local_volume
+            measures_host = self.measures_host_for_volume_sizing(payload)
+            wants_volume_probe = settings.RENTAL_VOLUME_FAST_PATH_ENABLED and bool(
+                measures_host or payload.volume_limit_gb
+            )
+            probe_with_power = not (
+                payload.workload_kind == WorkloadKind.FILLER and bool(payload.gpu_power_limits)
+            )
+            early_host_probe: asyncio.Task | None = None
+            early_volume_probe: asyncio.Task | None = None
+
+            def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
+                nonlocal early_host_probe, early_volume_probe
+                if not early_probes_allowed:
+                    return
+                if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
+                    early_host_probe = asyncio.create_task(
+                        self.probe_prerun_host(
+                            connected_ssh_client,
+                            docker_image=payload.docker_image,
+                            with_power=probe_with_power,
+                            log_extra=default_extra,
+                        )
+                    )
+                    connections.callback(early_host_probe.cancel)
+                if wants_volume_probe:
+                    early_volume_probe = asyncio.create_task(
+                        self.probe_volume_host(
+                            connected_ssh_client, with_df=measures_host, log_extra=default_extra
+                        )
+                    )
+                    connections.callback(early_volume_probe.cancel)
+
             current_step = "ssh_connect"
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
@@ -5955,6 +6002,7 @@ class DockerService:
                         executor_info=executor_info,
                         private_key=private_key,
                     ),
+                    on_ssh_connected=start_early_probes,
                 )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
@@ -5967,43 +6015,6 @@ class DockerService:
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-
-                # DAH-3980: the host probes do not read the image; started here they run beside the
-                # image inspect. Their answers are used only when no pull or build ran in between
-                # (the image label, and listings minutes old), and the volume facts only when the
-                # cleanup below changed nothing; otherwise each probe runs again at its own step.
-                early_probes_allowed = not is_custom_build and not local_volume
-                measures_host = self.measures_host_for_volume_sizing(payload)
-                wants_volume_probe = settings.RENTAL_VOLUME_FAST_PATH_ENABLED and bool(
-                    measures_host or payload.volume_limit_gb
-                )
-                probe_with_power = not (
-                    payload.workload_kind == WorkloadKind.FILLER and bool(payload.gpu_power_limits)
-                )
-                early_host_probe = (
-                    asyncio.create_task(
-                        self.probe_prerun_host(
-                            ssh_client,
-                            docker_image=payload.docker_image,
-                            with_power=probe_with_power,
-                            log_extra=default_extra,
-                        )
-                    )
-                    if early_probes_allowed and settings.RENTAL_PRERUN_HOST_PROBE_ENABLED
-                    else None
-                )
-                early_volume_probe = (
-                    asyncio.create_task(
-                        self.probe_volume_host(
-                            ssh_client, with_df=measures_host, log_extra=default_extra
-                        )
-                    )
-                    if early_probes_allowed and wants_volume_probe
-                    else None
-                )
-                for early_probe in (early_host_probe, early_volume_probe):
-                    if early_probe is not None:
-                        connections.callback(early_probe.cancel)
 
                 # set real-time logging
                 self.log_task = asyncio.create_task(
