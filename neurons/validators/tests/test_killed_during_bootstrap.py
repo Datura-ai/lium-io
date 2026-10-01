@@ -504,15 +504,32 @@ async def test_a_sweep_id_is_ours_once_its_rm_is_handed_to_ssh(monkeypatch, atte
 
 
 @pytest.mark.asyncio
-async def test_an_unsent_rm_keeps_an_id_another_sweep_marked(monkeypatch):
+@pytest.mark.parametrize("other_order", ["before", "during"])
+async def test_an_unsent_rm_keeps_an_id_another_sweep_marked(other_order):
+    """Another sweep's sent `rm` of the same ID, made before this one's channel fails or while it waits for
+    one, keeps the ID ours."""
     swept_id = _container_id("filler_swept-1")
-    own_sweep_removals.mark([swept_id])
-    ssh = Mock()
-    ssh.run = AsyncMock(side_effect=asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed"))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def fail_open(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed")
+
+    first = Mock(run=AsyncMock(side_effect=fail_open))
+    second = Mock(run=AsyncMock(return_value=Mock(stdout="", stderr="", exit_status=0)))
+    if other_order == "before":
+        await DockerService._rm_containers(second, [swept_id], max_attempts=1, own_ids=[swept_id])
+    pending = asyncio.create_task(
+        DockerService._rm_containers(first, [swept_id], max_attempts=1, own_ids=[swept_id])
+    )
+    await entered.wait()
+    if other_order == "during":
+        await DockerService._rm_containers(second, [swept_id], max_attempts=1, own_ids=[swept_id])
+    release.set()
 
     with pytest.raises(asyncssh.ChannelOpenError):
-        await DockerService._rm_containers(ssh, [swept_id], max_attempts=1, own_ids=[swept_id])
-
+        await pending
     assert own_sweep_removals.sent_rm_for(swept_id)
 
 

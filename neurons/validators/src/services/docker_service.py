@@ -1214,24 +1214,34 @@ class _OwnSweepRegistry:
     read). Only an SSH channel that never opened proves the `rm` was not sent, and only that takes the
     ID back (_MarkOwnRemovalsOnSubmit). The sweep removes by full ID, so a retry's new container under
     the same name is never one of them.
+
+    Each `rm` marks under its own token, and taking an ID back drops only that token: two sweeps can
+    target one filler, and one sweep's unsent `rm` must not undo the other's sent one. An ID is ours
+    while any token remains.
     """
 
     # Only a create still bootstrapping reads an ID, minutes after its sweep: the cap only bounds memory.
     MAX_IDS = 10_000
 
     def __init__(self) -> None:
-        self._ids: dict[str, None] = {}
+        self._ids: dict[str, set[object]] = {}
 
-    def mark(self, container_ids: Iterable[str]) -> None:
+    def mark(self, container_ids: Iterable[str], token: object = None) -> None:
         for container_id in container_ids:
-            self._ids.pop(container_id, None)
-            self._ids[container_id] = None
+            tokens = self._ids.pop(container_id, set())
+            tokens.add(token)
+            self._ids[container_id] = tokens
         while len(self._ids) > self.MAX_IDS:
             del self._ids[next(iter(self._ids))]
 
-    def unmark(self, container_ids: Iterable[str]) -> None:
+    def unmark(self, container_ids: Iterable[str], token: object = None) -> None:
         for container_id in container_ids:
-            self._ids.pop(container_id, None)
+            tokens = self._ids.get(container_id)
+            if tokens is None:
+                continue
+            tokens.discard(token)
+            if not tokens:
+                del self._ids[container_id]
 
     def sent_rm_for(self, container_id: str | None) -> bool:
         return bool(container_id) and container_id in self._ids
@@ -1245,24 +1255,23 @@ own_sweep_removals = _OwnSweepRegistry()
 
 class _MarkOwnRemovalsOnSubmit:
     """The SSH client a sweep's `docker rm` is run through: its IDs are marked as ours just before each
-    attempt is sent. A channel that never opened (asyncssh.ChannelOpenError) sent nothing; the IDs this
-    `rm` marked are taken back then, unless an earlier attempt got a channel (its outcome is unknown)."""
+    attempt is sent. A channel that never opened (asyncssh.ChannelOpenError) sent nothing; this `rm`'s
+    marks are taken back then, unless an earlier attempt got a channel (its outcome is unknown). The marks
+    are this `rm`'s own token, so another sweep's mark on the same ID stays."""
 
     def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_ids: list[str]) -> None:
         self._ssh_client = ssh_client
         self._ids = container_ids
-        self._newly_marked: list[str] | None = None
+        self._token = object()
         self._channel_opened = False
 
     async def run(self, command: str, **kwargs: Any) -> Any:
-        if self._newly_marked is None:
-            self._newly_marked = [i for i in self._ids if not own_sweep_removals.sent_rm_for(i)]
-        own_sweep_removals.mark(self._ids)
+        own_sweep_removals.mark(self._ids, self._token)
         try:
             result = await self._ssh_client.run(command, **kwargs)
         except asyncssh.ChannelOpenError:
             if not self._channel_opened:
-                own_sweep_removals.unmark(self._newly_marked)
+                own_sweep_removals.unmark(self._ids, self._token)
             raise
         except BaseException:
             self._channel_opened = True
