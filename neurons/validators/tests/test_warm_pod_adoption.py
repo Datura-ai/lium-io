@@ -17,6 +17,7 @@ import pytest
 import services.docker_service as ds_module
 from payload_models.payloads import (
     ContainerCreated,
+    ContainerCreateRequest,
     CustomOptions,
     PayloadPortMapping,
     VolumeEncryptionStatus,
@@ -503,3 +504,157 @@ async def test_adopted_rent_replies_before_the_inspector_start_and_a_delete_wait
         "Inspector collector start runs after the reply",
         "Finished in subnet.",
     ]
+
+
+# The bench rent as the backend serialized it (LIUM-44 replay, untracked/scripts/lium44/rent.json),
+# claiming warm pod e5cc9735-b344-4c90-afa3-7899350d94b1; available_ports cut to 2 of its 300, the
+# eligibility gate does not read them.
+BENCH_RENT_REQUEST_JSON = """
+{
+    "message_type": "ContainerCreateRequest",
+    "miner_hotkey": "miner-hotkey",
+    "executor_id": "d61ffebd-32b5-4429-a4c4-4dabd20a1347",
+    "miner_address": null,
+    "miner_port": null,
+    "pod_id": "e5cc9735-b344-4c90-afa3-7899350d94b1",
+    "workload_kind": "CUSTOMER_RENTAL",
+    "docker_image": "daturaai/pytorch:2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1",
+    "user_public_keys": [
+        "ssh-ed25519 synthetic-test-key"
+    ],
+    "gpu_uuids": [
+        "GPU-0"
+    ],
+    "cpu_count": 4,
+    "memory_gb": 16,
+    "custom_options": {
+        "volumes": null,
+        "environment": null,
+        "entrypoint": null,
+        "internal_ports": [],
+        "startup_commands": null,
+        "shm_size": "6g",
+        "initial_port_count": null
+    },
+    "debug": false,
+    "local_volume": null,
+    "volume_limit_gb": 60,
+    "storage_limit_gb": 3,
+    "disk_share": 1.0,
+    "min_volume_gb": null,
+    "external_volume_info": null,
+    "is_sysbox": true,
+    "docker_username": null,
+    "docker_password": null,
+    "timestamp": 1790894156110,
+    "pre_dispatch_profilers": [],
+    "backup_log_id": null,
+    "restore_path": null,
+    "bootstrap_restore": null,
+    "enable_jupyter": null,
+    "enable_volume_encryption": true,
+    "available_ports": [
+        {
+            "docker_port": null,
+            "internal_port": 20001,
+            "external_port": 20001
+        },
+        {
+            "docker_port": null,
+            "internal_port": 20002,
+            "external_port": 20002
+        }
+    ],
+    "pod_mapping": [
+        {
+            "docker_port": 22,
+            "internal_port": 20300,
+            "external_port": 20300
+        },
+        {
+            "docker_port": 8888,
+            "internal_port": 20299,
+            "external_port": 20299
+        },
+        {
+            "docker_port": 20001,
+            "internal_port": 20001,
+            "external_port": 20001
+        },
+        {
+            "docker_port": 20002,
+            "internal_port": 20002,
+            "external_port": 20002
+        },
+        {
+            "docker_port": 20003,
+            "internal_port": 20003,
+            "external_port": 20003
+        },
+        {
+            "docker_port": 20004,
+            "internal_port": 20004,
+            "external_port": 20004
+        },
+        {
+            "docker_port": 20005,
+            "internal_port": 20005,
+            "external_port": 20005
+        },
+        {
+            "docker_port": 20006,
+            "internal_port": 20006,
+            "external_port": 20006
+        },
+        {
+            "docker_port": 20007,
+            "internal_port": 20007,
+            "external_port": 20007
+        },
+        {
+            "docker_port": 20008,
+            "internal_port": 20008,
+            "external_port": 20008
+        },
+        {
+            "docker_port": 20009,
+            "internal_port": 20009,
+            "external_port": 20009
+        },
+        {
+            "docker_port": 20010,
+            "internal_port": 20010,
+            "external_port": 20010
+        }
+    ],
+    "active_container_names": null,
+    "active_volume_names": null,
+    "cluster_membership": null,
+    "dockerfile_content": null,
+    "ships_sshd": true,
+    "gpu_power_limits": null,
+    "cache_volumes": null
+}
+"""
+
+
+def test_bench_rent_without_the_jupyter_flag_fits_a_warm_pod(monkeypatch):
+    monkeypatch.setattr(ds_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    payload = ContainerCreateRequest.model_validate_json(BENCH_RENT_REQUEST_JSON)
+
+    unfit_reason = ds_module._rent_unfit_for_warm_pod(payload, payload.custom_options, in_cvm=False)
+
+    assert payload.pod_id == "e5cc9735-b344-4c90-afa3-7899350d94b1"
+    assert payload.enable_jupyter is None
+    assert unfit_reason is None
+
+
+def test_rent_with_jupyter_explicitly_off_is_unfit_for_a_warm_pod(monkeypatch):
+    monkeypatch.setattr(ds_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    payload = ContainerCreateRequest.model_validate_json(BENCH_RENT_REQUEST_JSON).model_copy(
+        update={"enable_jupyter": False}
+    )
+
+    unfit_reason = ds_module._rent_unfit_for_warm_pod(payload, payload.custom_options, in_cvm=False)
+
+    assert unfit_reason == "jupyter_off"

@@ -1543,7 +1543,8 @@ def _rent_unfit_for_warm_pod(
         "dockerfile": payload.dockerfile_content is not None,
         "registry_credentials": bool(payload.docker_username or payload.docker_password),
         "encryption_off": not (payload.enable_volume_encryption and settings.ENABLE_VOLUME_ENCRYPTION),
-        "jupyter_off": not payload.enable_jupyter,
+        # None (the bench, any API rent without the flag) adopts and gets the warm pod's running Jupyter
+        "jupyter_off": payload.enable_jupyter is False,
         "not_sysbox": not payload.is_sysbox,
         # sshd and Jupyter come from the image's own start.sh only on a default-template rent
         "not_default_template": not payload.ships_sshd,
