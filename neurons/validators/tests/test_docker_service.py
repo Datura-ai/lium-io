@@ -7898,3 +7898,25 @@ async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
     )
 
     assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+
+
+@pytest.mark.asyncio
+async def test_finish_stream_logs_sends_the_last_batch_without_waiting_for_the_next_tick(docker_service):
+    # Arrange: the stream loop is mid-wait when the create logs its last line and finishes
+    docker_service.redis_service.publish = AsyncMock()
+    docker_service.log_task = asyncio.create_task(
+        docker_service.handle_stream_logs(miner_hotkey="m", executor_id="e", pod_id="p")
+    )
+    await asyncio.sleep(0.05)
+    await docker_service.stream_log("last line", "success", "container_creation")
+
+    # Act
+    loop = asyncio.get_running_loop()
+    finish_started_at = loop.time()
+    await docker_service.finish_stream_logs()
+
+    # Assert: well under LOG_STREAM_INTERVAL, and the last line went out
+    assert loop.time() - finish_started_at < 0.1
+    docker_service.redis_service.publish.assert_awaited_once()
+    published_logs = docker_service.redis_service.publish.await_args.args[1]["logs"]
+    assert [log["log_text"] for log in published_logs] == ["last line"]
