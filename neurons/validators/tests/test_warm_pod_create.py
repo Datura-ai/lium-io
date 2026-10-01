@@ -4,8 +4,7 @@ A warm pod is the default-template container started while the machine is idle, 
 yet; an eligible rent adopts it later. Its create is the normal one with these differences: no
 keys, fillers keep running, a 1 GB volume, the label `lium.warm_pod=<pod_id>`, no GPU power
 restore (a PEARL filler may run beside it), no rented-pod cache entry, its pending mark cleared on
-success, and a refusal when a renter's `pod_*` is on the host. The env marker `LIUM_WARM_POD=1` on a
-keyless CUSTOMER_RENTAL stands for WorkloadKind.WARM_POD while the backend cannot send it.
+success, and a refusal when a renter's `pod_*` is on the host.
 """
 
 from __future__ import annotations
@@ -32,7 +31,6 @@ from test_deploy_optimizations import (
 
 import services.docker_service as ds_module
 from services.docker_service import (
-    WARM_POD_ENV_MARKER,
     WARM_POD_LABEL,
     WARM_POD_VOLUME_GB,
     DockerService,
@@ -46,14 +44,6 @@ def svc():
 
 def _warm_payload(**over):
     return _payload(workload_kind=WorkloadKind.WARM_POD, user_public_keys=[], **over)
-
-
-def _marker_payload(**over):
-    return _payload(
-        user_public_keys=[],
-        custom_options=CustomOptions(environment={WARM_POD_ENV_MARKER: "1", "HF_HOME": "/root/hf"}),
-        **over,
-    )
 
 
 def _ssh_client_listing_containers(names_and_warm_labels: str):
@@ -145,43 +135,25 @@ async def test_warm_create_cleanup_keeps_fillers(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_marker_form_is_a_warm_create_and_the_marker_stays_out_of_the_env(svc, monkeypatch):
-    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
-    payload = _marker_payload()
-
-    result = await _run(svc, payload)
-
-    assert isinstance(result, ContainerCreated), result
-    run_spec = _created_run_spec(svc)
-    assert run_spec.labels == {WARM_POD_LABEL: payload.pod_id}
-    assert WARM_POD_ENV_MARKER not in run_spec.environment
-    assert run_spec.environment["HF_HOME"] == "/root/hf"
-    assert not any(WARM_POD_ENV_MARKER in str(spec) for spec in _docker_client(svc).exec_specs)
-    assert svc.clean_existing_containers.await_args.kwargs["remove_every_filler"] is False
-    assert result.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-
-
-@pytest.mark.asyncio
-async def test_marker_on_a_renters_create_with_keys_is_stripped_and_ignored(svc, monkeypatch):
-    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
-
-    result = await _run(
-        svc,
-        _payload(custom_options=CustomOptions(environment={WARM_POD_ENV_MARKER: "1"})),
-    )
-
-    assert isinstance(result, ContainerCreated), result
-    run_spec = _created_run_spec(svc)
-    assert run_spec.labels == {}
-    assert WARM_POD_ENV_MARKER not in run_spec.environment
-    assert svc.clean_existing_containers.await_args.kwargs["remove_every_filler"] is True
-
-
-@pytest.mark.asyncio
 async def test_customer_create_with_no_keys_is_still_refused(svc, monkeypatch):
     _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
 
     result = await _run(svc, _payload(user_public_keys=[]))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.NoSshKeys
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_customer_create_with_the_old_warm_env_marker_and_no_keys_is_refused(svc, monkeypatch):
+    # a renter-controlled env var never selects the warm path
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    result = await _run(
+        svc,
+        _payload(user_public_keys=[], custom_options=CustomOptions(environment={"LIUM_WARM_POD": "1"})),
+    )
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_code == FailedContainerErrorCodes.NoSshKeys
