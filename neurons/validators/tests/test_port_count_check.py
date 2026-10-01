@@ -106,12 +106,6 @@ def _background_jobs(
             id="1-answered-plus-2-held-fails",
         ),
         pytest.param(_background_jobs([40010, 40011, 40012]), [], 3, id="none-answered"),
-        pytest.param(
-            _background_jobs([ANSWERED_PAIRS[0][1], 40010]),
-            ANSWERED_PAIRS,
-            1,
-            id="an-answered-port-is-not-held",
-        ),
         pytest.param(None, ANSWERED_PAIRS, 0, id="no-backend-snapshot"),
         pytest.param(
             _background_jobs([40010], owner="miner"), ANSWERED_PAIRS, 0, id="miner-default-job"

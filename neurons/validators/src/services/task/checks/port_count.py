@@ -156,5 +156,4 @@ class PortCountCheck:
             return 0
         if rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM:
             return 0
-        answered = {external for _internal, external in ctx.state.verified_port_pairs}
-        return len(set(rented_data.get_filler_ports(ctx.executor.uuid)) - answered)
+        return len(set(rented_data.get_filler_ports(ctx.executor.uuid)))
