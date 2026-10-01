@@ -13,6 +13,7 @@ import hashlib
 import logging
 from unittest.mock import AsyncMock, Mock
 
+import asyncssh
 import pytest
 import requests
 from docker.errors import APIError, NotFound
@@ -432,9 +433,11 @@ async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, fr
         if from_probe else None
     )  # fmt: skip
 
-    async def remove(_ssh, _extra, _pod, _names, _targets, _every):
+    async def remove(_ssh, _extra, _pod, _names, _targets, _every, own_ids=()):
+        assert list(own_ids) == [swept_id]
         if rm_error is not None:
             raise rm_error
+        own_sweep_removals.mark(own_ids)  # what the real `rm` does once it is sent
         return survivors
 
     svc._remove_stale_containers = remove
@@ -449,10 +452,11 @@ async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, fr
             await sweep
     else:
         assert await sweep == ["filler_swept-1"]
-    # the ID is ours from before its `rm`, whatever the `rm` answered or the host lists afterwards
-    assert own_sweep_removals.sent_rm_for(swept_id)
-    if rm_error is not None:
+    if rm_error is not None:  # the stub raised before any SSH rm
+        assert ssh.rms == []
+        assert not own_sweep_removals.sent_rm_for(swept_id)
         return
+    assert own_sweep_removals.sent_rm_for(swept_id)
     # the customer's create removes the replacement by its own ID and records it as well
     assert own_sweep_removals.sent_rm_for(replacement_id) == (survivor == "replacement")
     assert ssh.rms == ([[replacement_id]] if survivor == "replacement" else [])
@@ -461,6 +465,55 @@ async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, fr
     assert all("docker inspect" not in c.args[0] for c in ssh.run.await_args_list)
     # the replacement: its rm and the confirmation that follows it
     assert ssh.run.await_count == (0 if from_probe else 1) + (2 if survivor == "replacement" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempts", "ours"),
+    [(["ok"], True), (["answer-lost"], True), (["no-channel"], False),
+     (["answer-lost", "no-channel"], True), (["no-channel", "ok"], True)],
+    ids=["answered", "answer-lost", "never-sent", "lost-then-no-channel", "no-channel-then-answered"],
+)  # fmt: skip
+async def test_a_sweep_id_is_ours_once_its_rm_is_handed_to_ssh(monkeypatch, attempts, ours):
+    monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
+    swept_id = _container_id("filler_swept-1")
+    outcomes = iter(attempts)
+    ssh = Mock()
+
+    async def run(command, **_kwargs):
+        assert command == f"/usr/bin/docker rm -fv {swept_id}"
+        assert own_sweep_removals.sent_rm_for(swept_id)
+        outcome = next(outcomes)
+        if outcome == "no-channel":
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed")
+        if outcome == "answer-lost":
+            raise ConnectionResetError("SSH dropped after the rm was sent")
+        return Mock(stdout="", stderr="", exit_status=0)
+
+    ssh.run = AsyncMock(side_effect=run)
+
+    rm = DockerService._rm_containers(ssh, [swept_id], max_attempts=len(attempts), own_ids=[swept_id])
+    if attempts[-1] == "ok":
+        await rm
+    else:
+        with pytest.raises((asyncssh.ChannelOpenError, ConnectionResetError)):
+            await rm
+
+    assert ssh.run.await_count == len(attempts)
+    assert own_sweep_removals.sent_rm_for(swept_id) == ours
+
+
+@pytest.mark.asyncio
+async def test_an_unsent_rm_keeps_an_id_another_sweep_marked(monkeypatch):
+    swept_id = _container_id("filler_swept-1")
+    own_sweep_removals.mark([swept_id])
+    ssh = Mock()
+    ssh.run = AsyncMock(side_effect=asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed"))
+
+    with pytest.raises(asyncssh.ChannelOpenError):
+        await DockerService._rm_containers(ssh, [swept_id], max_attempts=1, own_ids=[swept_id])
+
+    assert own_sweep_removals.sent_rm_for(swept_id)
 
 
 @pytest.mark.asyncio

@@ -1209,9 +1209,11 @@ class _OwnSweepRegistry:
 
     A customer's create removes every `filler_*` on the node, including a filler whose own create is
     still bootstrapping. That create then finds its container gone; the validator removed it, so it is
-    not a node kill. One rule: an ID is ours from just before its `rm` is sent, whatever the `rm`
-    answers or a later listing shows (an `rm` can finish after its answer is lost or a listing is read).
-    The sweep removes by full ID, so a retry's new container under the same name is never one of them.
+    not a node kill. One rule: an ID is ours from the moment its `rm` is handed to SSH, whatever the
+    `rm` answers or a later listing shows (an `rm` can finish after its answer is lost or a listing is
+    read). Only an SSH channel that never opened proves the `rm` was not sent, and only that takes the
+    ID back (_MarkOwnRemovalsOnSubmit). The sweep removes by full ID, so a retry's new container under
+    the same name is never one of them.
     """
 
     # Only a create still bootstrapping reads an ID, minutes after its sweep: the cap only bounds memory.
@@ -1227,6 +1229,10 @@ class _OwnSweepRegistry:
         while len(self._ids) > self.MAX_IDS:
             del self._ids[next(iter(self._ids))]
 
+    def unmark(self, container_ids: Iterable[str]) -> None:
+        for container_id in container_ids:
+            self._ids.pop(container_id, None)
+
     def sent_rm_for(self, container_id: str | None) -> bool:
         return bool(container_id) and container_id in self._ids
 
@@ -1235,6 +1241,34 @@ class _OwnSweepRegistry:
 
 
 own_sweep_removals = _OwnSweepRegistry()
+
+
+class _MarkOwnRemovalsOnSubmit:
+    """The SSH client a sweep's `docker rm` is run through: its IDs are marked as ours just before each
+    attempt is sent. A channel that never opened (asyncssh.ChannelOpenError) sent nothing; the IDs this
+    `rm` marked are taken back then, unless an earlier attempt got a channel (its outcome is unknown)."""
+
+    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_ids: list[str]) -> None:
+        self._ssh_client = ssh_client
+        self._ids = container_ids
+        self._newly_marked: list[str] | None = None
+        self._channel_opened = False
+
+    async def run(self, command: str, **kwargs: Any) -> Any:
+        if self._newly_marked is None:
+            self._newly_marked = [i for i in self._ids if not own_sweep_removals.sent_rm_for(i)]
+        own_sweep_removals.mark(self._ids)
+        try:
+            result = await self._ssh_client.run(command, **kwargs)
+        except asyncssh.ChannelOpenError:
+            if not self._channel_opened:
+                own_sweep_removals.unmark(self._newly_marked)
+            raise
+        except BaseException:
+            self._channel_opened = True
+            raise
+        self._channel_opened = True
+        return result
 
 
 class _PendingDeletionRegistry:
@@ -2882,10 +2916,9 @@ class DockerService:
 
             swept = {name: listed_ids[name] for name in stale_containers if name in listed_ids}
             targets = [swept.get(name, name) for name in stale_containers]
-            # before the rm is sent: a create bootstrapping one of these may see it gone at once
-            own_sweep_removals.mark(swept.values())
             survivors = await self._remove_stale_containers(
-                ssh_client, default_extra, pod_name, stale_containers, targets, remove_every_filler
+                ssh_client, default_extra, pod_name, stale_containers, targets, remove_every_filler,
+                own_ids=list(swept.values()),
             )
             if remove_every_filler and survivors:
                 replacements = {n: i for n, i in survivors.items() if n in swept and i and i != swept[n]}
@@ -2918,16 +2951,17 @@ class DockerService:
         stale_containers: list[str],
         targets: list[str],
         remove_every_filler: bool,
+        own_ids: Iterable[str] = (),
     ) -> dict[str, str] | None:
         """`docker rm -fv` the ``targets`` (an ID, or the name when no ID was listed). Returns the removed
         fillers' names seen on the host after it, with the ID each one has now ("" when not listed); None
         when that could not be read. A customer create (DAH-3706) uses the tolerant rm and then confirms
-        that no filler survived."""
+        that no filler survived. ``own_ids`` are marked as ours when their `rm` is sent."""
         if not remove_every_filler:
-            await self._rm_containers(ssh_client, targets)
+            await self._rm_containers(ssh_client, targets, own_ids=own_ids)
             return {}
 
-        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, targets)
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, targets, own_ids=own_ids)
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not removed_fillers:
             return {}
@@ -3027,6 +3061,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         targets: list[str],
+        own_ids: Iterable[str] = (),
     ) -> None:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
@@ -3038,7 +3073,7 @@ class DockerService:
         container created since the listing is not a stale one.
         """
         try:
-            await self._rm_containers(ssh_client, targets, max_attempts=1)
+            await self._rm_containers(ssh_client, targets, max_attempts=1, own_ids=own_ids)
             return
         except Exception:
             still_present = await self._targets_still_on_host(ssh_client, targets)
@@ -3058,14 +3093,19 @@ class DockerService:
                 extra=get_extra_info({**default_extra, "container_names": still_present}),
             ),
         )
-        await self._rm_containers(ssh_client, still_present)
+        await self._rm_containers(
+            ssh_client, still_present, own_ids=[i for i in own_ids if i in still_present]
+        )
 
     @staticmethod
     async def _rm_containers(
-        ssh_client: asyncssh.SSHClientConnection, targets: list[str], max_attempts: int = 5
+        ssh_client: asyncssh.SSHClientConnection,
+        targets: list[str],
+        max_attempts: int = 5,
+        own_ids: Iterable[str] = (),
     ) -> None:
         await retry_ssh_command(
-            ssh_client,
+            _MarkOwnRemovalsOnSubmit(ssh_client, list(own_ids)) if own_ids else ssh_client,
             "/usr/bin/docker rm -fv " + " ".join(shlex.quote(t) for t in targets),
             'clean_existing_containers',
             max_attempts=max_attempts,

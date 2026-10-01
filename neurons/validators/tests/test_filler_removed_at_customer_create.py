@@ -166,9 +166,16 @@ async def test_a_filler_that_survives_the_removal_is_still_recorded_as_ours(dock
     ssh_client = _host(
         [
             _listing(f"pod_target {target_id}\nfiller_stuck {stuck_id}\nfiller_gone {gone_id}\n"),
+            _listing(""),  # the `docker rm` answer
             _listing("filler_stuck\n"),
         ]
     )
+
+    async def send_rm(client, command, *_args, **_kwargs):
+        if command.startswith("/usr/bin/docker rm "):
+            await client.run(command)
+
+    retry_ssh_mock.side_effect = send_rm
 
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
