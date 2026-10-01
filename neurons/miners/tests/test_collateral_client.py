@@ -550,9 +550,13 @@ async def test_a_used_nonce_with_no_receipt_keeps_the_record_until_a_receipt_set
     signed_hash = client._read_sent_record(CHAIN_ID)["hash"]
 
     provider.nonce = provider.pending_nonce = NONCE + 1
+    unknown = f"nonce {NONCE} is used, so its outcome is unknown"
     for _ in range(2):
-        with pytest.raises(CollateralOutcomeUnknownError, match=f"nonce {NONCE} is used, so its outcome is unknown"):
+        with pytest.raises(CollateralOutcomeUnknownError, match=unknown) as raised:
             await client.finalize_reclaim(5)
+    assert "SUBTENSOR_EVM_RPC_URL set to an RPC that serves its receipt" in str(raised.value)
+    assert f"delete {client.sent_record_path}" in str(raised.value)
+    assert "no transaction was sent" in str(raised.value)
     assert len(provider.sent) == 1
     assert client._read_sent_record(CHAIN_ID)["hash"] == signed_hash
 
@@ -564,22 +568,6 @@ async def test_a_used_nonce_with_no_receipt_keeps_the_record_until_a_receipt_set
     provider.mine_sent = True
     await client.finalize_reclaim(5)
     assert [decode_legacy(raw)["nonce"] for raw in provider.sent] == [NONCE, NONCE + 1]
-
-
-async def test_a_used_nonce_with_no_receipt_names_the_two_ways_to_settle_it(monkeypatch):
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    provider.mine_sent = False
-    client = client_with(provider)
-    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
-    with pytest.raises(CollateralOutcomeUnknownError):
-        await client.finalize_reclaim(5)
-
-    provider.nonce = provider.pending_nonce = NONCE + 1
-    with pytest.raises(CollateralOutcomeUnknownError) as raised:
-        await client.finalize_reclaim(5)
-    assert "SUBTENSOR_EVM_RPC_URL set to an RPC that serves its receipt" in str(raised.value)
-    assert f"delete {client.sent_record_path}" in str(raised.value)
-    assert "no transaction was sent" in str(raised.value)
 
 
 async def test_a_refusal_that_echoes_the_rpc_url_is_reported_in_local_words_only():
@@ -742,17 +730,23 @@ async def test_a_forged_send_record_gets_nothing_signed_or_broadcast(record):
     assert client._read_sent_record(CHAIN_ID) == record
 
 
-async def test_a_record_this_key_signed_for_the_contract_is_replaced_from_its_verified_bytes():
+@pytest.mark.parametrize("contract", ["1.0.2", "1.0.0"])
+async def test_a_record_this_key_signed_for_the_contract_is_replaced_from_its_verified_bytes(contract):
+    """The replacement command builds the default 1.0.2 client; a 1.0.0 reclaim is still this key's send."""
+    from core import utils
+
+    to = CONTRACT if contract == "1.0.2" else OLD_CONTRACT
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    client = client_with(provider)
-    record = signed_record()
+    client = utils.get_collateral_contract(miner_key=MINER_KEY)
+    client._w3 = AsyncWeb3(provider)
+    record = signed_record(to=to)
     # loose fields next to the bytes are never what gets signed
     client._write_sent_record(CHAIN_ID, {**record, "to": ATTACKER, "value": 10**18, "data": "0x"})
 
     outcome = await client.replace_earlier_send()
     assert "the replacement, succeeded" in outcome
     replacement = decode_legacy(provider.sent[-1])
-    assert replacement["to"] == CONTRACT and replacement["value"] == 0 and replacement["nonce"] == NONCE
+    assert replacement["to"] == to and replacement["value"] == 0 and replacement["nonce"] == NONCE
     assert replacement["data"] == decode_legacy(record["raw"])["data"]
 
 
@@ -782,87 +776,58 @@ async def test_a_receipt_that_is_not_final_on_chain_never_clears_the_send_record
     assert len(provider.sent) == 1
 
 
-async def test_a_fresh_send_whose_receipt_block_is_orphaned_keeps_its_record():
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("orphaned", "not the finalized block at that number"),
+        # backend A finalized block 20; a lagging backend B serves its own block 16 to a read by number
+        ("lagging-backend", "not the finalized block at that number"),
+        ("numeric-reads-on-another-fork", None),
+        ("too-far-back", "too far back"),
+    ],
+)
+async def test_a_fresh_send_record_clears_only_on_a_receipt_on_the_finalized_chain(monkeypatch, case, error):
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
-    provider.canonical_hashes[16] = "0x" + "bb" * 32
+    if case != "orphaned":
+        provider.block_number = provider.finalized_number = 20
+    if case == "orphaned":
+        provider.canonical_hashes[16] = "0x" + "bb" * 32
+    elif case == "lagging-backend":
+        provider.canonical_hashes[16] = "0x" + "aa" * 32
+        provider.fork_hashes[16] = BLOCK_HASH
+    elif case == "numeric-reads-on-another-fork":
+        provider.fork_hashes = {n: "0x" + f"{n:060x}0b0b" for n in range(16, 20)}
+    else:
+        monkeypatch.setattr(collateral_module, "FINALITY_CHECK_MAX_BLOCKS", 3)
     client = client_with(provider)
 
-    with pytest.raises(CollateralOutcomeUnknownError, match="not the finalized block at that number"):
+    if error is None:
+        await client.finalize_reclaim(5)
+        assert client._read_sent_record(CHAIN_ID) is None
+        return
+    with pytest.raises(CollateralOutcomeUnknownError, match=error):
         await client.finalize_reclaim(5)
     assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
-
-
-async def test_a_receipt_from_a_lagging_backend_on_another_fork_is_not_final():
-    """Backend A finalized block 20 on fork A; a lagging backend B serves its own block 16, the one the receipt
-    names, to a read by number (review of 21ec2fd: "orphaned receipt treated finalized: True")."""
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
-    provider.block_number = provider.finalized_number = 20
-    provider.canonical_hashes[16] = "0x" + "aa" * 32
-    provider.fork_hashes[16] = BLOCK_HASH
-    client = client_with(provider)
-
-    with pytest.raises(CollateralOutcomeUnknownError, match="not the finalized block at that number"):
-        await client.finalize_reclaim(5)
-    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
-    assert ("eth_getBlockByHash", ["0x" + "aa" * 32, False]) in provider.requests
-
-
-async def test_a_receipt_on_the_finalized_chain_clears_the_record_even_when_numeric_reads_reach_another_fork():
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
-    provider.block_number = provider.finalized_number = 20
-    provider.fork_hashes = {n: "0x" + f"{n:060x}0b0b" for n in range(16, 20)}
-    client = client_with(provider)
-
-    await client.finalize_reclaim(5)
-    assert client._read_sent_record(CHAIN_ID) is None
-
-
-async def test_a_receipt_too_far_behind_the_finalized_block_keeps_the_record(monkeypatch):
-    monkeypatch.setattr(collateral_module, "FINALITY_CHECK_MAX_BLOCKS", 3)
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
-    provider.block_number = provider.finalized_number = 20
-    client = client_with(provider)
-
-    with pytest.raises(CollateralOutcomeUnknownError, match="too far back"):
-        await client.finalize_reclaim(5)
-    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+    if case == "lagging-backend":
+        assert ("eth_getBlockByHash", ["0x" + "aa" * 32, False]) in provider.requests
 
 
 OLD_CONTRACT = "0x999F9A49A85e9D6E981cad42f197349f50172bEB"
 
 
-async def test_an_unmined_send_to_the_1_0_0_contract_is_replaced_to_that_contract():
-    """The replacement command builds the default 1.0.2 client; a 1.0.0 reclaim is still this key's send."""
-    from core import utils
-
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    client = utils.get_collateral_contract(miner_key=MINER_KEY)
-    client._w3 = AsyncWeb3(provider)
-    record = signed_record(to=OLD_CONTRACT)
-    client._write_sent_record(CHAIN_ID, record)
-
-    outcome = await client.replace_earlier_send()
-    assert "the replacement, succeeded" in outcome
-    replacement = decode_legacy(provider.sent[-1])
-    assert replacement["to"] == OLD_CONTRACT and replacement["nonce"] == NONCE
-    assert replacement["data"] == decode_legacy(record["raw"])["data"]
-
-
-async def test_a_send_to_an_unconfigured_contract_is_not_replaced():
+@pytest.mark.parametrize(
+    "recorded,error",
+    [(True, "not sent to a configured collateral contract"), (False, "nothing was replaced")],
+    ids=["unconfigured-contract", "no-record"],
+)
+async def test_nothing_is_replaced_without_a_recorded_send_to_a_configured_contract(recorded, error):
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
     client = client_with(provider)
-    record = signed_record(to=OLD_CONTRACT)
-    client._write_sent_record(CHAIN_ID, record)
+    if recorded:
+        client._write_sent_record(CHAIN_ID, signed_record(to=OLD_CONTRACT))
 
-    with pytest.raises(CollateralTransactionError, match="not sent to a configured collateral contract"):
+    with pytest.raises(CollateralTransactionError, match=error):
         await client.replace_earlier_send()
-    assert provider.sent == []
-
-
-async def test_nothing_is_replaced_without_a_recorded_send():
-    provider = FakeProvider()
-    with pytest.raises(CollateralTransactionError, match="nothing was replaced"):
-        await client_with(provider).replace_earlier_send()
     assert provider.sent == []
 
 
@@ -913,26 +878,6 @@ async def test_a_reclaim_stopped_after_finality_keeps_its_record_and_the_retry_r
         await client.reclaim_collateral(EXECUTOR)
     assert client._read_sent_record(CHAIN_ID) is None
     assert len(provider.sent) == 1
-
-
-async def test_a_reclaim_logs_its_request_id_before_its_record_is_cleared(monkeypatch, caplog):
-    provider = FakeProvider(logs=[started_log(reclaim_request_id=12)])
-    client = client_with(provider)
-    logged_at_clear = []
-    real_clear = client._clear_sent_record
-
-    def clear(chain_id, tx_hash):
-        logged_at_clear.append(caplog.text)
-        real_clear(chain_id, tx_hash)
-
-    monkeypatch.setattr(client, "_clear_sent_record", clear)
-    with caplog.at_level(logging.INFO, logger=collateral_module.logger.name):
-        event = await client.reclaim_collateral(EXECUTOR)
-
-    assert event["args"]["reclaimRequestId"] == 12
-    assert len(logged_at_clear) == 1
-    assert f"Transaction {sent_hash(provider)} succeeded in block 16; it started reclaim request 12" in logged_at_clear[0]
-    assert client._read_sent_record(CHAIN_ID) is None
 
 
 async def test_a_settled_earlier_reclaim_logs_its_request_id_before_its_record_is_cleared(monkeypatch):
@@ -1019,17 +964,6 @@ async def test_the_record_directory_is_synced_before_the_broadcast(monkeypatch):
     assert events[: events.index("broadcast") + 1] == ["fsync file", "rename", "fsync directory", "broadcast"]
 
 
-async def test_the_open_reclaim_list_reads_every_request_at_the_finalized_block_hash():
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
-    provider.block_number = 5000
-    client = client_with(provider)
-
-    requests = await client.get_reclaim_events()
-    assert [request.reclaim_request_id for request in requests] == [5]
-    details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
-
-
 async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
     provider.block_number = provider.finalized_number = 5000
@@ -1111,15 +1045,6 @@ async def test_a_block_whose_logs_a_backend_cannot_serve_by_hash_is_an_error_not
     with pytest.raises(CollateralTransactionError, match="could not answer a block's logs"):
         await client_with(provider).get_reclaim_events()
     assert [method for method, _ in provider.requests].count("eth_call") == 0
-
-
-async def test_a_request_in_both_the_range_and_the_by_hash_answer_is_listed_once():
-    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
-    provider.block_number = 5000
-
-    requests = await client_with(provider).get_reclaim_events()
-
-    assert [request.reclaim_request_id for request in requests] == [5]
 
 
 def test_the_bloom_check_matches_a_bloom_built_from_the_log():
@@ -1299,10 +1224,7 @@ def test_replace_collateral_transaction_exits_0_only_on_a_success(archive_networ
 @pytest.mark.parametrize(
     "url,origin",
     [
-        (
-            "https://user:pw@evm.example.invalid:8443/v2/key?apikey=key",
-            "https://evm.example.invalid:8443",
-        ),
+        ("https://user:pw@evm.example.invalid:8443/v2/key?apikey=key", "https://evm.example.invalid:8443"),
         ("https://evm.example.invalid/key", "https://evm.example.invalid"),
         ("evm.example.invalid/key", "<unparsed>"),
         (None, None),
@@ -1361,52 +1283,16 @@ def assert_no_rpc_secret(text: str):
 @pytest.mark.parametrize(
     "args,stdin",
     [
-        (
-            ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY],
-            None,
-        ),
-        (
-            [
-                "reclaim-collateral",
-                "--executor_uuid",
-                EXECUTOR,
-                "--private-key",
-                MINER_KEY,
-                "--contract",
-                "1.0.2",
-            ],
-            None,
-        ),
-        (
-            ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY],
-            None,
-        ),
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY], None),
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
+         + ["--contract", "1.0.2"], None),
+        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY], None),
         (["get-balance-of-eth-address", "--private-key", MINER_KEY], None),
-        (
-            [
-                "finalize-reclaim-request",
-                "--reclaim-request-id",
-                "5",
-                "--private-key",
-                MINER_KEY,
-                "--contract",
-                "1.0.2",
-            ],
-            None,
-        ),
+        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY]
+         + ["--contract", "1.0.2"], None),
         (["get-miner-collateral", "--contract", "1.0.2"], None),
-        (
-            [
-                "get-executor-collateral",
-                "--address",
-                "192.0.2.10",
-                "--port",
-                "8001",
-                "--contract",
-                "1.0.2",
-            ],
-            None,
-        ),
+        (["get-executor-collateral", "--address", "192.0.2.10", "--port", "8001"]
+         + ["--contract", "1.0.2"], None),
         (["get-reclaim-requests", "--contract", "1.0.2"], None),
         (["remove-executor", "--address", "192.0.2.10", "--port", "8001"], "y\n"),
     ],

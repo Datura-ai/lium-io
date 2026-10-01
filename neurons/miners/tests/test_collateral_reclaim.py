@@ -56,12 +56,8 @@ def test_cli_keeps_reclaim_commands_and_registers_executors_without_a_deposit():
 
     commands = set(cli.commands)
     assert {
-        "reclaim-collateral",
-        "finalize-reclaim-request",
-        "get-reclaim-requests",
-        "get-executor-collateral",
-        "get-miner-collateral",
-        "transfer-tao-to-eth-address",
+        "reclaim-collateral", "finalize-reclaim-request", "get-reclaim-requests",
+        "get-executor-collateral", "get-miner-collateral", "transfer-tao-to-eth-address",
     } <= commands
     assert "deposit-collateral" not in commands
 
@@ -150,18 +146,8 @@ def test_reclaim_uses_the_contract_that_holds_the_collateral(chain, cli_services
 def test_reclaim_contract_option_skips_detection(chain, cli_services):
     from cli import cli
 
-    result = CliRunner().invoke(
-        cli,
-        [
-            "reclaim-collateral",
-            "--executor_uuid",
-            EXECUTOR,
-            "--private-key",
-            MINER_KEY,
-            "--contract",
-            "1.0.0",
-        ],
-    )
+    args = ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
+    result = CliRunner().invoke(cli, [*args, "--contract", "1.0.0"])
     assert result.exit_code == 0, result.output
     assert cli_services == ["1.0.0"]
     assert chain.reads == []
