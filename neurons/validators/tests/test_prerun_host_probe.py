@@ -1044,6 +1044,35 @@ async def test_cleanup_that_removed_a_volume_measures_the_volume_facts_again(svc
     assert svc.probe_volume_host.await_count == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("bootstrap_restore", "raised_during_volume_creation"), [(False, 1), (True, 0)])
+async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
+    svc_fixture, monkeypatch, bootstrap_restore, raised_during_volume_creation
+):
+    """DAH-3980: the live power query costs no round trip of its own, unless a restore runs first."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    raise_low = AsyncMock(return_value=0)
+    monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", raise_low)
+    raised_at_volume_creation: list[int] = []
+
+    async def slow_create_local_volume(**kwargs):
+        await asyncio.sleep(0.01)
+        raised_at_volume_creation.append(raise_low.await_count)
+
+    svc.create_local_volume = slow_create_local_volume
+    payload = _deploy_payload()
+    if bootstrap_restore:
+        payload.bootstrap_restore = Mock(restore_log_id="restore-log")
+
+    result = await _run_create_container(svc, payload)
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert raised_at_volume_creation == [raised_during_volume_creation]
+    raise_low.assert_awaited_once()
+
+
 @pytest.fixture
 def svc_fixture():
     return DockerService(

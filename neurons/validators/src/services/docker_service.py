@@ -5665,6 +5665,42 @@ class DockerService:
             raise docker_outcome
         return ssh_outcome, docker_outcome
 
+    async def _restore_gpu_power_for_uncapped_pod(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        host_probe: PrerunHostProbe | None,
+        default_extra: dict,
+    ) -> None:
+        # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
+        # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
+        # without its own cap starts, so a customer (or an uncapped filler) never
+        # inherits a reduced limit. Best-effort, never blocks the rental.
+        if payload.gpu_uuids:
+            await restore_tracked_gpu_power_limits(
+                ssh_client,
+                self.redis_service,
+                payload.gpu_uuids,
+                log_extra=default_extra,
+                host_probe=host_probe,
+            )
+        else:
+            # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
+            await restore_all_host_gpu_power_limits(
+                ssh_client, self.redis_service, log_extra=default_extra, host_probe=host_probe
+            )
+        # State-free last-resort net: if a pre-cap record was lost, the record-based
+        # restore above did nothing — lift anything still below the check's floor back
+        # to the GPU's own default, so the customer never starts on a capped GPU.
+        # Always a live query: volume creation and a bootstrap restore ran since the
+        # probe, so its power state can be minutes old.
+        await raise_low_power_limits_to_default(
+            ssh_client,
+            payload.executor_id,
+            payload.gpu_uuids or None,
+            log_extra=default_extra,
+        )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -6364,6 +6400,21 @@ class DockerService:
                     or swept_cache_volumes
                     or reclaimed_cache_volumes
                 )
+                # DAH-3980: a pod without its own power cap gets its GPUs' power back while its volume
+                # is sized and created. Only after the cleanup (a PEARL filler must be gone before its
+                # cap is lifted) and never before a bootstrap restore (minutes would age the query).
+                early_gpu_power_restore = (
+                    asyncio.create_task(
+                        self._restore_gpu_power_for_uncapped_pod(
+                            ssh_client, payload, host_probe, default_extra
+                        )
+                    )
+                    if not (payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits)
+                    and not payload.bootstrap_restore
+                    else None
+                )
+                if early_gpu_power_restore is not None:
+                    connections.callback(early_gpu_power_restore.cancel)
 
                 # Add profiler for docker volume creation
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
@@ -6587,32 +6638,11 @@ class DockerService:
                     if not cap_applied:
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
                 else:
-                    # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
-                    # without its own cap starts, so a customer (or an uncapped filler) never
-                    # inherits a reduced limit. Best-effort, never blocks the rental.
-                    if payload.gpu_uuids:
-                        await restore_tracked_gpu_power_limits(
-                            ssh_client,
-                            self.redis_service,
-                            payload.gpu_uuids,
-                            log_extra=default_extra,
-                            host_probe=host_probe,
+                    await (
+                        early_gpu_power_restore
+                        or self._restore_gpu_power_for_uncapped_pod(
+                            ssh_client, payload, host_probe, default_extra
                         )
-                    else:
-                        # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
-                        await restore_all_host_gpu_power_limits(
-                            ssh_client, self.redis_service, log_extra=default_extra, host_probe=host_probe
-                        )
-                    # State-free last-resort net: if a pre-cap record was lost, the record-based
-                    # restore above did nothing — lift anything still below the check's floor back
-                    # to the GPU's own default, so the customer never starts on a capped GPU.
-                    # Always a live query: volume creation and a bootstrap restore ran since the
-                    # probe, so its power state can be minutes old.
-                    await raise_low_power_limits_to_default(
-                        ssh_client,
-                        payload.executor_id,
-                        payload.gpu_uuids or None,
-                        log_extra=default_extra,
                     )
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
