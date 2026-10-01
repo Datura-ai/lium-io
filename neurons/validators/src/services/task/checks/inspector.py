@@ -139,8 +139,7 @@ class InspectorRentedCheck:
             "verdict": verdict.as_payload().model_dump(),
         }
         if verdict.platform_findings:
-            # every finding was one of our own execs seen from a host whose Tetragon lost the
-            # sshd ancestry — recorded, not malicious (the 8 Sep false positives); the findings
+            # every finding was one of our own execs — recorded, not malicious; the findings
             # themselves are in the inspector event's report
             clean_what["platform_findings"] = len(verdict.platform_findings)
         if _canary_failed(report):
@@ -304,7 +303,7 @@ def _build_inspector_event(
 
 
 def _sensor_attested(ctx: Context) -> bool:
-    # The sensor (libinspector.so + Tetragon) ships inside the executor image. On a dstack CVM
+    # The sensor ships inside the executor image. On a dstack CVM
     # the image is part of the measured stack — but only when ENABLE_ATTESTATION_WHITELIST is on
     # does the validator compare that stack against TDX_WHITELIST (attestation_service._verify_tdx);
     # with the flag off (prod today) a passed attestation says the quote is genuine, not that the

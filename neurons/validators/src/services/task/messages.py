@@ -812,7 +812,7 @@ class InspectorMessages:
         reason="INSPECTOR_PLATFORM_ORIGIN_ONLY",
         severity="info",
         category="runtime",
-        impact="Only validator/executor execs seen (sshd ancestry lost on this host); nothing provider-side",
+        impact="Only validator/executor execs seen; nothing provider-side",
     )
     VALIDATION_ERROR = MessageTemplate(
         event="Inspector validation error",

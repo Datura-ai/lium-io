@@ -1,32 +1,10 @@
 """Turn an Inspector report into a verdict the validator can act on (DAH-3275).
 
-The sensor reports every `docker exec` / `nsenter` / memory read against a rented pod. Many of
-those are the platform's own: the liveness exec (`checks/rented_machine.py`, `cat
-/root/.ssh/authorized_keys`), the executor's disk metric (`executor/services/hardware_service.py`,
-`df -k <mount>`), the validator's miner jobs (`miner_jobs/restore_storage.py` `mkdir`/`chown`/`tar
-… --strip-components=1`, `miner_jobs/backup_storage.py` `du`/`tar -czf`), key injection, the
-sshd bootstrap and the gocryptfs setup scripts (`docker_service.py`, `sh -c '<script>'`). They
-all run from inside the executor container — the validator's SSH session lands there — so the
-sensor tags them `nested_from:executor-…` with `host=false`. On hosts where Tetragon lost the
-ancestry to sshd they surfaced as findings: 607 of the 632 MALICIOUS rounds on 8 Sep.
-
-Classification is by that ancestry, as `design/RENTER_DATA_PRIVACY.md` row 16 intends: a Docker
-control-plane action (`DockerExec`, and the `docker cp` / `docker rm` / … the executor runs on a
-pod's behalf) from inside the executor container is *platform-origin* (the sensor itself already
-drops docker-policy findings whose ancestry reaches sshd or pid 1, so these are the ones it could
-not trust); anything from the host, a `NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
-what the check, the score gate and the renter event act on when it names a rented pod (or names no
-container at all); a finding on any other container is recorded under `unmatched_containers` and
-acts on nobody. The executor's own backup and restore (`executor/src/storage/restic.py`) never
-reach this module: the sensor classifies the encrypted flow's `nsenter -t <pid> -U` as benign
-(nsenter.rs: a `CLONE_NEWUSER`-only `setns`, judged by nstype, never by a container name) and the
-unencrypted flow's `-v volume_<pod_id>:/workspace` bind as a runtime mount (mount.rs: runc /
-container-stack binaries), so neither is a finding — a name-based exemption here would only let a
-provider's `lium-storage-…`-named container borrow the platform's origin. The payloads are too many and too
-script-shaped for an exact allow-list to be honest, so the platform execs' payloads are recorded
-in the verdict (`platform_exec_commands`) for the daily digest instead of gating anything. What keeps
-the tag trustworthy — a provider `docker exec`-ing into the executor container to borrow its
-ancestry — is the verifier's job: DAH-3278 (stack-binary ancestry gating, sysbox-fs exemption).
+Findings are split into platform-origin (the platform's own operations on a pod) and
+provider-origin. Provider-origin findings are what the check, the score gate and the renter event
+act on when they name a rented pod (or name no container at all); a finding on any other container
+is recorded under `unmatched_containers` and acts on nobody. Platform execs' payloads are recorded
+in the verdict (`platform_exec_commands`) for the daily digest instead of gating anything.
 """
 
 from __future__ import annotations
@@ -230,8 +208,7 @@ def docker_exec_command(command: str) -> str | None:
 
 
 def is_executor_stack_container(name: str) -> bool:
-    """The sensor's own rule for the executor stack (docker_cli.rs): the compose project may be
-    `executor`, `executor-…` or `lium-executor-executor-1`."""
+    """Whether a container name belongs to the executor stack."""
     return name == "executor" or name.startswith("executor-") or "-executor-" in name
 
 
@@ -255,14 +232,8 @@ def nested_from_executor(finding: dict[str, Any]) -> bool:
 
 
 def is_platform_origin(finding: dict[str, Any]) -> bool:
-    """A Docker control-plane action the sensor traced to inside the executor container
-    (`host=false`, a `nested_from:<executor-stack container>` tag). The sensor already drops
-    docker-policy findings whose ancestry reaches sshd or the container's pid 1, so every such
-    finding is one whose ancestry it could not trust; until DAH-3278 hardens that on the verifier,
-    all of them count as the platform's. Everything else — an nsenter, a memory or overlayfs read,
-    anything from the host — is the provider's. The executor's own backup/restore nsenter and volume
-    bind (restic.py) are benign at the sensor (module docstring) and never arrive here; a
-    `NamespaceEnter` that does arrive is a real pid/mnt/net entry, whatever container it came from."""
+    """Whether a finding is one of the platform's own operations; everything else is the
+    provider's."""
     if _kind(finding) not in _DOCKER_CONTROL_PLANE_KINDS:
         return False
     if finding.get("host") is True:
