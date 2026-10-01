@@ -7065,6 +7065,36 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     assert "/tmp/" not in setup_script
 
 
+@pytest.mark.asyncio
+async def test_setup_encrypted_local_volume_counts_the_utf8_bytes_of_a_unicode_path(docker_service):
+    # LIUM-16: a template volume path such as /workspace/данные; asyncssh sends a str input as UTF-8,
+    # so `head -c` must take the script's UTF-8 bytes, or it cuts into the keys behind it
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+
+    with patch.object(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    ):
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name="pod_test",
+            plaintext_path="/workspace/\u0434\u0430\u043d\u043d\u044b\u0435",
+            volume_name="volume_test",
+            pod_id="pod-id",
+            log_tag="test",
+            log_extra={},
+            authorized_keys=["ssh-ed25519 AAAA renter"],
+        )
+
+    upload_call = next(
+        call for call in ssh_client.run.await_args_list if call.kwargs.get("input") is not None
+    )
+    setup_script, renter_keys = upload_call.kwargs["input"].split("ssh-ed25519", 1)
+    assert "/workspace/\u0434\u0430\u043d\u043d\u044b\u0435" in setup_script
+    assert f"head -c {len(setup_script.encode('utf-8'))} > " in upload_call.args[0]
+    assert renter_keys == " AAAA renter\n"
+
+
 def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:
     workdir = tempfile.mkdtemp()
     stub_bin = os.path.join(workdir, "stub_bin")
@@ -7898,6 +7928,108 @@ async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
     )
 
     assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+
+
+# LIUM-27: on the encrypted path the keys ride at the end of the one volume setup exec; its exit
+# status says which part failed (90 upload, 91 init/mount, 92 mount check, 93 keys).
+
+
+async def _create_with_volume_setup_exit(docker_service, monkeypatch, *, exit_status, state):
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+
+    async def run(command, *_args, **_kwargs):
+        if "sh -c 'umask 077" in command:
+            return _make_ssh_command_result(exit_status=exit_status)
+        return _make_ssh_command_result()
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    inspect = AsyncMock(return_value=state)
+    docker_service.rental_docker_client_factory.client.inspect_container_state = inspect
+    cleanup = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image=_CUDA_IMAGE,
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        is_sysbox=True,
+        enable_volume_encryption=True,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+    assert isinstance(result, FailedContainerRequest)
+    cleanup.assert_awaited_once()
+    assert cleanup.await_args.kwargs["container_name"] == f"pod_{payload.pod_id}"
+    assert cleanup.await_args.kwargs["remove_volume"] is True
+    return result, inspect
+
+
+@pytest.mark.asyncio
+async def test_a_key_write_that_fails_in_the_volume_setup_exec_names_the_exiting_image(
+    docker_service, monkeypatch
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service,
+        monkeypatch,
+        exit_status=93,
+        state=_state(status="exited", running=False, exit_code=0, restart_count=1),
+    )
+
+    assert result.failure_step == "add_public_keys"
+    # the mount was up: the encryption itself did not fail
+    assert result.volume_encryption_status is None
+    error = _failure_error_field(result)
+    assert "is not running" in error, error
+    assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
+    assert "exit_status=93" in error
+
+
+@pytest.mark.asyncio
+async def test_a_key_write_that_fails_in_a_running_container_keeps_the_exec_error(
+    docker_service, monkeypatch
+):
+    result, _ = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=93, state=_state()
+    )
+
+    assert result.failure_step == "add_public_keys"
+    assert result.volume_encryption_status is None
+    assert _failure_error_field(result).startswith("Failed to add SSH public keys inside container")
+
+
+@pytest.mark.parametrize("exit_status", [90, 91, 92, 1])
+@pytest.mark.asyncio
+async def test_a_failed_mount_in_the_volume_setup_exec_fails_the_encryption(
+    docker_service, monkeypatch, exit_status
+):
+    result, inspect = await _create_with_volume_setup_exit(
+        docker_service, monkeypatch, exit_status=exit_status, state=_state()
+    )
+
+    assert result.failure_step == "encrypted_volume_setup"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
+    inspect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
