@@ -53,6 +53,12 @@ def _oom_killed_state() -> dict:
     return state
 
 
+def _oom_restarting_state() -> dict:
+    state = _container_state(status="restarting", running=True, restarting=True, exit_code=137)
+    state["State"]["OOMKilled"] = True
+    return state
+
+
 _SIGKILLED = _container_state(status="removing", running=False, exit_code=137)
 # `docker stop` on the node: SIGTERM, a CMD that handles it (sshd, python, tini) exits 143
 _STOPPED = _container_state(status="exited", running=False, exit_code=143)
@@ -924,7 +930,7 @@ def _inspect_always_fails_from(api: FakeApiClient, n: int) -> None:
     ("after", "outcome"),
     [("sigkill", "killed"), ("oom", "oom"), ("gone", "removed"), ("still-running", None),
      ("image-exited-0", "exited"), ("image-exited-1", "exited"), ("500-then-sigkill", "killed"),
-     ("500-then-running", None), ("500-every-time", "unread")],
+     ("500-then-running", None), ("500-every-time", "unread"), ("oom-restarting", "oom")],
 )  # fmt: skip
 async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(svc, monkeypatch, caplog, after, outcome):
     """No Jupyter, no environment and a skipped SSH bootstrap (ships_sshd) run no exec after the key step:
@@ -936,6 +942,8 @@ async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(s
         "sigkill": _SIGKILLED,
         "500-then-sigkill": _SIGKILLED,
         "oom": _oom_killed_state(),
+        # unless-stopped mid-restart after the OOM kill: Running and Restarting, OOMKilled kept
+        "oom-restarting": _oom_restarting_state(),
         "image-exited-0": _container_state(status="exited", running=False, exit_code=0),
         "image-exited-1": _container_state(status="exited", running=False, exit_code=1),
     }
@@ -970,6 +978,28 @@ async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(s
     (logged,) = _events(caplog)
     assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == outcome
     assert "is not running" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_kill_while_the_logs_drain_is_not_a_created_container(svc, monkeypatch, caplog):
+    """The log drain awaits before the pod is cached; a SIGKILL while it runs is read by the final State check."""
+    api = FakeApiClient()
+    api.container_states = [_RUNNING, _RUNNING]
+    _bootstrapping_create(svc, monkeypatch, api, skip_ssh_bootstrap=True)
+
+    async def killed_while_draining():
+        api.container_states = [_SIGKILLED]
+
+    monkeypatch.setattr(svc, "finish_stream_logs", killed_while_draining)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+    svc.redis_service.add_rented_pod.assert_not_awaited()
+    (logged,) = _events(caplog)
+    assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == "killed"
 
 
 @pytest.mark.asyncio

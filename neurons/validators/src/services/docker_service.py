@@ -927,7 +927,9 @@ async def _raise_unless_running_before_created(
                     f"({FINAL_STATE_INSPECT_ATTEMPTS} attempts): {inspect_exc}"
                 ) from inspect_exc
             await asyncio.sleep(FINAL_STATE_INSPECT_RETRY_DELAY_S)
-    if not state.running:
+    # mid-restart (unless-stopped after an OOM kill, say) Docker reports Running=True with Restarting=True
+    # and can keep OOMKilled until the next start; a paused container is Running=True too
+    if not state.running or state.restarting or state.status != "running":
         raise ContainerGoneBeforeExec(
             f"{failure} and the container has stopped ({state.describe()})",
             container_name=container_name,
@@ -7272,17 +7274,18 @@ class DockerService:
                     if environment_error:
                         raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
-                    # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
-                    # the validator, no environment and ships_sshd, no exec runs after the key step.
-                    current_step = soft_failed_step or "final_state_check"
-                    await _raise_unless_running_before_created(docker_client, container_name=container_name)
-
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
 
                     await self.finish_stream_logs()
+
+                    # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
+                    # the validator, no environment and ships_sshd, no exec runs after the key step. Read
+                    # after the log drain, which awaits, so a kill while it drains is seen too.
+                    current_step = soft_failed_step or "final_state_check"
+                    await _raise_unless_running_before_created(docker_client, container_name=container_name)
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.
