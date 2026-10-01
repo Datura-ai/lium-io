@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
 
+from protocol.vc_protocol.compute_requests import NetworkEMA
+
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, _is_speed_reading
@@ -16,6 +18,7 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+_EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 
 @dataclass(frozen=True)
@@ -258,7 +261,7 @@ class VerifyXCheck:
                 deferred_network = {
                     key: value
                     for key, value in updated_specs["network"].items()
-                    if key not in ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
+                    if key not in _EMA_KEYS
                 }
                 updated_state = replace(
                     ctx.state, specs={**updated_specs, "network": deferred_network}
@@ -419,6 +422,53 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
         return False
     speed = _download_speed(result)
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+
+
+def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
+    """Why this cycle's VerifyX sample must not move the published EMA, or None.
+
+    Held: a cycle another check failed, and a passing cycle without the image cached on a
+    never-measured node, since the image pre-pull shares the link. Not held: a cycle VerifyX itself
+    failed (the gate working), and anything without the backend's answer, as for the cold retry.
+    """
+    if ctx.state.rented_data is None:
+        return None
+    if failed_check_id:
+        if failed_check_id != VerifyXCheck.check_id:
+            return f"cycle failed {failed_check_id}"
+        return None
+    if ctx.state.recommended_image_cached is False:
+        prev_ema = _stored_network_ema(ctx)
+        if prev_ema is None or prev_ema.ema_verifyx_download_speed is None:
+            return "never-measured node, image not cached yet"
+    return None
+
+
+def _stored_network_ema(ctx: Context) -> NetworkEMA | None:
+    rented_data = ctx.state.rented_data
+    return rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+
+
+def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
+    """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
+
+    Only keys this cycle wrote are touched. A never-measured node publishes none, which the backend
+    already reads as unseeded (the backend's first-pass deferral relies on it). The raw samples stay.
+    """
+    network = specs.get("network")
+    if not isinstance(network, dict) or not any(key in network for key in _EMA_KEYS):
+        return specs
+    prev_ema = _stored_network_ema(ctx)
+    held = dict(network)
+    for key in _EMA_KEYS:
+        if key not in held:
+            continue
+        previous = getattr(prev_ema, key, None)
+        if previous is None:
+            del held[key]
+        else:
+            held[key] = previous
+    return {**specs, "network": held}
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:

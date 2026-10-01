@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -271,7 +273,9 @@ class EventSink(Protocol):
 # DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
 # the validator. They are emitted on every cycle for as long as the state lasts (an old image,
 # a banned provider, a host-side workload) and were 135,000 WARNING lines in two
-# days. The event keeps its severity for the backend and the portal; only the log line is INFO.
+# days. The event keeps its severity for the backend and the portal; when the event is a warning,
+# only the log line is INFO (DEBUG when it repeats the previous cycle, see StatusChangeTracker). An
+# error (an enforced EXECUTOR_IMAGE_OUTDATED, PROVIDER_SIDE_LOAD_ABOVE_LIMIT) stays ERROR every cycle.
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "EXECUTOR_IMAGE_OUTDATED",
@@ -281,9 +285,46 @@ PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
 )
 
 
+class StatusChangeTracker:
+    """The last outcome each executor had on each check, kept across pipeline runs.
+
+    Every check emits one event per executor per cycle, and most of them repeat the previous cycle
+    word for word. The sink logs a repeat at DEBUG and a change at INFO. The outcome is the event
+    name, reason code and severity; `what_we_saw` and timings vary every cycle and are not part of it.
+    """
+
+    def __init__(self, max_entries: int = 200_000):
+        self.max_entries = max_entries
+        self._last: OrderedDict[tuple[str, str, str], tuple[str, str, str]] = OrderedDict()
+
+    def changed(
+        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]
+    ) -> bool:
+        # the miner reports its executor UUIDs: keyed without the hotkey, one miner could replay another
+        # provider's UUID and move that provider's lines between INFO and DEBUG
+        key = (miner_hotkey, executor_uuid, check_id)
+        previous = self._last.pop(key, None)
+        self._last[key] = outcome
+        if len(self._last) > self.max_entries:
+            self._last.popitem(last=False)
+        return previous != outcome
+
+
+STEP_DURATION_LOGGER = "services.task.step_duration"
+
+
 class LoggerSink:
-    def __init__(self, logger_: logging.Logger):
+    def __init__(self, logger_: logging.Logger, tracker: StatusChangeTracker | None = None):
         self.logger = logger_
+        self.tracker = tracker
+        # writes its message as the whole line: the shared JSON formatter adds ~280 bytes of fixed
+        # fields, more than the step duration it carries on each repeated outcome
+        self.duration_logger = logging.getLogger(STEP_DURATION_LOGGER)
+        if not self.duration_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self.duration_logger.addHandler(handler)
+            self.duration_logger.propagate = False
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
@@ -291,7 +332,37 @@ class LoggerSink:
         if level == "warning" and event.reason_code in PROVIDER_STATE_REASON_CODES:
             level = "info"
             extra["reason"] = "provider_state"
+        if self._is_repeat(event) and level == "info":
+            level = "debug"
+            self._log_step_duration(event)
         getattr(self.logger, level)(_m(event.event, extra=extra))
+
+    def _log_step_duration(self, event: ValidationEvent) -> None:
+        # The step-duration panels unwrap extra.context.execution_time_ms per extra.check_id from
+        # every validator line, so a repeat keeps those two fields at INFO in the same shape.
+        execution_time_ms = event.context.get("execution_time_ms")
+        if execution_time_ms is None or self.logger.isEnabledFor(logging.DEBUG):
+            return
+        line = {
+            "level": "INFO",
+            "logger": STEP_DURATION_LOGGER,
+            "message": "Check step duration",
+            "extra": {"check_id": event.check_id, "context": {"execution_time_ms": execution_time_ms}},
+        }
+        self.duration_logger.info(json.dumps(line, separators=(",", ":")))
+
+    def _is_repeat(self, event: ValidationEvent) -> bool:
+        executor_uuid = event.context.get("executor_uuid")
+        if self.tracker is None or not executor_uuid or not event.check_id:
+            return False
+        changed = self.tracker.changed(
+            str(event.context.get("miner_hotkey") or ""),
+            executor_uuid,
+            event.check_id,
+            (event.event, event.reason_code, event.severity),
+        )
+        # The run's last event carries the per-step summary; it stays at INFO as one line per run.
+        return not changed and "steps_total_s" not in event.what_we_saw
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
