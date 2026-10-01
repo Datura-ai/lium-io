@@ -195,6 +195,9 @@ class SubtensorClient:
     _initialized = False
     _subtensor = None
     _warm_up_task = None
+    # only the connector reads the chain in a thread: the main validator also calls the same
+    # websocket from the loop, and the sync substrate client cannot serve two threads at once
+    _chain_reads_in_thread = False
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
@@ -219,6 +222,7 @@ class SubtensorClient:
         self.config = settings.get_bittensor_config()
         self.redis_service = RedisService()
         self._has_alerted_for_stale_portal_snapshot = False
+        self._chain_read_lock = asyncio.Lock()
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
@@ -448,18 +452,28 @@ class SubtensorClient:
     def get_evm_address_for_hotkey(self, hotkey):
         return self.hotkey_to_evm_address.get(hotkey, None)
 
-    def sync_evm_address_maps(self):
+    async def _run_chain_read(self, chain_read, *args):
+        # a blocking chain read: in the connector off the event loop, one at a time
+        if not self._chain_reads_in_thread:
+            return chain_read(*args)
+        async with self._chain_read_lock:
+            return await asyncio.to_thread(chain_read, *args)
+
+    def _read_uid_to_evm_address(self) -> dict[int, str]:
         with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
             node = self.get_node()
             associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
-            for uid, evm_address in associated_evms:
-                # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
-                evm_address_hex = evm_address[0]
-                self.uid_to_evm_address[uid] = evm_address_hex
+            # the query map pages lazily, so it is iterated here, inside the timed chain read;
+            # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
+            return {uid: evm_address[0] for uid, evm_address in associated_evms}
 
-            """Update the map of miner_hotkey -> evm_address for all miners."""
-            for miner in self.miners:
-                self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
+    async def sync_evm_address_maps(self):
+        # the maps are read by the loop, so they are updated here, never from the thread
+        self.uid_to_evm_address.update(await self._run_chain_read(self._read_uid_to_evm_address))
+
+        """Update the map of miner_hotkey -> evm_address for all miners."""
+        for miner in self.miners:
+            self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
 
         logger.info(
             _m(
@@ -647,7 +661,9 @@ class SubtensorClient:
                     )
                 )
                 return
-            miners = self._build_serving_miners_with_opted_in_routing(opted_in_miners)
+            miners = await self._run_chain_read(
+                self._build_serving_miners_with_opted_in_routing, opted_in_miners
+            )
 
         logger.info(
             _m(
@@ -1019,12 +1035,12 @@ class SubtensorClient:
 
                 if count == 0:
                     await self.fetch_miners()
-                    self.sync_evm_address_maps()
+                    await self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
                     await self.fetch_miners()
-                    self.sync_evm_address_maps()
+                    await self.sync_evm_address_maps()
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
@@ -1057,9 +1073,10 @@ class SubtensorClient:
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
 
     @classmethod
-    async def initialize(cls) -> Self:
+    async def initialize(cls, chain_reads_in_thread: bool = False) -> Self:
         """Initialize the singleton instance asynchronously."""
         instance = cls.get_instance()
+        instance._chain_reads_in_thread = chain_reads_in_thread
 
         # Start warm-up task only once (static)
         if cls._warm_up_task is None or cls._warm_up_task.done():
