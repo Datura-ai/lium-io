@@ -1073,6 +1073,66 @@ async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
     raise_low.assert_awaited_once()
 
 
+_OVERLAPPED_ROWS = (
+    "Prerun host probe (parallel)",
+    "Volume host probe (parallel)",
+    "GPU power restore (parallel)",
+)
+
+
+def _slow_overlapped_operations(svc, monkeypatch) -> None:
+    async def slow_probe(*args, **kwargs):
+        await asyncio.sleep(0.03)
+        return None
+
+    async def slow_raise(*args, **kwargs):
+        await asyncio.sleep(0.03)
+        return 0
+
+    svc.probe_prerun_host = AsyncMock(side_effect=slow_probe)
+    svc.probe_volume_host = AsyncMock(side_effect=slow_probe)
+    monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", slow_raise)
+
+
+def _overlapped_rows_ms(result) -> dict[str, int]:
+    return {p.name.value: p.duration for p in result.profilers if p.name.value in _OVERLAPPED_ROWS}
+
+
+@pytest.mark.asyncio
+async def test_cached_create_profiles_each_overlapped_operation_with_its_own_duration(
+    svc_fixture, monkeypatch
+):
+    """DAH-3980: the step rows show only the residual wait; zero there must not read as free."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    _slow_overlapped_operations(svc, monkeypatch)
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    rows_ms = _overlapped_rows_ms(result)
+    assert sorted(rows_ms) == sorted(_OVERLAPPED_ROWS)
+    assert all(ms >= 25 for ms in rows_ms.values()), rows_ms
+
+
+@pytest.mark.asyncio
+async def test_discarded_early_probe_gets_no_overlapped_row(svc_fixture, monkeypatch):
+    """A probe rerun at its step is in that step's row; the discarded early run is not counted again."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    _slow_overlapped_operations(svc, monkeypatch)
+    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert svc.probe_volume_host.await_count == 2
+    assert sorted(_overlapped_rows_ms(result)) == [
+        "GPU power restore (parallel)",
+        "Prerun host probe (parallel)",
+    ]
+
+
 @pytest.fixture
 def svc_fixture():
     return DockerService(
