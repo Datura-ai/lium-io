@@ -6006,6 +6006,7 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
+        unfit_reason: str | None,
         custom_options: CustomOptions,
         executor_info: ExecutorSSHInfo,
         docker_hub_digest_lookup: asyncio.Task | None,
@@ -6015,9 +6016,6 @@ class DockerService:
     ) -> _AdoptedWarmPod | None:
         # a customer create of a `pod_<id>` the validator pre-started for this rent (DAH-3980); None
         # = the normal create runs, and a warm pod that failed any check is gone by then
-        unfit_reason = _rent_unfit_for_warm_pod(
-            payload, custom_options, in_cvm=bool(executor_info.tdx_quote)
-        )
         if unfit_reason:
             self._log_warm_pod_not_adopted(default_extra, unfit_reason, warm_pod_removed=False)
             return None
@@ -6603,34 +6601,44 @@ class DockerService:
                     )
                     connections.callback(early_volume_probe.cancel)
 
+            warm_pod_unfit_reason = (
+                _rent_unfit_for_warm_pod(payload, custom_options, in_cvm=bool(executor_info.tdx_quote))
+                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                else payload.workload_kind.value
+            )
             current_step = "ssh_connect"
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
             # changing how the connection is established.
-            #
-            # DAH-3004: the asyncssh session and the Docker-SDK-over-SSH client are two
-            # independent SSH handshakes to the same host; opened one after the other they
-            # cost p50 2.1 s / p90 4.3 s per rent (container_profiler_events, 7 d). Open them
-            # together: same connections, same order of use, roughly half the wait.
+            ssh_connect = connect_with_phase_timing(
+                log_extra=default_extra,
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=known_hosts_policy,
+                keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
+                keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
+            )
+            docker_connect = self.rental_docker_client_factory.connect(
+                executor_info=executor_info,
+                private_key=private_key,
+            )
             async with AsyncExitStack() as connections:
-                ssh_client, docker_client = await self._connect_ssh_and_docker(
-                    connections,
-                    connect_with_phase_timing(
-                        log_extra=default_extra,
-                        host=executor_info.address,
-                        port=executor_info.ssh_port,
-                        username=executor_info.ssh_username,
-                        client_keys=[pkey],
-                        known_hosts=known_hosts_policy,
-                        keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
-                        keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
-                    ),
-                    self.rental_docker_client_factory.connect(
-                        executor_info=executor_info,
-                        private_key=private_key,
-                    ),
-                    on_ssh_connected=start_early_probes,
-                )
+                if warm_pod_unfit_reason is None:
+                    # DAH-3980: the warm pod's take-over runs on this session alone; the Docker
+                    # SDK's own SSH handshake, most of the connect, is made only by a fallback
+                    ssh_client = await connections.enter_async_context(ssh_connect)
+                    start_early_probes(ssh_client)
+                    docker_client = None
+                else:
+                    # DAH-3004: the asyncssh session and the Docker-SDK-over-SSH client are two
+                    # independent SSH handshakes to the same host; opened one after the other they
+                    # cost p50 2.1 s / p90 4.3 s per rent (container_profiler_events, 7 d). Open them
+                    # together: same connections, same order of use, roughly half the wait.
+                    ssh_client, docker_client = await self._connect_ssh_and_docker(
+                        connections, ssh_connect, docker_connect, on_ssh_connected=start_early_probes
+                    )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
                     _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
@@ -6657,6 +6665,7 @@ class DockerService:
                     adopted_warm_pod = await self._adopt_warm_pod(
                         ssh_client,
                         payload,
+                        warm_pod_unfit_reason,
                         custom_options,
                         executor_info,
                         docker_hub_digest_lookup,
@@ -6674,6 +6683,9 @@ class DockerService:
                             profilers,
                             default_extra,
                         )
+                if docker_client is None:
+                    current_step = "ssh_connect"
+                    docker_client = await connections.enter_async_context(docker_connect)
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
                 # written to the executor's ~/.docker/config.json for a `docker logout` to clear.

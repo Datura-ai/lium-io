@@ -134,8 +134,27 @@ class _FakeHost:
         ]
 
 
+class _DockerConnectRecorder:
+    """The Docker-SDK-over-SSH factory, noting on the host's timeline when the create connects it."""
+
+    def __init__(self, client, host: _FakeHost):
+        self.client = client
+        self.host = host
+
+    def connect(self, **kwargs):
+        return self
+
+    async def __aenter__(self):
+        self.host.events.append("docker connected")
+        return self.client
+
+    async def __aexit__(self, *exc):
+        return None
+
+
 def _patch_host(svc, monkeypatch, host: _FakeHost) -> None:
     _patch_happy(svc, monkeypatch, host.ssh_client)
+    svc.rental_docker_client_factory = _DockerConnectRecorder(svc.rental_docker_client_factory.client, host)
     # what the normal create's port step makes of the rent's pod_mapping
     monkeypatch.setattr(
         svc,
@@ -658,3 +677,38 @@ def test_rent_with_jupyter_explicitly_off_is_unfit_for_a_warm_pod(monkeypatch):
     unfit_reason = ds_module._rent_unfit_for_warm_pod(payload, payload.custom_options, in_cvm=False)
 
     assert unfit_reason == "jupyter_off"
+
+
+@pytest.mark.asyncio
+async def test_adoption_takes_over_the_warm_pod_without_connecting_the_docker_sdk(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    assert "keys" in host.events
+    assert "docker connected" not in host.events
+
+
+@pytest.mark.asyncio
+async def test_fallback_connects_the_docker_sdk_after_the_warm_pod_removal_and_creates(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+    host.container["Config"]["Labels"] = {}
+
+    await _assert_normal_create_after_removal(svc, host, payload)
+    assert host.events.index("remove_warm_pod") < host.events.index("docker connected")
+
+
+@pytest.mark.asyncio
+async def test_unfit_rent_connects_ssh_and_docker_sdk_together_as_before(svc, monkeypatch):
+    payload = _rent_payload(custom_options=CustomOptions(startup_commands="python train.py"))
+    _adoptable(svc, monkeypatch, payload)
+    connect_both = AsyncMock(wraps=svc._connect_ssh_and_docker)
+    monkeypatch.setattr(svc, "_connect_ssh_and_docker", connect_both)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated), result
+    connect_both.assert_awaited_once()
