@@ -223,6 +223,7 @@ class SubtensorClient:
         self.redis_service = RedisService()
         self._has_alerted_for_stale_portal_snapshot = False
         self._chain_read_lock = asyncio.Lock()
+        self._miners_fetch_lock = asyncio.Lock()
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
@@ -684,7 +685,10 @@ class SubtensorClient:
 
     async def get_miners(self) -> list[bittensor.NeuronInfo]:
         if not self.miners:
-            await self.fetch_miners()
+            # a caller arriving during the first load waits for it instead of reading the chain again
+            async with self._miners_fetch_lock:
+                if not self.miners:
+                    await self.fetch_miners()
         return self.miners
     
     async def send_weights_to_lium(self, payload: dict):
@@ -1034,7 +1038,7 @@ class SubtensorClient:
                     raise RuntimeError("subtensor is not initialized")
 
                 if count == 0:
-                    await self.fetch_miners()
+                    await self.get_miners()
                     await self.sync_evm_address_maps()
 
                 count += 1

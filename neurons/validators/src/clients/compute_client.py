@@ -197,6 +197,18 @@ class ComputeClient:
         asyncio.create_task(self.poll_executors_uptime())
         asyncio.create_task(self.poll_revenue_per_gpu_type())
 
+        # connect once the miners are loaded, as when this read blocked the loop: a rent accepted
+        # earlier waits out the whole read
+        try:
+            await self.subtensor_client.get_miners()
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Connecting to backend app before the miners are loaded",
+                    extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
+                )
+            )
+
         max_delay = 60
 
         while True:
