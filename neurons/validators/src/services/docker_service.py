@@ -6129,6 +6129,10 @@ class DockerService:
                 payload.pod_mapping,
                 payload.workload_kind,
             )
+            # the UI shows the SSH command from this line while the pod is still being built
+            ssh_port_map = self._find_mapping_by_docker_port(port_maps, 22)
+            if ssh_port_map:
+                await self.stream_log(f"Port mappings ready: 22->{ssh_port_map[2]}", "success", log_tag)
 
             # Add profiler for port mappings generation
             profilers.append(ProfilerStep.since(ProfilerStepName.PORT_MAPPINGS_GENERATED, prev_timestamp))
