@@ -29,12 +29,12 @@ in an `unauthorized` push.
 The login step comes after the `docker build` steps, never before: the base images (`python:*-slim`,
 `docker:26-cli`) are public docker.io images, and once the exchanged token is the docker.io credential
 every pull uses it. It covers only the repositories in the ruleset, so a build after the login fails
-with `401 Unauthorized: access token has insufficient scope` (run 36727847745, `validator_cd_dev`).
+with `401 Unauthorized: access token has insufficient scope`.
 The executor runner image needs the executor digest from its push, so `executor_cd_*` log out
 (`docker logout`, no server argument) before the runner build and log in again for the runner push.
 The CLI stores a docker.io login under `https://index.docker.io/v1/`, and `docker logout docker.io`
 leaves that entry in place, so the runner build would still pull with the push token.
-`test_dockerhub_oidc_login.py` fails on a workflow that builds while logged in. The `docker_publish.sh` scripts under
+The `docker_publish.sh` scripts under
 `neurons/*/` log in themselves only when a caller passes `DOCKERHUB_PAT`, so a caller in another
 repository that still holds a token keeps working.
 
@@ -47,6 +47,18 @@ subject-claim rule, resources and a scope:
 | Label | Subject claim | Resources (Docker Hub repositories) | Scope |
 |---|---|---|---|
 | `lium-io-publish` | `repo:Datura-ai/lium-io:environment:dockerhub-push` | `daturaai/compute-subnet-executor`, `…-executor-runner`, `…-miner`, `…-miner-runner`, `…-validator`, `…-validator-runner`, `daturaai/lium-watchtower` | image push |
+| `lium-io-dev` | `repo:Datura-ai/lium-io:environment:dockerhub-push-dev` | `daturaai/compute-subnet-executor-dev`, `daturaai/compute-subnet-executor-runner-dev` (only these two) | image push |
+
+`lium-io-dev` is the branch path: `executor_cd_dev` dispatched from any branch but `main` runs in
+`dockerhub-push-dev`, which has no branch policy, and pushes `daturaai/compute-subnet-executor-dev:dev`
+and `…-executor-runner-dev:dev` (the runner pins the `-dev` executor by digest). A ruleset covers
+repositories, not tags, so the dev subject must never be added to `lium-io-publish`: a branch
+could then edit its workflow and push `:latest`. Create the two `-dev` repositories (Docker Hub →
+`daturaai` → Create repository) before the ruleset. A dev stack tests a branch image by pointing
+`EXECUTOR_IMAGE_REF` at `daturaai/compute-subnet-executor-dev:dev` (and its updater's
+`WATCHTOWER_IMAGE` at `daturaai/compute-subnet-executor-runner-dev`). A dispatch from `main` still
+pushes the `dev` tag of the release repositories, which the dev and staging stacks pull.
+`miner_cd_dev` and `validator_cd_dev` stay `main`-only (no branch run since April).
 
 Why the environment and not the tag: GitHub's default subject for a job that names an environment is
 `repo:<org>/<repo>:environment:<name>` — the ref does not appear in it. The environment
@@ -62,7 +74,9 @@ Copy the connection id into the repository variable:
 gh variable set DOCKERHUB_OIDC_CONNECTIONID -R Datura-ai/lium-io --body "<connection id>"
 ```
 
-Check: dispatch `executor_cd_dev.yml` from `main`; the login step ends with `Login Succeeded`.
+Check: dispatch `executor_cd_dev.yml` from `main`, then from a feature branch; both login steps
+end with `Login Succeeded`. Until `lium-io-dev` exists, the branch run fails at the login step and
+pushes nothing.
 Failures are listed on the connection's Edit page (Failures table).
 
 The other two pushing repositories use the same step with the same variable name and lifetime:
