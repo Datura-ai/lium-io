@@ -296,9 +296,14 @@ class MinerService:
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
-        Flag off: list returned as is.
+        Flag off: the list minus repeats.
+
+        An executor uuid the miner lists more than once is kept once (its first entry), with or
+        without the flag: each entry starts its own pipeline, and a repeat would be validated,
+        and counted in its idle tier, twice in one cycle.
         """
         self._stop_awaiting_wave_list(payload)
+        executors = self._first_entry_per_uuid(executors, default_extra)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -315,13 +320,41 @@ class MinerService:
             claimed.append(executor)
         return claimed
 
+    @staticmethod
+    def _first_entry_per_uuid(
+        executors: list[ExecutorSSHInfo], default_extra: dict
+    ) -> list[ExecutorSSHInfo]:
+        unique: dict[str, ExecutorSSHInfo] = {}
+        repeats: dict[str, int] = {}
+        for executor in executors:
+            if executor.uuid in unique:
+                repeats[executor.uuid] = repeats.get(executor.uuid, 0) + 1
+                continue
+            unique[executor.uuid] = executor
+        for executor_uuid, dropped in repeats.items():
+            logger.warning(
+                _m(
+                    "Executor listed twice by miner; scored once",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": executor_uuid,
+                            "listed_count": dropped + 1,
+                            "dropped_count": dropped,
+                        }
+                    ),
+                ),
+            )
+        return list(unique.values())
+
     def _only_requested(
         self, executors: list[ExecutorSSHInfo], executor_id: str, default_extra: dict
     ) -> list[ExecutorSSHInfo]:
         """The express lane asked the miner for one executor; run the pipeline on that one only.
         A miner that answers with more (an old miner ignoring the filter, or a misbehaving one)
         would otherwise get every extra executor verified here, concurrently with the wave that
-        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958)."""
+        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958).
+        Repeats of the requested uuid are dropped too: each entry would start its own pipeline."""
         requested = [executor for executor in executors if executor.uuid == executor_id]
         if len(requested) != len(executors):
             logger.warning(
@@ -336,7 +369,7 @@ class MinerService:
                     ),
                 )
             )
-        return requested
+        return self._first_entry_per_uuid(requested, default_extra)
 
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
@@ -1212,6 +1245,12 @@ class MinerService:
                         # The spec carries at most the backend's bound; the rest of the list goes
                         # in PodStatesReport chunks below, or waits for the next cycle.
                         "pod_states": self._pod_states_capped_for_spec(result, default_extra),
+                        # None when the cycle's probe saw no rented pod with an ssh_port on this node
+                        "pod_ssh": (
+                            [observation.model_dump(mode="json") for observation in result.pod_ssh]
+                            if result.pod_ssh is not None
+                            else None
+                        ),
                     },
                 )
             except Exception as e:
