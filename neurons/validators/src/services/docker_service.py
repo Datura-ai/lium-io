@@ -1527,7 +1527,7 @@ class DockerService:
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
-        self.is_realtime_logging = False
+        self.log_stream_finish_requested = asyncio.Event()
 
     @staticmethod
     def get_container_name(payload: ContainerBaseRequest) -> str:
@@ -2599,10 +2599,12 @@ class DockerService:
             "pod_id": pod_id,
         }
 
-        self.is_realtime_logging = True
+        self.log_stream_finish_requested.clear()
 
         while True:
-            await asyncio.sleep(LOG_STREAM_INTERVAL)
+            # finish_stream_logs cuts the wait short: the last batch goes out at once
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.log_stream_finish_requested.wait(), LOG_STREAM_INTERVAL)
 
             async with self.lock:
                 logs_to_process = self.logs_queue[:]
@@ -2636,7 +2638,7 @@ class DockerService:
                         exc_info=True,
                     )
 
-            if not self.is_realtime_logging:
+            if self.log_stream_finish_requested.is_set():
                 break
 
         logger.info(
@@ -2647,7 +2649,7 @@ class DockerService:
         )
 
     async def finish_stream_logs(self):
-        self.is_realtime_logging = False
+        self.log_stream_finish_requested.set()
         if self.log_task:
             await self.log_task
 
