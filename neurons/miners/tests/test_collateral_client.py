@@ -48,6 +48,17 @@ def hex_encode(types, values) -> str:
 SENDS = {selector("finalizeReclaim(uint256)"), selector("reclaimCollateral(bytes16,string,bytes16)")}
 
 
+def bloom_of(logs) -> str:
+    """A block's logs bloom built as the yellow paper's M3:2048, as one 2048-bit big-endian integer."""
+    bits = 0
+    for log in logs:
+        for value in [log["address"], *log["topics"]]:
+            digest = AsyncWeb3.keccak(hexstr=value)
+            for i in (0, 2, 4):
+                bits |= 1 << (int.from_bytes(digest[i : i + 2], "big") & 2047)
+    return "0x" + bits.to_bytes(256, "big").hex()
+
+
 class FakeProvider(AsyncBaseProvider):
     """Answers the JSON-RPC methods the client uses; eth_call is routed by function selector.
 
@@ -99,6 +110,8 @@ class FakeProvider(AsyncBaseProvider):
         self.fork_hashes = {}
         # hashes whose receipt request is answered with TX_HASH's receipt
         self.receipts_of_another = set()
+        # block hashes a lagging backend answers a by-hash log read for with "unknown block"
+        self.unknown_block_hashes = set()
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -108,12 +121,21 @@ class FakeProvider(AsyncBaseProvider):
             return self.canonical_hashes[number]
         return BLOCK_HASH if number == 16 else "0x" + f"{number:064x}"
 
+    def logs_in(self, block_hash: str) -> list:
+        return [log for log in self.logs if log["blockHash"] == block_hash]
+
     def block(self, number: int) -> dict:
-        return {"number": hex(number), "hash": self.chain_hash(number), "parentHash": self.chain_hash(number - 1)}
+        block_hash = self.chain_hash(number)
+        return {
+            "number": hex(number),
+            "hash": block_hash,
+            "parentHash": self.chain_hash(number - 1),
+            "logsBloom": bloom_of(self.logs_in(block_hash)),
+        }
 
     def fork_block(self, number: int) -> dict:
         parent = self.fork_hashes.get(number - 1, self.chain_hash(number - 1))
-        return {"number": hex(number), "hash": self.fork_hashes[number], "parentHash": parent}
+        return {"number": hex(number), "hash": self.fork_hashes[number], "parentHash": parent, "logsBloom": bloom_of([])}
 
     async def make_request(self, method, params):
         self.requests.append((method, params))
@@ -160,6 +182,10 @@ class FakeProvider(AsyncBaseProvider):
                 (self.block(n) for n in candidates if n <= self.block_number and self.chain_hash(n) == params[0]), None
             )
             return {"jsonrpc": "2.0", "id": 1, "result": found}
+        if method == "eth_getLogs" and "blockHash" in params[0]:
+            if params[0]["blockHash"] in self.unknown_block_hashes:
+                return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unknown block"}}
+            return {"jsonrpc": "2.0", "id": 1, "result": self.logs_in(params[0]["blockHash"])}
         if method == "eth_getLogs":
             logs = self.logs_by_fork.pop(0) if self.logs_by_fork else self.logs
             return {"jsonrpc": "2.0", "id": 1, "result": logs}
@@ -853,6 +879,76 @@ async def test_a_mined_reclaim_whose_answer_was_lost_reports_its_request_id(monk
     assert len(provider.sent) == 1
 
 
+class Stopped(BaseException):
+    """The container stopping: nothing after it runs, no handler catches it."""
+
+
+def stop_on_outcome_line(monkeypatch) -> SimpleNamespace:
+    """Stops the run when the outcome line is about to be logged, while `switch.on`."""
+    switch = SimpleNamespace(on=True)
+    real_info = collateral_module.logger.info
+
+    def info(message, *args, **kwargs):
+        if switch.on and "succeeded in block" in str(message):
+            raise Stopped()
+        real_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(collateral_module.logger, "info", info)
+    return switch
+
+
+async def test_a_reclaim_stopped_after_finality_keeps_its_record_and_the_retry_reports_its_request_id(monkeypatch):
+    """Review of 7cd21ec: the record was cleared before the request ID was decoded and logged, so a stop in between
+    left no record and the listing only reaches back RECLAIM_LOOKBACK_BLOCKS blocks."""
+    provider = FakeProvider(logs=[started_log(reclaim_request_id=12)])
+    client = client_with(provider)
+    stop = stop_on_outcome_line(monkeypatch)
+    with pytest.raises(Stopped):
+        await client.reclaim_collateral(EXECUTOR)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+
+    stop.on = False
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralTransactionError, match="succeeded in block 16; it started reclaim request 12;"):
+        await client.reclaim_collateral(EXECUTOR)
+    assert client._read_sent_record(CHAIN_ID) is None
+    assert len(provider.sent) == 1
+
+
+async def test_a_reclaim_logs_its_request_id_before_its_record_is_cleared(monkeypatch, caplog):
+    provider = FakeProvider(logs=[started_log(reclaim_request_id=12)])
+    client = client_with(provider)
+    logged_at_clear = []
+    real_clear = client._clear_sent_record
+
+    def clear(chain_id, tx_hash):
+        logged_at_clear.append(caplog.text)
+        real_clear(chain_id, tx_hash)
+
+    monkeypatch.setattr(client, "_clear_sent_record", clear)
+    with caplog.at_level(logging.INFO, logger=collateral_module.logger.name):
+        event = await client.reclaim_collateral(EXECUTOR)
+
+    assert event["args"]["reclaimRequestId"] == 12
+    assert len(logged_at_clear) == 1
+    assert f"Transaction {sent_hash(provider)} succeeded in block 16; it started reclaim request 12" in logged_at_clear[0]
+    assert client._read_sent_record(CHAIN_ID) is None
+
+
+async def test_a_settled_earlier_reclaim_logs_its_request_id_before_its_record_is_cleared(monkeypatch):
+    provider = FakeProvider(logs=[started_log(reclaim_request_id=12)])
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.reclaim_collateral(EXECUTOR)
+
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    stop_on_outcome_line(monkeypatch)
+    with pytest.raises(Stopped):
+        await client.settle_earlier_send()
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+
+
 async def test_a_retried_finalize_settles_the_earlier_send_before_it_reads_the_request(monkeypatch):
     """A mined finalize closes the request, so the open-request check alone would hide its outcome."""
     reclaims = selector("reclaims(uint256)")
@@ -934,6 +1030,19 @@ async def test_the_open_reclaim_list_reads_every_request_at_the_finalized_block_
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
 
 
+async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.block_number = provider.finalized_number = 5000
+    client = client_with(provider)
+
+    block_hash = await client.finalized_block_hash()
+    reclaim = await client.get_reclaim_request(5, block_hash=block_hash)
+
+    assert reclaim[2] == 10**17
+    details = [params for method, params in provider.requests if method == "eth_call"]
+    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000)}]
+
+
 FORK_B = "0x" + "0b" * 32
 
 
@@ -976,6 +1085,57 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(log
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
 
 
+async def test_an_empty_log_answer_from_a_lagging_backend_still_lists_the_open_request():
+    """Review of 21ec2fd: backend A serves the finalized block, lagging backend B the numeric log range and
+    answers []. Block 4500's header, linked to the finalized block, has a bloom that may hold the event, so that
+    block's logs are read again by its hash."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.block_number = provider.finalized_number = 5000
+    provider.logs = [{**started_log(), "blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}]
+    provider.logs_by_fork = [[]]
+
+    requests = await client_with(provider).get_reclaim_events()
+
+    assert [(request.reclaim_request_id, request.block_number) for request in requests] == [(5, 4500)]
+    by_hash = [params[0] for method, params in provider.requests if method == "eth_getLogs" and "blockHash" in params[0]]
+    assert [log_filter["blockHash"] for log_filter in by_hash] == [provider.chain_hash(4500)]
+
+
+async def test_a_block_whose_logs_a_backend_cannot_serve_by_hash_is_an_error_not_an_empty_list():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.block_number = provider.finalized_number = 5000
+    provider.logs = [{**started_log(), "blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}]
+    provider.logs_by_fork = [[]] * collateral_module.RECLAIM_LIST_ATTEMPTS
+    provider.unknown_block_hashes = {provider.chain_hash(4500)}
+
+    with pytest.raises(CollateralTransactionError, match="could not answer a block's logs"):
+        await client_with(provider).get_reclaim_events()
+    assert [method for method, _ in provider.requests].count("eth_call") == 0
+
+
+async def test_a_request_in_both_the_range_and_the_by_hash_answer_is_listed_once():
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
+    provider.block_number = 5000
+
+    requests = await client_with(provider).get_reclaim_events()
+
+    assert [request.reclaim_request_id for request in requests] == [5]
+
+
+def test_the_bloom_check_matches_a_bloom_built_from_the_log():
+    log = started_log()
+    bloom = bytes.fromhex(bloom_of([log]).removeprefix("0x"))
+    address, topic = bytes.fromhex(CONTRACT.removeprefix("0x")), bytes.fromhex(log["topics"][0].removeprefix("0x"))
+    other = bytes.fromhex("12" * 20)
+
+    assert collateral_module.bloom_may_hold(bloom, address, topic)
+    assert not collateral_module.bloom_may_hold(bytes(256), address, topic)
+    assert not collateral_module.bloom_may_hold(bloom, other, topic)
+    # a bloom that proves nothing never hides a block
+    assert collateral_module.bloom_may_hold(None, address, topic)
+    assert collateral_module.bloom_may_hold(b"\x00" * 10, address, topic)
+
+
 async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head():
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[started_log()])
     provider.block_number, provider.finalized_number = 5003, 5000
@@ -984,7 +1144,9 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
 
     assert [request.reclaim_request_id for request in requests] == [5]
     assert [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"][0] == "finalized"
-    (log_filter,) = [params[0] for method, params in provider.requests if method == "eth_getLogs"]
+    (log_filter,) = [
+        params[0] for method, params in provider.requests if method == "eth_getLogs" and "blockHash" not in params[0]
+    ]
     assert log_filter["toBlock"] == hex(5000)
     details = [params for method, params in provider.requests if method == "eth_call"]
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)

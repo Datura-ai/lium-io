@@ -127,11 +127,16 @@ async def versions_holding_collateral(executor_uuid: str) -> list[str]:
 async def versions_with_open_reclaim(reclaim_request_id: int, miner_address: str) -> list[str]:
     """The CONTRACT_VERSIONS keys whose contract holds an open reclaim request with this id for this miner.
 
-    Reclaim request ids are counted per contract, so the same id can exist on several contracts.
+    Reclaim request ids are counted per contract, so the same id can exist on several contracts. Every contract is
+    read at one finalized block named by its hash: reads at `latest` one after another can straddle a request
+    opening on one contract and report only the other, and the CLI then picks it without asking.
     """
+    block_hash = await get_collateral_contract().finalized_block_hash()
     versions = []
     for version in settings.CONTRACT_VERSIONS:
-        _, miner, amount, _ = await get_collateral_contract(version=version).get_reclaim_request(reclaim_request_id)
+        _, miner, amount, _ = await get_collateral_contract(version=version).get_reclaim_request(
+            reclaim_request_id, block_hash=block_hash
+        )
         if amount > 0 and miner.lower() == miner_address.lower():
             versions.append(version)
     return versions

@@ -1,5 +1,6 @@
 """The miner's reclaim path for executors that still hold collateral on the contract."""
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,6 +17,7 @@ OLD_CONTRACT = "0x999F9A49A85e9D6E981cad42f197349f50172bEB"
 EXECUTOR = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
 # A random well-formed key; it signs nothing in these tests.
 MINER_KEY = "0x" + "11" * 32
+FINALIZED_HASH = "0x" + "f1" * 32
 
 
 def test_h160_to_ss58_maps_an_evm_address_to_its_mirror_account():
@@ -70,20 +72,34 @@ def test_cli_keeps_reclaim_commands_and_registers_executors_without_a_deposit():
 
 @pytest.fixture
 def chain(monkeypatch):
-    """Per-contract collateral and reclaim requests, read by address instead of over RPC."""
-    state = SimpleNamespace(collateral={}, reclaims={}, reads=[])
+    """Per-contract collateral and reclaim requests, read by address instead of over RPC.
+
+    `reclaims` is the latest state and `reclaims_at[block hash]` the state at a block; a reclaim read names the
+    block it was read at in `reclaim_blocks` (None: latest), and `after_reclaim_read` runs after each one."""
+    state = SimpleNamespace(
+        collateral={}, reclaims={}, reads=[], reclaims_at={}, reclaim_blocks=[],
+        finalized_hash=FINALIZED_HASH, after_reclaim_read=lambda: None,
+    )
 
     async def get_executor_collateral(self, executor_uuid):
         state.reads.append(self.contract_address)
         return Decimal(state.collateral.get(self.contract_address, 0))
 
-    async def get_reclaim_request(self, reclaim_request_id):
+    async def get_reclaim_request(self, reclaim_request_id, block_hash=None):
         state.reads.append(self.contract_address)
+        state.reclaim_blocks.append(block_hash)
         default = (bytes(16), "0x" + "00" * 20, 0, 0)
-        return state.reclaims.get((self.contract_address, reclaim_request_id), default)
+        reclaims = state.reclaims if block_hash is None else state.reclaims_at.get(block_hash, state.reclaims)
+        found = reclaims.get((self.contract_address, reclaim_request_id), default)
+        state.after_reclaim_read()
+        return found
+
+    async def finalized_block_hash(self):
+        return state.finalized_hash
 
     monkeypatch.setattr(CollateralClient, "get_executor_collateral", get_executor_collateral)
     monkeypatch.setattr(CollateralClient, "get_reclaim_request", get_reclaim_request)
+    monkeypatch.setattr(CollateralClient, "finalized_block_hash", finalized_block_hash)
     # the earlier-send check still runs, lock and temp record included, without asking finney for its chain ID
     monkeypatch.setattr(CollateralClient, "_pinned_chain_id", AsyncMock(return_value=964))
     return state
@@ -180,6 +196,43 @@ def test_finalize_uses_the_contract_with_this_miners_open_request(chain, cli_ser
         cli, ["finalize-reclaim-request", "--reclaim-request-id", "7", "--private-key", MINER_KEY]
     )
     assert result.exit_code == 0, result.output
+    assert cli_services == ["1.0.0"]
+
+
+@pytest.mark.parametrize(
+    "state_change,detected,prompted",
+    [
+        ("none", ["1.0.0"], False),
+        # open on both at the finalized block; a read at latest sees the 1.0.2 one only after its own read
+        ("both_open_between_reads", ["1.0.2", "1.0.0"], True),
+        # opens on 1.0.2 after the finalized block: the answer is that one block's state
+        ("1.0.2_opens_after_the_block", ["1.0.0"], False),
+    ],
+)
+def test_finalize_reads_every_contract_at_one_finalized_block(chain, cli_services, state_change, detected, prompted):
+    """Review of 7cd21ec: request 5 is open on 1.0.0, and on 1.0.2 by the time the second read runs. Reads at
+    latest one after another reported 1.0.0 alone, so the CLI picked it without asking. Read at one block, the
+    answer is never a mix of two chain states."""
+    from cli import cli
+    from core.utils import versions_with_open_reclaim
+
+    miner = Account.from_key(MINER_KEY).address
+    request = (UUID(EXECUTOR).bytes, miner, 10**17, 0)
+    chain.reclaims[(OLD_CONTRACT, 5)] = request
+    chain.reclaims_at[FINALIZED_HASH] = {(OLD_CONTRACT, 5): request}
+    if state_change == "both_open_between_reads":
+        chain.reclaims_at[FINALIZED_HASH][(CONTRACT, 5)] = request
+    if state_change != "none":
+        chain.after_reclaim_read = lambda: chain.reclaims.__setitem__((CONTRACT, 5), request)
+
+    assert asyncio.run(versions_with_open_reclaim(5, miner)) == detected
+    assert chain.reclaim_blocks == [FINALIZED_HASH, FINALIZED_HASH]
+
+    result = CliRunner().invoke(
+        cli, ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY], input="2\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert ("Select contract version" in result.output) is prompted
     assert cli_services == ["1.0.0"]
 
 
