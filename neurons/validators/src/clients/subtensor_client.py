@@ -457,8 +457,16 @@ class SubtensorClient:
         # a blocking chain read: in the connector off the event loop, one at a time
         if not self._chain_reads_in_thread:
             return chain_read(*args)
-        async with self._chain_read_lock:
-            return await asyncio.to_thread(chain_read, *args)
+        await self._chain_read_lock.acquire()
+        # cancelling the caller does not stop the thread: the lock is released when the thread
+        # ends, so no second read shares the websocket with it
+        read_in_thread = asyncio.ensure_future(asyncio.to_thread(chain_read, *args))
+        read_in_thread.add_done_callback(lambda _: self._chain_read_lock.release())
+        return await asyncio.shield(read_in_thread)
+
+    def _no_chain_read_in_thread(self):
+        # the loop-side redial closes or replaces the websocket a chain read thread may be using
+        return self._chain_read_lock if self._chain_reads_in_thread else contextlib.nullcontext()
 
     def _read_uid_to_evm_address(self) -> dict[int, str]:
         with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
@@ -685,6 +693,9 @@ class SubtensorClient:
 
     async def get_miners(self) -> list[bittensor.NeuronInfo]:
         if not self.miners:
+            if not self._chain_reads_in_thread:
+                await self.fetch_miners()
+                return self.miners
             # a caller arriving during the first load waits for it instead of reading the chain again
             async with self._miners_fetch_lock:
                 if not self.miners:
@@ -1031,14 +1042,19 @@ class SubtensorClient:
         backoff = SUBTENSOR_BACKOFF_INITIAL
         while True:
             try:
-                self._return_to_first_endpoint()
-                self.set_subtensor()
+                async with self._no_chain_read_in_thread():
+                    self._return_to_first_endpoint()
+                    self.set_subtensor()
 
                 if SubtensorClient._subtensor is None:
                     raise RuntimeError("subtensor is not initialized")
 
                 if count == 0:
-                    await self.get_miners()
+                    # the connector's rents join this first load; the main validator fetches as on main
+                    if self._chain_reads_in_thread:
+                        await self.get_miners()
+                    else:
+                        await self.fetch_miners()
                     await self.sync_evm_address_maps()
 
                 count += 1
@@ -1061,7 +1077,8 @@ class SubtensorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
-                self._switch_endpoint_after_read_failure(e)
+                async with self._no_chain_read_in_thread():
+                    self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(
                         "[_warm_up_subtensor] Failed to connect into subtensor",
@@ -1096,6 +1113,11 @@ class SubtensorClient:
             try:
                 await cls._warm_up_task
             except asyncio.CancelledError:
+                pass
+        if cls._instance is not None and cls._instance._chain_reads_in_thread:
+            # a read cancelled with the warm-up still runs in its thread; the next instance would
+            # share the websocket with it
+            async with cls._instance._chain_read_lock:
                 pass
         cls._warm_up_task = None
         cls._instance = None
