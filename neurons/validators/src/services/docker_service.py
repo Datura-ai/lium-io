@@ -897,6 +897,44 @@ async def _raise_if_killed_after_exec(
         )
 
 
+FINAL_STATE_INSPECT_ATTEMPTS = 3
+FINAL_STATE_INSPECT_RETRY_DELAY_S = 1.0
+
+
+async def _raise_unless_running_before_created(
+    docker_client: RentalDockerSdkClient, *, container_name: str
+) -> None:
+    """The last State read before the pod is cached as rented. Unlike _raise_if_killed_after_exec,
+    no exec result stands behind it: an inspect that keeps failing fails the create (the backend can
+    rent elsewhere), and a container that has stopped for any reason — the image's own exit, code 0
+    included — raises ContainerGoneBeforeExec, whose cause decides between a kill and the step's own
+    failure."""
+    failure = "the bootstrap's last exec ended"
+    for attempt in range(1, FINAL_STATE_INSPECT_ATTEMPTS + 1):
+        try:
+            state = await docker_client.inspect_container_state(container_name=container_name)
+            break
+        except Exception as inspect_exc:  # noqa: BLE001 — retried, then the create fails
+            if is_docker_not_found_error(inspect_exc):
+                raise ContainerGoneBeforeExec(
+                    f"{failure} and the container is gone",
+                    container_name=container_name,
+                    state=None,
+                ) from inspect_exc
+            if attempt == FINAL_STATE_INSPECT_ATTEMPTS:
+                raise RuntimeError(
+                    f"could not read the container State before caching the pod "
+                    f"({FINAL_STATE_INSPECT_ATTEMPTS} attempts): {inspect_exc}"
+                ) from inspect_exc
+            await asyncio.sleep(FINAL_STATE_INSPECT_RETRY_DELAY_S)
+    if not state.running:
+        raise ContainerGoneBeforeExec(
+            f"{failure} and the container has stopped ({state.describe()})",
+            container_name=container_name,
+            state=state,
+        )
+
+
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
     ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed`,
@@ -918,8 +956,10 @@ class ContainerKilledDuringBootstrap(Exception):
         self.oom_killed = bool(state.oom_killed) if state else False
         self.signal = state.kill_signal if state else None
         self.cause = container_gone_cause(state)
+        # the wire `msg`: the backend builds the renter-facing error from it, so it carries no diagnosis
+        self.renter_sentence = self._sentence()
         super().__init__(
-            f"{KILLED_DURING_BOOTSTRAP_STEP}: {self._sentence()} during {bootstrap_step} "
+            f"{KILLED_DURING_BOOTSTRAP_STEP}: {self.renter_sentence} during {bootstrap_step} "
             f"(cause={self.cause} oom_killed={str(self.oom_killed).lower()} exit_code={self.exit_code!r} "
             f"signal={self.signal!r} status={self.status!r}). {detail}"
         )
@@ -7132,6 +7172,9 @@ class DockerService:
                             raise
                         raise explained from keys_exc
 
+                    # a bootstrap that failed without a kill goes on (inherited soft failure); the final
+                    # State check fails the create under this step if the container has stopped since
+                    soft_failed_step: str | None = None
                     current_step = "ssh_bootstrap"
                     if image_manages_services:
                         # DAH-2265: the default image / cached template ships and
@@ -7150,14 +7193,14 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                    else:
-                        await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                            raise_if_container_gone=True,
-                        )
+                    elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                        raise_if_container_gone=True,
+                    ):
+                        soft_failed_step = current_step
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:
@@ -7231,12 +7274,8 @@ class DockerService:
 
                     # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
                     # the validator, no environment and ships_sshd, no exec runs after the key step.
-                    current_step = "final_state_check"
-                    await _raise_if_killed_after_exec(
-                        docker_client,
-                        container_name=container_name,
-                        failure="the bootstrap's last exec ended",
-                    )
+                    current_step = soft_failed_step or "final_state_check"
+                    await _raise_unless_running_before_created(docker_client, container_name=container_name)
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
@@ -7471,12 +7510,17 @@ class DockerService:
             ):
                 failure_detail = f"{failure_detail}: {e}"
 
+            last_exc = _last_attempt_exception(e)
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=str(log_text),
+                msg=(
+                    last_exc.renter_sentence
+                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
+                    else str(log_text)
+                ),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=(

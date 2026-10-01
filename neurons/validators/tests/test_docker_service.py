@@ -147,6 +147,12 @@ class _FakeRentalDockerClient:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
 
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
+
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
         if self.start_error is not None:
@@ -7736,7 +7742,12 @@ async def _create_failing_at_add_public_keys(
     )
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == failure_step, "dashboards key on the step"
-    assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
+    if failure_step == "killed_during_bootstrap":
+        # a kill's msg is its renter-safe cause sentence; the diagnosis stays in detail
+        assert result.msg.startswith(("the container was stopped by the node", "the container stopped before"))
+        assert "cause=" not in result.msg
+    else:
+        assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
     # the container was still there to inspect: the explanation is read before cleanup removes it
     assert inspect.await_args.kwargs == {"container_name": docker_service.get_container_name(payload)}
     cleanup.assert_awaited_once()

@@ -351,6 +351,8 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP == "killed_during_bootstrap"
     assert sentence in result.detail
+    # the backend builds the renter's error from msg: the cause sentence, without the diagnosis
+    assert sentence in result.msg and "cause=" not in result.msg and "Failed create_container" not in result.msg
     assert f"during {step}" in result.detail and "has no long-running command" not in result.detail
     assert f"(cause={event['cause']} oom_killed=" in result.detail
     # the backend reads Docker's "is not running" as the renter's image exiting, not a kill on the node
@@ -904,34 +906,105 @@ async def test_a_silent_kill_during_jupyter_setup_is_killed_during_bootstrap(svc
     assert logged["bootstrap_step"] == "jupyter_setup" and logged["cause"] == cause
 
 
+def _inspect_always_fails_from(api: FakeApiClient, n: int) -> None:
+    """Inspect call `n` (1-based) and every later one fail with a transient daemon error."""
+    real_inspect, looks = api.inspect_container, []
+
+    def inspect(container_name):
+        looks.append(container_name)
+        if len(looks) >= n:
+            raise APIError("500 Server Error: Internal Server Error (\"context deadline exceeded\")")
+        return real_inspect(container_name)
+
+    api.inspect_container = inspect
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("after", "cause"),
-    [("sigkill", "killed"), ("oom", "oom"), ("gone", "removed"), ("still-running", None), ("image-exited", None)],
-)
-async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(svc, monkeypatch, caplog, after, cause):
+    ("after", "outcome"),
+    [("sigkill", "killed"), ("oom", "oom"), ("gone", "removed"), ("still-running", None),
+     ("image-exited-0", "exited"), ("image-exited-1", "exited"), ("500-then-sigkill", "killed"),
+     ("500-then-running", None), ("500-every-time", "unread")],
+)  # fmt: skip
+async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(svc, monkeypatch, caplog, after, outcome):
     """No Jupyter, no environment and a skipped SSH bootstrap (ships_sshd) run no exec after the key step:
-    the State read before the pod is cached still names a kill instead of a ContainerCreated."""
+    the State read before the pod is cached still names a kill, or the image's own exit, instead of a
+    ContainerCreated; a transient inspect error is retried, and a State never read fails the create."""
+    monkeypatch.setattr("services.docker_service.FINAL_STATE_INSPECT_RETRY_DELAY_S", 0)
     api = FakeApiClient()
     later = {
         "sigkill": _SIGKILLED,
+        "500-then-sigkill": _SIGKILLED,
         "oom": _oom_killed_state(),
-        "image-exited": _container_state(status="exited", running=False, exit_code=0),
+        "image-exited-0": _container_state(status="exited", running=False, exit_code=0),
+        "image-exited-1": _container_state(status="exited", running=False, exit_code=1),
     }
     api.container_states = [_RUNNING, later.get(after, _RUNNING)]
     _bootstrapping_create(svc, monkeypatch, api, skip_ssh_bootstrap=True)
     if after == "gone":
         _gone_at_inspect(api, 2)
+    elif after.startswith("500-then"):
+        _inspect_fails_at(api, 2)
+    elif after == "500-every-time":
+        _inspect_always_fails_from(api, 2)
     caplog.set_level(logging.WARNING)
 
     result = await _create(svc, _payload())
 
-    if cause is None:
+    if outcome is None:
         assert isinstance(result, ContainerCreated)
         assert _events(caplog) == []
         return
     assert isinstance(result, FailedContainerRequest)
+    svc.redis_service.add_rented_pod.assert_not_awaited()
+    if outcome in ("exited", "unread"):
+        # the image's own exit, or a State never read: the step's own failure, not a kill on the node
+        assert result.failure_step == "final_state_check"
+        assert _events(caplog) == []
+        if outcome == "unread":
+            assert "could not read the container State before caching the pod (3 attempts)" in result.detail
+        else:
+            assert "status='exited'" in result.detail
+        return
     assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
     (logged,) = _events(caplog)
-    assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == cause
+    assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == outcome
     assert "is not running" not in result.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_exit", [0, 1])
+async def test_a_failed_ssh_bootstrap_on_a_stopped_container_is_not_a_created_container(
+    svc, monkeypatch, caplog, image_exit
+):
+    """The bootstrap's exec ends nonzero while the image's own command exits: the bootstrap returns its
+    soft False, and with no environment exec after it the final State check fails the create under
+    ssh_bootstrap, with no node-kill event."""
+    api = FakeApiClient()
+    exited = _container_state(status="exited", running=False, exit_code=image_exit)
+    # keys, bootstrap script written, bootstrap script run: running; the State read after the run's exit 1
+    api.container_states = [_RUNNING, _RUNNING, _RUNNING, exited]
+    _bootstrapping_create(svc, monkeypatch, api)
+    _exec_exits(0, 0, 1)(api)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == "ssh_bootstrap"
+    assert "killed_during_bootstrap" not in result.detail and f"exit_code={image_exit}" in result.detail
+    assert _events(caplog) == []
+    svc.redis_service.add_rented_pod.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_ssh_bootstrap_on_a_running_container_still_creates(svc, monkeypatch, caplog):
+    # the inherited soft failure: a bootstrap that ends nonzero on a live container goes on as before
+    api = FakeApiClient()
+    api.container_states = [_RUNNING]
+    _bootstrapping_create(svc, monkeypatch, api)
+    _exec_exits(0, 0, 1)(api)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
