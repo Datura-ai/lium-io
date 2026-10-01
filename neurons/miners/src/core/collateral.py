@@ -176,13 +176,23 @@ def bloom_may_hold(bloom, *values: bytes) -> bool:
             return True
     if not isinstance(bloom, bytes | bytearray) or len(bloom) != 256:
         return True
-    for value in values:
-        digest = AsyncWeb3.keccak(value)
-        for i in (0, 2, 4):
-            bit = int.from_bytes(digest[i : i + 2], "big") & 2047
-            if not bloom[255 - bit // 8] & (1 << (bit % 8)):
-                return False
-    return True
+    return all(bloom[255 - bit // 8] & (1 << (bit % 8)) for value in values for bit in bloom_bits(value))
+
+
+def bloom_bits(value: bytes):
+    digest = AsyncWeb3.keccak(value)
+    for i in (0, 2, 4):
+        yield int.from_bytes(digest[i : i + 2], "big") & 2047
+
+
+def logs_bloom(logs) -> str:
+    """The logs bloom of a block that holds exactly `logs`, as the header's hex text."""
+    bloom = bytearray(256)
+    for log in logs:
+        for value in (log["address"], *log["topics"]):
+            for bit in bloom_bits(bytes.fromhex(hash_text(value))):
+                bloom[255 - bit // 8] |= 1 << (bit % 8)
+    return bloom.hex()
 
 
 def record_hashes(record: dict) -> list[str]:
@@ -865,18 +875,18 @@ class CollateralClient:
     async def get_reclaim_events(self) -> list[ReclaimRequest]:
         """Open reclaim requests started in the last RECLAIM_LOOKBACK_BLOCKS finalized blocks.
 
-        A load-balanced RPC can answer any read by number from a backend on another fork or one that lags behind,
-        so the logs are read in one batch with that backend's block at the finalized number, and kept only when it
-        is the finalized block. Each request's state is read at the finalized block's hash and must match its log.
-        A request started after the finalized block is listed once its block is final."""
+        A load-balanced RPC can answer any read from a backend on another fork or one that lags behind, so the
+        blocks are kept only when they link by parent hashes to the finalized block, and their logs are read by
+        block hash (see `_reclaim_events_at`). Each request's state is read at the finalized block's hash and must
+        match its log. A request started after the finalized block is listed once its block is final."""
         for _ in range(RECLAIM_LIST_ATTEMPTS):
             finalized = await self.w3.eth.get_block("finalized")
             requests = await self._reclaim_events_at(finalized)
             if requests is not None:
                 return requests
         raise CollateralTransactionError(
-            f"The RPC answered the open reclaim requests from blocks that are not on the finalized chain, or with no "
-            f"logs for a block that may hold one, {RECLAIM_LIST_ATTEMPTS} times; run this again"
+            f"The RPC answered the open reclaim requests from blocks that are not on the finalized chain, or with "
+            f"only part of a block's logs, {RECLAIM_LIST_ATTEMPTS} times; run this again"
         )
 
     async def _reclaim_at_block_hash(self, reclaim_request_id: int, block_hash) -> tuple:
@@ -891,12 +901,12 @@ class CollateralClient:
         return tuple(self.w3.codec.decode(outputs, result))
 
     async def _reclaim_events_at(self, finalized) -> list[ReclaimRequest] | None:
-        """The open requests at the finalized block, or None when a block or log is not on its chain, or a block whose
-        bloom may hold the event is answered with no logs.
+        """The open requests at the finalized block, or None when a block or log is not on its chain, or a block's
+        logs are answered only in part.
 
-        A range eth_getLogs can reach a lagging backend whose empty answer looks like no request. So the logs are
-        read by block hash, which a backend answers for that block or refuses, for every block on the finalized
-        chain whose logs bloom may hold this contract's ReclaimProcessStarted."""
+        A range eth_getLogs can reach a lagging backend whose empty answer looks like no request. So every log of
+        each block on the finalized chain whose logs bloom may hold this contract's ReclaimProcessStarted is read by
+        block hash, and the answer is kept only when those logs make up the header's bloom exactly."""
         top = finalized["number"]
         lowest = max(top - RECLAIM_LOOKBACK_BLOCKS, 0)
         event = self.contract.events.ReclaimProcessStarted()
@@ -910,21 +920,20 @@ class CollateralClient:
             raw_logs = []
             for start in range(0, len(candidates), CHAIN_READ_BATCH):
                 batch = candidates[start : start + CHAIN_READ_BATCH]
-                filters = [
-                    {"address": self.contract_address, "topics": [AsyncWeb3.to_hex(topic)],
-                     "blockHash": AsyncWeb3.to_hex(hexstr=hash_text(block["hash"]))}
-                    for block in batch
-                ]
+                filters = [{"blockHash": AsyncWeb3.to_hex(hexstr=hash_text(block["hash"]))} for block in batch]
                 answers = await self._read_together(*(("eth_getLogs", [log_filter]) for log_filter in filters))
                 for block, answer in zip(batch, answers):
-                    # A Frontier node answers [] for a block hash it knows but whose receipts it cannot load, so an
-                    # empty answer for a block whose bloom may hold the event is no proof that it holds none. A bloom
-                    # false positive reads the same way; the list then fails instead of answering a guess.
-                    if not answer:
-                        return None
                     if any(log.get("removed") or not same_hash(log["blockHash"], block["hash"]) for log in answer):
                         return None
-                    raw_logs.extend(answer)
+                    # A Frontier node answers [] for a block hash it knows but whose receipts it cannot load. The
+                    # header's bloom is made of every log in the block, so an answer that makes it up is complete,
+                    # including one that holds another contract's event and none of this one's.
+                    if logs_bloom(answer) != hash_text(block.get("logsBloom")):
+                        return None
+                    raw_logs.extend(
+                        log for log in answer
+                        if same_hash(log["address"], address) and log["topics"] and same_hash(log["topics"][0], topic)
+                    )
         except RpcReadError as error:
             raise CollateralTransactionError(
                 f"The RPC did not answer the reclaim request list ({error}); run this again, or set "

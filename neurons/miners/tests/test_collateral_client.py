@@ -49,6 +49,17 @@ def hex_encode(types, values) -> str:
 SENDS = {selector("finalizeReclaim(uint256)"), selector("reclaimCollateral(bytes16,string,bytes16)")}
 
 
+def bloom_of(logs) -> str:
+    """The 2048-bit logs bloom of a block holding `logs`: three bits from the keccak of each address and topic."""
+    bits = 0
+    for log in logs:
+        for value in (log["address"], *log["topics"]):
+            digest = AsyncWeb3.keccak(hexstr=value)
+            for i in (0, 2, 4):
+                bits |= 1 << (int.from_bytes(digest[i : i + 2], "big") % 2048)
+    return "0x" + f"{bits:0512x}"
+
+
 class FakeProvider(AsyncBaseProvider):
     """Answers the JSON-RPC methods the client uses; eth_call is routed by function selector.
 
@@ -145,12 +156,12 @@ class FakeProvider(AsyncBaseProvider):
 
     def block(self, number: int) -> dict:
         block_hash = self.chain_hash(number)
-        holds_log = any(int(log["blockNumber"], 16) == number and log["blockHash"] == block_hash for log in self.logs)
+        logs = [log for log in self.logs if int(log["blockNumber"], 16) == number and log["blockHash"] == block_hash]
         return {
             "number": hex(number),
             "hash": block_hash,
             "parentHash": self.chain_hash(number - 1),
-            "logsBloom": "0x" + ("ff" if holds_log else "00") * 256,
+            "logsBloom": bloom_of(logs),
         }
 
     def fork_block(self, number: int) -> dict:
@@ -1045,6 +1056,20 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
     assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
     assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
+
+
+async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_requests():
+    """Review of a7a2820: a block holds this contract's Reclaimed and the old contract's ReclaimProcessStarted, so
+    its bloom holds this address and the started topic, though no log holds both."""
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
+    provider.block_number = provider.finalized_number = 5000
+    at = {"blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}
+    provider.logs = [{**reclaimed_log(), **at}, {**started_log(), **at, "address": OLD_CONTRACT, "logIndex": "0x1"}]
+
+    assert await client_with(provider).get_reclaim_events() == []
+    old = CollateralClient(network="finney", contract_address=OLD_CONTRACT)
+    old._w3 = AsyncWeb3(provider)
+    assert [request.reclaim_request_id for request in await old.get_reclaim_events()] == [5]
 
 
 async def test_a_batch_above_the_rpc_limit_fails_the_list(monkeypatch):
