@@ -6282,6 +6282,34 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
 
 
 @pytest.mark.asyncio
+async def test_create_container_encrypted_keys_ride_in_the_volume_setup_exec(docker_service, monkeypatch):
+    # without a restore between mount and keys, the keys go in with the mount: no second exec
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    setup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
+    keys_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "add_ssh_public_keys_with_rental_docker", keys_spy)
+    payload = _create_payload(str(uuid4()), encrypted=True).model_copy(update={"bootstrap_restore": None})
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert setup_spy.await_args.kwargs["authorized_keys"] == ["ssh-ed25519 test-key"]
+    keys_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_old_executor(
     docker_service,
     monkeypatch,
@@ -6967,6 +6995,7 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
                 pod_id=pod_id,
                 log_tag="test",
                 log_extra={},
+                authorized_keys=["ssh-ed25519 AAAA'$(id)' renter"],
             )
 
     logged = " ".join(rec.getMessage() for rec in caplog.records)
@@ -6991,10 +7020,15 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     upload_call = stdin_calls[0]
     upload_cmd = upload_call.args[0]
     # 0600 from the first byte: the script holds the same material as the passfile it writes
-    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'umask 077 && cat > ")
+    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'umask 077\n")
     assert f"{docker_service_module._VOLUME_SETUP_TMPFS}/.x" in upload_cmd
     assert "<<" not in upload_cmd
-    setup_script = upload_call.kwargs["input"]
+    # the renter's key is data on stdin behind the script, never shell text
+    assert "AAAA" not in upload_cmd
+    stdin_data = upload_call.kwargs["input"]
+    setup_script, renter_keys = stdin_data.split("ssh-ed25519", 1)
+    assert renter_keys == " AAAA'$(id)' renter\n"
+    assert f"head -c {len(setup_script)} > " in upload_cmd
     assert "gocryptfs" in setup_script
     assert passphrase not in setup_script
     assert passphrase.encode("ascii").hex() not in setup_script
