@@ -9,6 +9,7 @@ from incentive.miner_incentive_log import IncentiveReason
 from protocol.vc_protocol.validator_requests import (
     AVAILABILITY_CATEGORY as AVAILABILITY_CATEGORY,
     PodContainerState,
+    PodSshObservation,
     ValidationEvent,
 )
 from pydantic import BaseModel, Field, PrivateAttr
@@ -76,6 +77,9 @@ class JobResult(BaseModel):
     # DAH-3338: container state per rented pod plus reaped orphans; None = the cycle never
     # observed any (not reached the rented-state check, nothing reaped).
     pod_states: list[PodContainerState] | None = None
+    # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
+    # None when the node has no rented pod with an ssh_port or the probe did not run.
+    pod_ssh: list[PodSshObservation] | None = None
 
     inspector_outcome: str = "SKIPPED"
 

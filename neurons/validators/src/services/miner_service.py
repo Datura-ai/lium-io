@@ -1245,6 +1245,12 @@ class MinerService:
                         # The spec carries at most the backend's bound; the rest of the list goes
                         # in PodStatesReport chunks below, or waits for the next cycle.
                         "pod_states": self._pod_states_capped_for_spec(result, default_extra),
+                        # None when the cycle's probe saw no rented pod with an ssh_port on this node
+                        "pod_ssh": (
+                            [observation.model_dump(mode="json") for observation in result.pod_ssh]
+                            if result.pod_ssh is not None
+                            else None
+                        ),
                     },
                 )
             except Exception as e:
