@@ -392,6 +392,10 @@ WARM_POD_LABEL = "lium.warm_pod"
 WARM_POD_VOLUME_GB = 1
 # each remote command of a warm pod's adoption; the grow and the keys exec take well under a second
 WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS = 30
+# The host's own bound on an adoption step that changes something: TERM at 20 s, KILL 5 s later, so
+# it is over before the local wait above gives up and the fallback recreates a volume of the same
+# name (a command asyncssh stops waiting for keeps running on the host).
+WARM_POD_HOST_TIMEOUT = "timeout -k 5 20"
 # Where the gocryptfs passphrase and the script that carries it live for the second they exist
 # inside the rental container. /dev/shm is the tmpfs Docker (and sysbox) mount into every
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
@@ -1510,7 +1514,7 @@ def _warm_pod_volume_grow_command(volume_name: str, size_gb: int) -> str:
     grow = shlex.quote(
         'truncate -s "$1" "$2" && losetup -c "$(losetup -j "$2" | cut -d: -f1)" && xfs_growfs "$3" >/dev/null'
     )
-    return (
+    command = (
         "set -e; "
         "root=$(/usr/bin/docker info -f '{{.DockerRootDir}}'); "
         f"plugin=$(/usr/bin/docker plugin inspect {plugin} -f '{{{{.Id}}}}'); "
@@ -1519,6 +1523,8 @@ def _warm_pod_volume_grow_command(volume_name: str, size_gb: int) -> str:
         f"nsenter -t 1 -m -- sh -c {grow} grow {int(size_gb)}G "
         f'"$root/plugins/$plugin/rootfs${{data_dir:?}}/"{volume} "$root/plugins/$plugin/propagated-mount/"{volume}'
     )
+    # the whole command: a slow `docker info` must not push the grow past the bound
+    return f"{WARM_POD_HOST_TIMEOUT} sh -c {shlex.quote(command)}"
 
 
 def _rent_unfit_for_warm_pod(
@@ -6071,19 +6077,6 @@ class DockerService:
                 jupyter_token = dict(
                     entry.partition("=")[::2] for entry in container["Config"]["Env"]
                 )["JUPYTER_PASSWORD"]
-                logger.info(
-                    _m(
-                        "Warm pod adopted",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_name": container_name,
-                            "volume_limit_gb": sizing.volume_limit_gb,
-                            "storage_limit_gb": sizing.storage_limit_gb,
-                            "step_timings_ms": {step.name.value: step.duration for step in profilers},
-                            "total_ms": now_ms() - started_ms,
-                        }),
-                    )
-                )
                 return _AdoptedWarmPod(
                     port_maps=[
                         (mapping.docker_port, mapping.external_port) for mapping in payload.pod_mapping
@@ -6167,7 +6160,7 @@ class DockerService:
         if [str(host_config.get("NanoCpus")), str(host_config.get("Memory"))] != wanted_limits:
             # the run left swap at its default, twice the memory limit
             resource_commands.append(
-                f"/usr/bin/docker update --cpus {payload.cpu_count} --memory {payload.memory_gb}g "
+                f"{WARM_POD_HOST_TIMEOUT} /usr/bin/docker update --cpus {payload.cpu_count} --memory {payload.memory_gb}g "
                 f"--memory-swap {2 * payload.memory_gb}g {container_q}"
             )
         await _await_all_then_raise_first_error(*(
@@ -6192,7 +6185,7 @@ class DockerService:
 
         # the keys are stdin, never shell text
         keys_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
+            f"{WARM_POD_HOST_TIMEOUT} /usr/bin/docker exec -u 0 -i {container_q} sh -c "
             + shlex.quote(_build_warm_pod_keys_exec_script("/root")),
             input="".join(f"{public_key}\n" for public_key in payload.user_public_keys),
             check=False,
@@ -6262,6 +6255,19 @@ class DockerService:
                 remove_volume=True,
             )
             raise
+        logger.info(
+            _m(
+                "Warm pod adopted",
+                extra=get_extra_info({
+                    **default_extra,
+                    "container_name": container_name,
+                    "volume_limit_gb": adopted.volume_limit_gb,
+                    "storage_limit_gb": adopted.storage_limit_gb,
+                    "step_timings_ms": {step.name.value: step.duration for step in adopted.profilers},
+                    "total_ms": sum(step.duration or 0 for step in adopted.profilers),
+                }),
+            )
+        )
         await self._cache_rented_pod_best_effort(
             executor_info=executor_info,
             pod_id=payload.pod_id,
