@@ -1314,7 +1314,9 @@ def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
 
 def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
     if allow_init:
-        return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"'
+        # scrypt N=2^10, not the default 2^16 (0.44 s less per create): the passphrase is 256
+        # random bits from HKDF, so key stretching adds nothing. A volume keeps the N it was made with.
+        return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -scryptn 10 -passfile "$_pf"'
     return (
         f'  echo "gocryptfs.conf missing under {_LIUM_CIPHER_MOUNT};'
         ' refusing to re-initialise an existing rental volume" >&2\n'
