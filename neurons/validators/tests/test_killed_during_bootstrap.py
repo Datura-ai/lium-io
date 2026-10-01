@@ -123,6 +123,7 @@ async def test_a_gone_container_gets_no_exec_and_its_state_is_read_then(
 
     gone = info.value
     assert gone.container_name == "pod_exec" and text in str(gone)
+    assert "is not running" not in gone.kill_detail
     assert api.exec_started == [] and (events is None or api.events == events)
     if expected is None:
         assert gone.state is None and container_gone_cause(gone.state) == "removed"
@@ -294,10 +295,17 @@ _ENDED_ON = "the container stopped before it was ready: its command ended on "
          {"cause": "removed", "exit_code": None}),
         ("set_environment", [_RUNNING, _RUNNING, _SIGKILLED], _exec_exits(0, 137), _BY_NODE + "it was killed (SIGKILL)",
          {"cause": "killed"}),
+        # inspect said running, Docker refused the exec with 409 "is not running", the re-inspect reads the kill
+        ("add_public_keys", [_RUNNING, _SIGKILLED],
+         lambda api: setattr(api, "exec_start", Mock(side_effect=_not_running_conflict(with_response=True))),
+         _BY_NODE + "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "removing"}),
+        ("ssh_bootstrap", [_RUNNING, _RUNNING, _SIGKILLED],
+         lambda api: setattr(api, "exec_start", Mock(side_effect=[None, _not_running_conflict(with_response=True)])),
+         _BY_NODE + "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "removing"}),
     ],
     ids=["ssh-oom", "ssh-sigkill", "ssh-exited-143", "ssh-exited-137", "ssh-exec-137-dead", "ssh-exec-137-404",
          "keys-oom", "keys-removing-exit-0", "keys-dead-exit-1", "keys-exec-130", "keys-exec-137-404", "env-removed",
-         "env-exec-137"],
+         "env-exec-137", "keys-exec-409", "ssh-exec-409"],
 )  # fmt: skip
 async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     svc, monkeypatch, caplog, step, states, setup, sentence, event
@@ -319,6 +327,8 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     assert sentence in result.detail
     assert f"during {step}" in result.detail and "has no long-running command" not in result.detail
     assert f"(cause={event['cause']} oom_killed=" in result.detail
+    # the backend reads Docker's "is not running" as the renter's image exiting, not a kill on the node
+    assert "is not running" not in result.detail
     assert _failure_extra(caplog)["failure_step"] == "killed_during_bootstrap"
     failure = next(r for r in caplog.records if str(r.msg) == "Failed create_container")
     assert failure.levelno == logging.ERROR and failure.exc_info is None

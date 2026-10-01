@@ -971,7 +971,12 @@ async def _explain_add_public_keys_failure(
             state = await docker_client.inspect_container_state(container_name=container_name)
         except Exception as inspect_exc:
             if is_docker_not_found_error(inspect_exc):
-                return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=None)
+                return ContainerGoneBeforeExec(
+                    str(cause),
+                    container_name=container_name,
+                    state=None,
+                    kill_detail="SSH-key exec failed and the container is gone",
+                )
             logger.warning(
                 _m(
                     "Could not inspect the container after a failed SSH-key injection",
@@ -984,7 +989,12 @@ async def _explain_add_public_keys_failure(
             )
             return cause
         if _killed_after_exec(state):
-            return ContainerGoneBeforeExec(str(cause), container_name=container_name, state=state)
+            return ContainerGoneBeforeExec(
+                str(cause),
+                container_name=container_name,
+                state=state,
+                kill_detail=f"SSH-key exec failed and the container has stopped ({state.describe()})",
+            )
     if not state.exited_since_start or (state.killed_by_host and container_gone_cause(state) != "exited"):
         return cause
     if state.running:
@@ -3147,18 +3157,10 @@ class DockerService:
     ) -> list[str] | None:
         """Which of ``targets`` (IDs or names) `docker ps -a` still lists; None when the listing could
         not be read."""
-        try:
-            result = await ssh_client.run(
-                DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
-            )
-        except Exception as exc:
-            logger.warning(
-                _m("docker ps -a listing failed", extra={"error_type": exc.__class__.__name__, "timeout_s": _PRERUN_HOST_PROBE_TIMEOUT_SECONDS})
-            )
+        listing = await self._list_all_containers(ssh_client)
+        if listing is None:
             return None
-        if result.exit_status != 0 or not isinstance(result.stdout, str):
-            return None
-        names, ids = parse_container_listing(result.stdout.splitlines())
+        names, ids = listing
         on_host = set(names) | set(ids.values())
         return [target for target in targets if target in on_host]
 
@@ -5944,7 +5946,7 @@ class DockerService:
             container_name=container_name,
             bootstrap_step=bootstrap_step,
             state=gone.state,
-            detail=str(gone),
+            detail=gone.kill_detail,
         )
         logger.warning(
             _m(

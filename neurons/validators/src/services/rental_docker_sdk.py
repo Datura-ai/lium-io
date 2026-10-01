@@ -64,12 +64,24 @@ class ContainerGoneBeforeExec(RentalDockerOperationError):
     already "No such container" — so no exec was attempted (a `restarting` container is waited
     for, a `paused` one is the plain error). ``state`` is the last inspect read while the
     container still answered, None once it is gone: OOMKilled and ExitCode are read from here,
-    because the next inspect may find nothing."""
+    because the next inspect may find nothing.
 
-    def __init__(self, message: str, *, container_name: str, state: ContainerStateSnapshot | None):
+    ``kill_detail`` is the text a kill reports: the message without Docker's refused-exec text
+    ("is not running"), which the backend reads as the image exiting. The message keeps it for an
+    image whose own command ended."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        container_name: str,
+        state: ContainerStateSnapshot | None,
+        kill_detail: str | None = None,
+    ):
         super().__init__(message)
         self.container_name = container_name
         self.state = state
+        self.kill_detail = kill_detail or message
 
 
 class RentalDockerContainerRestartingError(RentalDockerOperationError):
@@ -587,15 +599,20 @@ class RentalDockerSdkClient:
             readiness = await _in_docker_thread(self._inspect_container_exec_readiness, container_name)
         except ContainerGoneBeforeExec as gone:
             raise ContainerGoneBeforeExec(
-                f"{message}; {gone}", container_name=container_name, state=None
+                f"{message}; {gone}",
+                container_name=container_name,
+                state=None,
+                kill_detail=f"Docker refused the exec; {gone}",
             ) from gone
         except Exception:  # noqa: BLE001 — the exec error is the one to report
             return
         if readiness.gone:
+            state_after = f"container state after the refused exec: {readiness.detail}"
             raise ContainerGoneBeforeExec(
-                f"{message}; container state after the refused exec: {readiness.detail}",
+                f"{message}; {state_after}",
                 container_name=container_name,
                 state=readiness.state,
+                kill_detail=f"Docker refused the exec; {state_after}",
             )
 
     def _inspect_container_exec_readiness(
