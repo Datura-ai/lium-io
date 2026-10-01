@@ -52,6 +52,7 @@ from services.prerun_host_probe import (
     ProbedVolume,
     image_label_command,
     parse_prerun_host_probe,
+    port_check_containers_command,
     prerun_host_probe_command,
 )
 from test_deploy_optimizations import (
@@ -64,6 +65,7 @@ from test_deploy_optimizations import (
 )
 
 _IMAGE = "daturaai/pytorch:1.0.0"
+_HOTKEY = "5HotkeyOfTheMiner"
 
 
 def _probe(**over) -> PrerunHostProbe:
@@ -77,6 +79,7 @@ def _probe(**over) -> PrerunHostProbe:
         shared_nodes_whole_host_only=(),
         power_state_stdout="",
         image_label_value="",
+        port_check_container_names=(),
     )
     base.update(over)
     return PrerunHostProbe(**base)
@@ -103,6 +106,8 @@ def _stdout(
     power_rc: int = 0,
     label: tuple[str, ...] = ("1",),
     label_rc: int = 0,
+    port_check: tuple[str, ...] = (),
+    port_check_rc: int = 0,
 ) -> str:
     out = (
         _tagged("PS", *ps, rc=ps_rc)
@@ -116,6 +121,7 @@ def _stdout(
     if power is not None:
         out += _tagged("POWER", *power, rc=power_rc)
     out += _tagged("LABEL", *label, rc=label_rc)
+    out += _tagged("PORTCHECK", *port_check, rc=port_check_rc)
     return out
 
 
@@ -145,10 +151,15 @@ def _cmds(client) -> list[str]:
 
 def test_probe_command_carries_every_section_and_the_per_command_texts():
     cmd = prerun_host_probe_command(
-        docker_image=_IMAGE, image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL, with_power=True
+        docker_image=_IMAGE,
+        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
+        miner_hotkey=_HOTKEY,
+        with_power=True
     )
     assert "\n" not in cmd
-    for tag in ("PS", "VOL", "MNT", "GPUMINORMAP", "GPUDEV", "SHARED", "SHAREDW", "POWER", "LABEL"):
+    for tag in (
+        "PS", "VOL", "MNT", "GPUMINORMAP", "GPUDEV", "SHARED", "SHAREDW", "POWER", "LABEL", "PORTCHECK"
+    ):
         assert f"t {tag} " in cmd
     # shlex.quote wraps each section command; the quoted forms of the shared texts are inside
     import shlex
@@ -167,6 +178,7 @@ def test_probe_command_carries_every_section_and_the_per_command_texts():
         in cmd
     )
     assert shlex.quote(image_label_command(_IMAGE, _ENCRYPTED_VOLUME_IMAGE_LABEL)) in cmd
+    assert shlex.quote(port_check_containers_command(_HOTKEY)) in cmd
     # the probe reads; it never removes, installs or writes
     for verb in (" rm ", "volume rm", "plugin install", "nvidia-smi -pl", "-pm 1"):
         assert verb not in cmd
@@ -174,7 +186,10 @@ def test_probe_command_carries_every_section_and_the_per_command_texts():
 
 def test_probe_command_without_power_has_no_nvidia_smi():
     cmd = prerun_host_probe_command(
-        docker_image=_IMAGE, image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL, with_power=False
+        docker_image=_IMAGE,
+        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
+        miner_hotkey=_HOTKEY,
+        with_power=False
     )
     assert "nvidia-smi" not in cmd
     assert "t POWER " not in cmd
@@ -252,6 +267,7 @@ def test_parser_empty_sections_are_empty_not_none():
         ({"gpu_minor_map_rc": 2}, "gpu_minor_map_stdout"),
         ({"power_rc": 127}, "power_state_stdout"),
         ({"label_rc": 1}, "image_label_value"),
+        ({"port_check_rc": 1}, "port_check_container_names"),
     ],
 )
 def test_parser_failed_section_is_none_and_the_rest_survive(kwargs, attr):
@@ -369,6 +385,7 @@ case "$1 $2" in
   "volume ls") printf 'volume_a vloopback:latest\\nvolume_b local\\n' ;;
   "inspect --format") printf 'volume_a\\n\\nvolume_a\\n' ;;
   "image inspect") printf '%s\\n' "$LABEL_VALUE" ;;
+  "ps --format") printf 'health_check_1\\n' ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
 """
@@ -388,7 +405,10 @@ def _run_probe_in_sh(tmp_path, *, label_value: str = "1", with_power: bool = Tru
     smi.write_text(_NVIDIA_SMI_STUB)
     smi.chmod(smi.stat().st_mode | stat.S_IXUSR)
     cmd = prerun_host_probe_command(
-        docker_image=_IMAGE, image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL, with_power=with_power
+        docker_image=_IMAGE,
+        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
+        miner_hotkey=_HOTKEY,
+        with_power=with_power
     )
     cmd = cmd.replace("/usr/bin/docker", str(stub))
     env = {**os.environ, "LABEL_VALUE": label_value, "PATH": f"{tmp_path}:/usr/bin:/bin"}
@@ -407,6 +427,7 @@ def test_probe_through_sh_lists_docker_sections_and_marks_absent_nvidia_smi(tmp_
     )
     assert probe.mounted_volume_names == ("volume_a", "volume_a")  # blank lines dropped as before
     assert probe.image_label_value == "1"
+    assert probe.port_check_container_names == ("health_check_1",)
     # the GPU / device-node sections list whatever the test host has (a GPU workstation has
     # /dev/nvidia*, a CI runner may have /dev/infiniband/*) — they are listings, never failures
     assert probe.gpu_minor_map_stdout is not None and probe.gpu_device_nodes is not None
@@ -440,7 +461,10 @@ def test_probe_through_sh_prefix_failure_is_a_whole_probe_fallback(tmp_path):
     broken_awk.write_text("#!/bin/sh\nexit 1\n")
     broken_awk.chmod(broken_awk.stat().st_mode | stat.S_IXUSR)
     cmd = prerun_host_probe_command(
-        docker_image=_IMAGE, image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL, with_power=False
+        docker_image=_IMAGE,
+        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
+        miner_hotkey=_HOTKEY,
+        with_power=False
     ).replace("/usr/bin/docker", str(stub))
     env = {**os.environ, "LABEL_VALUE": "1", "PATH": f"{tmp_path}:/usr/bin:/bin"}
     out = subprocess.run(
@@ -460,12 +484,15 @@ def test_probe_through_sh_prefix_failure_is_a_whole_probe_fallback(tmp_path):
 async def test_probe_prerun_host_runs_one_command_and_parses(docker_service):
     ssh = _ssh(_ssh_result(stdout=_stdout()))
     probe = await docker_service.probe_prerun_host(
-        ssh, docker_image=_IMAGE, with_power=True, log_extra={}
+        ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}
     )
     assert probe is not None and probe.container_names == ("pod_a", "other")
     assert _cmds(ssh) == [
         prerun_host_probe_command(
-            docker_image=_IMAGE, image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL, with_power=True
+            docker_image=_IMAGE,
+        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
+        miner_hotkey=_HOTKEY,
+        with_power=True
         )
     ]
 
@@ -475,7 +502,7 @@ async def test_probe_prerun_host_ssh_error_is_none(docker_service):
     ssh = _ssh(ConnectionError("channel closed"))
     assert (
         await docker_service.probe_prerun_host(
-            ssh, docker_image=_IMAGE, with_power=True, log_extra={}
+            ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}
         )
         is None
     )
@@ -490,7 +517,7 @@ async def test_probe_prerun_host_is_bounded_and_a_timeout_is_none(docker_service
     ssh = _ssh(asyncio.TimeoutError())
     assert (
         await docker_service.probe_prerun_host(
-            ssh, docker_image=_IMAGE, with_power=True, log_extra={}
+            ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}
         )
         is None
     )
@@ -502,7 +529,7 @@ async def test_probe_prerun_host_garbage_is_none(docker_service):
     ssh = _ssh(_ssh_result(stdout="sh: t: not found\n"))
     assert (
         await docker_service.probe_prerun_host(
-            ssh, docker_image=_IMAGE, with_power=True, log_extra={}
+            ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}
         )
         is None
     )
@@ -802,6 +829,34 @@ async def test_restore_tracked_limits_with_probe_uses_it_for_before_values():
     assert POWER_STATE_CMD not in _cmds(ssh)
 
 
+@pytest.mark.asyncio
+async def test_port_check_with_probe_nothing_lingering_runs_nothing(docker_service):
+    ssh = _ssh()
+    ok, msg = await docker_service.wait_for_port_check_containers(
+        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
+        ssh_client=ssh, probed_container_names=(),
+    )
+    assert (ok, msg) == (True, "No port check containers found")
+    assert _cmds(ssh) == []
+
+
+@pytest.mark.asyncio
+async def test_port_check_with_probe_lingering_removes_the_same_as_the_live_listing(docker_service):
+    live_ssh = _ssh(_ssh_result(stdout="health_check_1\n"), _ssh_result(stdout=""))
+    live = await docker_service.wait_for_port_check_containers(
+        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
+        ssh_client=live_ssh,
+    )
+    probed_ssh = _ssh(_ssh_result(stdout=""))
+    probed = await docker_service.wait_for_port_check_containers(
+        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
+        ssh_client=probed_ssh, probed_container_names=("health_check_1",),
+    )
+    assert live == probed == (True, "Port check containers forcefully removed")
+    assert _cmds(live_ssh) == [port_check_containers_command(_HOTKEY), _cmds(probed_ssh)[0]]
+    assert _cmds(probed_ssh)[0].endswith("| xargs -r /usr/bin/docker rm -fv")
+
+
 # ------------------------------------------------------------------
 # create_container wiring
 # ------------------------------------------------------------------
@@ -869,7 +924,7 @@ async def test_create_container_flag_on_probes_once_and_hands_it_to_every_consum
     svc = svc_fixture
     monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
     ssh_client = _deploy_ssh_client()
-    probe = _probe()
+    probe = _probe(port_check_container_names=("health_check_1",))
     _wire(svc, monkeypatch, ssh_client, probe_result=probe)
     payload = _deploy_payload(enable_volume_encryption=True, is_sysbox=True)
     result = await _run_create_container(svc, payload)
@@ -890,6 +945,8 @@ async def test_create_container_flag_on_probes_once_and_hands_it_to_every_consum
 
     assert _probe_kwarg(ds.build_gpu_docker_config_for_executor) is probe
     assert _probe_kwarg(ds.restore_tracked_gpu_power_limits) is probe
+    port_check = svc.wait_for_port_check_containers.await_args.kwargs
+    assert port_check["probed_container_names"] is probe.port_check_container_names
     # the last-resort raise runs minutes after the probe and never takes it
     assert "host_probe" not in ds.raise_low_power_limits_to_default.await_args.kwargs
 
@@ -912,6 +969,8 @@ async def test_create_container_withdraws_docker_listings_after_a_removal(svc_fi
         svc.reclaim_dphn_cache_for_rental,
     ):
         assert _probe_kwarg(m) is None, m
+    port_check = svc.wait_for_port_check_containers.await_args.kwargs
+    assert port_check["probed_container_names"] is None
     from services import docker_service as ds
 
     # a docker removal does not touch the GPU / power sections

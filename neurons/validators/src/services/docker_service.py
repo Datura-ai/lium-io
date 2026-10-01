@@ -93,6 +93,8 @@ from services.prerun_host_probe import (
     PrerunHostProbe,
     image_label_command,
     parse_prerun_host_probe,
+    port_check_container_filters,
+    port_check_containers_command,
     prerun_host_probe_command,
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
@@ -2541,6 +2543,7 @@ class DockerService:
         private_key: str,
         *,
         ssh_client: asyncssh.SSHClientConnection | None = None,
+        probed_container_names: tuple[str, ...] | None = None,
     ) -> tuple[bool, str]:
         """Force-remove lingering port-check / probe containers before a rental.
 
@@ -2577,6 +2580,8 @@ class DockerService:
             private_key: Encrypted SSH private key (ignored when ``ssh_client``
                 is provided).
             ssh_client: Optional pre-opened SSH session to reuse.
+            probed_container_names: The same listing, already read by the pre-run host probe
+                (LIUM-57); None runs the listing here.
 
         Returns:
             Tuple of (success: bool, message: str). Always succeeds — removal is
@@ -2584,21 +2589,16 @@ class DockerService:
             - (True, "No port check containers found")
             - (True, "Port check containers forcefully removed")
         """
-        container_prefix = f"container_{miner_hotkey}_"
-        health_check_prefix = "health_check_"
-        container_filter = shlex.quote(f"name=^{container_prefix}")
-        health_check_filter = shlex.quote(f"name=^{health_check_prefix}")
+        listing_command = port_check_containers_command(miner_hotkey)
 
         async def _run_checks(client: asyncssh.SSHClientConnection) -> tuple[bool, str]:
-            # docker ps OR-s multiple --filter name= flags
-            command = (
-                '/usr/bin/docker ps --format "{{.Names}}" '
-                f"--filter {container_filter} "
-                f"--filter {health_check_filter}"
-            )
-            result = await client.run(command)
+            if probed_container_names is None:
+                result = await client.run(listing_command)
+                names = [n for n in (result.stdout or "").strip().split("\n") if n]
+            else:
+                names = list(probed_container_names)
 
-            if not result.stdout or not result.stdout.strip():
+            if not names:
                 return True, "No port check containers found"
 
             # Found lingering probe container(s). Force-remove IMMEDIATELY and let
@@ -2608,7 +2608,6 @@ class DockerService:
             # to hotkey-only — the old retry loop could never clear a foreign
             # health_check_*, so removal is the only path that frees the port
             # (see DAH-2272 ADR).
-            names = [n for n in result.stdout.strip().split("\n") if n]
             logger.warning(
                 _m(
                     "port_check_force_removed",
@@ -2621,9 +2620,7 @@ class DockerService:
             )
 
             remove_cmd = (
-                "/usr/bin/docker ps -q "
-                f"--filter {container_filter} "
-                f"--filter {health_check_filter} "
+                f"/usr/bin/docker ps -q {port_check_container_filters(miner_hotkey)} "
                 "| xargs -r /usr/bin/docker rm -fv"
             )
             await client.run(remove_cmd)
@@ -3387,6 +3384,7 @@ class DockerService:
         *,
         docker_image: str,
         with_power: bool,
+        miner_hotkey: str,
         log_extra: dict,
     ) -> PrerunHostProbe | None:
         """DAH-3257: the pre-run host listings in one SSH command; None on any failure.
@@ -3398,6 +3396,7 @@ class DockerService:
             docker_image=docker_image,
             image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
             with_power=with_power,
+            miner_hotkey=miner_hotkey,
         )
         started = time.monotonic()
         try:
@@ -3439,6 +3438,7 @@ class DockerService:
                             ("shared_nodes_whole_host", probe.shared_nodes_whole_host_only),
                             ("power", probe.power_state_stdout if with_power else ""),
                             ("image_label", probe.image_label_value),
+                            ("port_check", probe.port_check_container_names),
                         )
                         if value is None
                     ],
@@ -5958,6 +5958,7 @@ class DockerService:
                                 connected_ssh_client,
                                 docker_image=payload.docker_image,
                                 with_power=probe_with_power,
+                                miner_hotkey=payload.miner_hotkey,
                                 log_extra=default_extra,
                             ),
                             ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
@@ -6350,6 +6351,7 @@ class DockerService:
                             # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
                             # (apply_filler_gpu_power_limits) and never reads the probe's power state.
                             with_power=probe_with_power,
+                            miner_hotkey=payload.miner_hotkey,
                             log_extra=default_extra,
                         )
                 # The probe is a snapshot. Once a step below removes a container or a volume, the
@@ -6733,7 +6735,8 @@ class DockerService:
                 # ssh_client so we don't pay for a second connect (and don't widen
                 # the TOCTOU gap). No wait — the rental takes priority; the
                 # port-allocated retry loop + `docker rm -fv` are the backstop for
-                # any residual race.
+                # any residual race. LIUM-57: the listing comes from the pre-run host probe
+                # (saves its own 2 round trips), unless a removal withdrew the probe's listings.
                 current_step = "port_check_wait"
                 wait_ok, wait_msg = await self.wait_for_port_check_containers(
                     executor_info=executor_info,
@@ -6741,6 +6744,11 @@ class DockerService:
                     keypair=keypair,
                     private_key=private_key,
                     ssh_client=ssh_client,
+                    probed_container_names=(
+                        docker_listing_probe.port_check_container_names
+                        if docker_listing_probe is not None
+                        else None
+                    ),
                 )
                 logger.info(
                     _m(
