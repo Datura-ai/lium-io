@@ -34,7 +34,8 @@ while the driver's count still covers the rental and the anchor, or on an anchor
 scrape that lists another card twice while its rows still cover every card (`confirm_first`), posts from
 its second consecutive cycle instead. The first clean cycle after an incident the backend recorded or
 never answered posts `state=recovered` and deletes the mark once the backend answered with a delivery
-that needs no retry; a fault after a posted recovery starts a new incident. A mark nothing was posted
+that needs no retry; a fault after a posted recovery starts a new incident that still owes the recovery
+the backend did not acknowledge. A mark nothing was posted
 for is deleted without a post. A backend that is down or older (404) is no answer: the next cycle asks
 again. A dry run judges and logs only: it reads and writes no mark. Every mark is also kept in this process and preferred to
 the Redis copy (a failed write or delete leaves Redis behind), so an
@@ -393,8 +394,12 @@ class RentedGpuDropCheck:
                 return None
             return await self._recover(ctx, pod, mark, rented_total, nvml_count, redis_ok)
 
-        if mark is None or mark.recovering:
+        if mark is None:
             mark = DropMark(now_iso)
+        elif mark.recovering:
+            # A recovery the backend has not acknowledged is still owed: a held fault posts nothing, so the
+            # next clean cycle must still find it.
+            mark = DropMark(now_iso, recorded=mark.recorded, unanswered=mark.unanswered)
         else:
             mark = replace(mark, consecutive_cycles=mark.consecutive_cycles + 1)
         answer: RentedGpuDropResponse | None = None

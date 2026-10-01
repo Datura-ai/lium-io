@@ -540,6 +540,27 @@ async def test_a_fault_after_a_posted_recovery_starts_a_new_incident(context_fac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("glitch", GLITCHES)
+async def test_a_held_glitch_after_an_unacknowledged_recovery_keeps_the_recovery_owed(
+    context_factory, glitch
+):
+    services = _services()
+    await _run(context_factory, services, listed=UUIDS[:5])
+    services.backend.report_rented_gpu_drop.return_value = RentedGpuDropResponse(
+        recorded=True, delivery="notify_failed"
+    )
+    await _run(context_factory, services, listed=UUIDS)
+    services.backend.report_rented_gpu_drop.return_value = NOTIFIED
+
+    held = await _run(context_factory, services, **glitch)
+    assert held.event.what_we_saw["pods"][0]["held"] is True
+    await _run(context_factory, services, listed=UUIDS)
+
+    assert _states(services) == ["fault", "recovered", "recovered"]
+    assert services.redis.store == {}
+
+
+@pytest.mark.asyncio
 async def test_dry_run_logs_the_drop_and_posts_nothing(context_factory):
     services = _services()
 
