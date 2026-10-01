@@ -440,3 +440,33 @@ async def test_rent_without_a_warm_pod_takes_the_normal_create_after_one_inspect
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     assert "remove_warm_pod" not in host.events
     assert len([cmd for cmd in host.commands() if cmd.startswith("/usr/bin/docker inspect pod_")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_grow_runs_under_the_host_timeout_shorter_than_the_local_wait(svc, monkeypatch):
+    payload = _rent_payload()
+    host = _adoptable(svc, monkeypatch, payload)
+
+    await _run(svc, payload)
+
+    grow = next(cmd for cmd in host.commands() if "nsenter -t 1 -m" in cmd)
+    assert grow.startswith("timeout -k 5 20 sh -c ")
+    assert 20 + 5 < ds_module.WARM_POD_ADOPTION_COMMAND_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_warm_pod_adopted_is_not_logged_when_a_delete_cancelled_the_create(svc, monkeypatch, caplog):
+    payload = _rent_payload()
+    _adoptable(svc, monkeypatch, payload)
+    monkeypatch.setattr(
+        svc,
+        "_abort_if_cancelled_by_delete",
+        AsyncMock(side_effect=[None, ds_module._CreateCancelledByDelete("delete arrived")]),
+    )
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock())
+
+    with caplog.at_level("INFO"):
+        result = await _run(svc, payload)
+
+    assert not isinstance(result, ContainerCreated)
+    assert not any("Warm pod adopted" in record.getMessage() for record in caplog.records)
