@@ -1504,6 +1504,50 @@ fi
 """
 
 
+# exit status of the volume setup exec -> the step that failed and its log message; any other
+# status is `docker exec` itself failing, which used to surface at the upload
+_VOLUME_SETUP_EXEC_FAILURES: dict[int, tuple[str, str]] = {
+    90: ("upload_setup_script", "Failed to upload gocryptfs setup script into container"),
+    91: ("setup_or_mount", "Failed to initialize or mount gocryptfs inside container"),
+    92: ("verify_mount", "gocryptfs mount did not become visible inside container"),
+    93: ("add_public_keys", "Failed to add SSH public keys inside container"),
+}
+_VOLUME_SETUP_UPLOAD_FAILURE = _VOLUME_SETUP_EXEC_FAILURES[90]
+
+
+def _build_volume_setup_exec_script(
+    plaintext_path: str,
+    *,
+    setup_script_path: str,
+    passfile_path: str,
+    setup_script_size: int,
+    with_authorized_keys: bool,
+) -> str:
+    # The fixed program of the one volume setup exec; its stdin is the setup script, exactly
+    # setup_script_size bytes, then the renter's public keys. `head -c` takes only the script onto
+    # tmpfs and leaves the keys to the final `cat`: they stay data, never shell text.
+    script = shlex.quote(setup_script_path)
+    passfile = shlex.quote(passfile_path)
+    mount_check = (
+        f"awk -v target={shlex.quote(plaintext_path)} "
+        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
+    )
+    lines = [
+        "umask 077",
+        f'trap "rm -f {script} {passfile}" EXIT',
+        f"head -c {setup_script_size} > {script} && [ $(wc -c < {script}) -eq {setup_script_size} ] || exit 90",
+        f"sh {script} || exit 91",
+        f"{mount_check} || {{ echo '--- /proc/mounts ---'; cat /proc/mounts;"
+        " echo '--- gocryptfs ps ---'; ps aux | grep '[g]ocryptfs'; exit 92; }",
+    ]
+    if with_authorized_keys:
+        # chmod up front: sshd may already be up and must find the directory private
+        lines.append(
+            "{ mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys; } || exit 93"
+        )
+    return "\n".join(lines)
+
+
 class DockerService:
     def __init__(
         self,
@@ -3782,7 +3826,9 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
         allow_init: bool = True,
+        authorized_keys: list[str] | tuple[str, ...] = (),
     ) -> None:
+        # authorized_keys: the renter's public keys, appended to /root/.ssh once the mount is up
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
 
         container_q = shlex.quote(container_name)
@@ -3793,13 +3839,6 @@ class DockerService:
         wrapped_var = _opaque_shell_name()
         while wrapped_var == pad_var:
             wrapped_var = _opaque_shell_name()
-
-        async def wipe_tmp_files() -> None:
-            await ssh_client.run(
-                f"/usr/bin/docker exec -u 0 {container_q} rm -f "
-                f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
-                check=False,
-            )
 
         async def fail_step(step: str, message: str, result: Any | None = None) -> None:
             exit_status = getattr(result, "exit_status", None)
@@ -3855,82 +3894,49 @@ class DockerService:
             passfile_path=passfile_path,
             allow_init=allow_init,
         )
+        key_data = "".join(f"{public_key}\n" for public_key in authorized_keys)
         # The script goes over the SSH channel's stdin, never in the command string: sshd hands
         # the command string to `sh -c`, so a heredoc there is the remote shell's argv, readable
         # by anyone on the host (`/proc/<pid>/cmdline`, execsnoop, auditd) for as long as the
-        # exec runs — pad and wrapped passphrase side by side. `umask 077` makes the file 0600
-        # from its first byte: it carries the same material as the passfile the script chmods 600.
-        upload_cmd = (
+        # exec runs — pad and wrapped passphrase side by side. The keys follow it on the same
+        # stdin, so upload, mount, check and keys cost one round trip instead of five.
+        setup_command = (
             f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
-            f"{shlex.quote(f'umask 077 && cat > {setup_script_path}')}"
-        )
-        logger.info(
-            _m(
-                "Uploading encrypted-volume setup script",
-                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
+            + shlex.quote(
+                _build_volume_setup_exec_script(
+                    plaintext_path,
+                    setup_script_path=setup_script_path,
+                    passfile_path=passfile_path,
+                    setup_script_size=len(setup_script.encode("ascii")),
+                    with_authorized_keys=bool(authorized_keys),
+                )
             )
         )
-        upload_result = await ssh_client.run(upload_cmd, input=setup_script)
-        if upload_result.exit_status != 0:
-            await wipe_tmp_files()
-            await fail_step(
-                "upload_setup_script",
-                "Failed to upload gocryptfs setup script into container",
-                upload_result,
-            )
-
         logger.info(
             _m(
                 "Running gocryptfs init/mount",
-                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
-            )
-        )
-        mount_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u 0 {container_q} sh {shlex.quote(setup_script_path)}",
-        )
-        await wipe_tmp_files()
-        if mount_result.exit_status != 0:
-            await fail_step(
-                "setup_or_mount",
-                "Failed to initialize or mount gocryptfs inside container",
-                mount_result,
-            )
-
-        verify_mount_script = (
-            f"awk -v target={shlex.quote(plaintext_path)} "
-            "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
-        )
-        logger.info(
-            _m(
-                "Verifying gocryptfs mount",
                 extra=get_extra_info({
                     **log_extra,
                     "container_name": container_name,
-                    "plaintext_path": plaintext_path,
                     "pod_id": pod_id,
+                    "with_authorized_keys": bool(authorized_keys),
                 }),
             )
         )
-        verify_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u 0 {container_q} sh -lc {shlex.quote(verify_mount_script)}"
-        )
-        if verify_result.exit_status != 0:
-            diagnostic_script = (
-                'printf "%s\\n" "--- /proc/mounts ---"; '
-                'cat /proc/mounts; '
-                'printf "%s\\n" "--- gocryptfs ps ---"; '
-                'ps aux | grep [g]ocryptfs || true'
-            )
-            diagnostic_result = await ssh_client.run(
-                f"/usr/bin/docker exec -u 0 {container_q} sh -lc "
-                f"{shlex.quote(diagnostic_script)}",
+        # `docker inspect` on the host, not `id` in the container: a renter image is not
+        # guaranteed to ship coreutils. Read beside the exec, it costs no round trip of its own.
+        setup_result, user_inspect_result = await asyncio.gather(
+            ssh_client.run(setup_command, input=setup_script + key_data, check=False),
+            ssh_client.run(
+                f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
                 check=False,
+            ),
+        )
+        if setup_result.exit_status != 0:
+            step, message = _VOLUME_SETUP_EXEC_FAILURES.get(
+                setup_result.exit_status, _VOLUME_SETUP_UPLOAD_FAILURE
             )
-            await fail_step(
-                "verify_mount",
-                "gocryptfs mount did not become visible inside container",
-                diagnostic_result,
-            )
+            await fail_step(step, message, setup_result)
 
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
@@ -3939,6 +3945,7 @@ class DockerService:
             ssh_client=ssh_client,
             container_q=container_q,
             plaintext_path=plaintext_path,
+            user_inspect_result=user_inspect_result,
             log_extra={**log_extra, "container_name": container_name, "pod_id": pod_id},
         )
         if unwritable_workspace_error:
@@ -3966,6 +3973,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         container_q: str,
         plaintext_path: str,
+        user_inspect_result: Any,
         log_extra: dict,
     ) -> str | None:
         """Hand the freshly mounted workspace to the image's own user.
@@ -3982,13 +3990,8 @@ class DockerService:
         at ``/root/workspace`` under a 0700 ``/root`` is chown-ed and still
         unreachable).
         """
-        # `docker inspect` on the host, not `id` in the container: a renter image
-        # is not guaranteed to ship coreutils, and a probe we cannot run must not
-        # be mistaken for a probe that passed.
-        inspect_result = await ssh_client.run(
-            f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
-            check=False,
-        )
+        # a probe we cannot run must not be mistaken for a probe that passed
+        inspect_result = user_inspect_result
         if inspect_result.exit_status != 0:
             return (
                 f"could not read the image USER of the rental container "
@@ -7216,6 +7219,9 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
+                # the keys ride in the encrypted volume setup exec, unless a restore must write
+                # /root between the mount and the keys
+                keys_in_volume_setup = use_encrypted_volume and not payload.bootstrap_restore
                 try:
                     if use_encrypted_volume:
                         current_step = "encrypted_volume_setup"
@@ -7227,6 +7233,7 @@ class DockerService:
                             pod_id=payload.pod_id,
                             log_tag=log_tag,
                             log_extra=default_extra,
+                            authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
                         )
                         volume_encryption_status = VolumeEncryptionStatus.ENABLED
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
@@ -7261,13 +7268,14 @@ class DockerService:
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
                     try:
-                        await self.add_ssh_public_keys_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            public_keys=payload.user_public_keys,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                        )
+                        if not keys_in_volume_setup:
+                            await self.add_ssh_public_keys_with_rental_docker(
+                                docker_client=docker_client,
+                                container_name=container_name,
+                                public_keys=payload.user_public_keys,
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                            )
                     except Exception as keys_exc:
                         # DAH-3678: name the exiting image (DAH-2624) whatever form the exec
                         # failure took; the step and the cleanup below stay as they are.
