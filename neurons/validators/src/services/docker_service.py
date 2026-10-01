@@ -2983,14 +2983,12 @@ class DockerService:
         replacements: dict[str, str],
     ) -> None:
         """A customer create's sweep found a filler retry's new container under a removed filler's name:
-        remove it by its own ID (one attempt), then confirm again. An ID is recorded as ours only when the `rm`
-        answered and the confirmation no longer lists it; a failed `rm` or listing records none. A failure is
-        logged; a filler that still survives is reported by the confirmation, and the create goes on."""
+        remove it by its own ID (one attempt), then confirm again. Its ID is ours once the `rm` is handed to SSH,
+        as in the sweep (_MarkOwnRemovalsOnSubmit), whatever the `rm` answers or the confirmation lists. A failure
+        is logged; a filler that still survives is reported by the confirmation, and the create goes on."""
         ids = list(replacements.values())
-        acknowledged = False
         try:
-            await self._rm_containers(ssh_client, ids, max_attempts=1)
-            acknowledged = True
+            await self._rm_containers(ssh_client, ids, max_attempts=1, own_ids=ids)
         except Exception as exc:
             logger.warning(
                 _m(
@@ -3002,15 +3000,12 @@ class DockerService:
                     }),
                 )
             )
-        survivors = await self._confirm_fillers_removed(
+        await self._confirm_fillers_removed(
             ssh_client=ssh_client,
             default_extra=default_extra,
             pod_name=pod_name,
             removed_fillers=list(replacements),
         )
-        if acknowledged and survivors is not None:
-            still_listed = set(survivors.values())
-            own_sweep_removals.mark([container_id for container_id in ids if container_id not in still_listed])
 
     async def _confirm_fillers_removed(
         self,

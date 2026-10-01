@@ -518,11 +518,13 @@ async def test_an_unsent_rm_keeps_an_id_another_sweep_marked(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "after", ["gone", "still-listed", "listing-failed", "rm-answer-lost-listing-failed", "rm-answer-lost-still-listed"]
-)
-async def test_a_replacement_filler_is_ours_only_once_its_rm_is_confirmed(svc, monkeypatch, after):
-    """The ID is ours only when its `rm` answered and the confirmation no longer lists it; a lost answer or a
-    failed listing records none."""
+    "after",
+    ["gone", "still-listed", "listing-failed", "rm-answer-lost-listing-failed", "rm-answer-lost-still-listed",
+     "rm-never-sent"],
+)  # fmt: skip
+async def test_a_replacement_filler_is_ours_once_its_rm_is_handed_to_ssh(svc, monkeypatch, after):
+    """The sweep's rule: the ID is ours once its `rm` is sent, whatever the `rm` answers or the confirmation
+    lists; only a channel that never opened records none."""
     monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
     replacement_id = _container_id("filler_swept-1", generation=1)
     listing = f"filler_swept-1 {replacement_id}\n" if after.endswith("still-listed") else ""
@@ -531,6 +533,9 @@ async def test_a_replacement_filler_is_ours_only_once_its_rm_is_confirmed(svc, m
 
     async def run(command, **kwargs):
         if command.startswith("/usr/bin/docker rm -fv "):
+            assert own_sweep_removals.sent_rm_for(replacement_id)
+            if after == "rm-never-sent":
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed")
             if after.startswith("rm-answer-lost"):
                 raise ConnectionResetError("SSH dropped after the rm was sent")
             return await rm_ok(command, **kwargs)
@@ -542,7 +547,7 @@ async def test_a_replacement_filler_is_ours_only_once_its_rm_is_confirmed(svc, m
 
     await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
 
-    assert own_sweep_removals.sent_rm_for(replacement_id) == (after == "gone")
+    assert own_sweep_removals.sent_rm_for(replacement_id) == (after != "rm-never-sent")
 
 
 @pytest.mark.asyncio
