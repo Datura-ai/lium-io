@@ -10,7 +10,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -865,11 +865,6 @@ def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
     return "exited"
 
 
-def _listed_ids(survivors: dict[str, str] | None) -> set[str]:
-    """The container IDs a filler-removal confirmation listed; none when it could not be read."""
-    return {i for i in (survivors or {}).values() if i}
-
-
 def _killed_after_exec(state: ContainerStateSnapshot) -> bool:
     return not state.running and container_gone_cause(state) != "exited"
 
@@ -1210,81 +1205,33 @@ inflight_creates = _InflightCreateRegistry()
 
 
 class _OwnSweepRegistry:
-    """Container IDs a create's stale sweep (clean_existing_containers) force-removed.
+    """Container IDs this validator sent `docker rm` for in a create's stale sweep (clean_existing_containers).
 
-    A customer's create removes every `filler_*` on the node, including a filler whose own
-    create is still bootstrapping. That create then finds its container gone; the validator removed
-    it, so it is not a node kill. A retry of the same pod reuses the name, so the sweep lists full
-    IDs and removes by ID: an older same-name container never matches the ID this create's `docker
-    run` made, and a newer one is not removed, whatever order the listing, the run and the `rm` land
-    in. An ID counts only once `docker rm` printed it back as removed (an empty listing afterwards
-    is not proof) and that ID is not still on the host; while an `rm` of it is in flight,
-    `removed_by_us` waits for its outcome (the host may drop the container before the `rm` returns).
-    Two creates can sweep the same filler at once, so every open sweep of an ID is waited for, not
-    only the latest. An `rm` whose SSH call got no answer may have run, and so may one still in
-    flight when the wait runs out: those IDs are `maybe_removed_by_us`, neither ours nor the node's.
+    A customer's create removes every `filler_*` on the node, including a filler whose own create is
+    still bootstrapping. That create then finds its container gone; the validator removed it, so it is
+    not a node kill. One rule: an ID is ours from just before its `rm` is sent, whatever the `rm`
+    answers or a later listing shows (an `rm` can finish after its answer is lost or a listing is read).
+    The sweep removes by full ID, so a retry's new container under the same name is never one of them.
     """
 
-    TTL_SECONDS = 15 * 60
-    IN_FLIGHT_WAIT_SECONDS = 90
+    # Only a create still bootstrapping reads an ID, minutes after its sweep: the cap only bounds memory.
+    MAX_IDS = 10_000
 
     def __init__(self) -> None:
-        self._removed_at: dict[str, float] = {}
-        self._maybe_removed_at: dict[str, float] = {}
-        self._in_flight: dict[str, list[asyncio.Event]] = {}
+        self._ids: dict[str, None] = {}
 
-    def begin(self, container_ids: list[str]) -> asyncio.Event:
-        done = asyncio.Event()
+    def mark(self, container_ids: Iterable[str]) -> None:
         for container_id in container_ids:
-            self._in_flight.setdefault(container_id, []).append(done)
-        return done
+            self._ids.pop(container_id, None)
+            self._ids[container_id] = None
+        while len(self._ids) > self.MAX_IDS:
+            del self._ids[next(iter(self._ids))]
 
-    def end(
-        self, container_ids: list[str], done: asyncio.Event, *, removed: list[str], unanswered: list[str] = ()
-    ) -> None:
-        """Closes the sweep ``begin`` opened for ``container_ids``; ``removed``: the ones confirmed gone;
-        ``unanswered``: the ones an `rm` with no answer may have removed."""
-        now = time.monotonic()
-        self._removed_at = {i: t for i, t in self._removed_at.items() if now - t < self.TTL_SECONDS}
-        self._maybe_removed_at = {i: t for i, t in self._maybe_removed_at.items() if now - t < self.TTL_SECONDS}
-        for container_id in container_ids:
-            sweeps = [s for s in self._in_flight.get(container_id, ()) if s is not done]
-            if sweeps:
-                self._in_flight[container_id] = sweeps
-            else:
-                self._in_flight.pop(container_id, None)
-            if container_id in removed:
-                self._removed_at[container_id] = now
-            elif container_id in unanswered:
-                self._maybe_removed_at[container_id] = now
-        done.set()
-
-    async def removed_by_us(self, container_id: str | None) -> bool:
-        if not container_id:
-            return False
-        sweeps = list(self._in_flight.get(container_id, ()))
-        if sweeps and container_id not in self._removed_at:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(sweep.wait() for sweep in sweeps)), self.IN_FLIGHT_WAIT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                pass
-        at = self._removed_at.get(container_id)
-        return at is not None and time.monotonic() - at < self.TTL_SECONDS
-
-    def maybe_removed_by_us(self, container_id: str | None) -> bool:
-        """An `rm` of this ID was sent and got no answer, or is still in flight (read after
-        ``removed_by_us``, which waits for it)."""
-        if container_id and self._in_flight.get(container_id):
-            return True
-        at = self._maybe_removed_at.get(container_id) if container_id else None
-        return at is not None and time.monotonic() - at < self.TTL_SECONDS
+    def sent_rm_for(self, container_id: str | None) -> bool:
+        return bool(container_id) and container_id in self._ids
 
     def clear(self) -> None:
-        self._removed_at.clear()
-        self._maybe_removed_at.clear()
-        self._in_flight.clear()
+        self._ids.clear()
 
 
 own_sweep_removals = _OwnSweepRegistry()
@@ -2882,8 +2829,8 @@ class DockerService:
         (typed fields, countable) and the create goes on.
 
         A stale container whose full ID the listing carried is removed by that ID, so a same-name
-        container created after the listing is left alone; own_sweep_removals records only the IDs
-        `docker rm` printed back. A name listed without an ID is removed by name and not recorded.
+        container created after the listing is left alone; own_sweep_removals records each such ID
+        before its `rm` is sent. A name listed without an ID is removed by name and not recorded.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -2935,30 +2882,11 @@ class DockerService:
 
             swept = {name: listed_ids[name] for name in stale_containers if name in listed_ids}
             targets = [swept.get(name, name) for name in stale_containers]
-            # in flight before the rm: a create bootstrapping one of these may see it gone at once
-            sweep = own_sweep_removals.begin(list(swept.values()))
-            acknowledged: set[str] = set()
-            unanswered: set[str] = set()
-            survivors: dict[str, str] | None = {}
-            try:
-                survivors = await self._remove_stale_containers(
-                    ssh_client, default_extra, pod_name, stale_containers, targets, remove_every_filler,
-                    acknowledged, unanswered,
-                )
-            finally:
-                # a survivor is compared by ID: a same-name container created after the rm does not undo
-                # the removal `docker rm` acknowledged; a survivor listed without an ID, or an unconfirmed
-                # listing (None), counts as the listed container still there. An unanswered rm stays maybe
-                # ours unless the confirmation lists that same ID.
-                survivor_ids = (
-                    set(swept.values()) if survivors is None
-                    else {i or swept.get(n, "") for n, i in survivors.items()}
-                )  # fmt: skip
-                removed = [i for i in swept.values() if i in acknowledged and i not in survivor_ids]
-                own_sweep_removals.end(
-                    list(swept.values()), sweep, removed=removed,
-                    unanswered=[i for i in swept.values() if i in unanswered and i not in _listed_ids(survivors)],
-                )
+            # before the rm is sent: a create bootstrapping one of these may see it gone at once
+            own_sweep_removals.mark(swept.values())
+            survivors = await self._remove_stale_containers(
+                ssh_client, default_extra, pod_name, stale_containers, targets, remove_every_filler
+            )
             if remove_every_filler and survivors:
                 replacements = {n: i for n, i in survivors.items() if n in swept and i and i != swept[n]}
                 if replacements:
@@ -2990,19 +2918,16 @@ class DockerService:
         stale_containers: list[str],
         targets: list[str],
         remove_every_filler: bool,
-        acknowledged: set[str],
-        unanswered: set[str],
     ) -> dict[str, str] | None:
-        """`docker rm -fv` the ``targets`` (an ID, or the name when no ID was listed); adds each target
-        `docker rm` printed back to ``acknowledged``, even when a later target made it fail, and each one
-        an `rm` with no answer may have removed to ``unanswered``. Returns the removed fillers' names seen
-        on the host after it, with the ID each one has now ("" when not listed); None when that could not
-        be read. A customer create (DAH-3706) uses the tolerant rm and then confirms that no filler survived."""
+        """`docker rm -fv` the ``targets`` (an ID, or the name when no ID was listed). Returns the removed
+        fillers' names seen on the host after it, with the ID each one has now ("" when not listed); None
+        when that could not be read. A customer create (DAH-3706) uses the tolerant rm and then confirms
+        that no filler survived."""
         if not remove_every_filler:
-            await self._rm_containers(ssh_client, targets, acknowledged, unanswered=unanswered)
+            await self._rm_containers(ssh_client, targets)
             return {}
 
-        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, targets, acknowledged, unanswered)
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, targets)
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not removed_fillers:
             return {}
@@ -3024,46 +2949,30 @@ class DockerService:
         replacements: dict[str, str],
     ) -> None:
         """A customer create's sweep found a filler retry's new container under a removed filler's name:
-        remove it by its own ID (one attempt), then confirm again. An ID is recorded as ours only when `docker
-        rm` acknowledged it and the confirmation no longer lists it, as in the sweep. A failure is logged; a
-        filler that still survives is reported by the confirmation, and the create goes on."""
+        remove it by its own ID (one attempt), then confirm again. Its ID is ours from before the `rm`, as in
+        the sweep. A failure is logged; a filler that still survives is reported by the confirmation, and the
+        create goes on."""
         ids = list(replacements.values())
-        sweep = own_sweep_removals.begin(ids)
-        acknowledged: set[str] = set()
-        unanswered: set[str] = set()
-        survivors: dict[str, str] | None = None
+        own_sweep_removals.mark(ids)
         try:
-            try:
-                await self._rm_containers(ssh_client, ids, acknowledged, max_attempts=1, unanswered=unanswered)
-            except Exception as exc:
-                logger.warning(
-                    _m(
-                        "docker rm -fv of a replacement filler failed",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_names": list(replacements),
-                            "error_type": exc.__class__.__name__,
-                        }),
-                    )
+            await self._rm_containers(ssh_client, ids, max_attempts=1)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "docker rm -fv of a replacement filler failed",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_names": list(replacements),
+                        "error_type": exc.__class__.__name__,
+                    }),
                 )
-            survivors = await self._confirm_fillers_removed(
-                ssh_client=ssh_client,
-                default_extra=default_extra,
-                pod_name=pod_name,
-                removed_fillers=list(replacements),
             )
-        finally:
-            survivor_ids = (
-                set(ids) if survivors is None
-                else {i or replacements.get(n, "") for n, i in survivors.items()}
-            )  # fmt: skip
-            own_sweep_removals.end(
-                ids, sweep,
-                removed=[i for i in ids if i in acknowledged and i not in survivor_ids],
-                unanswered=[
-                    i for i in ids if i in unanswered and i not in acknowledged and i not in _listed_ids(survivors)
-                ],
-            )  # fmt: skip
+        await self._confirm_fillers_removed(
+            ssh_client=ssh_client,
+            default_extra=default_extra,
+            pod_name=pod_name,
+            removed_fillers=list(replacements),
+        )
 
     async def _confirm_fillers_removed(
         self,
@@ -3114,8 +3023,6 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         targets: list[str],
-        acknowledged: set[str],
-        unanswered: set[str] | None = None,
     ) -> None:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
@@ -3127,7 +3034,7 @@ class DockerService:
         container created since the listing is not a stale one.
         """
         try:
-            await self._rm_containers(ssh_client, targets, acknowledged, max_attempts=1, unanswered=unanswered)
+            await self._rm_containers(ssh_client, targets, max_attempts=1)
             return
         except Exception:
             still_present = await self._targets_still_on_host(ssh_client, targets)
@@ -3147,35 +3054,18 @@ class DockerService:
                 extra=get_extra_info({**default_extra, "container_names": still_present}),
             ),
         )
-        await self._rm_containers(ssh_client, still_present, acknowledged, unanswered=unanswered)
+        await self._rm_containers(ssh_client, still_present)
 
     @staticmethod
     async def _rm_containers(
-        ssh_client: asyncssh.SSHClientConnection,
-        targets: list[str],
-        acknowledged: set[str],
-        max_attempts: int = 5,
-        unanswered: set[str] | None = None,
+        ssh_client: asyncssh.SSHClientConnection, targets: list[str], max_attempts: int = 5
     ) -> None:
-        """`docker rm -fv <targets>`; `docker rm` prints each argument it removed, one per line. When an
-        attempt's SSH call got no answer (it may have removed them), the targets never printed back go to
-        ``unanswered``."""
-        printed: list[str] = []
-        dropped: list[BaseException] = []
-        try:
-            await retry_ssh_command(
-                ssh_client,
-                "/usr/bin/docker rm -fv " + " ".join(shlex.quote(t) for t in targets),
-                'clean_existing_containers',
-                max_attempts=max_attempts,
-                stdout_sink=printed,
-                transport_errors=dropped,
-            )
-        finally:
-            wanted = set(targets)
-            acknowledged.update(line.strip() for out in printed for line in out.splitlines() if line.strip() in wanted)
-            if dropped and unanswered is not None:
-                unanswered.update(t for t in targets if t not in acknowledged)
+        await retry_ssh_command(
+            ssh_client,
+            "/usr/bin/docker rm -fv " + " ".join(shlex.quote(t) for t in targets),
+            'clean_existing_containers',
+            max_attempts=max_attempts,
+        )
 
     @staticmethod
     async def _list_all_containers(
@@ -7252,6 +7142,13 @@ class DockerService:
                                     failure="Jupyter setup's docker exec failed",
                                 )
                                 raise
+                            # run_jupyter's last exec does not check its exit status: a kill mid-exec
+                            # returns normally, so read the State here too.
+                            await _raise_if_killed_after_exec(
+                                docker_client,
+                                container_name=container_name,
+                                failure="Jupyter setup's docker exec ended",
+                            )
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation (covers key
@@ -7329,17 +7226,11 @@ class DockerService:
                         # _CreateCancelledByDelete here; otherwise the failure names the kill
                         # it was, not the exec it broke.
                         await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-                        if container_gone_cause(post_run_exc.state) == "exited":
+                        gone_cause = container_gone_cause(post_run_exc.state)
+                        if gone_cause == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
                             raise
-                        sweep_reason = None
-                        if container_gone_cause(post_run_exc.state) != "oom":
-                            if await own_sweep_removals.removed_by_us(container_id):
-                                sweep_reason = "removed_by_own_sweep"
-                            elif own_sweep_removals.maybe_removed_by_us(container_id):
-                                # the sweep's `rm` was sent and its answer lost: not provably the node's
-                                sweep_reason = "maybe_removed_by_own_sweep"
-                        if sweep_reason is not None:
+                        if gone_cause != "oom" and own_sweep_removals.sent_rm_for(container_id):
                             # Another create on this node swept this very container (a customer's
                             # create removes every filler): the validator removed it, not the node.
                             # A sweep's `rm -f` never sets OOMKilled, so an observed OOM is the node's.
@@ -7349,7 +7240,7 @@ class DockerService:
                                     extra=get_extra_info({
                                         **default_extra,
                                         "container_name": container_name,
-                                        "reason": sweep_reason,
+                                        "reason": "removed_by_own_sweep",
                                         "bootstrap_step": current_step,
                                     }),
                                 )

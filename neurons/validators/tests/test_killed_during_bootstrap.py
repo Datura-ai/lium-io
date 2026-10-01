@@ -9,7 +9,6 @@ names the failure `killed_during_bootstrap` with `oom_killed` and the exit code,
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import logging
 from unittest.mock import AsyncMock, Mock
@@ -336,37 +335,16 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
         assert len(client.exec_specs) == 2 and api.events == _RACE
 
 
-def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str, *, rm: str = "done") -> None:
-    """Another create's sweep takes ``container_id`` just before inspect call `n` (1-based). ``rm``:
-    "done" (its `rm` has returned), or "ok" / "failed" (still in flight; it ends that way a moment
-    later, while this create is classifying), "unanswered" (its SSH call got no answer), "stuck"
-    (still in flight when the wait runs out), or "overlap" (a second create sweeps the same ID and
-    finds it already gone at once, while the first sweep's acknowledgement comes a moment later)."""
+def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str) -> None:
+    """Another create's sweep sends `rm` for ``container_id`` just before inspect call `n` (1-based)."""
     real_inspect, looks = api.inspect_container, []
     loop = asyncio.get_running_loop()
-
-    def sweep() -> None:
-        in_flight = own_sweep_removals.begin([container_id])
-        if rm == "stuck":
-            return
-        if rm == "overlap":
-            second = own_sweep_removals.begin([container_id])
-            own_sweep_removals.end([container_id], second, removed=[])
-        end = functools.partial(
-            own_sweep_removals.end, [container_id], in_flight,
-            removed=[] if rm in ("failed", "unanswered") else [container_id],
-            unanswered=[container_id] if rm == "unanswered" else [],
-        )  # fmt: skip
-        if rm == "done":
-            end()
-        else:
-            loop.call_later(0.05, end)
 
     def inspect(container_name):
         # docker-py runs in a worker thread; the sweep lands on the loop before this inspect returns
         looks.append(container_name)
         if len(looks) == n:
-            loop.call_soon_threadsafe(sweep)
+            loop.call_soon_threadsafe(own_sweep_removals.mark, [container_id])
         return real_inspect(container_name)
 
     api.inspect_container = inspect
@@ -377,24 +355,16 @@ def _swept_at_inspect(api: FakeApiClient, n: int, container_id: str, *, rm: str 
     "swept",
     [
         "during-bootstrap",
-        "listed-before-docker-run-returned",
-        "rm-in-flight-then-ok",
         "older-same-name-container-before-docker-run",
         "older-same-name-container-during-bootstrap",
-        "rm-in-flight-then-failed",
-        "rm-sent-answer-lost",
-        "rm-still-in-flight-after-the-wait",
-        "second-sweep-found-it-gone-first-acknowledged-later",
         "during-bootstrap-oom",
     ],
 )
 async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypatch, caplog, swept):
     """A customer's create removes every filler on the node, one still bootstrapping included: that
-    create finds its container gone, but the validator removed it, so no kill is filed. The sweep is
-    matched by container ID, so it counts whenever it listed the containers (even before this
-    create's `docker run` returned, as long as it removed this very container) and waits for an
-    `rm` still in flight. A sweep of an older container with the same name (a retry of the pod), an
-    `rm` that failed, or an OOM (a sweep's `rm -f` never causes one) still files the kill."""
+    create finds its container gone, but the validator sent the `rm`, so no kill is filed. The sweep is
+    matched by container ID: a sweep of an older container with the same name (a retry of the pod), or
+    an OOM (a sweep's `rm -f` never causes one), still files the kill."""
     api = FakeApiClient()
     api.container_states = [_RUNNING, _oom_killed_state() if swept.endswith("-oom") else _SIGKILLED]
     _bootstrapping_create(svc, monkeypatch, api)
@@ -403,29 +373,16 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     name = f"pod_{payload.pod_id}"
     this, older = _container_id(name), _container_id(name, generation=1)
     if swept == "older-same-name-container-before-docker-run":
-        own_sweep_removals.end([older], own_sweep_removals.begin([older]), removed=[older])
+        own_sweep_removals.mark([older])
     elif swept == "older-same-name-container-during-bootstrap":
         _swept_at_inspect(api, 2, older)
-    elif swept == "rm-in-flight-then-ok":
-        _swept_at_inspect(api, 2, this, rm="ok")
-    elif swept == "rm-in-flight-then-failed":
-        _swept_at_inspect(api, 2, this, rm="failed")
-    elif swept == "rm-sent-answer-lost":
-        # `rm -fv` reached Docker (SIGKILL, removing/137) but SSH dropped before its stdout came back
-        _swept_at_inspect(api, 2, this, rm="unanswered")
-    elif swept == "rm-still-in-flight-after-the-wait":
-        monkeypatch.setattr(own_sweep_removals, "IN_FLIGHT_WAIT_SECONDS", 0.01)
-        _swept_at_inspect(api, 2, this, rm="stuck")
-    elif swept == "second-sweep-found-it-gone-first-acknowledged-later":
-        _swept_at_inspect(api, 2, this, rm="overlap")
     else:
-        # "listed-before-docker-run-returned": the ID match makes the listing time irrelevant
         _swept_at_inspect(api, 2, this)
 
     result = await _create(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    if swept.startswith("older-") or swept.endswith(("-failed", "-oom")):
+    if swept.startswith("older-") or swept.endswith("-oom"):
         assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
         (logged,) = _events(caplog)
         assert logged["container_name"] == name
@@ -434,9 +391,7 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     assert result.failure_step == "ssh_bootstrap"
     assert "stopped by the node" not in result.detail
     assert _events(caplog) == []
-    maybe = swept in ("rm-sent-answer-lost", "rm-still-in-flight-after-the-wait")
-    reason = "maybe_removed_by_own_sweep" if maybe else "removed_by_own_sweep"
-    assert any(getattr(r.msg, "extra", {}).get("reason") == reason for r in caplog.records)
+    assert any(getattr(r.msg, "extra", {}).get("reason") == "removed_by_own_sweep" for r in caplog.records)
 
 
 def _sweep_host(listing: str, rm_prints=None, rm_exit: int = 0) -> Mock:
@@ -462,12 +417,12 @@ def _sweep_host(listing: str, rm_prints=None, rm_exit: int = 0) -> Mock:
     ("from_probe", "rm_error", "survivor"),
     [(False, None, None), (True, None, None), (False, RuntimeError("rm never sent"), None),
      (False, None, "same"), (False, None, "replacement")],
-    ids=["listed", "from-probe", "rm-failed", "filler-survived-the-rm", "replacement-after-ack"],
+    ids=["listed", "from-probe", "rm-failed", "filler-survived-the-rm", "replacement-after-the-rm"],
 )  # fmt: skip
-async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_probe, rm_error, survivor):
+async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, from_probe, rm_error, survivor):
     swept_id = _container_id("filler_swept-1")
     replacement_id = _container_id("filler_swept-1", generation=1)
-    # a filler retry took the name with a new ID after `docker rm` acknowledged the old one
+    # a filler retry took the name with a new ID after the old one's `rm`
     survivors = {"same": {"filler_swept-1": swept_id}, "replacement": {"filler_swept-1": replacement_id}}.get(
         survivor, {}
     )
@@ -477,10 +432,9 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
         if from_probe else None
     )  # fmt: skip
 
-    async def remove(_ssh, _extra, _pod, _names, targets, _every, acknowledged, _unanswered):
+    async def remove(_ssh, _extra, _pod, _names, _targets, _every):
         if rm_error is not None:
             raise rm_error
-        acknowledged.update(targets)
         return survivors
 
     svc._remove_stale_containers = remove
@@ -493,16 +447,16 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
     if rm_error is not None:
         with pytest.raises(RuntimeError, match="rm never sent"):
             await sweep
-        assert not await own_sweep_removals.removed_by_us(swept_id)
+    else:
+        assert await sweep == ["filler_swept-1"]
+    # the ID is ours from before its `rm`, whatever the `rm` answered or the host lists afterwards
+    assert own_sweep_removals.sent_rm_for(swept_id)
+    if rm_error is not None:
         return
-    assert await sweep == ["filler_swept-1"]
-    # the same ID still on the host after the rm (_confirm_fillers_removed saw it) was not removed by us;
-    # a new ID under the name does not undo the acknowledged removal of the old one
-    assert await own_sweep_removals.removed_by_us(swept_id) == (survivor != "same")
     # the customer's create removes the replacement by its own ID and records it as well
-    assert await own_sweep_removals.removed_by_us(replacement_id) == (survivor == "replacement")
+    assert own_sweep_removals.sent_rm_for(replacement_id) == (survivor == "replacement")
     assert ssh.rms == ([[replacement_id]] if survivor == "replacement" else [])
-    assert not await own_sweep_removals.removed_by_us(None)
+    assert not own_sweep_removals.sent_rm_for(None)
     # the IDs come with the listing: no `docker inspect` round trip, from the probe or not
     assert all("docker inspect" not in c.args[0] for c in ssh.run.await_args_list)
     # the replacement: its rm and the confirmation that follows it
@@ -513,9 +467,9 @@ async def test_the_stale_sweep_records_the_container_ids_it_removed(svc, from_pr
 @pytest.mark.parametrize(
     "after", ["gone", "still-listed", "listing-failed", "rm-answer-lost-listing-failed", "rm-answer-lost-still-listed"]
 )
-async def test_a_replacement_filler_counts_as_ours_only_once_confirmed_gone(svc, monkeypatch, after):
-    """`docker rm` acknowledging the replacement's ID is not enough: the confirmation must no longer list it.
-    An rm whose answer was lost stays maybe ours unless the confirmation lists that same ID."""
+async def test_a_replacement_filler_is_ours_once_its_rm_is_sent(svc, monkeypatch, after):
+    """An `rm` can finish after its answer is lost and after a listing still shows the ID, so neither the
+    answer nor the confirmation decides: the ID is ours from before its `rm` was sent."""
     monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
     replacement_id = _container_id("filler_swept-1", generation=1)
     listing = f"filler_swept-1 {replacement_id}\n" if after.endswith("still-listed") else ""
@@ -535,8 +489,7 @@ async def test_a_replacement_filler_counts_as_ours_only_once_confirmed_gone(svc,
 
     await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
 
-    assert await own_sweep_removals.removed_by_us(replacement_id) == (after == "gone")
-    assert own_sweep_removals.maybe_removed_by_us(replacement_id) == (after == "rm-answer-lost-listing-failed")
+    assert own_sweep_removals.sent_rm_for(replacement_id)
 
 
 @pytest.mark.asyncio
@@ -545,11 +498,11 @@ async def test_a_replacement_filler_counts_as_ours_only_once_confirmed_gone(svc,
     ["acknowledged", "node-removed-it-first", "replaced-by-a-new-same-name-container", "no-id-listed",
      "acknowledged-then-a-later-target-failed", "rm-sent-answer-lost", "rm-sent-answer-lost-confirmation-failed"],
 )  # fmt: skip
-async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkeypatch, case):
-    """The sweep removes by the listed ID and records an ID only when `docker rm` printed it back:
-    an empty listing after a failed rm is not proof, and a same-name container created since the
-    listing is not removed under the old ID. A customer's create then finds that replacement filler and
-    removes it by its own ID. An rm whose SSH call got no answer leaves its IDs neither ours nor the node's."""
+async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, case):
+    """The sweep removes by the listed ID and records each ID before its `rm` is sent, whatever the `rm`
+    answers: a same-name container created since the listing is not removed under the old ID. A customer's
+    create then finds that replacement filler and removes it by its own ID. A name listed without an ID is
+    removed by name and recorded as nothing."""
     monkeypatch.setattr("core.utils.wait_fixed", lambda _s: __import__("tenacity").wait_none())
     old, new, other = _container_id("filler_a"), _container_id("filler_a", generation=1), _container_id("filler_b")
     listing = f"filler_a {old}\nfiller_b {other}\n"
@@ -609,17 +562,11 @@ async def test_only_an_id_docker_rm_printed_back_is_recorded_as_ours(svc, monkey
         assert rms[-1] == [new]
     if case == "no-id-listed":
         assert rms == [["filler_a"]]
-        assert not await own_sweep_removals.removed_by_us(old)
+        assert not own_sweep_removals.sent_rm_for(old)
         return
     assert rms[0] == [old, other]
-    assert await own_sweep_removals.removed_by_us(old) == (case in ("acknowledged", "acknowledged-then-a-later-target-failed"))
-    assert await own_sweep_removals.removed_by_us(new) == replaced
-    assert await own_sweep_removals.removed_by_us(other) == (
-        case not in ("acknowledged-then-a-later-target-failed", "rm-sent-answer-lost", "rm-sent-answer-lost-confirmation-failed")
-    )
-    # with the confirmation unavailable, an rm whose answer was lost still leaves its IDs maybe ours
-    lost = case.startswith("rm-sent-answer-lost")
-    assert own_sweep_removals.maybe_removed_by_us(old) == lost and own_sweep_removals.maybe_removed_by_us(other) == lost
+    assert own_sweep_removals.sent_rm_for(old) and own_sweep_removals.sent_rm_for(other)
+    assert own_sweep_removals.sent_rm_for(new) == replaced
 
 
 def test_the_listing_maps_each_name_to_its_full_container_id():
@@ -628,37 +575,16 @@ def test_the_listing_maps_each_name_to_its_full_container_id():
     assert names == ("pod_a", "pod_b", "pod_c") and ids == {"pod_a": good}
 
 
-@pytest.mark.asyncio
-async def test_an_rm_still_in_flight_is_waited_for_and_a_stuck_one_is_only_maybe_ours(monkeypatch):
+def test_the_sweep_registry_keeps_the_newest_ids_up_to_its_cap(monkeypatch):
     registry = type(own_sweep_removals)()
-    ok, failed, stuck = (_container_id(n) for n in ("pod_ok", "pod_failed", "pod_stuck"))
-    for container_id, removed in ((ok, True), (failed, False)):
-        sweep = registry.begin([container_id])
-        end = functools.partial(registry.end, [container_id], sweep, removed=[container_id] if removed else [])
-        asyncio.get_running_loop().call_later(0.01, end)
-    registry.begin([stuck])
-    monkeypatch.setattr(registry, "IN_FLIGHT_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(registry, "MAX_IDS", 2)
+    first, second, third = (_container_id(n) for n in ("pod_a", "pod_b", "pod_c"))
+    registry.mark([first, second])
+    registry.mark([first])  # marked again: now the newest
+    registry.mark([third])
 
-    assert await registry.removed_by_us(ok)
-    assert not await registry.removed_by_us(failed) and not registry.maybe_removed_by_us(failed)
-    assert not await registry.removed_by_us(stuck) and registry.maybe_removed_by_us(stuck)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("first", ["acknowledged", "failed", "stuck"])
-async def test_every_open_sweep_of_an_id_is_waited_for(monkeypatch, first):
-    """Two creates sweep the same filler; the second finds it already gone while the first `rm` runs."""
-    registry = type(own_sweep_removals)()
-    monkeypatch.setattr(registry, "IN_FLIGHT_WAIT_SECONDS", 0.05)
-    filler = _container_id("filler_a")
-    first_sweep = registry.begin([filler])
-    registry.end([filler], registry.begin([filler]), removed=[])
-    if first != "stuck":
-        removed = [filler] if first == "acknowledged" else []
-        asyncio.get_running_loop().call_later(0.01, lambda: registry.end([filler], first_sweep, removed=removed))
-
-    assert await registry.removed_by_us(filler) is (first == "acknowledged")
-    assert registry.maybe_removed_by_us(filler) is (first == "stuck")
+    assert registry.sent_rm_for(first) and registry.sent_rm_for(third)
+    assert not registry.sent_rm_for(second) and not registry.sent_rm_for(None) and not registry.sent_rm_for("")
 
 
 @pytest.mark.asyncio
@@ -839,3 +765,28 @@ async def test_a_kill_during_jupyter_setup_is_killed_during_bootstrap(svc, monke
     assert "during jupyter_setup" in result.detail
     # the backend reads Docker's "is not running" as the renter's image exiting, not a kill on the node
     assert "is not running" not in result.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("after", "cause"), [("sigkill", "killed"), ("gone", "removed")])
+async def test_a_silent_kill_during_jupyter_setup_is_killed_during_bootstrap(svc, monkeypatch, caplog, after, cause):
+    """run_jupyter's last exec does not check its exit status, so a kill mid-exec returns normally: the
+    State read after it still names the kill instead of a ContainerCreated for a dead pod."""
+    api = FakeApiClient()
+    api.container_states = [_RUNNING, _SIGKILLED if after == "sigkill" else _RUNNING]
+    _bootstrapping_create(svc, monkeypatch, api, skip_ssh_bootstrap=True)
+    if after == "gone":
+        _gone_at_inspect(api, 2)
+    monkeypatch.setattr(
+        svc, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001), (8889, 20002, 20002)], (8889, 20002)))
+    )
+    monkeypatch.setattr(svc, "run_jupyter", AsyncMock(return_value=None))
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload(enable_jupyter=True))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+    svc.run_jupyter.assert_awaited_once()
+    (logged,) = _events(caplog)
+    assert logged["bootstrap_step"] == "jupyter_setup" and logged["cause"] == cause

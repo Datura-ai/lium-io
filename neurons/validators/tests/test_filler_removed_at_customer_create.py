@@ -160,9 +160,8 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
 
 
 @pytest.mark.asyncio
-async def test_a_filler_that_survives_the_removal_is_not_recorded_as_removed_by_our_sweep(
-    docker_service, retry_ssh_mock
-):
+async def test_a_filler_that_survives_the_removal_is_still_recorded_as_ours(docker_service, retry_ssh_mock):
+    # its `rm` can still finish after the confirmation listed it, so the listing does not undo it
     stuck_id, gone_id, target_id = "a" * 64, "b" * 64, "c" * 64
     ssh_client = _host(
         [
@@ -170,13 +169,6 @@ async def test_a_filler_that_survives_the_removal_is_not_recorded_as_removed_by_
             _listing("filler_stuck\n"),
         ]
     )
-
-    async def rm(_ssh, command, _tag, stdout_sink=None, **_kwargs):
-        # dockerd prints every ID back, the stuck one too; the confirmation listing still has it
-        if stdout_sink is not None:  # the volume rm passes none
-            stdout_sink.append("\n".join(command.split()[3:]) + "\n")
-
-    retry_ssh_mock.side_effect = rm
 
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
@@ -186,9 +178,7 @@ async def test_a_filler_that_survives_the_removal_is_not_recorded_as_removed_by_
         remove_every_filler=True,
     )
 
-    assert not await own_sweep_removals.removed_by_us(stuck_id)
-    assert await own_sweep_removals.removed_by_us(gone_id)
-    assert await own_sweep_removals.removed_by_us(target_id)
+    assert all(own_sweep_removals.sent_rm_for(i) for i in (stuck_id, gone_id, target_id))
 
 
 @pytest.mark.asyncio
