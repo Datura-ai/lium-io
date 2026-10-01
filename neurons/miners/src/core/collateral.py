@@ -875,8 +875,8 @@ class CollateralClient:
             if requests is not None:
                 return requests
         raise CollateralTransactionError(
-            f"The RPC answered the open reclaim requests from blocks that are not on the finalized chain "
-            f"{RECLAIM_LIST_ATTEMPTS} times; run this again"
+            f"The RPC answered the open reclaim requests from blocks that are not on the finalized chain, or with no "
+            f"logs for a block that may hold one, {RECLAIM_LIST_ATTEMPTS} times; run this again"
         )
 
     async def _reclaim_at_block_hash(self, reclaim_request_id: int, block_hash) -> tuple:
@@ -891,7 +891,8 @@ class CollateralClient:
         return tuple(self.w3.codec.decode(outputs, result))
 
     async def _reclaim_events_at(self, finalized) -> list[ReclaimRequest] | None:
-        """The open requests at the finalized block, or None when a block or log is not on its chain.
+        """The open requests at the finalized block, or None when a block or log is not on its chain, or a block whose
+        bloom may hold the event is answered with no logs.
 
         A range eth_getLogs can reach a lagging backend whose empty answer looks like no request. So the logs are
         read by block hash, which a backend answers for that block or refuses, for every block on the finalized
@@ -916,6 +917,11 @@ class CollateralClient:
                 ]
                 answers = await self._read_together(*(("eth_getLogs", [log_filter]) for log_filter in filters))
                 for block, answer in zip(batch, answers):
+                    # A Frontier node answers [] for a block hash it knows but whose receipts it cannot load, so an
+                    # empty answer for a block whose bloom may hold the event is no proof that it holds none. A bloom
+                    # false positive reads the same way; the list then fails instead of answering a guess.
+                    if not answer:
+                        return None
                     if any(log.get("removed") or not same_hash(log["blockHash"], block["hash"]) for log in answer):
                         return None
                     raw_logs.extend(answer)

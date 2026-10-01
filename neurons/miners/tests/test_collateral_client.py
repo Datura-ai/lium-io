@@ -102,7 +102,8 @@ class FakeProvider(AsyncBaseProvider):
         # blocks below this number are pruned: a read of one answers null
         self.oldest_kept = 0
         # who answers each next batch: "b" a backend on fork B, "lagging" one without these blocks, "429" none,
-        # "logs-lagging" a gateway that sends the batch's blocks to A and its logs to a lagging backend
+        # "logs-lagging" a gateway that sends the batch's blocks to A and its logs to a lagging backend,
+        # "logs-empty" one that sends the logs to a backend that knows each block hash and answers it with no logs
         self.batch_backends = []
         self.fork_b_hash = FORK_B
 
@@ -115,8 +116,12 @@ class FakeProvider(AsyncBaseProvider):
             raise aiohttp.ClientResponseError(None, (), status=429, message="Too Many Requests")
         answers = []
         for i, (method, params) in enumerate(requests):
-            if backend == "a" or params[0] == "finalized" or (backend == "logs-lagging" and method != "eth_getLogs"):
+            logs_elsewhere = backend in ("logs-lagging", "logs-empty")
+            if backend == "a" or params[0] == "finalized" or (logs_elsewhere and method != "eth_getLogs"):
                 answer = await self.make_request(method, params)
+            elif backend == "logs-empty":
+                self.requests.append((method, params))
+                answer = {"result": []}
             elif backend == "logs-lagging":
                 self.requests.append((method, params))
                 unknown = {"error": {"code": -32000, "message": "unknown block"}}
@@ -1006,8 +1011,10 @@ def fork_b_log(url="https://fork-b/reclaim"):
         ([], 2 * 10**17, None),
         # review of 7a226f9: the batch's blocks reach A and its logs a lagging backend, which knows no such block
         (["logs-lagging"] * 5, 10**17, None),
+        # review of 12d1599: the logs reach a backend that knows the block's hash but answers it with no logs
+        (["logs-empty"] * 5 * collateral_module.RECLAIM_LIST_ATTEMPTS, 10**17, None),
     ],
-    ids=["b-then-a", "lagging-then-a", "b-every-time", "log-and-state-disagree", "split-empty-logs"],
+    ids=["b-then-a", "lagging-then-a", "b-every-time", "log-and-state-disagree", "split-empty-logs", "known-block-no-logs"],
 )
 async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(backends, amount, urls):
     """A load-balanced RPC answers the finalized block from backend A and other reads from a lagging backend B or
