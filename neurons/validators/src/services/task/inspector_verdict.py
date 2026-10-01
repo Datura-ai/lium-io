@@ -45,8 +45,7 @@ KNOWN_FINDING_KINDS = frozenset(
 )
 # fs.rs / mount.rs kinds: no container, the path is in `command`
 _PATH_SHAPED_KINDS = frozenset({"OverlayFsRead", "OverlayFsWrite", "DockerVolumeMount"})
-# The kinds the sensor's two docker policies emit (`tamper-docker-cli`, `tamper-docker-sock-write`;
-# docker_cli.rs `finding_is_rental_interference`): every `Docker*` kind except the path-shaped
+# The Docker control-plane kinds: every `Docker*` kind except the path-shaped
 # `DockerVolumeMount`. The executor drives a pod's whole life through the Docker API from inside
 # its own container — create, start, `docker cp` for a restore, `docker rm` when the rental ends —
 # so any of these with the executor's ancestry is the platform's, not only the exec.
@@ -54,9 +53,8 @@ _DOCKER_CONTROL_PLANE_KINDS = (
     frozenset(kind for kind in KNOWN_FINDING_KINDS if kind.startswith("Docker")) - _PATH_SHAPED_KINDS
 )
 RENTAL_VOLUME_TAG = "rental_volume"
-# the renter's pod-log entry carries at most this many evidence hashes; the finding count is the
-# sensor's to choose (21,694 OverlayFsRead in one day, 8 Sep), the full list stays in the
-# inspector event's `context.verdict`
+# the renter's pod-log entry carries at most this many evidence hashes; the finding count is
+# unbounded, the full list stays in the inspector event's `context.verdict`
 _RENTER_EVIDENCE_MAX = 20
 UNKNOWN_KIND = "unknown"
 _PAYLOAD_PREVIEW_CHARS = 160

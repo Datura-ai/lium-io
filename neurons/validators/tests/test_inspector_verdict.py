@@ -185,7 +185,7 @@ def _path_finding(kind: str, path: str) -> dict:
     ],
 )
 def test_a_read_of_the_pods_volume_names_the_pod_and_only_that_pod(kind, path):
-    # the 8 Sep class-D shape: tamper-fs on the pod's volume data, container unset
+    # a path-shaped finding on the pod's volume data, container unset
     verdict = build_verdict({}, [_path_finding(kind, path)], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
 
     assert verdict.affected_pod_ids == [POD]

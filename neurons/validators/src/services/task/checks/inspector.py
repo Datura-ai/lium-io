@@ -250,7 +250,7 @@ class InspectorRentedCheck:
         )
         if acts:
             # The renter hears about it only when the verdict acts: in shadow mode the
-            # classifier is still being measured against the sensor's false positives, and a
+            # classifier is still being measured, and a
             # "the provider read your pod" event on a wrong call cannot be taken back.
             await _tell_renters(ctx, verdict, when=event.when.isoformat())
         updates: dict[str, Any] = {
