@@ -896,6 +896,10 @@ class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
 
+class AuthorizedKeysWriteFailed(RuntimeError):
+    """The volume setup exec mounted the encrypted volume but could not write the renter's keys."""
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -3692,7 +3696,8 @@ class DockerService:
                     }),
                 )
             )
-            raise RuntimeError(
+            error_class = AuthorizedKeysWriteFailed if step == "add_public_keys" else RuntimeError
+            raise error_class(
                 f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})"
             )
 
@@ -3733,7 +3738,8 @@ class DockerService:
                     plaintext_path,
                     setup_script_path=setup_script_path,
                     passfile_path=passfile_path,
-                    setup_script_size=len(setup_script.encode("ascii")),
+                    # asyncssh sends a str input as UTF-8; a template path may be non-ASCII
+                    setup_script_size=len(setup_script.encode("utf-8")),
                     with_authorized_keys=bool(authorized_keys),
                 )
             )
@@ -7048,19 +7054,24 @@ class DockerService:
                 # the keys ride in the encrypted volume setup exec, unless a restore must write
                 # /root between the mount and the keys
                 keys_in_volume_setup = use_encrypted_volume and not payload.bootstrap_restore
+                keys_write_failure: AuthorizedKeysWriteFailed | None = None
                 try:
                     if use_encrypted_volume:
                         current_step = "encrypted_volume_setup"
-                        await self.setup_encrypted_local_volume(
-                            ssh_client=ssh_client,
-                            container_name=container_name,
-                            plaintext_path=local_volume_path,
-                            volume_name=local_volume,
-                            pod_id=payload.pod_id,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                            authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
-                        )
+                        try:
+                            await self.setup_encrypted_local_volume(
+                                ssh_client=ssh_client,
+                                container_name=container_name,
+                                plaintext_path=local_volume_path,
+                                volume_name=local_volume,
+                                pod_id=payload.pod_id,
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                                authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
+                            )
+                        except AuthorizedKeysWriteFailed as exc:
+                            # the mount is up: fail at add_public_keys below, as a separate keys exec did
+                            keys_write_failure = exc
                         volume_encryption_status = VolumeEncryptionStatus.ENABLED
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
@@ -7094,6 +7105,8 @@ class DockerService:
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
                     try:
+                        if keys_write_failure:
+                            raise keys_write_failure
                         if not keys_in_volume_setup:
                             await self.add_ssh_public_keys_with_rental_docker(
                                 docker_client=docker_client,
