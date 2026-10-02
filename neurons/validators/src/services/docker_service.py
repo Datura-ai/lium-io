@@ -433,7 +433,7 @@ _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
 # (30 s); a probe slower than this is a hung host, and the per-command path takes over.
 _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
-# LIUM-93: a forced rm of a few containers takes about a second; a hung dockerd must fail the
+# DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
 
@@ -595,7 +595,7 @@ class ContainerCleanupReport:
 
 
 def _remove_and_list_containers_command(container_names: list[str], volume_names: list[str]) -> str:
-    """One shell line for a customer create's removal (LIUM-93): `docker rm -fv`, its exit status,
+    """One shell line for a customer create's removal (DAH-3980): `docker rm -fv`, its exit status,
     the `docker ps -a` names left after it, that listing's exit status, then `docker volume rm` of
     the unprotected volumes, if any. Every output line is tagged so the parser never guesses."""
     names = " ".join(shlex.quote(name) for name in container_names)
@@ -609,7 +609,17 @@ def _remove_and_list_containers_command(container_names: list[str], volume_names
     return command
 
 
-def _parse_remove_and_list_containers(stdout: str) -> tuple[int | None, list[str] | None]:
+class CustomerContainerRemoval(NamedTuple):
+    first_rm_exited_zero: bool
+    container_names_after_rm: list[str] | None
+
+
+class RemoveAndListContainersOutput(NamedTuple):
+    rm_exit_status: int | None
+    container_names_after_rm: list[str] | None
+
+
+def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOutput:
     """(rm exit status, names listed after the rm). The status is None when its line is missing,
     repeated or not a number; the names are None unless the listing exited 0 -- an untagged line
     makes both None, so an ambiguous output never reads as a clean removal."""
@@ -626,9 +636,9 @@ def _parse_remove_and_list_containers(stdout: str) -> tuple[int | None, list[str
             if value:
                 names.append(value)
         else:
-            return None, None
+            return RemoveAndListContainersOutput(None, None)
     rm_exit_status = int(rm_statuses[0]) if len(rm_statuses) == 1 and rm_statuses[0].isdigit() else None
-    return rm_exit_status, names if ps_statuses == ["0"] else None
+    return RemoveAndListContainersOutput(rm_exit_status, names if ps_statuses == ["0"] else None)
 
 
 def _volume_host_probe_command(*, with_df: bool) -> str:
@@ -2836,9 +2846,7 @@ class DockerService:
 
     @staticmethod
     async def _remove_volumes(ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]) -> None:
-        volumes = " ".join(shlex.quote(volume) for volume in volume_names)
-        command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
-        await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+        await retry_ssh_command(ssh_client, DockerCommand.volume_remove(*volume_names), 'clean_existing_containers')
 
     async def _remove_stale_containers(
         self,
@@ -2921,11 +2929,10 @@ class DockerService:
         default_extra: dict,
         stale_containers: list[str],
         volumes_to_remove: list[str],
-    ) -> tuple[bool, list[str] | None]:
+    ) -> CustomerContainerRemoval:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
-        Returns (that one attempt exited 0, the `docker ps -a` names read after the last rm, or None).
 
-        LIUM-93: the rm, the listing and the volume rm travel as one command, bounded by
+        DAH-3980: the rm, the listing and the volume rm travel as one command, bounded by
         _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS; a timeout fails the create at the cleanup step.
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
@@ -2935,14 +2942,14 @@ class DockerService:
         """
         command = _remove_and_list_containers_command(stale_containers, volumes_to_remove)
         started = time.monotonic()
+        timeout_error: TimeoutError | None = None
         try:
             result = await ssh_client.run(
                 command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
             )
         except TimeoutError as exc:
-            raise Exception(
-                f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
-            ) from exc
+            timeout_error = exc
+            rm_exit_status, names_after = None, None
         except Exception as exc:
             rm_error: Exception = exc
             rm_exit_status, names_after = None, None
@@ -2964,8 +2971,12 @@ class DockerService:
                 }),
             )
         )
+        if timeout_error is not None:
+            raise Exception(
+                f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from timeout_error
         if rm_exit_status == 0:
-            return True, names_after
+            return CustomerContainerRemoval(True, names_after)
 
         if names_after is None:
             names_after = await self._list_all_container_names(ssh_client)
@@ -2992,7 +3003,7 @@ class DockerService:
             names_after = await self._list_all_container_names(ssh_client)
         if volumes_to_remove:
             await self._remove_volumes(ssh_client, volumes_to_remove)
-        return False, names_after
+        return CustomerContainerRemoval(False, names_after)
 
     @staticmethod
     async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
@@ -3030,7 +3041,7 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
-        caller passes it only while nothing but the fillers it was adjusted for (LIUM-90) has been
+        caller passes it only while nothing but the fillers it was adjusted for has been
         removed since the probe ran.
         """
         skip_set = {name for name in (skip_volume_names or []) if name}
@@ -6521,21 +6532,19 @@ class DockerService:
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                     report=cleanup_report,
                 )
-                # LIUM-90: removing only fillers (confirmed gone, their volumes left to the backend's
+                # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, and frees
                 # disk, so the probes stay: the early df can only read less free space than there is.
                 removed_only_fillers_cleanly = (
                     cleanup_report.removed_cleanly_without_volume_rm
                     and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in removed_containers)
                 )
-                if removed_containers:
-                    docker_listing_probe = (
-                        docker_listing_probe.without_containers(
-                            removed_containers,
-                            [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
-                        )
-                        if removed_only_fillers_cleanly and docker_listing_probe is not None
-                        else None
+                if removed_containers and not removed_only_fillers_cleanly:
+                    docker_listing_probe = None
+                elif removed_containers and docker_listing_probe is not None:
+                    docker_listing_probe = docker_listing_probe.without_containers(
+                        removed_containers,
+                        [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
                     )
 
                 removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(

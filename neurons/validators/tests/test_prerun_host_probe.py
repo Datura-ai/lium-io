@@ -16,9 +16,9 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
   removal commands as the per-command path for the same host facts; a failed section falls back;
 - `create_container`: flag off → never probes; flag on → one probe handed to every consumer; the
   docker listings are withdrawn after a removal; the last-resort power raise never reads the probe;
-- LIUM-90: a customer create that removed only a filler, cleanly, keeps every probe and relists
+- a customer create that removed only a filler, cleanly, keeps every probe and relists
   nothing; any other removal, a survivor or a failed rm relists as before;
-- LIUM-93: that removal and its confirmation are the create's one host command; a removal that
+- that removal and its confirmation are the create's one host command; a removal that
   times out fails the create at the cleanup step.
 """
 
@@ -1222,7 +1222,7 @@ def _wire_customer_create_over_the_host(
     ps_after_rm: str = "",
     docker_rm_raises: Exception | None = None,
 ) -> AsyncMock:
-    """LIUM-90: both early probes on; the cleanup, the sweeps and the port-check wait are the real
+    """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it."""
     monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
     monkeypatch.setattr(settings, "RENTAL_VOLUME_FAST_PATH_ENABLED", True)
@@ -1232,7 +1232,7 @@ def _wire_customer_create_over_the_host(
         if cmd.startswith("/usr/bin/docker rm -fv"):
             if docker_rm_raises is not None:
                 raise docker_rm_raises
-            # LIUM-93: the removal command reports the rm's status and the names left after it
+            # the removal command reports the rm's status and the names left after it
             names_after = "".join(f"NAME\t{name}\n" for name in ps_after_rm.split())
             return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t0\n")
         if cmd == DOCKER_PS_ALL_NAMES_CMD:
@@ -1274,7 +1274,7 @@ def _relisting_commands(ssh_client) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc_fixture, monkeypatch):
-    """LIUM-90: the filler's removal is the only host change; nothing is listed or probed again."""
+    """The filler's removal is the only host change; nothing is listed or probed again."""
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
         svc, monkeypatch, probe=_probe_with_containers("filler_x")
@@ -1285,7 +1285,7 @@ async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # LIUM-93: the rm and its confirming listing are the one host command of the whole create
+    # the rm and its confirming listing are the one host command of the whole create
     assert _cmds(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
     assert _relisting_commands(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
@@ -1332,7 +1332,7 @@ async def test_customer_create_relists_after_any_other_removal(
 async def test_customer_create_without_a_filler_runs_the_same_commands_as_before(
     svc_fixture, monkeypatch
 ):
-    """LIUM-90 changes nothing when the cleanup removes nothing (the list is the one before it)."""
+    """Keeping the probes changes nothing when the cleanup removes nothing (the list is the one before it)."""
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
         svc, monkeypatch, probe=_probe_with_containers("pod_keep")
@@ -1352,7 +1352,7 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
 async def test_customer_create_whose_filler_removal_times_out_fails_at_the_cleanup_step(
     svc_fixture, monkeypatch
 ):
-    """LIUM-93: a hung dockerd fails the create where a failed cleanup does, never hangs it."""
+    """A hung dockerd fails the create where a failed cleanup does, never hangs it."""
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
         svc,

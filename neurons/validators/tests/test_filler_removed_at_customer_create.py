@@ -8,7 +8,7 @@ a CUSTOMER_RENTAL create treats every `filler_*` as stale whatever the list says
 still lists one), re-reads `docker ps -a` after the removal, and writes the typed event
 `FILLER_STILL_RUNNING` for a name that survived — the create goes on, the event makes it countable.
 A FILLER create keeps protecting its listed sibling bundles (DAH-2465).
-LIUM-93: the customer's rm, that re-read and the unprotected volumes' rm are one bounded SSH command.
+DAH-3980: the customer's rm, that re-read and the unprotected volumes' rm are one bounded SSH command.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ async def test_rm_failure_on_a_filler_create_still_raises(docker_service, retry_
 
 
 def _removal(*names_after: str, rm_exit: int = 0, ps_exit: int = 0, stderr: str = ""):
-    # LIUM-93: what the one removal command prints: the rm's status, the names left, the listing's status
+    # what the one removal command prints: the rm's status, the names left, the listing's status
     listed = "".join(f"NAME\t{name}\n" for name in names_after)
     return _listing(f"RM\t{rm_exit}\n{listed}PS\t{ps_exit}\n", stderr=stderr)
 
@@ -403,6 +403,28 @@ async def test_a_removal_that_times_out_fails_the_cleanup(docker_service, retry_
     # a hung dockerd is not asked again
     assert ssh_client.run.await_count == 2
     retry_ssh_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_removal_that_times_out_still_logs_its_duration(docker_service, retry_ssh_mock, caplog):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _listing("pod_target\nfiller_x\n"),
+            asyncssh.TimeoutError(None, None, None, None, None, None, "", ""),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO), pytest.raises(Exception, match="did not finish"):
+        await _clean_for_customer(docker_service, ssh_client)
+
+    [removal_log] = [
+        record.msg
+        for record in caplog.records
+        if getattr(record.msg, "message", None) == "customer_container_removal"
+    ]
+    assert "removal_ms" in removal_log.extra
+    assert removal_log.extra["listing_read"] is False
 
 
 _DOCKER_STUB = """#!/bin/sh
