@@ -5873,6 +5873,7 @@ class DockerService:
             # Keep this immediately before the guard; the broad except uses it as failure_step.
             require_rental_docker_ssh_host_key(executor_info)
 
+            has_credentials = bool(payload.docker_username and payload.docker_password)
             current_step = "ssh_connect"
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
@@ -5886,7 +5887,9 @@ class DockerService:
                 # DAH-3980: the registry digest a present image is checked against (DAH-3873), asked
                 # from here while the SSH connects; the host's daemon took ~2 s for the same answer
                 docker_hub_digest_lookup: asyncio.Task[str | None] | None = None
-                if not is_custom_build:
+                # with credentials the image is usually private: an anonymous lookup only gets a 401,
+                # and the daemon path below asks the registry with the rent's credentials
+                if not is_custom_build and not has_credentials:
                     docker_hub_digest_lookup = asyncio.create_task(fetch_docker_hub_digest(payload.docker_image))
                     # a failed connect or an early return must not leave the lookup running
                     connections.callback(docker_hub_digest_lookup.cancel)
@@ -5940,7 +5943,6 @@ class DockerService:
                 # for a default image that still had to be pulled: that pull went anonymous, into
                 # Docker Hub's unauthenticated rate limit, while the credentials sat unused. A custom
                 # build has no image to probe and keeps the login it always had.
-                has_credentials = bool(payload.docker_username and payload.docker_password)
                 image_present = False
                 if not is_custom_build:
                     current_step = "docker_image_inspect"
@@ -5965,8 +5967,12 @@ class DockerService:
                     # DAH-3873: a mutable tag (`:prod`) on the host can be an old build. Pull when the
                     # registry tag moved. When the registry does not answer, use the local image.
                     if not image_present:
-                        docker_hub_digest_lookup.cancel()
-                    elif (docker_hub_digest := await docker_hub_digest_lookup) is not None:
+                        if docker_hub_digest_lookup is not None:
+                            docker_hub_digest_lookup.cancel()
+                    elif (
+                        docker_hub_digest_lookup is not None
+                        and (docker_hub_digest := await docker_hub_digest_lookup) is not None
+                    ):
                         image_present = any(
                             repo_digest.endswith(f"@{docker_hub_digest}")
                             for repo_digest in local_repo_digests

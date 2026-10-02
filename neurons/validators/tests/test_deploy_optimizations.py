@@ -375,6 +375,49 @@ async def test_daemon_checks_the_registry_when_docker_hub_gives_no_digest(svc, m
 
 
 @pytest.mark.asyncio
+async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path
+):
+    """The success path the bench measured: one lookup, one inspect, no daemon registry check."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
+    no_docker_hub_digest_on_rent_path.return_value = "sha256:current"
+
+    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
+    assert _docker_client(svc).image_exists_calls == ["daturaai/pytorch:prod"]
+    assert _docker_client(svc).freshness_calls == []
+    assert _docker_client(svc).login_calls == []
+    assert _pulled_images(svc) == []
+    assert _ssh_run_cmds(ssh_client) == [
+        '/usr/bin/docker volume ls --format "{{.Name}}"',
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
+        "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+    ]
+    assert _exec_argv_texts(svc) == ["sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"]
+
+
+@pytest.mark.asyncio
+async def test_a_rent_with_registry_credentials_skips_the_anonymous_docker_hub_lookup(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path
+):
+    """An anonymous lookup of a private image only gets a 401; the daemon asks with the rent's credentials."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    result = await _run(svc, _payload(docker_image="private/repo:prod", **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_not_called()
+    assert _docker_client(svc).freshness_calls == [
+        {"image": "private/repo:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_inspect_probe_uses_sdk_data_not_host_shell(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
