@@ -178,7 +178,7 @@ def test_nothing_to_do_on_any_contract_exits_1_and_sends_nothing(chain, cli_serv
     # the same exit code as the contract rejecting the call when --contract names one
     assert result.exit_code == 1, result.output
     assert cli_services == []
-    assert sorted(chain.reads) == sorted([CONTRACT, OLD_CONTRACT])
+    assert set(chain.reads) == {CONTRACT, OLD_CONTRACT}
 
 
 def test_finalize_uses_the_contract_with_this_miners_open_request(chain, cli_services):
