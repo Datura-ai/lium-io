@@ -384,7 +384,11 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
     no_docker_hub_digest_on_rent_path.return_value = "sha256:current"
 
-    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+    payload = _payload(docker_image="daturaai/pytorch:prod")
+
+    result = await _run(svc, payload)
+    # the inspector start runs after the reply
+    await ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
 
     assert isinstance(result, ContainerCreated)
     no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
@@ -681,11 +685,11 @@ async def test_summary_emitted_on_success(svc, monkeypatch):
     assert isinstance(extra["total_duration_ms"], int)
     names = {s["name"] for s in extra["profile_steps"]}
     assert "Docker pull step finished" in names
-    assert "Inspector collector start step finished" in names
+    assert "Inspector collector start runs after the reply" in names
     assert "Finished in subnet." in names
     inspector = next(
         s for s in extra["profile_steps"]
-        if s["name"] == "Inspector collector start step finished"
+        if s["name"] == "Inspector collector start runs after the reply"
     )
     assert inspector["skipped"] is True
 
