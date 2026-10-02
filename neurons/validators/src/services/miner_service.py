@@ -2382,7 +2382,17 @@ class MinerService:
     async def _log_ssh_key_removal_after_reply(self, remove_ssh_key: Awaitable[bool], log_extra: dict) -> None:
         # the removal logs its own failure; this line puts it after the reply in the log
         started_ms = now_ms()
-        ssh_key_removed = await remove_ssh_key
+        try:
+            ssh_key_removed = await remove_ssh_key
+        except asyncio.CancelledError:
+            # a delete's wait for the steps after the reply timed out, or the connector stops
+            logger.warning(
+                _m(
+                    "Validator SSH key removal after reply cancelled; the key may stay at the miner",
+                    extra=get_extra_info({**log_extra, "duration_ms": now_ms() - started_ms}),
+                )
+            )
+            raise
         logger.info(
             _m(
                 "Validator SSH key removal after reply finished",
