@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shlex
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
@@ -9,9 +10,13 @@ from typing import Any, Literal
 from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
+from .rented_gpu_drop import RentedGpuDropCheck
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
+
+logger = logging.getLogger(__name__)
 
 # DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
 # binary. Above a full scrape (~15 s on a real box, so a payload that will not decrypt is only
@@ -175,6 +180,36 @@ def _classify_scrape_failure(
     return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
 
 
+def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -> dict[str, Any]:
+    """The specs a `no_gpu_details` report carries, in the key shape a successful scrape has."""
+    report = _scrape_error_report(stdout) or {}
+    data = report.get("data")
+    if not isinstance(data, dict):
+        return {"gpu": {}}
+    specs = _update_keys(_deobfuscate(data, obfuscation_keys), ORIGINAL_KEYS)
+    return specs if isinstance(specs.get("gpu"), dict) else {**specs, "gpu": {}}
+
+
+async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
+    # A scrape that lists no GPU (card 0 lost, the only card lost, the driver down) fails here, and
+    # this check is fatal, so RentedGpuDropCheck never runs on that cycle: hand it the empty scrape.
+    gpu = specs["gpu"]
+    count = gpu.get("count")
+    state = replace(
+        ctx.state,
+        specs=specs,
+        gpu_count=count if isinstance(count, int) else 0,
+        gpu_details=[],
+    )
+    try:
+        await RentedGpuDropCheck().run(ctx.model_copy(update={"state": state}))
+    except Exception:
+        logger.warning(
+            _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),
+            exc_info=True,
+        )
+
+
 @dataclass(frozen=True)
 class StdinAttempt:
     """Why the stdin delivery failed, carried into the event of the binary retry.
@@ -258,7 +293,7 @@ class MachineSpecScrapeCheck:
             retryable=False,
             stdin_text=ctx.config.machine_scrape_source,
         )
-        result = self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
+        result = await self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
         if result.passed:
             return result
 
@@ -305,7 +340,7 @@ class MachineSpecScrapeCheck:
             timeout=timeout,
             retryable=False,
         )
-        return self._check_result_from_scrape_run(
+        return await self._check_result_from_scrape_run(
             ctx, scrape_run, delivery="upload", fallback_from=fallback_from
         )
 
@@ -333,9 +368,9 @@ class MachineSpecScrapeCheck:
         scrape_run = await ctx.runner.run(
             _binary_command(remote_dir, script_filename), timeout=timeout, retryable=False
         )
-        return self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
+        return await self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
 
-    def _check_result_from_scrape_run(
+    async def _check_result_from_scrape_run(
         self,
         ctx: Context,
         scrape_run: SSHCommandResult,
@@ -349,6 +384,10 @@ class MachineSpecScrapeCheck:
 
         if not scrape_run.success or not scrape_run.stdout.strip():
             failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            if failure.scrape_error == "no_gpu_details":
+                await _report_rented_gpu_loss(
+                    ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)
+                )
             event = render_message(
                 failure.template,
                 ctx=ctx,

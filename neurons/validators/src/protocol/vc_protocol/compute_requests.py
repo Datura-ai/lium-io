@@ -323,6 +323,20 @@ class PodSshUnreachableResponse(BaseModel):
 SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED = "notify_failed"
 
 
+class RentedGpuDropResponse(BaseModel):
+    # False when nothing was written: the backend's flag is off, the pod is not in an open rental,
+    # or a recovery named no open incident.
+    recorded: bool
+    # "notified" (every due notice went out), "recorded" (the incident was already known and told),
+    # "notify_failed" (a notice was refused; report again next cycle), "disabled" (the platform side
+    # has the alert switched off; nothing written), "not_rented" (no open rental).
+    delivery: str | None = None
+
+
+GPU_DROP_DELIVERY_DISABLED = "disabled"
+GPU_DROP_DELIVERY_NOT_RENTED = "not_rented"
+
+
 class VerificationStartedResponse(BaseModel):
     """Ack for DAH-3019 `verification-started` (one request per miner): how many of the batch's
     executors the backend stored the run start for, so the provider portal can show which step
