@@ -1032,7 +1032,7 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
     assert reclaim[2] == 10**17
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000)}]
+    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}]
 
 
 FORK_B = "0x" + "0b" * 32
@@ -1096,7 +1096,7 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
 
     assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
+    assert details and all(block == {"blockHash": provider.chain_hash(5000), "requireCanonical": True} for _, block in details)
 
 
 async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_requests():
@@ -1161,7 +1161,7 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
     numbers = [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"]
     assert numbers[0] == "finalized" and max(int(number, 16) for number in numbers[1:]) == 4999
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockHash": provider.chain_hash(5000)} for _, block in details)
+    assert details and all(block == {"blockHash": provider.chain_hash(5000), "requireCanonical": True} for _, block in details)
 
 
 async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():

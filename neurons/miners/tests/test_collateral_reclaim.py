@@ -306,8 +306,32 @@ async def test_remove_executor_reads_every_contract_at_one_block(chain):
     chain.collateral_at[LATEST_HASH] = {OLD_CONTRACT: "0.01"}
     chain.after_collateral_read = lambda: chain.collateral.update({CONTRACT: "0.01", OLD_CONTRACT: "0"})
 
-    assert await versions_holding_collateral(EXECUTOR) == ["1.0.0"]
-    assert chain.collateral_blocks == [LATEST_HASH, LATEST_HASH]
+    assert await versions_holding_collateral(EXECUTOR) == ["1.0.2", "1.0.0"]
+    assert chain.collateral_blocks == [LATEST_HASH, None, LATEST_HASH, None]
+
+    deleted = []
+    service = CliService.__new__(CliService)
+    service.logger = logging.getLogger("test")
+    service.executor_dao = SimpleNamespace(
+        find_one=lambda address, port: SimpleNamespace(uuid=UUID(EXECUTOR)),
+        delete_by_address_port=lambda address, port: deleted.append((address, port)),
+    )
+    assert await service.remove_executor("192.0.2.10", 8001) is False
+    assert deleted == []
+
+
+async def test_remove_executor_refuses_when_only_the_latest_read_sees_a_deposit(chain):
+    """Review 5394742345 at 4ac762f: a backend that does not know the pinned hash can answer from another state
+    with no deposit on either contract, while `latest` shows the current contract's deposit."""
+    import logging
+
+    from core.utils import versions_holding_collateral
+    from services.cli_service import CliService
+
+    chain.collateral = {CONTRACT: "0.01"}
+    chain.collateral_at[LATEST_HASH] = {}
+
+    assert await versions_holding_collateral(EXECUTOR) == ["1.0.2"]
 
     deleted = []
     service = CliService.__new__(CliService)

@@ -4,10 +4,15 @@ score effect."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.services.task.checks import CollateralStatusCheck
 from neurons.validators.src.services.task.result_handler import ResultHandler
@@ -258,3 +263,87 @@ async def test_the_check_puts_the_contract_answer_in_the_published_job_result(
     )
     assert job.collateral_deposited is expected
     assert (job.score, job.job_score) == (1.0, 1.0)
+
+
+@contextlib.asynccontextmanager
+async def _rpc_server(monkeypatch, handler):
+    app = web.Application()
+    app.router.add_post("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(settings, "SUBTENSOR_EVM_RPC_URL", f"http://127.0.0.1:{port}/")
+    try:
+        yield
+    finally:
+        await runner.cleanup()
+
+
+def _http_reader():
+    return CollateralStatusReader(evm_address_for_hotkey=lambda _hotkey: MINER_EVM, clock=Clock())
+
+
+@pytest.mark.asyncio
+async def test_the_rpc_answer_is_read_over_http_and_decoded(monkeypatch):
+    fake = FakeRpc(MINER_EVM, Decimal(9))
+
+    async def handler(request):
+        return web.Response(body=json.dumps(await fake(await request.json())), content_type="application/json")
+
+    async with _rpc_server(monkeypatch, handler):
+        status, _ = await _status(_http_reader())
+
+    assert (status.deposited, status.read_failed) == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_an_rpc_answer_over_the_size_cap_is_a_failed_read_and_is_not_buffered(monkeypatch):
+    """Review comment 4168134745 at 4ac762f: a broken or hostile RPC can answer a body of any size inside the
+    timeout. This one streams valid JSON with no end; the read stops one byte past the cap."""
+
+    async def handler(request):
+        response = web.StreamResponse()
+        await response.prepare(request)
+        await response.write(b'[{"jsonrpc": "2.0", "id": 0, "result": {"hash": "' + BLOCK_HASH.encode() + b'", "pad": "')
+        try:
+            for _ in range(1024):
+                await response.write(b"x" * 64 * 1024)
+        except (ConnectionError, RuntimeError):
+            pass
+        return response
+
+    async with _rpc_server(monkeypatch, handler):
+        with pytest.raises(ValueError, match="longer than"):
+            await collateral_status._post_batch([{"jsonrpc": "2.0", "id": 0, "method": "eth_blockNumber"}])
+        status, cached = await _status(_http_reader())
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    assert status.error_message == "Collateral read failed: ValueError"
+
+
+@pytest.mark.asyncio
+async def test_a_slow_drip_rpc_answer_is_cut_at_the_timeout(monkeypatch):
+    monkeypatch.setattr(settings, "COLLATERAL_STATUS_TIMEOUT_SECONDS", 0.5)
+
+    async def handler(request):
+        response = web.StreamResponse()
+        await response.prepare(request)
+        try:
+            await response.write(b"[")
+            for _ in range(100):
+                await asyncio.sleep(0.1)
+                await response.write(b" ")
+        except (ConnectionError, RuntimeError):
+            pass
+        return response
+
+    async with _rpc_server(monkeypatch, handler):
+        started = time.monotonic()
+        status, _ = await _status(_http_reader())
+        elapsed = time.monotonic() - started
+
+    assert (status.deposited, status.read_failed) == (False, True)
+    assert "TimeoutError" in status.error_message
+    assert elapsed < 3

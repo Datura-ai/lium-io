@@ -900,10 +900,11 @@ class CollateralClient:
 
     async def _call_at_block_hash(self, function, block_hash):
         """A view function's result at a block named by its hash. A contract function's call(block_identifier=<hash>)
-        looks the hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash."""
+        looks the hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash.
+        requireCanonical: a backend that does not have the block refuses instead of answering from another state."""
         result = await self.w3.eth.call(
             {"to": self.contract_address, "data": function._encode_transaction_data()},
-            block_identifier={"blockHash": AsyncWeb3.to_hex(block_hash)},
+            block_identifier={"blockHash": AsyncWeb3.to_hex(block_hash), "requireCanonical": True},
         )
         outputs = [output["type"] for output in function.abi["outputs"]]
         decoded = self.w3.codec.decode(outputs, result)

@@ -14,6 +14,7 @@ reports the last answer for that executor when there is one.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -35,6 +36,11 @@ EXECUTOR_TO_MINER_SELECTOR = "f44e1119"  # executorToMiner(bytes16) -> address
 COLLATERALS_SELECTOR = "fdda13a1"  # collaterals(bytes16) -> uint256
 
 WEI_PER_TAO = Decimal(10) ** 18
+
+# The RPC is peer-controlled, so its answer is read up to this size before anything is decoded. The largest
+# answer is the latest header, which lists one ~70-byte hash per transaction, so this holds a block of over
+# 7,000 transactions; the two eth_call answers are ~200 bytes.
+MAX_RPC_ANSWER_BYTES = 512 * 1024
 
 RpcBatch = Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]]
 
@@ -104,13 +110,28 @@ def _word(result: str) -> str:
     return hex_part[:64]
 
 
+async def _read_bounded(response: aiohttp.ClientResponse, limit: int) -> bytes:
+    """The body up to `limit` bytes; one byte more marks it oversized (the caller checks the length)."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            break
+    return b"".join(chunks)
+
+
 async def _post_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
     url = settings.SUBTENSOR_EVM_RPC_URL or RPC_URLS[settings.BITTENSOR_NETWORK]
     timeout = aiohttp.ClientTimeout(total=settings.COLLATERAL_STATUS_TIMEOUT_SECONDS)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=batch) as response:
             response.raise_for_status()
-            return await response.json(content_type=None)
+            body = await _read_bounded(response, MAX_RPC_ANSWER_BYTES)
+    if len(body) > MAX_RPC_ANSWER_BYTES:
+        raise ValueError(f"JSON-RPC answer longer than {MAX_RPC_ANSWER_BYTES} bytes")
+    return json.loads(body)
 
 
 def _evm_address_for_hotkey(hotkey: str) -> str | None:
