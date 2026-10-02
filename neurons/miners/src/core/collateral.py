@@ -901,11 +901,19 @@ class CollateralClient:
     async def _call_at_block_hash(self, function, block_hash):
         """A view function's result at a block named by its hash. A contract function's call(block_identifier=<hash>)
         looks the hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash.
-        requireCanonical: a backend that does not have the block refuses instead of answering from another state."""
-        result = await self.w3.eth.call(
-            {"to": self.contract_address, "data": function._encode_transaction_data()},
-            block_identifier={"blockHash": AsyncWeb3.to_hex(block_hash), "requireCanonical": True},
+
+        Frontier ignores requireCanonical and answers a hash it does not know from its pending state, so the call
+        goes in one batch with eth_getBlockByHash: the backend that answers the call must also hold the block, and
+        a null block fails the read."""
+        hash_hex = AsyncWeb3.to_hex(block_hash)
+        call = {"to": self.contract_address, "data": function._encode_transaction_data()}
+        block, result = await self._read_together(
+            ("eth_getBlockByHash", [hash_hex, False]),
+            ("eth_call", [call, {"blockHash": hash_hex, "requireCanonical": True}]),
         )
+        if not isinstance(block, dict) or block.get("hash") != hash_hex:
+            raise RpcReadError("the RPC does not have the block the read is pinned to")
+        result = bytes.fromhex(result.removeprefix("0x"))
         outputs = [output["type"] for output in function.abi["outputs"]]
         decoded = self.w3.codec.decode(outputs, result)
         return decoded[0] if len(outputs) == 1 else tuple(decoded)

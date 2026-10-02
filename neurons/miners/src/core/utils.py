@@ -117,8 +117,9 @@ def get_collateral_contract(
 async def versions_holding_collateral(executor_uuid: str) -> list[str]:
     """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor.
 
-    Every contract is read twice: at one latest block named by its hash (requireCanonical, so a backend that does
-    not have that block refuses instead of answering from another state) and at `latest`. A version counts when
+    Every contract is read twice: at one latest block named by its hash, in a batch with that block's header, so a
+    backend that does not have the block fails the read instead of answering from another state (Frontier ignores
+    requireCanonical), and at `latest`. A version counts when
     either read sees collateral, so the answer errs towards "still held": reads at `latest` alone, one after
     another, can straddle a deposit landing on one contract and a reclaim finalizing on the other and report
     neither, and removing the executor then drops the record of collateral that is still held. Latest, not

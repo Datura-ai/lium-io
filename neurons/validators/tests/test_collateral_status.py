@@ -301,7 +301,20 @@ async def test_the_rpc_answer_is_read_over_http_and_decoded(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_rpc_answer_over_the_size_cap_is_a_failed_read_and_is_not_buffered(monkeypatch):
     """Review comment 4168134745 at 4ac762f: a broken or hostile RPC can answer a body of any size inside the
-    timeout. This one streams valid JSON with no end; the read stops one byte past the cap."""
+    timeout. This one streams valid JSON with no end; the read stops one byte past the cap.
+
+    Read b at 0a6fee9: a read-all-then-check client raises the same error, so the bytes the client takes off the
+    socket are counted too. The server offers 64 MiB; the client must stop near the cap."""
+    import aiohttp
+
+    received = []
+    feed_data = aiohttp.StreamReader.feed_data
+
+    def counting_feed_data(self, data, *args, **kwargs):
+        received.append(len(data))
+        return feed_data(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(aiohttp.StreamReader, "feed_data", counting_feed_data)
 
     async def handler(request):
         response = web.StreamResponse()
@@ -317,6 +330,8 @@ async def test_an_rpc_answer_over_the_size_cap_is_a_failed_read_and_is_not_buffe
     async with _rpc_server(monkeypatch, handler):
         with pytest.raises(ValueError, match="longer than"):
             await collateral_status._post_batch([{"jsonrpc": "2.0", "id": 0, "method": "eth_blockNumber"}])
+        # the cap, one chunk past it, and what flow control lets in before the read stops
+        assert 0 < sum(received) <= collateral_status.MAX_RPC_ANSWER_BYTES + 2 * 1024 * 1024
         status, cached = await _status(_http_reader())
 
     assert (status.deposited, status.read_failed, cached) == (False, True, False)

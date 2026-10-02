@@ -1035,6 +1035,18 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
     assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}]
 
 
+async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
+    """Review 5395259575 at 0a6fee9: Frontier ignores requireCanonical and answers a call at an unknown hash from
+    its pending state. The header read in the same batch is null there, so the read fails instead of answering."""
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.block_number = provider.finalized_number = 5000
+    client = client_with(provider)
+
+    with pytest.raises(collateral_module.RpcReadError, match="does not have the block"):
+        await client.get_executor_collateral(EXECUTOR, block_hash="0x" + "ee" * 32)
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=provider.chain_hash(5000)) == Decimal("0.01")
+
+
 FORK_B = "0x" + "0b" * 32
 # the batches of one listing: the headers below the finalized block, then the receipts of the one block with a log
 LIST_BATCHES = collateral_module.RECLAIM_LOOKBACK_BLOCKS // collateral_module.CHAIN_READ_BATCH + 1
