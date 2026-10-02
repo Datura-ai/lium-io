@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -24,6 +25,7 @@ from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
 from .availability import availability_errors, build_ssh_unreachable_event
+from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import TenantEnforcementMessages
 from .models import JobResult
 from .pipeline import PodRecoverer
@@ -116,6 +118,7 @@ class TaskService:
         `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
         (the express lane, DAH-2958). The wave never sets it.
         """
+        task_started_at = time.monotonic()
         attestation_digest = None
         tee_type = None
         attestation_passed = False
@@ -230,6 +233,14 @@ class TaskService:
                 # (success=True, score 0 when the image is OUTDATED).
                 if not success or result.score <= 0:
                     result.failure_reason_code = last_event.reason_code
+                # The liumd shadow is logged only; the result above is final before it starts.
+                if settings.VALIDATOR_LIUMD_SHADOW and not settings.DRY_RUN:
+                    await run_liumd_shadow(
+                        last_context,
+                        ok=ok,
+                        events=events,
+                        deadline_monotonic=shadow_deadline(task_started_at),
+                    )
                 return result
 
         except Exception as e:
