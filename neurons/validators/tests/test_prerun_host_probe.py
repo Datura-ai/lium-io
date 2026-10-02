@@ -1199,3 +1199,59 @@ def svc_fixture():
         redis_service=Mock(),
         attestation_service=Mock(),
     )
+
+
+_PORT_ALLOCATED_REFUSAL = RuntimeError(
+    "Docker SDK run container failed: 500 Server Error: driver failed programming external "
+    "connectivity on endpoint pod_x: Bind for 0.0.0.0:20001 failed: port is already allocated"
+)
+
+
+def _wire_real_docker_run(svc, monkeypatch, *, refusals: int) -> list[str]:
+    """Probe on, the real `docker run` retry; returns the order of port-check waits and runs."""
+    monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
+    monkeypatch.setattr(settings, "PORT_COLLISION_RETRY_ENABLED", False)
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+    monkeypatch.delattr(svc, "_run_rental_docker_create_with_port_retry")  # the real retry loop
+    monkeypatch.setattr(svc, "_remove_failed_rental_container_for_retry", AsyncMock())
+    monkeypatch.setattr("services.docker_service._PORT_ALLOCATED_RETRY_SLEEP_SEC", 0)
+    calls: list[str] = []
+
+    async def port_check_wait(**kwargs) -> tuple[bool, str]:
+        listing = "early" if kwargs.get("probed_container_names") is not None else "live"
+        calls.append(f"port_check_wait:{listing}")
+        return True, "No port check containers found"
+
+    async def run_container(spec) -> None:
+        calls.append("docker_run")
+        if calls.count("docker_run") <= refusals:
+            raise _PORT_ALLOCATED_REFUSAL
+
+    svc.wait_for_port_check_containers = port_check_wait
+    _docker_client(svc).run_container = run_container
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_docker_run_that_succeeds_reads_only_the_early_port_check_listing(svc_fixture, monkeypatch):
+    svc = svc_fixture
+    calls = _wire_real_docker_run(svc, monkeypatch, refusals=0)
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert calls == ["port_check_wait:early", "docker_run"]
+
+
+@pytest.mark.asyncio
+async def test_the_first_port_refusal_reads_the_port_check_listing_live_before_the_retry(
+    svc_fixture, monkeypatch
+):
+    """A port check started after the probe's listing holds a rent port; only a live listing sees it."""
+    svc = svc_fixture
+    calls = _wire_real_docker_run(svc, monkeypatch, refusals=2)
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert calls == ["port_check_wait:early", "docker_run", "port_check_wait:live", "docker_run", "docker_run"]

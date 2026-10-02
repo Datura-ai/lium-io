@@ -1585,6 +1585,7 @@ class DockerService:
         log_tag: str = "container_creation",
         port_maps: list[tuple[int, int, int]] | None = None,
         spare_port_pairs: list[PayloadPortMapping] | None = None,
+        remove_port_checks_listed_live: Callable[[], Awaitable[tuple[bool, str]]] | None = None,
     ) -> None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
@@ -1595,6 +1596,8 @@ class DockerService:
         retried ONCE with the new mapping; `port_maps` is updated in place so the create's answer
         carries the port the pod really got. No free candidate, or a second bind refusal, fails the
         create as `RentalPortCollisionError`. Flag off: the DAH-1991 same-command wait as before.
+
+        `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry.
         """
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
@@ -1633,6 +1636,11 @@ class DockerService:
                         continue
 
                 port_allocation_phrase = _port_allocated_phrase(exc)
+                if port_allocation_phrase and remove_port_checks_listed_live is not None:
+                    # the pre-run wait used the listing taken at SSH connect; a port check started
+                    # since then holds the port and only a live listing sees it
+                    await remove_port_checks_listed_live()
+                    remove_port_checks_listed_live = None
                 if port_allocation_phrase and remapped:
                     # the one retry on the new mapping was refused too: no third candidate
                     error_text = str(exc)
@@ -6742,17 +6750,16 @@ class DockerService:
                 # any residual race. DAH-3980: the listing comes from the pre-run host probe
                 # (saves its own 2 round trips), unless a removal withdrew the probe's listings.
                 current_step = "port_check_wait"
+                probed_port_check_names = (
+                    docker_listing_probe.port_check_container_names if docker_listing_probe is not None else None
+                )
                 wait_ok, wait_msg = await self.wait_for_port_check_containers(
                     executor_info=executor_info,
                     miner_hotkey=payload.miner_hotkey,
                     keypair=keypair,
                     private_key=private_key,
                     ssh_client=ssh_client,
-                    probed_container_names=(
-                        docker_listing_probe.port_check_container_names
-                        if docker_listing_probe is not None
-                        else None
-                    ),
+                    probed_container_names=probed_port_check_names,
                 )
                 logger.info(
                     _m(
@@ -6782,6 +6789,17 @@ class DockerService:
                         log_tag=log_tag,
                         port_maps=port_maps,
                         spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                        remove_port_checks_listed_live=(
+                            None
+                            if probed_port_check_names is None
+                            else lambda: self.wait_for_port_check_containers(
+                                executor_info=executor_info,
+                                miner_hotkey=payload.miner_hotkey,
+                                keypair=keypair,
+                                private_key=private_key,
+                                ssh_client=ssh_client,
+                            )
+                        ),
                     )
                     if jupyter_port_map:
                         # a port collision may have moved the Jupyter mapping: the URL below
