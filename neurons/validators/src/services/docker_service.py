@@ -2806,16 +2806,19 @@ class DockerService:
         pod_name: str,
         active_volume_names: list[str] | None,
         report: ContainerCleanupReport,
+        listed_fillers: asyncio.Future[list[str]],
     ) -> list[str]:
         """LIUM-95: a customer create's `filler_*` removal, started as soon as the SSH session is up
         so the kill overlaps the image inspect and the host probes. The same removal, confirmation and
         report as the cleanup step's, which skips the names returned here; a listing that cannot be
-        read returns none and leaves every filler to that step."""
+        read returns none and leaves every filler to that step. LIUM-114: ``listed_fillers`` gets the
+        names once listed, so the cleanup step need not wait for the removal itself."""
         fillers = [
             name
             for name in await self._list_all_container_names(ssh_client) or []
             if name.startswith(FILLER_CONTAINER_PREFIX)
         ]
+        listed_fillers.set_result(fillers)
         if not fillers:
             return []
         logger.info(
@@ -6204,6 +6207,7 @@ class DockerService:
             )
             filler_removal_at_ssh_connect: asyncio.Task | None = None
             filler_removal_at_ssh_connect_report = ContainerCleanupReport()
+            fillers_listed_at_ssh_connect: asyncio.Future[list[str]] = asyncio.get_running_loop().create_future()
 
             async def settle_filler_removal_at_ssh_connect() -> None:
                 # a create that ends before its cleanup step awaited the removal: stop it, log its error
@@ -6229,6 +6233,7 @@ class DockerService:
                             self.get_container_name(payload),
                             payload.active_volume_names,
                             filler_removal_at_ssh_connect_report,
+                            fillers_listed_at_ssh_connect,
                         )
                     )
                     connections.push_async_callback(settle_filler_removal_at_ssh_connect)
@@ -6635,10 +6640,27 @@ class DockerService:
                 # block the critical path for ~10s. (sleep defaults to 0.)
                 # LIUM-95: everything after the cleanup (power restore, cache reclaim, docker run) still
                 # waits for the fillers to be removed and confirmed; an error fails the create here.
+                # LIUM-114: only docker run needs them gone (it binds their top port and takes their
+                # GPU), so a removal that deletes no volume, on a host with no DPHN cache for the
+                # reclaim below (the filler mounts it), is awaited right before docker run instead.
                 fillers_removed_at_ssh_connect: list[str] = []
                 if filler_removal_at_ssh_connect is not None:
-                    filler_removal, filler_removal_at_ssh_connect = filler_removal_at_ssh_connect, None
-                    fillers_removed_at_ssh_connect = await filler_removal
+                    fillers_removed_at_ssh_connect = await fillers_listed_at_ssh_connect
+                    removal_waits_for_docker_run = (
+                        bool(fillers_removed_at_ssh_connect)
+                        and host_probe is not None
+                        and host_probe.volume_names is not None
+                        and not any(
+                            name.startswith(DPHN_CACHE_VOLUME_PREFIX) for name in host_probe.volume_names
+                        )
+                        and all(
+                            f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" in protected_volume_names
+                            for name in fillers_removed_at_ssh_connect
+                        )
+                    )
+                    if not removal_waits_for_docker_run:
+                        filler_removal, filler_removal_at_ssh_connect = filler_removal_at_ssh_connect, None
+                        await filler_removal
                 cleanup_report = ContainerCleanupReport()
                 removed_containers = await self.clean_existing_containers(
                     ssh_client=ssh_client,
@@ -6663,6 +6685,8 @@ class DockerService:
                     and (
                         filler_removal_at_ssh_connect_report.removed_cleanly_without_volume_rm
                         or not fillers_removed_at_ssh_connect
+                        # LIUM-114: still running, it deletes no volume, and the probe predates it
+                        or filler_removal_at_ssh_connect is not None
                     )
                     and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in removed_containers)
                 )
@@ -6722,12 +6746,27 @@ class DockerService:
                     or swept_cache_volumes
                     or reclaimed_cache_volumes
                 )
+                async def restore_gpu_power_once_the_fillers_are_gone(
+                    filler_removal: asyncio.Task,
+                ) -> tuple[Any, ProfilerStep] | None:
+                    # LIUM-114/DAH-2356: a PEARL filler's cap is lifted only once its removal is
+                    # confirmed; after a failed removal nothing is lifted and the create fails
+                    await asyncio.wait([filler_removal])
+                    if filler_removal.cancelled() or filler_removal.exception() is not None:
+                        return None
+                    return await _with_own_duration(
+                        self._restore_gpu_power_for_uncapped_pod(ssh_client, payload, host_probe, default_extra),
+                        ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
+                    )
+
                 # DAH-3980: a pod without its own power cap gets its GPUs' power back while its volume
                 # is sized and created. Only after the cleanup (a PEARL filler must be gone before its
                 # cap is lifted) and never before a bootstrap restore (minutes would age the query).
                 early_gpu_power_restore = (
                     asyncio.create_task(
-                        _with_own_duration(
+                        restore_gpu_power_once_the_fillers_are_gone(filler_removal_at_ssh_connect)
+                        if filler_removal_at_ssh_connect is not None
+                        else _with_own_duration(
                             self._restore_gpu_power_for_uncapped_pod(
                                 ssh_client, payload, host_probe, default_extra
                             ),
@@ -6963,6 +7002,8 @@ class DockerService:
                     )
                     if not cap_applied:
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
+                elif filler_removal_at_ssh_connect is not None:
+                    pass  # LIUM-114: the restore waits for the filler removal, awaited before docker run
                 elif early_gpu_power_restore is not None:
                     _, early_gpu_power_restore_step = await early_gpu_power_restore
                     profilers.append(early_gpu_power_restore_step)
@@ -7054,6 +7095,26 @@ class DockerService:
                 prev_timestamp = now_ms()
 
                 try:
+                    if filler_removal_at_ssh_connect is not None:
+                        # LIUM-114: the run binds the filler's top port and takes its GPU, so it waits
+                        # for the removal and the power restore chained on it. A removal that failed or
+                        # timed out fails the create as at the cleanup step; the except below removes
+                        # the volume made meanwhile, as after a failed run.
+                        current_step = "container_cleanup"
+                        filler_removal, filler_removal_at_ssh_connect = filler_removal_at_ssh_connect, None
+                        wait_started = time.monotonic()
+                        await filler_removal
+                        logger.info(
+                            _m(
+                                "filler_removal_wait_before_run",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "removal_wait_before_run_ms": int((time.monotonic() - wait_started) * 1000),
+                                }),
+                            )
+                        )
+                        _, early_gpu_power_restore_step = await early_gpu_power_restore
+                        profilers.append(early_gpu_power_restore_step)
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)

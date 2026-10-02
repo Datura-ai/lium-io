@@ -22,7 +22,10 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
   times out fails the create at the cleanup step;
 - LIUM-95: a customer create removes its fillers as soon as the SSH session is up, beside the image
   inspect and the probes; the cleanup step awaits that removal, never removes those fillers again,
-  and everything after it (power restore, cache reclaim, docker run) still waits for it.
+  and everything after it (power restore, cache reclaim, docker run) still waits for it;
+- LIUM-114: a removal that deletes no volume, on a host with no DPHN cache, is awaited right before
+  docker run instead: the volume is made meanwhile, the power restore and the run wait for it, a
+  failed removal fails the create there and the failed run's cleanup removes the volume.
 """
 
 from __future__ import annotations
@@ -1215,8 +1218,7 @@ async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc
     [
         (("filler_x", "pod_old"), ["volume_x"], 0, ""),  # a pod removed beside the filler
         (("filler_x",), [], 0, ""),  # the filler's volume removed by the create
-        (("filler_x",), ["volume_x"], 0, "filler_x\n"),  # the filler survived the rm
-        (("filler_x",), ["volume_x"], 1, ""),  # the rm failed although the filler is gone
+        # a survivor or a failed rm of a removal awaited before docker run: see LIUM-114's test below
     ],
 )
 async def test_customer_create_relists_after_any_other_removal(
@@ -1279,12 +1281,19 @@ async def test_customer_create_whose_filler_removal_times_out_fails_at_the_clean
         docker_rm_raises=asyncssh.TimeoutError(None, None, None, None, None, None, "", ""),
     )
 
-    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+    svc.cleanup_failed_container_creation = AsyncMock(return_value=False)
+    payload = _deploy_payload(active_volume_names=["volume_x"])
+
+    result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "FailedContainerRequest"
     assert result.failure_step == "container_cleanup"
     [removal] = [call for call in ssh_client.run.await_args_list if call.args[0].startswith("/usr/bin/docker rm -fv")]
     assert removal.kwargs["timeout"] == ds_module._CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+    # LIUM-114: awaited before docker run, the run is never issued and the volume goes with it
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    assert svc.cleanup_failed_container_creation.await_args.kwargs["volume_name"] == f"volume_{payload.pod_id}"
+    assert svc.cleanup_failed_container_creation.await_args.kwargs["remove_volume"] is True
 
 
 def _removal_commands(ssh_client) -> list[str]:
@@ -1383,9 +1392,11 @@ async def test_customer_create_hands_on_a_listing_without_the_filler_whichever_s
         (0, "", 1),  # the confirming listing failed
     ],
 )
-async def test_customer_create_whose_early_removal_is_not_clean_relists_and_removes_nothing_twice(
+async def test_customer_create_whose_early_removal_is_not_clean_removes_nothing_twice(
     svc_fixture, monkeypatch, docker_rm_exit, ps_after_rm, listing_after_rm_exit
 ):
+    """LIUM-114: the outcome is read only before docker run, so the sweeps keep the probe read before
+    the removal: the filler's volume is protected and the df can only read less free space."""
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
         svc,
@@ -1400,12 +1411,8 @@ async def test_customer_create_whose_early_removal_is_not_clean_relists_and_remo
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert _removal_commands(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
-    assert _relisting_commands(ssh_client) == [
-        DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
-        '/usr/bin/docker volume ls --format "{{.Name}}"',
-        port_check_containers_command("miner"),
-    ]
-    assert svc.probe_volume_host.await_count == 2
+    assert _relisting_commands(ssh_client) == []
+    svc.probe_volume_host.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1431,31 +1438,129 @@ async def test_customer_create_removes_a_pod_beside_the_filler_at_the_cleanup_st
     ]
 
 
+def _record_create_steps(svc, events: list[str]) -> None:
+    def recorder(event: str, returns=None) -> AsyncMock:
+        return AsyncMock(side_effect=lambda *args, **kwargs: events.append(event) or returns)
+
+    svc._restore_gpu_power_for_uncapped_pod = recorder("power restore")
+    svc.reclaim_dphn_cache_for_rental = recorder("cache reclaim", returns=False)
+    svc.create_local_volume = recorder("volume created")
+    svc._run_rental_docker_create_with_port_retry = recorder("docker run")
+
+
 @pytest.mark.asyncio
-async def test_power_restore_cache_reclaim_and_docker_run_wait_for_the_early_removal(
-    svc_fixture, monkeypatch
+async def test_volume_is_made_while_the_removal_runs_and_power_restore_and_docker_run_wait_for_it(
+    svc_fixture, monkeypatch, caplog
 ):
-    """LIUM-94's C3 guard: a PEARL filler is gone before its cap is lifted, and the Dolphin cache
-    is reclaimed only once the filler that mounts it is gone."""
+    """LIUM-114: only docker run needs the filler gone; LIUM-94's C3 guard: a PEARL filler is gone
+    before its cap is lifted."""
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(
         svc, monkeypatch, probe=_probe_with_containers("filler_x"), docker_rm_seconds=0.05
     )
     events: list[str] = []
     _record_removal(ssh_client, events)
-
-    def recorder(event: str, returns=None) -> AsyncMock:
-        return AsyncMock(side_effect=lambda *args, **kwargs: events.append(event) or returns)
-
-    svc._restore_gpu_power_for_uncapped_pod = recorder("power restore")
-    svc.reclaim_dphn_cache_for_rental = recorder("cache reclaim", returns=False)
-    svc._run_rental_docker_create_with_port_retry = recorder("docker run")
+    _record_create_steps(svc, events)
 
     result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert events == [
+        "removal issued",
+        "cache reclaim",
+        "volume created",
+        "removal confirmed",
+        "power restore",
+        "docker run",
+    ]
+    assert "filler_removal_wait_before_run" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe", "active_volume_names"),
+    [
+        (  # a DPHN filler mounts the cache the reclaim may remove
+            _probe(
+                container_names=("filler_x",),
+                volumes=(
+                    ProbedVolume(name="volume_x", driver="vloopback:latest"),
+                    ProbedVolume(name="dphn_cache_hf_x", driver="local"),
+                ),
+                mounted_volume_names=("volume_x", "dphn_cache_hf_x"),
+            ),
+            ["volume_x"],
+        ),
+        (_probe_with_containers("filler_x"), []),  # the removal deletes the filler's volume
+        # the probe's volume listing failed: no word on a DPHN cache
+        (_probe(container_names=("filler_x",), volumes=None, mounted_volume_names=None), ["volume_x"]),
+    ],
+    ids=["dphn_cache", "volume_rm", "probe_without_volumes"],
+)
+async def test_removal_still_awaited_at_the_cleanup_step_when_a_step_there_needs_it(
+    svc_fixture, monkeypatch, probe, active_volume_names
+):
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=probe, docker_rm_seconds=0.05)
+    events: list[str] = []
+    _record_removal(ssh_client, events)
+    _record_create_steps(svc, events)
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=active_volume_names))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert events[:2] == ["removal issued", "removal confirmed"]
-    assert sorted(events[2:]) == ["cache reclaim", "docker run", "power restore"]
+    assert sorted(events[2:]) == ["cache reclaim", "docker run", "power restore", "volume created"]
+
+
+@pytest.mark.asyncio
+async def test_failed_removal_fails_the_create_before_docker_run_and_removes_the_volume_made_meanwhile(
+    svc_fixture, monkeypatch
+):
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    events: list[str] = []
+    _record_create_steps(svc, events)
+
+    async def failing_removal(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        events.append("removal failed")
+        raise Exception("[clean_existing_containers] docker rm -fv failed")
+
+    svc._remove_stale_containers_tolerantly = AsyncMock(side_effect=failing_removal)
+    svc.cleanup_failed_container_creation = AsyncMock(return_value=False)
+    payload = _deploy_payload(active_volume_names=["volume_x"])
+
+    result = await _run_create_container(svc, payload)
+
+    assert type(result).__name__ == "FailedContainerRequest"
+    assert result.failure_step == "container_cleanup"
+    assert "docker rm -fv failed" in result.detail
+    assert events == ["cache reclaim", "volume created", "removal failed"]
+    svc.cleanup_failed_container_creation.assert_awaited_once()
+    assert svc.cleanup_failed_container_creation.await_args.kwargs["volume_name"] == f"volume_{payload.pod_id}"
+    assert svc.cleanup_failed_container_creation.await_args.kwargs["remove_volume"] is True
+
+
+@pytest.mark.asyncio
+async def test_customer_create_without_a_filler_waits_for_nothing_before_docker_run(
+    svc_fixture, monkeypatch, caplog
+):
+    """LIUM-114: no filler, no change: the listing at SSH connect is the one extra command, as on LIUM-95."""
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("pod_keep"))
+    events: list[str] = []
+    _record_create_steps(svc, events)
+
+    result = await _run_create_container(
+        svc, _deploy_payload(active_container_names=["pod_keep"], active_volume_names=["volume_keep"])
+    )
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert _cmds(ssh_client) == [DOCKER_PS_ALL_NAMES_CMD]
+    assert sorted(events[:-1]) == ["cache reclaim", "power restore", "volume created"]
+    assert events[-1] == "docker run"
+    assert "filler_removal_wait_before_run" not in caplog.text
 
 
 def _removals_at_ssh_connect_left_running() -> list[asyncio.Task]:
