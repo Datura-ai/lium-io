@@ -16,6 +16,7 @@ import pytest_asyncio
 from tenacity import Future, RetryError
 
 import services.docker_service as docker_service_module
+from services.attestation_service import AttestationError
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
@@ -6412,6 +6413,82 @@ async def test_create_container_streams_the_ssh_port_once_for_the_ui(docker_serv
         if call.args[0].startswith("Port mappings ready")
     ]
     assert port_lines == [("Port mappings ready: 22->40022", "success", "container_creation")]
+
+
+@pytest.mark.asyncio
+async def test_create_container_publishes_the_ssh_port_before_the_host_connection_completes(
+    docker_service, monkeypatch
+):
+    # Arrange: the real log stream, and a host connection that takes a while
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    for streamed in ("stream_log", "handle_stream_logs", "finish_stream_logs"):
+        monkeypatch.delattr(docker_service, streamed)
+    docker_service.redis_service.publish = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(
+        docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20020, 40022)], None))
+    )
+    connect_ssh_and_docker = docker_service._connect_ssh_and_docker
+    published_before_connected: list[str] = []
+
+    async def connect_slowly(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        published_before_connected.extend(
+            log["log_text"]
+            for call in docker_service.redis_service.publish.await_args_list
+            for log in call.args[1]["logs"]
+        )
+        return await connect_ssh_and_docker(*args, **kwargs)
+
+    monkeypatch.setattr(docker_service, "_connect_ssh_and_docker", connect_slowly)
+    payload = _create_payload(str(uuid4()), encrypted=False).model_copy(update={"bootstrap_restore": None})
+
+    # Act
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    # Assert: well before LOG_STREAM_INTERVAL, and the stream ended with the create
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert published_before_connected == ["Port mappings ready: 22->40022"]
+    assert docker_service.log_task.done()
+
+
+@pytest.mark.asyncio
+async def test_create_container_ends_the_log_stream_when_attestation_fails(docker_service, monkeypatch):
+    # Arrange: the attestation fails before the stream task ever ran
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    for streamed in ("stream_log", "handle_stream_logs", "finish_stream_logs"):
+        monkeypatch.delattr(docker_service, streamed)
+    docker_service.redis_service.publish = AsyncMock()
+    monkeypatch.setattr(
+        docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20020, 40022)], None))
+    )
+    monkeypatch.setattr(
+        docker_service, "_prepare_known_hosts_policy", AsyncMock(side_effect=AttestationError("bad quote"))
+    )
+    payload = _create_payload(str(uuid4()), encrypted=False).model_copy(update={"bootstrap_restore": None})
+
+    # Act
+    result = await asyncio.wait_for(
+        docker_service.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload, tdx_quote=None),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        ),
+        timeout=2,
+    )
+
+    # Assert
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "attestation"
+    assert docker_service.log_task.done()
+    published_logs = docker_service.redis_service.publish.await_args.args[1]["logs"]
+    assert [log["log_text"] for log in published_logs] == ["Port mappings ready: 22->40022"]
 
 
 @pytest.mark.asyncio
