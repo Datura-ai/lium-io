@@ -262,3 +262,28 @@ async def test_a_scrape_failure_that_does_not_show_a_dead_gpu_runtime_on_a_rente
     assert "host_gpu_fault_reset" not in event.what_we_saw
     assert _resets(service) == []
     assert (await _record(service))["failed"] == 1
+
+
+@pytest.mark.parametrize("drop_check_raises", [False, True], ids=["drop-check-runs", "drop-check-raises"])
+@pytest.mark.asyncio
+async def test_a_dead_gpu_runtime_both_reports_the_gpu_loss_and_resets_the_rented_node(
+    context_factory, drop_check_raises
+):
+    service = _redis_service()
+    await _cycle(context_factory, service, scrape=HEALTHY)
+    seen = []
+
+    async def drop_check_run(self, ctx):
+        seen.append((ctx.state.gpu_count, ctx.state.gpu_details))
+        if drop_check_raises:
+            raise RuntimeError("backend down")
+
+    with patch.object(machine_spec_scrape.RentedGpuDropCheck, "run", drop_check_run):
+        ok, event, _ = await _cycle(context_factory, service, scrape=DEAD_NVML)
+
+    assert ok is False
+    assert seen == [(0, [])]
+    assert event.reason_code == DRIVER
+    assert event.what_we_saw["host_gpu_fault_reset"] is True
+    [reset] = _resets(service)
+    assert reset["reason_code"] == DRIVER
