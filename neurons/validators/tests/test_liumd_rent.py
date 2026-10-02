@@ -28,6 +28,7 @@ from services.liumd_rent import LiumdAgentFrames
 from services.miner_service import MinerService
 
 BENCH_EXECUTOR_ID = "df044c30-b8b4-4f4f-8860-9d451c16090c"
+MINER_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 GPU_UUID = "GPU-6a1f0c52-3e9b-4d7a-8f21-0b9c4e5d7a13"
 RENTER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIrenterkey renter@laptop"
 TODAYS_PATH_REPLY = Mock(name="todays_path_reply")
@@ -48,7 +49,7 @@ RESULT_STEPS = {
 
 def make_rent_payload(**overrides) -> ContainerCreateRequest:
     fields = dict(
-        miner_hotkey="5TestMiner",
+        miner_hotkey=MINER_HOTKEY,
         executor_id=BENCH_EXECUTOR_ID,
         miner_address="10.0.0.1",
         miner_port=8000,
@@ -309,6 +310,7 @@ async def test_customer_rent_on_a_node_with_a_filler_carries_preempt_and_gpu_pow
 
     rent = relay.frames_of_type("rent")[0]
     assert isinstance(reply, ContainerCreated)
+    assert rent["validator_hotkey"] == MINER_HOTKEY
     assert rent["preempt"] == {"fillers": True}
     assert rent["gpu_power"] == [{"gpu_uuid": GPU_UUID, "restore_watts": 140}]
     assert rent["gpu_power_floor_ratio"] == 0.9
@@ -326,6 +328,8 @@ async def test_customer_rent_on_a_node_with_a_filler_carries_preempt_and_gpu_pow
         pytest.param({"executor_id": str(uuid4())}, id="another_executor"),
         pytest.param({"ships_sshd": False}, id="image_without_sshd"),
         pytest.param({"local_volume": "volume_existing"}, id="edit_of_existing_pod"),
+        pytest.param({"miner_hotkey": ""}, id="empty_miner_hotkey"),
+        pytest.param({"miner_hotkey": "5TestMiner"}, id="miner_hotkey_not_ss58"),
     ],
 )
 async def test_ineligible_rent_never_sends_a_frame(miner_service, overrides):

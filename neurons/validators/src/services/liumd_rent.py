@@ -12,6 +12,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable, Iterator
@@ -64,6 +65,8 @@ LIUMD_REPLY_GRACE_SECONDS = 5.0
 # on _InflightCreate would let the wait wake on the delete itself
 LIUMD_DELETE_POLL_SECONDS = 0.1
 LOG_TAG = "container_creation"
+# the agents refuse a rent whose `validator_hotkey` is not this shape (liumd-rent agent.rs, check_rent_frame)
+SS58_ADDRESS_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{47,48}")
 
 
 def liumd_ineligibility_reason(payload: ContainerCreateRequest) -> str | None:
@@ -82,6 +85,8 @@ def liumd_ineligibility_reason(payload: ContainerCreateRequest) -> str | None:
         "edit_of_existing_pod": bool(payload.local_volume),
         "no_volume_limit": not payload.volume_limit_gb,
         "whole_node_gpus": not payload.gpu_uuids,
+        # the agent removes the port-check containers `container_<miner_hotkey>_*` by this hotkey
+        "miner_hotkey_not_ss58": not SS58_ADDRESS_PATTERN.fullmatch(payload.miner_hotkey),
         "no_public_keys": not payload.user_public_keys,
         "external_volume": payload.external_volume_info is not None,
         "bootstrap_restore": payload.bootstrap_restore is not None,
@@ -341,7 +346,9 @@ class LiumdRentService:
             "attempt": attempt,
             "executor_id": payload.executor_id,
             "deadline_ms": LIUMD_RENT_DEADLINE_MS,
-            "validator_hotkey": settings.get_bittensor_wallet().get_hotkey().ss58_address,
+            # the name the agents parse; the port-check containers are named by the miner's hotkey
+            # (executor_connectivity/orchestrator.py), as today's rent removes them
+            "validator_hotkey": payload.miner_hotkey,
             # null: the connector holds no registry digest before the host is asked (design §10)
             "image": {"ref": payload.docker_image, "expected_digest": None},
             "container": {
