@@ -662,7 +662,8 @@ class ContainerCreated(ContainerBaseResponse):
     backup_log_id: str | None = None
     restore_path: str | None = None
     restore_log_id: str | None = None
-    jupyter_url: str | None = None
+    # the URL carries Jupyter's token: kept out of str(), which the connector logs
+    jupyter_url: str | None = Field(default=None, repr=False)
     warnings: list[ContainerWarningCode] | None = None
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
@@ -778,7 +779,7 @@ class FailedAddDebugSshKey(BaseValidatorResponse):
 
 class JupyterServerInstalled(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterServerInstalled
-    jupyter_url: str
+    jupyter_url: str = Field(repr=False)
 
 
 class JupyterInstallationFailed(ContainerBaseResponse):
