@@ -1308,20 +1308,11 @@ def test_replace_collateral_transaction_exits_0_only_on_a_success(archive_networ
     assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text + result.output
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["replace-collateral-transaction"],
-        ["reclaim-collateral", "--executor_uuid", EXECUTOR],
-        ["finalize-reclaim-request", "--reclaim-request-id", "5"],
-    ],
-    ids=lambda args: args[0],
-)
-def test_a_signing_collateral_command_takes_no_key_on_the_command_line(monkeypatch, args):
+def test_replace_collateral_transaction_takes_no_key_on_the_command_line(monkeypatch):
     import cli as cli_module
 
     monkeypatch.setattr(cli_module, "get_collateral_contract", lambda **_: pytest.fail("nothing may be signed"))
-    result = CliRunner().invoke(cli_module.cli, [*args, "--private-key", MINER_KEY])
+    result = CliRunner().invoke(cli_module.cli, ["replace-collateral-transaction", "--private-key", MINER_KEY])
     assert result.exit_code == 2
     assert "No such option" in result.output
 
@@ -1391,6 +1382,8 @@ def assert_no_rpc_secret(text: str):
         (["reclaim-collateral", "--executor_uuid", EXECUTOR], f"{MINER_KEY}\n"),
         (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--contract", "1.0.2"], f"{MINER_KEY}\n"),
         (["finalize-reclaim-request", "--reclaim-request-id", "5"], f"{MINER_KEY}\n"),
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY], None),
+        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY], None),
         (["get-balance-of-eth-address", "--private-key", MINER_KEY], None),
         (["finalize-reclaim-request", "--reclaim-request-id", "5", "--contract", "1.0.2"], f"{MINER_KEY}\n"),
         (["get-miner-collateral", "--contract", "1.0.2"], None),

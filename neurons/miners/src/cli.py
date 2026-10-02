@@ -293,10 +293,10 @@ def remove_executor(address: str, port: int):
 
 @cli.command()
 @click.option("--executor_uuid", prompt="Executor UUID", help="UUID of the executor to reclaim collateral from")
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 @contract_option
-def reclaim_collateral(executor_uuid: str, contract_version: str | None):
+def reclaim_collateral(executor_uuid: str, private_key: str, contract_version: str | None):
     """Reclaim collateral for a specific executor from the contract that holds it"""
-    private_key = click.prompt("Ethereum Private Key", hide_input=True)
     if miner_account(private_key) is None:
         sys.exit(1)
     settle_earlier_send(private_key)
@@ -412,10 +412,10 @@ def get_reclaim_requests(contract_version: str | None):
 
 @cli.command()
 @click.option("--reclaim-request-id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 @contract_option
-def finalize_reclaim_request(reclaim_request_id: int, contract_version: str | None):
+def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract_version: str | None):
     """Finalize a reclaim request by its ID on the contract that holds it"""
-    private_key = click.prompt("Ethereum Private Key", hide_input=True)
     account = miner_account(private_key)
     if account is None:
         sys.exit(1)

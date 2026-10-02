@@ -249,7 +249,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-coll
 ```
 
 - `<executor_uuid>`: The uuid of the executor.
-- The command asks for the Ethereum private key at a hidden prompt and takes no `--private-key` option, so the key stays out of shell history and the process list.
+- The command asks for the Ethereum private key at a hidden prompt, so the key stays out of shell history and the process list.
 
 The command logs the reclaim request ID; keep it for the finalize step.
 
@@ -283,7 +283,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-rec
 ```
 
 - `<reclaim-request-id>`: The ID of the reclaim request you wish to finalize.
-- The command asks for the Ethereum private key at a hidden prompt and takes no `--private-key` option, so the key stays out of shell history and the process list.
+- The command asks for the Ethereum private key at a hidden prompt, so the key stays out of shell history and the process list.
 
 This command will finalize the reclaim request and return the collateral to your account. Reclaim request IDs are counted per contract; when the same ID is open on both contracts for your key, the command asks for the version.
 
