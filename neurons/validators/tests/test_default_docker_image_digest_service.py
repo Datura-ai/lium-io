@@ -1,5 +1,6 @@
 """Tests for the default docker image digest snapshot (DAH-2380)."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -162,3 +163,15 @@ async def test_fetch_docker_hub_digest_asks_docker_hub_only_for_a_plain_hub_tag(
     else:
         assert digest == "sha256:d"
         assert fetch.await_args.args[1] == looked_up
+
+
+@pytest.mark.asyncio
+async def test_fetch_docker_hub_digest_gives_up_at_its_bound_when_docker_hub_hangs(monkeypatch):
+    monkeypatch.setattr(f"{_MODULE}._RENT_PATH_DIGEST_TIMEOUT_SECONDS", 0.05)
+    async def docker_hub_hangs(*args: object) -> str | None:
+        await asyncio.Event().wait()
+
+    with patch(f"{_MODULE}.fetch_registry_digest", docker_hub_hangs):
+        digest = await asyncio.wait_for(fetch_docker_hub_digest("daturaai/pytorch:prod"), timeout=2)
+
+    assert digest is None

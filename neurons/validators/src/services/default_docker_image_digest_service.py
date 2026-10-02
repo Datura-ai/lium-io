@@ -14,6 +14,7 @@ pipeline context, so there is no shared mutable cache to keep in sync.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -35,7 +36,9 @@ _DOCKER_HUB_TAGGED_REFERENCE = re.compile(
     r"(?:docker\.io/)?((?:[a-z0-9]+(?:[_-][a-z0-9]+)*/)?[a-z0-9]+(?:[._-][a-z0-9]+)*)"
     r":([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
 )
-_RENT_PATH_DIGEST_TIMEOUT_SECONDS = 10
+# the host daemon's own registry check costs ~2 s (staging "Docker image inspect" 2490 ms) and a
+# normal lookup ~0.2-0.4 s: a lookup still out after 2 s can no longer beat the daemon path
+_RENT_PATH_DIGEST_TIMEOUT_SECONDS = 2
 
 
 def _shared_config_image_refs() -> tuple[str, ...]:
@@ -142,9 +145,15 @@ async def fetch_docker_hub_digest(image: str) -> str | None:
         return None
     if "/" not in repository:
         repository = f"library/{repository}"
-    timeout = aiohttp.ClientTimeout(total=_RENT_PATH_DIGEST_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        return await fetch_registry_digest(session, f"{repository}:{tag}")
+    # one bound for the token request and the HEAD together; aiohttp's `total` bounds each request alone
+    try:
+        async with asyncio.timeout(_RENT_PATH_DIGEST_TIMEOUT_SECONDS), aiohttp.ClientSession() as session:
+            return await fetch_registry_digest(session, f"{repository}:{tag}")
+    except TimeoutError:
+        logger.warning(
+            "Docker Hub digest lookup for %s gave no answer in %s s", image, _RENT_PATH_DIGEST_TIMEOUT_SECONDS
+        )
+        return None
 
 
 async def fetch_executor_image_digest() -> str | None:
