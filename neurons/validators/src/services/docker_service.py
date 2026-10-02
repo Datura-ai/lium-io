@@ -2697,13 +2697,8 @@ class DockerService:
             "pod_id": pod_id,
         }
 
-        self.log_stream_finish_requested.clear()
-
         while True:
-            # finish_stream_logs cuts the wait short: the last batch goes out at once
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self.log_stream_finish_requested.wait(), LOG_STREAM_INTERVAL)
-
+            finishing = self.log_stream_finish_requested.is_set()
             async with self.lock:
                 logs_to_process = self.logs_queue[:]
                 self.logs_queue.clear()
@@ -2736,8 +2731,12 @@ class DockerService:
                         exc_info=True,
                     )
 
-            if self.log_stream_finish_requested.is_set():
+            if finishing:
                 break
+            # publish first, then wait: the first line (the UI's SSH port) goes out at once, and
+            # finish_stream_logs cuts the wait short so the last batch does too
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.log_stream_finish_requested.wait(), LOG_STREAM_INTERVAL)
 
         logger.info(
             _m(
@@ -6289,6 +6288,18 @@ class DockerService:
                     failure_step=current_step,
                 )
 
+            # DAH-3980: started before the host connection, the port line above reaches the backend
+            # ~1.5 s earlier; every return from here on calls finish_stream_logs. Cleared here, not
+            # in the task: a create failing before the task first runs must keep its finish request.
+            self.log_stream_finish_requested.clear()
+            self.log_task = asyncio.create_task(
+                self.handle_stream_logs(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                )
+            )
+
             # add executor in pending status dict
             current_step = "pending_pod"
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -6311,6 +6322,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 )
                 logger.error(log_text)
+                await self.finish_stream_logs()
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
@@ -6422,14 +6434,6 @@ class DockerService:
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
 
-                # set real-time logging
-                self.log_task = asyncio.create_task(
-                    self.handle_stream_logs(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        pod_id=payload.pod_id,
-                    )
-                )
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
                 # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
