@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from clients.compute_client import ComputeClient
 from clients.subtensor_client import SubtensorClient
 from clients.validator_portal_api import ValidatorPortalAPI
 
@@ -91,6 +93,57 @@ async def test_rent_during_the_warm_up_first_load_joins_it_with_one_metagraph_re
 
     assert miner is serving_miner
     assert len(metagraph_reads) == 1
+
+
+@pytest.mark.asyncio
+async def test_connector_connects_to_backend_while_the_first_miners_load_is_pending() -> None:
+    # Arrange
+    subtensor_client = _make_connector_subtensor_client()
+    subtensor_client._return_to_first_endpoint = MagicMock()
+    subtensor_client.set_subtensor = MagicMock()
+    portal_released = asyncio.Event()
+
+    async def _held_portal_request() -> list:
+        await portal_released.wait()
+        return []
+
+    async def _backend_never_answering():
+        await asyncio.Event().wait()
+        yield
+
+    compute_client = ComputeClient.__new__(ComputeClient)
+    compute_client.logging_extra = {}
+    compute_client.connect = MagicMock(side_effect=_backend_never_answering)
+    held_portal = AsyncMock(side_effect=_held_portal_request)
+
+    with (
+        patch.object(SubtensorClient, "_subtensor", MagicMock()),
+        patch.object(SubtensorClient, "_warm_up_task", None),
+        patch.object(SubtensorClient, "get_instance", return_value=subtensor_client),
+        patch.object(ValidatorPortalAPI, "get_opted_in_miners", held_portal),
+        patch.multiple(
+            ComputeClient,
+            handle_send_messages=AsyncMock(),
+            subscribe_mesages_from_redis=AsyncMock(),
+            poll_rented_machines=AsyncMock(),
+            poll_executors_uptime=AsyncMock(),
+            poll_revenue_per_gpu_type=AsyncMock(),
+        ),
+    ):
+        # Act
+        run_forever = asyncio.create_task(compute_client.run_forever())
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(1):
+                while not compute_client.connect.called:
+                    await asyncio.sleep(0.01)
+        connect_attempted = compute_client.connect.called
+        run_forever.cancel()
+        SubtensorClient._warm_up_task.cancel()
+
+    # Assert
+    assert held_portal.await_count == 1
+    assert not portal_released.is_set()
+    assert connect_attempted
 
 
 def _make_main_validator_subtensor_client() -> SubtensorClient:
