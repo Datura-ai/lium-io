@@ -409,9 +409,9 @@ class Settings(BaseSettings):
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
     # marks the executor inactive and stops billing the renter. Only the validator's scrape on the host
     # decides; nothing read from the renter's container does. A later clean scrape validates the node as
-    # usual. Off (the default): the scrape failure halts the cycle without a reset, as before. On only
-    # after a signal the provider cannot forge corroborates the fault: the report comes from the node's
-    # own host, so on its own it cannot prove the GPU is dead. Turning it off stops
+    # usual. Off (the default): the scrape failure halts the cycle without a reset, as before. On once
+    # the matching backend change has rolled out, which handles this reset like GPU_MISSING (penalty
+    # proposed, relisted only after a full GPU re-verification). Turning it off stops
     # future resets only: an executor already reset stays inactive until its next clean scrape, and
     # cycles already skipped are not billed or paid afterwards.
     RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)

@@ -205,9 +205,9 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
     """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing.
 
     It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
-    and billing stops. The backend proposes no penalty for a reset whose reason_code is in its sweep's skip set
-    (penalty_trigger.py SCRAPE_FAILURE_REASONS), which holds both codes here. A node without a customer pod keeps
-    the plain halt.
+    and billing stops. It is handled like GPU_MISSING: with the matching backend change the backend proposes
+    EXECUTOR_INACTIVE_MID_RENTAL for it, and the node is listed again only after a full GPU re-verification.
+    A node without a customer pod keeps the plain halt.
     """
     if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
         return {}
