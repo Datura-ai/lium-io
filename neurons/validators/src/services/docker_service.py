@@ -1580,9 +1580,10 @@ def _build_volume_setup_exec_script(
         "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
     )
     lines = [
-        "umask 077",
         f'trap "rm -f {script} {passfile}" EXIT',
-        f"dd bs=1 count={setup_script_size} of={script} 2>/dev/null"
+        # 0600 from the first byte, and only for the upload: the script's mkdir -p of a volume
+        # path's missing parents keeps the exec's default umask, as in separate execs
+        f"(umask 077 && dd bs=1 count={setup_script_size} of={script} 2>/dev/null)"
         f" && [ $(wc -c < {script}) -eq {setup_script_size} ] || exit 90",
         f"sh {script} || exit 91",
         f"{mount_check} || {{ echo '--- /proc/mounts ---'; cat /proc/mounts;"

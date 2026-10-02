@@ -7230,7 +7230,8 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     upload_call = stdin_calls[0]
     upload_cmd = upload_call.args[0]
     # 0600 from the first byte: the script holds the same material as the passfile it writes
-    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'umask 077\n")
+    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c ")
+    assert "(umask 077 && dd bs=1 " in upload_cmd
     assert f"{docker_service_module._VOLUME_SETUP_TMPFS}/.x" in upload_cmd
     assert "<<" not in upload_cmd
     # the renter's key is data on stdin behind the script, never shell text
@@ -7302,6 +7303,29 @@ def test_volume_setup_exec_upload_leaves_every_byte_after_the_script_on_stdin(tm
     assert completed.returncode == 0, completed.stderr
     assert setup_script_path.read_text() == setup_script
     assert completed.stdout.decode("utf-8") == renter_keys
+
+
+def test_volume_setup_exec_runs_the_setup_script_under_the_exec_default_umask(tmp_path):
+    # only the upload is 0077; the script's mkdir -p of a volume path's missing parents keeps 0022
+    setup_script = "umask\n"
+    program = docker_service_module._build_volume_setup_exec_script(
+        "/root",
+        setup_script_path=str(tmp_path / "setup"),
+        passfile_path=str(tmp_path / "passfile"),
+        setup_script_size=len(setup_script.encode("utf-8")),
+        with_authorized_keys=False,
+    )
+    upload_and_run_lines = [line for line in program.splitlines() if not line.endswith("exit 92; }")]
+
+    completed = subprocess.run(
+        ["sh", "-c", "umask 022\n" + "\n".join(upload_and_run_lines)],
+        input=setup_script.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.decode("utf-8").strip() in ("0022", "022")
 
 
 def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:
@@ -8151,7 +8175,7 @@ async def _create_with_volume_setup_exit(docker_service, monkeypatch, *, exit_st
     ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
 
     async def run(command, *_args, **_kwargs):
-        if "sh -c 'umask 077" in command:
+        if "(umask 077 && dd bs=1 " in command:
             return _make_ssh_command_result(exit_status=exit_status)
         return _make_ssh_command_result()
 
