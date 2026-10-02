@@ -268,11 +268,6 @@ class Settings(BaseSettings):
         env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
         default=True,
     )
-    # DAH-3275: a provider-origin Inspector finding on a rented pod fails the check, zeroes the
-    # score and asks the backend for an inspector_auto quarantine (off the marketplace + renters
-    # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
-    # the inspector event, no renter is told, the score is untouched.
-    INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
