@@ -2,10 +2,10 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, TypeVar
 
 import aiohttp
 import bittensor
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
+ChainReadResult = TypeVar("ChainReadResult")
 
 SYNC_CYCLE = 12
 SUBTENSOR_BACKOFF_INITIAL = 12
@@ -453,7 +454,9 @@ class SubtensorClient:
     def get_evm_address_for_hotkey(self, hotkey):
         return self.hotkey_to_evm_address.get(hotkey, None)
 
-    async def _run_chain_read(self, chain_read, *args):
+    async def _run_chain_read(
+        self, chain_read: Callable[..., ChainReadResult], *args: object
+    ) -> ChainReadResult:
         # a blocking chain read: in the connector off the event loop, one at a time
         if not self._chain_reads_in_thread:
             return chain_read(*args)
@@ -464,7 +467,7 @@ class SubtensorClient:
         read_in_thread.add_done_callback(lambda _: self._chain_read_lock.release())
         return await asyncio.shield(read_in_thread)
 
-    def _no_chain_read_in_thread(self):
+    def _pause_chain_reads_in_thread(self) -> contextlib.AbstractAsyncContextManager:
         # the loop-side redial closes or replaces the websocket a chain read thread may be using
         return self._chain_read_lock if self._chain_reads_in_thread else contextlib.nullcontext()
 
@@ -476,11 +479,10 @@ class SubtensorClient:
             # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
             return {uid: evm_address[0] for uid, evm_address in associated_evms}
 
-    async def sync_evm_address_maps(self):
+    async def sync_evm_address_maps(self) -> None:
         # the maps are read by the loop, so they are updated here, never from the thread
         self.uid_to_evm_address.update(await self._run_chain_read(self._read_uid_to_evm_address))
 
-        """Update the map of miner_hotkey -> evm_address for all miners."""
         for miner in self.miners:
             self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
 
@@ -1042,7 +1044,7 @@ class SubtensorClient:
         backoff = SUBTENSOR_BACKOFF_INITIAL
         while True:
             try:
-                async with self._no_chain_read_in_thread():
+                async with self._pause_chain_reads_in_thread():
                     self._return_to_first_endpoint()
                     self.set_subtensor()
 
@@ -1077,7 +1079,7 @@ class SubtensorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
-                async with self._no_chain_read_in_thread():
+                async with self._pause_chain_reads_in_thread():
                     self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(
