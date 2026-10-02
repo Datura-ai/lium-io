@@ -22,9 +22,9 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import availability_errors, build_ssh_unreachable_event
-from .messages import TenantEnforcementMessages
-from .models import JobResult
+from .availability import MAX_PEER_TEXT_LENGTH, availability_errors, build_ssh_unreachable_event
+from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
+from .models import JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
@@ -38,6 +38,28 @@ def _is_ssh_transport_failure(error: BaseException) -> bool:
     verifier's HTTP call raises the same types and says nothing about the node's own SSH.
     """
     return isinstance(error, (asyncssh.Error, OSError))
+
+
+def _transport_unreachable_event(*, executor_uuid: str, error: BaseException) -> ValidationEvent:
+    """The structured event of a run whose shell died after the connect.
+
+    The rented-machine check's template; no check_id, since the error does not say which check
+    was running when the shell died.
+    """
+    template = TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE
+    return build_msg(
+        event=template.event,
+        reason=template.reason,
+        severity=template.severity,
+        category=template.category,
+        impact=template.impact,
+        remediation=template.remediation,
+        help_uri=template.help_uri or REASON_CODE_DOCS_URL,
+        what={
+            "executor_uuid": executor_uuid,
+            "transport_error": repr(error)[:MAX_PEER_TEXT_LENGTH],
+        },
+    )
 
 
 class TaskService:
@@ -231,6 +253,7 @@ class TaskService:
 
         except Exception as e:
             failure_reason_code = None
+            event = None
             # DAH-2748: SSH we could not open is an availability error, not a verdict on the
             # machine. One is enough to hide the node until a cycle succeeds.
             if is_opening_ssh_connection and _is_ssh_transport_failure(e):
@@ -252,7 +275,8 @@ class TaskService:
                 # backend call included): inside a rollout window that withholds a verdict for two
                 # cycles at most, outside it the name changes nothing.
                 if has_reached_the_node and _is_ssh_transport_failure(e):
-                    failure_reason_code = TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+                    event = _transport_unreachable_event(executor_uuid=executor_info.uuid, error=e)
+                    failure_reason_code = event.reason_code
                 log_text = _m(
                     "Pipeline validation error",
                     extra=get_extra_info({
@@ -288,6 +312,7 @@ class TaskService:
                 gpu_attestation_passed=gpu_attestation_passed,
                 availability_errors=availability_problems,
                 failure_reason_code=failure_reason_code,
+                validation_event=event,
             )
 
 

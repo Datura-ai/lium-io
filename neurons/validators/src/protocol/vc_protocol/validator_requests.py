@@ -219,7 +219,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # stale cleanup reaped. None when the cycle never reached the rented-state check. The backend
     # writes it onto rental_history; an older backend ignores the key.
     pod_states: list[PodContainerState] | None = None
-    # This cycle's SSH probe of each RUNNING pod rented on the node, successes included. None until
+    # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None until
     # the cycle probes; an older backend ignores the key.
     pod_ssh: list[PodSshObservation] | None = None
 

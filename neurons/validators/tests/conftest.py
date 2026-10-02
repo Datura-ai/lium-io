@@ -101,6 +101,13 @@ def update_snapshot(request: pytest.FixtureRequest) -> bool:
     return request.config.getoption("--update-snapshot")
 
 
+@pytest.fixture(autouse=True)
+def no_docker_hub_digest_on_rent_path():
+    """create_container asks Docker Hub for a present image's digest; no answer keeps tests offline."""
+    with patch("services.docker_service.fetch_docker_hub_digest", AsyncMock(return_value=None)) as lookup:
+        yield lookup
+
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_sql_logging():
     """Enable SQL query logging for all tests."""

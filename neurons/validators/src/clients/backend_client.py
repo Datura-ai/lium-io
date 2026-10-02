@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
@@ -20,6 +20,7 @@ from protocol.vc_protocol.compute_requests import (
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
+    RentedGpuDropResponse,
     VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
@@ -296,6 +297,53 @@ class BackendClient:
             PodHostRebootRecoveredResponse,
             json_data={"container_finished_at": container_finished_at},
             timeout=10,
+        )
+
+    async def report_rented_gpu_drop(
+        self,
+        pod_id: str,
+        *,
+        state: str,
+        executor_id: str,
+        first_seen_at: str,
+        consecutive_cycles: int,
+        expected_gpu_count: int,
+        visible_gpu_count: int,
+        missing_uuids: list[str],
+        nvml_error_code: int | None,
+        faults: list[str],
+        pod_gpu_count: int | None,
+        rented_gpu_count: int | None,
+        nvml_gpu_count: int,
+    ) -> RentedGpuDropResponse | None:
+        """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
+        (``state="recovered"``).
+
+        The backend keeps one incident per pod until the recovery and tells the provider, support and
+        the renter once per incident. Older backends 404, which is no answer: the caller reports again
+        next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
+        ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
+        ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
+            RentedGpuDropResponse,
+            json_data={
+                "state": state,
+                "executor_id": executor_id,
+                "first_seen_at": first_seen_at,
+                "consecutive_cycles": consecutive_cycles,
+                "expected_gpu_count": expected_gpu_count,
+                "visible_gpu_count": visible_gpu_count,
+                "missing_uuids": missing_uuids,
+                "nvml_error_code": nvml_error_code,
+                "faults": faults,
+                "pod_gpu_count": pod_gpu_count,
+                "rented_gpu_count": rented_gpu_count,
+                "nvml_gpu_count": nvml_gpu_count,
+            },
+            timeout=10,
+            non_200_log_level=logging.WARNING,
         )
 
     async def get_filler_run_active(
