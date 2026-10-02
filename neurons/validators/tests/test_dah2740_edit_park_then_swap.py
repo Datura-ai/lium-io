@@ -9,6 +9,7 @@ name, and a failure renames the old one back and starts it.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -97,6 +98,59 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
     # only after the replacement is up is the old container removed; the new one never is
     assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv {parked}"
     assert f"/usr/bin/docker rm -fv {name} 2>/dev/null || true" not in ssh.commands
+
+
+@pytest.mark.asyncio
+async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert ssh.commands == [
+        f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" --filter name=^{name}$ --filter name=^{parked}$',
+        f"/usr/bin/docker rename {name} {parked}",
+        f"/usr/bin/docker stop -t 10 {parked}",
+        '/usr/bin/docker volume ls --format "{{.Name}}"',
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
+        "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+        f"/usr/bin/docker rm -fv {parked}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch):
+    """After the reply the edit is a success: a delete's wait timing out, or a shutdown, cancels the
+    steps after it, and that removes the parked container instead of undoing the edit."""
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+
+    async def inspector_start_that_hangs(**kwargs) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(svc, "_run_inspector_collector_lifecycle", inspector_start_that_hangs)
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+    await asyncio.sleep(0)
+    steps_finished = await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=0.01)
+
+    assert isinstance(result, ContainerCreated)
+    assert steps_finished is False
+    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv {parked}"
+    assert f"/usr/bin/docker rename {parked} {name}" not in ssh.commands
 
 
 @pytest.mark.asyncio
