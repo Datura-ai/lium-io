@@ -173,12 +173,23 @@ class CollateralStatusReader:
 
     async def _read(self, executor_uuid: str, evm_address: str, required_tao: Decimal | None) -> CollateralStatus:
         to = settings.COLLATERAL_CONTRACT_ADDRESS
+        # both calls at one block hash (EIP-1898): "latest" twice can answer from two blocks or forks,
+        # pairing an old owner with a new owner's deposit
+        [head] = await self._rpc(
+            [{"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByNumber", "params": ["latest", False]}]
+        )
+        block_hash = (head.get("result") or {}).get("hash") if isinstance(head, dict) else None
+        if not block_hash:
+            raise ValueError("eth_getBlockByNumber has no block hash")
         batch = [
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "eth_call",
-                "params": [{"to": to, "data": executor_call_data(selector, executor_uuid)}, "latest"],
+                "params": [
+                    {"to": to, "data": executor_call_data(selector, executor_uuid)},
+                    {"blockHash": block_hash, "requireCanonical": True},
+                ],
             }
             for request_id, selector in ((1, EXECUTOR_TO_MINER_SELECTOR), (2, COLLATERALS_SELECTOR))
         ]

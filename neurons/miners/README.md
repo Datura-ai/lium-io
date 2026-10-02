@@ -245,11 +245,11 @@ This will display the TAO collateral associated with the specified executor.
 To reclaim your collateral, use the following command:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-collateral --executor_uuid <executor_uuid> --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-collateral --executor_uuid <executor_uuid>
 ```
 
 - `<executor_uuid>`: The uuid of the executor.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
+- The command asks for the Ethereum private key at a hidden prompt and takes no `--private-key` option, so the key stays out of shell history and the process list.
 
 The command logs the reclaim request ID; keep it for the finalize step.
 
@@ -279,11 +279,11 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-cont
 To finalize a reclaim request and reclaim your collateral, use the following command:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim-request-id <reclaim-request-id> --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim-request-id <reclaim-request-id>
 ```
 
 - `<reclaim-request-id>`: The ID of the reclaim request you wish to finalize.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
+- The command asks for the Ethereum private key at a hidden prompt and takes no `--private-key` option, so the key stays out of shell history and the process list.
 
 This command will finalize the reclaim request and return the collateral to your account. Reclaim request IDs are counted per contract; when the same ID is open on both contracts for your key, the command asks for the version.
 

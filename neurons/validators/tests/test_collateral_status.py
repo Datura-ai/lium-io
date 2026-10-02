@@ -27,6 +27,7 @@ MINER_EVM = "0x1111111111111111111111111111111111111111"
 OTHER_EVM = "0x2222222222222222222222222222222222222222"
 GPU_MODEL = "NVIDIA H100 80GB HBM3"
 GPU_COUNT = 8
+BLOCK_HASH = "0x" + "ab" * 32
 # 0.103 TAO per H100 × 8 cards × COLLATERAL_DAYS (7)
 REQUIRED_TAO = Decimal("5.768")
 
@@ -45,9 +46,11 @@ class FakeRpc:
         self.batches: list[list[dict]] = []
 
     async def __call__(self, batch):
-        self.batches.append(batch)
         if self.fail:
             raise self.fail
+        if batch[0]["method"] == "eth_getBlockByNumber":
+            return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": {"hash": BLOCK_HASH}}]
+        self.batches.append(batch)
         results = {
             executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID): _address_word(self.owner),
             executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID): _tao_word(self.collateral_tao),
@@ -106,6 +109,7 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
     [batch] = rpc.batches
     assert [req["params"][0]["to"] for req in batch] == [settings.COLLATERAL_CONTRACT_ADDRESS] * 2
+    assert [req["params"][1] for req in batch] == [{"blockHash": BLOCK_HASH, "requireCanonical": True}] * 2
 
 
 @pytest.mark.asyncio
@@ -180,6 +184,19 @@ async def test_an_rpc_error_answer_is_a_failed_read():
     status, _ = await _status(_reader(rpc))
 
     assert (status.deposited, status.read_failed) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_a_head_with_no_block_hash_is_a_failed_read_and_makes_no_eth_call():
+    calls = []
+
+    async def rpc(batch):
+        calls.append(batch[0]["method"])
+        return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": None}]
+
+    status, _ = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, calls) == (False, True, ["eth_getBlockByNumber"])
 
 
 def _context(context_factory):

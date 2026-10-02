@@ -1263,7 +1263,7 @@ def archive_network(monkeypatch):
     "args,exit_code",
     [
         (["current-contract-version"], 0),
-        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY], 1),
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR], 1),
     ],
     ids=["non-collateral-command", "collateral-command"],
 )
@@ -1271,7 +1271,7 @@ def test_a_command_on_an_unknown_network_runs_or_names_the_setting(archive_netwo
     from cli import cli
 
     with caplog.at_level(logging.INFO):
-        result = CliRunner().invoke(cli, args)
+        result = CliRunner().invoke(cli, args, input=f"{MINER_KEY}\n")
     assert result.exit_code == exit_code, result.output
     if exit_code == 0:
         assert CONTRACT in result.output
@@ -1308,11 +1308,20 @@ def test_replace_collateral_transaction_exits_0_only_on_a_success(archive_networ
     assert MINER_KEY.removeprefix("0x")[:16] not in caplog.text + result.output
 
 
-def test_replace_collateral_transaction_takes_no_key_on_the_command_line(monkeypatch):
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["replace-collateral-transaction"],
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR],
+        ["finalize-reclaim-request", "--reclaim-request-id", "5"],
+    ],
+    ids=lambda args: args[0],
+)
+def test_a_signing_collateral_command_takes_no_key_on_the_command_line(monkeypatch, args):
     import cli as cli_module
 
     monkeypatch.setattr(cli_module, "get_collateral_contract", lambda **_: pytest.fail("nothing may be signed"))
-    result = CliRunner().invoke(cli_module.cli, ["replace-collateral-transaction", "--private-key", MINER_KEY])
+    result = CliRunner().invoke(cli_module.cli, [*args, "--private-key", MINER_KEY])
     assert result.exit_code == 2
     assert "No such option" in result.output
 
@@ -1379,13 +1388,11 @@ def assert_no_rpc_secret(text: str):
 @pytest.mark.parametrize(
     "args,stdin",
     [
-        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY], None),
-        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
-         + ["--contract", "1.0.2"], None),
-        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY], None),
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR], f"{MINER_KEY}\n"),
+        (["reclaim-collateral", "--executor_uuid", EXECUTOR, "--contract", "1.0.2"], f"{MINER_KEY}\n"),
+        (["finalize-reclaim-request", "--reclaim-request-id", "5"], f"{MINER_KEY}\n"),
         (["get-balance-of-eth-address", "--private-key", MINER_KEY], None),
-        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY]
-         + ["--contract", "1.0.2"], None),
+        (["finalize-reclaim-request", "--reclaim-request-id", "5", "--contract", "1.0.2"], f"{MINER_KEY}\n"),
         (["get-miner-collateral", "--contract", "1.0.2"], None),
         (["get-executor-collateral", "--address", "192.0.2.10", "--port", "8001"]
          + ["--contract", "1.0.2"], None),
@@ -1455,11 +1462,11 @@ cli()
 @pytest.mark.parametrize(
     "args",
     [
-        ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY],
-        ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY],
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR],
+        ["finalize-reclaim-request", "--reclaim-request-id", "5"],
         # --contract skips detection: the send itself fails, and that must exit 1 too
-        ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY, "--contract", "1.0.2"],
-        ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY, "--contract", "1.0.2"],
+        ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--contract", "1.0.2"],
+        ["finalize-reclaim-request", "--reclaim-request-id", "5", "--contract", "1.0.2"],
         ["get-balance-of-eth-address", "--private-key", MINER_KEY],
     ],
     ids=lambda args: "-".join(a for a in args if a in {"reclaim-collateral", "finalize-reclaim-request", "get-balance-of-eth-address", "--contract"}),
@@ -1481,6 +1488,7 @@ def test_collateral_command_process_output_leaves_out_a_keyed_rpc_url(rejecting_
     }
     result = subprocess.run(
         [sys.executable, "-c", RPC_CLI_BOOTSTRAP, str(src), *args],
+        input=f"{MINER_KEY}\n",
         env=env,
         capture_output=True,
         text=True,

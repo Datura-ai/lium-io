@@ -147,7 +147,7 @@ def test_reclaim_uses_the_contract_that_holds_the_collateral(chain, cli_services
 
     chain.collateral[holder] = "0.5"
     result = CliRunner().invoke(
-        cli, ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
+        cli, ["reclaim-collateral", "--executor_uuid", EXECUTOR], input=f"{MINER_KEY}\n"
     )
     assert result.exit_code == 0, result.output
     assert cli_services == [version]
@@ -156,8 +156,8 @@ def test_reclaim_uses_the_contract_that_holds_the_collateral(chain, cli_services
 def test_reclaim_contract_option_skips_detection(chain, cli_services):
     from cli import cli
 
-    args = ["reclaim-collateral", "--executor_uuid", EXECUTOR, "--private-key", MINER_KEY]
-    result = CliRunner().invoke(cli, [*args, "--contract", "1.0.0"])
+    args = ["reclaim-collateral", "--executor_uuid", EXECUTOR]
+    result = CliRunner().invoke(cli, [*args, "--contract", "1.0.0"], input=f"{MINER_KEY}\n")
     assert result.exit_code == 0, result.output
     assert cli_services == ["1.0.0"]
     assert chain.reads == []
@@ -174,7 +174,7 @@ def test_reclaim_contract_option_skips_detection(chain, cli_services):
 def test_nothing_to_do_on_any_contract_exits_1_and_sends_nothing(chain, cli_services, args):
     from cli import cli
 
-    result = CliRunner().invoke(cli, [*args, "--private-key", MINER_KEY])
+    result = CliRunner().invoke(cli, args, input=f"{MINER_KEY}\n")
     # the same exit code as the contract rejecting the call when --contract names one
     assert result.exit_code == 1, result.output
     assert cli_services == []
@@ -189,7 +189,7 @@ def test_finalize_uses_the_contract_with_this_miners_open_request(chain, cli_ser
     # the same id on the current contract belongs to another miner
     chain.reclaims[(CONTRACT, 7)] = (UUID(EXECUTOR).bytes, "0x" + "22" * 20, 10**17, 0)
     result = CliRunner().invoke(
-        cli, ["finalize-reclaim-request", "--reclaim-request-id", "7", "--private-key", MINER_KEY]
+        cli, ["finalize-reclaim-request", "--reclaim-request-id", "7"], input=f"{MINER_KEY}\n"
     )
     assert result.exit_code == 0, result.output
     assert cli_services == ["1.0.0"]
@@ -225,7 +225,7 @@ def test_finalize_reads_every_contract_at_one_finalized_block(chain, cli_service
     assert chain.reclaim_blocks == [FINALIZED_HASH, FINALIZED_HASH]
 
     result = CliRunner().invoke(
-        cli, ["finalize-reclaim-request", "--reclaim-request-id", "5", "--private-key", MINER_KEY], input="2\n"
+        cli, ["finalize-reclaim-request", "--reclaim-request-id", "5"], input=f"{MINER_KEY}\n2\n"
     )
     assert result.exit_code == 0, result.output
     assert ("Select contract version" in result.output) is prompted
@@ -262,7 +262,10 @@ MALFORMED_KEYS = ["0x" + "ab" * 8, "not-a-hex-private-key", "zq" * 32]
 def test_malformed_key_exits_1_and_logs_an_error_without_the_key(chain, cli_services, caplog, args, bad_key):
     from cli import cli
 
-    result = CliRunner().invoke(cli, [*args, "--private-key", bad_key])
+    if args[0] in ("reclaim-collateral", "finalize-reclaim-request"):
+        result = CliRunner().invoke(cli, args, input=f"{bad_key}\n")
+    else:
+        result = CliRunner().invoke(cli, [*args, "--private-key", bad_key])
 
     assert result.exit_code == 1, result.output
     assert cli_services == []
