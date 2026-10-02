@@ -1043,8 +1043,8 @@ async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
     client = client_with(provider)
 
     with pytest.raises(collateral_module.RpcReadError, match="does not have the block"):
-        await client.get_executor_collateral(EXECUTOR, block_hash="0x" + "ee" * 32)
-    assert await client.get_executor_collateral(EXECUTOR, block_hash=provider.chain_hash(5000)) == Decimal("0.01")
+        await client.get_executor_collateral(EXECUTOR, block_hash=bytes.fromhex("ee" * 32))
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash()) == Decimal("0.01")
 
 
 FORK_B = "0x" + "0b" * 32
