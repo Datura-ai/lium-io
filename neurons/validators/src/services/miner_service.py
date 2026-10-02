@@ -241,6 +241,8 @@ REST_SSH_SUBMIT_TIMEOUT = 30  # Timeout for SSH key submission requests
 REST_CONTAINER_OP_TIMEOUT = 30  # Timeout for container operations
 REST_POD_LOGS_TIMEOUT = 30  # Timeout for pod logs requests
 REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
+# DAH-3980 liumd: the key submit and the inspector start after an agent rent, together
+AGENT_RENT_INSPECTOR_START_TIMEOUT = 60
 
 # Emitted instead of a validation result for an executor under a special manual (bare-metal)
 # rental. Distinct string so manual passes are greppable in Loki and can never be mistaken for a
@@ -1432,73 +1434,97 @@ class MinerService:
             "container_name": container_name,
         }
         base_url = f"http://{payload.miner_address}:{payload.miner_port}"
-        private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
         try:
-            ssh_request = SSHPubKeySubmitRequest(
-                public_key=public_key,
-                validator_signature=self._sign_validator_pubkey(my_key, public_key),
-                executor_id=payload.executor_id,
-                # the miner's rental hook still hears of the rent, after it
-                is_rental_request=True,
-                miner_hotkey=payload.miner_hotkey,
-            )
-            status, response_data = await self._make_rest_request(
-                method="POST",
-                url=f"{base_url}/api/validator/ssh-pubkey-submit",
-                json_data=self._serialize_request(ssh_request),
-                headers={**self._generate_auth_headers(my_key, payload.miner_hotkey), "Content-Type": "application/json"},
-                timeout=REST_CONTAINER_OP_TIMEOUT,
-                log_extra=log_extra,
-                operation_name="SSH key submit",
-            )
+            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
             try:
-                msg = _parse_miner_response(response_data) if status == 200 and response_data else None
-                executor = msg.executors[0] if isinstance(msg, AcceptSSHKeyRequest) and msg.executors else None
-                if executor is None or executor.uuid != payload.executor_id:
-                    logger.error(
-                        _m("No SSH to the node after an agent rent; inspector not started", extra=get_extra_info(log_extra))
-                    )
-                    return
-                docker_service = self.liumd_rent.docker_service
-                await docker_service._cache_rented_pod_best_effort(executor, payload.pod_id, container_name, log_extra)
-                if settings.ENABLE_INSPECTOR:
-                    started_ms = now_ms()
-                    pkey = asyncssh.import_private_key(
-                        self.ssh_service.decrypt_payload(my_key.ss58_address, private_key.decode("utf-8"))
-                    )
-                    known_hosts = await docker_service._prepare_known_hosts_policy(executor, payload.miner_hotkey, log_extra)
-                    async with asyncssh.connect(
-                        host=executor.address,
-                        port=executor.ssh_port,
-                        username=executor.ssh_username,
-                        client_keys=[pkey],
-                        known_hosts=known_hosts,
-                    ) as ssh_client:
-                        # logs its own failure as "Inspector collector start failed"
-                        await docker_service._run_inspector_collector_lifecycle(ssh_client, executor, "start", log_extra)
-                    logger.info(
-                        _m(
-                            "Create step after reply finished",
-                            extra=get_extra_info({
-                                **log_extra,
-                                "step": ProfilerStepName.INSPECTOR_START.value,
-                                "duration_ms": now_ms() - started_ms,
-                            }),
-                        )
+                async with asyncio.timeout(AGENT_RENT_INSPECTOR_START_TIMEOUT):
+                    await self._submit_key_and_start_inspector(
+                        payload, container_name, my_key, private_key, public_key, base_url, log_extra
                     )
             finally:
-                await self._remove_ssh_key_via_rest(
-                    base_url=base_url,
-                    my_key=my_key,
-                    public_key=public_key,
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    log_extra=log_extra,
-                )
+                # a lost, timed-out or cancelled submit may still have installed the key; the removal stays
+                # outside the time limit, a removal cut short is the key left on the node
+                for _ in range(2):
+                    if await self._remove_ssh_key_via_rest(
+                        base_url=base_url,
+                        my_key=my_key,
+                        public_key=public_key,
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        log_extra=log_extra,
+                    ):
+                        break
+                else:
+                    logger.error(
+                        _m("Validator key may be left on the node after an agent rent", extra=get_extra_info(log_extra))
+                    )
         except Exception as exc:
             logger.error(
-                _m("Create steps after reply failed", extra=get_extra_info({**log_extra, "error": str(exc)})),
+                _m("Create steps after reply failed", extra=get_extra_info({**log_extra, "error": repr(exc)})),
                 exc_info=True,
+            )
+
+    async def _submit_key_and_start_inspector(
+        self,
+        payload: ContainerCreateRequest,
+        container_name: str,
+        my_key: bittensor.Keypair,
+        private_key: bytes,
+        public_key: bytes,
+        base_url: str,
+        log_extra: dict,
+    ) -> None:
+        # the miner key exchange of an agent rent, then the rented-pod cache and the inspector start over SSH
+        ssh_request = SSHPubKeySubmitRequest(
+            public_key=public_key,
+            validator_signature=self._sign_validator_pubkey(my_key, public_key),
+            executor_id=payload.executor_id,
+            # the miner's rental hook still hears of the rent, after it
+            is_rental_request=True,
+            miner_hotkey=payload.miner_hotkey,
+        )
+        status, response_data = await self._make_rest_request(
+            method="POST",
+            url=f"{base_url}/api/validator/ssh-pubkey-submit",
+            json_data=self._serialize_request(ssh_request),
+            headers={**self._generate_auth_headers(my_key, payload.miner_hotkey), "Content-Type": "application/json"},
+            timeout=REST_CONTAINER_OP_TIMEOUT,
+            log_extra=log_extra,
+            operation_name="SSH key submit",
+        )
+        msg = _parse_miner_response(response_data) if status == 200 and response_data else None
+        executor = msg.executors[0] if isinstance(msg, AcceptSSHKeyRequest) and msg.executors else None
+        if executor is None or executor.uuid != payload.executor_id:
+            logger.error(
+                _m("No SSH to the node after an agent rent; inspector not started", extra=get_extra_info(log_extra))
+            )
+            return
+        docker_service = self.liumd_rent.docker_service
+        await docker_service._cache_rented_pod_best_effort(executor, payload.pod_id, container_name, log_extra)
+        if settings.ENABLE_INSPECTOR:
+            started_ms = now_ms()
+            pkey = asyncssh.import_private_key(
+                self.ssh_service.decrypt_payload(my_key.ss58_address, private_key.decode("utf-8"))
+            )
+            known_hosts = await docker_service._prepare_known_hosts_policy(executor, payload.miner_hotkey, log_extra)
+            async with asyncssh.connect(
+                host=executor.address,
+                port=executor.ssh_port,
+                username=executor.ssh_username,
+                client_keys=[pkey],
+                known_hosts=known_hosts,
+            ) as ssh_client:
+                # logs its own failure as "Inspector collector start failed"
+                await docker_service._run_inspector_collector_lifecycle(ssh_client, executor, "start", log_extra)
+            logger.info(
+                _m(
+                    "Create step after reply finished",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "step": ProfilerStepName.INSPECTOR_START.value,
+                        "duration_ms": now_ms() - started_ms,
+                    }),
+                )
             )
 
     async def _route_container(self, payload: ContainerBaseRequest):

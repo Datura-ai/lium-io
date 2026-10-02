@@ -518,6 +518,9 @@ class ComputeClient:
                 async with self.lock:
                     log_to_send = self.message_queue.pop(0)
 
+                if isinstance(log_to_send, LiumdRentRequest) and liumd_agent_frames.is_rent_without_waiter(log_to_send):
+                    # DAH-3980 liumd: that rent has already failed; sent now, the agent would build an orphan pod
+                    continue
                 if log_to_send:
                     try:
                         await self.send_model(log_to_send)

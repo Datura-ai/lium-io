@@ -16,6 +16,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from docker.utils import parse_bytes
@@ -46,6 +47,7 @@ from services.docker_service import (
     _build_volume_setup_exec_script,
     _opaque_shell_name,
     _xor_wrap_passphrase,
+    create_steps_after_reply,
     inflight_creates,
 )
 from services.gpu_power_limit import MIN_POWER_LIMIT_RATIO, read_gpu_power_restore_records
@@ -67,6 +69,25 @@ LIUMD_DELETE_POLL_SECONDS = 0.1
 LOG_TAG = "container_creation"
 # the agents refuse a rent whose `validator_hotkey` is not this shape (liumd-rent agent.rs, check_rent_frame)
 SS58_ADDRESS_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{47,48}")
+# the agent's step names (design §2.3), each a `liumd <step>` profiler row; any other step a reply names is dropped
+LIUMD_STEP_NAMES = frozenset(
+    step.value.removeprefix("liumd ")
+    for step in ProfilerStepName
+    if step.value.startswith("liumd ") and step != ProfilerStepName.LIUMD_ROUND_TRIP
+)
+# a failed exec reports the step its exit code maps to (the rent's `exit_codes`)
+LIUMD_FAILED_STEP_NAMES = LIUMD_STEP_NAMES | {step for step, _ in _VOLUME_SETUP_EXEC_FAILURES.values()}
+# the `error` codes of design §2.3; any other code is reported as `unknown`
+LIUMD_ERROR_CODES = frozenset(
+    {"not_connected", "send_failed", "reply_lost", "protocol", "ineligible", "busy", "step_failed", "deadline", "cancelled"}
+)
+# compute-app's codes for a rent it may have handed to the agent: they cannot know the host's state, whatever
+# their flags say
+LIUMD_HOST_UNKNOWN_CODES = frozenset({"send_failed", "reply_lost"})
+# the connector's word on an attempt, kept for the agent's `attempt_state unacked` after a lost ack (design §3)
+ATTEMPT_ACKED = "acked"
+ATTEMPT_FAILED = "failed"
+ATTEMPT_MARK_TTL_SECONDS = 3600
 
 
 def liumd_ineligibility_reason(payload: ContainerCreateRequest) -> str | None:
@@ -109,37 +130,97 @@ class LiumdAgentFrames:
     def __init__(self) -> None:
         # set by ComputeClient; False when the compute-app socket is down and nothing can be sent
         self.send_to_backend: Callable[[LiumdRentRequest], bool] | None = None
-        self._replies_by_attempt: dict[str, asyncio.Queue[dict]] = {}
+        # set by LiumdRentService: where the connector's word on each attempt is kept (design §3)
+        self.redis_service: RedisService | None = None
+        self._waiters_by_attempt: dict[str, _ReplyWaiter] = {}
+        self._settle_tasks: set[asyncio.Task] = set()
 
     def send(self, request: LiumdRentRequest) -> bool:
         return self.send_to_backend is not None and self.send_to_backend(request)
 
+    def is_rent_without_waiter(self, request: LiumdRentRequest) -> bool:
+        # a `rent` still queued after its waiter gave up (timeout, cancel) must never reach the agent
+        return request.frame.get("type") == "rent" and request.frame.get("attempt") not in self._waiters_by_attempt
+
     @contextlib.contextmanager
-    def waiting_for(self, attempt: str) -> Iterator[asyncio.Queue[dict]]:
-        replies: asyncio.Queue[dict] = asyncio.Queue()
-        self._replies_by_attempt[attempt] = replies
+    def waiting_for(self, executor_id: str, pod_id: str, attempt: str) -> Iterator[asyncio.Queue[dict]]:
+        waiter = _ReplyWaiter(executor_id=executor_id, pod_id=pod_id, replies=asyncio.Queue())
+        self._waiters_by_attempt[attempt] = waiter
         try:
-            yield replies
+            yield waiter.replies
         finally:
-            del self._replies_by_attempt[attempt]
+            del self._waiters_by_attempt[attempt]
 
     def deliver(self, message: LiumdAgentFrame) -> None:
+        # called from the compute-app receive loop: a bad frame is dropped here and never raises into it
+        try:
+            self._deliver(message)
+        except Exception as exc:
+            logger.warning(
+                _m("liumd frame dropped", extra=get_extra_info({"executor_id": message.executor_id, "error": repr(exc)}))
+            )
+
+    def _deliver(self, message: LiumdAgentFrame) -> None:
         frame = message.frame
+        rent_id, attempt = frame.get("rent_id"), frame.get("attempt")
         log_fields = {
             "executor_id": message.executor_id,
-            "frame_type": frame.get("type"),
-            "rent_id": frame.get("rent_id"),
-            "attempt": frame.get("attempt"),
+            "frame_type": str(frame.get("type")),
+            "rent_id": rent_id if isinstance(rent_id, str) else None,
+            "attempt": attempt if isinstance(attempt, str) else None,
         }
-        if frame.get("type") == "attempt_state":
-            # settle is not built yet (design §3): the agent's word on an earlier attempt is only logged
-            logger.info(_m("liumd attempt_state", extra=get_extra_info({**log_fields, "state": frame.get("state")})))
+        if not (isinstance(rent_id, str) and isinstance(attempt, str)):
+            logger.info(_m("liumd frame dropped: rent_id or attempt is not a string", extra=get_extra_info(log_fields)))
             return
-        replies = self._replies_by_attempt.get(frame.get("attempt"))
-        if replies is None:
+        if frame.get("type") == "attempt_state":
+            state = frame.get("state")
+            logger.info(_m("liumd attempt_state", extra=get_extra_info({**log_fields, "state": str(state)})))
+            # a waiting rent settles its own attempt
+            if state == "unacked" and attempt not in self._waiters_by_attempt:
+                task = asyncio.ensure_future(self._settle(message.executor_id, rent_id, attempt))
+                self._settle_tasks.add(task)
+                task.add_done_callback(self._settle_tasks.discard)
+            return
+        waiter = self._waiters_by_attempt.get(attempt)
+        if waiter is None or (waiter.executor_id, waiter.pod_id, waiter.pod_id) != (message.executor_id, message.pod_id, rent_id):
             logger.info(_m("liumd frame for no waiting rent", extra=get_extra_info(log_fields)))
             return
-        replies.put_nowait(frame)
+        waiter.replies.put_nowait(frame)
+
+    async def _settle(self, executor_id: str, rent_id: str, attempt: str) -> None:
+        # an attempt the agent kept after its `result`: ack only what the connector handed on as created
+        try:
+            mark = await self.redis_service.get(attempt_mark_key(attempt))
+        except Exception as exc:
+            # unanswered, the agent keeps the attempt and reports it again on its next hello
+            logger.warning(_m("liumd settle skipped: attempt mark unreadable", extra=get_extra_info({"attempt": attempt, "error": repr(exc)})))
+            return
+        action = "ack" if mark == ATTEMPT_ACKED.encode() else "rollback"
+        logger.info(_m("liumd settle", extra=get_extra_info({"executor_id": executor_id, "attempt": attempt, "action": action})))
+        self.send(
+            LiumdRentRequest(
+                executor_id=executor_id,
+                pod_id=rent_id,
+                frame=_settle_frame(rent_id, attempt, action),
+            )
+        )
+
+
+@dataclass
+class _ReplyWaiter:
+    # the one source a rent's replies are accepted from
+    executor_id: str
+    pod_id: str
+    replies: asyncio.Queue[dict]
+
+
+@dataclass
+class _RentProgress:
+    # how far a rent got, for what its exit must undo
+    log_extra: dict
+    attempt: str | None = None
+    pending_marked: bool = False
+    sent: bool = False
 
 
 # In-process like inflight_creates: the rent and the compute-app socket live in the one connector loop.
@@ -156,6 +237,7 @@ class LiumdRentService:
         self.redis_service = redis_service
         self.docker_service = docker_service
         self.agent_frames = agent_frames
+        agent_frames.redis_service = redis_service
 
     async def rent_through_agent(
         self, payload: ContainerCreateRequest
@@ -163,11 +245,33 @@ class LiumdRentService:
         # the rent's reply from the node's agent; None when today's path must take the rent (design §3)
         if payload.executor_id not in LIUMD_EXECUTOR_IDS:
             return None
-        log_extra = {
-            "miner_hotkey": payload.miner_hotkey,
-            "executor_id": payload.executor_id,
-            "pod_id": payload.pod_id,
-        }
+        progress = _RentProgress(
+            log_extra={"miner_hotkey": payload.miner_hotkey, "executor_id": payload.executor_id, "pod_id": payload.pod_id}
+        )
+        outcome: ContainerCreated | FailedContainerRequest | None = None
+        try:
+            outcome = await self._rent(payload, progress)
+        except asyncio.CancelledError:
+            if progress.sent:
+                self._abandon_attempt(payload, progress.attempt)
+            raise
+        except Exception as exc:
+            if not progress.sent:
+                # the agent never heard of this rent
+                _log_rent_result(progress.log_extra, attempt=progress.attempt, path="today", reason=f"connector_error_{type(exc).__name__}")
+                return None
+            self._abandon_attempt(payload, progress.attempt)
+            _log_rent_result(progress.log_extra, attempt=progress.attempt, path="failed", reason=f"connector_error_{type(exc).__name__}")
+            outcome = _failed(payload, "The node agent's rent failed", "liumd_connector_error")
+        finally:
+            if not isinstance(outcome, ContainerCreated):
+                await self._release_failed_rent(payload, progress)
+        return outcome
+
+    async def _rent(
+        self, payload: ContainerCreateRequest, progress: _RentProgress
+    ) -> ContainerCreated | FailedContainerRequest | None:
+        # rent_through_agent's work; `progress` tells it what an exit must undo
         started_ms = now_ms()
         reason = liumd_ineligibility_reason(payload)
         if reason is None and await self.redis_service.renting_in_progress(
@@ -176,7 +280,7 @@ class LiumdRentService:
             # today's path declines it with RentingInProgress
             reason = "renting_in_progress"
         if reason is not None:
-            _log_rent_result(log_extra, attempt=None, path="today", reason=reason)
+            _log_rent_result(progress.log_extra, attempt=None, path="today", reason=reason)
             return None
 
         custom_options = CustomOptions.sanitize(payload.custom_options)
@@ -192,12 +296,12 @@ class LiumdRentService:
             payload.workload_kind,
         )
         if not port_maps:
-            _log_rent_result(log_extra, attempt=None, path="today", reason="no_port_maps")
+            _log_rent_result(progress.log_extra, attempt=None, path="today", reason="no_port_maps")
             return None
         port_maps_generated_ms = now_ms()
 
-        attempt = secrets.token_hex(8)
-        log_extra = {**log_extra, "attempt": attempt}
+        attempt = progress.attempt = secrets.token_hex(8)
+        log_extra = progress.log_extra = {**progress.log_extra, "attempt": attempt}
         rent_frame = await self._build_rent_frame(payload, custom_options, attempt, port_maps, log_extra)
         # the same exclusion today's create holds: the rental probe stays off the node, a second create waits
         async with self.redis_service.executor_create_exclusion(payload.executor_id):
@@ -205,41 +309,49 @@ class LiumdRentService:
                 _log_rent_result(log_extra, attempt=attempt, path="failed", reason="cancelled_by_delete")
                 return _failed(payload, "Create cancelled by an in-flight delete", "cancelled_by_delete")
             # PortConnectivityCheck tolerates the port-check containers the agent removes while this is set
+            progress.pending_marked = True
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            with self.agent_frames.waiting_for(attempt) as replies:
+            with self.agent_frames.waiting_for(payload.executor_id, payload.pod_id, attempt) as replies:
                 sent_ms = now_ms()
                 if not self._send_frame(payload, rent_frame):
-                    await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
                     _log_rent_result(log_extra, attempt=attempt, path="today", reason="compute_app_socket_down")
                     return None
+                progress.sent = True
                 ssh_port = next(external for docker, _, external in port_maps if docker == 22)
                 await self._stream_logs(payload, [(f"Port mappings ready: 22->{ssh_port}", "success")])
-                reply, steps_seen, cancelled_by_delete = await self._wait_for_reply(payload, attempt, replies)
+                reply, steps_seen, cancel_sent = await self._wait_for_reply(payload, attempt, replies)
             replied_ms = now_ms()
 
         reply_type = reply["type"] if reply else "timeout"
-        steps = (reply or {}).get("steps") or steps_seen
-        if reply_type == "result":
-            self._send_frame(payload, {"type": "ack", "rent_id": payload.pod_id, "attempt": attempt})
+        steps = _known_steps((reply or {}).get("steps")) or steps_seen
+        # a delete that landed while the reply was on its way wins over the reply
+        cancelled_by_delete = cancel_sent or inflight_creates.is_cancelled(payload.pod_id)
+        result_is_valid = reply_type == "result" and _is_result_of(reply, rent_frame)
+        if reply_type == "result" and (cancelled_by_delete or not result_is_valid):
+            # the agent removes this attempt's container and volume by its label; an ack would leave them to nobody
+            self._send_frame(payload, _settle_frame(payload.pod_id, attempt, "rollback"))
         if cancelled_by_delete:
-            # the delete removes whatever this attempt left; a fallback would build the pod it deleted
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
             _log_rent_result(log_extra, attempt=attempt, path="failed", reason="cancelled_by_delete", steps=steps)
             return _failed(payload, "Create cancelled by an in-flight delete", "cancelled_by_delete")
         if reply_type == "timeout":
-            self._send_frame(payload, {"type": "cancel", "rent_id": payload.pod_id, "attempt": attempt, "reason": "timeout"})
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            self._send_frame(payload, _cancel_frame(payload, attempt, "timeout"))
             _log_rent_result(log_extra, attempt=attempt, path="failed", reason="timeout", steps=steps)
             return _failed(payload, "The node agent did not answer the rent in time", "liumd_timeout")
         if reply_type == "result":
+            if not result_is_valid:
+                _log_rent_result(log_extra, attempt=attempt, path="failed", reason="bad_result", steps=steps)
+                return _failed(payload, "The node agent's rent failed", "liumd_bad_result")
             await self._stream_logs(payload, [("Created Docker Container", "success")])
             _log_rent_result(log_extra, attempt=attempt, path="agent", reason=None, steps=steps, round_trip_ms=replied_ms - sent_ms)
-            return self._container_created(
-                payload, custom_options, reply, port_maps, started_ms, port_maps_generated_ms, sent_ms, replied_ms
+            created = self._container_created(
+                payload, custom_options, steps, port_maps, started_ms, port_maps_generated_ms, sent_ms, replied_ms
             )
+            # a task runs on a later loop turn, after the caller queued ContainerCreated for compute-app
+            # (ComputeClient holds its lock across no await), so the ack follows it in the same queue
+            create_steps_after_reply.start(payload.pod_id, self._acknowledge_result(payload, attempt))
+            return created
 
-        await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-        code = reply.get("code")
+        code = reply.get("code") if reply.get("code") in LIUMD_ERROR_CODES else "unknown"
         if code == "busy":
             _log_rent_result(log_extra, attempt=attempt, path="failed", reason=code, steps=steps)
             return _failed(
@@ -248,30 +360,54 @@ class LiumdRentService:
                 None,
                 error_code=FailedContainerErrorCodes.RentingInProgress,
             )
-        if not reply.get("host_touched") or reply.get("cleaned"):
+        if _host_confirmed_clean(reply):
             # nothing of this pod is left on the host: today's by-name cleanup touches nothing (LIUM-79 F1)
             _log_rent_result(log_extra, attempt=attempt, path="today", reason=f"agent_{code}", steps=steps)
             return None
-        failure_step = f"liumd_{reply.get('failed_step') or code}"
+        # the host may hold this attempt's objects: the agent rolls back on `cancel`; today's path would race it
+        self._send_frame(payload, _cancel_frame(payload, attempt, "timeout"))
+        failed_step = reply.get("failed_step") if reply.get("failed_step") in LIUMD_FAILED_STEP_NAMES else None
+        detail = reply.get("detail") if isinstance(reply.get("detail"), dict) else {}
+        exit_code = detail.get("exit_code") if _is_int(detail.get("exit_code")) else None
+        failure_step = f"liumd_{failed_step or code}"
         _log_rent_result(log_extra, attempt=attempt, path="failed", reason=failure_step, steps=steps)
         return _failed(
             payload,
-            str(reply.get("message") or "The node agent's rent failed"),
+            "The node agent's rent failed",
             failure_step,
             detail=_m(
                 "liumd rent failed and its objects could not be confirmed removed",
-                extra=get_extra_info({
-                    **log_extra,
-                    "code": code,
-                    "failed_step": reply.get("failed_step"),
-                    "exit_code": (reply.get("detail") or {}).get("exit_code"),
-                    "stderr_tail": (reply.get("detail") or {}).get("stderr_tail"),
-                }),
+                extra=get_extra_info({**log_extra, "code": code, "failed_step": failed_step, "exit_code": exit_code}),
             ).to_full_string(),
-            volume_encryption_status=(
-                VolumeEncryptionStatus.FAILED if reply.get("failed_step") == "exec_volume_setup" else None
-            ),
+            volume_encryption_status=VolumeEncryptionStatus.FAILED if failed_step == "exec_volume_setup" else None,
         )
+
+    async def _acknowledge_result(self, payload: ContainerCreateRequest, attempt: str) -> None:
+        # the agent may forget the attempt now; the mark answers its `unacked` if the ack is lost
+        await self._mark_attempt(attempt, ATTEMPT_ACKED)
+        self._send_frame(payload, {"type": "ack", "rent_id": payload.pod_id, "attempt": attempt})
+
+    async def _release_failed_rent(self, payload: ContainerCreateRequest, progress: _RentProgress) -> None:
+        # every exit but ContainerCreated, task cancellation included; never raises over the rent's outcome
+        if progress.pending_marked:
+            try:
+                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            except Exception as exc:
+                logger.warning(_m("liumd pending pod mark not removed", extra=get_extra_info({**progress.log_extra, "error": repr(exc)})))
+        if progress.sent:
+            await self._mark_attempt(progress.attempt, ATTEMPT_FAILED)
+
+    async def _mark_attempt(self, attempt: str, mark: str) -> None:
+        try:
+            await self.redis_service.set(attempt_mark_key(attempt), mark, ex=ATTEMPT_MARK_TTL_SECONDS)
+        except Exception as exc:
+            logger.warning(_m("liumd attempt mark not stored", extra=get_extra_info({"attempt": attempt, "mark": mark, "error": repr(exc)})))
+
+    def _abandon_attempt(self, payload: ContainerCreateRequest, attempt: str) -> None:
+        # the reply may or may not have come: `cancel` stops a running rent, `settle rollback` removes a finished
+        # one; the agent ignores whichever does not fit the attempt's state
+        self._send_frame(payload, _cancel_frame(payload, attempt, "timeout"))
+        self._send_frame(payload, _settle_frame(payload.pod_id, attempt, "rollback"))
 
     def _send_frame(self, payload: ContainerCreateRequest, frame: dict) -> bool:
         return self.agent_frames.send(
@@ -282,22 +418,20 @@ class LiumdRentService:
         self, payload: ContainerCreateRequest, attempt: str, replies: asyncio.Queue[dict]
     ) -> tuple[dict | None, dict[str, int], bool]:
         # the agent's `result` or `error` (None after the deadline), the steps it reported, and whether a
-        # delete cancelled the rent
+        # delete cancelled the rent (its `cancel` is sent)
         deadline = time.monotonic() + LIUMD_RENT_DEADLINE_MS / 1000 + LIUMD_REPLY_GRACE_SECONDS
         steps_seen: dict[str, int] = {}
         cancelled_by_delete = False
         while (remaining := deadline - time.monotonic()) > 0:
             if not cancelled_by_delete and inflight_creates.is_cancelled(payload.pod_id):
                 cancelled_by_delete = True
-                self._send_frame(
-                    payload, {"type": "cancel", "rent_id": payload.pod_id, "attempt": attempt, "reason": "pod_deleted"}
-                )
+                self._send_frame(payload, _cancel_frame(payload, attempt, "pod_deleted"))
             try:
                 frame = await asyncio.wait_for(replies.get(), min(remaining, LIUMD_DELETE_POLL_SECONDS))
             except asyncio.TimeoutError:
                 continue
             if frame.get("type") == "step":
-                steps_seen[frame.get("step")] = frame.get("ms")
+                steps_seen.update(_known_steps({frame.get("step"): frame.get("ms")}))
             elif frame.get("type") in ("result", "error"):
                 return frame, steps_seen, cancelled_by_delete
         return None, steps_seen, cancelled_by_delete
@@ -385,7 +519,7 @@ class LiumdRentService:
         self,
         payload: ContainerCreateRequest,
         custom_options: CustomOptions,
-        result: dict,
+        steps: dict[str, int],
         port_maps: list[tuple[int, int, int]],
         started_ms: int,
         port_maps_generated_ms: int,
@@ -402,11 +536,10 @@ class LiumdRentService:
             ProfilerStep(name=ProfilerStepName.STARTED_IN_SUBNET, duration=started_ms - (payload.timestamp or started_ms)),
             ProfilerStep(name=ProfilerStepName.PORT_MAPPINGS_GENERATED, duration=port_maps_generated_ms - started_ms),
         ]
-        for step_name, duration_ms in (result.get("steps") or {}).items():
-            try:
-                profilers.append(ProfilerStep(name=ProfilerStepName(f"liumd {step_name}"), duration=duration_ms))
-            except ValueError:
-                pass  # a step this connector has no row for
+        profilers += [
+            ProfilerStep(name=ProfilerStepName(f"liumd {step_name}"), duration=duration_ms)
+            for step_name, duration_ms in steps.items()
+        ]
         finished_ms = now_ms()
         profilers += [
             ProfilerStep(name=ProfilerStepName.LIUMD_ROUND_TRIP, duration=replied_ms - sent_ms),
@@ -418,8 +551,8 @@ class LiumdRentService:
             executor_id=payload.executor_id,
             pod_id=payload.pod_id,
             workload_kind=payload.workload_kind,
-            container_name=result["container_name"],
-            volume_name=result["volume_name"],
+            container_name=self.docker_service.get_container_name(payload),
+            volume_name=f"volume_{payload.pod_id}",
             port_maps=[(docker_port, external_port) for docker_port, _, external_port in port_maps],
             profilers=profilers,
             warnings=[],
@@ -532,3 +665,43 @@ def _log_rent_result(
             }),
         )
     )
+
+
+def attempt_mark_key(attempt: str) -> str:
+    return f"liumd:attempt:{attempt}"
+
+
+def _cancel_frame(payload: ContainerCreateRequest, attempt: str, reason: str) -> dict:
+    return {"type": "cancel", "rent_id": payload.pod_id, "attempt": attempt, "reason": reason}
+
+
+def _settle_frame(rent_id: str, attempt: str, action: str) -> dict:
+    return {"type": "settle", "rent_id": rent_id, "attempt": attempt, "action": action}
+
+
+def _known_steps(steps: object) -> dict[str, int]:
+    # only the agent's own step names with int durations reach the logs and the profile
+    if not isinstance(steps, dict):
+        return {}
+    return {name: ms for name, ms in steps.items() if name in LIUMD_STEP_NAMES and _is_int(ms)}
+
+
+def _is_int(value: object) -> bool:
+    # JSON true / false arrive as bool, which isinstance counts as int
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_result_of(result: dict, rent_frame: dict) -> bool:
+    # the container and volume the rent asked for; the connector reports these names to compute-app
+    return (
+        result.get("container_name") == rent_frame["container"]["name"]
+        and result.get("volume_name") == rent_frame["volume"]["name"]
+    )
+
+
+def _host_confirmed_clean(error: dict) -> bool:
+    # the agent's explicit word that nothing of the rent is on the host; a missing or non-bool flag is unknown
+    if error.get("code") in LIUMD_HOST_UNKNOWN_CODES:
+        return False
+    host_touched = error.get("host_touched")
+    return host_touched is False or (host_touched is True and error.get("cleaned") is True)
