@@ -2,7 +2,8 @@
 
 **[Validator Documentation](https://docs.lium.io/validators)**
 
-Subnet 51 has one validator, operated by the Lium team (hotkey `5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p`).
+Subnet 51 has one validator, operated by the Lium team (hotkey `5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p`;
+it swaps to `5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK` — swap pending, executors and miners accept both).
 This directory is its source. If you want to verify what the validator does, use the community
 [sn51-auditor](https://github.com/Datura-ai/sn51-auditor) instead of running a second validator.
 The steps below are for the Lium team's own deployments and for testnet.

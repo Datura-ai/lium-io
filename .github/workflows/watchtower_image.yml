@@ -15,7 +15,7 @@ on:
       tag:
         description: "Version tag to push; must equal project.version in watchtower/pyproject.toml"
         type: string
-        default: "1.1.1"
+        default: "1.2.0"
         required: true
       push_staging:
         description: "Also build with the staging digest endpoint baked in and push <tag>-staging"
