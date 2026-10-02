@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
+
+from core.config import settings
 
 from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
@@ -178,6 +181,65 @@ def _classify_scrape_failure(
             gpu_scrape_error=str(gpu_scrape_error)[:200],
         )
     return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
+
+
+# The scrape's own NVML reading on the host says the node cannot serve a GPU: NVML answered with zero cards
+# (SCRAPE_FAILED_NO_GPU), or raised one of these nvml.h return codes (SCRAPE_FAILED_DRIVER): driver not
+# loaded, GPU lost, GPU requires reset, GPU not found. Anything else stays a plain halt: the library copied
+# to a temp file that a full or read-only disk refuses (LIBRARY_NOT_FOUND), a driver/library mismatch that
+# leaves pods started before the upgrade working, a permission or memory error, UNKNOWN (999, which names
+# no fault), and SCRAPE_FAILED_ON_HOST (a missing interpreter or a traceback says nothing of the GPU).
+HOST_GPU_RUNTIME_DEAD_NVML_CODES = frozenset({9, 15, 16, 28})
+_NVML_ERROR_CODE_RX = re.compile(r"^NVMLError\w*\((\d+)\)")
+HOST_GPU_RUNTIME_FAULT_IMPACT = (
+    "Validation halted — GPU runtime dead on the host of a rented node: verified job cleared, "
+    "executor marked inactive until a clean scrape"
+)
+
+
+def _gpu_runtime_is_dead(failure: ScrapeFailure) -> bool:
+    if failure.template.reason == Msg.SCRAPE_FAILED_NO_GPU.reason:
+        return True
+    if failure.template.reason != Msg.SCRAPE_FAILED_DRIVER.reason:
+        return False
+    match = _NVML_ERROR_CODE_RX.match(failure.gpu_scrape_error or "")
+    return match is not None and int(match.group(1)) in HOST_GPU_RUNTIME_DEAD_NVML_CODES
+
+
+def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
+    """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing.
+
+    It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
+    and billing stops. It is handled like GPU_MISSING: with the matching backend change the backend proposes
+    EXECUTOR_INACTIVE_MID_RENTAL for it, and the node is listed again only after a full GPU re-verification.
+    A node without a customer pod keeps the plain halt.
+    """
+    if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
+        return {}
+    if not _gpu_runtime_is_dead(failure):
+        return {}
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    if not rented_executor or not rented_executor.pods:
+        return {}
+    # The executor UUID is the miner's word and the backend resets by UUID alone, so a rental another miner
+    # owns must never be cleared on this miner's report.
+    if rented_executor.miner_hotkey != ctx.miner_hotkey:
+        return {}
+    pod_ids = [pod.pod_id for pod in rented_executor.pods]
+    evidence: dict[str, Any] = {
+        "reason_code": failure.template.reason,
+        "check_id": check_id,
+        "pod_id": pod_ids[0],
+        "rented_pod_ids": pod_ids,
+        "scrape_error": failure.scrape_error,
+    }
+    if failure.gpu_scrape_error is not None:
+        evidence["gpu_scrape_error"] = failure.gpu_scrape_error
+    return {
+        "clear_verified_job_info": True,
+        "clear_verified_job_evidence": evidence,
+    }
 
 
 def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -> dict[str, Any]:
@@ -388,10 +450,12 @@ class MachineSpecScrapeCheck:
                 await _report_rented_gpu_loss(
                     ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)
                 )
+            reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
             event = render_message(
                 failure.template,
                 ctx=ctx,
                 check_id=self.check_id,
+                impact=HOST_GPU_RUNTIME_FAULT_IMPACT if reset else None,
                 what={
                     **what,
                     "command_id": scrape_run.command_id,
@@ -399,9 +463,10 @@ class MachineSpecScrapeCheck:
                     "duration_ms": scrape_run.duration_ms,
                     "stderr_tail": scrape_run.stderr[-400:],
                     **failure.cause_event_fields(),
+                    **({"host_gpu_fault_reset": True} if reset else {}),
                 },
             )
-            return CheckResult(passed=False, event=event)
+            return CheckResult(passed=False, event=event, updates=reset)
 
         try:
             decrypted = _decrypt_payload(ctx, scrape_run.stdout)

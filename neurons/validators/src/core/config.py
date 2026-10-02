@@ -404,6 +404,17 @@ class Settings(BaseSettings):
     RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
         env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
     )
+    # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
+    # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
+    # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
+    # marks the executor inactive and stops billing the renter. Only the validator's scrape on the host
+    # decides; nothing read from the renter's container does. A later clean scrape validates the node as
+    # usual. Off (the default): the scrape failure halts the cycle without a reset, as before. On once
+    # the matching backend change has rolled out, which handles this reset like GPU_MISSING (penalty
+    # proposed, relisted only after a full GPU re-verification). Turning it off stops
+    # future resets only: an executor already reset stays inactive until its next clean scrape, and
+    # cycles already skipped are not billed or paid afterwards.
+    RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)
     # Report a rented node that lost a GPU to the backend from the first cycle that sees it (a possible
     # glitch waits one more); observation only, no score change. Off by default.
     RENTED_GPU_DROP_CHECK_ENABLED: bool = Field(env="RENTED_GPU_DROP_CHECK_ENABLED", default=False)
