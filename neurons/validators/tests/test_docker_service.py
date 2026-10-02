@@ -147,6 +147,12 @@ class _FakeRentalDockerClient:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
 
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
+
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
         if self.start_error is not None:
@@ -7714,7 +7720,9 @@ def _state(**overrides) -> ContainerStateSnapshot:
     return ContainerStateSnapshot(**{**base, **overrides})
 
 
-async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, state, exec_error):
+async def _create_failing_at_add_public_keys(
+    docker_service, monkeypatch, *, state, exec_error, failure_step="add_public_keys"
+):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(
         docker_service, "add_ssh_public_keys_with_rental_docker", AsyncMock(side_effect=exec_error)
@@ -7733,8 +7741,13 @@ async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, sta
         private_key="encrypted",
     )
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "add_public_keys", "dashboards key on the step"
-    assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
+    assert result.failure_step == failure_step, "dashboards key on the step"
+    if failure_step == "killed_during_bootstrap":
+        # a kill's msg is its renter-safe cause sentence; the diagnosis stays in detail
+        assert result.msg.startswith(("the container was stopped by the node", "the container stopped before"))
+        assert "cause=" not in result.msg
+    else:
+        assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
     # the container was still there to inspect: the explanation is read before cleanup removes it
     assert inspect.await_args.kwargs == {"container_name": docker_service.get_container_name(payload)}
     cleanup.assert_awaited_once()
@@ -7759,15 +7772,21 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
             "is restarting",
             id="restarting",
         ),
+        # Docker restarts only a command that ended on its own: a SIGTERM-handling CMD's 143 is its own exit
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=143, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-143",
+        ),
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=137, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-137",
+        ),
         pytest.param(
             _state(status="running", running=True, restart_count=1),
             "is restarting",
             id="running-again-after-a-restart",
-        ),
-        pytest.param(
-            _state(status="dead", running=False, exit_code=1, restart_count=0),
-            "is not running",
-            id="dead",
         ),
     ],
 )
@@ -7807,18 +7826,26 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
     [
         pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
         pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+        # `dead` is a removal the daemon could not finish, not the image's exit, whatever the code
+        pytest.param(_state(status="dead", running=False, exit_code=1, restart_count=0), id="dead"),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_key_injection_that_fails_after_a_host_kill_keeps_the_exec_error(
+async def test_a_key_injection_that_fails_after_a_host_kill_is_killed_during_bootstrap(
     docker_service, monkeypatch, state
 ):
     """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
     result = await _create_failing_at_add_public_keys(
-        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+        docker_service,
+        monkeypatch,
+        state=state,
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step="killed_during_bootstrap",
     )
 
-    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+    error = _failure_error_field(result)
+    assert "has no long-running command" not in error
+    assert str(_EXEC_KILLED_BY_EXIT) in error
 
 
 @pytest.mark.asyncio
