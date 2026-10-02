@@ -166,6 +166,68 @@ def block_number(block) -> int:
     return int(number, 16) if isinstance(number, str) else number
 
 
+def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
+    """Init code for a contract-creation eth_call that makes each (calldata, output size) view call to `to` in one
+    EVM run and returns NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run
+    reads one state on one backend, and the three header words prove which block that state is."""
+
+    def push2(value: int) -> bytes:
+        return b"\x61" + value.to_bytes(2, "big")
+
+    scratch = 0x2000
+    code = bytearray()
+    data_slots: list[int] = []
+    revert_slots: list[int] = []
+    out = 0x60
+    for data, size in calls:
+        # CODECOPY(scratch, <data offset>, len)
+        code += push2(len(data))
+        data_slots.append(len(code) + 1)
+        code += push2(0) + push2(scratch) + b"\x39"
+        # STATICCALL(gas, to, scratch, len, out, size); revert on failure or a short answer
+        code += push2(size) + push2(out) + push2(len(data)) + push2(scratch)
+        code += b"\x73" + bytes.fromhex(to.removeprefix("0x")) + b"\x5a\xfa\x15"
+        revert_slots.append(len(code) + 1)
+        code += push2(0) + b"\x57" + push2(size) + b"\x3d\x10"
+        revert_slots.append(len(code) + 1)
+        code += push2(0) + b"\x57"
+        out += size
+    # memory[0:0x60] = NUMBER, BLOCKHASH(NUMBER - 1), TIMESTAMP; RETURN(0, out)
+    code += b"\x43\x60\x00\x52" + b"\x60\x01\x43\x03\x40\x60\x20\x52" + b"\x42\x60\x40\x52"
+    code += push2(out) + b"\x60\x00\xf3"
+    revert_at = len(code)
+    code += b"\x5b\x60\x00\x80\xfd"
+    for slot in revert_slots:
+        code[slot : slot + 2] = revert_at.to_bytes(2, "big")
+    offset = len(code)
+    for slot, (data, _size) in zip(data_slots, calls):
+        code[slot : slot + 2] = offset.to_bytes(2, "big")
+        offset += len(data)
+    return "0x" + bytes(code).hex() + b"".join(data for data, _ in calls).hex()
+
+
+def pinned_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
+    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
+    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
+    if not isinstance(result, str):
+        raise RpcReadError("the pinned read has no answer")
+    raw = bytes.fromhex(result.removeprefix("0x"))
+    if len(raw) != 0x60 + sum(sizes):
+        raise RpcReadError(f"the pinned read answered {len(raw)} bytes")
+    number, parent, timestamp = (raw[i : i + 32] for i in (0, 32, 64))
+    if (
+        int.from_bytes(number, "big") != block_number(header)
+        or not same_hash(parent, header.get("parentHash"))
+        or int.from_bytes(timestamp, "big") != int(header["timestamp"], 16)
+    ):
+        raise RpcReadError("the read did not run on the block it is pinned to")
+    outputs, at = [], 0x60
+    for size in sizes:
+        outputs.append(raw[at : at + size])
+        at += size
+    return outputs
+
+
 def bloom_may_hold(bloom, *values: bytes) -> bool:
     """Whether a block's 2048-bit logs bloom may hold a log with every one of `values` (address, topics): False
     only when the bloom proves it does not. A missing or malformed bloom proves nothing."""
@@ -902,19 +964,21 @@ class CollateralClient:
         """A view function's result at a block named by its hash. A contract function's call(block_identifier=<hash>)
         looks the hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash.
 
-        Frontier ignores requireCanonical and answers a hash it does not know from its pending state, so the call
-        goes in one batch with eth_getBlockByHash: the backend that answers the call must also hold the block, and
-        a null block fails the read."""
+        Frontier ignores requireCanonical and answers a hash it does not know from its pending state, and a gateway
+        can send each entry of a batch to another backend. So the call runs inside pinned_read_code, whose answer
+        carries the number, parent hash and timestamp of the block it ran on, and those must match the block's
+        header; a null header fails the read. Every output of the contract's view functions is a static type."""
         hash_hex = AsyncWeb3.to_hex(block_hash)
-        call = {"to": self.contract_address, "data": function._encode_transaction_data()}
+        outputs = [output["type"] for output in function.abi["outputs"]]
+        size = 32 * len(outputs)
+        code = pinned_read_code(self.contract_address, [(bytes.fromhex(function._encode_transaction_data()[2:]), size)])
         block, result = await self._read_together(
             ("eth_getBlockByHash", [hash_hex, False]),
-            ("eth_call", [call, {"blockHash": hash_hex, "requireCanonical": True}]),
+            ("eth_call", [{"data": code}, {"blockHash": hash_hex, "requireCanonical": True}]),
         )
         if not isinstance(block, dict) or block.get("hash") != hash_hex:
             raise RpcReadError("the RPC does not have the block the read is pinned to")
-        result = bytes.fromhex(result.removeprefix("0x"))
-        outputs = [output["type"] for output in function.abi["outputs"]]
+        [result] = pinned_outputs(result, block, [size])
         decoded = self.w3.codec.decode(outputs, result)
         return decoded[0] if len(outputs) == 1 else tuple(decoded)
 

@@ -125,6 +125,8 @@ class FakeProvider(AsyncBaseProvider):
         self.fork_b_hash = FORK_B
         # transactions of a listed block whose receipt is answered with null, as by a partly synced backend
         self.withheld_receipts = set()
+        # what a backend's pending state answers, by selector, when it runs a call pinned to a hash it does not know
+        self.pending_calls = {}
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -141,6 +143,13 @@ class FakeProvider(AsyncBaseProvider):
             logs_elsewhere = backend in ("logs-lagging", "logs-empty")
             if backend == "a" or params[0] == "finalized" or (logs_elsewhere and method != "eth_getTransactionReceipt"):
                 answer = await self.make_request(method, params)
+            elif backend == "split":
+                # a gateway that sends the header read to A and the call to a backend without the block
+                if method == "eth_call":
+                    self.requests.append((method, params))
+                    answer = self.pinned_run(params, known=False)
+                else:
+                    answer = await self.make_request(method, params)
             elif backend == "logs-empty":
                 self.requests.append((method, params))
                 answer = {"result": None}
@@ -166,6 +175,7 @@ class FakeProvider(AsyncBaseProvider):
             "number": hex(number),
             "hash": block_hash,
             "parentHash": self.chain_hash(number - 1),
+            "timestamp": hex(1_700_000_000 + 12 * number),
             "logsBloom": bloom_of(logs),
             "transactions": list(dict.fromkeys(listed_tx(block_hash, log["transactionHash"]) for log in logs)),
         }
@@ -188,8 +198,35 @@ class FakeProvider(AsyncBaseProvider):
         parent = self.fork_hashes.get(number - 1, self.chain_hash(number - 1))
         return {"number": hex(number), "hash": self.fork_hashes[number], "parentHash": parent}
 
+    def pinned_run(self, params, known: bool = True) -> dict:
+        """A pinned_read_code eth_call: the header words of the block it runs on, then each inner call's answer.
+        A hash this backend does not know runs on its pending state, as Frontier does, with `pending_calls`."""
+        code = bytes.fromhex(params[0]["data"].removeprefix("0x"))
+        number = self.block_number + 1
+        if known:
+            found = next((n for n in range(self.block_number + 1) if self.chain_hash(n) == params[1]["blockHash"]), None)
+            number = found if found is not None else number
+        header = self.block(number) if number <= self.block_number else {
+            "number": hex(number), "parentHash": self.chain_hash(self.block_number), "timestamp": hex(1_800_000_000)
+        }
+        calls = self.calls if number <= self.block_number else {**self.calls, **self.pending_calls}
+        out = int(header["number"], 16).to_bytes(32, "big") + bytes.fromhex(header["parentHash"][2:])
+        out += int(header["timestamp"], 16).to_bytes(32, "big")
+        at = 0
+        while code[at] == 0x61 and code[at + 9] == 0x39:
+            offset = int.from_bytes(code[at + 4 : at + 6], "big")
+            size = int.from_bytes(code[at + 11 : at + 13], "big")
+            answer = calls.get(code[offset : offset + 4].hex())
+            if answer is None or len(answer) - 2 < 2 * size:
+                return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "revert"}}
+            out += bytes.fromhex(answer[2 : 2 + 2 * size])
+            at += 59
+        return {"jsonrpc": "2.0", "id": 1, "result": "0x" + out.hex()}
+
     async def make_request(self, method, params):
         self.requests.append((method, params))
+        if method == "eth_call" and "to" not in params[0]:
+            return self.pinned_run(params)
         if method == "eth_call":
             data = params[0]["data"].removeprefix("0x")
             if params[1] == "latest" and data[:8] in SENDS:
@@ -1045,6 +1082,39 @@ async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
     with pytest.raises(collateral_module.RpcReadError, match="does not have the block"):
         await client.get_executor_collateral(EXECUTOR, block_hash=bytes.fromhex("ee" * 32))
     assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash()) == Decimal("0.01")
+
+
+async def test_a_pinned_read_split_across_backends_fails_instead_of_reading_pending_state():
+    """Review 5397109362 at 0132b5c: a gateway can send the header read to a backend that has the block and the
+    call to one that does not, which answers from its pending state. The call's own header words then name
+    another block, so the read fails instead of reporting the pending amount."""
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.pending_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    provider.block_number = provider.finalized_number = 5000
+    client = client_with(provider)
+    block_hash = await client.latest_block_hash()
+
+    provider.batch_backends = ["split"]
+    with pytest.raises(collateral_module.RpcReadError, match="did not run on the block"):
+        await client.get_executor_collateral(EXECUTOR, block_hash=block_hash)
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=block_hash) == Decimal("0.01")
+
+
+async def test_remove_executor_fails_when_its_pinned_read_is_split_across_backends(monkeypatch):
+    """Review 5397109362: the removal guard's pinned read, split by a gateway onto a backend whose pending state
+    shows no collateral, fails instead of letting the executor's local row go while TAO is still locked."""
+    from core import utils
+
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.pending_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    client = client_with(provider)
+    monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
+    monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
+
+    provider.batch_backends = ["split"]
+    with pytest.raises(collateral_module.RpcReadError, match="did not run on the block"):
+        await utils.versions_holding_collateral(EXECUTOR)
+    assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
 
 
 FORK_B = "0x" + "0b" * 32

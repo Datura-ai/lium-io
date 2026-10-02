@@ -60,6 +60,67 @@ def executor_call_data(selector: str, executor_uuid: str) -> str:
     return "0x" + selector + UUID(executor_uuid).bytes.hex().ljust(64, "0")
 
 
+def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
+    """Init code for a contract-creation eth_call that makes each (calldata, output size) view call to `to` in one
+    EVM run and returns NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run
+    reads one state on one backend, and the three header words prove which block that state is."""
+    def push2(value: int) -> bytes:
+        return b"\x61" + value.to_bytes(2, "big")
+
+    scratch = 0x2000
+    code = bytearray()
+    data_slots: list[int] = []
+    revert_slots: list[int] = []
+    out = 0x60
+    for data, size in calls:
+        # CODECOPY(scratch, <data offset>, len)
+        code += push2(len(data))
+        data_slots.append(len(code) + 1)
+        code += push2(0) + push2(scratch) + b"\x39"
+        # STATICCALL(gas, to, scratch, len, out, size); revert on failure or a short answer
+        code += push2(size) + push2(out) + push2(len(data)) + push2(scratch)
+        code += b"\x73" + bytes.fromhex(to.removeprefix("0x")) + b"\x5a\xfa\x15"
+        revert_slots.append(len(code) + 1)
+        code += push2(0) + b"\x57" + push2(size) + b"\x3d\x10"
+        revert_slots.append(len(code) + 1)
+        code += push2(0) + b"\x57"
+        out += size
+    # memory[0:0x60] = NUMBER, BLOCKHASH(NUMBER - 1), TIMESTAMP; RETURN(0, out)
+    code += b"\x43\x60\x00\x52" + b"\x60\x01\x43\x03\x40\x60\x20\x52" + b"\x42\x60\x40\x52"
+    code += push2(out) + b"\x60\x00\xf3"
+    revert_at = len(code)
+    code += b"\x5b\x60\x00\x80\xfd"
+    for slot in revert_slots:
+        code[slot : slot + 2] = revert_at.to_bytes(2, "big")
+    offset = len(code)
+    for slot, (data, _size) in zip(data_slots, calls):
+        code[slot : slot + 2] = offset.to_bytes(2, "big")
+        offset += len(data)
+    return "0x" + bytes(code).hex() + b"".join(data for data, _ in calls).hex()
+
+
+def pinned_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
+    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
+    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
+    if not isinstance(result, str):
+        raise ValueError("pinned read has no answer")
+    raw = bytes.fromhex(result.removeprefix("0x"))
+    if len(raw) != 0x60 + sum(sizes):
+        raise ValueError(f"pinned read answered {len(raw)} bytes")
+    number, parent, timestamp = (raw[i : i + 32] for i in (0, 32, 64))
+    if (
+        int.from_bytes(number, "big") != int(header["number"], 16)
+        or "0x" + parent.hex() != str(header["parentHash"]).lower()
+        or int.from_bytes(timestamp, "big") != int(header["timestamp"], 16)
+    ):
+        raise ValueError("the read did not run on the block it is pinned to")
+    outputs, at = [], 0x60
+    for size in sizes:
+        outputs.append(raw[at : at + size])
+        at += size
+    return outputs
+
+
 def required_deposit_tao(gpu_model: str | None, gpu_count: int) -> Decimal | None:
     unit = shared_client.config.required_deposit_amount.get(gpu_model) if gpu_model else None
     if unit is None:
@@ -194,48 +255,39 @@ class CollateralStatusReader:
 
     async def _read(self, executor_uuid: str, evm_address: str, required_tao: Decimal | None) -> CollateralStatus:
         to = settings.COLLATERAL_CONTRACT_ADDRESS
-        # both calls at one block hash (EIP-1898): "latest" twice can answer from two blocks or forks,
-        # pairing an old owner with a new owner's deposit
+        # owner and amount come from one EVM run (pinned_read_code), so one backend reads both from one state; a
+        # gateway that splits a batch across backends cannot pair an old owner with a new owner's deposit
         [head] = await self._rpc(
             [{"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByNumber", "params": ["latest", False]}]
         )
-        block_hash = (head.get("result") or {}).get("hash") if isinstance(head, dict) else None
-        if not block_hash:
-            raise ValueError("eth_getBlockByNumber has no block hash")
-        # Frontier ignores requireCanonical and answers a hash it does not know from its pending state, so the
-        # calls go in one batch with eth_getBlockByHash: the backend that answers them must also hold the block
-        batch = [
-            {"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByHash", "params": [block_hash, False]},
-        ] + [
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "eth_call",
-                "params": [
-                    {"to": to, "data": executor_call_data(selector, executor_uuid)},
-                    {"blockHash": block_hash, "requireCanonical": True},
-                ],
-            }
-            for request_id, selector in ((1, EXECUTOR_TO_MINER_SELECTOR), (2, COLLATERALS_SELECTOR))
+        header = head.get("result") if isinstance(head, dict) else None
+        if not isinstance(header, dict) or not all(header.get(k) for k in ("hash", "number", "parentHash", "timestamp")):
+            raise ValueError("eth_getBlockByNumber has no block header")
+        calls = [
+            (bytes.fromhex(executor_call_data(selector, executor_uuid)[2:]), 32)
+            for selector in (EXECUTOR_TO_MINER_SELECTOR, COLLATERALS_SELECTOR)
         ]
-        answers = await self._rpc(batch)
-        if not isinstance(answers, list):
-            raise ValueError("JSON-RPC batch answered with a single object")
-        by_id = {answer.get("id"): answer for answer in answers if isinstance(answer, dict)}
-        block = (by_id.get(0) or {}).get("result")
-        if not isinstance(block, dict) or block.get("hash") != block_hash:
-            raise ValueError("the RPC does not have the block the read is pinned to")
-        results = []
-        for request_id in (1, 2):
-            answer = by_id.get(request_id)
-            if answer is None or "error" in answer or "result" not in answer:
-                raise ValueError(f"eth_call {request_id} has no result")
-            results.append(answer["result"])
+        [answer] = await self._rpc(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_call",
+                    "params": [
+                        {"data": pinned_read_code(to, calls)},
+                        {"blockHash": header["hash"], "requireCanonical": True},
+                    ],
+                }
+            ]
+        )
+        if not isinstance(answer, dict) or "error" in answer or "result" not in answer:
+            raise ValueError("eth_call has no result")
+        owner, collateral = pinned_outputs(answer["result"], header, [32, 32])
         return decide(
             executor_uuid=executor_uuid,
             evm_address=evm_address,
-            owner_word=results[0],
-            collateral_word=results[1],
+            owner_word=owner.hex(),
+            collateral_word=collateral.hex(),
             required_tao=required_tao,
         )
 

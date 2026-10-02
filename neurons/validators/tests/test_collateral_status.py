@@ -45,32 +45,49 @@ def _tao_word(tao: Decimal) -> str:
     return "0x" + format(int(tao * 10**18), "x").rjust(64, "0")
 
 
+HEADER = {"hash": BLOCK_HASH, "number": hex(16), "parentHash": "0x" + "aa" * 32, "timestamp": hex(1_700_000_000)}
+# the pending state a backend without BLOCK_HASH runs a call on, as Frontier does
+PENDING = {"number": hex(17), "parentHash": "0x" + "bb" * 32, "timestamp": hex(1_700_000_012)}
+
+
+def _pinned_inner_calls(code: bytes) -> list[tuple[str, int]]:
+    """The (calldata, output size) of each view call a pinned_read_code runs, in order."""
+    calls, at = [], 0
+    while code[at] == 0x61 and code[at + 9] == 0x39:
+        length, offset = int.from_bytes(code[at + 1 : at + 3], "big"), int.from_bytes(code[at + 4 : at + 6], "big")
+        calls.append(("0x" + code[offset : offset + length].hex(), int.from_bytes(code[at + 11 : at + 13], "big")))
+        at += 59
+    return calls
+
+
 class FakeRpc:
     def __init__(self, owner: str, collateral_tao: Decimal, *, fail: Exception | None = None):
         self.owner, self.collateral_tao, self.fail = owner, collateral_tao, fail
+        # False: the backend that runs the call does not have BLOCK_HASH and answers from PENDING
         self.has_block = True
+        self.pending_owner, self.pending_collateral_tao = owner, collateral_tao
         self.batches: list[list[dict]] = []
 
     async def __call__(self, batch):
         if self.fail:
             raise self.fail
         if batch[0]["method"] == "eth_getBlockByNumber":
-            return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": {"hash": BLOCK_HASH}}]
+            return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": HEADER}]
         self.batches.append(batch)
-        if batch[0]["method"] == "eth_getBlockByHash":
-            block = {"hash": batch[0]["params"][0]} if self.has_block else None
-            batch = batch[1:]
-            head = [{"jsonrpc": "2.0", "id": 0, "result": block}]
-        else:
-            head = []
+        [req] = batch
+        header = HEADER if self.has_block and req["params"][1]["blockHash"] == BLOCK_HASH else PENDING
+        owner, tao = (
+            (self.owner, self.collateral_tao) if header is HEADER else (self.pending_owner, self.pending_collateral_tao)
+        )
         results = {
-            executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID): _address_word(self.owner),
-            executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID): _tao_word(self.collateral_tao),
+            executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID): _address_word(owner),
+            executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID): _tao_word(tao),
         }
-        # answered out of order, as a batch may be
-        return [
-            {"jsonrpc": "2.0", "id": req["id"], "result": results[req["params"][0]["data"]]} for req in reversed(batch)
-        ] + head
+        out = int(header["number"], 16).to_bytes(32, "big") + bytes.fromhex(header["parentHash"][2:])
+        out += int(header["timestamp"], 16).to_bytes(32, "big")
+        for data, size in _pinned_inner_calls(bytes.fromhex(req["params"][0]["data"][2:])):
+            out += bytes.fromhex(results[data][2:])[:size]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": "0x" + out.hex()}]
 
 
 class Clock:
@@ -119,10 +136,15 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert status.contract_version == ("1.0.2" if deposited else None)
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
-    [batch] = rpc.batches
-    assert batch[0] == {"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByHash", "params": [BLOCK_HASH, False]}
-    assert [req["params"][0]["to"] for req in batch[1:]] == [settings.COLLATERAL_CONTRACT_ADDRESS] * 2
-    assert [req["params"][1] for req in batch[1:]] == [{"blockHash": BLOCK_HASH, "requireCanonical": True}] * 2
+    [[req]] = rpc.batches
+    assert "to" not in req["params"][0]
+    assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
+    contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
+    assert req["params"][0]["data"].count("73" + contract) == 2
+    assert _pinned_inner_calls(bytes.fromhex(req["params"][0]["data"][2:])) == [
+        (executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID), 32),
+        (executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID), 32),
+    ]
 
 
 @pytest.mark.asyncio
@@ -132,6 +154,22 @@ async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_is_a_failed_read()
     status, cached = await _status(_reader(rpc))
 
     assert (status.deposited, status.read_failed, cached) == (False, True, False)
+
+
+@pytest.mark.asyncio
+async def test_a_read_a_gateway_sends_to_a_backend_without_the_block_is_not_published_as_deposited():
+    """Review 5397109362 at 0132b5c: the header comes from a backend that has the block, the call from one that
+    does not and answers from its pending state, where the miner owns a funded executor. The call's own header
+    words name another block, so the read fails instead of caching collateral_deposited=True."""
+    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
+    rpc.has_block = False
+    rpc.pending_owner, rpc.pending_collateral_tao = MINER_EVM, Decimal(9)
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    rpc.has_block = True
+    status, _ = await _status(_reader(rpc))
+    assert (status.deposited, status.read_failed) == (False, False)
 
 
 @pytest.mark.asyncio
