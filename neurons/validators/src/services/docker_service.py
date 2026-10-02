@@ -7462,10 +7462,15 @@ class DockerService:
 
                     # add environment variables
                     current_step = "set_environment"
+                    environment = custom_options.environment if custom_options else None
+                    if image_managed_jupyter:
+                        # DAH-3980: start.sh reads the token from the run env and nothing reads it from
+                        # /etc/environment; appending it there cost the reply one docker exec
+                        environment = {name: value for name, value in environment.items() if name != "JUPYTER_PASSWORD"}
                     environment_error = await self.add_environment_variables_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
-                        environment=custom_options.environment if custom_options else None,
+                        environment=environment,
                         log_tag=log_tag,
                         log_extra=default_extra,
                     )

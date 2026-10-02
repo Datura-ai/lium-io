@@ -625,6 +625,37 @@ async def test_a_delete_stops_the_image_jupyter_wait_without_a_message(svc, monk
 
 
 @pytest.mark.asyncio
+async def test_a_jupyter_only_rent_appends_nothing_to_etc_environment(svc, monkeypatch, sent_to_compute_app):
+    """DAH-3980: the image-managed token reaches start.sh through the run env; no exec writes it to a file."""
+    async def jupyter_answers(command):
+        return _ssh_result(exit_status=0)
+
+    _, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_answers)
+
+    await _run(svc, payload)
+
+    assert "JUPYTER_PASSWORD" in _created_run_spec(svc).environment
+    assert not any("/etc/environment" in argv for argv in _exec_argv_texts(svc))
+
+
+@pytest.mark.asyncio
+async def test_a_jupyter_rent_still_appends_the_template_env(svc, monkeypatch, sent_to_compute_app):
+    async def jupyter_answers(command):
+        return _ssh_result(exit_status=0)
+
+    _, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_answers)
+    payload.custom_options = CustomOptions(environment={"HF_HOME": "/workspace/hf"})
+
+    await _run(svc, payload)
+
+    token = _created_run_spec(svc).environment["JUPYTER_PASSWORD"]
+    appended = [spec for spec in _docker_client(svc).exec_specs if "cat >> /etc/environment" in " ".join(spec.argv)]
+    assert len(appended) == 1
+    assert "HF_HOME=/workspace/hf" in str(appended[0].stdin)
+    assert token not in str(appended[0].stdin)
+
+
+@pytest.mark.asyncio
 async def test_image_managed_jupyter_falls_back_when_docker_port_is_not_8888(svc, monkeypatch):
     """The image's start.sh hardcodes `jupyter lab --port=8888`. If the mapped docker
     port ever moved off 8888 the image's Jupyter would be unreachable, so the validator
