@@ -5958,7 +5958,7 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         log_extra: dict,
         jupyter_installed: JupyterServerInstalled | None = None,
-        jupyter_host_port: int | None = None,
+        container_name: str | None = None,
     ) -> None:
         # the create's steps a renter's first login does not need; closes the create's sessions
         try:
@@ -5970,7 +5970,7 @@ class DockerService:
                         self._report_image_jupyter_when_it_answers(
                             ssh_client,
                             jupyter_installed=jupyter_installed,
-                            jupyter_host_port=jupyter_host_port,
+                            container_name=container_name,
                             log_extra=log_extra,
                         ),
                         delete_cancels=True,
@@ -6011,13 +6011,19 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         *,
         jupyter_installed: JupyterServerInstalled,
-        jupyter_host_port: int,
+        container_name: str,
         log_extra: dict,
     ) -> None:
-        # the image's own Jupyter on the pod's published port: its URL goes to the backend once it answers
-        # `/api` answers 200 without a token (jupyter_server's version), so the token stays off the host
-        probe = f"until curl -fs -m 1 -o /dev/null http://127.0.0.1:{jupyter_host_port}/api; do sleep 0.1; done"
-        command = f"timeout {IMAGE_JUPYTER_READY_TIMEOUT_SECONDS} sh -c {shlex.quote(probe)}"
+        # the image's own Jupyter, probed inside the pod: its URL goes to the backend once it answers
+        # Not the host's port: the session may land in the executor's container (its own 127.0.0.1), and a
+        # published port may differ from the bound one. `/api` answers 200 without a token, so none is sent.
+        probe = (
+            f"until curl -fs -m 1 -o /dev/null http://127.0.0.1:{IMAGE_JUPYTER_DOCKER_PORT}/api; do sleep 0.1; done"
+        )
+        command = (
+            f"/usr/bin/docker exec {shlex.quote(container_name)} "
+            f"timeout {IMAGE_JUPYTER_READY_TIMEOUT_SECONDS} sh -c {shlex.quote(probe)}"
+        )
         started_ms = now_ms()
         try:
             result = await ssh_client.run(command, timeout=IMAGE_JUPYTER_READY_TIMEOUT_SECONDS + 10)
@@ -6053,7 +6059,6 @@ class DockerService:
                 "Image Jupyter answers",
                 extra=get_extra_info({
                     **log_extra,
-                    "jupyter_host_port": jupyter_host_port,
                     "jupyter_ready_ms": now_ms() - started_ms,
                 }),
             ),
@@ -7607,7 +7612,7 @@ class DockerService:
                         executor_info=executor_info,
                         log_extra={**default_extra, "container_name": container_name},
                         jupyter_installed=jupyter_installed_when_it_answers,
-                        jupyter_host_port=jupyter_port_map[1] if jupyter_port_map else None,
+                        container_name=container_name,
                     ),
                 )
                 return container_created_reply

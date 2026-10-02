@@ -553,7 +553,8 @@ def _image_jupyter_create(svc, monkeypatch, *, jupyter_probe):
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.setattr(
         svc, "generate_portMappings",
-        AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
+        # internal 40888 != external 30888, as on a node with RENTING_PORT_MAPPINGS
+        AsyncMock(return_value=([(22, 20001, 20001), (8888, 40888, 30888)], (8888, 30888))),
     )
 
     async def _run_on_host(command, *args, **kwargs):
@@ -563,6 +564,15 @@ def _image_jupyter_create(svc, monkeypatch, *, jupyter_probe):
 
     ssh_client.run = AsyncMock(side_effect=_run_on_host)
     return ssh_client, _payload(ships_sshd=True, enable_jupyter=True)
+
+
+async def _wait_for_steps_after_reply(pod_id: str) -> None:
+    # not wait_until_done: it cancels the Jupyter wait the way a delete does
+    async def _all_steps_gone():
+        while pod_id in ds_module.create_steps_after_reply._tasks_by_pod_id:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_all_steps_gone(), timeout=10)
 
 
 @pytest.mark.asyncio
@@ -583,9 +593,27 @@ async def test_image_jupyter_url_follows_the_reply_once_jupyter_answers(svc, mon
     assert isinstance(installed, JupyterServerInstalled)
     assert (installed.pod_id, installed.executor_id) == (payload.pod_id, payload.executor_id)
     assert installed.jupyter_url == f"http://127.0.0.1:30888/lab?token={token}"
+
+
+@pytest.mark.asyncio
+async def test_image_jupyter_probe_runs_in_the_pod_whatever_the_host_port(svc, monkeypatch, sent_to_compute_app):
+    """The create's SSH session may land in the executor's own container, whose loopback is not the host's;
+    the pod's own 127.0.0.1:8888 answers wherever the session lands and however the port is published."""
+    async def jupyter_answers(command):
+        return _ssh_result(exit_status=0)
+
+    ssh_client, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_answers)
+
+    await _run(svc, payload)
+    await _wait_for_steps_after_reply(payload.pod_id)
+
+    token = _created_run_spec(svc).environment["JUPYTER_PASSWORD"]
     probe = next(command for command in _ssh_run_cmds(ssh_client) if "/api" in command)
-    assert "http://127.0.0.1:30888/api" in probe
+    assert probe.startswith(f"/usr/bin/docker exec pod_{payload.pod_id} timeout ")
+    assert "http://127.0.0.1:8888/api" in probe
+    assert "30888" not in probe and "40888" not in probe
     assert token not in probe
+    assert isinstance(sent_to_compute_app[0], JupyterServerInstalled)
 
 
 @pytest.mark.asyncio
