@@ -38,6 +38,8 @@ from services import nvidia_devices as nd
 from services.docker_service import (
     DockerService,
     _ENCRYPTED_VOLUME_IMAGE_LABEL,
+    VolumeMinSizeError,
+    VolumeSizingResult,
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
@@ -1246,6 +1248,54 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
     assert _cmds(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
+
+
+_EARLY_DF_PROBE = Mock(name="volume probe with the df read before the filler's rm")
+_LIVE_DF_PROBE = Mock(name="volume probe with the df read after the filler's rm")
+
+
+@pytest.mark.asyncio
+async def test_customer_create_sizes_the_volume_again_on_a_live_df_when_the_early_df_fails_the_minimum(
+    svc_fixture, monkeypatch
+):
+    """The early df was read before the filler's rm freed its disk."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    svc.probe_volume_host = AsyncMock(side_effect=[_EARLY_DF_PROBE, _LIVE_DF_PROBE])
+    svc.resolve_volume_sizing = AsyncMock(
+        side_effect=[
+            VolumeMinSizeError("Fresh vloopback sizing produced 1GB volume, below required minimum 2GB"),
+            VolumeSizingResult(volume_limit_gb=2, storage_limit_gb=1, path="fresh"),
+        ]
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert [call.kwargs["host_probe"] for call in svc.resolve_volume_sizing.await_args_list] == [
+        _EARLY_DF_PROBE,
+        _LIVE_DF_PROBE,
+    ]
+    assert svc.create_local_volume.await_args.kwargs["limit"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("containers", [("filler_x",), ("pod_keep",)], ids=["after_a_filler_removal", "no_removal"])
+async def test_a_volume_shrunk_by_the_early_df_is_not_measured_again(svc_fixture, monkeypatch, containers):
+    """A tight disk shrinks the volume on any df; a second one would cost every such rent a round trip."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers(*containers))
+    svc.resolve_volume_sizing = AsyncMock(
+        return_value=VolumeSizingResult(volume_limit_gb=1, storage_limit_gb=1, path="fresh")
+    )
+
+    result = await _run_create_container(
+        svc, _deploy_payload(active_container_names=["pod_keep"], active_volume_names=["volume_keep", "volume_x"])
+    )
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    svc.probe_volume_host.assert_awaited_once()
+    svc.resolve_volume_sizing.assert_awaited_once()
 
 
 @pytest.mark.asyncio

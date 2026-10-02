@@ -6661,6 +6661,7 @@ class DockerService:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
                     volume_probe: VolumeHostProbe | None = None
+                    early_df_predates_filler_removal = False
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
@@ -6669,6 +6670,7 @@ class DockerService:
                         if early_volume_probe is not None and image_present and not cleanup_changed_host:
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
+                            early_df_predates_filler_removal = bool(removed_containers)
                         else:
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
@@ -6678,13 +6680,36 @@ class DockerService:
 
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
-                    sizing = await self.resolve_volume_sizing(
-                        ssh_client=ssh_client,
-                        payload=payload,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                        host_probe=volume_probe,
-                    )
+                    sizing: VolumeSizingResult | None = None
+                    try:
+                        sizing = await self.resolve_volume_sizing(
+                            ssh_client=ssh_client,
+                            payload=payload,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                            host_probe=volume_probe,
+                        )
+                    except VolumeMinSizeError:
+                        if not early_df_predates_filler_removal:
+                            raise
+                    # the early df did not count the disk the filler's rm freed: measure it once live
+                    # when that df fails the rent. Not when it only shrinks the volume: on a tight disk
+                    # the live df reads the same, and every such rent would pay the round trip.
+                    if sizing is None:
+                        current_step = "volume_host_probe"
+                        volume_probe = await self.probe_volume_host(
+                            ssh_client,
+                            with_df=measures_host,
+                            log_extra=default_extra,
+                        )
+                        current_step = "volume_sizing"
+                        sizing = await self.resolve_volume_sizing(
+                            ssh_client=ssh_client,
+                            payload=payload,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                            host_probe=volume_probe,
+                        )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
 
