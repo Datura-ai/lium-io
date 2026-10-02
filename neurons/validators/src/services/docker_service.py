@@ -970,6 +970,9 @@ class _EditSwap:
         # sshd, so the restore goes through the same steps as start_existing_container
         # (start, remount with allow_init=False, sshd bootstrap). None falls back to `docker start`.
         self.bring_up: Callable[[str], Awaitable[None]] | None = None
+        # set once the reply went to the backend: from then on the edit stands, whatever ends the
+        # steps after the reply (a delete's wait timing out cancels them)
+        self.replacement_is_up = False
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1034,7 +1037,7 @@ class _EditSwap:
         if self.parked_name is None:
             return False
         try:
-            if exc is None or isinstance(exc, _CreateCancelledByDelete):
+            if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
                 removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_name)}")
@@ -7402,6 +7405,7 @@ class DockerService:
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.
+                edit_swap.replacement_is_up = True
                 create_steps_after_reply.start(
                     payload.pod_id,
                     self._run_create_steps_after_reply(
