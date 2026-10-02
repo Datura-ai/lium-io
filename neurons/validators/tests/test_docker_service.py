@@ -7238,7 +7238,7 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     stdin_data = upload_call.kwargs["input"]
     setup_script, renter_keys = stdin_data.split("ssh-ed25519", 1)
     assert renter_keys == " AAAA'$(id)' renter\n"
-    assert f"head -c {len(setup_script)} > " in upload_cmd
+    assert f"dd bs=1 count={len(setup_script)} of=" in upload_cmd
     assert "gocryptfs" in setup_script
     assert passphrase not in setup_script
     assert passphrase.encode("ascii").hex() not in setup_script
@@ -7251,7 +7251,7 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
 @pytest.mark.asyncio
 async def test_setup_encrypted_local_volume_counts_the_utf8_bytes_of_a_unicode_path(docker_service):
     # a template volume path such as /workspace/данные; asyncssh sends a str input as UTF-8,
-    # so `head -c` must take the script's UTF-8 bytes, or it cuts into the keys behind it
+    # so `dd` must take the script's UTF-8 bytes, or it cuts into the keys behind it
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
 
@@ -7274,8 +7274,34 @@ async def test_setup_encrypted_local_volume_counts_the_utf8_bytes_of_a_unicode_p
     )
     setup_script, renter_keys = upload_call.kwargs["input"].split("ssh-ed25519", 1)
     assert "/workspace/\u0434\u0430\u043d\u043d\u044b\u0435" in setup_script
-    assert f"head -c {len(setup_script.encode('utf-8'))} > " in upload_call.args[0]
+    assert f"dd bs=1 count={len(setup_script.encode('utf-8'))} of=" in upload_call.args[0]
     assert renter_keys == " AAAA renter\n"
+
+
+def test_volume_setup_exec_upload_leaves_every_byte_after_the_script_on_stdin(tmp_path):
+    # a stdio `head -c` (busybox, BSD) reads a whole buffer from the pipe and swallows the keys
+    setup_script = "# gocryptfs setup and mount\n" * 200
+    renter_keys = "ssh-ed25519 AAAA renter\n"
+    setup_script_path = tmp_path / "setup"
+    program = docker_service_module._build_volume_setup_exec_script(
+        "/root",
+        setup_script_path=str(setup_script_path),
+        passfile_path=str(tmp_path / "passfile"),
+        setup_script_size=len(setup_script.encode("utf-8")),
+        with_authorized_keys=True,
+    )
+    upload_line = next(line for line in program.splitlines() if line.endswith("exit 90"))
+
+    completed = subprocess.run(
+        ["sh", "-c", f"{upload_line}\ncat"],
+        input=(setup_script + renter_keys).encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert setup_script_path.read_text() == setup_script
+    assert completed.stdout.decode("utf-8") == renter_keys
 
 
 def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:

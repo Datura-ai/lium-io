@@ -1515,8 +1515,9 @@ def _build_volume_setup_exec_script(
     with_authorized_keys: bool,
 ) -> str:
     # The fixed program of the one volume setup exec; its stdin is the setup script, exactly
-    # setup_script_size bytes, then the renter's public keys. `head -c` takes only the script onto
-    # tmpfs and leaves the keys to the final `cat`: they stay data, never shell text.
+    # setup_script_size bytes, then the renter's public keys. `dd bs=1` takes only the script onto
+    # tmpfs and leaves the keys to the final `cat`: they stay data, never shell text. Not `head -c`:
+    # busybox's reads a whole buffer from the pipe and swallows the keys.
     script = shlex.quote(setup_script_path)
     passfile = shlex.quote(passfile_path)
     mount_check = (
@@ -1526,7 +1527,8 @@ def _build_volume_setup_exec_script(
     lines = [
         "umask 077",
         f'trap "rm -f {script} {passfile}" EXIT',
-        f"head -c {setup_script_size} > {script} && [ $(wc -c < {script}) -eq {setup_script_size} ] || exit 90",
+        f"dd bs=1 count={setup_script_size} of={script} 2>/dev/null"
+        f" && [ $(wc -c < {script}) -eq {setup_script_size} ] || exit 90",
         f"sh {script} || exit 91",
         f"{mount_check} || {{ echo '--- /proc/mounts ---'; cat /proc/mounts;"
         " echo '--- gocryptfs ps ---'; ps aux | grep '[g]ocryptfs'; exit 92; }",
