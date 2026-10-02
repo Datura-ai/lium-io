@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import pytest
+from clients import compute_client as compute_client_module
 from clients.compute_client import ComputeClient, OutgoingMessages
 from datura.requests.miner_requests import AcceptSSHKeyRequest
 from payload_models.payloads import (
@@ -28,6 +29,8 @@ from services.docker_service import create_steps_after_reply, inflight_creates
 from services.gpu_power_limit import GpuPowerRestoreRecord
 from services.liumd_rent import LiumdAgentFrames, LiumdRentService
 from services.miner_service import MinerService
+from tenacity import wait_fixed
+from websockets.exceptions import ConnectionClosedError
 
 BENCH_EXECUTOR_ID = "df044c30-b8b4-4f4f-8860-9d451c16090c"
 MINER_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
@@ -153,6 +156,7 @@ def answer_rent_with(*replies: Callable[[dict], dict]) -> Callable[[dict], list[
 @pytest.fixture
 def miner_service(mocker) -> MinerService:
     mocker.patch("core.config.settings.USE_REST_API", True)
+    mocker.patch.object(miner_module, "AGENT_RENT_KEY_REMOVAL_PAUSES_SECONDS", (0, 0, 0, 0, 0))
     mocker.patch("core.config.settings.ENABLE_VOLUME_ENCRYPTION", True)
     mocker.patch(
         "core.config.Settings.get_bittensor_wallet",
@@ -441,7 +445,9 @@ async def test_cancellation_releases_pending_mark_and_sends_cancel(miner_service
     assert miner_service.redis_service.remove_pending_pod.await_count == 1
     assert [(frame["type"], frame.get("action")) for frame in relay.sent] == [("rent", None), ("cancel", None), ("settle", "rollback")]
     attempt = relay.frames_of_type("rent")[0]["attempt"]
-    miner_service.redis_service.set.assert_awaited_once_with(f"liumd:attempt:{attempt}", "failed", ex=3600)
+    miner_service.redis_service.set.assert_awaited_once_with(
+        f"liumd:attempt:{attempt}", f"failed|{payload.executor_id}|{payload.pod_id}", ex=3600
+    )
 
 
 @pytest.mark.asyncio
@@ -529,9 +535,16 @@ async def test_unsent_rent_is_not_replayed_after_its_waiter_times_out(miner_serv
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("mark", "action"), [(b"acked", "ack"), (b"failed", "rollback"), (None, "rollback")])
+@pytest.mark.parametrize(
+    ("mark", "action"),
+    [
+        (f"acked|{BENCH_EXECUTOR_ID}|pod".encode(), "ack"),
+        (f"failed|{BENCH_EXECUTOR_ID}|pod".encode(), "rollback"),
+        (None, "rollback"),
+    ],
+)
 async def test_unacked_attempt_gets_a_settlement(miner_service, mark, action):
-    # F3 (b), from test_lium128_review.py
+    # F3 (b), from test_lium128_review.py; decision 4 of LIUM-160
     frames = miner_service.liumd_rent.agent_frames
     miner_service.redis_service.get = AsyncMock(return_value=mark)
     relay = relay_for(miner_service, lambda frame: [])
@@ -557,14 +570,15 @@ async def test_ack_and_acked_mark_follow_the_handed_on_container_created(miner_s
 
     reply = await miner_service.handle_container(payload)
     frames_at_hand_off = [frame["type"] for frame in relay.sent]
-    marks_at_hand_off = miner_service.redis_service.set.await_count
+    marks_at_hand_off = [call.args[1] for call in miner_service.redis_service.set.await_args_list]
     await create_steps_after_reply.wait_until_done(payload.pod_id, 5)
 
     assert isinstance(reply, ContainerCreated)
-    assert (frames_at_hand_off, marks_at_hand_off) == (["rent"], 0)
+    ids = f"{payload.executor_id}|{payload.pod_id}"
+    assert (frames_at_hand_off, marks_at_hand_off) == (["rent"], [f"accepting|{ids}"])
     assert [frame["type"] for frame in relay.sent] == ["rent", "ack"]
     attempt = relay.sent[0]["attempt"]
-    miner_service.redis_service.set.assert_awaited_once_with(f"liumd:attempt:{attempt}", "acked", ex=3600)
+    miner_service.redis_service.set.assert_awaited_with(f"liumd:attempt:{attempt}", f"acked|{ids}", ex=3600)
     miner_service.redis_service.remove_pending_pod.assert_not_awaited()
 
 
@@ -693,8 +707,8 @@ async def test_inspector_submit_timeout_still_removes_possibly_installed_key(min
 
 
 @pytest.mark.asyncio
-async def test_hung_submit_is_cut_at_the_time_limit_and_a_failed_removal_retried_once(miner_service, monkeypatch, caplog):
-    # F5: the one time limit on the step, then two removals that both answer False
+async def test_hung_submit_is_cut_at_the_time_limit_and_a_failed_removal_retried_four_times(miner_service, monkeypatch, caplog):
+    # F5: the one time limit on the step, then five removals that all answer False
     async def hung_submit(**kwargs):
         await asyncio.Event().wait()
 
@@ -706,7 +720,7 @@ async def test_hung_submit_is_cut_at_the_time_limit_and_a_failed_removal_retried
 
     await asyncio.wait_for(miner_service._start_inspector_after_agent_rent(payload, "pod_test"), 1)
 
-    assert miner_service._remove_ssh_key_via_rest.await_count == 2
+    assert miner_service._remove_ssh_key_via_rest.await_count == 5
     key_left = [record for record in caplog.records if record.getMessage() == "Validator key may be left on the node after an agent rent"]
     assert len(key_left) == 1
     assert payload.executor_id in key_left[0].msg.to_full_string()
@@ -800,3 +814,312 @@ async def test_connector_error_after_the_send_fails_the_rent_without_todays_path
     miner_service._handle_container.assert_not_awaited()
     assert [frame["type"] for frame in relay.sent] == ["rent", "cancel", "settle"]
     miner_service.redis_service.remove_pending_pod.assert_awaited_once()
+
+
+def unacked_report(executor_id: str, rent_id: str, attempt: str, state: object = "unacked") -> LiumdAgentFrame:
+    return LiumdAgentFrame(
+        message_type="LiumdAgentFrame",
+        executor_id=executor_id,
+        pod_id=rent_id,
+        frame={"type": "attempt_state", "rent_id": rent_id, "attempt": attempt, "state": state},
+    )
+
+
+async def settle_reports(frames: LiumdAgentFrames) -> None:
+    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*frames._settle_tasks), 1)
+
+
+@pytest.mark.asyncio
+async def test_delete_during_the_success_log_publish_rolls_back_and_never_acks(miner_service):
+    # LIUM-160 decision 2; LIUM-154 test_delete_during_success_log_publish_still_wins, LIUM-152 §2e
+    payload = make_rent_payload()
+    relay = relay_for(miner_service, answer_rent_with(result_frame))
+
+    async def publish(channel, message):
+        if message["logs"][0]["log_text"] == "Created Docker Container":
+            assert inflight_creates.cancel(payload.pod_id)
+            await asyncio.sleep(0)
+
+    miner_service.redis_service.publish = publish
+
+    reply = await miner_service.handle_container(payload)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, 1)
+
+    assert isinstance(reply, FailedContainerRequest)
+    assert reply.failure_step == "cancelled_by_delete"
+    assert [(frame["type"], frame.get("action")) for frame in relay.sent] == [("rent", None), ("settle", "rollback")]
+    marks = [call.args[1].split("|")[0] for call in miner_service.redis_service.set.await_args_list]
+    assert marks == ["accepting", "failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap", ["before_reply_publish", "acked_mark_failing"])
+async def test_settlement_racing_the_hand_over_on_a_shared_redis_lock_never_rolls_back(miner_service, gap):
+    # LIUM-160 decisions 2-4; LIUM-154 test_lium154_serialized.py, LIUM-146 scenario A, LIUM-152 §2a: Redis
+    # commands share one lock as REDIS_COMMAND_LOCK_ENABLED makes them
+    payload = make_rent_payload()
+    frames = miner_service.liumd_rent.agent_frames
+    relay = relay_for(miner_service, answer_rent_with(result_frame))
+    entered, release = asyncio.Event(), asyncio.Event()
+    marks: dict[str, bytes] = {}
+    redis_lock = asyncio.Lock()
+
+    async def store(key, value, **kwargs):
+        async with redis_lock:
+            if gap == "acked_mark_failing" and value.startswith("acked|"):
+                entered.set()
+                await release.wait()
+                raise ConnectionError("injected Redis SET failure")
+            marks[key] = value.encode()
+
+    async def publish(channel, message):
+        async with redis_lock:
+            if gap == "before_reply_publish" and message["logs"][0]["log_text"] == "Created Docker Container":
+                entered.set()
+                await release.wait()
+
+    async def read(key):
+        async with redis_lock:
+            return marks.get(key)
+
+    miner_service.redis_service.set = store
+    miner_service.redis_service.get = read
+    miner_service.redis_service.publish = publish
+    rent = asyncio.create_task(miner_service.handle_container(payload))
+    await asyncio.wait_for(entered.wait(), 1)
+    attempt = relay.sent[0]["attempt"]
+
+    frames.deliver(unacked_report(payload.executor_id, payload.pod_id, attempt))
+    await asyncio.sleep(0)
+    release.set()
+    await settle_reports(frames)
+    reply = await rent
+    await create_steps_after_reply.wait_until_done(payload.pod_id, 1)
+
+    assert isinstance(reply, ContainerCreated)
+    assert relay.frames_of_type("settle") == []
+    assert [frame["type"] for frame in relay.sent] == ["rent", "ack"]
+
+
+@pytest.mark.asyncio
+async def test_accepting_mark_not_stored_fails_the_rent_and_never_acks(miner_service):
+    # LIUM-160 decision 2; LIUM-152 test_ack_requires_a_stored_decision, LIUM-146
+    # test_failed_mark_write_does_not_ack_and_then_rollback_handed_on_success (whose ContainerCreated it replaces)
+    payload = make_rent_payload()
+    relay = relay_for(miner_service, answer_rent_with(result_frame))
+    miner_service.redis_service.set = AsyncMock(side_effect=ConnectionError("injected SET failure"))
+    frames = miner_service.liumd_rent.agent_frames
+
+    reply = await miner_service.handle_container(payload)
+    attempt = relay.sent[0]["attempt"]
+    frames.deliver(unacked_report(payload.executor_id, payload.pod_id, attempt))
+    await settle_reports(frames)
+
+    assert isinstance(reply, FailedContainerRequest)
+    assert reply.failure_step == "liumd_mark_failed"
+    assert relay.frames_of_type("ack") == []
+    assert [frame.get("action") for frame in relay.frames_of_type("settle")] == ["rollback", "rollback"]
+    miner_service._handle_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_acked_mark_tried_three_times_then_the_ack_goes_anyway(miner_service, caplog):
+    # LIUM-160 decision 3
+    payload = make_rent_payload()
+    relay = relay_for(miner_service, answer_rent_with(result_frame))
+    marks: list[str] = []
+
+    async def store(key, value, **kwargs):
+        marks.append(value.split("|")[0])
+        if value.startswith("acked|"):
+            raise ConnectionError("injected SET failure")
+
+    miner_service.redis_service.set = store
+    caplog.set_level(logging.ERROR)
+
+    reply = await miner_service.handle_container(payload)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, 1)
+
+    assert isinstance(reply, ContainerCreated)
+    assert marks == ["accepting", "acked", "acked", "acked"]
+    assert [frame["type"] for frame in relay.sent] == ["rent", "ack"]
+    assert "liumd acked mark not stored, ack sent anyway" in [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mark_state", "settled"),
+    [("failed", ["rollback"]), (None, ["rollback"]), ("acked", []), ("accepting", [])],
+)
+async def test_late_result_is_settled_at_once_by_the_attempt_mark(miner_service, mark_state, settled):
+    # LIUM-160 decision 5; LIUM-154 test_late_result_gets_immediate_rollback_without_another_hello, LIUM-146
+    # scenario C, LIUM-152 §2b
+    frames = miner_service.liumd_rent.agent_frames
+    relay = relay_for(miner_service, lambda frame: [])
+    mark = f"{mark_state}|{BENCH_EXECUTOR_ID}|pod".encode() if mark_state else None
+    miner_service.redis_service.get = AsyncMock(return_value=mark)
+    rent = {"rent_id": "pod", "attempt": "late", "container": {"name": "pod_x", "ports": []}, "volume": {"name": "volume_x"}}
+
+    frames.deliver(LiumdAgentFrame(message_type="LiumdAgentFrame", executor_id=BENCH_EXECUTOR_ID, pod_id="pod", frame=result_frame(rent)))
+    await settle_reports(frames)
+
+    assert [frame["action"] for frame in relay.frames_of_type("settle")] == settled
+
+
+@pytest.mark.asyncio
+async def test_result_after_the_rent_timed_out_gets_rollback_without_another_hello(miner_service, monkeypatch):
+    # LIUM-160 decision 5, through the rent: the timeout stores `failed`, the late result reads it
+    payload = make_rent_payload()
+    relay = relay_for(miner_service, lambda frame: [])
+    marks: dict[str, bytes] = {}
+
+    async def store(key, value, **kwargs):
+        marks[key] = value.encode()
+
+    miner_service.redis_service.set = store
+    miner_service.redis_service.get = AsyncMock(side_effect=marks.get)
+    monkeypatch.setattr(liumd_rent_module, "LIUMD_RENT_DEADLINE_MS", 1)
+    monkeypatch.setattr(liumd_rent_module, "LIUMD_REPLY_GRACE_SECONDS", 0)
+    frames = miner_service.liumd_rent.agent_frames
+
+    reply = await miner_service.handle_container(payload)
+    rent = relay.sent[0]
+    frames.deliver(LiumdAgentFrame(message_type="LiumdAgentFrame", executor_id=payload.executor_id, pod_id=payload.pod_id, frame=result_frame(rent)))
+    await settle_reports(frames)
+
+    assert reply.failure_step == "liumd_timeout"
+    assert [(frame["type"], frame.get("action")) for frame in relay.sent] == [("rent", None), ("cancel", None), ("settle", "rollback")]
+
+
+@pytest.mark.asyncio
+async def test_unacked_attempt_still_being_handed_over_gets_no_answer(miner_service):
+    # LIUM-160 decision 4: `accepting` is the rent between its result and its hand-over
+    frames = miner_service.liumd_rent.agent_frames
+    miner_service.redis_service.get = AsyncMock(return_value=f"accepting|{BENCH_EXECUTOR_ID}|pod".encode())
+    relay = relay_for(miner_service, lambda frame: [])
+
+    frames.deliver(unacked_report(BENCH_EXECUTOR_ID, "pod", "old"))
+    await settle_reports(frames)
+
+    assert relay.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("executor_id", "rent_id"),
+    [pytest.param("other-executor", "pod", id="foreign_executor"), pytest.param(BENCH_EXECUTOR_ID, "other-pod", id="foreign_pod")],
+)
+@pytest.mark.parametrize("mark_state", ["acked", "failed", "accepting"])
+async def test_settlement_of_an_attempt_marked_for_another_executor_or_pod_gets_no_answer(executor_id, rent_id, mark_state, caplog):
+    # LIUM-160 decision 4; LIUM-146 test_settlement_does_not_ack_a_foreign_executor_attempt
+    frames = LiumdAgentFrames()
+    frames.redis_service = Mock(get=AsyncMock(return_value=f"{mark_state}|{BENCH_EXECUTOR_ID}|pod".encode()))
+    frames.send_to_backend = Mock(return_value=True)
+    caplog.set_level(logging.WARNING)
+
+    frames.deliver(unacked_report(executor_id, rent_id, "known-attempt"))
+    await settle_reports(frames)
+
+    frames.send_to_backend.assert_not_called()
+    assert [record.getMessage() for record in caplog.records] == ["liumd settle skipped: attempt marked for another executor or pod"]
+
+
+@pytest.mark.asyncio
+async def test_rent_is_not_resent_by_the_send_retry_after_its_waiter_is_gone(monkeypatch):
+    # LIUM-160 decision 6; LIUM-152 test_transport_retry_rechecks_the_waiter, LIUM-146 scenario B: the real
+    # tenacity retry with its pause shortened
+    frames = LiumdAgentFrames()
+    monkeypatch.setattr(compute_client_module, "liumd_agent_frames", frames)
+    client = object.__new__(ComputeClient)
+    client.message_queue = OutgoingMessages()
+    client.lock = asyncio.Lock()
+    client.logging_extra = {}
+    first_send_failed = asyncio.Event()
+    sent_frame_types: list[str] = []
+
+    async def send(raw):
+        sent_frame_types.append(json.loads(raw)["frame"]["type"])
+        first_send_failed.set()
+        raise ConnectionClosedError(None, None)
+
+    client.ws = Mock(send=send)
+    retrying = ComputeClient.send_model.retry_with(wait=wait_fixed(0.02))
+    client.send_model = lambda message: retrying(client, message)
+    request = LiumdRentRequest(executor_id="executor", pod_id="pod", frame={"type": "rent", "rent_id": "pod", "attempt": "attempt"})
+
+    with frames.waiting_for("executor", "pod", "attempt"):
+        client.message_queue.append(request)
+        sender = asyncio.create_task(client.handle_send_messages())
+        await asyncio.wait_for(first_send_failed.wait(), 1)
+    await asyncio.sleep(0.1)
+    sender.cancel()
+    await asyncio.gather(sender, return_exceptions=True)
+
+    assert sent_frame_types == ["rent"]
+
+
+@pytest.mark.asyncio
+async def test_delete_cancelling_the_steps_after_reply_does_not_cut_the_key_removal(miner_service):
+    # LIUM-160 decision 7; LIUM-146 test_delete_wait_does_not_interrupt_key_removal, LIUM-154 §2c
+    payload = make_rent_payload()
+    removal_started, removal_done = asyncio.Event(), asyncio.Event()
+    miner_service._submit_key_and_start_inspector = AsyncMock()
+
+    async def remove(**kwargs):
+        removal_started.set()
+        await asyncio.sleep(0.05)
+        removal_done.set()
+        return True
+
+    miner_service._remove_ssh_key_via_rest = AsyncMock(side_effect=remove)
+    create_steps_after_reply.start(payload.pod_id, miner_service._start_inspector_after_agent_rent(payload, "pod_test"))
+    await asyncio.wait_for(removal_started.wait(), 1)
+
+    steps_finished = await create_steps_after_reply.wait_until_done(payload.pod_id, 0.01)
+    await asyncio.wait_for(removal_done.wait(), 1)
+
+    assert not steps_finished
+    assert miner_service._remove_ssh_key_via_rest.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_key_removal_pauses_one_two_four_eight_seconds_between_its_five_tries(miner_service, monkeypatch):
+    # LIUM-160 decision 7
+    monkeypatch.setattr(miner_module, "AGENT_RENT_KEY_REMOVAL_PAUSES_SECONDS", (0, 1, 2, 4, 8))
+    pauses: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(miner_module.asyncio, "sleep", sleep)
+    miner_service._remove_ssh_key_via_rest = AsyncMock(return_value=False)
+
+    await miner_service._remove_agent_rent_key(make_rent_payload(), Mock(), b"key", "http://miner", {})
+
+    assert pauses == [0, 1, 2, 4, 8]
+    assert miner_service._remove_ssh_key_via_rest.await_count == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pytest.param({"type": "attempt_state", "state": {"stdin_b64": "U1lOVEhFVElDX1NUQVRF"}}, id="state_dict"),
+        pytest.param({"type": "attempt_state", "state": "U1lOVEhFVElDX1NUQVRF"}, id="state_text"),
+        pytest.param({"type": "U1lOVEhFVElDX1NUQVRF"}, id="frame_type"),
+    ],
+)
+async def test_unknown_attempt_state_or_frame_type_is_logged_as_unknown(frame, caplog):
+    # LIUM-160 decision 8; LIUM-146 test_attempt_state_does_not_log_arbitrary_secret_data
+    frames = LiumdAgentFrames()
+    caplog.set_level(logging.INFO)
+
+    frames.deliver(LiumdAgentFrame(message_type="LiumdAgentFrame", executor_id="executor", pod_id="pod", frame={**frame, "attempt": "a", "rent_id": "pod"}))
+
+    logged = "\n".join(record.msg.to_full_string() if hasattr(record.msg, "to_full_string") else record.getMessage() for record in caplog.records)
+    assert "U1lOVEhFVElDX1NUQVRF" not in logged
+    assert "unknown" in logged

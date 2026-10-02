@@ -503,6 +503,10 @@ class ComputeClient:
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
     async def send_model(self, msg: DeliveryStamps):
+        if isinstance(msg, LiumdRentRequest) and liumd_agent_frames.is_rent_without_waiter(msg):
+            # DAH-3980 liumd: checked on every retry; that rent has already failed, sent now the agent would
+            # build an orphan pod
+            return
         # stamped inside the retry so a message resent after a reconnect reports its own delay
         msg.forwarded_at = time.time()
         msg.queue_depth = len(self.message_queue)
@@ -518,9 +522,6 @@ class ComputeClient:
                 async with self.lock:
                     log_to_send = self.message_queue.pop(0)
 
-                if isinstance(log_to_send, LiumdRentRequest) and liumd_agent_frames.is_rent_without_waiter(log_to_send):
-                    # DAH-3980 liumd: that rent has already failed; sent now, the agent would build an orphan pod
-                    continue
                 if log_to_send:
                     try:
                         await self.send_model(log_to_send)

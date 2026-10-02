@@ -243,6 +243,8 @@ REST_POD_LOGS_TIMEOUT = 30  # Timeout for pod logs requests
 REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
 # DAH-3980 liumd: the key submit and the inspector start after an agent rent, together
 AGENT_RENT_INSPECTOR_START_TIMEOUT = 60
+# the pause before each removal of an agent rent's validator key: five tries, 1-2-4-8 s apart
+AGENT_RENT_KEY_REMOVAL_PAUSES_SECONDS = (0, 1, 2, 4, 8)
 
 # Emitted instead of a validation result for an executor under a special manual (bare-metal)
 # rental. Distinct string so manual passes are greppable in Loki and can never be mistaken for a
@@ -1443,26 +1445,30 @@ class MinerService:
                     )
             finally:
                 # a lost, timed-out or cancelled submit may still have installed the key; the removal stays
-                # outside the time limit, a removal cut short is the key left on the node
-                for _ in range(2):
-                    if await self._remove_ssh_key_via_rest(
-                        base_url=base_url,
-                        my_key=my_key,
-                        public_key=public_key,
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        log_extra=log_extra,
-                    ):
-                        break
-                else:
-                    logger.error(
-                        _m("Validator key may be left on the node after an agent rent", extra=get_extra_info(log_extra))
-                    )
+                # outside the time limit and a delete's cancel of these steps does not cut it
+                await asyncio.shield(self._remove_agent_rent_key(payload, my_key, public_key, base_url, log_extra))
         except Exception as exc:
             logger.error(
                 _m("Create steps after reply failed", extra=get_extra_info({**log_extra, "error": repr(exc)})),
                 exc_info=True,
             )
+
+    async def _remove_agent_rent_key(
+        self, payload: ContainerCreateRequest, my_key: bittensor.Keypair, public_key: bytes, base_url: str, log_extra: dict
+    ) -> None:
+        # the validator key of an agent rent's inspector start; one error line when every removal failed
+        for pause_seconds in AGENT_RENT_KEY_REMOVAL_PAUSES_SECONDS:
+            await asyncio.sleep(pause_seconds)
+            if await self._remove_ssh_key_via_rest(
+                base_url=base_url,
+                my_key=my_key,
+                public_key=public_key,
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                log_extra=log_extra,
+            ):
+                return
+        logger.error(_m("Validator key may be left on the node after an agent rent", extra=get_extra_info(log_extra)))
 
     async def _submit_key_and_start_inspector(
         self,
