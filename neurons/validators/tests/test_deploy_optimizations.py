@@ -398,7 +398,7 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
         # a customer's create looks for fillers to remove as soon as the SSH session is up
-        '/usr/bin/docker ps -a --format "{{.Names}}"',
+        '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"',
         '/usr/bin/docker volume ls --format "{{.Name}}"',
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
