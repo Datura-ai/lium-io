@@ -216,8 +216,8 @@ def _patch_happy(svc, monkeypatch, ssh_client):
         svc, "generate_portMappings",
         AsyncMock(return_value=([(22, 20001, 20001)], None)),
     )
-    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock())
-    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         svc, "resolve_volume_sizing",
         AsyncMock(return_value=Mock(volume_limit_gb=10, storage_limit_gb=20)),
