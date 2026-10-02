@@ -598,6 +598,19 @@ class Settings(BaseSettings):
     # turns it on.
     ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
 
+    # collateral_deposited keeps its meaning for the backend's provider statistics and the support board:
+    # the miner's associated EVM address owns the executor on this contract and its collateral covers
+    # required_deposit_amount × gpu_count × COLLATERAL_DAYS. It has no score effect. The read is a plain
+    # JSON-RPC eth_call, cached per executor for COLLATERAL_STATUS_CACHE_SECONDS.
+    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
+    COLLATERAL_CONTRACT_ADDRESS: str = Field(
+        env="COLLATERAL_CONTRACT_ADDRESS", default="0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"
+    )
+    COLLATERAL_CONTRACT_VERSION: str = "1.0.2"
+    COLLATERAL_DAYS: int = 7
+    COLLATERAL_STATUS_TIMEOUT_SECONDS: float = Field(env="COLLATERAL_STATUS_TIMEOUT_SECONDS", default=5.0, gt=0)
+    COLLATERAL_STATUS_CACHE_SECONDS: int = Field(env="COLLATERAL_STATUS_CACHE_SECONDS", default=1800, ge=0)
+
     FEATURE_FLAGS: dict[str, bool] = {
         FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,  # If it's True - then bad internet connection will raise error on synthetic job
     }

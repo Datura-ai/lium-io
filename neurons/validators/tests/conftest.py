@@ -118,6 +118,21 @@ def setup_sql_logging():
     print("✅ SQL logging enabled for all tests")
 
 
+@pytest.fixture(autouse=True)
+def _no_collateral_rpc(monkeypatch):
+    """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so."""
+    from services import collateral_status
+
+    async def _refuse(batch):
+        raise AssertionError("collateral RPC called in a unit test")
+
+    monkeypatch.setattr(
+        collateral_status,
+        "_reader",
+        collateral_status.CollateralStatusReader(rpc=_refuse, evm_address_for_hotkey=lambda _hotkey: None),
+    )
+
+
 @pytest.fixture
 def context_factory():
     def _factory(**overrides):

@@ -2,6 +2,7 @@ from .banned_gpu import BannedGpuCheck
 from .banned_provider import BannedProviderCheck
 from .cached_template_verification import CachedTemplateVerificationCheck
 from .capability import CapabilityCheck
+from .collateral_status import CollateralStatusCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
@@ -40,6 +41,7 @@ __all__ = [
     "BannedProviderCheck",
     "CachedTemplateVerificationCheck",
     "CapabilityCheck",
+    "CollateralStatusCheck",
     "CpuTruthCheck",
     "DiskHealthCheck",
     "CustomBuildOrphanSweepCheck",

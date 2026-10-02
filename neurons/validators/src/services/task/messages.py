@@ -686,6 +686,30 @@ class DuplicateExecutorMessages:
     )
 
 
+class CollateralStatusMessages:
+    DEPOSITED = MessageTemplate(
+        event="Collateral verified",
+        reason="COLLATERAL_OK",
+        severity="info",
+        category="policy",
+        impact="None; collateral has no score effect",
+    )
+    NOT_DEPOSITED = MessageTemplate(
+        event="No collateral deposited",
+        reason="COLLATERAL_MISSING",
+        severity="info",
+        category="policy",
+        impact="None; collateral has no score effect",
+    )
+    READ_FAILED = MessageTemplate(
+        event="Collateral read failed",
+        reason="COLLATERAL_READ_FAILED",
+        severity="info",
+        category="policy",
+        impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
 class StaleContainerCleanupMessages:
     CLEANED = MessageTemplate(
         event="Stale container cleanup complete",

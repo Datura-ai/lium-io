@@ -31,6 +31,7 @@ from .checks import (
     BannedProviderCheck,
     CachedTemplateVerificationCheck,
     CapabilityCheck,
+    CollateralStatusCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -312,6 +313,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
+                CollateralStatusCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.
@@ -430,6 +432,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
+                CollateralStatusCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
@@ -502,6 +505,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
+                CollateralStatusCheck(),
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),
