@@ -129,25 +129,24 @@ class CollateralStatusReader:
         self._rpc = rpc or _post_batch
         self._evm_address_for_hotkey = evm_address_for_hotkey or _evm_address_for_hotkey
         self._clock = clock
-        self._cache: dict[tuple[str, str, str | None, int], tuple[float, CollateralStatus]] = {}
+        self._cache: dict[tuple[str, str, str, str | None, int], tuple[float, CollateralStatus]] = {}
 
     async def status(
         self, *, miner_hotkey: str, executor_uuid: str, gpu_model: str | None, gpu_count: int
     ) -> tuple[CollateralStatus, bool]:
         """The executor's status and whether it came from the cache."""
-        key = (miner_hotkey, executor_uuid, gpu_model, gpu_count)
+        evm_address = self._evm_address_for_hotkey(miner_hotkey)
+        if evm_address is None:
+            # not cached: the miner can associate an address at any time
+            return CollateralStatus(
+                False, None, f"No evm address found that is associated to this miner hotkey {miner_hotkey} in subnet"
+            ), False
+
+        key = (miner_hotkey, executor_uuid, evm_address, gpu_model, gpu_count)
         cached = self._cache.get(key)
         now = self._clock()
         if cached and now - cached[0] < settings.COLLATERAL_STATUS_CACHE_SECONDS:
             return cached[1], True
-
-        evm_address = self._evm_address_for_hotkey(miner_hotkey)
-        if evm_address is None:
-            status = CollateralStatus(
-                False, None, f"No evm address found that is associated to this miner hotkey {miner_hotkey} in subnet"
-            )
-            self._cache[key] = (now, status)
-            return status, False
 
         try:
             status = await asyncio.wait_for(

@@ -136,6 +136,21 @@ async def test_a_read_is_reused_until_the_cache_expires():
 
 
 @pytest.mark.asyncio
+async def test_a_missing_evm_address_is_not_cached_once_the_miner_associates_one():
+    clock = Clock()
+    address = [None]
+    reader = CollateralStatusReader(
+        rpc=FakeRpc(MINER_EVM, Decimal(9)),
+        evm_address_for_hotkey=lambda _: address[0],
+        clock=clock,
+    )
+    assert (await _status(reader))[0].deposited is False
+    address[0] = MINER_EVM
+    clock.now += 121
+    assert (await _status(reader))[0].deposited is True
+
+
+@pytest.mark.asyncio
 async def test_a_failed_read_keeps_the_last_answer_and_names_only_the_error_class():
     clock = Clock()
     rpc = FakeRpc(MINER_EVM, Decimal(9))
