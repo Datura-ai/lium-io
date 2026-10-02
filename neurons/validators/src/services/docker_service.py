@@ -5873,14 +5873,6 @@ class DockerService:
             # Keep this immediately before the guard; the broad except uses it as failure_step.
             require_rental_docker_ssh_host_key(executor_info)
 
-            # DAH-3980: the registry digest a present image is checked against (DAH-3873), asked from
-            # here while the SSH connects; the host's daemon took ~2 s for the same answer
-            docker_hub_digest_lookup = (
-                None
-                if is_custom_build
-                else asyncio.create_task(fetch_docker_hub_digest(payload.docker_image))
-            )
-
             current_step = "ssh_connect"
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
@@ -5891,6 +5883,13 @@ class DockerService:
             # cost p50 2.1 s / p90 4.3 s per rent (container_profiler_events, 7 d). Open them
             # together: same connections, same order of use, roughly half the wait.
             async with AsyncExitStack() as connections:
+                # DAH-3980: the registry digest a present image is checked against (DAH-3873), asked
+                # from here while the SSH connects; the host's daemon took ~2 s for the same answer
+                docker_hub_digest_lookup: asyncio.Task[str | None] | None = None
+                if not is_custom_build:
+                    docker_hub_digest_lookup = asyncio.create_task(fetch_docker_hub_digest(payload.docker_image))
+                    # a failed connect or an early return must not leave the lookup running
+                    connections.callback(docker_hub_digest_lookup.cancel)
                 ssh_client, docker_client = await self._connect_ssh_and_docker(
                     connections,
                     connect_with_phase_timing(
