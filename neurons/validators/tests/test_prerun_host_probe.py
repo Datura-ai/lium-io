@@ -1212,6 +1212,7 @@ async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc
 
 
 _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
+_POD_OLD_REMOVAL = _remove_and_list_containers_command(["pod_old"], ["volume_old"])
 
 
 @pytest.mark.asyncio
@@ -1219,14 +1220,7 @@ _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
     ("containers", "active_volume_names", "docker_rm_exit", "ps_after_rm", "listing_after_rm_exit", "removals"),
     [
         # a pod removed beside the filler: the filler at SSH connect, the pod at the cleanup step
-        (
-            ("filler_x", "pod_old"),
-            ["volume_x"],
-            0,
-            "",
-            0,
-            [_FILLER_X_REMOVAL, _remove_and_list_containers_command(["pod_old"], ["volume_old"])],
-        ),
+        (("filler_x", "pod_old"), ["volume_x"], 0, "", 0, [_FILLER_X_REMOVAL, _POD_OLD_REMOVAL]),
         # the filler's volume removed by the create
         (("filler_x",), [], 0, "", 0, [_remove_and_list_containers_command(["filler_x"], ["volume_x"])]),
         (("filler_x",), ["volume_x"], 0, "filler_x\n", 0, [_FILLER_X_REMOVAL]),  # the filler survived the rm
@@ -1235,14 +1229,7 @@ _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
     ],
 )
 async def test_customer_create_relists_after_any_other_removal(
-    svc_fixture,
-    monkeypatch,
-    containers,
-    active_volume_names,
-    docker_rm_exit,
-    ps_after_rm,
-    listing_after_rm_exit,
-    removals,
+    svc_fixture, monkeypatch, containers, active_volume_names, docker_rm_exit, ps_after_rm, listing_after_rm_exit, removals
 ):
     """Every removal but a clean filler-only one lists the host again; nothing is removed twice."""
     svc = svc_fixture
