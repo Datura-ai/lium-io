@@ -3,6 +3,7 @@ import contextlib
 import dataclasses
 import enum
 import ipaddress
+import json
 import logging
 import math
 import random
@@ -99,6 +100,17 @@ from services.prerun_host_probe import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
+from services.one_exec_create import (
+    CONTAINER_CREATED_STEP,
+    RUNNING_STEP,
+    STARTED_STEP,
+    VOLUME_CREATED_STEP,
+    OneExecCreateReply,
+    build_one_exec_create_request,
+    one_exec_profiler_rows,
+    run_one_exec_create,
+    settle_one_exec_create,
+)
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
@@ -115,6 +127,7 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     ContainerUlimit,
     DeviceMount,
+    GpuDockerConfig,
     PortBinding,
     RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
@@ -1310,6 +1323,55 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
+def _local_volume_driver_and_opts(
+    limit: int | None, sparse: bool
+) -> tuple[str | None, dict[str, str] | None]:
+    if not limit:
+        return None, None
+    # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
+    # by default (creation time scales with size). `sparse=true` writes a sparse
+    # file (creation ~flat) while still capping the volume at `size`. Gated to
+    # full-node rentals only — see the caller — because a sparse partial volume
+    # leaves its unwritten space free in df AND still counts its declared size in
+    # resolve_volume_sizing(), double-counting the pool and overcommitting host disk.
+    driver_opts = {"size": f"{limit}g"}
+    if sparse:
+        driver_opts["sparse"] = "true"
+    return _LOOPBACK_PLUGIN_ALIAS, driver_opts
+
+
+def _creates_volume_and_container_in_one_exec(
+    payload: ContainerCreateRequest,
+    executor_info: ExecutorSSHInfo,
+    *,
+    use_encrypted_volume: bool,
+    image_present: bool,
+    cleanup_changed_host: bool,
+    volume_probe: "VolumeHostProbe | None",
+    volume_limit_gb: int | None,
+) -> bool:
+    # LIUM-65: only a normal rent of a cached image onto an encrypted local volume, on a host the
+    # cleanup left as it was; every other create keeps today's separate steps
+    return (
+        payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+        and use_encrypted_volume
+        and image_present
+        and not cleanup_changed_host
+        and payload.external_volume_info is None
+        and not payload.bootstrap_restore
+        and payload.cluster_membership is None
+        and not executor_info.tdx_quote
+        # the probe must have seen the loopback plugin enabled: installing it is today's job
+        and volume_probe is not None
+        and (not volume_limit_gb or volume_probe.loopback_plugin_enabled)
+    )
+
+
+def _one_exec_not_running_reason(failure: dict) -> str:
+    # the same two parts today's capture reads: the container's state, then its logs tail
+    return f"{json.dumps(failure.get('state') or {})}\n{failure.get('logs') or ''}"
+
+
 def _should_repair_stale_mountpoint(
     exc: Exception,
     local_volume: str | None,
@@ -1925,6 +1987,117 @@ class DockerService:
         if result.exit_status != 0 or not (result.stdout or "").strip():
             return None
         return _parse_listening_ports(str(result.stdout))
+
+    async def _create_volume_and_run_in_one_exec(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        run_spec: ContainerRunSpec,
+        local_volume_create: dict,
+        log_tag: str,
+        default_extra: dict,
+    ) -> OneExecCreateReply | None:
+        """LIUM-65: the volume, `docker run` and the running check as one exec on the host.
+
+        Returns the reply when the container runs or a step failed for good (the script removed
+        what it made). Returns None when today's path must take the create, with nothing of this
+        exec left on the host: the rental network is missing or not isolated, the pod's volume or
+        container name is already taken, dockerd refused a host port or hit a stale vloopback
+        mountpoint (today's path remaps and repairs those), or python3 could not start.
+
+        A lost or unclear reply is not a failed create: the attempt may still be running on the
+        host. The settle waits for it to exit, then adopts its running container or removes what
+        its record says it made; only a confirmed removal lets today's path start.
+        """
+        volume_name = local_volume_create["local_volume"]
+        limit = local_volume_create["limit"]
+        volume_driver, volume_driver_opts = _local_volume_driver_and_opts(
+            limit, local_volume_create["sparse"]
+        )
+        request = build_one_exec_create_request(
+            run_spec=run_spec,
+            volume_name=volume_name,
+            volume_driver=volume_driver,
+            volume_driver_opts=volume_driver_opts,
+            volume_timeout_s=self._get_local_volume_create_timeout(limit, 10),
+        )
+
+        async def stream_step_log(step: str) -> None:
+            if step == VOLUME_CREATED_STEP:
+                await self.stream_log("Creating docker container", "success", log_tag)
+
+        await self.stream_log(local_volume_create["log_text"], "success", log_tag)
+        reply = await run_one_exec_create(ssh_client, request, stream_step_log, default_extra)
+        if reply.ran_to_running:
+            return reply
+        failed_step = reply.failure.get("failed_step") if reply.failure else None
+        error_text = str(reply.failure.get("error", "")) if reply.failure else ""
+        failed_for_good = failed_step in (
+            VOLUME_CREATED_STEP, CONTAINER_CREATED_STEP, STARTED_STEP, RUNNING_STEP, "lock"
+        ) and not (
+            _port_allocated_phrase(Exception(error_text))
+            or _is_stale_vloopback_mountpoint_error(error_text)
+        )
+        if failed_for_good:
+            return reply
+        if not reply.left_host_as_found:
+            settled = await settle_one_exec_create(ssh_client, request, default_extra)
+            if settled == "adopt":
+                if VOLUME_CREATED_STEP not in reply.step_ms:
+                    await self.stream_log("Creating docker container", "success", log_tag)
+                reply.adopted = True
+                return reply
+            if settled != "gone":
+                raise RentalDockerOperationError(
+                    "Docker SDK run container failed: the one-exec create lost its reply and its "
+                    "volume and container could not be confirmed removed"
+                )
+        logger.warning(
+            _m(
+                "ONE_EXEC_CREATE_FALLBACK",
+                extra=get_extra_info({
+                    **default_extra,
+                    "failed_step": failed_step,
+                    "error": error_text,
+                    "exit_status": reply.exit_status,
+                }),
+            )
+        )
+        return None
+
+    def _log_container_not_running(
+        self,
+        *,
+        failure_reason: str,
+        gpu_config: GpuDockerConfig,
+        container_name: str,
+        default_extra: dict,
+    ) -> None:
+        # DAH-1987: says whether the reason points to our --device flags
+        nvidia_signal = any(
+            marker in failure_reason.lower()
+            for marker in ("/dev/nvidia", "device cgroup", "no such device", "operation not permitted")
+        )
+        log_extra = get_extra_info({
+            **default_extra,
+            "container_name": container_name,
+            "gpu_device_mounts": [
+                device.path_on_host for device in gpu_config.device_mounts
+            ],
+            "gpu_device_request_ids": [
+                list(device_request.device_ids)
+                for device_request in gpu_config.device_requests
+            ],
+            "failure_reason": failure_reason[:2000],
+        })
+        if nvidia_signal:
+            logger.error(_m(
+                "docker run failed with NVIDIA-device-related error — "
+                "possible regression from GPU device configuration",
+                extra=log_extra,
+            ))
+        else:
+            logger.error(_m("docker run failed", extra=log_extra))
 
     def _build_rental_container_run_spec(
         self,
@@ -4573,21 +4746,9 @@ class DockerService:
                 # part of the SDK migration scope. The user-controlled volume name is
                 # not used in this shell command; volume creation below is SDK-backed.
                 await ssh_client.run(command)
-
-            # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
-            # by default (creation time scales with size). `sparse=true` writes a sparse
-            # file (creation ~flat) while still capping the volume at `size`. Gated to
-            # full-node rentals only — see the caller — because a sparse partial volume
-            # leaves its unwritten space free in df AND still counts its declared size in
-            # resolve_volume_sizing(), double-counting the pool and overcommitting host disk.
-            volume_driver = loopback_plugin_name
-            volume_driver_opts = {"size": f"{limit}g"}
-            if sparse:
-                volume_driver_opts["sparse"] = "true"
         else:
             loopback_plugin_name = None
-            volume_driver = None
-            volume_driver_opts = None
+        volume_driver, volume_driver_opts = _local_volume_driver_and_opts(limit, sparse)
 
         timeout = self._get_local_volume_create_timeout(limit, timeout)
         volume_log_extra = {
@@ -6624,6 +6785,9 @@ class DockerService:
                             f"{payload.bootstrap_restore.backup_engine}; the provider must update "
                             "the executor image"
                         )
+                # LIUM-65: create_local_volume's arguments when the volume is made by the one exec
+                # with `docker run` below; None when it was made here, as before
+                deferred_local_volume_create: dict | None = None
                 if not local_volume:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
@@ -6665,7 +6829,7 @@ class DockerService:
                     full_node_rental = (
                         payload.disk_share is not None and payload.disk_share >= 1.0
                     )
-                    await self.create_local_volume(
+                    local_volume_create = dict(
                         ssh_client=ssh_client,
                         docker_client=docker_client,
                         local_volume=local_volume,
@@ -6676,13 +6840,25 @@ class DockerService:
                         sparse=full_node_rental,
                         host_probe=volume_probe,
                     )
-                    created_local_volume = True
+                    if _creates_volume_and_container_in_one_exec(
+                        payload,
+                        executor_info,
+                        use_encrypted_volume=use_encrypted_volume,
+                        image_present=image_present,
+                        cleanup_changed_host=cleanup_changed_host,
+                        volume_probe=volume_probe,
+                        volume_limit_gb=effective_volume_limit_gb,
+                    ):
+                        deferred_local_volume_create = local_volume_create
+                    else:
+                        await self.create_local_volume(**local_volume_create)
+                        created_local_volume = True
 
-                    # DAH-1524: profile local volume sizing + creation on its own;
-                    # otherwise this SSH-bound time hides inside the broad
-                    # "container creation" bucket and looks like `docker run`.
-                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
-                    prev_timestamp = now_ms()
+                        # DAH-1524: profile local volume sizing + creation on its own;
+                        # otherwise this SSH-bound time hides inside the broad
+                        # "container creation" bucket and looks like `docker run`.
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
+                        prev_timestamp = now_ms()
 
                 external_volume_name = None
                 if payload.bootstrap_restore and not use_encrypted_volume:
@@ -6769,8 +6945,11 @@ class DockerService:
                     if not cap_applied:
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
                 elif early_gpu_power_restore is not None:
-                    _, early_gpu_power_restore_step = await early_gpu_power_restore
-                    profilers.append(early_gpu_power_restore_step)
+                    # LIUM-65: it overlapped the volume step; with the volume in the one exec it
+                    # overlaps that exec and is awaited after it, still before the reply
+                    if deferred_local_volume_create is None:
+                        _, early_gpu_power_restore_step = await early_gpu_power_restore
+                        profilers.append(early_gpu_power_restore_step)
                 else:
                     await self._restore_gpu_power_for_uncapped_pod(
                         ssh_client, payload, host_probe, default_extra
@@ -6858,22 +7037,61 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.PORT_CHECK_WAIT, prev_timestamp))
                 prev_timestamp = now_ms()
 
+                one_exec_reply: OneExecCreateReply | None = None
                 try:
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-                    await self.stream_log("Creating docker container", "success", log_tag)
-                    await self._run_rental_docker_create_with_port_retry(
-                        docker_client=docker_client,
-                        ssh_client=ssh_client,
-                        run_spec=run_spec,
-                        container_name=container_name,
-                        default_extra=default_extra,
-                        local_volume=local_volume,
-                        log_tag=log_tag,
-                        port_maps=port_maps,
-                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
-                    )
+                    if deferred_local_volume_create is not None:
+                        one_exec_reply = await self._create_volume_and_run_in_one_exec(
+                            ssh_client=ssh_client,
+                            run_spec=run_spec,
+                            local_volume_create=deferred_local_volume_create,
+                            log_tag=log_tag,
+                            default_extra=default_extra,
+                        )
+                    if one_exec_reply is not None:
+                        created_local_volume = (
+                            one_exec_reply.ran_to_running or VOLUME_CREATED_STEP in one_exec_reply.step_ms
+                        )
+                    if one_exec_reply is not None and not one_exec_reply.ran_to_running:
+                        failed_step = one_exec_reply.failure["failed_step"]
+                        error_text = str(one_exec_reply.failure.get("error", ""))
+                        if failed_step == VOLUME_CREATED_STEP:
+                            current_step = "volume_creation"
+                            raise RentalDockerOperationError(f"Docker SDK create volume failed: {error_text}")
+                        if failed_step == RUNNING_STEP:
+                            current_step = "container_health_check"
+                            self._log_container_not_running(
+                                failure_reason=_one_exec_not_running_reason(one_exec_reply.failure),
+                                gpu_config=gpu_config,
+                                container_name=container_name,
+                                default_extra=default_extra,
+                            )
+                            raise Exception("Run docker run command but container is not running")
+                        await self.stream_log(error_text, "error", log_tag)
+                        raise RentalDockerOperationError(f"Docker SDK run container failed: {error_text}")
+                    if one_exec_reply is None:
+                        if deferred_local_volume_create is not None:
+                            # the one exec could not take this create: today's volume step, then run
+                            current_step = "volume_creation"
+                            await self.create_local_volume(**deferred_local_volume_create)
+                            created_local_volume = True
+                            profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
+                            prev_timestamp = now_ms()
+                            current_step = "docker_run"
+                        await self.stream_log("Creating docker container", "success", log_tag)
+                        await self._run_rental_docker_create_with_port_retry(
+                            docker_client=docker_client,
+                            ssh_client=ssh_client,
+                            run_spec=run_spec,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            local_volume=local_volume,
+                            log_tag=log_tag,
+                            port_maps=port_maps,
+                            spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                        )
                     if jupyter_port_map:
                         # a port collision may have moved the Jupyter mapping: the URL below
                         # and the answer to the backend read the port the pod really got
@@ -6884,15 +7102,16 @@ class DockerService:
                     container_created = True
                     logger.info("Container creation step finished")
 
-                    # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
-                    # --gpus prestart hook, +sysbox/storage-opt) from the post-run
-                    # running-state poll below.
-                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_RUN, prev_timestamp))
-                    prev_timestamp = now_ms()
+                    if one_exec_reply is None:
+                        # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
+                        # --gpus prestart hook, +sysbox/storage-opt) from the post-run
+                        # running-state poll below.
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_RUN, prev_timestamp))
+                        prev_timestamp = now_ms()
 
-                    # check if the container is running correctly
+                    # check if the container is running correctly (the one exec checked it on the host)
                     current_step = "container_health_check"
-                    if not await self.check_container_running(ssh_client, container_name):
+                    if one_exec_reply is None and not await self.check_container_running(ssh_client, container_name):
                         # Capture the failure reason and check whether it points to our
                         # --device flags (DAH-1987). State.Error covers cgroup / device
                         # failures; logs --tail covers entrypoint failures.
@@ -6909,31 +7128,12 @@ class DockerService:
                         except Exception:
                             failure_reason = "(failure_reason capture failed)"
 
-                        nvidia_signal = any(
-                            marker in failure_reason.lower()
-                            for marker in ("/dev/nvidia", "device cgroup", "no such device", "operation not permitted")
+                        self._log_container_not_running(
+                            failure_reason=failure_reason,
+                            gpu_config=gpu_config,
+                            container_name=container_name,
+                            default_extra=default_extra,
                         )
-                        log_extra = get_extra_info({
-                            **default_extra,
-                            "container_name": container_name,
-                            "gpu_device_mounts": [
-                                device.path_on_host for device in gpu_config.device_mounts
-                            ],
-                            "gpu_device_request_ids": [
-                                list(device_request.device_ids)
-                                for device_request in gpu_config.device_requests
-                            ],
-                            "failure_reason": failure_reason[:2000],
-                        })
-                        if nvidia_signal:
-                            logger.error(_m(
-                                "docker run failed with NVIDIA-device-related error — "
-                                "possible regression from GPU device configuration",
-                                extra=log_extra,
-                            ))
-                        else:
-                            logger.error(_m("docker run failed", extra=log_extra))
-
                         raise Exception("Run docker run command but container is not running")
                 except Exception:
                     container_missing = await self.cleanup_failed_container_creation(
@@ -6943,7 +7143,12 @@ class DockerService:
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
-                    container_vanished = container_created and container_missing
+                    # the one exec removed what it made, so only its own report knows the container vanished
+                    container_vanished = (container_created and container_missing) or bool(
+                        one_exec_reply is not None
+                        and one_exec_reply.failure
+                        and one_exec_reply.failure.get("vanished")
+                    )
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
                     if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
@@ -6953,9 +7158,15 @@ class DockerService:
                         )
                     raise
 
-                # Add profiler for the post-run container running-state poll
-                profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_RUNNING_CHECK, prev_timestamp))
+                if one_exec_reply is None:
+                    # Add profiler for the post-run container running-state poll
+                    profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_RUNNING_CHECK, prev_timestamp))
+                else:
+                    profilers.extend(one_exec_profiler_rows(one_exec_reply))
                 prev_timestamp = now_ms()
+                if deferred_local_volume_create is not None and early_gpu_power_restore is not None:
+                    _, early_gpu_power_restore_step = await early_gpu_power_restore
+                    profilers.append(early_gpu_power_restore_step)
 
                 logger.info(
                     _m(

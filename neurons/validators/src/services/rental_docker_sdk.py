@@ -1047,6 +1047,25 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
+def build_container_create_body(spec: ContainerRunSpec) -> dict:
+    # the Engine API body `_run_container_sync` makes docker-py POST to /containers/create
+    from docker.constants import DEFAULT_DOCKER_API_VERSION
+    from docker.types import ContainerConfig, HostConfig
+    from docker.utils import format_environment
+
+    return ContainerConfig(
+        DEFAULT_DOCKER_API_VERSION,
+        spec.image,
+        list(spec.command) or None,
+        detach=True,
+        ports=_container_ports(spec.ports) or None,
+        environment=format_environment(spec.environment) if spec.environment else None,
+        volumes=_container_volumes(spec.volumes) or None,
+        entrypoint=spec.entrypoint or None,
+        host_config=HostConfig(DEFAULT_DOCKER_API_VERSION, **_build_host_config_kwargs(spec)),
+    )
+
+
 def _require_icc_off(name: str, network: dict) -> None:
     options = network.get("Options") or {}
     if network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false":
