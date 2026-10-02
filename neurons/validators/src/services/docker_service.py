@@ -2422,7 +2422,8 @@ class DockerService:
                 jupyter_port_map: tuple[int, int] | None = None
 
                 user_defined = bool(internal_ports)
-                docker_internal_ports = internal_ports or self._get_preferred_ports(initial_port_count)
+                # a copy: the edits below must not reach the caller's list or the shared PREFERRED_POD_PORTS
+                docker_internal_ports = list(internal_ports or self._get_preferred_ports(initial_port_count))
                 if ssh_port in docker_internal_ports:
                     docker_internal_ports.remove(ssh_port)
                 docker_internal_ports.insert(0, ssh_port)
