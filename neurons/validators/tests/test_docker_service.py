@@ -7250,7 +7250,7 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
 
 @pytest.mark.asyncio
 async def test_setup_encrypted_local_volume_counts_the_utf8_bytes_of_a_unicode_path(docker_service):
-    # LIUM-16: a template volume path such as /workspace/данные; asyncssh sends a str input as UTF-8,
+    # a template volume path such as /workspace/данные; asyncssh sends a str input as UTF-8,
     # so `head -c` must take the script's UTF-8 bytes, or it cuts into the keys behind it
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
@@ -8113,7 +8113,7 @@ async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
     assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
 
 
-# LIUM-27: on the encrypted path the keys ride at the end of the one volume setup exec; its exit
+# DAH-3980: on the encrypted path the keys ride at the end of the one volume setup exec; its exit
 # status says which part failed (90 upload, 91 init/mount, 92 mount check, 93 keys).
 
 

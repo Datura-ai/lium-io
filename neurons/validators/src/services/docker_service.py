@@ -10,7 +10,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2698,7 +2698,7 @@ class DockerService:
         }
 
         while True:
-            finishing = self.log_stream_finish_requested.is_set()
+            finish_requested = self.log_stream_finish_requested.is_set()
             async with self.lock:
                 logs_to_process = self.logs_queue[:]
                 self.logs_queue.clear()
@@ -2731,7 +2731,7 @@ class DockerService:
                         exc_info=True,
                     )
 
-            if finishing:
+            if finish_requested:
                 break
             # publish first, then wait: the first line (the UI's SSH port) goes out at once, and
             # finish_stream_logs cuts the wait short so the last batch does too
@@ -3873,7 +3873,7 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
         allow_init: bool = True,
-        authorized_keys: list[str] | tuple[str, ...] = (),
+        authorized_keys: Sequence[str] = (),
     ) -> None:
         # authorized_keys: the renter's public keys, appended to /root/.ssh once the mount is up
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
@@ -4022,7 +4022,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         container_q: str,
         plaintext_path: str,
-        user_inspect_result: Any,
+        user_inspect_result: asyncssh.SSHCompletedProcess,
         log_extra: dict,
     ) -> str | None:
         """Hand the freshly mounted workspace to the image's own user.
@@ -4040,15 +4040,14 @@ class DockerService:
         unreachable).
         """
         # a probe we cannot run must not be mistaken for a probe that passed
-        inspect_result = user_inspect_result
-        if inspect_result.exit_status != 0:
+        if user_inspect_result.exit_status != 0:
             return (
                 f"could not read the image USER of the rental container "
-                f"(docker inspect exit={inspect_result.exit_status}, "
-                f"stderr={(inspect_result.stderr or '')[-300:]!r})"
+                f"(docker inspect exit={user_inspect_result.exit_status}, "
+                f"stderr={(user_inspect_result.stderr or '')[-300:]!r})"
             )
 
-        image_user: str = (inspect_result.stdout or "").strip()
+        image_user: str = (user_inspect_result.stdout or "").strip()
         if image_user in ("", "0", "root", "0:0", "root:root"):
             return None
 
