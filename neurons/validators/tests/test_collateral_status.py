@@ -48,6 +48,7 @@ def _tao_word(tao: Decimal) -> str:
 class FakeRpc:
     def __init__(self, owner: str, collateral_tao: Decimal, *, fail: Exception | None = None):
         self.owner, self.collateral_tao, self.fail = owner, collateral_tao, fail
+        self.has_block = True
         self.batches: list[list[dict]] = []
 
     async def __call__(self, batch):
@@ -56,6 +57,12 @@ class FakeRpc:
         if batch[0]["method"] == "eth_getBlockByNumber":
             return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": {"hash": BLOCK_HASH}}]
         self.batches.append(batch)
+        if batch[0]["method"] == "eth_getBlockByHash":
+            block = {"hash": batch[0]["params"][0]} if self.has_block else None
+            batch = batch[1:]
+            head = [{"jsonrpc": "2.0", "id": 0, "result": block}]
+        else:
+            head = []
         results = {
             executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID): _address_word(self.owner),
             executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID): _tao_word(self.collateral_tao),
@@ -63,7 +70,7 @@ class FakeRpc:
         # answered out of order, as a batch may be
         return [
             {"jsonrpc": "2.0", "id": req["id"], "result": results[req["params"][0]["data"]]} for req in reversed(batch)
-        ]
+        ] + head
 
 
 class Clock:
@@ -113,8 +120,18 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
     [batch] = rpc.batches
-    assert [req["params"][0]["to"] for req in batch] == [settings.COLLATERAL_CONTRACT_ADDRESS] * 2
-    assert [req["params"][1] for req in batch] == [{"blockHash": BLOCK_HASH, "requireCanonical": True}] * 2
+    assert batch[0] == {"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByHash", "params": [BLOCK_HASH, False]}
+    assert [req["params"][0]["to"] for req in batch[1:]] == [settings.COLLATERAL_CONTRACT_ADDRESS] * 2
+    assert [req["params"][1] for req in batch[1:]] == [{"blockHash": BLOCK_HASH, "requireCanonical": True}] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_is_a_failed_read():
+    rpc = FakeRpc(MINER_EVM, Decimal(9))
+    rpc.has_block = False
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
 
 
 @pytest.mark.asyncio

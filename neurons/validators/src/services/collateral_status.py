@@ -202,7 +202,11 @@ class CollateralStatusReader:
         block_hash = (head.get("result") or {}).get("hash") if isinstance(head, dict) else None
         if not block_hash:
             raise ValueError("eth_getBlockByNumber has no block hash")
+        # Frontier ignores requireCanonical and answers a hash it does not know from its pending state, so the
+        # calls go in one batch with eth_getBlockByHash: the backend that answers them must also hold the block
         batch = [
+            {"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByHash", "params": [block_hash, False]},
+        ] + [
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -218,6 +222,9 @@ class CollateralStatusReader:
         if not isinstance(answers, list):
             raise ValueError("JSON-RPC batch answered with a single object")
         by_id = {answer.get("id"): answer for answer in answers if isinstance(answer, dict)}
+        block = (by_id.get(0) or {}).get("result")
+        if not isinstance(block, dict) or block.get("hash") != block_hash:
+            raise ValueError("the RPC does not have the block the read is pinned to")
         results = []
         for request_id in (1, 2):
             answer = by_id.get(request_id)
