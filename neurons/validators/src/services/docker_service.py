@@ -6438,10 +6438,13 @@ class DockerService:
                 filler_removal_at_ssh_connect.cancel()
                 [removal_outcome] = await asyncio.gather(filler_removal_at_ssh_connect, return_exceptions=True)
                 if isinstance(removal_outcome, Exception):
+                    # the type only: the error's text carries the executor's stderr or SSH banner
                     logger.warning(
                         _m(
                             "Filler removal at SSH connect failed before the cleanup step",
-                            extra=get_extra_info({**default_extra, "error": str(removal_outcome)}),
+                            extra=get_extra_info(
+                                {**default_extra, "error_type": removal_outcome.__class__.__name__}
+                            ),
                         )
                     )
 
