@@ -962,22 +962,21 @@ class CollateralClient:
 
     async def _call_at_block_hash(self, function, block_hash):
         """A view function's result at a block named by its hash. A contract function's call(block_identifier=<hash>)
-        looks the hash up and sends the call by number, so the call is sent here with an EIP-1898 block hash.
+        looks the hash up and sends the call by number; here the header is read by hash first.
 
-        Frontier ignores requireCanonical and answers a hash it does not know from its pending state, and a gateway
-        can send each entry of a batch to another backend. So the call runs inside pinned_read_code, whose answer
-        carries the number, parent hash and timestamp of the block it ran on, and those must match the block's
-        header; a null header fails the read. Every output of the contract's view functions is a static type."""
+        Frontier ignores requireCanonical and answers a hash it does not know from its pending state, which can
+        carry the block's number, parent and timestamp. So the call is pinned by the header's number, which a
+        backend without that block answers with "header not found", and it runs inside pinned_read_code, whose
+        header words must match the header. Every output of the contract's view functions is a static type."""
         hash_hex = AsyncWeb3.to_hex(block_hash)
         outputs = [output["type"] for output in function.abi["outputs"]]
         size = 32 * len(outputs)
         code = pinned_read_code(self.contract_address, [(bytes.fromhex(function._encode_transaction_data()[2:]), size)])
-        block, result = await self._read_together(
-            ("eth_getBlockByHash", [hash_hex, False]),
-            ("eth_call", [{"data": code}, {"blockHash": hash_hex, "requireCanonical": True}]),
-        )
+        (block,) = await self._read_together(("eth_getBlockByHash", [hash_hex, False]))
         if not isinstance(block, dict) or block.get("hash") != hash_hex:
             raise RpcReadError("the RPC does not have the block the read is pinned to")
+        # by number: a backend without that block answers "header not found", where an unknown hash runs on pending
+        (result,) = await self._read_together(("eth_call", [{"data": code}, {"blockNumber": block["number"]}]))
         [result] = pinned_outputs(result, block, [size])
         decoded = self.w3.codec.decode(outputs, result)
         return decoded[0] if len(outputs) == 1 else tuple(decoded)

@@ -258,7 +258,7 @@ class CollateralStatusReader:
         # owner and amount come from one EVM run (pinned_read_code), so one backend reads both from one state; a
         # gateway that splits a batch across backends cannot pair an old owner with a new owner's deposit
         [head] = await self._rpc(
-            [{"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByNumber", "params": ["latest", False]}]
+            [{"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByNumber", "params": ["finalized", False]}]
         )
         header = head.get("result") if isinstance(head, dict) else None
         if not isinstance(header, dict) or not all(header.get(k) for k in ("hash", "number", "parentHash", "timestamp")):
@@ -275,7 +275,9 @@ class CollateralStatusReader:
                     "method": "eth_call",
                     "params": [
                         {"data": pinned_read_code(to, calls)},
-                        {"blockHash": header["hash"], "requireCanonical": True},
+                        # by number: a backend without that block answers "header not found", where an unknown
+                        # hash runs on pending state that can carry the block's number, parent and timestamp
+                        {"blockNumber": header["number"]},
                     ],
                 }
             ]

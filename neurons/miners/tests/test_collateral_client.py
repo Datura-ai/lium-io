@@ -203,7 +203,12 @@ class FakeProvider(AsyncBaseProvider):
         A hash this backend does not know runs on its pending state, as Frontier does, with `pending_calls`."""
         code = bytes.fromhex(params[0]["data"].removeprefix("0x"))
         number = self.block_number + 1
-        if known:
+        if "blockNumber" in params[1]:
+            # Frontier: a number the backend does not have is an error, never its pending state
+            if not known or int(params[1]["blockNumber"], 16) > self.block_number:
+                return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "header not found"}}
+            number = int(params[1]["blockNumber"], 16)
+        elif known:
             found = next((n for n in range(self.block_number + 1) if self.chain_hash(n) == params[1]["blockHash"]), None)
             number = found if found is not None else number
         header = self.block(number) if number <= self.block_number else {
@@ -1069,7 +1074,7 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
     assert reclaim[2] == 10**17
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}]
+    assert [block for _, block in details] == [{"blockNumber": hex(5000)}]
 
 
 async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
@@ -1094,8 +1099,8 @@ async def test_a_pinned_read_split_across_backends_fails_instead_of_reading_pend
     client = client_with(provider)
     block_hash = await client.latest_block_hash()
 
-    provider.batch_backends = ["split"]
-    with pytest.raises(collateral_module.RpcReadError, match="did not run on the block"):
+    provider.batch_backends = ["a", "split"]
+    with pytest.raises(collateral_module.RpcReadError, match="an error answer"):
         await client.get_executor_collateral(EXECUTOR, block_hash=block_hash)
     assert await client.get_executor_collateral(EXECUTOR, block_hash=block_hash) == Decimal("0.01")
 
@@ -1111,8 +1116,8 @@ async def test_remove_executor_fails_when_its_pinned_read_is_split_across_backen
     monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
     monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
 
-    provider.batch_backends = ["split"]
-    with pytest.raises(collateral_module.RpcReadError, match="did not run on the block"):
+    provider.batch_backends = ["a", "split"]
+    with pytest.raises(collateral_module.RpcReadError, match="an error answer"):
         await utils.versions_holding_collateral(EXECUTOR)
     assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
 
@@ -1178,7 +1183,7 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
 
     assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockHash": provider.chain_hash(5000), "requireCanonical": True} for _, block in details)
+    assert details and all(block == {"blockNumber": hex(5000)} for _, block in details)
 
 
 async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_requests():
@@ -1243,7 +1248,7 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
     numbers = [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"]
     assert numbers[0] == "finalized" and max(int(number, 16) for number in numbers[1:]) == 4999
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockHash": provider.chain_hash(5000), "requireCanonical": True} for _, block in details)
+    assert details and all(block == {"blockNumber": hex(5000)} for _, block in details)
 
 
 async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():

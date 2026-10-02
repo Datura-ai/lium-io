@@ -67,15 +67,25 @@ class FakeRpc:
         self.has_block = True
         self.pending_owner, self.pending_collateral_tao = owner, collateral_tao
         self.batches: list[list[dict]] = []
+        self.head_tags: list[str] = []
+        self.pending = PENDING
 
     async def __call__(self, batch):
         if self.fail:
             raise self.fail
         if batch[0]["method"] == "eth_getBlockByNumber":
+            self.head_tags.append(batch[0]["params"][0])
             return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": HEADER}]
         self.batches.append(batch)
         [req] = batch
-        header = HEADER if self.has_block and req["params"][1]["blockHash"] == BLOCK_HASH else PENDING
+        at = req["params"][1]
+        # as Finney's Frontier answers: an unknown number is "header not found", an unknown hash runs on pending
+        if "blockNumber" in at:
+            if not (self.has_block and at["blockNumber"] == HEADER["number"]):
+                return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "header not found"}}]
+            header = HEADER
+        else:
+            header = HEADER if self.has_block and at.get("blockHash") == BLOCK_HASH else self.pending
         owner, tao = (
             (self.owner, self.collateral_tao) if header is HEADER else (self.pending_owner, self.pending_collateral_tao)
         )
@@ -138,7 +148,8 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
     [[req]] = rpc.batches
     assert "to" not in req["params"][0]
-    assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
+    assert req["params"][1] == {"blockNumber": HEADER["number"]}
+    assert rpc.head_tags == ["finalized"]
     contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
     assert req["params"][0]["data"].count("73" + contract) == 2
     assert _pinned_inner_calls(bytes.fromhex(req["params"][0]["data"][2:])) == [
@@ -170,6 +181,20 @@ async def test_a_read_a_gateway_sends_to_a_backend_without_the_block_is_not_publ
     rpc.has_block = True
     status, _ = await _status(_reader(rpc))
     assert (status.deposited, status.read_failed) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_a_pending_block_with_the_pinned_number_parent_and_timestamp_is_never_read():
+    """Review at 78c163c: a backend one block behind can answer an unknown hash from a pending block with the
+    pinned header's number, parent and timestamp but other collateral. The read is pinned by number, which such a
+    backend does not have, so it fails instead of reporting the pending state."""
+    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
+    rpc.has_block = False
+    rpc.pending = {k: HEADER[k] for k in ("number", "parentHash", "timestamp")}
+    rpc.pending_owner, rpc.pending_collateral_tao = MINER_EVM, Decimal(9)
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
 
 
 @pytest.mark.asyncio
