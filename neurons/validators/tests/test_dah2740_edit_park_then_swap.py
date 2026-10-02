@@ -16,7 +16,7 @@ from payload_models.payloads import ContainerCreated, FailedContainerRequest
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
 
 from core.utils import retry_ssh_command
-from services.docker_service import EDIT_PARKED_SUFFIX, DockerService
+from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply
 
 
 @pytest.fixture
@@ -60,12 +60,15 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
 
 
 async def _run(svc, payload):
-    return await svc.create_container(
+    result = await svc.create_container(
         payload=payload,
         executor_info=_executor_info(payload),
         keypair=Mock(ss58_address="validator-hotkey"),
         private_key="encrypted",
     )
+    # a successful edit removes the parked container after its reply, with the create's session close
+    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    return result
 
 
 def _docker(commands: list[str], verb: str) -> list[str]:
