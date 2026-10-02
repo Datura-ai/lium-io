@@ -102,6 +102,8 @@ from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.one_exec_create import (
     CONTAINER_CREATED_STEP,
+    ONE_EXEC_CREATE_MAX_SEC,
+    OUTCOME_UNKNOWN_STEP,
     RUNNING_STEP,
     STARTED_STEP,
     VOLUME_CREATED_STEP,
@@ -1046,6 +1048,8 @@ class _InflightCreate:
     # entry outlives any single one of them and only the last to leave clears it.
     running: int = 0
     cancelled_by_delete: bool = False
+    # LIUM-74: at least this long a delete waits, while the create is in a step it cannot leave early
+    abort_wait_s: float = 0.0
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -1089,13 +1093,18 @@ class _InflightCreateRegistry:
     def is_running(self, pod_id: str) -> bool:
         return pod_id in self._creates_by_pod_id
 
+    def extend_abort_wait(self, pod_id: str, seconds: float) -> None:
+        create = self._creates_by_pod_id.get(pod_id)
+        if create is not None:
+            create.abort_wait_s = max(create.abort_wait_s, seconds)
+
     async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""
         create = self._creates_by_pod_id.get(pod_id)
         if create is None:
             return True
         try:
-            await asyncio.wait_for(create.done.wait(), timeout)
+            await asyncio.wait_for(create.done.wait(), max(timeout, create.abort_wait_s))
         except asyncio.TimeoutError:
             return False
         return True
@@ -2007,7 +2016,8 @@ class DockerService:
 
         A lost or unclear reply is not a failed create: the attempt may still be running on the
         host. The settle waits for it to exit, then adopts its running container or removes what
-        its record says it made; only a confirmed removal lets today's path start.
+        carries its label; only a confirmed removal lets today's path start, anything else fails
+        the create as `OUTCOME_UNKNOWN_STEP`.
         """
         volume_name = local_volume_create["local_volume"]
         limit = local_volume_create["limit"]
@@ -2041,17 +2051,25 @@ class DockerService:
         if failed_for_good:
             return reply
         if not reply.left_host_as_found:
+            settle_started = time.monotonic()
             settled = await settle_one_exec_create(ssh_client, request, default_extra)
+            # the settle is this create's time too: an adopted rent must not profile as a fast one
+            reply.wall_ms += round((time.monotonic() - settle_started) * 1000)
             if settled == "adopt":
                 if VOLUME_CREATED_STEP not in reply.step_ms:
                     await self.stream_log("Creating docker container", "success", log_tag)
                 reply.adopted = True
                 return reply
             if settled != "gone":
-                raise RentalDockerOperationError(
-                    "Docker SDK run container failed: the one-exec create lost its reply and its "
-                    "volume and container could not be confirmed removed"
-                )
+                reply.failure = {
+                    "failed_step": OUTCOME_UNKNOWN_STEP,
+                    "error": (
+                        f"the one-exec create lost its reply and the settle answered {settled!r}: "
+                        "its volume and container could not be confirmed removed"
+                    ),
+                    "cleaned": False,
+                }
+                return reply
         logger.warning(
             _m(
                 "ONE_EXEC_CREATE_FALLBACK",
@@ -6945,11 +6963,10 @@ class DockerService:
                     if not cap_applied:
                         raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
                 elif early_gpu_power_restore is not None:
-                    # LIUM-65: it overlapped the volume step; with the volume in the one exec it
-                    # overlaps that exec and is awaited after it, still before the reply
-                    if deferred_local_volume_create is None:
-                        _, early_gpu_power_restore_step = await early_gpu_power_restore
-                        profilers.append(early_gpu_power_restore_step)
+                    # the renter's entrypoint must not start under the previous cap: awaited before
+                    # the container starts, also when the one exec makes the volume with it
+                    _, early_gpu_power_restore_step = await early_gpu_power_restore
+                    profilers.append(early_gpu_power_restore_step)
                 else:
                     await self._restore_gpu_power_for_uncapped_pod(
                         ssh_client, payload, host_probe, default_extra
@@ -7038,17 +7055,28 @@ class DockerService:
                 prev_timestamp = now_ms()
 
                 one_exec_reply: OneExecCreateReply | None = None
+                # the one exec removed what carried its attempt's label; a removal by name below
+                # could hit another attempt's container, so it runs only after the exec's success
+                one_exec_owns_cleanup = False
                 try:
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     if deferred_local_volume_create is not None:
+                        one_exec_owns_cleanup = True
+                        # the delete waits out the exec and its settle rather than tear down under them
+                        inflight_creates.extend_abort_wait(
+                            payload.pod_id, ONE_EXEC_CREATE_MAX_SEC + CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS
+                        )
                         one_exec_reply = await self._create_volume_and_run_in_one_exec(
                             ssh_client=ssh_client,
                             run_spec=run_spec,
                             local_volume_create=deferred_local_volume_create,
                             log_tag=log_tag,
                             default_extra=default_extra,
+                        )
+                        one_exec_owns_cleanup = (
+                            one_exec_reply is not None and not one_exec_reply.ran_to_running
                         )
                     if one_exec_reply is not None:
                         created_local_volume = (
@@ -7060,6 +7088,8 @@ class DockerService:
                         if failed_step == VOLUME_CREATED_STEP:
                             current_step = "volume_creation"
                             raise RentalDockerOperationError(f"Docker SDK create volume failed: {error_text}")
+                        if failed_step == OUTCOME_UNKNOWN_STEP:
+                            current_step = OUTCOME_UNKNOWN_STEP
                         if failed_step == RUNNING_STEP:
                             current_step = "container_health_check"
                             self._log_container_not_running(
@@ -7136,13 +7166,15 @@ class DockerService:
                         )
                         raise Exception("Run docker run command but container is not running")
                 except Exception:
-                    container_missing = await self.cleanup_failed_container_creation(
-                        ssh_client=ssh_client,
-                        default_extra=default_extra,
-                        container_name=container_name,
-                        volume_name=local_volume,
-                        remove_volume=created_local_volume,
-                    )
+                    container_missing = False
+                    if not one_exec_owns_cleanup:
+                        container_missing = await self.cleanup_failed_container_creation(
+                            ssh_client=ssh_client,
+                            default_extra=default_extra,
+                            container_name=container_name,
+                            volume_name=local_volume,
+                            remove_volume=created_local_volume,
+                        )
                     # the one exec removed what it made, so only its own report knows the container vanished
                     container_vanished = (container_created and container_missing) or bool(
                         one_exec_reply is not None
@@ -7164,9 +7196,6 @@ class DockerService:
                 else:
                     profilers.extend(one_exec_profiler_rows(one_exec_reply))
                 prev_timestamp = now_ms()
-                if deferred_local_volume_create is not None and early_gpu_power_restore is not None:
-                    _, early_gpu_power_restore_step = await early_gpu_power_restore
-                    profilers.append(early_gpu_power_restore_step)
 
                 logger.info(
                     _m(

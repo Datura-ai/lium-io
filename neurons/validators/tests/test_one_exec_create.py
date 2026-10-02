@@ -5,17 +5,23 @@ Covered here:
   step lines and calls, each step's failure with what it removes, the refusals that create
   nothing (missing rental network, a name already taken, unexpected request fields), SIGTERM
   mid-run removes the attempt's own work, and `settle` adopts or removes only its attempt's;
+- ownership (LIUM-74): only what carries the attempt's label is removed — never a container
+  another actor won the name with (409), never anything after a refusal; a timed-out create is
+  reconciled before `cleaned`; a refused retry keeps the first attempt's record, and a missing
+  record is `unknown`, never `gone`;
 - hostile values (quotes, `$()`, newlines) in image / env / volume / container name reach the host
   only inside the JSON: the command line is a constant, the fake dockerd receives them verbatim;
 - the container body is the one docker-py posts for the same run spec;
 - `create_container`: the step lines become today's `stream_log` texts and profiler rows; each
   step's failure keeps today's failure step; port collision / no python3 / missing network take
   today's path; a lost reply is settled first (adopt, or today's path only after a confirmed
-  removal, else the create fails); the creates that never use it.
+  removal, else the create fails); the creates that never use it; a rejected exec issues no
+  removal by name; the GPU power restore ends before the start; the settle time is profiled.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -24,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import quote
@@ -73,7 +80,10 @@ _HOSTILE = "x'\"; $(touch {marker}) `touch {marker}`\nrm -rf / #"
 
 
 class _FakeDockerd:
-    """Answers the Engine API calls the script makes; `refuse` names the step that fails."""
+    """Answers the Engine API calls the script makes; `refuse` names the step that fails.
+
+    Keeps one volume and one container with the labels they were created with, as dockerd does:
+    a volume made before (`volume_exists`) carries none."""
 
     def __init__(self, *, refuse: str | None = None, running: bool = True, vanish: bool = False,
                  network_missing: bool = False, volume_exists: bool = False):
@@ -82,7 +92,14 @@ class _FakeDockerd:
         self.vanish = vanish
         self.network_missing = network_missing
         self.volume_exists = volume_exists
+        self.volume_labels: dict | None = None
+        # None: no container
+        self.container_labels: dict | None = None
         self.calls: list[tuple[str, str, object]] = []
+
+    def _container(self) -> dict:
+        return {"Id": _CONTAINER_ID, "Config": {"Labels": self.container_labels},
+                "State": {"Running": self.running, "Status": "exited", "ExitCode": 1, "OOMKilled": False, "Error": ""}}
 
     def answer(self, method: str, path: str, body):
         self.calls.append((method, path, body))
@@ -92,26 +109,45 @@ class _FakeDockerd:
                 return 404, {"message": "network lium-rentals not found"}
             return 200, {"Driver": "bridge", "Options": {"com.docker.network.bridge.enable_icc": "false"}}
         if method == "GET" and path.startswith("/volumes/"):
-            return (200, {}) if self.volume_exists else (404, {"message": "no such volume"})
+            if not self.volume_exists:
+                return 404, {"message": "no such volume"}
+            return 200, {"Name": path.rsplit("/", 1)[1], "Labels": self.volume_labels}
         if method == "GET" and path.startswith("/containers/container_"):
-            return 404, {"message": "No such container"}
+            if self.container_labels is None:
+                return 404, {"message": "No such container"}
+            return 200, self._container()
         if method == "POST" and path == "/volumes/create":
-            return (500, {"message": "disk full"}) if self.refuse == "volume" else (201, {"Name": body["Name"]})
+            if self.refuse == "volume":
+                return 500, {"message": "disk full"}
+            self.volume_exists, self.volume_labels = True, body.get("Labels")
+            return 201, {"Name": body["Name"]}
         if method == "POST" and path.startswith("/containers/create?name="):
-            return (500, {"message": "no such image"}) if self.refuse == "create" else (201, {"Id": _CONTAINER_ID})
+            if self.refuse == "create":
+                return 500, {"message": "no such image"}
+            self.container_labels = body.get("Labels") or {}
+            return 201, {"Id": _CONTAINER_ID}
         if method == "POST" and path == f"{container}/start":
             if self.refuse == "start":
                 return 500, {"message": "Bind for 0.0.0.0:20001 failed: port is already allocated"}
             return 204, None
         if method == "GET" and path == f"{container}/json":
             if self.vanish:
+                self.container_labels = None
+            if self.container_labels is None:
                 return 404, {"message": "No such container"}
-            return 200, {"State": {"Running": self.running, "Status": "exited", "ExitCode": 1,
-                                   "OOMKilled": False, "Error": ""}}
+            return 200, self._container()
         if method == "GET" and path.startswith(f"{container}/logs"):
             text = b"entrypoint: boom\n"
             return 200, b"\x02\x00\x00\x00" + len(text).to_bytes(4, "big") + text
-        if method == "DELETE":
+        if method == "DELETE" and path.startswith(f"{container}?"):
+            if self.container_labels is None:
+                return 404, {"message": "No such container"}
+            self.container_labels = None
+            return 204, None
+        if method == "DELETE" and path.startswith("/volumes/"):
+            if not self.volume_exists:
+                return 404, {"message": "no such volume"}
+            self.volume_exists = False
             return 204, None
         return 404, {"message": f"unexpected {method} {path}"}
 
@@ -161,11 +197,12 @@ def fake_dockerd_socket():
     shutil.rmtree(directory)
 
 
-def _script(socket_path: str, running_check_sec: float = 0.3) -> str:
+def _script(socket_path: str, running_check_sec: float = 0.3, reconcile_sec: float = 0.5) -> str:
     # the attempt's lock and record go next to the socket instead of the host's /tmp
     return (
         ONE_EXEC_CREATE_SCRIPT.replace('"/var/run/docker.sock"', repr(socket_path))
         .replace("RUNNING_CHECK_SEC = 10", f"RUNNING_CHECK_SEC = {running_check_sec}")
+        .replace("RECONCILE_SEC = 10", f"RECONCILE_SEC = {reconcile_sec}")
         .replace('"/tmp/lium-one-exec-"', repr(os.path.join(os.path.dirname(socket_path), "attempt-")))
     )
 
@@ -180,7 +217,8 @@ def _run_script(socket_path: str, request: dict) -> tuple[list[dict], int]:
 
 def _settle(socket_path: str, create_request: dict, attempt: str | None = None) -> dict:
     request = {"action": "settle", "attempt": attempt or create_request["attempt"],
-               "container_name": create_request["container_name"]}
+               "container_name": create_request["container_name"],
+               "volume_name": create_request["volume"]["Name"]}
     lines, _ = _run_script(socket_path, request)
     return lines[-1]
 
@@ -241,23 +279,22 @@ def test_script_happy_path_prints_every_step_and_posts_the_request_bodies(fake_d
         ("POST", f"/containers/{_CONTAINER_ID}/start"),
         ("GET", f"/containers/{_CONTAINER_ID}/json"),
     ]
-    assert fake.calls[3][2] == request["volume"]
-    assert fake.calls[4][2] == request["container"]
+    labels = {"lium.one-exec.attempt": request["attempt"]}
+    assert fake.calls[3][2] == {**request["volume"], "Labels": labels}
+    assert fake.calls[4][2] == {**request["container"], "Labels": {**(request["container"].get("Labels") or {}), **labels}}
 
 
 @pytest.mark.parametrize(
     ("fake", "failed_step", "removed"),
     [
-        # the name was absent before the attempt, so whatever answers to it now is its own
-        (_FakeDockerd(refuse="volume"), "volume_created", ["/volumes/volume_pod-1"]),
-        (_FakeDockerd(refuse="create"), "container_created",
-         ["/containers/container_pod-1?force=1&v=1", "/volumes/volume_pod-1"]),
+        # only what carries the attempt's label: a refused create made nothing to remove
+        (_FakeDockerd(refuse="volume"), "volume_created", []),
+        (_FakeDockerd(refuse="create"), "container_created", ["/volumes/volume_pod-1"]),
         (_FakeDockerd(refuse="start"), "started",
          [f"/containers/{_CONTAINER_ID}?force=1&v=1", "/volumes/volume_pod-1"]),
         (_FakeDockerd(running=False), "running",
          [f"/containers/{_CONTAINER_ID}?force=1&v=1", "/volumes/volume_pod-1"]),
-        (_FakeDockerd(vanish=True), "running",
-         [f"/containers/{_CONTAINER_ID}?force=1&v=1", "/volumes/volume_pod-1"]),
+        (_FakeDockerd(vanish=True), "running", ["/volumes/volume_pod-1"]),
     ],
     ids=["volume", "create", "start", "not-running", "vanished"],
 )
@@ -350,7 +387,8 @@ def test_settle_of_another_attempt_removes_nothing(fake_dockerd_socket):
 
     settled = _settle(socket_path, request, attempt="someone-else")
 
-    assert settled == {"step": "settled", "result": "gone"}
+    # no record of that attempt: nothing says what it left, so it is not `gone`
+    assert settled == {"step": "settled", "result": "unknown"}
     assert not [call for call in fake.calls if call[0] == "DELETE"]
 
 
@@ -375,6 +413,101 @@ def test_settle_removes_what_a_killed_attempt_recorded(fake_dockerd_socket):
     assert [path for method, path, _ in fake.calls if method == "DELETE"] == [
         f"/containers/{_CONTAINER_ID}?force=1&v=1", "/volumes/volume_pod-1",
     ]
+
+
+def test_script_conflicting_container_is_not_owned_by_the_failed_create(fake_dockerd_socket):
+    # another actor creates the name between the absence check and the create: dockerd says 409
+    class ConcurrentCreate(_FakeDockerd):
+        def answer(self, method, path, body):
+            if method == "POST" and path.startswith("/containers/create?"):
+                self.calls.append((method, path, body))
+                self.container_labels = {}
+                return 409, {"message": "Conflict: name is already in use by container other-id"}
+            return super().answer(method, path, body)
+
+    fake = ConcurrentCreate()
+
+    lines, _ = _run_script(fake_dockerd_socket(fake), _request())
+
+    assert lines[-1]["failed_step"] == "container_created"
+    assert lines[-1]["cleaned"] is False
+    assert not [path for method, path, _ in fake.calls if method == "DELETE" and path.startswith("/containers/")]
+    assert fake.container_labels == {}
+
+
+def test_script_timed_out_volume_create_is_not_declared_clean_before_it_commits(fake_dockerd_socket):
+    # dockerd finishes the create after the script's client timeout and after its DELETE saw 404
+    finish_create = threading.Event()
+    finished = threading.Event()
+
+    class SlowVolume(_FakeDockerd):
+        def answer(self, method, path, body):
+            if method == "POST" and path == "/volumes/create":
+                self.calls.append((method, path, body))
+                finish_create.wait(5)
+                self.volume_exists = True
+                finished.set()
+                return 201, {"Name": body["Name"]}
+            if method == "DELETE" and path.startswith("/volumes/"):
+                self.calls.append((method, path, body))
+                return 404, {"message": "not found yet"}
+            return super().answer(method, path, body)
+
+    fake = SlowVolume()
+    request = {**_request(), "volume_timeout_s": 0.05}
+
+    try:
+        lines, _ = _run_script(fake_dockerd_socket(fake), request)
+    finally:
+        finish_create.set()
+
+    assert finished.wait(2)
+    assert lines[-1]["failed_step"] == "volume_created"
+    assert not (lines[-1]["cleaned"] and fake.volume_exists), lines
+
+
+def test_script_timed_out_volume_create_that_commits_is_removed_then_clean(fake_dockerd_socket):
+    # the reconcile sees the late volume by its label, removes it, and only then says cleaned
+    class LateVolume(_FakeDockerd):
+        def answer(self, method, path, body):
+            if method == "POST" and path == "/volumes/create":
+                time.sleep(0.3)
+            return super().answer(method, path, body)
+
+    fake = LateVolume()
+    request = {**_request(), "volume_timeout_s": 0.05}
+
+    lines, _ = _run_script(fake_dockerd_socket(fake), request)
+
+    assert lines[-1]["failed_step"] == "volume_created"
+    assert lines[-1]["cleaned"] is True
+    assert fake.volume_exists is False
+    assert ("DELETE", "/volumes/volume_pod-1", None) in fake.calls
+
+
+def test_settle_after_a_refused_retry_still_adopts_the_first_attempt(fake_dockerd_socket):
+    # attempt A finished but its reply was never read; retry B refuses on A's volume
+    fake = _FakeDockerd()
+    socket_path = fake_dockerd_socket(fake)
+    first = _request()
+    _run_script(socket_path, first)
+
+    refusal, _ = _run_script(socket_path, _request())
+    settled = _settle(socket_path, first)
+
+    assert refusal[-1]["failed_step"] == "volume_exists"
+    assert settled == {"step": "settled", "result": "adopt"}
+    assert not [call for call in fake.calls if call[0] == "DELETE"]
+
+
+def test_settle_without_a_record_is_unknown_not_gone(fake_dockerd_socket):
+    # resources on the host, but no record of the attempt (executor replaced, record lost)
+    fake = _FakeDockerd(volume_exists=True)
+
+    settled = _settle(fake_dockerd_socket(fake), _request())
+
+    assert settled == {"step": "settled", "result": "unknown"}
+    assert not [call for call in fake.calls if call[0] == "DELETE"]
 
 
 def test_script_refuses_a_request_with_unexpected_fields(fake_dockerd_socket):
@@ -574,8 +707,8 @@ async def test_create_container_one_exec_step_failure_keeps_todays_failure_step(
     assert result.failure_step == failure_step
     assert result.error_code == error_code
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
-    # the name-based cleanup stays behind the script's own
-    svc.cleanup_failed_container_creation.assert_awaited_once()
+    # the script removed what carried its label; a removal by name could hit another attempt's
+    svc.cleanup_failed_container_creation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -645,7 +778,7 @@ async def test_create_container_lost_reply_takes_todays_path_only_after_a_confir
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("settled", ["not_gone", None])
+@pytest.mark.parametrize("settled", ["not_ours", "unknown", None])
 async def test_create_container_lost_reply_unconfirmed_removal_fails_the_create(svc, monkeypatch, settled):
     _wire_one_exec(svc, monkeypatch, _FakeProcess(_HAPPY_LINES[:2], exit_status=None))
     monkeypatch.setattr(ds, "settle_one_exec_create", AsyncMock(return_value=settled))
@@ -653,9 +786,10 @@ async def test_create_container_lost_reply_unconfirmed_removal_fails_the_create(
     result = await _run_create_container(svc, _encrypted_payload())
 
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "docker_run"
+    assert result.failure_step == "one_exec_outcome_unknown"
     svc.create_local_volume.assert_not_awaited()
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    svc.cleanup_failed_container_creation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -694,6 +828,76 @@ async def test_create_container_without_the_narrow_conditions_never_uses_the_one
 
     ssh_client.create_process.assert_not_awaited()
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_container_lock_loser_removes_nothing_by_name(svc, monkeypatch):
+    # attempt A holds the pod's lock; B gets the script's refusal and must not `docker rm` A's container
+    _wire_one_exec(svc, monkeypatch, _FakeProcess([_failed("lock", "another attempt holds the lock")], exit_status=1))
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation",
+                        DockerService.cleanup_failed_container_creation.__get__(svc))
+    monkeypatch.setattr(svc, "capture_failed_container_diagnostics",
+                        AsyncMock(return_value=Mock(container_missing=False)))
+    commands = []
+
+    async def record_command(ssh, command, *args, **kwargs):
+        commands.append(command)
+        return ""
+
+    monkeypatch.setattr(ds, "retry_ssh_command", record_command)
+
+    result = await _run_create_container(svc, _encrypted_payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert not [command for command in commands if "docker rm" in command or "docker volume rm" in command]
+
+
+@pytest.mark.asyncio
+async def test_create_container_one_exec_starts_after_the_gpu_power_restore(svc, monkeypatch):
+    restored = False
+    restored_at_start = None
+
+    async def slow_restore(*args):
+        nonlocal restored
+        await asyncio.sleep(0.05)
+        restored = True
+
+    class ObserveStart(_Lines):
+        async def __anext__(self):
+            nonlocal restored_at_start
+            line = await super().__anext__()
+            if json.loads(line).get("step") == "started":
+                restored_at_start = restored
+            return line
+
+    process = _FakeProcess([])
+    process.stdout = ObserveStart(_HAPPY_LINES)
+    _wire_one_exec(svc, monkeypatch, process)
+    monkeypatch.setattr(svc, "_restore_gpu_power_for_uncapped_pod", slow_restore)
+
+    result = await _run_create_container(svc, _encrypted_payload())
+
+    assert isinstance(result, ContainerCreated), getattr(result, "msg", "")
+    assert restored_at_start is True
+
+
+@pytest.mark.asyncio
+async def test_create_container_adopted_profile_counts_the_settle(svc, monkeypatch):
+    # no reply at all: every host timing is lost, the settle alone takes 100 ms
+    _wire_one_exec(svc, monkeypatch, _FakeProcess([], exit_status=None))
+
+    async def slow_settle(*args):
+        await asyncio.sleep(0.1)
+        return "adopt"
+
+    monkeypatch.setattr(ds, "settle_one_exec_create", slow_settle)
+
+    result = await _run_create_container(svc, _encrypted_payload())
+
+    rows = _rows(result)
+    assert sum(rows[name] for name in (
+        ProfilerStepName.DOCKER_VOLUME_CREATION, ProfilerStepName.DOCKER_RUN, ProfilerStepName.CONTAINER_RUNNING_CHECK,
+    )) >= 100
 
 
 @pytest.fixture

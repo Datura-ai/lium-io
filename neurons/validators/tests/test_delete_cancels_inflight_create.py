@@ -217,3 +217,22 @@ async def test_wait_gives_up_on_a_create_that_does_not_stop() -> None:
 
     assert finished is False
     create_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_wait_covers_a_create_that_extended_it_for_the_one_exec() -> None:
+    """LIUM-74: the one exec cannot leave early, so the delete waits past its own timeout."""
+    pod_id = str(uuid4())
+
+    async def create() -> None:
+        with inflight_creates.track(pod_id):
+            inflight_creates.extend_abort_wait(pod_id, 5)
+            await asyncio.sleep(0.05)
+
+    create_task: asyncio.Task[None] = asyncio.create_task(create())
+    await asyncio.sleep(0)  # let the create register itself
+
+    finished: bool = await inflight_creates.wait_until_done(pod_id, timeout=0.01)
+
+    assert finished is True
+    await create_task

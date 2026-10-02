@@ -11,10 +11,11 @@ same `ContainerRunSpec`. The script never builds a shell string; the values reac
 JSON bodies or URL-quoted path parts.
 
 The script prints one JSON line per finished step (`{"step": "volume_created", "ms": 41}`) and, on
-a failure, removes what it created and prints `{"step": "failed", "failed_step": …}`. It touches
-only names that were absent when it started, records each creation on the host before making it,
-and removes its own work when the channel drops or SIGTERM comes. After a lost reply the same
-script, as `settle`, waits for the attempt to exit and adopts or removes what the record names.
+a failure, removes what it created and prints `{"step": "failed", "failed_step": …}`. It creates
+only names that were absent when it started, labels the volume and the container with its attempt
+id and removes only what carries that label; it removes its own work when the channel drops or
+SIGTERM comes. After a lost reply the same script, as `settle`, waits for the attempt to exit and
+adopts or removes its labelled work, by the attempt's own record of what is still pending.
 """
 
 from __future__ import annotations
@@ -44,12 +45,16 @@ CONTAINER_CREATED_STEP = "container_created"
 STARTED_STEP = "started"
 RUNNING_STEP = "running"
 FAILED_LINE = "failed"
+# the connector's own failed step: a lost reply the settle could neither adopt nor prove removed
+OUTCOME_UNKNOWN_STEP = "one_exec_outcome_unknown"
 
 # volume ≤ 180 s (`_LOCAL_VOLUME_TIMEOUT_MAX_SEC`) + create 60 + start 60 + running check 10, plus margin
 ONE_EXEC_CREATE_HOST_DEADLINE_SEC = 330
 ONE_EXEC_CREATE_CONNECTOR_DEADLINE_SEC = ONE_EXEC_CREATE_HOST_DEADLINE_SEC + 15
 # a settle waits for the attempt's lock (the script's SETTLE_WAIT_SEC), then removes
 ONE_EXEC_SETTLE_CONNECTOR_DEADLINE_SEC = 360 + 30
+# the longest a create can stay in the exec: the exec, then the settle of a lost reply
+ONE_EXEC_CREATE_MAX_SEC = ONE_EXEC_CREATE_CONNECTOR_DEADLINE_SEC + ONE_EXEC_SETTLE_CONNECTOR_DEADLINE_SEC
 
 ONE_EXEC_CREATE_SCRIPT = r'''
 import fcntl, hashlib, http.client, json, os, signal, socket, sys, time
@@ -59,9 +64,13 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 CALL_TIMEOUT_SEC = 60
 RUNNING_CHECK_SEC = 10
 SETTLE_WAIT_SEC = 360
+# after a failure: how long dockerd is re-read for a create whose answer never came
+RECONCILE_SEC = 10
 ICC_OPTION = "com.docker.network.bridge.enable_icc"
+# set on the volume and the container at create: the only proof a delete accepts
+ATTEMPT_LABEL = "lium.one-exec.attempt"
 CREATE_FIELDS = {"action", "attempt", "network", "volume", "volume_timeout_s", "container_name", "container"}
-SETTLE_FIELDS = {"action", "attempt", "container_name"}
+SETTLE_FIELDS = {"action", "attempt", "container_name", "volume_name"}
 
 
 class StepFailed(Exception):
@@ -99,7 +108,10 @@ def call(method, path, body=None, timeout=CALL_TIMEOUT_SEC):
 
 
 def answer(method, path, body=None, timeout=CALL_TIMEOUT_SEC):
-    status, raw = call(method, path, body, timeout)
+    return checked(*call(method, path, body, timeout))
+
+
+def checked(status, raw):
     if status >= 300:
         try:
             message = json.loads(raw)["message"]
@@ -141,15 +153,20 @@ def hold_attempt_lock(container_name, wait_sec):
     while True:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return handle, base + ".json"
+            return handle, base
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 raise RuntimeError("another attempt holds the lock")
             time.sleep(0.1)
 
 
+def record_path(base, attempt):
+    # one record per attempt: a refused or later attempt never writes over this one's
+    return "%s-%s.json" % (base, hashlib.sha256(attempt.encode()).hexdigest()[:16])
+
+
 class Record:
-    # what this attempt may have made, written BEFORE each creation, so a settle finds it all
+    # the attempt's outcome and its creates still `pending` in dockerd (sent, no answer yet)
     def __init__(self, path, state):
         self.path = path
         self.state = state
@@ -163,6 +180,14 @@ class Record:
 
 def is_absent(path):
     return call("GET", path)[0] == 404
+
+
+def create_call(record, kind, path, body, timeout=CALL_TIMEOUT_SEC):
+    # a create whose answer never came may still commit in dockerd: it stays pending in the record
+    record.save(pending=record.state["pending"] + [kind])
+    status, raw = call("POST", path, body, timeout)
+    record.save(pending=[pending for pending in record.state["pending"] if pending != kind])
+    return checked(status, raw)
 
 
 def require_isolated_bridge(name):
@@ -200,79 +225,134 @@ def wait_running(container_id):
         time.sleep(0.2)
 
 
-def remove_recorded(record):
-    # both names were absent before this attempt, so whatever answers to them now is its own
+def find_own(path, attempt, labels_of):
+    # what answers to the name: ("absent" | "not_ours" | "own", the object when it is this attempt's)
+    status, raw = call("GET", path)
+    if status == 404:
+        return "absent", None
+    found = checked(status, raw)
+    if (labels_of(found) or {}).get(ATTEMPT_LABEL) != attempt:
+        return "not_ours", None
+    return "own", found
+
+
+def container_labels(container):
+    return (container.get("Config") or {}).get("Labels")
+
+
+def reconcile(record, container_name, volume_name):
+    # removes only what carries this attempt's label. "gone": dockerd shows both names absent and no
+    # create of this attempt is pending; "not_ours": another owner holds a name; else "unknown"
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    state = record.state
+    attempt = record.state["attempt"]
+    deadline = time.monotonic() + RECONCILE_SEC
+    while True:
+        removed = False
+        try:
+            container, found = find_own("/containers/%s/json" % q(container_name), attempt, container_labels)
+            if found:
+                call("DELETE", "/containers/%s?force=1&v=1" % q(found["Id"]))
+                removed = True
+            volume, found = find_own("/volumes/" + q(volume_name), attempt, lambda found: found.get("Labels"))
+            if found:
+                call("DELETE", "/volumes/" + q(volume_name))
+                removed = True
+        except Exception:
+            container = volume = "unknown"
+        seen = {"container": container, "volume": volume}
+        # its own object seen = that pending create has committed and was just removed
+        pending = [kind for kind in record.state["pending"] if seen[kind] != "own"]
+        if pending != record.state["pending"]:
+            record.save(pending=pending)
+        if "not_ours" in seen.values():
+            result = "not_ours"
+        elif container == volume == "absent" and not pending:
+            result = "gone"
+        elif time.monotonic() >= deadline:
+            result = "unknown"
+        else:
+            if not removed:
+                time.sleep(0.2)
+            continue
+        record.save(outcome=result)
+        return result
+
+
+def emit_failure(failure, cleaned):
     try:
-        gone = True
-        container = state.get("container_id") or state.get("container")
-        if container:
-            gone = call("DELETE", "/containers/%s?force=1&v=1" % q(container))[0] in (204, 404)
-        if state.get("volume"):
-            gone = call("DELETE", "/volumes/" + q(state["volume"]))[0] in (204, 404) and gone
-    except Exception:
-        gone = False
-    record.save(outcome="cleaned" if gone else "cleanup_failed")
-    return gone
+        emit(step="failed", failed_step=failure.step, error=str(failure)[-2000:], cleaned=cleaned, **failure.details)
+    except ReplyLost:
+        pass
 
 
 def create(request):
     try:
-        lock, record_path = hold_attempt_lock(request["container_name"], 0)
+        lock, base = hold_attempt_lock(request["container_name"], 0)
     except Exception as error:
         emit(step="failed", failed_step="lock", error=str(error), cleaned=True)
         return 1
-    record = Record(record_path, {"attempt": request["attempt"], "outcome": None})
+    attempt = request["attempt"]
+    record = Record(record_path(base, attempt), {"attempt": attempt, "outcome": None, "pending": []})
+    record.save()
     container_name, volume_name = request["container_name"], request["volume"]["Name"]
+    labels = {ATTEMPT_LABEL: attempt}
     try:
         timed("network", lambda: require_isolated_bridge(request["network"]))
         if not is_absent("/volumes/" + q(volume_name)):
             raise StepFailed("volume_exists", "volume %s is already on the host" % volume_name)
         if not is_absent("/containers/%s/json" % q(container_name)):
             raise StepFailed("container_exists", "container %s is already on the host" % container_name)
-        record.save(volume=volume_name)
-        timed("volume_created", lambda: answer(
-            "POST", "/volumes/create", request["volume"], request["volume_timeout_s"]
+    except StepFailed as failure:
+        # nothing created yet: this attempt owns nothing and removes nothing
+        record.save(outcome="refused")
+        emit_failure(failure, cleaned=True)
+        return 1
+    except ReplyLost:
+        record.save(outcome="refused")
+        return 3
+    try:
+        timed("volume_created", lambda: create_call(
+            record, "volume", "/volumes/create", dict(request["volume"], Labels=labels), request["volume_timeout_s"]
         ))
-        record.save(container=container_name)
-        container_id = timed("container_created", lambda: answer(
-            "POST", "/containers/create?name=" + q(container_name), request["container"]
+        container_body = dict(request["container"], Labels=dict(request["container"].get("Labels") or {}, **labels))
+        container_id = timed("container_created", lambda: create_call(
+            record, "container", "/containers/create?name=" + q(container_name), container_body
         )["Id"])
-        record.save(container_id=container_id)
         timed("started", lambda: answer("POST", "/containers/%s/start" % q(container_id)))
         timed("running", lambda: (wait_running(container_id), record.save(outcome="running")))
     except StepFailed as failure:
-        cleaned = remove_recorded(record)
-        try:
-            emit(step="failed", failed_step=failure.step, error=str(failure)[-2000:], cleaned=cleaned, **failure.details)
-        except ReplyLost:
-            pass
+        emit_failure(failure, cleaned=reconcile(record, container_name, volume_name) == "gone")
         return 1
     except ReplyLost:
-        remove_recorded(record)
+        reconcile(record, container_name, volume_name)
         return 3
     return 0
 
 
 def settle(request):
     # after a lost reply: wait out the create attempt, then adopt its running pod or remove its own
-    lock, record_path = hold_attempt_lock(request["container_name"], SETTLE_WAIT_SEC)
+    lock, base = hold_attempt_lock(request["container_name"], SETTLE_WAIT_SEC)
+    path = record_path(base, request["attempt"])
     try:
-        with open(record_path) as handle:
+        with open(path) as handle:
             state = json.load(handle)
     except (OSError, ValueError):
-        state = {}
-    if state.get("attempt") != request["attempt"]:
-        emit(step="settled", result="gone")
+        state = None
+    if not (isinstance(state, dict) and state.get("attempt") == request["attempt"]
+            and isinstance(state.get("pending"), list)):
+        # no record of this attempt: nothing tells what it left in dockerd, so absence proves nothing
+        emit(step="settled", result="unknown")
         return 0
     if state.get("outcome") == "running":
-        status, raw = call("GET", "/containers/%s/json" % q(state["container_id"]))
-        if status == 200 and (json.loads(raw).get("State") or {}).get("Running"):
+        try:
+            _, found = find_own("/containers/%s/json" % q(request["container_name"]), request["attempt"],
+                                container_labels)
+        except Exception:
+            found = None
+        if found and (found.get("State") or {}).get("Running"):
             emit(step="settled", result="adopt")
             return 0
-    gone = remove_recorded(Record(record_path, state))
-    emit(step="settled", result="gone" if gone else "not_gone")
+    emit(step="settled", result=reconcile(Record(path, state), request["container_name"], request["volume_name"]))
     return 0
 
 
@@ -398,12 +478,14 @@ async def settle_one_exec_create(
     ssh_client: asyncssh.SSHClientConnection, create_request: dict, log_extra: dict
 ) -> str | None:
     """After a lost or unclear reply: wait until the create attempt has exited on the host, then
-    `adopt` (its container runs) or remove what its record says it made — `gone` once dockerd
-    confirms, `not_gone` otherwise. None when the settle itself could not run or answer."""
+    `adopt` (its container runs) or remove what carries its label — `gone` once dockerd shows both
+    names absent, `not_ours` when another owner holds one, `unknown` when nothing proves either
+    (no record of the attempt, a create of it still pending). None when the settle itself failed."""
     request = {
         "action": "settle",
         "attempt": create_request["attempt"],
         "container_name": create_request["container_name"],
+        "volume_name": create_request["volume"]["Name"],
     }
     try:
         completed = await asyncio.wait_for(
@@ -419,7 +501,7 @@ async def settle_one_exec_create(
             extra=get_extra_info({**log_extra, "result": result, "detail": str(completed)[-500:]}),
         )
     )
-    return result if result in ("adopt", "gone", "not_gone") else None
+    return result if result in ("adopt", "gone", "not_ours", "unknown") else None
 
 
 def one_exec_profiler_rows(reply: OneExecCreateReply) -> list[ProfilerStep]:
