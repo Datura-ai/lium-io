@@ -11,6 +11,7 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
@@ -164,6 +165,31 @@ async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, 
     assert result is created
     remove_key.assert_awaited_once()
     assert any("Validator SSH key removal after reply finished" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_key_removal_after_the_reply_is_logged(mocker, miner_service, caplog):
+    """A delete's wait timing out, or a shutdown, can leave the validator's key at the miner: say so."""
+    executor_id = str(uuid4())
+    payload = _make_create_payload(executor_id)
+    my_key = _wire_common_mocks(mocker, miner_service, executor_id)
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    async def removal_that_hangs(**kwargs) -> bool:
+        await asyncio.Event().wait()
+        return True
+
+    mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", removal_that_hangs)
+
+    with caplog.at_level("INFO"):
+        await miner_service._handle_container(payload)
+        await asyncio.sleep(0)
+        steps_finished = await docker_service_module.create_steps_after_reply.wait_until_done(payload.pod_id, 0.01)
+
+    assert steps_finished is False
+    [cancelled] = [r for r in caplog.records if "Validator SSH key removal after reply cancelled" in r.getMessage()]
+    assert cancelled.levelname == "WARNING"
+    assert str(my_key) not in cancelled.getMessage()
 
 
 # ---------------------------------------------------------------------------
