@@ -119,18 +119,22 @@ def setup_sql_logging():
 
 
 @pytest.fixture(autouse=True)
-def _no_collateral_rpc(monkeypatch):
-    """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so."""
+def _no_collateral_rpc():
+    """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so.
+
+    Not monkeypatch: an autouse fixture that requests it moves its undo after the event loop's teardown,
+    and a test that patched time.monotonic with a finite iterator then fails there."""
     from services import collateral_status
 
     async def _refuse(batch):
         raise AssertionError("collateral RPC called in a unit test")
 
-    monkeypatch.setattr(
-        collateral_status,
-        "_reader",
-        collateral_status.CollateralStatusReader(rpc=_refuse, evm_address_for_hotkey=lambda _hotkey: None),
+    saved = collateral_status._reader
+    collateral_status._reader = collateral_status.CollateralStatusReader(
+        rpc=_refuse, evm_address_for_hotkey=lambda _hotkey: None
     )
+    yield
+    collateral_status._reader = saved
 
 
 @pytest.fixture
