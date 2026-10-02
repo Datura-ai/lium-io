@@ -15,7 +15,7 @@ from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFinge
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
-from services.redis_service import GPU_ANCHOR_BROKEN_KEY, VERIFIED_JOB_COUNT_KEY, RedisService
+from services.redis_service import GPU_ANCHOR_BROKEN_KEY, VERIFIED_JOB_COUNT_KEY, RedisService, verified_job_field
 
 from tests.helpers import build_state
 
@@ -36,7 +36,7 @@ def _redis_service() -> RedisService:
 
 
 async def _record(service: RedisService) -> dict:
-    return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR))
+    return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, verified_job_field("hk", EXECUTOR)))
 
 
 @pytest.mark.asyncio
@@ -121,7 +121,7 @@ async def test_result_handler_passes_the_broken_mark_to_the_reset(context_factor
 async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
     Pipeline, the outcome persisted by the ResultHandler."""
-    verified = await service.get_verified_job_info(EXECUTOR)
+    verified = await service.get_verified_job_info(EXECUTOR, "hk")
     ctx = context_factory(
         state=build_state(gpu_uuids=uuids, gpu_model_count=f"A100:{len(uuids.split(','))}"), verified=verified
     )
