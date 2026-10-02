@@ -1241,13 +1241,18 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
     )
 
 
+class AnswerWithOwnDuration(NamedTuple):
+    answer: Any
+    own_duration_step: ProfilerStep
+
+
 async def _with_own_duration(
     operation: Awaitable[Any], step_name: ProfilerStepName
-) -> tuple[Any, ProfilerStep]:
+) -> AnswerWithOwnDuration:
     # an early task's own start->end; the caller records it only if it uses the answer
     started_ms = now_ms()
     answer = await operation
-    return answer, ProfilerStep.since(step_name, started_ms)
+    return AnswerWithOwnDuration(answer, ProfilerStep.since(step_name, started_ms))
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -2580,8 +2585,8 @@ class DockerService:
             private_key: Encrypted SSH private key (ignored when ``ssh_client``
                 is provided).
             ssh_client: Optional pre-opened SSH session to reuse.
-            probed_container_names: The same listing, already read by the pre-run host probe
-                (LIUM-57); None runs the listing here.
+            probed_container_names: The same listing, already read by the pre-run host probe;
+                None runs the listing here.
 
         Returns:
             Tuple of (success: bool, message: str). Always succeeds — removal is
@@ -5708,8 +5713,7 @@ class DockerService:
         # State-free last-resort net: if a pre-cap record was lost, the record-based
         # restore above did nothing — lift anything still below the check's floor back
         # to the GPU's own default, so the customer never starts on a capped GPU.
-        # Always a live query: volume creation and a bootstrap restore ran since the
-        # probe, so its power state can be minutes old.
+        # Always a live query: the probe's power state can be minutes old.
         await raise_low_power_limits_to_default(
             ssh_client,
             payload.executor_id,
@@ -5941,11 +5945,12 @@ class DockerService:
             wants_volume_probe = settings.RENTAL_VOLUME_FAST_PATH_ENABLED and bool(
                 measures_host or payload.volume_limit_gb
             )
-            probe_with_power = not (
-                payload.workload_kind == WorkloadKind.FILLER and bool(payload.gpu_power_limits)
+            brings_own_power_cap = payload.workload_kind == WorkloadKind.FILLER and bool(
+                payload.gpu_power_limits
             )
-            early_host_probe: asyncio.Task | None = None
-            early_volume_probe: asyncio.Task | None = None
+            probe_with_power = not brings_own_power_cap
+            early_host_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
+            early_volume_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
 
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
                 nonlocal early_host_probe, early_volume_probe
@@ -6444,8 +6449,7 @@ class DockerService:
                             ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
                         )
                     )
-                    if not (payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits)
-                    and not payload.bootstrap_restore
+                    if not brings_own_power_cap and not payload.bootstrap_restore
                     else None
                 )
                 if early_gpu_power_restore is not None:
@@ -6735,7 +6739,7 @@ class DockerService:
                 # ssh_client so we don't pay for a second connect (and don't widen
                 # the TOCTOU gap). No wait — the rental takes priority; the
                 # port-allocated retry loop + `docker rm -fv` are the backstop for
-                # any residual race. LIUM-57: the listing comes from the pre-run host probe
+                # any residual race. DAH-3980: the listing comes from the pre-run host probe
                 # (saves its own 2 round trips), unless a removal withdrew the probe's listings.
                 current_step = "port_check_wait"
                 wait_ok, wait_msg = await self.wait_for_port_check_containers(

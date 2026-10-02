@@ -5,7 +5,7 @@ questions, each its own SSH round trip: the container list (`clean_existing_cont
 volume list and the mounted-volume list (`clean_stale_vloopback_volumes`), the volume names
 again (`reclaim_dphn_cache_for_rental`), the kernel's GPU UUID→minor map and the shared device
 nodes (`build_gpu_docker_config_for_executor`), the nvidia-smi power state
-(`raise_low_power_limits_to_default`) and the image's volume-encryption label; LIUM-57 adds the
+(`raise_low_power_limits_to_default`) and the image's volume-encryption label; DAH-3980 adds the
 lingering port-check / health-check containers (`wait_for_port_check_containers`). On the far half of
 the fleet a round trip is 0.2–0.6 s, so the listings cost more than the work they inform.
 
