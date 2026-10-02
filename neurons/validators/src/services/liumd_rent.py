@@ -84,8 +84,8 @@ LIUMD_ERROR_CODES = frozenset(
 # compute-app's codes for a rent it may have handed to the agent: they cannot know the host's state, whatever
 # their flags say
 LIUMD_HOST_UNKNOWN_CODES = frozenset({"send_failed", "reply_lost"})
-# the connector's word on an attempt, kept as `<state>|<executor_id>|<pod_id>` for the agent's
-# `attempt_state unacked` and for a `result` that comes after its rent gave up (design §3)
+# the connector's short memory of an attempt, kept as `<state>|<executor_id>|<pod_id>` for a `result` that comes
+# after its rent gave up; the agent's `unacked` is settled by compute-app from the pod row (liumd_relay.py)
 ATTEMPT_ACCEPTING = "accepting"
 ATTEMPT_ACKED = "acked"
 ATTEMPT_FAILED = "failed"
@@ -179,34 +179,33 @@ class LiumdAgentFrames:
             logger.info(_m("liumd frame dropped: rent_id or attempt is not a string", extra=get_extra_info(log_fields)))
             return
         if frame.get("type") == "attempt_state":
+            # logged only: a missing or expired mark is unknown state, so the settlement is compute-app's, by the pod
             state = _known_or_unknown(frame.get("state"), LIUMD_ATTEMPT_STATES)
             logger.info(_m("liumd attempt_state", extra=get_extra_info({**log_fields, "state": state})))
-            # a waiting rent settles its own attempt
-            if state == "unacked" and attempt not in self._waiters_by_attempt:
-                self._start_settle(message.executor_id, rent_id, attempt, late_result=False)
             return
         waiter = self._waiters_by_attempt.get(attempt)
         if waiter is None and frame.get("type") == "result":
             # its rent gave up (timeout, cancel): the agent keeps the pod until it hears `settle`
-            self._start_settle(message.executor_id, rent_id, attempt, late_result=True)
+            self._start_late_result_rollback(message.executor_id, rent_id, attempt)
             return
         if waiter is None or (waiter.executor_id, waiter.pod_id, waiter.pod_id) != (message.executor_id, message.pod_id, rent_id):
             logger.info(_m("liumd frame for no waiting rent", extra=get_extra_info(log_fields)))
             return
         waiter.replies.put_nowait(frame)
 
-    def _start_settle(self, executor_id: str, rent_id: str, attempt: str, *, late_result: bool) -> None:
-        task = asyncio.ensure_future(self._settle(executor_id, rent_id, attempt, late_result=late_result))
+    def _start_late_result_rollback(self, executor_id: str, rent_id: str, attempt: str) -> None:
+        task = asyncio.ensure_future(self._roll_back_late_result_of_failed_attempt(executor_id, rent_id, attempt))
         self._settle_tasks.add(task)
         task.add_done_callback(self._settle_tasks.discard)
 
-    async def _settle(self, executor_id: str, rent_id: str, attempt: str, *, late_result: bool) -> None:
-        # an attempt the agent holds with no rent waiting on it: answered by the connector's mark of that attempt
-        log_extra = {"executor_id": executor_id, "rent_id": rent_id, "attempt": attempt, "late_result": late_result}
+    async def _roll_back_late_result_of_failed_attempt(self, executor_id: str, rent_id: str, attempt: str) -> None:
+        # a `result` with no rent waiting on it: rolled back only when this attempt is marked `failed`; any other
+        # mark, or none, is unknown here and left to compute-app's settlement of the agent's `unacked`
+        log_extra = {"executor_id": executor_id, "rent_id": rent_id, "attempt": attempt}
         try:
             mark = await self.redis_service.get(attempt_mark_key(attempt))
         except Exception as exc:
-            # unanswered, the agent keeps the attempt and reports it again on its next hello
+            # unanswered, the agent keeps the attempt; compute-app settles it at the next hello
             logger.warning(_m("liumd settle skipped: attempt mark unreadable", extra=get_extra_info({**log_extra, "error": repr(exc)})))
             return
         mark_fields = mark.decode().split("|") if mark else []
@@ -214,24 +213,11 @@ class LiumdAgentFrames:
             logger.warning(_m("liumd settle skipped: attempt marked for another executor or pod", extra=get_extra_info(log_extra)))
             return
         state = mark_fields[0] if mark_fields else None
-        if state in (None, ATTEMPT_FAILED):
-            action = "rollback"
-        elif state == ATTEMPT_ACKED and not late_result:
-            action = "ack"
-        else:
-            # `accepting`: the rent is still handing the pod on, the agent asks again at its next hello;
-            # `acked` for a repeated result: the pod is already handed on
-            action = None
+        action = "rollback" if state == ATTEMPT_FAILED else None
         logger.info(_m("liumd settle", extra=get_extra_info({**log_extra, "mark": state, "action": action})))
         if action is None:
             return
-        self.send(
-            LiumdRentRequest(
-                executor_id=executor_id,
-                pod_id=rent_id,
-                frame=_settle_frame(rent_id, attempt, action),
-            )
-        )
+        self.send(LiumdRentRequest(executor_id=executor_id, pod_id=rent_id, frame=_settle_frame(rent_id, attempt, action)))
 
 
 @dataclass
@@ -352,8 +338,8 @@ class LiumdRentService:
                 # a delete that landed while the reply was on its way wins over the reply
                 cancelled_by_delete = cancel_sent or inflight_creates.is_cancelled(payload.pod_id)
                 result_is_valid = reply is not None and reply["type"] == "result" and _is_result_of(reply, rent_frame)
-                # stored while the waiter stands: once it is gone, an `unacked` or a repeated `result` of this
-                # attempt reads the mark, and `accepting` keeps the agent's pod
+                # stored while the waiter stands: once it is gone, a repeated `result` of this attempt reads the
+                # mark, and only `failed` rolls it back
                 accepting = (
                     result_is_valid
                     and not cancelled_by_delete
@@ -366,10 +352,13 @@ class LiumdRentService:
             # the agent removes this attempt's container and volume by its label; an ack would leave them to nobody
             self._send_frame(payload, _settle_frame(payload.pod_id, attempt, "rollback"))
         if cancelled_by_delete:
+            if reply_type != "result":
+                # the agent may have finished before the cancel reached it, and ignores a cancel once it has
+                self._send_frame(payload, _settle_frame(payload.pod_id, attempt, "rollback"))
             _log_rent_result(log_extra, attempt=attempt, path="failed", reason="cancelled_by_delete", steps=steps)
             return _failed(payload, "Create cancelled by an in-flight delete", "cancelled_by_delete")
         if reply_type == "timeout":
-            self._send_frame(payload, _cancel_frame(payload, attempt, "timeout"))
+            self._abandon_attempt(payload, attempt)
             _log_rent_result(log_extra, attempt=attempt, path="failed", reason="timeout", steps=steps)
             return _failed(payload, "The node agent did not answer the rent in time", "liumd_timeout")
         if reply_type == "result":
@@ -408,8 +397,8 @@ class LiumdRentService:
             # nothing of this pod is left on the host: today's by-name cleanup touches nothing (LIUM-79 F1)
             _log_rent_result(log_extra, attempt=attempt, path="today", reason=f"agent_{code}", steps=steps)
             return None
-        # the host may hold this attempt's objects: the agent rolls back on `cancel`; today's path would race it
-        self._send_frame(payload, _cancel_frame(payload, attempt, "timeout"))
+        # the host may hold this attempt's objects (`reply_lost`: maybe a finished pod); today's path would race it
+        self._abandon_attempt(payload, attempt)
         failed_step = reply.get("failed_step") if reply.get("failed_step") in LIUMD_FAILED_STEP_NAMES else None
         detail = reply.get("detail") if isinstance(reply.get("detail"), dict) else {}
         exit_code = detail.get("exit_code") if _is_int(detail.get("exit_code")) else None
@@ -427,13 +416,13 @@ class LiumdRentService:
         )
 
     async def _acknowledge_result(self, payload: ContainerCreateRequest, attempt: str) -> None:
-        # the agent may forget the attempt now; the mark answers its `unacked` if the ack is lost
+        # the agent may forget the attempt now; the `acked` mark keeps a repeated result of it from a rollback
         for _ in range(ATTEMPT_ACKED_MARK_TRIES):
             if await self._mark_attempt(payload, attempt, ATTEMPT_ACKED):
                 break
         else:
             # the pod is reported RUNNING: the ack still goes, and one that arrives ends the agent's record;
-            # a lost one leaves `accepting`, which the agent's `unacked` gets no answer to
+            # a lost one leaves it `unacked`, which compute-app settles from the pod row at the agent's next hello
             logger.error(_m("liumd acked mark not stored, ack sent anyway", extra=get_extra_info({"pod_id": payload.pod_id, "attempt": attempt})))
         self._send_frame(payload, {"type": "ack", "rent_id": payload.pod_id, "attempt": attempt})
 

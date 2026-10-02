@@ -259,13 +259,21 @@ async def test_agent_error_that_could_not_clean_up_fails_the_rent_without_todays
 
 
 @pytest.mark.asyncio
-async def test_lost_reply_fails_the_rent_without_todays_path(miner_service):
-    relay_for(miner_service, answer_rent_with(lambda rent: error_frame(rent, "reply_lost", host_touched=True, cleaned=False)))
+async def test_lost_reply_cancels_rolls_back_and_fails_the_rent_without_todays_path(miner_service):
+    # LIUM-186 V2: the agent may hold a finished pod, and it ignores `cancel` once the result is written
+    relay = relay_for(
+        miner_service, answer_rent_with(lambda rent: error_frame(rent, "reply_lost", host_touched=True, cleaned=False))
+    )
 
     reply = await miner_service.handle_container(make_rent_payload())
 
     assert isinstance(reply, FailedContainerRequest)
     assert reply.failure_step == "liumd_reply_lost"
+    assert [(frame["type"], frame.get("action")) for frame in relay.sent] == [
+        ("rent", None),
+        ("cancel", None),
+        ("settle", "rollback"),
+    ]
     miner_service._handle_container.assert_not_awaited()
 
 
@@ -280,6 +288,8 @@ async def test_silent_agent_times_out_cancels_and_fails_without_todays_path(mine
     assert isinstance(reply, FailedContainerRequest)
     assert reply.failure_step == "liumd_timeout"
     assert [frame["reason"] for frame in relay.frames_of_type("cancel")] == ["timeout"]
+    # LIUM-186 V2: the result may have been written and lost on its way
+    assert [frame["action"] for frame in relay.frames_of_type("settle")] == ["rollback"]
     miner_service._handle_container.assert_not_awaited()
 
 
@@ -302,6 +312,7 @@ async def test_pod_deleted_during_the_create_sends_cancel_and_never_falls_back(m
     assert isinstance(reply, FailedContainerRequest)
     assert reply.failure_step == "cancelled_by_delete"
     assert [frame["reason"] for frame in relay.frames_of_type("cancel")] == ["pod_deleted"]
+    assert [frame["action"] for frame in relay.frames_of_type("settle")] == ["rollback"]
     miner_service._handle_container.assert_not_awaited()
 
 
@@ -535,31 +546,19 @@ async def test_unsent_rent_is_not_replayed_after_its_waiter_times_out(miner_serv
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("mark", "action"),
-    [
-        (f"acked|{BENCH_EXECUTOR_ID}|pod".encode(), "ack"),
-        (f"failed|{BENCH_EXECUTOR_ID}|pod".encode(), "rollback"),
-        (None, "rollback"),
-    ],
-)
-async def test_unacked_attempt_gets_a_settlement(miner_service, mark, action):
-    # F3 (b), from test_lium128_review.py; decision 4 of LIUM-160
+@pytest.mark.parametrize("mark_state", ["acked", "failed", "accepting", None])
+async def test_unacked_attempt_gets_no_answer_from_the_connector(miner_service, mark_state):
+    # LIUM-186 V1: compute-app settles `unacked` from the pod row; an expired mark must never roll back a RUNNING pod
     frames = miner_service.liumd_rent.agent_frames
+    mark = f"{mark_state}|{BENCH_EXECUTOR_ID}|pod".encode() if mark_state else None
     miner_service.redis_service.get = AsyncMock(return_value=mark)
     relay = relay_for(miner_service, lambda frame: [])
-    message = LiumdAgentFrame(
-        message_type="LiumdAgentFrame",
-        executor_id=BENCH_EXECUTOR_ID,
-        pod_id="pod",
-        frame={"type": "attempt_state", "rent_id": "pod", "attempt": "old", "state": "unacked"},
-    )
 
-    frames.deliver(message)
-    await asyncio.sleep(0)
+    frames.deliver(unacked_report(BENCH_EXECUTOR_ID, "pod", "old"))
+    await settle_reports(frames)
 
-    miner_service.redis_service.get.assert_awaited_once_with("liumd:attempt:old")
-    assert relay.frames_of_type("settle") == [{"type": "settle", "rent_id": "pod", "attempt": "old", "action": action}]
+    miner_service.redis_service.get.assert_not_awaited()
+    assert relay.sent == []
 
 
 @pytest.mark.asyncio
@@ -919,7 +918,7 @@ async def test_accepting_mark_not_stored_fails_the_rent_and_never_acks(miner_ser
     assert isinstance(reply, FailedContainerRequest)
     assert reply.failure_step == "liumd_mark_failed"
     assert relay.frames_of_type("ack") == []
-    assert [frame.get("action") for frame in relay.frames_of_type("settle")] == ["rollback", "rollback"]
+    assert [frame.get("action") for frame in relay.frames_of_type("settle")] == ["rollback"]
     miner_service._handle_container.assert_not_awaited()
 
 
@@ -950,9 +949,9 @@ async def test_acked_mark_tried_three_times_then_the_ack_goes_anyway(miner_servi
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mark_state", "settled"),
-    [("failed", ["rollback"]), (None, ["rollback"]), ("acked", []), ("accepting", [])],
+    [("failed", ["rollback"]), (None, []), ("acked", []), ("accepting", [])],
 )
-async def test_late_result_is_settled_at_once_by_the_attempt_mark(miner_service, mark_state, settled):
+async def test_late_result_is_rolled_back_only_by_a_failed_mark(miner_service, mark_state, settled):
     # LIUM-160 decision 5; LIUM-154 test_late_result_gets_immediate_rollback_without_another_hello, LIUM-146
     # scenario C, LIUM-152 §2b
     frames = miner_service.liumd_rent.agent_frames
@@ -989,20 +988,12 @@ async def test_result_after_the_rent_timed_out_gets_rollback_without_another_hel
     await settle_reports(frames)
 
     assert reply.failure_step == "liumd_timeout"
-    assert [(frame["type"], frame.get("action")) for frame in relay.sent] == [("rent", None), ("cancel", None), ("settle", "rollback")]
-
-
-@pytest.mark.asyncio
-async def test_unacked_attempt_still_being_handed_over_gets_no_answer(miner_service):
-    # LIUM-160 decision 4: `accepting` is the rent between its result and its hand-over
-    frames = miner_service.liumd_rent.agent_frames
-    miner_service.redis_service.get = AsyncMock(return_value=f"accepting|{BENCH_EXECUTOR_ID}|pod".encode())
-    relay = relay_for(miner_service, lambda frame: [])
-
-    frames.deliver(unacked_report(BENCH_EXECUTOR_ID, "pod", "old"))
-    await settle_reports(frames)
-
-    assert relay.sent == []
+    assert [(frame["type"], frame.get("action")) for frame in relay.sent] == [
+        ("rent", None),
+        ("cancel", None),
+        ("settle", "rollback"),
+        ("settle", "rollback"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1011,14 +1002,15 @@ async def test_unacked_attempt_still_being_handed_over_gets_no_answer(miner_serv
     [pytest.param("other-executor", "pod", id="foreign_executor"), pytest.param(BENCH_EXECUTOR_ID, "other-pod", id="foreign_pod")],
 )
 @pytest.mark.parametrize("mark_state", ["acked", "failed", "accepting"])
-async def test_settlement_of_an_attempt_marked_for_another_executor_or_pod_gets_no_answer(executor_id, rent_id, mark_state, caplog):
+async def test_late_result_of_an_attempt_marked_for_another_executor_or_pod_gets_no_answer(executor_id, rent_id, mark_state, caplog):
     # LIUM-160 decision 4; LIUM-146 test_settlement_does_not_ack_a_foreign_executor_attempt
     frames = LiumdAgentFrames()
     frames.redis_service = Mock(get=AsyncMock(return_value=f"{mark_state}|{BENCH_EXECUTOR_ID}|pod".encode()))
     frames.send_to_backend = Mock(return_value=True)
     caplog.set_level(logging.WARNING)
+    rent = {"rent_id": rent_id, "attempt": "known-attempt", "container": {"name": "pod_x", "ports": []}, "volume": {"name": "volume_x"}}
 
-    frames.deliver(unacked_report(executor_id, rent_id, "known-attempt"))
+    frames.deliver(LiumdAgentFrame(message_type="LiumdAgentFrame", executor_id=executor_id, pod_id=rent_id, frame=result_frame(rent)))
     await settle_reports(frames)
 
     frames.send_to_backend.assert_not_called()
