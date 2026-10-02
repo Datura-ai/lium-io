@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
@@ -459,7 +460,7 @@ def test_a_hostile_container_name_stays_one_argument_of_the_rm(tmp_path):
     assert list(tmp_path.glob("pwned*")) == []
     assert (tmp_path / "rm_args").read_text().split("\0")[:-1] == hostile_names
     assert (tmp_path / "volume_rm_args").read_text().split("\0")[:-1] == hostile_volumes
-    assert ds_module._parse_remove_and_list_containers(stdout) == (0, ["pod_other"])
+    assert ds_module._parse_remove_and_list_containers(stdout) == (0, (("pod_other",), {}))
 
 
 @pytest.mark.asyncio
@@ -475,6 +476,70 @@ async def test_a_removal_without_a_filler_is_never_a_clean_filler_removal(docker
     assert ssh_client.run.await_count == 2
     assert report.removed_cleanly_without_volume_rm is False
 
+
+
+_LISTED_ID = "a" * 64
+_REPLACEMENT_ID = "b" * 64
+
+
+def _host_where_a_same_name_container_replaces_the_listed_one(name: str, events: list[str]) -> AsyncMock:
+    """A host that lists ``name`` under _LISTED_ID; by the time the rm arrives that container is gone
+    and a new one runs under the same name (_REPLACEMENT_ID). `docker rm -fv` removes by ID or name."""
+    containers = {name: _LISTED_ID}
+    listed = False
+
+    def listing() -> str:
+        return "".join(f"{n} {i}\n" for n, i in containers.items())
+
+    async def run(cmd, *args, **kwargs):
+        nonlocal listed
+        if cmd == ds_module.DOCKER_PS_ALL_NAMES_IDS_CMD:
+            stdout = listing()
+            if not listed:
+                listed = True
+                containers[name] = _REPLACEMENT_ID
+            return _listing(stdout)
+        assert cmd.startswith("/usr/bin/docker rm -fv "), cmd
+        targets = shlex.split(cmd.split(">/dev/null")[0])[3:]
+        events.append(" ".join(targets))
+        gone = [n for n, i in containers.items() if n in targets or i in targets]
+        for n in gone:
+            del containers[n]
+        rm_exit = 0 if len(gone) == len(targets) else 1
+        if "printf 'RM" not in cmd:
+            return _listing("", exit_status=rm_exit)
+        names = "".join(f"NAME\t{line}\n" for line in listing().splitlines())
+        return _listing(f"RM\t{rm_exit}\n{names}PS\t0\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    ssh_client.containers = containers
+    return ssh_client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "removals", "left_on_host", "survivor_events"),
+    [
+        # a filler retry's new container: the customer's node keeps no filler, so it goes by its own ID
+        # (the confirmation before that removal still reports it)
+        ("filler_x", [_LISTED_ID, _REPLACEMENT_ID], {}, 1),
+        # a same-name pod created since the listing is not the stale one: it stays
+        ("pod_old", [_LISTED_ID], {"pod_old": _REPLACEMENT_ID}, 0),
+    ],
+    ids=["replacement_filler", "replacement_pod"],
+)
+async def test_customer_removal_removes_the_listed_container_not_a_same_name_replacement(
+    docker_service, caplog, name, removals, left_on_host, survivor_events
+):
+    events: list[str] = []
+    ssh_client = _host_where_a_same_name_container_replaces_the_listed_one(name, events)
+
+    await _clean_for_customer(docker_service, ssh_client, active_volume_names=["volume_x", "volume_old"])
+
+    assert events == removals
+    assert ssh_client.containers == left_on_host
+    assert len(_events(caplog)) == survivor_events
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

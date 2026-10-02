@@ -89,10 +89,11 @@ from services.gpu_power_limit import (
 )
 from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
-    DOCKER_PS_ALL_NAMES_CMD,
+    DOCKER_PS_ALL_NAMES_IDS_CMD,
     DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
     PrerunHostProbe,
     image_label_command,
+    parse_container_listing,
     parse_prerun_host_probe,
     port_check_container_filters,
     port_check_containers_command,
@@ -594,14 +595,15 @@ class ContainerCleanupReport:
     removed_cleanly_without_volume_rm: bool = False
 
 
-def _remove_and_list_containers_command(container_names: list[str], volume_names: list[str]) -> str:
-    """One shell line for a customer create's removal (DAH-3980): `docker rm -fv`, its exit status,
-    the `docker ps -a` names left after it, that listing's exit status, then `docker volume rm` of
-    the unprotected volumes, if any. Every output line is tagged so the parser never guesses."""
-    names = " ".join(shlex.quote(name) for name in container_names)
+def _remove_and_list_containers_command(targets: list[str], volume_names: list[str]) -> str:
+    """One shell line for a customer create's removal (DAH-3980): `docker rm -fv` of the ``targets``
+    (a listed ID, or the name when no ID was listed), its exit status, the `docker ps -a` names and
+    full IDs left after it, that listing's exit status, then `docker volume rm` of the unprotected
+    volumes, if any. Every output line is tagged so the parser never guesses."""
+    names = " ".join(shlex.quote(target) for target in targets)
     command = (
         f"/usr/bin/docker rm -fv {names} >/dev/null; printf 'RM\\t%s\\n' \"$?\"; "
-        "/usr/bin/docker ps -a --format 'NAME\\t{{.Names}}'; printf 'PS\\t%s\\n' \"$?\""
+        "/usr/bin/docker ps -a --no-trunc --format 'NAME\\t{{.Names}} {{.ID}}'; printf 'PS\\t%s\\n' \"$?\""
     )
     if volume_names:
         volumes = " ".join(shlex.quote(volume) for volume in volume_names)
@@ -609,20 +611,28 @@ def _remove_and_list_containers_command(container_names: list[str], volume_names
     return command
 
 
+# `docker ps -a` as parse_container_listing reads it: the names, and name -> full ID
+ContainerListing = tuple[tuple[str, ...], dict[str, str]]
+
+
+def _docker_rm_command(targets: list[str]) -> str:
+    return "/usr/bin/docker rm -fv " + " ".join(shlex.quote(target) for target in targets)
+
+
 class CustomerContainerRemoval(NamedTuple):
     first_rm_exited_zero: bool
-    container_names_after_rm: list[str] | None
+    listing_after_rm: ContainerListing | None
 
 
 class RemoveAndListContainersOutput(NamedTuple):
     rm_exit_status: int | None
-    container_names_after_rm: list[str] | None
+    listing_after_rm: ContainerListing | None
 
 
 def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOutput:
-    """(rm exit status, names listed after the rm). The status is None when its line is missing,
-    repeated or not a number; the names are None unless the listing exited 0 -- an untagged line
-    makes both None, so an ambiguous output never reads as a clean removal."""
+    """(rm exit status, the listing after the rm). The status is None when its line is missing,
+    repeated or not a number; the listing is None unless it exited 0 -- an untagged line makes both
+    None, so an ambiguous output never reads as a clean removal."""
     rm_statuses: list[str] = []
     ps_statuses: list[str] = []
     names: list[str] = []
@@ -638,7 +648,9 @@ def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOut
         else:
             return RemoveAndListContainersOutput(None, None)
     rm_exit_status = int(rm_statuses[0]) if len(rm_statuses) == 1 and rm_statuses[0].isdigit() else None
-    return RemoveAndListContainersOutput(rm_exit_status, names if ps_statuses == ["0"] else None)
+    return RemoveAndListContainersOutput(
+        rm_exit_status, parse_container_listing(names) if ps_statuses == ["0"] else None
+    )
 
 
 def _volume_host_probe_command(*, with_df: bool) -> str:
@@ -2777,12 +2789,18 @@ class DockerService:
         filler, and a backend whose stop did not confirm may still list one. The removal is then
         re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
         (typed fields, countable) and the create goes on.
+
+        A stale container whose full ID the listing carried is removed by that ID, so a same-name
+        container created after the listing is left alone; a name listed without an ID is removed
+        by name.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
+            listed_ids = dict(host_probe.container_ids)
         else:
-            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
-            all_names = [name for name in (result.stdout or "").strip().split("\n") if name]
+            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_IDS_CMD)
+            names, listed_ids = parse_container_listing((result.stdout or "").splitlines())
+            all_names = list(names)
         if all_names:
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
             # deploy-path sleep; the port-race it hedged is now covered by
@@ -2837,7 +2855,13 @@ class DockerService:
                         volumes_to_remove.append(volume_name)
 
             removed_cleanly = await self._remove_stale_containers(
-                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler, volumes_to_remove
+                ssh_client,
+                default_extra,
+                pod_name,
+                stale_containers,
+                remove_every_filler,
+                volumes_to_remove,
+                {name: listed_ids[name] for name in stale_containers if name in listed_ids},
             )
             if report is not None:
                 report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
@@ -2856,45 +2880,92 @@ class DockerService:
         stale_containers: list[str],
         remove_every_filler: bool,
         volumes_to_remove: list[str],
+        listed_ids: dict[str, str],
     ) -> bool:
-        """`docker rm -fv` the stale containers, then `docker volume rm` the given volumes. A customer
-        create (DAH-3706) uses the tolerant rm and then confirms that no filler survived; True only
-        when that rm exited 0 at once and the confirmation lists no filler."""
+        """`docker rm -fv` the stale containers (by ``listed_ids``, by name where none was listed), then
+        `docker volume rm` the given volumes. A customer create (DAH-3706) uses the tolerant rm and then
+        confirms that no filler survived; True only when that rm exited 0 at once and the confirmation
+        lists no filler."""
+        targets = [listed_ids.get(name, name) for name in stale_containers]
         if not remove_every_filler:
-            names = " ".join(shlex.quote(name) for name in stale_containers)
-            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+            await retry_ssh_command(ssh_client, _docker_rm_command(targets), 'clean_existing_containers')
             if volumes_to_remove:
                 await self._remove_volumes(ssh_client, volumes_to_remove)
             return False
 
-        removed_at_once, names_after = await self._remove_stale_containers_tolerantly(
-            ssh_client, default_extra, stale_containers, volumes_to_remove
+        removed_at_once, listing_after = await self._remove_stale_containers_tolerantly(
+            ssh_client, default_extra, stale_containers, targets, volumes_to_remove
         )
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
-        if removed_fillers:
-            no_filler_left = self._confirm_fillers_removed(
-                default_extra=default_extra,
-                pod_name=pod_name,
-                removed_fillers=removed_fillers,
-                names_after=names_after,
+        if not removed_fillers:
+            return False
+        survivors = self._confirm_fillers_removed(
+            default_extra=default_extra,
+            pod_name=pod_name,
+            removed_fillers=removed_fillers,
+            listing_after=listing_after,
+        )
+        # a filler retry's new container under a removed filler's name: not the instance listed,
+        # but a customer's node keeps no filler, so it goes too, by its own ID
+        replacements = {
+            name: container_id
+            for name, container_id in (survivors or {}).items()
+            if container_id and name in listed_ids and container_id != listed_ids[name]
+        }
+        if replacements:
+            await self._remove_replacement_fillers(ssh_client, default_extra, pod_name, replacements)
+            return False
+        return removed_at_once and survivors == {}
+
+    async def _remove_replacement_fillers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        replacements: dict[str, str],
+    ) -> None:
+        """`docker rm -fv` the replacement fillers by their IDs (one attempt), then confirm again. A
+        failure is logged; a filler that still survives is reported by the confirmation, and the
+        create goes on."""
+        try:
+            await retry_ssh_command(
+                ssh_client,
+                _docker_rm_command(list(replacements.values())),
+                'clean_existing_containers',
+                max_attempts=1,
             )
-            return removed_at_once and no_filler_left
-        return False
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "docker rm -fv of a replacement filler failed",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_names": list(replacements),
+                        "error_type": exc.__class__.__name__,
+                    }),
+                )
+            )
+        self._confirm_fillers_removed(
+            default_extra=default_extra,
+            pod_name=pod_name,
+            removed_fillers=list(replacements),
+            listing_after=await self._list_all_containers(ssh_client),
+        )
 
     @staticmethod
     def _confirm_fillers_removed(
         default_extra: dict,
         pod_name: str,
         removed_fillers: list[str],
-        names_after: list[str] | None,
-    ) -> bool:
-        """Check the `docker ps -a` names read after a customer create's filler removal; log any survivor.
+        listing_after: ContainerListing | None,
+    ) -> dict[str, str] | None:
+        """Check the `docker ps -a` listing read after a customer create's filler removal; log and
+        return any surviving filler, each name with the full ID it is listed under ("" when none).
 
         A listing that could not be read (None: failed, timed out, exited non-zero) is logged as
-        well -- the confirmation never fails the create. True only when the listing was read and
-        shows no filler.
+        well and returns None -- the confirmation never fails the create.
         """
-        if names_after is None:
+        if listing_after is None:
             logger.warning(
                 _m(
                     "Unable to confirm the filler removal before the customer's create",
@@ -2905,8 +2976,11 @@ class DockerService:
                     }),
                 )
             )
-            return False
-        survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
+            return None
+        names_after, ids_after = listing_after
+        survivors = {
+            name: ids_after.get(name, "") for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)
+        }
         if survivors:
             logger.warning(
                 _m(
@@ -2916,18 +2990,19 @@ class DockerService:
                         "event": FILLER_STILL_RUNNING_EVENT,
                         "reason": "validator_rm_survived",
                         "pod_name": pod_name,
-                        "container_names": survivors,
+                        "container_names": list(survivors),
                         "removed_fillers": removed_fillers,
                     }),
                 )
             )
-        return not survivors
+        return survivors
 
     async def _remove_stale_containers_tolerantly(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         stale_containers: list[str],
+        targets: list[str],
         volumes_to_remove: list[str],
     ) -> CustomerContainerRemoval:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
@@ -2938,9 +3013,10 @@ class DockerService:
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
         for nothing. So on an rm error the listing decides: names already gone are not an error; names
         still there get retry_ssh_command's full budget (and raise as before), and the volume rm runs
-        again after them. A listing that cannot be read even on its own re-raises the rm error.
+        again after them. A listing that cannot be read even on its own re-raises the rm error. A
+        listed ID is looked for by that ID: a same-name container created since is not a stale one.
         """
-        command = _remove_and_list_containers_command(stale_containers, volumes_to_remove)
+        command = _remove_and_list_containers_command(targets, volumes_to_remove)
         started = time.monotonic()
         timeout_error: TimeoutError | None = None
         try:
@@ -2949,12 +3025,12 @@ class DockerService:
             )
         except TimeoutError as exc:
             timeout_error = exc
-            rm_exit_status, names_after = None, None
+            rm_exit_status, listing_after = None, None
         except Exception as exc:
             rm_error: Exception = exc
-            rm_exit_status, names_after = None, None
+            rm_exit_status, listing_after = None, None
         else:
-            rm_exit_status, names_after = _parse_remove_and_list_containers(result.stdout or "")
+            rm_exit_status, listing_after = _parse_remove_and_list_containers(result.stdout or "")
             rm_error = Exception(
                 f"[clean_existing_containers] command: {command} exit_code {rm_exit_status}, "
                 f"stderr: {(result.stderr or '').strip()}"
@@ -2966,7 +3042,7 @@ class DockerService:
                     **default_extra,
                     "removal_ms": int((time.monotonic() - started) * 1000),
                     "rm_exit_status": rm_exit_status,
-                    "listing_read": names_after is not None,
+                    "listing_read": listing_after is not None,
                     "volume_rm": bool(volumes_to_remove),
                 }),
             )
@@ -2976,14 +3052,15 @@ class DockerService:
                 f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
             ) from timeout_error
         if rm_exit_status == 0:
-            return CustomerContainerRemoval(True, names_after)
+            return CustomerContainerRemoval(True, listing_after)
 
-        if names_after is None:
-            names_after = await self._list_all_container_names(ssh_client)
-            if names_after is None:
+        if listing_after is None:
+            listing_after = await self._list_all_containers(ssh_client)
+            if listing_after is None:
                 raise rm_error
-        stale = set(stale_containers)
-        still_present = [name for name in names_after if name in stale]
+        names_on_host, ids_on_host = listing_after
+        on_host = set(names_on_host) | set(ids_on_host.values())
+        still_present = [target for target in targets if target in on_host]
         if not still_present:
             logger.info(
                 _m(
@@ -2998,21 +3075,20 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "container_names": still_present}),
                 ),
             )
-            names = " ".join(shlex.quote(name) for name in still_present)
-            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
-            names_after = await self._list_all_container_names(ssh_client)
+            await retry_ssh_command(ssh_client, _docker_rm_command(still_present), 'clean_existing_containers')
+            listing_after = await self._list_all_containers(ssh_client)
         if volumes_to_remove:
             await self._remove_volumes(ssh_client, volumes_to_remove)
-        return CustomerContainerRemoval(False, names_after)
+        return CustomerContainerRemoval(False, listing_after)
 
     @staticmethod
-    async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
-        """`docker ps -a` names with the prerun probe's timeout; None when the listing raised, timed out
-        or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
+    async def _list_all_containers(ssh_client: asyncssh.SSHClientConnection) -> ContainerListing | None:
+        """`docker ps -a` names and full IDs with the prerun probe's timeout; None when the listing raised,
+        timed out or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
         caller must not hang or read an empty listing as 'confirmed')."""
         try:
             result = await ssh_client.run(
-                DOCKER_PS_ALL_NAMES_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+                DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
             )
         except Exception as exc:
             # typed fields only: an asyncssh error's text can carry the host's banner
@@ -3028,7 +3104,7 @@ class DockerService:
                 )
             )
             return None
-        return [name for name in (result.stdout or "").strip().split("\n") if name]
+        return parse_container_listing((result.stdout or "").splitlines())
 
     async def clean_stale_vloopback_volumes(
         self,
