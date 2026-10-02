@@ -20,7 +20,8 @@ as a whole and every consumer runs as before. The probe reads, never writes.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, replace
 
 # The probe reads the same commands the per-command path runs, so the two paths cannot drift.
 from services.gpu_power_limit import POWER_STATE_CMD
@@ -141,6 +142,23 @@ class PrerunHostProbe:
         if self.shared_nodes_whole_host_only is None:
             return None
         return (*self.shared_nodes, *self.shared_nodes_whole_host_only)
+
+    def without_containers(
+        self, container_names: Collection[str], their_volume_names: Collection[str]
+    ) -> PrerunHostProbe:
+        """The probe as read after `docker rm -fv` of ``container_names``: they and the mounts of
+        ``their_volume_names`` leave the listings; the volume list stays (no volume was removed)."""
+        return replace(
+            self,
+            container_names=None
+            if self.container_names is None
+            else tuple(name for name in self.container_names if name not in container_names),
+            mounted_volume_names=None
+            if self.mounted_volume_names is None
+            else tuple(
+                name for name in self.mounted_volume_names if name not in their_volume_names
+            ),
+        )
 
 
 def _section(tag: str, command: str) -> str:
