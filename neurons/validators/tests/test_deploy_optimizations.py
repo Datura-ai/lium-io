@@ -19,6 +19,7 @@ Covers (from the plan's Test Plan):
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -614,6 +615,28 @@ async def test_image_jupyter_probe_runs_in_the_pod_whatever_the_host_port(svc, m
     assert "30888" not in probe and "40888" not in probe
     assert token not in probe
     assert isinstance(sent_to_compute_app[0], JupyterServerInstalled)
+
+
+def _raise_send_failed(message):
+    raise RuntimeError("outgoing queue closed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sink", [None, _raise_send_failed], ids=["no_sink", "sink_raises"])
+async def test_a_jupyter_message_that_cannot_be_sent_is_logged(svc, monkeypatch, caplog, sink):
+    async def jupyter_answers(command):
+        return _ssh_result(exit_status=0)
+
+    _, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_answers)
+    monkeypatch.setattr(ds_module.create_steps_after_reply, "send_to_compute_app", sink)
+
+    with caplog.at_level(logging.ERROR, logger=ds_module.logger.name):
+        await _run(svc, payload)
+        await _wait_for_steps_after_reply(payload.pod_id)
+
+    failures = [record for record in caplog.records if "Create steps after reply failed" in record.getMessage()]
+    assert len(failures) == 1
+    assert failures[0].msg.extra["pod_id"] == payload.pod_id
 
 
 @pytest.mark.asyncio

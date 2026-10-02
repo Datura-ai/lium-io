@@ -5997,6 +5997,9 @@ class DockerService:
                 if jupyter_wait:
                     # not `await jupyter_wait`: a delete cancels the wait, and the sessions still close here
                     await asyncio.wait([jupyter_wait])
+                    # a Jupyter message that could not be sent is logged below, not lost with the task
+                    if not jupyter_wait.cancelled() and jupyter_wait.exception():
+                        raise jupyter_wait.exception()
         except Exception as exc:
             logger.error(
                 _m(
