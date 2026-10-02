@@ -2856,11 +2856,8 @@ class DockerService:
         so the kill overlaps the image inspect and the host probes. The same removal and confirmation
         as the cleanup step's, which skips the names returned here; a listing that cannot be read
         returns none and leaves every filler to that step."""
-        filler_names_on_host = [
-            name
-            for name in await self._list_all_container_names(ssh_client) or []
-            if name.startswith(FILLER_CONTAINER_PREFIX)
-        ]
+        names_on_host, listed_ids = await self._list_all_containers(ssh_client) or ((), {})
+        filler_names_on_host = [name for name in names_on_host if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not filler_names_on_host:
             return FillerRemovalAtSshConnect(filler_names=[], removed_cleanly_without_volume_rm=False)
         logger.info(
@@ -2876,7 +2873,13 @@ class DockerService:
             if (volume_name := f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}") not in protected_volumes
         ]
         removed_cleanly = await self._remove_stale_containers(
-            ssh_client, default_extra, pod_name, filler_names_on_host, True, volumes_to_remove
+            ssh_client,
+            default_extra,
+            pod_name,
+            filler_names_on_host,
+            True,
+            volumes_to_remove,
+            {name: listed_ids[name] for name in filler_names_on_host if name in listed_ids},
         )
         return FillerRemovalAtSshConnect(
             filler_names=filler_names_on_host,

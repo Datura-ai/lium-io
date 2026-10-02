@@ -1129,6 +1129,7 @@ def _wire_customer_create_over_the_host(
     listing_after_rm_exit: int = 0,
     docker_rm_seconds: float = 0,
     containers_on_host: tuple[str, ...] | None = None,
+    container_ids: dict[str, str] | None = None,
 ) -> AsyncMock:
     """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it. The host lists the
@@ -1150,8 +1151,9 @@ def _wire_customer_create_over_the_host(
             return _ssh_result(
                 stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t{listing_after_rm_exit}\n"
             )
-        if cmd == DOCKER_PS_ALL_NAMES_CMD:
-            return _ssh_result(stdout="".join(f"{name}\n" for name in names_on_host))
+        if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
+            ids = container_ids or {}
+            return _ssh_result(stdout="".join(f"{name} {ids.get(name, '')}\n" for name in names_on_host))
         return _ssh_result()
 
     ssh_client.run.side_effect = answer
@@ -1203,12 +1205,29 @@ async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc
     # the rm and its confirming listing are one host command; the listing that finds the filler
     # at SSH connect is the other
     assert _cmds(ssh_client) == [
-        DOCKER_PS_ALL_NAMES_CMD,
+        DOCKER_PS_ALL_NAMES_IDS_CMD,
         _remove_and_list_containers_command(["filler_x"], []),
     ]
     assert _relisting_commands(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_customer_create_removes_the_filler_at_ssh_connect_by_the_id_it_was_listed_under(
+    svc_fixture, monkeypatch
+):
+    """A same-name filler created after the listing is not the instance the removal targets."""
+    svc = svc_fixture
+    filler_id = "f" * 64
+    ssh_client = _wire_customer_create_over_the_host(
+        svc, monkeypatch, probe=_probe_with_containers("filler_x"), container_ids={"filler_x": filler_id}
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert _removal_commands(ssh_client) == [_remove_and_list_containers_command([filler_id], [])]
 
 
 _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
@@ -1273,7 +1292,7 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
     )
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _cmds(ssh_client) == [DOCKER_PS_ALL_NAMES_CMD]
+    assert _cmds(ssh_client) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
 
@@ -1479,7 +1498,7 @@ def _relisting_fails_after_the_first(ssh_client) -> None:
 
     async def run(cmd, *args, **kwargs):
         nonlocal listings
-        if cmd == DOCKER_PS_ALL_NAMES_CMD:
+        if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
             listings += 1
             if listings > 1:
                 return _ssh_result(exit_status=1)
