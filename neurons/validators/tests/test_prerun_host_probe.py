@@ -17,7 +17,9 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
 - `create_container`: flag off → never probes; flag on → one probe handed to every consumer; the
   docker listings are withdrawn after a removal; the last-resort power raise never reads the probe;
 - LIUM-90: a customer create that removed only a filler, cleanly, keeps every probe and relists
-  nothing; any other removal, a survivor or a failed rm relists as before.
+  nothing; any other removal, a survivor or a failed rm relists as before;
+- LIUM-93: that removal and its confirmation are the create's one host command; a removal that
+  times out fails the create at the cleanup step.
 """
 
 from __future__ import annotations
@@ -29,10 +31,16 @@ import subprocess
 import asyncio
 from unittest.mock import AsyncMock, Mock
 
+import asyncssh
 import pytest
 from core.config import settings
 from services import nvidia_devices as nd
-from services.docker_service import DockerService, _ENCRYPTED_VOLUME_IMAGE_LABEL
+from services.docker_service import (
+    DockerService,
+    _ENCRYPTED_VOLUME_IMAGE_LABEL,
+    _remove_and_list_containers_command,
+)
+import services.docker_service as ds_module
 from services.gpu_power_limit import (
     POWER_LIMIT_SET_CONCURRENCY,
     POWER_STATE_CMD,
@@ -1206,7 +1214,13 @@ async def test_cleanup_that_removed_a_volume_measures_the_volume_facts_again(svc
 
 
 def _wire_customer_create_over_the_host(
-    svc, monkeypatch, *, probe: PrerunHostProbe, docker_rm_exit: int = 0, ps_after_rm: str = ""
+    svc,
+    monkeypatch,
+    *,
+    probe: PrerunHostProbe,
+    docker_rm_exit: int = 0,
+    ps_after_rm: str = "",
+    docker_rm_raises: Exception | None = None,
 ) -> AsyncMock:
     """LIUM-90: both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it."""
@@ -1216,7 +1230,11 @@ def _wire_customer_create_over_the_host(
 
     def answer(cmd, *args, **kwargs):
         if cmd.startswith("/usr/bin/docker rm -fv"):
-            return _ssh_result(exit_status=docker_rm_exit)
+            if docker_rm_raises is not None:
+                raise docker_rm_raises
+            # LIUM-93: the removal command reports the rm's status and the names left after it
+            names_after = "".join(f"NAME\t{name}\n" for name in ps_after_rm.split())
+            return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t0\n")
         if cmd == DOCKER_PS_ALL_NAMES_CMD:
             return _ssh_result(stdout=ps_after_rm)
         return _ssh_result()
@@ -1267,10 +1285,8 @@ async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    commands = _cmds(ssh_client)
-    assert commands.count("/usr/bin/docker rm -fv filler_x") == 1
-    assert commands.count(DOCKER_PS_ALL_NAMES_CMD) == 1
-    assert not any("docker volume rm" in cmd for cmd in commands)
+    # LIUM-93: the rm and its confirming listing are the one host command of the whole create
+    assert _cmds(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
     assert _relisting_commands(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
@@ -1330,6 +1346,27 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
     assert _cmds(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_customer_create_whose_filler_removal_times_out_fails_at_the_cleanup_step(
+    svc_fixture, monkeypatch
+):
+    """LIUM-93: a hung dockerd fails the create where a failed cleanup does, never hangs it."""
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(
+        svc,
+        monkeypatch,
+        probe=_probe_with_containers("filler_x"),
+        docker_rm_raises=asyncssh.TimeoutError(None, None, None, None, None, None, "", ""),
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+
+    assert type(result).__name__ == "FailedContainerRequest"
+    assert result.failure_step == "container_cleanup"
+    [removal] = [call for call in ssh_client.run.await_args_list if call.args[0].startswith("/usr/bin/docker rm -fv")]
+    assert removal.kwargs["timeout"] == ds_module._CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
 
 
 def test_probe_without_containers_drops_them_and_their_mounts_only():
