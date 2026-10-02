@@ -583,6 +583,14 @@ class VolumeHostProbe:
     loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
 
 
+@dataclass
+class ContainerCleanupReport:
+    """What `clean_existing_containers` vouches for about its removal, filled in when passed."""
+
+    # one `docker rm -fv` exited 0, the re-read `docker ps -a` lists no filler, no `docker volume rm` ran
+    removed_cleanly_without_volume_rm: bool = False
+
+
 def _volume_host_probe_command(*, with_df: bool) -> str:
     """One shell line: DockerRootDir, (optionally) df through the helper container, the volume
     list and the loopback plugin state, each output line tagged so the parser never guesses.
@@ -2708,6 +2716,7 @@ class DockerService:
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
         remove_every_filler: bool = False,
+        report: ContainerCleanupReport | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
@@ -2765,9 +2774,11 @@ class DockerService:
                 ),
             )
 
-            await self._remove_stale_containers(
+            removed_cleanly = await self._remove_stale_containers(
                 ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
             )
+            if report is not None:
+                report.removed_cleanly_without_volume_rm = removed_cleanly
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2781,6 +2792,8 @@ class DockerService:
                     if volume_name not in active_volume_set:
                         volumes_to_remove.append(volume_name)
                 if volumes_to_remove:
+                    if report is not None:
+                        report.removed_cleanly_without_volume_rm = False
                     volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
@@ -2794,23 +2807,26 @@ class DockerService:
         pod_name: str,
         stale_containers: list[str],
         remove_every_filler: bool,
-    ) -> None:
+    ) -> bool:
         """`docker rm -fv` the stale containers. A customer create (DAH-3706) uses the tolerant rm
-        and then confirms that no filler survived."""
+        and then confirms that no filler survived; True only when that rm exited 0 at once and the
+        confirmation lists no filler."""
         if not remove_every_filler:
             names = " ".join(shlex.quote(name) for name in stale_containers)
             await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
-            return
+            return False
 
-        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+        removed_at_once = await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if removed_fillers:
-            await self._confirm_fillers_removed(
+            no_filler_left = await self._confirm_fillers_removed(
                 ssh_client=ssh_client,
                 default_extra=default_extra,
                 pod_name=pod_name,
                 removed_fillers=removed_fillers,
             )
+            return removed_at_once and no_filler_left
+        return False
 
     async def _confirm_fillers_removed(
         self,
@@ -2818,11 +2834,11 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         removed_fillers: list[str],
-    ) -> None:
+    ) -> bool:
         """Re-read `docker ps -a` after a customer create's filler removal; log any survivor.
 
         A listing that fails, times out or exits non-zero is logged as well -- the confirmation
-        never fails the create.
+        never fails the create. True only when the listing was read and shows no filler.
         """
         names_after = await self._list_all_container_names(ssh_client)
         if names_after is None:
@@ -2836,7 +2852,7 @@ class DockerService:
                     }),
                 )
             )
-            return
+            return False
         survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
         if survivors:
             logger.warning(
@@ -2852,14 +2868,16 @@ class DockerService:
                     }),
                 )
             )
+        return not survivors
 
     async def _remove_stale_containers_tolerantly(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         stale_containers: list[str],
-    ) -> None:
-        """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
+    ) -> bool:
+        """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides; True
+        when that one attempt exited 0.
 
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
@@ -2872,7 +2890,7 @@ class DockerService:
             await retry_ssh_command(
                 ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers', max_attempts=1
             )
-            return
+            return True
         except Exception:
             still_present = await self._names_still_on_host(ssh_client, stale_containers)
             if still_present is None:
@@ -2884,7 +2902,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "container_names": stale_containers}),
                 ),
             )
-            return
+            return False
         logger.info(
             _m(
                 "docker rm -fv failed with containers still on the host; retrying those",
@@ -2893,6 +2911,7 @@ class DockerService:
         )
         names = " ".join(shlex.quote(name) for name in still_present)
         await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+        return False
 
     @staticmethod
     async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
@@ -2940,7 +2959,8 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
-        caller passes it only while nothing has removed a container since the probe ran.
+        caller passes it only while nothing but the fillers it was adjusted for (LIUM-90) has been
+        removed since the probe ran.
         """
         skip_set = {name for name in (skip_volume_names or []) if name}
         list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_CMD
@@ -6415,6 +6435,7 @@ class DockerService:
                 # wait_for_port_check_containers just before `docker run`, and the
                 # 90s _run_docker_create_with_port_retry budget), so we no longer
                 # block the critical path for ~10s. (sleep defaults to 0.)
+                cleanup_report = ContainerCleanupReport()
                 removed_containers = await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
@@ -6427,9 +6448,24 @@ class DockerService:
                     # create removes every filler_* whatever the backend listed; a filler create
                     # keeps protecting its listed sibling bundle (DAH-2465).
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                    report=cleanup_report,
+                )
+                # LIUM-90: removing only fillers (confirmed gone, their volumes left to the backend's
+                # filler delete) changes no listing but the containers and their mounts, and frees
+                # disk, so the probes stay: the early df can only read less free space than there is.
+                removed_only_fillers_cleanly = (
+                    cleanup_report.removed_cleanly_without_volume_rm
+                    and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in removed_containers)
                 )
                 if removed_containers:
-                    docker_listing_probe = None
+                    docker_listing_probe = (
+                        docker_listing_probe.without_containers(
+                            removed_containers,
+                            [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
+                        )
+                        if removed_only_fillers_cleanly and docker_listing_probe is not None
+                        else None
+                    )
 
                 removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(
                     ssh_client=ssh_client,
@@ -6471,7 +6507,7 @@ class DockerService:
                     host_probe=docker_listing_probe,
                 )
                 cleanup_changed_host = bool(
-                    removed_containers
+                    (removed_containers and not removed_only_fillers_cleanly)
                     or removed_vloopback_volumes
                     or swept_cache_volumes
                     or reclaimed_cache_volumes
