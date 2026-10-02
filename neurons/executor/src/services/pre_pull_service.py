@@ -19,7 +19,8 @@ digest-pinned, and only if
   hands in, and a pull that would not fit waits for the next sweep. The loop starts the
   sweep as its own task and never waits for it, so the default image's refresh runs on
   time even when a sweep overruns (a silent pull stream, a slow eviction); while one
-  sweep is still running the next refresh does not start another.
+  sweep is still running the next refresh does not start another, and the task is
+  cancelled when the loop ends, however it ends.
 
 One pull per sweep per node plus a random start delay keeps a fleet-wide enable from
 stampeding the registry. Every pull attempt ends in exactly one log line
@@ -42,6 +43,7 @@ import urllib3
 
 from core.config import settings
 from core.logger import get_logger
+from services.cache_prefetch_state import describe_error, redact
 from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
@@ -182,7 +184,7 @@ def _pull_pinned(
         api._raise_for_status(response)
         for event in api._stream_helper(response, decode=True) or ():
             if isinstance(event, dict) and event.get("error"):
-                return "pull_failed", str(event["error"])
+                return "pull_failed", redact(str(event["error"]))
             now = time.monotonic()
             if now > deadline:
                 return "timeout", f"exceeded {timeout_seconds:.0f}s"
@@ -310,7 +312,7 @@ class PrePuller:
                                 _pull_pinned, self.client, repo, tag, digest, budget
                             )
                         except Exception as e:
-                            outcome, detail = "pull_failed", str(e)
+                            outcome, detail = "pull_failed", describe_error(e)
             seconds = time.monotonic() - started
             logger.info(
                 f"pre_pull image={image_ref} digest={digest} seconds={seconds:.1f} outcome={outcome}"

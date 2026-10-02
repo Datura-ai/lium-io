@@ -878,10 +878,18 @@ async def test_digest_mismatch_gets_no_fresh_node_grace(context_factory, monkeyp
     assert "fresh_node_grace" not in result.event.what_we_saw
 
 
+_PULL_RECORD = {
+    "class": "PullStreamError", "code": "registry_unreachable", "host": None, "status": None,
+}
+
+
 @pytest.mark.asyncio
-async def test_remediation_quotes_the_executors_pull_error(context_factory, monkeypatch):
+@pytest.mark.parametrize("pull_error", [_PULL_RECORD, _PULL_ERROR])
+async def test_remediation_names_the_executors_pull_error_by_its_reason(
+    context_factory, monkeypatch, pull_error
+):
     redis = _fake_redis_service()
-    doc = _prefetch_doc(first_sweep_ok_at="2026-09-20T10:00:00Z")
+    doc = _prefetch_doc(first_sweep_ok_at="2026-09-20T10:00:00Z", pull_error=pull_error)
     ctx = _uncached_ctx(
         context_factory, monkeypatch, redis, doc, digests={_IMAGE_REF: _IMAGE_DIGEST}
     )
@@ -889,39 +897,141 @@ async def test_remediation_quotes_the_executors_pull_error(context_factory, monk
     result = await CachedTemplateVerificationCheck().run(ctx)
 
     remediation = result.event.remediation
-    assert _PULL_ERROR in remediation
+    assert "failed: registry_unreachable" in remediation
     assert "registry-1.docker.io and production.cloudflare.docker.com" in remediation
     assert "cache_template_service" not in remediation
+    # An older executor's text reaches neither the provider nor the event.
+    assert "TLS handshake" not in remediation
+    assert "TLS handshake" not in result.event.model_dump_json()
 
 
 @pytest.mark.parametrize(
-    ("error", "expected"),
+    ("error", "code", "expected"),
     [
         (
             '404 Client Error: Not Found ("No such image: daturaai/torch@sha256:aaa")',
+            "image_missing",
             "update the executor",
         ),
-        ("toomanyrequests: You have reached your pull rate limit", "docker login"),
-        ("write /var/lib/docker/tmp/x: no space left on device", "free disk"),
-        ("manifest for daturaai/torch@sha256:aaa not found: manifest unknown", "registry mirror"),
-        ("unauthorized: authentication required", "Docker login"),
+        ("toomanyrequests: You have reached your pull rate limit", "rate_limited", "docker login"),
+        ("write /var/lib/docker/tmp/x: no space left on device", "disk_full", "free disk"),
+        (
+            "manifest for daturaai/torch@sha256:aaa not found: manifest unknown",
+            "manifest_unknown",
+            "registry mirror",
+        ),
+        ("unauthorized: authentication required", "registry_denied", "Docker login"),
         # A status code inside a digest is not the registry's answer.
         (
             "Get https://registry-1.docker.io/v2/daturaai/torch/manifests/sha256:ab403f: "
             "net/http: TLS handshake timeout",
+            "registry_unreachable",
             "outbound connection",
         ),
-        ("pull daturaai/torch@sha256:c404e failed: connection reset by peer", "outbound connection"),
-        ("something new", "docker pull daturaai/torch@sha256:aaa"),
+        (
+            "pull daturaai/torch@sha256:c404e failed: connection reset by peer",
+            "registry_unreachable",
+            "outbound connection",
+        ),
+        ("something new", "unknown", "docker pull daturaai/torch@sha256:aaa"),
     ],
 )
-def test_remediation_names_the_next_step_for_the_error(error, expected):
+def test_an_older_executors_pull_error_text_is_read_as_its_reason_never_quoted(
+    error, code, expected
+):
     state = json.loads(_prefetch_doc(pull_error=error))
 
     text = _remediation_from_prefetch_state(state, _IMAGE_REF, "daturaai/torch@sha256:aaa", cached=False)
 
-    assert error[:40] in text
+    assert f"failed: {code}." in text
+    assert error[:20] not in text
     assert expected in text
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("image_missing", "update the executor"),
+        ("rate_limited", "docker login"),
+        ("disk_full", "free disk"),
+        ("registry_denied", "Docker login"),
+        ("manifest_unknown", "registry mirror"),
+        ("registry_unreachable", "outbound connection"),
+        ("timeout", "outbound connection"),
+        ("connect_error", "outbound connection"),
+        ("dns_error", "outbound connection"),
+        ("tls_error", "outbound connection"),
+        ("pull_failed", "docker pull daturaai/torch@sha256:aaa` on the host to reproduce"),
+        ("not_a_code", "docker pull daturaai/torch@sha256:aaa` on the host to reproduce"),
+    ],
+)
+def test_remediation_names_the_next_step_for_the_reason_code(code, expected):
+    record = {"class": "APIError", "code": code, "host": "registry.example", "status": 429}
+    state = json.loads(_prefetch_doc(pull_error=record))
+
+    text = _remediation_from_prefetch_state(state, _IMAGE_REF, "daturaai/torch@sha256:aaa", cached=False)
+
+    published = code if code != "not_a_code" else "unknown"
+    assert f"failed: {published} (APIError, HTTP 429, host registry.example). " in text
+    assert expected in text
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            {
+                "last_outcome": "loop_error",
+                "last_loop_error": {
+                    "class": "ClientConnectorError",
+                    "code": "connect_error",
+                    "host": "backend.example",
+                    "status": None,
+                },
+            },
+            "The executor's pre-pull loop failed: connect_error (ClientConnectorError, "
+            "host backend.example).",
+        ),
+        (
+            {
+                "last_outcome": "backend_no_templates",
+                "backend_url": "https://backend.example",
+                "last_backend_error": {
+                    "class": None, "code": "http_error", "host": "backend.example", "status": 503,
+                },
+            },
+            "got no image from the backend (http_error (HTTP 503, host backend.example)): check "
+            "that the executor can reach https://backend.example.",
+        ),
+        (
+            {
+                "last_outcome": "docker_unavailable",
+                "docker_error": {
+                    "class": "DockerException", "code": "docker_error", "host": None, "status": None,
+                },
+            },
+            "cannot reach Docker (docker_error (DockerException))",
+        ),
+        (
+            {"last_outcome": "gpu_unknown", "gpu_error": None},
+            "cannot read the GPU (no reason recorded)",
+        ),
+        (
+            {"last_outcome": "loop_error", "last_loop_error": "https://u:s3cret@backend.example"},
+            "The executor's pre-pull loop failed: unknown.",
+        ),
+        (
+            {
+                "last_outcome": "backend_no_templates",
+                "backend_url": "https://u:s3cret@backend.example/api",
+                "last_backend_error": "HTTP 503",
+            },
+            "(unknown): check that the executor can reach the backend.",
+        ),
+    ],
+)
+def test_remediation_describes_loop_errors_by_their_record(state, expected):
+    assert expected in _remediation_from_prefetch_state(state, _IMAGE_REF, _IMAGE_REF, cached=False)
 
 
 @pytest.mark.parametrize("images", [["x"], {_IMAGE_REF: "x"}])
@@ -985,3 +1095,88 @@ def test_remediation_without_a_prefetch_document_says_why_the_image_fails():
 
     assert missing.endswith("to see why the image is missing.")
     assert stale.endswith("to see why the image on the host is stale.")
+
+
+# --- fuzz: no text an executor's document carries reaches the fix text or the event ---------
+
+# A JWT's shape: a stub header, payload and signature.
+_STUB_JWT = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiJ4In0" + ".c2lnbmF0dXJl"
+# Credentials a 4-character window of which never occurs in an event by chance.
+_FUZZ_CREDENTIALS = (
+    "Zq9Xw7Yv",
+    "pQ@z/ Kx'J\"m>W#?Tq",
+    "Vb%40Nm\uff20Rt\ufe6bHy",
+    _STUB_JWT,
+    "ghp_" + "Kq7Zw" * 8,
+    "Jk Lm\tNp\xa0Qr",
+)
+# Each holds a character no class name or host may, so a shape check alone refuses it.
+_FUZZ_TEMPLATES = (
+    "https://provider:{c}@backend.example:8443/api",
+    "provider:{c}@backend.example/api",
+    "https://{c}@backend.example",
+    "https://{c}%40backend.example/api",
+    "https://first.last:12 {c}@host.example",
+    "GET https://backend.example/x?token={c}",
+    "GET https://backend.example/api/token%2F{c}",
+    "Authorization: Bearer {c}",
+    "password={c}",
+    "--password {c}",
+    "session: {c}",
+    "<password>{c}</password>",
+    "toomanyrequests: {c}",
+    "No such image: {c}",
+)
+_FUZZ_OUTCOMES = ("loop_error", "backend_no_templates", "docker_unavailable", "gpu_unknown", "sweep_ok")
+
+
+def _fuzz_doc(text, outcome, legacy):
+    error = text if legacy else {"class": text, "code": text, "host": text, "status": 999}
+    return {
+        "schema_version": 1 if legacy else 2,
+        "sweep_count": 1,
+        "last_outcome": outcome,
+        "backend_url": text,
+        "gpu_error": error,
+        "docker_error": error,
+        "last_backend_error": error,
+        "last_loop_error": error,
+        "last_error": error,
+        "last_malformed_template": text if legacy else {"missing": [text]},
+        "images": {
+            _IMAGE_REF: {
+                "last_outcome": "pull_failed" if outcome == "sweep_ok" else "up_to_date",
+                "last_error": error,
+                "last_local_error": error,
+                "last_remote_error": error,
+                "last_pull_error": error,
+                "last_cleanup_error": error,
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_substring_of_a_credential_in_the_document_reaches_the_fix_text_or_event(
+    context_factory, monkeypatch
+):
+    checked = 0
+    for credential in _FUZZ_CREDENTIALS:
+        windows = {credential[i : i + 4] for i in range(len(credential) - 3)}
+        for template in _FUZZ_TEMPLATES:
+            text = template.replace("{c}", credential)
+            for outcome in _FUZZ_OUTCOMES:
+                for legacy in (True, False):
+                    doc = json.dumps(_fuzz_doc(text, outcome, legacy))
+                    ctx = _mismatch_ctx(context_factory, monkeypatch, _result(stdout=doc))
+
+                    result = await CachedTemplateVerificationCheck().run(ctx)
+
+                    assert result.passed is False
+                    assert "unavailable" not in result.event.what_we_saw["prefetch_state"]
+                    event = result.event.model_dump_json()
+                    readable = json.dumps(json.loads(event), ensure_ascii=False)
+                    leaked = [w for w in windows if w in event or w in readable]
+                    assert not leaked, (template, outcome, legacy, leaked, result.event.remediation)
+                    checked += 1
+    assert checked == len(_FUZZ_CREDENTIALS) * len(_FUZZ_TEMPLATES) * len(_FUZZ_OUTCOMES) * 2

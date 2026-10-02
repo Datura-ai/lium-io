@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import aiohttp
 import docker
 import pytest
 import urllib3
@@ -280,6 +281,71 @@ def test_cancelling_the_loop_cancels_a_running_sweep(monkeypatch):
     )
 
 
+def test_a_cancel_that_lands_in_the_error_backoff_sleep_still_cancels_the_sweep(monkeypatch):
+    # The cancel used to live only in the loop's CancelledError handler. A cancel that arrives
+    # while the loop sleeps out an error backoff is raised inside a sibling except clause, so
+    # that handler never ran and the sweep started by the previous refresh kept running with
+    # nothing left to read its outcome. The finally covers it.
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    sweep_saw: list[str] = []
+    in_backoff = asyncio.Event()
+    templates = [
+        _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False),
+        _entry(REPO, CU128_TAG, DIGEST_CU128),
+    ]
+    fetches = 0
+
+    async def fetch(session, url, params):
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            return templates, 200, None
+        raise aiohttp.ClientError("backend down")  # the second refresh ends in the error backoff
+
+    async def ensure(client, data, state, keep_tags=frozenset()):
+        pass
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sweep_saw.append("cancelled")
+                raise
+
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds):
+        if fetches == 2:  # the sleep after the failed fetch is the error backoff
+            in_backoff.set()
+            await asyncio.Event().wait()  # the cancel lands here
+        await real_sleep(0)  # the refresh sleep: yield once, so the sweep task starts
+
+    async def main():
+        task = asyncio.create_task(
+            cache_template_service.run_cache_template_prefetch(state_path=None)
+        )
+        await asyncio.wait_for(in_backoff.wait(), timeout=5)
+        assert fetches == 2 and sweep_saw == []  # the sweep from refresh 1 is still hanging
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await real_sleep(0)  # one step for the sweep task to see its cancel
+        assert sweep_saw == ["cancelled"]
+
+    monkeypatch.setattr(cache_template_service, "_fetch_templates", fetch)
+    monkeypatch.setattr(cache_template_service, "_ensure_template", ensure)
+    monkeypatch.setattr(cache_template_service, "PrePuller", HangingPuller)
+    monkeypatch.setattr(
+        cache_template_service, "_get_gpu_info", lambda: ("NVIDIA H100 80GB HBM3", "580.65.06", None)
+    )
+    monkeypatch.setattr(cache_template_service.asyncio, "sleep", sleep)
+    asyncio.run(main())
+
+
 def test_a_pre_pull_entry_that_is_the_default_image_never_reaches_the_puller(monkeypatch):
     # the backend's top-N is global; when it repeats this node's default image, the default must not
     # become a tracked (evictable) pre-pull
@@ -504,6 +570,32 @@ def test_pull_exception_is_logged_as_one_failed_line_and_not_recorded(quiet_node
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image=")]
     assert len(lines) == 1 and "outcome=pull_failed" in lines[0] and "daemon gone" in lines[0]
     assert CU128_REF not in puller.state.images
+
+
+def test_a_pull_error_is_logged_with_its_class_and_without_its_credentials(
+    quiet_node, monkeypatch, caplog
+):
+    def boom(*_):
+        raise RuntimeError("GET https://provider:s3cret@registry.example/v2/?token=s3cret failed")
+
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", boom)
+    puller = PrePuller(_client(), state_path=None)
+
+    with caplog.at_level(logging.INFO):
+        _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image=")]
+    assert "detail=RuntimeError: GET https://***@registry.example/v2/?*** failed" in line
+    assert "s3cret" not in line
+
+
+def test_a_registry_error_event_is_logged_without_its_credentials(monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    client, _ = _pull_client([{"error": "denied: https://provider:s3cret@registry.example/v2/"}])
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, 60)
+
+    assert (outcome, detail) == ("pull_failed", "denied: https://***@registry.example/v2/")
 
 
 # --- disk guard -------------------------------------------------------------------------

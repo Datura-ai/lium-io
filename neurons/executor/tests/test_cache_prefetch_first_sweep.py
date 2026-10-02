@@ -8,16 +8,20 @@ checking the node for that image.
 """
 
 import asyncio
+import http.server
 import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import docker
 import pytest
+from aiohttp.client_exceptions import InvalidUrlClientError
 
 docker.errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
 
 from services import cache_prefetch_state, cache_template_service  # noqa: E402
-from services.cache_prefetch_state import CachePrefetchState, Outcome  # noqa: E402
+from services.cache_prefetch_state import CachePrefetchState, Outcome, Reason  # noqa: E402
 from services.cache_template_service import PullStreamError  # noqa: E402
 
 REPO = "daturaai/pytorch"
@@ -31,6 +35,10 @@ TEMPLATE = {
     "docker_image_digest": DIGEST,
 }
 REGISTRY_ERROR = "read tcp 10.0.0.2:51234->203.0.113.7:443: read: connection reset by peer"
+
+
+def _error(code, cls=None, host=None, status=None) -> dict:
+    return {"class": cls, "code": code, "host": host, "status": status}
 
 
 def _client(stream: list) -> MagicMock:
@@ -60,8 +68,9 @@ def test_pull_stream_error_is_raised_and_recorded(error_event):
 
     record = state.as_dict()["images"][IMAGE_REF]
     assert record["last_outcome"] == Outcome.PULL_FAILED
-    assert REGISTRY_ERROR in record["last_pull_error"]
-    assert "No such image" not in record["last_pull_error"]
+    # The registry's answer, not the follow-up lookup's "No such image", decides the reason.
+    assert record["last_pull_error"] == _error(Reason.REGISTRY_UNREACHABLE, "PullStreamError")
+    assert "connection reset" not in json.dumps(record)
     # The lookup that used to hide the error is never reached.
     assert all("@" not in call.args[0] for call in client.images.get.call_args_list)
 
@@ -85,16 +94,26 @@ class _Stop(BaseException):
     """Ends the loop from inside a patched sleep; the loop only catches Exception."""
 
 
-def _drive_loop(monkeypatch, ensure_outcomes: list, sleeps_before_stop: int, tmp_path, gpu=None):
+def _drive_loop(
+    monkeypatch,
+    ensure_outcomes: list,
+    sleeps_before_stop: int,
+    tmp_path,
+    gpu=None,
+    base_url="https://backend",
+    fetch=None,
+):
     """Run the loop with one template until `sleeps_before_stop` sleeps; return the delays."""
-    monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", "https://backend")
+    monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", base_url)
     monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
     monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", False)
     monkeypatch.setattr(cache_template_service.docker, "from_env", MagicMock())
     gpu = gpu or (lambda: ("NVIDIA H100", "580", None))
     monkeypatch.setattr(cache_template_service, "_get_gpu_info", gpu)
     monkeypatch.setattr(
-        cache_template_service, "_fetch_templates", AsyncMock(return_value=([TEMPLATE], 200, None))
+        cache_template_service,
+        "_fetch_templates",
+        fetch or AsyncMock(return_value=([TEMPLATE], 200, None)),
     )
     monkeypatch.setattr(
         cache_template_service, "_ensure_template", AsyncMock(side_effect=ensure_outcomes)
@@ -147,6 +166,346 @@ def test_an_unknown_gpu_at_boot_uses_none_of_the_fast_retries(monkeypatch, tmp_p
 
     jitter = cache_template_service.FIRST_SWEEP_RETRY_JITTER_SECONDS
     assert delays == [cache_template_service.ERROR_INTERVAL_SECONDS, 15 + jitter]
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "host"),
+    [
+        (
+            aiohttp.InvalidURL(
+                "https://provider:s3cret@backend.example/executors/default-docker-image"
+            ),
+            Reason.INVALID_URL,
+            "backend.example",
+        ),
+        (
+            aiohttp.ClientError("GET https://backend.example/executors?api_token=s3cret failed"),
+            Reason.UNKNOWN,
+            "backend",
+        ),
+        (
+            RuntimeError("backend.example answered 401 to Authorization: Bearer s3cret"),
+            Reason.UNKNOWN,
+            None,
+        ),
+        (
+            aiohttp.ClientError("Cannot connect to https://provider:s3c@ret@backend.example/api"),
+            Reason.UNKNOWN,
+            "backend",
+        ),
+        (
+            InvalidUrlClientError("https://provider:s3c/ret@backend.example/executors/x"),
+            Reason.INVALID_URL,
+            "backend",
+        ),
+        (
+            aiohttp.ClientError(
+                "Cannot connect to https://provider:s3cret@backend.example:bad/api"
+            ),
+            Reason.UNKNOWN,
+            "backend",
+        ),
+        (
+            InvalidUrlClientError('https://provider:s3c/r"et@backend.example/executors/x'),
+            Reason.INVALID_URL,
+            "backend",
+        ),
+        (
+            InvalidUrlClientError("https://provider:s3c/r et@backend.example/executors/x"),
+            Reason.INVALID_URL,
+            "backend",
+        ),
+        (
+            InvalidUrlClientError("https://provider:" + "s3cret/" * 43 + "@backend.example/x"),
+            Reason.INVALID_URL,
+            "backend",
+        ),
+        (
+            InvalidUrlClientError("https://provider:s3c/ret@bäckend.example/executors/x"),
+            Reason.INVALID_URL,
+            "backend",
+        ),
+        (
+            aiohttp.ClientError(
+                "401, message='Unauthorized', url='https://backend.example/x?api_token=s3cret'"
+            ),
+            Reason.UNKNOWN,
+            "backend",
+        ),
+    ],
+)
+def test_a_loop_error_is_logged_redacted_and_published_without_its_text(
+    monkeypatch, tmp_path, error, code, host
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(monkeypatch, [error], sleeps_before_stop=1, tmp_path=tmp_path)
+
+    (message,), _ = logger.error.call_args
+    assert "s3c" not in message and "ret@" not in message
+    assert type(error).__name__ in message and "ckend.example" in message
+    published = _error(code, type(error).__name__, host)
+    assert doc["last_loop_error"] == doc["last_error"] == published
+    assert "s3c" not in json.dumps(doc)
+
+
+def test_a_long_error_cannot_carry_a_credential_past_the_cut(monkeypatch, tmp_path):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    error = RuntimeError(
+        "Bearer " + "a" * 2440 + " https://u:s3cret" + "x" * 50 + "@backend.example/x"
+    )
+
+    _, doc = _drive_loop(monkeypatch, [error], sleeps_before_stop=1, tmp_path=tmp_path)
+
+    (message,), _ = logger.error.call_args
+    assert message.endswith("RuntimeError: Bearer …")
+    assert "s3cret" not in message
+    assert "s3cret" not in json.dumps(doc)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "published"),
+    [
+        ("https://provider:s3cret@backend.example/api", "https://backend.example"),
+        ("https://provider:s3c@ret@backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
+        ("https://backend.example:8443/api", "https://backend.example"),
+        ("https://provider:s3c/ret@backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
+        ("https://provider:s3cret@backend.example:bad/api", cache_prefetch_state.UNPARSEABLE_URL),
+        ("https://provider:1234/s3cret@backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
+        ("https://s3cret%40backend.example/api", cache_prefetch_state.UNPARSEABLE_URL),
+        ("https://backend.example/api/token%2Fs3cret", "https://backend.example"),
+    ],
+)
+def test_the_backend_url_is_published_as_its_scheme_and_host(
+    monkeypatch, tmp_path, base_url, published
+):
+    monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", base_url)
+    monkeypatch.setattr(
+        cache_template_service.docker, "from_env", MagicMock(side_effect=RuntimeError("no docker"))
+    )
+    path = tmp_path / "state.json"
+
+    asyncio.run(cache_template_service.run_cache_template_prefetch(str(path)))
+
+    assert json.loads(path.read_text())["backend_url"] == published
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # aiohttp refuses each of these before connecting, with the raw URL as the error's text.
+        "https://provider:s3c/ret@backend.example/api",
+        "https://provider:s3cret@backend.example:bad/api",
+        'https://provider:s3c/r"et@backend.example/api',
+        "https://provider:s3c/r et@backend.example/api",
+        "https://provider:" + "s3cret/" * 43 + "@backend.example/api",
+        "https://provider:s3c/ret@bäckend.example/api",
+    ],
+)
+def test_a_backend_url_aiohttp_rejects_is_logged_redacted_and_never_published(
+    monkeypatch, tmp_path, base_url
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url=base_url,
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert "InvalidUrlClientError" in message
+    assert "s3c" not in message and "ret@" not in message and "r et" not in message
+    assert "ckend.example" in message and "/api/executors/default-docker-image" in message
+    assert doc["backend_url"] == cache_prefetch_state.UNPARSEABLE_URL
+    published = _error(Reason.INVALID_URL, "InvalidUrlClientError")
+    assert doc["last_loop_error"] == doc["last_error"] == published
+    assert "s3c" not in json.dumps(doc)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # COMPUTE_REST_API_URL written without `https://`: aiohttp raises NonHttpUrlClientError.
+        "provider:s3cret@backend.example:8443/api",
+        "provider:s3cret@backend.example:bad/api",
+        "provider:s3c'r>et@backend.example/api",
+    ],
+)
+def test_a_backend_url_without_a_scheme_never_publishes_its_password(
+    monkeypatch, tmp_path, base_url
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url=base_url,
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert "NonHttpUrlClientError: ***@backend.example" in message
+    assert "s3c" not in message and "provider" not in message
+    assert "/api/executors/default-docker-image" in message
+    assert doc["backend_url"] == cache_prefetch_state.UNPARSEABLE_URL
+    published = _error(Reason.INVALID_URL, "NonHttpUrlClientError")
+    assert doc["last_loop_error"] == doc["last_error"] == published
+    assert "s3c" not in json.dumps(doc) and "provider" not in json.dumps(doc)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # The userinfo separator written as `%40`, or as a fullwidth or small at-sign.
+        "https://provider:s3cret%40backend.example:8443/api",
+        "https://provider:s3cret\uff20backend.example/api",
+        "https://provider:s3cret\ufe6bbackend.example:8443/api",
+        "provider:s3cret%40backend.example:8443/api",
+        "provider:s3cret\uff20backend.example:8443/api",
+        "provider:s3cret\ufe6bbackend.example/api",
+    ],
+)
+def test_a_backend_url_with_an_encoded_at_sign_never_publishes_its_password(
+    monkeypatch, tmp_path, base_url
+):
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url=base_url,
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert "s3c" not in message and "provider" not in message
+    assert "UrlClientError: " in message and "backend.example" in message
+    assert doc["backend_url"] == cache_prefetch_state.UNPARSEABLE_URL
+    assert doc["last_loop_error"] == doc["last_error"]
+    assert doc["last_loop_error"]["code"] == Reason.INVALID_URL
+    assert doc["last_loop_error"]["class"].endswith("UrlClientError")
+    assert doc["last_loop_error"]["host"] is None
+    assert "s3c" not in json.dumps(doc) and "provider" not in json.dumps(doc)
+
+
+class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+    location = ""
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", self.location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["provider:s3cret@backend.example/x", "provider:s3c r'et@backend.example:8443/x?token=s3cret"],
+)
+def test_a_redirect_to_a_location_without_a_scheme_never_publishes_its_password(
+    monkeypatch, tmp_path, location
+):
+    # aiohttp raises NonHttpUrlRedirectClientError, whose text is the Location it refused.
+    handler = type("Handler", (_RedirectHandler,), {"location": location})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+    try:
+        _, doc = _drive_loop(
+            monkeypatch,
+            [None],
+            sleeps_before_stop=1,
+            tmp_path=tmp_path,
+            base_url=f"http://127.0.0.1:{server.server_address[1]}",
+            fetch=cache_template_service._fetch_templates,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    (message,), _ = logger.error.call_args
+    assert "NonHttpUrlRedirectClientError: ***@backend.example" in message
+    assert "s3c" not in message and "provider" not in message
+    published = _error(Reason.INVALID_URL, "NonHttpUrlRedirectClientError", "127.0.0.1")
+    assert doc["last_loop_error"] == doc["last_error"] == published
+    assert "s3c" not in json.dumps(doc) and "provider" not in json.dumps(doc)
+
+
+class _HtmlHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"<html>maintenance</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def html_backend():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HtmlHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "/api?token=s3cret",
+        "?auth=s3cret",
+        "/api?api_token=s3cret",
+        # A path secret behind an encoded `/`.
+        "/api/token%2Fs3cret",
+        "/api/token%2fs3cret/x",
+    ],
+)
+def test_a_backend_answering_html_never_publishes_the_urls_query(
+    monkeypatch, tmp_path, html_backend, suffix
+):
+    # aiohttp's ContentTypeError quotes the request URL as url='...', query and all.
+    logger = MagicMock()
+    monkeypatch.setattr(cache_template_service, "logger", logger)
+
+    _, doc = _drive_loop(
+        monkeypatch,
+        [None],
+        sleeps_before_stop=1,
+        tmp_path=tmp_path,
+        base_url=html_backend + suffix,
+        fetch=cache_template_service._fetch_templates,
+    )
+
+    (message,), _ = logger.error.call_args
+    assert "ContentTypeError" in message and "text/html" in message
+    assert "s3cret" not in message and html_backend in message
+    published = _error(Reason.BAD_RESPONSE, "ContentTypeError", "127.0.0.1", 200)
+    assert doc["last_loop_error"] == doc["last_error"] == published
+    assert "s3cret" not in json.dumps(doc) and "text/html" not in json.dumps(doc)
+    assert doc["backend_url"] == "http://127.0.0.1"
 
 
 def test_retry_jitter_stays_inside_its_bound():
