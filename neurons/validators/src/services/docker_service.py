@@ -6208,12 +6208,16 @@ class DockerService:
             filler_removal_at_ssh_connect: asyncio.Task | None = None
             filler_removal_at_ssh_connect_report = ContainerCleanupReport()
             fillers_listed_at_ssh_connect: asyncio.Future[list[str]] = asyncio.get_running_loop().create_future()
+            removal_waits_for_docker_run = False
 
             async def settle_filler_removal_at_ssh_connect() -> None:
                 # a create that ends before its cleanup step awaited the removal: stop it, log its error
                 if filler_removal_at_ssh_connect is None:
                     return
-                filler_removal_at_ssh_connect.cancel()
+                # LIUM-114: one the cleanup step left to docker run finishes: a create failing in
+                # between leaves no filler behind, as when the cleanup step awaited it
+                if not removal_waits_for_docker_run:
+                    filler_removal_at_ssh_connect.cancel()
                 [outcome] = await asyncio.gather(filler_removal_at_ssh_connect, return_exceptions=True)
                 if isinstance(outcome, Exception):
                     logger.warning(

@@ -1543,6 +1543,27 @@ async def test_failed_removal_fails_the_create_before_docker_run_and_removes_the
 
 
 @pytest.mark.asyncio
+async def test_create_failing_after_the_cleanup_lets_the_removal_left_to_docker_run_finish(
+    svc_fixture, monkeypatch
+):
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(
+        svc, monkeypatch, probe=_probe_with_containers("filler_x"), docker_rm_seconds=0.2
+    )
+    events: list[str] = []
+    _record_removal(ssh_client, events)
+    _record_create_steps(svc, events)
+    svc.create_local_volume = AsyncMock(side_effect=RuntimeError("volume create failed"))
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+
+    assert type(result).__name__ == "FailedContainerRequest"
+    assert result.failure_step == "volume_creation"
+    assert events == ["removal issued", "cache reclaim", "removal confirmed"]
+    assert _removals_at_ssh_connect_left_running() == []
+
+
+@pytest.mark.asyncio
 async def test_customer_create_without_a_filler_waits_for_nothing_before_docker_run(
     svc_fixture, monkeypatch, caplog
 ):
