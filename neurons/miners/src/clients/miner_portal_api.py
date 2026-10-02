@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 # it then waits a whole extra 15-min cycle (DAH-2957). The wave itself still collapses
 # into one bulk request through the single-flight lock below.
 SNAPSHOT_TTL_SECONDS = 30
+# A request for an executor the stale snapshot already holds is answered from it while
+# one refresh runs in the background, instead of waiting for the portal inside a rent
+# (LIUM-49: 2,045 ms once). Capped at the 300 s TTL prod ran before DAH-2957: an executor
+# whose address changed in the portal meanwhile gets the old one and that rent fails.
+MAX_STALE_SERVE_SECONDS = 300
 FAILED_REFRESH_RETRY_SECONDS = 30
 BULK_FETCH_TIMEOUT_SECONDS = 15
 
@@ -35,26 +40,53 @@ class MinerPortalAPI:
     _snapshot_fetched_at: float | None = None
     _last_refresh_attempt_at: float | None = None
     _refresh_lock: asyncio.Lock = asyncio.Lock()
+    # strong reference: the event loop keeps only a weak one to a running task
+    _background_refresh: asyncio.Task | None = None
 
     @classmethod
     async def fetch_executors(
         cls, miner_hotkey: str, executor_id: str | None
     ) -> list[dict[str, Any]]:
         # serve one miner's executors from the shared snapshot, refreshing it when stale
+        if executor_id:
+            held = cls._filter_by_executor_id(cls._snapshot.get(miner_hotkey, []), executor_id)
+            # a missing executor still waits for the refresh: it may be a node just
+            # registered in the portal (DAH-2957)
+            if held and cls._snapshot_age_seconds() < MAX_STALE_SERVE_SECONDS:
+                if not cls._is_fresh():
+                    cls._start_background_refresh()
+                return held
+
         snapshot = await cls._get_snapshot()
         executors = snapshot.get(miner_hotkey, [])
         if executor_id:
-            # case-insensitive: the replaced DB-side filter compared UUIDs, not strings
-            wanted_id = str(executor_id).lower()
-            executors = [e for e in executors if str(e.get("id")).lower() == wanted_id]
+            executors = cls._filter_by_executor_id(executors, executor_id)
         return executors
+
+    @staticmethod
+    def _filter_by_executor_id(
+        executors: list[dict[str, Any]], executor_id: str
+    ) -> list[dict[str, Any]]:
+        # case-insensitive: the replaced DB-side filter compared UUIDs, not strings
+        wanted_id = str(executor_id).lower()
+        return [e for e in executors if str(e.get("id")).lower() == wanted_id]
+
+    @classmethod
+    def _snapshot_age_seconds(cls) -> float:
+        if cls._snapshot_fetched_at is None:
+            return float("inf")
+        return time.monotonic() - cls._snapshot_fetched_at
+
+    @classmethod
+    def _start_background_refresh(cls) -> None:
+        # _get_snapshot logs a failure and keeps the old snapshot; the next stale
+        # request starts a new attempt, subject to FAILED_REFRESH_RETRY_SECONDS
+        if cls._background_refresh is None or cls._background_refresh.done():
+            cls._background_refresh = asyncio.create_task(cls._get_snapshot())
 
     @classmethod
     def _is_fresh(cls) -> bool:
-        return (
-            cls._snapshot_fetched_at is not None
-            and time.monotonic() - cls._snapshot_fetched_at < SNAPSHOT_TTL_SECONDS
-        )
+        return cls._snapshot_age_seconds() < SNAPSHOT_TTL_SECONDS
 
     @classmethod
     async def _get_snapshot(cls) -> dict[str, list[dict[str, Any]]]:

@@ -15,6 +15,7 @@ import pytest
 
 from clients.miner_portal_api import (
     FAILED_REFRESH_RETRY_SECONDS,
+    MAX_STALE_SERVE_SECONDS,
     SNAPSHOT_TTL_SECONDS,
     MinerPortalAPI,
 )
@@ -36,6 +37,7 @@ def reset_cache():
     MinerPortalAPI._snapshot_fetched_at = None
     MinerPortalAPI._last_refresh_attempt_at = None
     MinerPortalAPI._refresh_lock = asyncio.Lock()
+    MinerPortalAPI._background_refresh = None
     yield
 
 
@@ -191,6 +193,132 @@ async def test_executor_id_filters_locally(monkeypatch):
 
     assert matched == [{"id": "aaaa-2", "validator_hotkey": "v1"}]
     assert missing == []
+    assert bulk.await_count == 1
+
+
+def _portal_blocked_until_released(snapshot):
+    # bulk fetch that hangs until the test sets the event: a slow portal answer
+    release = asyncio.Event()
+
+    async def slow_bulk():
+        await release.wait()
+        return snapshot
+
+    return AsyncMock(side_effect=slow_bulk), release
+
+
+async def test_fresh_snapshot_serves_executor_without_refresh(monkeypatch):
+    bulk = AsyncMock(return_value=SNAPSHOT)
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+    await MinerPortalAPI.fetch_executors("hotkey-a", None)
+
+    executors = await MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-1")
+
+    assert executors == [SNAPSHOT["hotkey-a"][0]]
+    assert bulk.await_count == 1
+    assert MinerPortalAPI._background_refresh is None
+
+
+async def test_stale_snapshot_holding_executor_answers_before_refresh_finishes(monkeypatch):
+    # LIUM-49, rb-0033: a rent's key-submit waited 2,045 ms for an inline portal refresh
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", AsyncMock(return_value=SNAPSHOT))
+    await MinerPortalAPI.fetch_executors("hotkey-a", None)
+    _expire_snapshot()
+    refreshed = {"hotkey-a": [{"id": "aaaa-1", "validator_hotkey": "v1", "price_per_gpu": 2}]}
+    bulk, release = _portal_blocked_until_released(refreshed)
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+
+    executors = await asyncio.wait_for(
+        MinerPortalAPI.fetch_executors("hotkey-a", "AAAA-1"), timeout=1
+    )
+    await asyncio.sleep(0)  # let the background refresh reach the portal
+
+    assert executors == [SNAPSHOT["hotkey-a"][0]]
+    assert bulk.await_count == 1
+    release.set()
+    await MinerPortalAPI._background_refresh
+    assert MinerPortalAPI._snapshot == refreshed
+
+
+async def test_stale_snapshot_missing_executor_waits_for_refresh(monkeypatch):
+    # DAH-2957: a node registered after the last refresh must be found by this request
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", AsyncMock(return_value=SNAPSHOT))
+    await MinerPortalAPI.fetch_executors("hotkey-a", None)
+    _expire_snapshot()
+    added = {"id": "aaaa-new", "validator_hotkey": "v1"}
+    bulk = AsyncMock(return_value={"hotkey-a": SNAPSHOT["hotkey-a"] + [added]})
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+
+    executors = await MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-new")
+
+    assert executors == [added]
+    assert bulk.await_count == 1
+    assert MinerPortalAPI._background_refresh is None
+
+
+async def test_snapshot_past_max_stale_age_waits_for_refresh(monkeypatch):
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", AsyncMock(return_value=SNAPSHOT))
+    await MinerPortalAPI.fetch_executors("hotkey-a", None)
+    MinerPortalAPI._snapshot_fetched_at -= MAX_STALE_SERVE_SECONDS + 1
+    MinerPortalAPI._last_refresh_attempt_at = None
+    moved = {"id": "aaaa-1", "validator_hotkey": "v1", "executor_ip_address": "10.0.0.2"}
+    bulk = AsyncMock(return_value={"hotkey-a": [moved]})
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+
+    executors = await MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-1")
+
+    assert executors == [moved]
+    assert bulk.await_count == 1
+
+
+async def test_failed_background_refresh_keeps_snapshot_and_next_request_retries(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", AsyncMock(return_value=SNAPSHOT))
+    await MinerPortalAPI.fetch_executors("hotkey-a", None)
+    _expire_snapshot()
+    bulk = AsyncMock(side_effect=RuntimeError("portal is down"))
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+
+    executors = await MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-1")
+    await MinerPortalAPI._background_refresh
+
+    assert executors == [SNAPSHOT["hotkey-a"][0]]
+    assert MinerPortalAPI._snapshot == SNAPSHOT
+    assert "Failed to refresh executor snapshot" in caplog.text
+
+    MinerPortalAPI._last_refresh_attempt_at -= FAILED_REFRESH_RETRY_SECONDS + 1
+    bulk.side_effect = None
+    bulk.return_value = {"hotkey-a": [SNAPSHOT["hotkey-a"][0]]}
+
+    await MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-1")
+    await MinerPortalAPI._background_refresh
+
+    assert bulk.await_count == 2
+    assert MinerPortalAPI._snapshot == {"hotkey-a": [SNAPSHOT["hotkey-a"][0]]}
+
+
+async def test_concurrent_stale_requests_start_one_background_refresh(monkeypatch):
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", AsyncMock(return_value=SNAPSHOT))
+    await MinerPortalAPI.fetch_executors("hotkey-a", None)
+    _expire_snapshot()
+    bulk, release = _portal_blocked_until_released(SNAPSHOT)
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-1"),
+            MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-2"),
+            MinerPortalAPI.fetch_executors("hotkey-b", "bbbb-1"),
+        ),
+        timeout=1,
+    )
+    await asyncio.sleep(0)
+
+    assert [len(executors) for executors in results] == [1, 1, 1]
+    assert bulk.await_count == 1
+    release.set()
+    await MinerPortalAPI._background_refresh
     assert bulk.await_count == 1
 
 
