@@ -2382,11 +2382,11 @@ class MinerService:
     async def _log_ssh_key_removal_after_reply(self, remove_ssh_key: Awaitable[bool], log_extra: dict) -> None:
         # the removal logs its own failure; this line puts it after the reply in the log
         started_ms = now_ms()
-        removed = await remove_ssh_key
+        ssh_key_removed = await remove_ssh_key
         logger.info(
             _m(
                 "Validator SSH key removal after reply finished",
-                extra=get_extra_info({**log_extra, "removed": removed, "duration_ms": now_ms() - started_ms}),
+                extra=get_extra_info({**log_extra, "removed": ssh_key_removed, "duration_ms": now_ms() - started_ms}),
             )
         )
 
