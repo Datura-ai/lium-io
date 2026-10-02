@@ -41,6 +41,8 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
+    LiumdAgentFrame,
+    LiumdRentRequest,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -70,6 +72,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import inflight_creates
+from services.liumd_rent import liumd_agent_frames
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -136,6 +139,14 @@ class ComputeClient:
 
         # initiate handlers
         self.backup_handler = BackupHandler(self)
+        liumd_agent_frames.send_to_backend = self.queue_liumd_request
+
+    def queue_liumd_request(self, request: LiumdRentRequest) -> bool:
+        # a frame for a node's agent; False while the socket is down, so the rent takes today's path at once
+        if self.ws is None:
+            return False
+        self.message_queue.append(request)
+        return True
 
     def accepted_request_type(self) -> type[BaseServerRequest]:
         return BaseServerRequest
@@ -613,6 +624,14 @@ class ComputeClient:
 
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
+        try:
+            agent_frame = LiumdAgentFrame.model_validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            liumd_agent_frames.deliver(agent_frame)
+            return
+
         try:
             response = Response.model_validate_json(raw_msg)
         except pydantic.ValidationError:

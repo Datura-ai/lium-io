@@ -574,12 +574,28 @@ class ProfilerStepName(str, enum.Enum):
     FILLER_PREEMPTION = "Filler preemption"
     BACKEND_PREP = "Backend rent prep"
     BACKEND_FINALIZE = "Backend finalize"
+    # DAH-3980 liumd: a rent the node's agent carried out. `liumd round trip` is the connector's send
+    # to the agent's reply; the other rows are the agent's own steps inside it, two of them in
+    # parallel lanes on the node, so they are never part of a sum of the profile.
+    LIUMD_ROUND_TRIP = "liumd round trip"
+    LIUMD_VALIDATED = "liumd validated"
+    LIUMD_PREEMPT_LISTED = "liumd preempt_listed"
+    LIUMD_FILLERS_REMOVED = "liumd fillers_removed"
+    LIUMD_FILLERS_GONE = "liumd fillers_gone"
+    LIUMD_VOLUME_CREATED = "liumd volume_created"
+    LIUMD_CONTAINER_CREATED = "liumd container_created"
+    LIUMD_GPU_POWER_RESTORED = "liumd gpu_power_restored"
+    LIUMD_STARTED = "liumd started"
+    LIUMD_RUNNING = "liumd running"
+    LIUMD_EXEC_VOLUME_SETUP = "liumd exec_volume_setup"
+    LIUMD_EXEC_ENVIRONMENT = "liumd exec_environment"
 
 
 PARALLEL_PROFILER_STEP_NAMES = frozenset({
     ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
     ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
     ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
+    *(step for step in ProfilerStepName if step.value.startswith("liumd ") and step != ProfilerStepName.LIUMD_ROUND_TRIP),
 })
 
 
@@ -751,6 +767,26 @@ class FailedContainerRequest(ContainerBaseResponse):
     # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
     # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
     step_detail: str | None = None
+
+
+class LiumdRentRequest(DeliveryStamps):
+    """DAH-3980 liumd (staging prototype): connector -> compute-app, a `rent`, `cancel` or `ack` frame
+    compute-app relays unchanged to the agent of `executor_id`. A `rent` frame carries the wrapped
+    volume passphrase: the frame is never logged or put in a repr."""
+
+    message_type: Literal["LiumdRentRequest"] = "LiumdRentRequest"
+    executor_id: str
+    pod_id: str
+    frame: dict = Field(repr=False)
+
+
+class LiumdAgentFrame(BaseModel):
+    """compute-app -> connector: a frame of the node's agent, or the `error` compute-app answers for it."""
+
+    message_type: Literal["LiumdAgentFrame"]
+    executor_id: str
+    pod_id: str | None = None
+    frame: dict
 
 
 class DuplicateExecutorsResponse(BaseModel):

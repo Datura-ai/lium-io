@@ -35,6 +35,7 @@ from payload_models.payloads import (
     CancelStorageOperationRequest,
     RestoreContainerRequest,
     ContainerBaseRequest,
+    ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     AddSshPublicKeyRequest,
@@ -52,6 +53,7 @@ from payload_models.payloads import (
     FailedAddDebugSshKey,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
+    ProfilerStepName,
     WorkloadKind,
     now_ms,
 )
@@ -64,6 +66,7 @@ from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, create_steps_after_reply, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
+from services.liumd_rent import LiumdRentService
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
@@ -265,6 +268,12 @@ class MinerService:
         self.task_service = task_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        self.liumd_rent = LiumdRentService(
+            redis_service=redis_service,
+            docker_service=DockerService(
+                ssh_service=ssh_service, redis_service=redis_service, attestation_service=attestation_service
+            ),
+        )
         # DAH-2958: executor uuid -> CYCLE_LANE | EXPRESS_LANE while its pipeline is running, then
         # CYCLE_DONE until the cycle's publish is recorded. The wave and the express lane run in
         # this one process, so a plain dict is the whole coordination: each lane skips what the
@@ -1412,8 +1421,97 @@ class MinerService:
         with inflight_creates.track(payload.pod_id):
             return await self._route_container(payload)
 
+    async def _start_inspector_after_agent_rent(self, payload: ContainerCreateRequest, container_name: str) -> None:
+        # the steps after the reply of a rent the node's agent made: today's REST key exchange, the
+        # rented-pod cache and the inspector start over SSH, off the rent's path
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        log_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_id": payload.executor_id,
+            "pod_id": payload.pod_id,
+            "container_name": container_name,
+        }
+        base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+        private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+        try:
+            ssh_request = SSHPubKeySubmitRequest(
+                public_key=public_key,
+                validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                executor_id=payload.executor_id,
+                # the miner's rental hook still hears of the rent, after it
+                is_rental_request=True,
+                miner_hotkey=payload.miner_hotkey,
+            )
+            status, response_data = await self._make_rest_request(
+                method="POST",
+                url=f"{base_url}/api/validator/ssh-pubkey-submit",
+                json_data=self._serialize_request(ssh_request),
+                headers={**self._generate_auth_headers(my_key, payload.miner_hotkey), "Content-Type": "application/json"},
+                timeout=REST_CONTAINER_OP_TIMEOUT,
+                log_extra=log_extra,
+                operation_name="SSH key submit",
+            )
+            try:
+                msg = _parse_miner_response(response_data) if status == 200 and response_data else None
+                executor = msg.executors[0] if isinstance(msg, AcceptSSHKeyRequest) and msg.executors else None
+                if executor is None or executor.uuid != payload.executor_id:
+                    logger.error(
+                        _m("No SSH to the node after an agent rent; inspector not started", extra=get_extra_info(log_extra))
+                    )
+                    return
+                docker_service = self.liumd_rent.docker_service
+                await docker_service._cache_rented_pod_best_effort(executor, payload.pod_id, container_name, log_extra)
+                if settings.ENABLE_INSPECTOR:
+                    started_ms = now_ms()
+                    pkey = asyncssh.import_private_key(
+                        self.ssh_service.decrypt_payload(my_key.ss58_address, private_key.decode("utf-8"))
+                    )
+                    known_hosts = await docker_service._prepare_known_hosts_policy(executor, payload.miner_hotkey, log_extra)
+                    async with asyncssh.connect(
+                        host=executor.address,
+                        port=executor.ssh_port,
+                        username=executor.ssh_username,
+                        client_keys=[pkey],
+                        known_hosts=known_hosts,
+                    ) as ssh_client:
+                        # logs its own failure as "Inspector collector start failed"
+                        await docker_service._run_inspector_collector_lifecycle(ssh_client, executor, "start", log_extra)
+                    logger.info(
+                        _m(
+                            "Create step after reply finished",
+                            extra=get_extra_info({
+                                **log_extra,
+                                "step": ProfilerStepName.INSPECTOR_START.value,
+                                "duration_ms": now_ms() - started_ms,
+                            }),
+                        )
+                    )
+            finally:
+                await self._remove_ssh_key_via_rest(
+                    base_url=base_url,
+                    my_key=my_key,
+                    public_key=public_key,
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    log_extra=log_extra,
+                )
+        except Exception as exc:
+            logger.error(
+                _m("Create steps after reply failed", extra=get_extra_info({**log_extra, "error": str(exc)})),
+                exc_info=True,
+            )
+
     async def _route_container(self, payload: ContainerBaseRequest):
         """Route a container request - uses REST API if configured, otherwise WebSocket."""
+        if isinstance(payload, ContainerCreateRequest):
+            # DAH-3980 liumd: a rent the node's agent can take goes to it, before the miner key exchange
+            agent_reply = await self.liumd_rent.rent_through_agent(payload)
+            if isinstance(agent_reply, ContainerCreated):
+                create_steps_after_reply.start(
+                    payload.pod_id, self._start_inspector_after_agent_rent(payload, agent_reply.container_name)
+                )
+            if agent_reply is not None:
+                return agent_reply
         if settings.USE_REST_API:
             logger.info(
                 _m(
