@@ -69,7 +69,7 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
-from services.docker_service import inflight_creates
+from services.docker_service import create_steps_after_reply, inflight_creates
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -127,6 +127,8 @@ class ComputeClient:
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
         self.message_queue = OutgoingMessages()
+        # DAH-3980: a create's message after its reply (Jupyter answers) leaves through this queue too
+        create_steps_after_reply.send_to_compute_app = self.message_queue.append
         self.lock = asyncio.Lock()
 
         self.logging_extra = {

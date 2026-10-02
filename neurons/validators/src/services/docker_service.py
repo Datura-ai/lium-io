@@ -37,6 +37,7 @@ from payload_models.payloads import (
     BootstrapRestoreSpec,
     CacheVolume,
     ContainerBaseRequest,
+    ContainerBaseResponse,
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleted,
@@ -214,6 +215,9 @@ FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
 IMAGE_JUPYTER_DOCKER_PORT = 8888
+# DAH-3980: how long after the create's reply the image's Jupyter gets to answer before it is reported
+# failed (it answers ~1.3–5 s after the container starts); polled on the host every 0.1 s.
+IMAGE_JUPYTER_READY_TIMEOUT_SECONDS = 60
 
 DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
@@ -1162,21 +1166,29 @@ inflight_creates = _InflightCreateRegistry()
 class _CreateStepsAfterReplyRegistry:
     """Create steps the backend's reply does not wait for, by pod.
 
-    DAH-3980: the inspector start, the create's session close and the validator key removal run
-    after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
-    them first: an inspector start landing after the delete's stop would leave the collector running.
-    Each step logs its own failure.
+    DAH-3980: the inspector start, the create's session close, the validator key removal and the
+    wait for the image's Jupyter run after the reply. Held here so the tasks are not collected, and
+    so a delete of the pod waits for them first: an inspector start landing after the delete's stop
+    would leave the collector running. A step started with `delete_cancels` is cancelled by the
+    delete at once instead. Each step logs its own failure.
     """
 
     def __init__(self) -> None:
         self._tasks_by_pod_id: dict[str, set[asyncio.Task]] = {}
+        self._tasks_a_delete_cancels: set[asyncio.Task] = set()
+        # where a step's message to the backend goes: ComputeClient wires its outgoing queue here
+        self.send_to_compute_app: Callable[[ContainerBaseResponse], None] | None = None
 
-    def start(self, pod_id: str, steps: Awaitable[None]) -> None:
+    def start(self, pod_id: str, steps: Awaitable[None], *, delete_cancels: bool = False) -> asyncio.Task:
         task = asyncio.ensure_future(steps)
         self._tasks_by_pod_id.setdefault(pod_id, set()).add(task)
+        if delete_cancels:
+            self._tasks_a_delete_cancels.add(task)
         task.add_done_callback(lambda done: self._forget(pod_id, done))
+        return task
 
     def _forget(self, pod_id: str, task: asyncio.Task) -> None:
+        self._tasks_a_delete_cancels.discard(task)
         tasks = self._tasks_by_pod_id.get(pod_id, set())
         tasks.discard(task)
         if not tasks:
@@ -1187,6 +1199,8 @@ class _CreateStepsAfterReplyRegistry:
         tasks = set(self._tasks_by_pod_id.get(pod_id, ()))
         if not tasks:
             return True
+        for task in tasks & self._tasks_a_delete_cancels:
+            task.cancel()
         _, pending = await asyncio.wait(tasks, timeout=timeout)
         for task in pending:
             task.cancel()
@@ -5943,10 +5957,24 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         executor_info: ExecutorSSHInfo,
         log_extra: dict,
+        jupyter_installed: JupyterServerInstalled | None = None,
+        jupyter_host_port: int | None = None,
     ) -> None:
         # the create's steps a renter's first login does not need; closes the create's sessions
         try:
             async with connections:
+                jupyter_wait = None
+                if jupyter_installed:
+                    jupyter_wait = create_steps_after_reply.start(
+                        jupyter_installed.pod_id,
+                        self._report_image_jupyter_when_it_answers(
+                            ssh_client,
+                            jupyter_installed=jupyter_installed,
+                            jupyter_host_port=jupyter_host_port,
+                            log_extra=log_extra,
+                        ),
+                        delete_cancels=True,
+                    )
                 if settings.ENABLE_INSPECTOR:
                     started_ms = now_ms()
                     # logs its own failure as "Inspector collector start failed"
@@ -5966,6 +5994,9 @@ class DockerService:
                             }),
                         )
                     )
+                if jupyter_wait:
+                    # not `await jupyter_wait`: a delete cancels the wait, and the sessions still close here
+                    await asyncio.wait([jupyter_wait])
         except Exception as exc:
             logger.error(
                 _m(
@@ -5974,6 +6005,60 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+
+    async def _report_image_jupyter_when_it_answers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        jupyter_installed: JupyterServerInstalled,
+        jupyter_host_port: int,
+        log_extra: dict,
+    ) -> None:
+        # the image's own Jupyter on the pod's published port: its URL goes to the backend once it answers
+        # `/api` answers 200 without a token (jupyter_server's version), so the token stays off the host
+        probe = f"until curl -fs -m 1 -o /dev/null http://127.0.0.1:{jupyter_host_port}/api; do sleep 0.1; done"
+        command = f"timeout {IMAGE_JUPYTER_READY_TIMEOUT_SECONDS} sh -c {shlex.quote(probe)}"
+        started_ms = now_ms()
+        try:
+            result = await ssh_client.run(command, timeout=IMAGE_JUPYTER_READY_TIMEOUT_SECONDS + 10)
+            if result.exit_status != 0:
+                # 124: timeout's own exit, Jupyter never answered
+                raise RuntimeError(f"exit_status={result.exit_status} stderr={result.stderr}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Image Jupyter did not answer",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "command": command,
+                        "jupyter_ready_ms": now_ms() - started_ms,
+                        "error": str(exc),
+                    }),
+                ),
+            )
+            create_steps_after_reply.send_to_compute_app(
+                JupyterInstallationFailed(
+                    miner_hotkey=jupyter_installed.miner_hotkey,
+                    executor_id=jupyter_installed.executor_id,
+                    pod_id=jupyter_installed.pod_id,
+                    workload_kind=jupyter_installed.workload_kind,
+                    msg=f"Jupyter did not answer on its port within {IMAGE_JUPYTER_READY_TIMEOUT_SECONDS} s",
+                )
+            )
+            return
+        logger.info(
+            _m(
+                "Image Jupyter answers",
+                extra=get_extra_info({
+                    **log_extra,
+                    "jupyter_host_port": jupyter_host_port,
+                    "jupyter_ready_ms": now_ms() - started_ms,
+                }),
+            ),
+        )
+        create_steps_after_reply.send_to_compute_app(jupyter_installed)
 
     async def create_container(
         self,
@@ -7339,14 +7424,22 @@ class DockerService:
                         )
 
                     jupyter_url = None
+                    jupyter_installed_when_it_answers = None
                     if payload.enable_jupyter and jupyter_port_map:
                         current_step = "jupyter_setup"
                         if image_managed_jupyter:
                             # DAH-2265: the image's start.sh already launched Jupyter from
                             # the JUPYTER_PASSWORD forwarded at `docker run` above, and
-                            # serves it as that token. Don't run run_jupyter; just build
-                            # the URL from the same token.
-                            jupyter_token = image_jupyter_token
+                            # serves it as that token. Don't run run_jupyter.
+                            # DAH-3980: the reply goes without the URL; it follows in
+                            # JupyterServerInstalled once Jupyter answers, after the reply.
+                            jupyter_installed_when_it_answers = JupyterServerInstalled(
+                                miner_hotkey=payload.miner_hotkey,
+                                executor_id=payload.executor_id,
+                                pod_id=payload.pod_id,
+                                workload_kind=payload.workload_kind,
+                                jupyter_url=f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={image_jupyter_token}",
+                            )
                         else:
                             jupyter_token = secrets.token_hex(16)
                             await self.run_jupyter(
@@ -7360,7 +7453,7 @@ class DockerService:
                                 local_volume_path=local_volume_path,
                                 encrypted_local_volume=use_encrypted_volume,
                             )
-                        jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
+                            jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation (covers key
                     # injection + bootstrap + jupyter since the running check)
@@ -7508,6 +7601,8 @@ class DockerService:
                         ssh_client=ssh_client,
                         executor_info=executor_info,
                         log_extra={**default_extra, "container_name": container_name},
+                        jupyter_installed=jupyter_installed_when_it_answers,
+                        jupyter_host_port=jupyter_port_map[1] if jupyter_port_map else None,
                     ),
                 )
                 return container_created_reply

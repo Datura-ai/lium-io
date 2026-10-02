@@ -18,6 +18,7 @@ Covers (from the plan's Test Plan):
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -30,6 +31,8 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     CustomOptions,
     FailedContainerRequest,
+    JupyterInstallationFailed,
+    JupyterServerInstalled,
     PayloadPortMapping,
     ProfilerStep,
     ProfilerStepName,
@@ -533,8 +536,92 @@ async def test_ships_sshd_true_forwards_jupyter_password_instead_of_run_jupyter(
     token = env.get("JUPYTER_PASSWORD")
     assert token
 
-    # The returned URL uses the same token the image will serve Jupyter as.
-    assert result.jupyter_url == f"http://127.0.0.1:30888/lab?token={token}"
+    # DAH-3980: the reply goes without the URL; it follows once Jupyter answers.
+    assert result.jupyter_url is None
+
+
+@pytest.fixture
+def sent_to_compute_app(monkeypatch):
+    sent = []
+    monkeypatch.setattr(ds_module.create_steps_after_reply, "send_to_compute_app", sent.append)
+    return sent
+
+
+def _image_jupyter_create(svc, monkeypatch, *, jupyter_probe):
+    """An image-managed Jupyter create whose host probe for Jupyter runs `jupyter_probe(command)`."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(
+        svc, "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
+    )
+
+    async def _run_on_host(command, *args, **kwargs):
+        if "/api" in command:
+            return await jupyter_probe(command)
+        return _ssh_result(exit_status=0)
+
+    ssh_client.run = AsyncMock(side_effect=_run_on_host)
+    return ssh_client, _payload(ships_sshd=True, enable_jupyter=True)
+
+
+@pytest.mark.asyncio
+async def test_image_jupyter_url_follows_the_reply_once_jupyter_answers(svc, monkeypatch, sent_to_compute_app):
+    """DAH-3980: the reply carries no URL; JupyterServerInstalled brings it after the host probe succeeds."""
+    async def jupyter_answers(command):
+        return _ssh_result(exit_status=0)
+
+    ssh_client, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_answers)
+
+    result = await _run(svc, payload)
+    await ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+
+    token = _created_run_spec(svc).environment["JUPYTER_PASSWORD"]
+    assert result.jupyter_url is None
+    assert len(sent_to_compute_app) == 1
+    installed = sent_to_compute_app[0]
+    assert isinstance(installed, JupyterServerInstalled)
+    assert (installed.pod_id, installed.executor_id) == (payload.pod_id, payload.executor_id)
+    assert installed.jupyter_url == f"http://127.0.0.1:30888/lab?token={token}"
+    probe = next(command for command in _ssh_run_cmds(ssh_client) if "/api" in command)
+    assert "http://127.0.0.1:30888/api" in probe
+    assert token not in probe
+
+
+@pytest.mark.asyncio
+async def test_image_jupyter_that_never_answers_is_reported_failed(svc, monkeypatch, sent_to_compute_app):
+    async def jupyter_times_out(command):
+        return _ssh_result(exit_status=124)
+
+    _, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_times_out)
+
+    result = await _run(svc, payload)
+    await ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+
+    assert result.jupyter_url is None
+    assert len(sent_to_compute_app) == 1
+    failed = sent_to_compute_app[0]
+    assert isinstance(failed, JupyterInstallationFailed)
+    assert failed.pod_id == payload.pod_id
+
+
+@pytest.mark.asyncio
+async def test_a_delete_stops_the_image_jupyter_wait_without_a_message(svc, monkeypatch, sent_to_compute_app):
+    probe_started = asyncio.Event()
+
+    async def jupyter_never_answers(command):
+        probe_started.set()
+        await asyncio.Event().wait()
+
+    _, payload = _image_jupyter_create(svc, monkeypatch, jupyter_probe=jupyter_never_answers)
+    await _run(svc, payload)
+    await asyncio.wait_for(probe_started.wait(), timeout=5)
+
+    # what delete_container does first, with its own timeout
+    steps_done = await ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, timeout=5)
+
+    assert steps_done is True
+    assert sent_to_compute_app == []
 
 
 @pytest.mark.asyncio
@@ -559,7 +646,7 @@ async def test_image_managed_jupyter_falls_back_when_docker_port_is_not_8888(svc
 
 
 @pytest.mark.asyncio
-async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
+async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch, sent_to_compute_app):
     """Regression guard: the default path (ships_sshd None) still runs the
     validator's run_jupyter and does NOT forward JUPYTER_PASSWORD."""
     ssh_client = _ssh_client(inspect_exit=0)
@@ -569,12 +656,18 @@ async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
         AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
     )
 
-    result = await _run(svc, _payload(enable_jupyter=True))
+    payload = _payload(enable_jupyter=True)
+
+    result = await _run(svc, payload)
+    await ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
 
     assert isinstance(result, ContainerCreated)
     svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
     svc.run_jupyter.assert_awaited_once()
     assert "JUPYTER_PASSWORD" not in _created_run_spec(svc).environment
+    # the slow path still waits for run_jupyter and replies with the URL; nothing follows the reply
+    assert result.jupyter_url.startswith("http://127.0.0.1:30888/lab?token=")
+    assert sent_to_compute_app == []
 
 
 @pytest.mark.asyncio
