@@ -186,9 +186,7 @@ class VerifyXCheck:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
             cloudflare_fallback = bool(verifyx_network.get("cloudflare_fallback"))
-            upload_blocked = cloudflare_fallback or bool(
-                verifyx_network.get("cloudflare_upload_fallback")
-            )
+            upload_blocked = bool(verifyx_network.get("cloudflare_upload_fallback"))
             unavailable_readings: list[str] = []
             ema_download = _feed_ema(
                 ctx,
@@ -392,10 +390,11 @@ def _feed_ema(
 
 
 def _fallback_upload_reading(reading: object, upload_blocked: bool) -> object:
-    """The upload reading `_feed_ema` gets. When Cloudflare failed the upload (a full fallback, or
-    `cloudflare_upload_fallback` with the download measured), the 0.0 (or missing value) the probe
-    reports is no measurement: None, and the previous upload EMA stands. Otherwise a 0.0 is a
-    host-caused failure and still lowers the EMA; a positive upload is always a measurement."""
+    """The upload reading `_feed_ema` gets. When Cloudflare failed the upload, or failed the
+    download so the upload never ran (`cloudflare_upload_fallback`: a 429 or a transport error),
+    the 0.0 (or missing value) the probe reports is no measurement: None, and the previous upload
+    EMA stands. Otherwise a 0.0, a direction timeout included, still lowers the EMA; a positive
+    upload is always a measurement."""
     if upload_blocked and not _is_positive_number(reading):
         return None
     return reading

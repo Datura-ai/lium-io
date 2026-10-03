@@ -36,17 +36,23 @@ LIB_PATH = "/usr/lib/libverifyx.so"
 # Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
 # a host that failed the probe for its own reason can mention that URL.
 _CLOUDFLARE_PROBE_FAIL_RX = re.compile(
-    r"429|timeout|timed out|outage|connection refused|rate.?limit",
+    r"429|timeout|timed out|outage|connection refused|rate.?limit"
+    r"|\bDownload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b",
     re.I,
 )
-# The upload faults Cloudflare causes, in the verifier's own words (celium-gpu-verifier network.rs
-# validate_speedtest_response / upload_sample). The upload runs only after the download from the
-# same host was measured, so a transport error there is not the host's egress; reqwest 0.12 prints
-# no cause, so refused, reset, TLS and DNS read alike. "Cloudflare up speedtest timeout" is left
-# out on purpose: an upload under ~30 Mbps cannot move its 450 MB in 120 s and ends the same way.
+# The faults Cloudflare causes on one direction, in the verifier's own words (celium-gpu-verifier
+# network.rs validate_speedtest_response / upload_sample / download_sample): its 429 and the reqwest
+# transport error. reqwest 0.12 prints no cause, so refused, reset, TLS and DNS read alike, and the
+# host's own link reads the same; such an error is taken as Cloudflare's. "Cloudflare up/down
+# speedtest timeout" is left out on purpose: a direction under ~30 Mbps cannot move its 450 MB in
+# 120 s and ends the same way.
 _CLOUDFLARE_UPLOAD_FAULT_RX = re.compile(
     r"\bCloudflare upload request failed for \S+ with HTTP 429\b"
     r"|\bUpload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b"
+)
+_CLOUDFLARE_DOWNLOAD_FAULT_RX = re.compile(
+    r"\bCloudflare download request failed for \S+ with HTTP 429\b"
+    r"|\bDownload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b"
 )
 
 
@@ -736,15 +742,17 @@ def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
     return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
 
 
-def _cloudflare_upload_mark(network_execution: dict) -> dict:
-    """`{"cloudflare_upload_fallback": True}` when Cloudflare itself failed the upload (a 429 or a
-    transport error): the probe then reports the measured download and an upload of 0.0, which is
-    no measurement of the host. Empty otherwise, a direction timeout included, so a slow upload
-    still lowers the EMA."""
+def _cloudflare_upload_mark(network_execution: dict, *, download_fallback: bool = False) -> dict:
+    """`{"cloudflare_upload_fallback": True}` when the upload of 0.0 the probe reports is no
+    measurement of the host: Cloudflare itself (a 429 or a transport error) failed the upload after
+    a measured download, or, on a package fallback (`download_fallback`), failed the download, so
+    the verifier never ran the upload. Empty otherwise, a direction timeout included, so a slow
+    host still lowers its upload EMA."""
     upload = (network_execution.get("speedtest") or {}).get("upload_mbps")
     if _is_positive_number(upload):
         return {}
-    if _CLOUDFLARE_UPLOAD_FAULT_RX.search(str(network_execution.get("error") or "")):
+    fault_rx = _CLOUDFLARE_DOWNLOAD_FAULT_RX if download_fallback else _CLOUDFLARE_UPLOAD_FAULT_RX
+    if fault_rx.search(str(network_execution.get("error") or "")):
         return {"cloudflare_upload_fallback": True}
     return {}
 
@@ -779,6 +787,7 @@ def _package_fallback_stats(
         "success": success,
         "cloudflare_fallback": True,
         "execution_time_ms": network_execution.get("execution_time_ms"),
+        **_cloudflare_upload_mark(network_execution, download_fallback=True),
     }
     return stats, errors
 
