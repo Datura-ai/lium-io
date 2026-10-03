@@ -36,8 +36,17 @@ LIB_PATH = "/usr/lib/libverifyx.so"
 # Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
 # a host that failed the probe for its own reason can mention that URL.
 _CLOUDFLARE_PROBE_FAIL_RX = re.compile(
-    r"429|timeout|timed out|outage|connection refused|rate.?limit",
+    r"429|timeout|timed out|outage|connection refused|rate.?limit"
+    r"|\bDownload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b",
     re.I,
+)
+# Cloudflare's own 429 on either direction, in the verifier's words (celium-gpu-verifier network.rs
+# validate_speedtest_response). A download 429 means the verifier skipped the upload; an upload 429
+# came after a measured download. The reqwest transport error is left out on purpose: it prints no
+# cause, so a host can produce it by blocking speed.cloudflare.com and keep an old upload EMA
+# forever. A direction timeout is left out too: a link under ~30 Mbps ends the same way.
+_CLOUDFLARE_RATE_LIMIT_RX = re.compile(
+    r"\bCloudflare (?:upload|download) request failed for \S+ with HTTP 429\b"
 )
 
 
@@ -727,6 +736,19 @@ def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
     return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
 
 
+def _cloudflare_upload_mark(network_execution: dict) -> dict:
+    """`{"cloudflare_upload_fallback": True}` when the upload of 0.0 the probe reports is no
+    measurement of the host: Cloudflare answered 429 on the upload, or on the download so the
+    verifier never ran the upload. Empty otherwise, a transport error or a direction timeout
+    included, so a host cannot keep its upload EMA by failing the probe itself."""
+    upload = (network_execution.get("speedtest") or {}).get("upload_mbps")
+    if _is_positive_number(upload):
+        return {}
+    if _CLOUDFLARE_RATE_LIMIT_RX.search(str(network_execution.get("error") or "")):
+        return {"cloudflare_upload_fallback": True}
+    return {}
+
+
 def _package_fallback_stats(
     network_execution: dict,
     *,
@@ -757,6 +779,7 @@ def _package_fallback_stats(
         "success": success,
         "cloudflare_fallback": True,
         "execution_time_ms": network_execution.get("execution_time_ms"),
+        **_cloudflare_upload_mark(network_execution),
     }
     return stats, errors
 
@@ -797,6 +820,7 @@ def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> 
             "success": False,
             "capacity_download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
             "execution_time_ms": network_execution.get("execution_time_ms"),
+            **_cloudflare_upload_mark(network_execution),
         }
         return stats, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
 
@@ -844,7 +868,7 @@ def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> 
                 errors=errors,
             )
         errors.append("Network performance data unavailable")
-        return {**stats, "success": False}, errors
+        return {**stats, "success": False, **_cloudflare_upload_mark(network_execution)}, errors
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
