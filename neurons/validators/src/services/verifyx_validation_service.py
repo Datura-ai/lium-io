@@ -988,7 +988,6 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
         f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
         f"success={network.get('success')} "
         f"cloudflare_fallback={network.get('cloudflare_fallback', False)} "
-        f"cloudflare_upload_fallback={network.get('cloudflare_upload_fallback', False)} "
         f"exec={exec_id}"
     )
     logger.info(
