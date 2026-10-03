@@ -767,6 +767,7 @@ class CollateralClient:
             tx_hash, receipt = await self._broadcast_again(record)
             if receipt["status"] != 1:
                 self._report_settled(chain_id, tx_hash, receipt, replaced=same_hash(tx_hash, signed_hash))
+            self._raise_if_started_request_missing(record["raw"], tx_hash, receipt)
             message = self._settled_message(tx_hash, receipt, replaced=same_hash(tx_hash, signed_hash))
             self._clear_after_logging(chain_id, record["hash"], message)
             return message

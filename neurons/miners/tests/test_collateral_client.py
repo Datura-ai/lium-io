@@ -1759,3 +1759,19 @@ async def test_a_mined_reclaim_whose_receipt_lacks_its_event_keeps_the_record_un
         await client.settle_earlier_send()
     assert client._read_sent_record(CHAIN_ID) is None
     assert len(provider.sent) == 1
+
+
+async def test_a_replaced_reclaim_whose_receipt_lacks_its_event_keeps_the_record(monkeypatch):
+    """Review of 36db3d6: the replacement success path cleared the record without the request ID."""
+    provider = FakeProvider(logs=[])
+    provider.mine_sent = False
+    client = client_with(provider)
+    monkeypatch.setattr(client.w3.eth, "wait_for_transaction_receipt", lost_receipt)
+    with pytest.raises(CollateralOutcomeUnknownError):
+        await client.reclaim_collateral(EXECUTOR)
+
+    provider.gas_price = GAS_PRICE + 1
+    provider.mine_sent = True
+    with pytest.raises(CollateralOutcomeUnknownError, match="no ReclaimProcessStarted event"):
+        await client.replace_earlier_send()
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider, -1)
