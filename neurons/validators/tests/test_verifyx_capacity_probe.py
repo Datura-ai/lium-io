@@ -346,6 +346,68 @@ async def test_a_measured_zero_upload_outside_a_fallback_still_lowers_the_upload
     assert net["ema_verifyx_upload_speed"] == pytest.approx(950.0)
 
 
+def _upload_only_failure_payload(error: str) -> dict:
+    """`execute_speedtest_fn` (network.rs) when only the upload failed: the download was measured,
+    the upload reads 0.0 and the probe's error names the upload."""
+    payload = _probe_payload(upload_mbps=0.0)
+    payload["success"] = False
+    payload["error"] = error
+    return payload
+
+
+UPLOAD_ONLY_CLOUDFLARE_ERRORS = [
+    "Cloudflare up speedtest timeout after 120 seconds",
+    "Download failed with status 404 for tensorflow. Cloudflare up request failed for "
+    "https://speed.cloudflare.com/__up with HTTP 429 Too Many Requests",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", UPLOAD_ONLY_CLOUDFLARE_ERRORS)
+async def test_cloudflare_failing_only_the_upload_keeps_the_upload_ema(context_factory, error):
+    """The download was measured, so this is no full fallback, but Cloudflare (429 or timeout)
+    failed the upload: the upload EMA stays at 1900 instead of halving to 950, no raw upload is
+    written, and the download EMA is fed the measured capacity."""
+    verification = _judge(_upload_only_failure_payload(error))
+    assert verification["network"].get("cloudflare_fallback") is not True
+    assert verification["network"]["cloudflare_upload_fallback"] is True
+    assert verification["network"]["download_speed"] == HOST_CAPACITY_MBPS
+
+    result = await _run_check(
+        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
+    )
+
+    net = result.updates["state"].specs["network"]
+    assert net["ema_verifyx_upload_speed"] == HOST_UPLOAD_MBPS
+    assert "verifyx_upload_speed" not in net
+    assert net["verifyx_download_speed"] == HOST_CAPACITY_MBPS
+    assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        "Cloudflare up request failed for https://speed.cloudflare.com/__up with HTTP 403 Forbidden",
+        "Cloudflare down speedtest timeout after 120 seconds",
+        "",
+    ],
+)
+async def test_a_host_caused_failed_upload_still_lowers_the_upload_ema(context_factory, error):
+    """A failed upload whose error is not a Cloudflare fault on the upload (a 403, a fault that
+    names only the download, no error at all) is a real 0 Mbps upload: 1900 → 950."""
+    verification = _judge(_upload_only_failure_payload(error))
+    assert "cloudflare_upload_fallback" not in verification["network"]
+
+    result = await _run_check(
+        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
+    )
+
+    net = result.updates["state"].specs["network"]
+    assert net["verifyx_upload_speed"] == 0.0
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(950.0)
+
+
 @pytest.mark.asyncio
 async def test_cloudflare_unreachable_still_passes_when_the_network_flag_is_on(
     context_factory,

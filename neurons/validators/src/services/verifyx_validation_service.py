@@ -39,6 +39,9 @@ _CLOUDFLARE_PROBE_FAIL_RX = re.compile(
     r"429|timeout|timed out|outage|connection refused|rate.?limit",
     re.I,
 )
+# The verifier names the failed direction ("Cloudflare up ...", network.rs) after any package
+# error, so the upload's own fault is the text from that name on.
+_CLOUDFLARE_UPLOAD_ERROR_RX = re.compile(r"\bcloudflare up(?:load)?\b(.*)", re.I | re.S)
 
 
 class VerifyXFailureClass(str, Enum):
@@ -727,6 +730,19 @@ def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
     return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
 
 
+def _cloudflare_upload_mark(network_execution: dict) -> dict:
+    """`{"cloudflare_upload_fallback": True}` when Cloudflare itself failed the upload (429,
+    timeout, ...), whatever the download did: the probe then reports the measured download and an
+    upload of 0.0, which is no measurement of the host. Empty otherwise."""
+    upload = (network_execution.get("speedtest") or {}).get("upload_mbps")
+    if _is_positive_number(upload):
+        return {}
+    match = _CLOUDFLARE_UPLOAD_ERROR_RX.search(str(network_execution.get("error") or ""))
+    if match and _CLOUDFLARE_PROBE_FAIL_RX.search(match.group(1)):
+        return {"cloudflare_upload_fallback": True}
+    return {}
+
+
 def _package_fallback_stats(
     network_execution: dict,
     *,
@@ -797,6 +813,7 @@ def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> 
             "success": False,
             "capacity_download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
             "execution_time_ms": network_execution.get("execution_time_ms"),
+            **_cloudflare_upload_mark(network_execution),
         }
         return stats, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
 
@@ -844,7 +861,7 @@ def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> 
                 errors=errors,
             )
         errors.append("Network performance data unavailable")
-        return {**stats, "success": False}, errors
+        return {**stats, "success": False, **_cloudflare_upload_mark(network_execution)}, errors
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
@@ -971,6 +988,7 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
         f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
         f"success={network.get('success')} "
         f"cloudflare_fallback={network.get('cloudflare_fallback', False)} "
+        f"cloudflare_upload_fallback={network.get('cloudflare_upload_fallback', False)} "
         f"exec={exec_id}"
     )
     logger.info(

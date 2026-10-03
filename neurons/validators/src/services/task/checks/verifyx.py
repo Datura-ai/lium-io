@@ -180,14 +180,15 @@ class VerifyXCheck:
                 }
             )
 
-            # Always compute verifyx network EMA. A Cloudflare probe failure that fell back to
-            # the package download feeds that number, never 0, and leaves no upload reading, so the
-            # previous upload EMA stands. A malformed reading never reaches compute_ema: the
-            # previous EMA stands.
+            # Each direction keeps its previous EMA when Cloudflare, not the host, failed it (see
+            # _fallback_upload_reading); a download fallback feeds the package reading, never 0.
             if "network" not in updated_specs:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
             cloudflare_fallback = bool(verifyx_network.get("cloudflare_fallback"))
+            upload_blocked = cloudflare_fallback or bool(
+                verifyx_network.get("cloudflare_upload_fallback")
+            )
             unavailable_readings: list[str] = []
             ema_download = _feed_ema(
                 ctx,
@@ -202,10 +203,10 @@ class VerifyXCheck:
                 ctx,
                 updated_specs["network"],
                 "upload",
-                _fallback_upload_reading(verifyx_network.get("upload_speed"), cloudflare_fallback),
+                _fallback_upload_reading(verifyx_network.get("upload_speed"), upload_blocked),
                 prev_ema.ema_verifyx_upload_speed if prev_ema else None,
                 unavailable_readings,
-                keep_previous_on_none=cloudflare_fallback,
+                keep_previous_on_none=upload_blocked,
             )
 
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
@@ -246,7 +247,7 @@ class VerifyXCheck:
                 NETWORK_GATE_TALLY.record(
                     ema_download,
                     MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
-                    fallback=bool(verifyx_network.get("cloudflare_fallback")),
+                    fallback=cloudflare_fallback,
                 )
 
             updated_state = replace(ctx.state, specs=updated_specs)
@@ -390,12 +391,12 @@ def _feed_ema(
     return ema
 
 
-def _fallback_upload_reading(reading: object, cloudflare_fallback: bool) -> object:
-    """The upload reading `_feed_ema` gets. The upload test goes to Cloudflare too, so on a
-    Cloudflare fallback the 0.0 (or missing value) the probe reports is no measurement: None,
-    and the previous upload EMA stands. Outside a fallback a 0.0 is a host-caused failure and
-    still lowers the EMA; a positive upload reading under a fallback is still a measurement."""
-    if cloudflare_fallback and not _is_positive_number(reading):
+def _fallback_upload_reading(reading: object, upload_blocked: bool) -> object:
+    """The upload reading `_feed_ema` gets. When Cloudflare failed the upload (a full fallback, or
+    `cloudflare_upload_fallback` with the download measured), the 0.0 (or missing value) the probe
+    reports is no measurement: None, and the previous upload EMA stands. Otherwise a 0.0 is a
+    host-caused failure and still lowers the EMA; a positive upload is always a measurement."""
+    if upload_blocked and not _is_positive_number(reading):
         return None
     return reading
 
