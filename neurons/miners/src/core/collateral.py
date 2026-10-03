@@ -377,6 +377,11 @@ class CollateralClient:
         imported than the head itself (`_storage_at_block_hash` fails on one that has not)."""
         return (await self.w3.eth.get_block("latest"))["parentHash"]
 
+    async def head_block_hashes(self):
+        """(head hash, its parent's hash), both from one head response, so the two name a block and its child."""
+        head = await self.w3.eth.get_block("latest")
+        return head["hash"], head["parentHash"]
+
     async def _pinned_chain_id(self) -> int:
         if self.miner_account is None:
             raise CollateralTransactionError(

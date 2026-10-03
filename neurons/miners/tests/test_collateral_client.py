@@ -1246,7 +1246,7 @@ async def test_a_read_pinned_to_the_head_needs_no_child():
     assert await client.get_executor_collateral(EXECUTOR, block_hash=head) == Decimal("0.01")
 
 
-async def test_remove_executor_reads_at_the_head_parent(monkeypatch):
+async def test_remove_executor_reads_at_the_head_and_its_parent(monkeypatch):
     from core import utils
 
     provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
@@ -1256,7 +1256,7 @@ async def test_remove_executor_reads_at_the_head_parent(monkeypatch):
     monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
 
     assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
-    assert {at for _, at in storage_reads(provider)} == {provider.substrate_hash(4999)}
+    assert {at for _, at in storage_reads(provider)} == {provider.substrate_hash(4999), provider.substrate_hash(5000)}
 
     provider.calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
     assert await utils.versions_holding_collateral(EXECUTOR) == []

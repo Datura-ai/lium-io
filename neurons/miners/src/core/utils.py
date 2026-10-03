@@ -117,21 +117,23 @@ def get_collateral_contract(
 async def versions_holding_collateral(executor_uuid: str) -> list[str]:
     """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor.
 
-    Every contract is read twice: at one block named by its hash (`_storage_at_block_hash`: the contract's
-    storage at the Substrate block that built it, so a backend without that block fails the read instead of
-    answering from another state), and at `latest`. The pinned block is the head's parent. A version counts when
-    either read sees collateral, so the answer errs towards "still held": reads at `latest` alone, one after
-    another, can straddle a deposit landing on one contract and a reclaim finalizing on the other and report
+    Every contract is read three times: at the head and at its parent, both named by hash and taken from one head
+    response (`_storage_at_block_hash`: the contract's storage at the Substrate block that built it, so a backend
+    without that block fails the read instead of answering from another state), and at `latest`. Both pinned reads
+    must succeed: a deposit in the head is seen there even when `latest` reaches a backend still at the parent.
+    A version counts when any read sees collateral, so the answer errs towards "still held": reads at `latest`
+    alone, one after another, can straddle a deposit landing on one contract and a reclaim finalizing on the other and report
     neither, and removing the executor then drops the record of collateral that is still held. Near the head, not
     finalized: a deposit that is mined but not yet final must still count, and the `latest` read sees one mined in
     the head block itself."""
-    block_hash = await get_collateral_contract().head_parent_hash()
+    head_hash, parent_hash = await get_collateral_contract().head_block_hashes()
     versions = []
     for version in settings.CONTRACT_VERSIONS:
         contract = get_collateral_contract(version=version)
-        pinned = await contract.get_executor_collateral(executor_uuid, block_hash=block_hash)
+        at_parent = await contract.get_executor_collateral(executor_uuid, block_hash=parent_hash)
+        at_head = await contract.get_executor_collateral(executor_uuid, block_hash=head_hash)
         latest = await contract.get_executor_collateral(executor_uuid)
-        if pinned > 0 or latest > 0:
+        if at_parent > 0 or at_head > 0 or latest > 0:
             versions.append(version)
     return versions
 

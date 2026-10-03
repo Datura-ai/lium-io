@@ -19,6 +19,7 @@ EXECUTOR = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
 MINER_KEY = "0x" + "11" * 32
 FINALIZED_HASH = "0x" + "f1" * 32
 LATEST_HASH = "0x" + "1a" * 32
+HEAD_HASH = "0x" + "2b" * 32
 
 
 def test_h160_to_ss58_maps_an_evm_address_to_its_mirror_account():
@@ -90,6 +91,9 @@ def chain(monkeypatch):
     async def head_parent_hash(self):
         return state.latest_hash
 
+    async def head_block_hashes(self):
+        return HEAD_HASH, state.latest_hash
+
     async def get_reclaim_request(self, reclaim_request_id, block_hash=None):
         state.reads.append(self.contract_address)
         state.reclaim_blocks.append(block_hash)
@@ -106,6 +110,7 @@ def chain(monkeypatch):
     monkeypatch.setattr(CollateralClient, "get_reclaim_request", get_reclaim_request)
     monkeypatch.setattr(CollateralClient, "finalized_block_hash", finalized_block_hash)
     monkeypatch.setattr(CollateralClient, "head_parent_hash", head_parent_hash)
+    monkeypatch.setattr(CollateralClient, "head_block_hashes", head_block_hashes)
     # the earlier-send check still runs, lock and temp record included, without asking finney for its chain ID
     monkeypatch.setattr(CollateralClient, "_pinned_chain_id", AsyncMock(return_value=964))
     return state
@@ -304,10 +309,11 @@ async def test_remove_executor_reads_every_contract_at_one_block(chain):
 
     chain.collateral = {OLD_CONTRACT: "0.01"}
     chain.collateral_at[LATEST_HASH] = {OLD_CONTRACT: "0.01"}
+    chain.collateral_at[HEAD_HASH] = {OLD_CONTRACT: "0.01"}
     chain.after_collateral_read = lambda: chain.collateral.update({CONTRACT: "0.01", OLD_CONTRACT: "0"})
 
     assert await versions_holding_collateral(EXECUTOR) == ["1.0.2", "1.0.0"]
-    assert chain.collateral_blocks == [LATEST_HASH, None, LATEST_HASH, None]
+    assert chain.collateral_blocks == [LATEST_HASH, HEAD_HASH, None, LATEST_HASH, HEAD_HASH, None]
 
     deleted = []
     service = CliService.__new__(CliService)
@@ -330,6 +336,7 @@ async def test_remove_executor_refuses_when_only_the_latest_read_sees_a_deposit(
 
     chain.collateral = {CONTRACT: "0.01"}
     chain.collateral_at[LATEST_HASH] = {}
+    chain.collateral_at[HEAD_HASH] = {}
 
     assert await versions_holding_collateral(EXECUTOR) == ["1.0.2"]
 
@@ -342,3 +349,16 @@ async def test_remove_executor_refuses_when_only_the_latest_read_sees_a_deposit(
     )
     assert await service.remove_executor("192.0.2.10", 8001) is False
     assert deleted == []
+
+
+async def test_remove_executor_refuses_when_only_the_head_holds_a_deposit(chain):
+    """Review 5399092277 at c21535c: the parent H holds nothing and its child C, the head, holds a deposit, while
+    `latest` reaches a backend still at H. Only the read pinned to C sees the deposit."""
+    from core.utils import versions_holding_collateral
+
+    chain.collateral = {}
+    chain.collateral_at[LATEST_HASH] = {}
+    chain.collateral_at[HEAD_HASH] = {CONTRACT: "0.01"}
+
+    assert await versions_holding_collateral(EXECUTOR) == ["1.0.2"]
+    assert HEAD_HASH in chain.collateral_blocks
