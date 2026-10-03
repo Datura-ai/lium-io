@@ -39,9 +39,15 @@ _CLOUDFLARE_PROBE_FAIL_RX = re.compile(
     r"429|timeout|timed out|outage|connection refused|rate.?limit",
     re.I,
 )
-# The verifier names the failed direction ("Cloudflare up ...", network.rs) after any package
-# error, so the upload's own fault is the text from that name on.
-_CLOUDFLARE_UPLOAD_ERROR_RX = re.compile(r"\bcloudflare up(?:load)?\b(.*)", re.I | re.S)
+# The upload faults Cloudflare causes, in the verifier's own words (celium-gpu-verifier network.rs
+# validate_speedtest_response / upload_sample). The upload runs only after the download from the
+# same host was measured, so a transport error there is not the host's egress; reqwest 0.12 prints
+# no cause, so refused, reset, TLS and DNS read alike. "Cloudflare up speedtest timeout" is left
+# out on purpose: an upload under ~30 Mbps cannot move its 450 MB in 120 s and ends the same way.
+_CLOUDFLARE_UPLOAD_FAULT_RX = re.compile(
+    r"\bCloudflare upload request failed for \S+ with HTTP 429\b"
+    r"|\bUpload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b"
+)
 
 
 class VerifyXFailureClass(str, Enum):
@@ -731,14 +737,14 @@ def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
 
 
 def _cloudflare_upload_mark(network_execution: dict) -> dict:
-    """`{"cloudflare_upload_fallback": True}` when Cloudflare itself failed the upload (429,
-    timeout, ...), whatever the download did: the probe then reports the measured download and an
-    upload of 0.0, which is no measurement of the host. Empty otherwise."""
+    """`{"cloudflare_upload_fallback": True}` when Cloudflare itself failed the upload (a 429 or a
+    transport error): the probe then reports the measured download and an upload of 0.0, which is
+    no measurement of the host. Empty otherwise, a direction timeout included, so a slow upload
+    still lowers the EMA."""
     upload = (network_execution.get("speedtest") or {}).get("upload_mbps")
     if _is_positive_number(upload):
         return {}
-    match = _CLOUDFLARE_UPLOAD_ERROR_RX.search(str(network_execution.get("error") or ""))
-    if match and _CLOUDFLARE_PROBE_FAIL_RX.search(match.group(1)):
+    if _CLOUDFLARE_UPLOAD_FAULT_RX.search(str(network_execution.get("error") or "")):
         return {"cloudflare_upload_fallback": True}
     return {}
 
