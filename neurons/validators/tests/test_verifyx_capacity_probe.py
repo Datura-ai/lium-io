@@ -27,6 +27,7 @@ import pytest
 
 from neurons.validators.src.services.task.checks.network_ema import compute_ema
 from neurons.validators.src.services.task.checks.verifyx import (
+    MAX_KEPT_UPLOAD_PROBES,
     MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
     VerifyXCheck,
 )
@@ -307,6 +308,28 @@ async def test_cloudflare_unreachable_for_five_cycles_does_not_delist_an_honest_
     assert all(outcomes)
     assert ema > MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
     assert upload_ema == HOST_UPLOAD_MBPS
+
+
+@pytest.mark.asyncio
+async def test_a_429_keeps_the_upload_ema_for_at_most_max_kept_upload_probes_in_a_row(
+    context_factory,
+):
+    """A host that brings on Cloudflare's 429 before every probe keeps its upload EMA for
+    MAX_KEPT_UPLOAD_PROBES probes, then it halves; a measured upload starts the count again."""
+
+    async def upload_after(payload: dict, prev_upload: float) -> float:
+        result = await _run_check(
+            context_factory, _judge(payload), prev_ema=HOST_CAPACITY_MBPS, prev_upload=prev_upload
+        )
+        return result.updates["state"].specs["network"]["ema_verifyx_upload_speed"]
+
+    uploads = [HOST_UPLOAD_MBPS]
+    for _ in range(MAX_KEPT_UPLOAD_PROBES + 2):
+        uploads.append(await upload_after(_cloudflare_unreachable_payload(), uploads[-1]))
+    assert uploads[1:] == pytest.approx([HOST_UPLOAD_MBPS] * MAX_KEPT_UPLOAD_PROBES + [950.0, 475.0])
+
+    measured = await upload_after(_probe_payload(), HOST_UPLOAD_MBPS)
+    assert await upload_after(_cloudflare_unreachable_payload(), measured) == measured
 
 
 UPLOAD_TRANSPORT_ERROR = (
