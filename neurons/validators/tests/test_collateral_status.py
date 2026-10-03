@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -16,128 +17,80 @@ from aiohttp import web
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.services.task.checks import CollateralStatusCheck
 from neurons.validators.src.services.task.result_handler import ResultHandler
-from services import collateral_status
 from services.collateral_status import (
-    COLLATERALS_SELECTOR,
-    EXECUTOR_TO_MINER_SELECTOR,
+    COLLATERALS_SLOT,
+    EXECUTOR_TO_MINER_SLOT,
     CollateralStatusReader,
-    executor_call_data,
+    evm_storage_key,
+    mapping_slot,
 )
 
 from core.config import settings
+from services import collateral_status
 from tests.helpers import build_state
 
 EXECUTOR_UUID = "0b9d2f4e-6c1a-4f3b-9e7d-2a5c8b1d4e6f"
 MINER_EVM = "0x1111111111111111111111111111111111111111"
 OTHER_EVM = "0x2222222222222222222222222222222222222222"
+NOBODY = "0x" + "0" * 40
 GPU_MODEL = "NVIDIA H100 80GB HBM3"
 GPU_COUNT = 8
 BLOCK_HASH = "0x" + "ab" * 32
+# blocks other than the finalized one: a sibling at its height, and its child
+SIBLING_HASH = "0x" + "cc" * 32
+CHILD_HASH = "0x" + "dd" * 32
 # 0.103 TAO per H100 × 8 cards × COLLATERAL_DAYS (7)
 REQUIRED_TAO = Decimal("5.768")
 
 
-def _address_word(address: str) -> str:
-    return "0x" + address[2:].rjust(64, "0")
+def _address_word(address: str) -> str | None:
+    return None if int(address, 16) == 0 else "0x" + address[2:].rjust(64, "0")
 
 
-def _tao_word(tao: Decimal) -> str:
-    return "0x" + format(int(tao * 10**18), "x").rjust(64, "0")
+def _tao_word(tao: Decimal) -> str | None:
+    return None if tao == 0 else "0x" + format(int(tao * 10**18), "x").rjust(64, "0")
 
 
-HEADER = {"hash": BLOCK_HASH, "number": hex(16), "parentHash": "0x" + "aa" * 32, "timestamp": hex(1_700_000_000)}
-CHILD = {"number": hex(17), "parentHash": BLOCK_HASH, "timestamp": hex(1_700_000_012)}
-SIBLING_CHILD = {"number": hex(17), "parentHash": "0x" + "cc" * 32, "timestamp": hex(1_700_000_012)}
-# the pending state a backend without BLOCK_HASH runs a call on, as Frontier does
-PENDING = {"number": hex(17), "parentHash": "0x" + "bb" * 32, "timestamp": hex(1_700_000_012)}
-
-
-def _pinned_inner_calls(code: bytes) -> list[tuple[str, int]]:
-    """The (calldata, output size) of each view call a pinned_read_code runs, in order."""
-    calls, at = [], 0
-    while code[at] == 0x61 and code[at + 9] == 0x39:
-        length, offset = int.from_bytes(code[at + 1 : at + 3], "big"), int.from_bytes(code[at + 4 : at + 6], "big")
-        calls.append(("0x" + code[offset : offset + length].hex(), int.from_bytes(code[at + 11 : at + 13], "big")))
-        at += 59
-    return calls
+def _storage(owner: str, tao: Decimal) -> dict[str, str | None]:
+    """One block's AccountStorages entries for the executor; an unset slot is absent and answers null."""
+    contract = settings.COLLATERAL_CONTRACT_ADDRESS
+    return {
+        evm_storage_key(contract, mapping_slot(EXECUTOR_UUID, EXECUTOR_TO_MINER_SLOT)): _address_word(owner),
+        evm_storage_key(contract, mapping_slot(EXECUTOR_UUID, COLLATERALS_SLOT)): _tao_word(tao),
+    }
 
 
 class FakeRpc:
+    """A gateway in front of Substrate backends. Each backend holds the state of the blocks it has imported and
+    answers state_getStorage at a hash only from that block, or "UnknownBlock" when it does not have it, as a
+    Subtensor node does. `route` picks the backend for each request of a batch."""
+
     def __init__(self, owner: str, collateral_tao: Decimal, *, fail: Exception | None = None):
-        self.owner, self.collateral_tao, self.fail = owner, collateral_tao, fail
-        # False: the backend that runs the call does not have BLOCK_HASH and answers from PENDING
-        self.has_block = True
-        self.pending_owner, self.pending_collateral_tao = owner, collateral_tao
+        self.fail = fail
+        self.backends: list[dict[str, tuple[str, Decimal]]] = [{BLOCK_HASH: (owner, collateral_tao)}]
+        self.route: Callable[[int, dict], int] = lambda _i, _req: 0
         self.batches: list[list[dict]] = []
-        self.head_tags: list[str] = []
-        self.pending = PENDING
-        self.sibling: tuple[str, Decimal] | None = None
-        # True: a gateway sends the hash-pinned call to a backend one block behind, which answers from PENDING
-        self.hash_lags = False
-        # the state after HEADER's child, when the child changed the executor's owner or collateral
-        self.child_state: tuple[str, Decimal] | None = None
-        # False: the backend has not imported a child of HEADER yet
-        self.has_child = True
-        # True: EVM::DisableWhitelistCheck is off and WhitelistedCreators is empty, so a contract-creation call fails
-        self.creator_whitelist = False
-        # False: the RPC drops eth_call's state override, so a call to an address with no code answers "0x"
-        self.honours_overrides = True
+        self.heads = 0
+
+    def set_state(self, owner: str, collateral_tao: Decimal) -> None:
+        self.backends[0][BLOCK_HASH] = (owner, collateral_tao)
 
     async def __call__(self, batch):
         if self.fail:
             raise self.fail
-        if batch[0]["method"] == "eth_getBlockByNumber":
-            self.head_tags.append(batch[0]["params"][0])
-            return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": HEADER}]
+        if batch[0]["method"] == "chain_getFinalizedHead":
+            self.heads += 1
+            return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": BLOCK_HASH}]
         self.batches.append(batch)
-        return [self._run(req) for req in batch]
+        return [self._answer(self.backends[self.route(i, req)], req) for i, req in enumerate(batch)]
 
-    def _code(self, params) -> str | None:
-        """The code an eth_call runs: a creation call's data (None while the creator whitelist refuses it), or the
-        code a state override sets at the called address ("0x" when there is none)."""
-        if "to" not in params[0]:
-            return None if self.creator_whitelist else params[0]["data"]
-        overrides = params[2] if len(params) > 2 and self.honours_overrides else {}
-        return overrides.get(params[0]["to"], {}).get("code", "0x")
-
-    def _run(self, req):
-        at = req["params"][1]
-        code = self._code(req["params"])
-        if code is None:
-            return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32603, "message": "evm error: NotAllowed"}}
-        if code == "0x":
-            return {"jsonrpc": "2.0", "id": req["id"], "result": "0x"}
-        # as Finney's Frontier answers: an unknown number is "header not found", an unknown hash runs on pending
-        if "blockNumber" in at:
-            known = self.has_block or self.sibling is not None
-            if known and at["blockNumber"] == HEADER["number"]:
-                header = HEADER
-            elif known and self.has_child and at["blockNumber"] == CHILD["number"]:
-                # a backend where a sibling is canonical runs on the sibling's child, whose parent hash is the sibling's
-                header = SIBLING_CHILD if self.sibling is not None else CHILD
-            else:
-                return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "header not found"}}
-        else:
-            known = self.has_block and not self.hash_lags
-            header = HEADER if known and at.get("blockHash") == BLOCK_HASH else self.pending
-        if header is CHILD and self.child_state is not None:
-            owner, tao = self.child_state
-        elif header is HEADER or header is CHILD:
-            owner, tao = self.owner, self.collateral_tao
-        else:
-            owner, tao = self.pending_owner, self.pending_collateral_tao
-        if "blockNumber" in at and self.sibling is not None:
-            # a backend whose block at that height is a sibling with the same number, parent and timestamp
-            owner, tao = self.sibling
-        results = {
-            executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID): _address_word(owner),
-            executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID): _tao_word(tao),
-        }
-        out = int(header["number"], 16).to_bytes(32, "big") + bytes.fromhex(header["parentHash"][2:])
-        out += int(header["timestamp"], 16).to_bytes(32, "big")
-        for data, size in _pinned_inner_calls(bytes.fromhex(code[2:])):
-            out += bytes.fromhex(results[data][2:])[:size]
-        return {"jsonrpc": "2.0", "id": req["id"], "result": "0x" + out.hex()}
+    @staticmethod
+    def _answer(backend, req):
+        assert req["method"] == "state_getStorage"
+        key, at = req["params"]
+        if at not in backend:
+            return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": 4003, "message": f"UnknownBlock: {at}"}}
+        return {"jsonrpc": "2.0", "id": req["id"], "result": _storage(*backend[at]).get(key)}
 
 
 class Clock:
@@ -158,9 +111,21 @@ async def _status(reader, gpu_model=GPU_MODEL, gpu_count=GPU_COUNT):
     )
 
 
-def test_call_data_is_the_selector_and_the_left_aligned_uuid():
-    data = executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID)
-    assert data == "0xfdda13a1" + EXECUTOR_UUID.replace("-", "") + "0" * 32
+def test_the_storage_keys_are_the_ones_finney_answers_for_the_1_0_2_contract():
+    """Executor 65af4497-… has open reclaim request 22 on the 1.0.2 contract. On finney, state_getStorage at these
+    keys answered the same words as executorToMiner() and collaterals() for it."""
+    contract = "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"
+    executor = "65af4497-335c-4528-8523-0441735e665d"
+    prefix = (
+        "0x1da53b775b270400e7e61ed5cbc5a146ab1160471b1418779239ba8e2b847e42"
+        "81e8cde4a494fd9b81dba034e0b8913d8a4023fdd1eaa7b242f3723a7d096b6cc693c7c6"
+    )
+    assert evm_storage_key(contract, mapping_slot(executor, EXECUTOR_TO_MINER_SLOT)) == prefix + (
+        "cc6a004345680850ecc4e3472c55acf28c408095c99a96eaa467d8913efe65457673a96dd0a6537c0319b06a05e04cdd"
+    )
+    assert evm_storage_key(contract, mapping_slot(executor, COLLATERALS_SLOT)) == prefix + (
+        "f7079d893e7f92eba7c2eaf578e3e6109d265339201d214e81869ea6bc9dae1f3d0dd728b994e3535a7e56a2b22da043"
+    )
 
 
 @pytest.mark.asyncio
@@ -171,7 +136,7 @@ def test_call_data_is_the_selector_and_the_left_aligned_uuid():
         pytest.param(MINER_EVM, MINER_EVM, Decimal(9), GPU_MODEL, True, None, id="above"),
         pytest.param(MINER_EVM, MINER_EVM, Decimal("5.767"), GPU_MODEL, False, "requires 5.768 TAO", id="below"),
         pytest.param(MINER_EVM, MINER_EVM, Decimal(0), GPU_MODEL, False, "requires", id="nothing-deposited"),
-        pytest.param("0x" + "0" * 40, MINER_EVM, Decimal(0), GPU_MODEL, False, "No miner address", id="no-owner"),
+        pytest.param(NOBODY, MINER_EVM, Decimal(0), GPU_MODEL, False, "No miner address", id="no-owner"),
         pytest.param(OTHER_EVM, MINER_EVM, Decimal(9), GPU_MODEL, False, "does not match", id="other-owner"),
         pytest.param(MINER_EVM, MINER_EVM, Decimal(9), "Unknown GPU", False, "No required deposit", id="no-rate"),
     ],
@@ -186,151 +151,91 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert status.contract_version == ("1.0.2" if deposited else None)
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
-    [[req, by_number, at_child]] = rpc.batches
-    address = collateral_status.PINNED_READ_ADDRESS
-    assert req["params"][0] == {"to": address, "data": "0x"}
-    assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
-    assert by_number["params"] == [req["params"][0], {"blockNumber": HEADER["number"]}, req["params"][2]]
-    assert at_child["params"] == [req["params"][0], {"blockNumber": CHILD["number"]}, req["params"][2]]
-    assert rpc.head_tags == ["finalized"]
-    contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
-    code = req["params"][2][address]["code"]
-    assert code.count("73" + contract) == 2
-    assert _pinned_inner_calls(bytes.fromhex(code[2:])) == [
-        (executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID), 32),
-        (executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID), 32),
+    contract = settings.COLLATERAL_CONTRACT_ADDRESS
+    [batch] = rpc.batches
+    assert [(req["method"], req["params"]) for req in batch] == [
+        ("state_getStorage", [evm_storage_key(contract, mapping_slot(EXECUTOR_UUID, EXECUTOR_TO_MINER_SLOT)), BLOCK_HASH]),
+        ("state_getStorage", [evm_storage_key(contract, mapping_slot(EXECUTOR_UUID, COLLATERALS_SLOT)), BLOCK_HASH]),
     ]
+    assert rpc.heads == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("creator_whitelist", [False, True], ids=["whitelist-check-disabled", "whitelist-check-on"])
-async def test_the_pinned_read_does_not_depend_on_the_evm_creator_whitelist(creator_whitelist):
-    """Review 5397591319 at 78c163c: Subtensor runs a contract-creation eth_call through WhitelistedCreators unless
-    EVM::DisableWhitelistCheck is set. The pinned read is a plain call to PINNED_READ_ADDRESS with its code set by
-    the state override, so it reads the same answer with the check on or off."""
+async def test_a_read_at_a_block_the_backend_does_not_have_is_a_failed_read():
     rpc = FakeRpc(MINER_EVM, Decimal(9))
-    rpc.creator_whitelist = creator_whitelist
-    status, cached = await _status(_reader(rpc))
-
-    assert (status.deposited, status.read_failed, cached) == (True, False, False)
-    assert status.collateral_tao == Decimal(9)
-
-
-@pytest.mark.asyncio
-async def test_an_rpc_that_drops_the_state_override_is_a_failed_read():
-    rpc = FakeRpc(MINER_EVM, Decimal(9))
-    rpc.honours_overrides = False
-    status, cached = await _status(_reader(rpc))
-
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
-    with pytest.raises(ValueError, match="state overrides"):
-        collateral_status.pinned_outputs("0x", HEADER, [32, 32])
-
-
-@pytest.mark.asyncio
-async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_is_a_failed_read():
-    rpc = FakeRpc(MINER_EVM, Decimal(9))
-    rpc.has_block = False
+    rpc.backends.append({SIBLING_HASH: (MINER_EVM, Decimal(9))})
+    rpc.route = lambda _i, _req: 1
     status, cached = await _status(_reader(rpc))
 
     assert (status.deposited, status.read_failed, cached) == (False, True, False)
 
 
-@pytest.mark.asyncio
-async def test_a_read_a_gateway_sends_to_a_backend_without_the_block_is_not_published_as_deposited():
-    """Review 5397109362 at 0132b5c: the header comes from a backend that has the block, the call from one that
-    does not and answers from its pending state, where the miner owns a funded executor. The call's own header
-    words name another block, so the read fails instead of caching collateral_deposited=True."""
-    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
-    rpc.has_block = False
-    rpc.pending_owner, rpc.pending_collateral_tao = MINER_EVM, Decimal(9)
-    status, cached = await _status(_reader(rpc))
-
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
-    rpc.has_block = True
-    status, _ = await _status(_reader(rpc))
-    assert (status.deposited, status.read_failed) == (False, False)
+ROUTES = {
+    "one-backend": lambda i, _req: 0,
+    "owner-to-lagging": lambda i, _req: 1 if i == 0 else 0,
+    "amount-to-lagging": lambda i, _req: 1 if i == 1 else 0,
+    "owner-to-sibling-canonical": lambda i, _req: 2 if i == 0 else 0,
+    "split-lagging-and-sibling": lambda i, _req: 1 if i == 0 else 2,
+    "all-to-sibling-canonical": lambda i, _req: 2,
+}
 
 
 @pytest.mark.asyncio
-async def test_a_pending_block_with_the_pinned_number_parent_and_timestamp_is_never_read():
-    """Review at 78c163c: a backend one block behind can answer an unknown hash from a pending block with the
-    pinned header's number, parent and timestamp but other collateral. The read is pinned by number, which such a
-    backend does not have, so it fails instead of reporting the pending state."""
-    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
-    rpc.has_block = False
-    rpc.pending = {k: HEADER[k] for k in ("number", "parentHash", "timestamp")}
-    rpc.pending_owner, rpc.pending_collateral_tao = MINER_EVM, Decimal(9)
+@pytest.mark.parametrize("route", list(ROUTES), ids=list(ROUTES))
+@pytest.mark.parametrize(
+    "at_block, in_sibling_and_child",
+    [
+        pytest.param((NOBODY, Decimal(0)), (MINER_EVM, Decimal(9)), id="deposit-only-off-the-block"),
+        pytest.param((MINER_EVM, Decimal(9)), (NOBODY, Decimal(0)), id="reclaim-only-off-the-block"),
+    ],
+)
+async def test_state_off_the_finalized_block_is_never_read(route, at_block, in_sibling_and_child):
+    """Review 5398901003 at 4fa570d: the finalized block H has no deposit, its pending sibling S and H's child C
+    both carry one, and the gateway sends each read to another backend: one a block behind, whose pending block
+    is S, and one where S is canonical. Each read names H by its Substrate hash, which a backend answers from H's
+    own state or refuses, so the answer is H's or the read fails; S's and C's state is never reported."""
+    rpc = FakeRpc(*at_block)
+    rpc.backends[0][CHILD_HASH] = in_sibling_and_child
+    rpc.backends.append({SIBLING_HASH: in_sibling_and_child})
+    rpc.backends.append({SIBLING_HASH: in_sibling_and_child, CHILD_HASH: in_sibling_and_child})
+    rpc.route = ROUTES[route]
     status, cached = await _status(_reader(rpc))
 
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
-
-
-@pytest.mark.asyncio
-async def test_a_sibling_block_with_the_pinned_number_parent_and_timestamp_is_never_read():
-    """Review at aca7529: the numbered call can reach a backend whose block at that height is a sibling of the
-    finalized one, with the same number, parent and timestamp but the miner's deposit. The read pinned by hash runs
-    on the finalized block itself, the two disagree, and the read fails instead of caching collateral_deposited."""
-    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
-    rpc.sibling = (MINER_EVM, Decimal(9))
-    status, cached = await _status(_reader(rpc))
-
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
-    rpc.sibling = None
-    status, _ = await _status(_reader(rpc))
-    assert (status.deposited, status.read_failed) == (False, False)
+    expected = (at_block[0] == MINER_EVM, False) if route == "one-backend" else (False, True)
+    assert (status.deposited, status.read_failed) == expected
+    assert cached is False
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "at_block, in_sibling_and_child, deposited",
-    [
-        pytest.param(("0x" + "0" * 40, Decimal(0)), (MINER_EVM, Decimal(9)), False, id="deposit-after-the-block"),
-        pytest.param((MINER_EVM, Decimal(9)), ("0x" + "0" * 40, Decimal(0)), True, id="reclaim-after-the-block"),
-    ],
+    "word",
+    ["0x" + "11" * 31, "0x" + "11" * 33, 7, {"value": "0x00"}],
+    ids=["short", "long", "number", "object"],
 )
-async def test_a_pending_sibling_that_agrees_with_the_child_is_never_read(at_block, in_sibling_and_child, deposited):
-    """Review 5398736862 at d391eb0: the hash-pinned call reaches a backend one block behind, whose pending sibling
-    carries the block's number, parent and timestamp, and the child changed the executor the same way the sibling
-    did. The sibling's and the child's runs agree; the run pinned by the block's number reads the block's own state,
-    so the read fails instead of caching either answer."""
-    rpc = FakeRpc(*at_block)
-    rpc.hash_lags = True
-    rpc.pending = {k: HEADER[k] for k in ("number", "parentHash", "timestamp")}
-    rpc.pending_owner, rpc.pending_collateral_tao = in_sibling_and_child
-    rpc.child_state = in_sibling_and_child
-    status, cached = await _status(_reader(rpc))
+async def test_a_storage_answer_that_is_not_a_32_byte_word_is_a_failed_read(word):
+    async def rpc(batch):
+        if batch[0]["method"] == "chain_getFinalizedHead":
+            return [{"jsonrpc": "2.0", "id": 0, "result": BLOCK_HASH}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": word} for req in batch]
 
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
-    rpc.hash_lags = False
-    rpc.child_state = None
     status, _ = await _status(_reader(rpc))
-    assert (status.deposited, status.read_failed) == (deposited, False)
+
+    assert (status.deposited, status.read_failed) == (False, True)
 
 
 @pytest.mark.asyncio
-async def test_a_lagging_pending_sibling_and_a_backend_where_the_sibling_is_canonical_are_never_read():
-    """Review at 8a84360: the hash-pinned call reaches a backend one block behind, which runs on its pending block,
-    a sibling with the finalized number, parent and timestamp; the other call reaches a backend where that sibling
-    is canonical. Both see the sibling's deposit. The second run is on a child, where BLOCKHASH(NUMBER - 1) is the
-    sibling's hash rather than the finalized one, so the read fails instead of caching collateral_deposited."""
-    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
-    rpc.has_block = False
-    rpc.pending = {k: HEADER[k] for k in ("number", "parentHash", "timestamp")}
-    rpc.pending_owner, rpc.pending_collateral_tao = MINER_EVM, Decimal(9)
-    rpc.sibling = (MINER_EVM, Decimal(9))
-    status, cached = await _status(_reader(rpc))
+async def test_two_answers_with_one_id_are_a_failed_read():
+    fake = FakeRpc(MINER_EVM, Decimal(9))
 
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    async def rpc(batch):
+        answers = await fake(batch)
+        if batch[0]["method"] == "state_getStorage":
+            answers = [answers[1], dict(answers[1])]
+        return answers
 
+    status, _ = await _status(_reader(rpc))
 
-@pytest.mark.asyncio
-async def test_a_finalized_block_with_no_child_yet_is_a_failed_read():
-    rpc = FakeRpc(MINER_EVM, Decimal(9))
-    rpc.has_child = False
-    status, cached = await _status(_reader(rpc))
-
-    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    assert (status.deposited, status.read_failed) == (False, True)
 
 
 @pytest.mark.asyncio
@@ -340,7 +245,7 @@ async def test_a_hotkey_with_no_evm_address_is_not_deposited_and_no_rpc_is_made(
 
     assert status.deposited is False
     assert "No evm address" in status.error_message
-    assert rpc.batches == []
+    assert (rpc.batches, rpc.heads) == ([], 0)
 
 
 @pytest.mark.asyncio
@@ -355,7 +260,7 @@ async def test_a_read_is_reused_until_the_cache_expires():
     assert (status.deposited, cached, len(rpc.batches)) == (True, True, 1)
 
     clock.now += 2
-    rpc.collateral_tao = Decimal(0)
+    rpc.set_state(MINER_EVM, Decimal(0))
     status, cached = await _status(reader)
     assert (status.deposited, cached, len(rpc.batches)) == (False, False, 2)
 
@@ -408,7 +313,7 @@ async def test_an_rpc_error_answer_is_a_failed_read():
 
 
 @pytest.mark.asyncio
-async def test_a_head_with_no_block_hash_is_a_failed_read_and_makes_no_eth_call():
+async def test_a_head_with_no_block_hash_is_a_failed_read_and_makes_no_storage_read():
     calls = []
 
     async def rpc(batch):
@@ -417,7 +322,7 @@ async def test_a_head_with_no_block_hash_is_a_failed_read_and_makes_no_eth_call(
 
     status, _ = await _status(_reader(rpc))
 
-    assert (status.deposited, status.read_failed, calls) == (False, True, ["eth_getBlockByNumber"])
+    assert (status.deposited, status.read_failed, calls) == (False, True, ["chain_getFinalizedHead"])
 
 
 def _context(context_factory):
@@ -451,7 +356,7 @@ def _context(context_factory):
     [
         pytest.param(MINER_EVM, REQUIRED_TAO, True, id="funded"),
         pytest.param(MINER_EVM, Decimal("0.01"), False, id="underfunded"),
-        pytest.param("0x" + "0" * 40, Decimal(0), False, id="no-deposit"),
+        pytest.param(NOBODY, Decimal(0), False, id="no-deposit"),
     ],
 )
 async def test_the_check_puts_the_contract_answer_in_the_published_job_result(
@@ -535,7 +440,7 @@ async def test_an_rpc_answer_over_the_size_cap_is_a_failed_read_and_is_not_buffe
     async def handler(request):
         response = web.StreamResponse()
         await response.prepare(request)
-        await response.write(b'[{"jsonrpc": "2.0", "id": 0, "result": {"hash": "' + BLOCK_HASH.encode() + b'", "pad": "')
+        await response.write(b'[{"jsonrpc": "2.0", "id": 0, "result": "' + BLOCK_HASH.encode() + b'", "pad": "')
         try:
             for _ in range(1024):
                 await response.write(b"x" * 64 * 1024)

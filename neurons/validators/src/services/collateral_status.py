@@ -6,21 +6,20 @@ meaning CollateralContractService gave it: the miner hotkey's associated EVM add
 executor on the contract, and the executor's collateral covers
 required_deposit_amount[gpu_model] × gpu_count × COLLATERAL_DAYS. It has no score effect.
 
-The finalized header is read first. Then two view calls (`executorToMiner(bytes16)`,
-`collaterals(bytes16)`) run in one EVM run (pinned_read_code), twice: pinned by the header's hash,
-where the run's NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP must match the header, and on the
-header's child, where BLOCKHASH(NUMBER - 1) must be the header's hash, and a third time pinned by the
-header's number, since the child's run sees the child's state. The three runs must agree. A
-backend without the block or its child answers an error, and the read fails. The code runs as the
-code of PINNED_READ_ADDRESS through eth_call's state override, a plain call, so Subtensor's EVM
-creator whitelist does not apply to it. A read is kept per executor for
-COLLATERAL_STATUS_CACHE_SECONDS; a failed read reports the last answer for that executor when there
-is one.
+The finalized Substrate block hash is read first. Then the contract's two storage words for the
+executor (`executorToMiner[executorId]`, `collaterals[executorId]`) are read from pallet-evm's
+AccountStorages with `state_getStorage` at that hash. A Substrate node answers a state query at a
+hash only from that block's own state, and a node without the block answers an error, so each
+answer is the block's value whichever backend serves it. An eth_call cannot give that: Frontier
+answers an unknown block hash from its pending state, and a number can reach a sibling block. A read
+is kept per executor for COLLATERAL_STATUS_CACHE_SECONDS; a failed read reports the last answer for
+that executor when there is one.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -29,6 +28,8 @@ from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 import aiohttp
+import xxhash
+from Crypto.Hash import keccak
 
 from core.config import settings, shared_client
 
@@ -38,21 +39,17 @@ RPC_URLS = {
     "finney": "https://lite.chain.opentensor.ai",
 }
 
-# keccak256 of the signature, first 4 bytes
-EXECUTOR_TO_MINER_SELECTOR = "f44e1119"  # executorToMiner(bytes16) -> address
-COLLATERALS_SELECTOR = "fdda13a1"  # collaterals(bytes16) -> uint256
+# Storage slots of the 1.0.2 contract's mappings (celium-collateral-contracts src/Collateral.sol: NETUID and
+# TRUSTEE share slot 0, BURN_ADDRESS and DECISION_TIMEOUT slot 1, MIN_COLLATERAL_INCREASE slot 2). Checked on
+# finney against the contract's getters for every open reclaim request.
+EXECUTOR_TO_MINER_SLOT = 3  # mapping(bytes16 => address)
+COLLATERALS_SLOT = 4  # mapping(bytes16 => uint256)
 
 WEI_PER_TAO = Decimal(10) ** 18
 
-# The RPC is peer-controlled, so its answer is read up to this size before anything is decoded. The largest
-# answer is the latest header, which lists one ~70-byte hash per transaction, so this holds a block of over
-# 7,000 transactions; the two eth_call answers are ~200 bytes.
+# The RPC is peer-controlled, so its answer is read up to this size before anything is decoded. The answers
+# are a block hash and two 32-byte storage words.
 MAX_RPC_ANSWER_BYTES = 512 * 1024
-
-# An address with no code and no precompile. A pinned read is a call to it with pinned_read_code set as its code
-# by eth_call's state override. A contract-creation eth_call would go through the runtime's creator whitelist
-# (WhitelistedCreators, DisableWhitelistCheck), which a plain call does not.
-PINNED_READ_ADDRESS = "0x00000000000000000000000000000000000c0113"
 
 RpcBatch = Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]]
 
@@ -67,99 +64,34 @@ class CollateralStatus:
     read_failed: bool = False
 
 
-def executor_call_data(selector: str, executor_uuid: str) -> str:
-    # bytes16 is left-aligned in its 32-byte word
-    return "0x" + selector + UUID(executor_uuid).bytes.hex().ljust(64, "0")
+def _twox128(data: bytes) -> bytes:
+    return b"".join(xxhash.xxh64(data, seed=seed).intdigest().to_bytes(8, "little") for seed in (0, 1))
 
 
-def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
-    """Code that makes each (calldata, output size) view call to `to` in one EVM run and returns NUMBER,
-    BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run reads one state on one
-    backend, and the header words prove which block that state is. It is run by pinned_call."""
-    def push2(value: int) -> bytes:
-        return b"\x61" + value.to_bytes(2, "big")
-
-    scratch = 0x2000
-    code = bytearray()
-    data_slots: list[int] = []
-    revert_slots: list[int] = []
-    out = 0x60
-    for data, size in calls:
-        # CODECOPY(scratch, <data offset>, len)
-        code += push2(len(data))
-        data_slots.append(len(code) + 1)
-        code += push2(0) + push2(scratch) + b"\x39"
-        # STATICCALL(gas, to, scratch, len, out, size); revert on failure or a short answer
-        code += push2(size) + push2(out) + push2(len(data)) + push2(scratch)
-        code += b"\x73" + bytes.fromhex(to.removeprefix("0x")) + b"\x5a\xfa\x15"
-        revert_slots.append(len(code) + 1)
-        code += push2(0) + b"\x57" + push2(size) + b"\x3d\x10"
-        revert_slots.append(len(code) + 1)
-        code += push2(0) + b"\x57"
-        out += size
-    # memory[0:0x60] = NUMBER, BLOCKHASH(NUMBER - 1), TIMESTAMP; RETURN(0, out)
-    code += b"\x43\x60\x00\x52" + b"\x60\x01\x43\x03\x40\x60\x20\x52" + b"\x42\x60\x40\x52"
-    code += push2(out) + b"\x60\x00\xf3"
-    revert_at = len(code)
-    code += b"\x5b\x60\x00\x80\xfd"
-    for slot in revert_slots:
-        code[slot : slot + 2] = revert_at.to_bytes(2, "big")
-    offset = len(code)
-    for slot, (data, _size) in zip(data_slots, calls):
-        code[slot : slot + 2] = offset.to_bytes(2, "big")
-        offset += len(data)
-    return "0x" + bytes(code).hex() + b"".join(data for data, _ in calls).hex()
+def _blake2_128_concat(data: bytes) -> bytes:
+    return hashlib.blake2b(data, digest_size=16).digest() + data
 
 
-def pinned_call(code: str, pin: dict[str, Any]) -> list[Any]:
-    """eth_call params that run `code` at the block `pin` names, as the code of PINNED_READ_ADDRESS."""
-    return [{"to": PINNED_READ_ADDRESS, "data": "0x"}, pin, {PINNED_READ_ADDRESS: {"code": code}}]
+def mapping_slot(executor_uuid: str, slot: int) -> bytes:
+    """The storage slot of `mapping(bytes16 => ...)` at `slot` for the executor; a bytes16 key is left-aligned."""
+    key = UUID(executor_uuid).bytes.ljust(32, b"\0")
+    return keccak.new(data=key + slot.to_bytes(32, "big"), digest_bits=256).digest()
 
 
-def _pinned_answer(result: str, sizes: list[int]) -> bytes:
-    if not isinstance(result, str):
-        raise ValueError("pinned read has no answer")
-    raw = bytes.fromhex(result.removeprefix("0x"))
-    if not raw:
-        # a call to an address with no code answers nothing: the RPC did not apply the state override
-        raise ValueError("pinned read answered 0 bytes; the RPC must support eth_call state overrides")
-    if len(raw) != 0x60 + sum(sizes):
-        raise ValueError(f"pinned read answered {len(raw)} bytes")
-    return raw
+def evm_storage_key(contract: str, slot: bytes) -> str:
+    """The Substrate key of pallet-evm's AccountStorages[contract][slot]."""
+    address = bytes.fromhex(contract.removeprefix("0x"))
+    key = _twox128(b"EVM") + _twox128(b"AccountStorages") + _blake2_128_concat(address) + _blake2_128_concat(slot)
+    return "0x" + key.hex()
 
 
-def pinned_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
-    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
-    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
-    raw = _pinned_answer(result, sizes)
-    number, parent, timestamp = (raw[i : i + 32] for i in (0, 32, 64))
-    if (
-        int.from_bytes(number, "big") != int(header["number"], 16)
-        or "0x" + parent.hex() != str(header["parentHash"]).lower()
-        or int.from_bytes(timestamp, "big") != int(header["timestamp"], 16)
-    ):
-        raise ValueError("the read did not run on the block it is pinned to")
-    outputs, at = [], 0x60
-    for size in sizes:
-        outputs.append(raw[at : at + size])
-        at += size
-    return outputs
-
-
-def child_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
-    """The view call outputs of a pinned_read_code answer that ran on a child of `header`: NUMBER is one past it
-    and BLOCKHASH(NUMBER - 1) is its hash, which only a chain holding that block can answer."""
-    raw = _pinned_answer(result, sizes)
-    if (
-        int.from_bytes(raw[0:32], "big") != int(header["number"], 16) + 1
-        or "0x" + raw[32:64].hex() != str(header["hash"]).lower()
-    ):
-        raise ValueError("the read did not run on a child of the block it is pinned to")
-    outputs, at = [], 0x60
-    for size in sizes:
-        outputs.append(raw[at : at + size])
-        at += size
-    return outputs
+def storage_word(result: Any) -> str:
+    """A state_getStorage answer as a 32-byte word: an unset slot answers null and reads as zero."""
+    if result is None:
+        return "00" * 32
+    if not isinstance(result, str) or len(result.removeprefix("0x")) != 64:
+        raise ValueError("state_getStorage did not answer a 32-byte word")
+    return result.removeprefix("0x")
 
 
 def required_deposit_tao(gpu_model: str | None, gpu_count: int) -> Decimal | None:
@@ -296,56 +228,32 @@ class CollateralStatusReader:
 
     async def _read(self, executor_uuid: str, evm_address: str, required_tao: Decimal | None) -> CollateralStatus:
         to = settings.COLLATERAL_CONTRACT_ADDRESS
-        # owner and amount come from one EVM run (pinned_read_code), so one backend reads both from one state; a
-        # gateway that splits a batch across backends cannot pair an old owner with a new owner's deposit
-        [head] = await self._rpc(
-            [{"jsonrpc": "2.0", "id": 0, "method": "eth_getBlockByNumber", "params": ["finalized", False]}]
-        )
-        header = head.get("result") if isinstance(head, dict) else None
-        if not isinstance(header, dict) or not all(header.get(k) for k in ("hash", "number", "parentHash", "timestamp")):
-            raise ValueError("eth_getBlockByNumber has no block header")
-        calls = [
-            (bytes.fromhex(executor_call_data(selector, executor_uuid)[2:]), 32)
-            for selector in (EXECUTOR_TO_MINER_SELECTOR, COLLATERALS_SELECTOR)
-        ]
-        # Neither a hash nor a number pin names the block alone: an unknown hash runs on pending state that can
-        # carry the block's number, parent and timestamp, and a number can reach a sibling with the same three. A
-        # run on the block's child can: BLOCKHASH(NUMBER - 1) there is the block's own hash. The answer counts only
-        # when the run pinned by hash matches the header and agrees with the child's run; no child yet fails closed.
-        # The child's run sees the child's state, so a third run pinned by the block's number must agree too: a
-        # backend without the block answers "header not found", one holding it answers from the block's own state.
-        code = pinned_read_code(to, calls)
-        pins = (
-            {"blockHash": header["hash"], "requireCanonical": True},
-            {"blockNumber": header["number"]},
-            {"blockNumber": hex(int(header["number"], 16) + 1)},
-        )
+        [head] = await self._rpc([{"jsonrpc": "2.0", "id": 0, "method": "chain_getFinalizedHead", "params": []}])
+        block_hash = head.get("result") if isinstance(head, dict) else None
+        if not isinstance(block_hash, str) or len(block_hash.removeprefix("0x")) != 64:
+            raise ValueError("chain_getFinalizedHead has no block hash")
+        slots = (mapping_slot(executor_uuid, EXECUTOR_TO_MINER_SLOT), mapping_slot(executor_uuid, COLLATERALS_SLOT))
         answers = await self._rpc(
             [
-                {"jsonrpc": "2.0", "id": i, "method": "eth_call", "params": pinned_call(code, pin)}
-                for i, pin in enumerate(pins, start=1)
+                {"jsonrpc": "2.0", "id": i, "method": "state_getStorage", "params": [evm_storage_key(to, slot), block_hash]}
+                for i, slot in enumerate(slots, start=1)
             ]
         )
-        if not isinstance(answers, list) or len(answers) != len(pins):
-            raise ValueError("eth_call has no result")
-        results = []
-        for answer in sorted(answers, key=lambda a: a.get("id", -1) if isinstance(a, dict) else -1):
-            if not isinstance(answer, dict) or "error" in answer or "result" not in answer:
-                raise ValueError("eth_call has no result")
-            results.append(answer["result"])
-        runs = [
-            pinned_outputs(results[0], header, [32, 32]),
-            pinned_outputs(results[1], header, [32, 32]),
-            child_outputs(results[2], header, [32, 32]),
-        ]
-        if not runs[0] == runs[1] == runs[2]:
-            raise ValueError("the reads at the block and at its child disagree")
-        owner, collateral = runs[0]
+        if not isinstance(answers, list) or len(answers) != len(slots):
+            raise ValueError("state_getStorage has no result")
+        by_id = {answer.get("id"): answer for answer in answers if isinstance(answer, dict)}
+        words = []
+        for i in range(1, len(slots) + 1):
+            answer = by_id.get(i)
+            if answer is None or "error" in answer or "result" not in answer:
+                raise ValueError("state_getStorage has no result")
+            words.append(storage_word(answer["result"]))
+        owner, collateral = words
         return decide(
             executor_uuid=executor_uuid,
             evm_address=evm_address,
-            owner_word=owner.hex(),
-            collateral_word=collateral.hex(),
+            owner_word=owner,
+            collateral_word=collateral,
             required_tao=required_tao,
         )
 

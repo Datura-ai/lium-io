@@ -616,8 +616,9 @@ class Settings(BaseSettings):
 
     # collateral_deposited keeps its meaning for the backend's provider statistics and the support board:
     # the miner's associated EVM address owns the executor on this contract and its collateral covers
-    # required_deposit_amount × gpu_count × COLLATERAL_DAYS. It has no score effect. The read is a plain
-    # JSON-RPC eth_call, cached per executor for COLLATERAL_STATUS_CACHE_SECONDS.
+    # required_deposit_amount × gpu_count × COLLATERAL_DAYS. It has no score effect. The read is the contract's
+    # storage at the finalized block through the Substrate JSON-RPC (state_getStorage), so the URL must be a
+    # Subtensor node; it is cached per executor for COLLATERAL_STATUS_CACHE_SECONDS.
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env="COLLATERAL_CONTRACT_ADDRESS", default="0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"

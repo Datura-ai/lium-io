@@ -20,7 +20,9 @@ from uuid import UUID
 
 import aiohttp
 import rlp
+import xxhash
 from bittensor_wallet import Keypair
+from Crypto.Hash import keccak
 from eth_account import Account
 from eth_utils import event_abi_to_log_topic
 from web3 import AsyncHTTPProvider, AsyncWeb3
@@ -82,10 +84,17 @@ CHAIN_READ_BATCH = 50
 KEPT_BLOCKS_MIN = 128
 # The default finney RPC answers HTTP 429 after about 100 reads in 30 s; a batch waits this long before each retry.
 RATE_LIMIT_RETRY_SEC = (2, 5, 10)
-# An address with no code and no precompile. A pinned read is a call to it with pinned_read_code set as its code
-# by eth_call's state override. A contract-creation eth_call would go through the runtime's creator whitelist
-# (WhitelistedCreators, DisableWhitelistCheck), which a plain call does not.
-PINNED_READ_ADDRESS = "0x00000000000000000000000000000000000c0113"
+# The storage slots of the `collaterals` and `reclaims` mappings of each deployed contract
+# (celium-collateral-contracts src/Collateral.sol). 1.0.2 (a93c2c8 onward) has NETUID and TRUSTEE in slot 0,
+# BURN_ADDRESS and DECISION_TIMEOUT in slot 1, MIN_COLLATERAL_INCREASE in slot 2, then executorToMiner,
+# collaterals, reclaims; checked on finney against the getters for every open reclaim request. 1.0.0 (f7ce73e) has
+# no BURN_ADDRESS, so NETUID, TRUSTEE and DECISION_TIMEOUT share slot 0 and each mapping sits one slot lower; its
+# slots 0, 1 and nextReclaimId (slot 6) match its getters on finney. A contract not listed here is not read at a
+# pinned block.
+STORAGE_LAYOUTS = {
+    "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6": {"collaterals": 4, "reclaims": 5},
+    "0x999F9A49A85e9D6E981cad42f197349f50172bEB": {"collaterals": 3, "reclaims": 4},
+}
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 
 SS58_FORMAT = 42
@@ -170,92 +179,59 @@ def block_number(block) -> int:
     return int(number, 16) if isinstance(number, str) else number
 
 
-def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
-    """Code that makes each (calldata, output size) view call to `to` in one EVM run and returns NUMBER,
-    BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run reads one state on one
-    backend, and the header words prove which block that state is. It is run by pinned_call."""
-
-    def push2(value: int) -> bytes:
-        return b"\x61" + value.to_bytes(2, "big")
-
-    scratch = 0x2000
-    code = bytearray()
-    data_slots: list[int] = []
-    revert_slots: list[int] = []
-    out = 0x60
-    for data, size in calls:
-        # CODECOPY(scratch, <data offset>, len)
-        code += push2(len(data))
-        data_slots.append(len(code) + 1)
-        code += push2(0) + push2(scratch) + b"\x39"
-        # STATICCALL(gas, to, scratch, len, out, size); revert on failure or a short answer
-        code += push2(size) + push2(out) + push2(len(data)) + push2(scratch)
-        code += b"\x73" + bytes.fromhex(to.removeprefix("0x")) + b"\x5a\xfa\x15"
-        revert_slots.append(len(code) + 1)
-        code += push2(0) + b"\x57" + push2(size) + b"\x3d\x10"
-        revert_slots.append(len(code) + 1)
-        code += push2(0) + b"\x57"
-        out += size
-    # memory[0:0x60] = NUMBER, BLOCKHASH(NUMBER - 1), TIMESTAMP; RETURN(0, out)
-    code += b"\x43\x60\x00\x52" + b"\x60\x01\x43\x03\x40\x60\x20\x52" + b"\x42\x60\x40\x52"
-    code += push2(out) + b"\x60\x00\xf3"
-    revert_at = len(code)
-    code += b"\x5b\x60\x00\x80\xfd"
-    for slot in revert_slots:
-        code[slot : slot + 2] = revert_at.to_bytes(2, "big")
-    offset = len(code)
-    for slot, (data, _size) in zip(data_slots, calls):
-        code[slot : slot + 2] = offset.to_bytes(2, "big")
-        offset += len(data)
-    return "0x" + bytes(code).hex() + b"".join(data for data, _ in calls).hex()
+def _twox128(data: bytes) -> bytes:
+    return b"".join(xxhash.xxh64(data, seed=seed).intdigest().to_bytes(8, "little") for seed in (0, 1))
 
 
-def pinned_call(code: str, pin: dict) -> list:
-    """eth_call params that run `code` at the block `pin` names, as the code of PINNED_READ_ADDRESS."""
-    return [{"to": PINNED_READ_ADDRESS, "data": "0x"}, pin, {PINNED_READ_ADDRESS: {"code": code}}]
+def _blake2_128_concat(data: bytes) -> bytes:
+    return hashlib.blake2b(data, digest_size=16).digest() + data
 
 
-def _pinned_answer(result: str, sizes: list[int]) -> bytes:
+def _keccak(data: bytes) -> bytes:
+    return keccak.new(data=data, digest_bits=256).digest()
+
+
+def mapping_slot(key: bytes, slot: int) -> int:
+    """The storage slot of a Solidity mapping's entry: keccak256(key padded to 32 bytes . slot). A bytes16 key is
+    left-aligned, an integer key right-aligned; the caller pads it."""
+    return int.from_bytes(_keccak(key + slot.to_bytes(32, "big")), "big")
+
+
+def evm_storage_key(contract: str, slot: int) -> str:
+    """The Substrate key of pallet-evm's AccountStorages[contract][slot]."""
+    address = bytes.fromhex(contract.removeprefix("0x"))
+    key = _twox128(b"EVM") + _twox128(b"AccountStorages")
+    return "0x" + (key + _blake2_128_concat(address) + _blake2_128_concat(slot.to_bytes(32, "big"))).hex()
+
+
+def ethereum_block_hash_key(number: int) -> str:
+    """The Substrate key of pallet-ethereum's BlockHash[number] (Twox64Concat of the U256, little-endian): the
+    hash of the EVM block that Substrate block `number` built, in that block's own state."""
+    encoded = number.to_bytes(32, "little")
+    hashed = xxhash.xxh64(encoded, seed=0).intdigest().to_bytes(8, "little") + encoded
+    return "0x" + (_twox128(b"Ethereum") + _twox128(b"BlockHash") + hashed).hex()
+
+
+def storage_word(result) -> bytes:
+    """A state_getStorage answer as 32 bytes: an unset slot answers null and reads as zero."""
+    if result is None:
+        return bytes(32)
     if not isinstance(result, str):
-        raise RpcReadError("the pinned read has no answer")
-    raw = bytes.fromhex(result.removeprefix("0x"))
-    if not raw:
-        # a call to an address with no code answers nothing: the RPC did not apply the state override
-        raise RpcReadError("the pinned read answered 0 bytes; the RPC must support eth_call state overrides")
-    if len(raw) != 0x60 + sum(sizes):
-        raise RpcReadError(f"the pinned read answered {len(raw)} bytes")
-    return raw
+        raise RpcReadError("the storage read answered no word")
+    try:
+        word = bytes.fromhex(result.removeprefix("0x"))
+    except ValueError as error:
+        raise RpcReadError("the storage read answered no word") from error
+    if len(word) != 32:
+        raise RpcReadError(f"the storage read answered {len(word)} bytes")
+    return word
 
 
-def pinned_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
-    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
-    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
-    raw = _pinned_answer(result, sizes)
-    number, parent, timestamp = (raw[i : i + 32] for i in (0, 32, 64))
-    if (
-        int.from_bytes(number, "big") != block_number(header)
-        or not same_hash(parent, header.get("parentHash"))
-        or int.from_bytes(timestamp, "big") != int(header["timestamp"], 16)
-    ):
-        raise RpcReadError("the read did not run on the block it is pinned to")
-    outputs, at = [], 0x60
-    for size in sizes:
-        outputs.append(raw[at : at + size])
-        at += size
-    return outputs
-
-
-def child_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
-    """The view call outputs of a pinned_read_code answer that ran on a child of `header`: NUMBER is one past it
-    and BLOCKHASH(NUMBER - 1) is its hash, which only a chain holding that block can answer."""
-    raw = _pinned_answer(result, sizes)
-    if int.from_bytes(raw[0:32], "big") != block_number(header) + 1 or not same_hash(raw[32:64], header.get("hash")):
-        raise RpcReadError("the read did not run on a child of the block it is pinned to")
-    outputs, at = [], 0x60
-    for size in sizes:
-        outputs.append(raw[at : at + size])
-        at += size
-    return outputs
+def _low(word: bytes, size: int) -> bytes:
+    """The `size` low-order bytes of a storage word that holds one value of that size."""
+    if any(word[: 32 - size]):
+        raise RpcReadError("a storage word holds more than the value the contract keeps there")
+    return word[32 - size :]
 
 
 def bloom_may_hold(bloom, *values: bytes) -> bool:
@@ -378,11 +354,12 @@ class CollateralClient:
 
     async def get_executor_collateral(self, executor_uuid: str, block_hash=None):
         """The executor's collateral in TAO, at the block named by `block_hash` when one is given, else at latest."""
-        function = self.contract.functions.collaterals(executor_uuid_bytes(executor_uuid))
         if block_hash is None:
-            amount = await function.call()
+            amount = await self.contract.functions.collaterals(executor_uuid_bytes(executor_uuid)).call()
         else:
-            amount = await self._call_at_block_hash(function, block_hash)
+            slot = mapping_slot(executor_uuid_bytes(executor_uuid).ljust(32, b"\0"), self._layout()["collaterals"])
+            [word] = await self._storage_at_block_hash([slot], block_hash)
+            amount = int.from_bytes(word, "big")
         return AsyncWeb3.from_wei(amount, "ether")
 
     async def get_reclaim_request(self, reclaim_request_id: int, block_hash=None) -> tuple:
@@ -396,8 +373,8 @@ class CollateralClient:
         return (await self.w3.eth.get_block("finalized"))["hash"]
 
     async def head_parent_hash(self):
-        """The newest block a pinned read can run on: the head's parent. `_call_at_block_hash` also runs the read on
-        the pinned block's child, and no node has a child of the head yet ("header not found")."""
+        """The block a read near the head is pinned to: the head's parent, which more backends of a gateway have
+        imported than the head itself (`_storage_at_block_hash` fails on one that has not)."""
         return (await self.w3.eth.get_block("latest"))["parentHash"]
 
     async def _pinned_chain_id(self) -> int:
@@ -989,38 +966,46 @@ class CollateralClient:
         )
 
     async def _reclaim_at_block_hash(self, reclaim_request_id: int, block_hash) -> tuple:
-        return await self._call_at_block_hash(self.contract.functions.reclaims(reclaim_request_id), block_hash)
-
-    async def _call_at_block_hash(self, function, block_hash):
-        """A view function's result at a block named by its hash. A contract function's call(block_identifier=<hash>)
-        looks the hash up and sends the call by number; here the header is read by hash first.
-
-        Frontier ignores requireCanonical and answers a hash it does not know from its pending state, which can
-        carry the block's number, parent and timestamp; a call pinned by number can reach a sibling block with the
-        same three. So it runs inside pinned_read_code twice: pinned by hash, where the header words must match the
-        header, and on the block's child, where BLOCKHASH(NUMBER - 1) must be the block's hash, which only a chain
-        holding the block answers. The child's run sees the child's state, so a third run pinned by the block's
-        number, which a backend without the block refuses, must agree as well. The answers must agree; no child yet
-        fails closed. Both runs are plain calls
-        (pinned_call), so the creator whitelist does not apply. Every output of the contract's view functions is a
-        static type."""
-        hash_hex = AsyncWeb3.to_hex(block_hash)
-        outputs = [output["type"] for output in function.abi["outputs"]]
-        size = 32 * len(outputs)
-        code = pinned_read_code(self.contract_address, [(bytes.fromhex(function._encode_transaction_data()[2:]), size)])
-        (block,) = await self._read_together(("eth_getBlockByHash", [hash_hex, False]))
-        if not isinstance(block, dict) or block.get("hash") != hash_hex:
-            raise RpcReadError("the RPC does not have the block the read is pinned to")
-        by_hash, by_number, at_child = await self._read_together(
-            ("eth_call", pinned_call(code, {"blockHash": hash_hex, "requireCanonical": True})),
-            ("eth_call", pinned_call(code, {"blockNumber": hex(block_number(block))})),
-            ("eth_call", pinned_call(code, {"blockNumber": hex(block_number(block) + 1)})),
+        """(executorId, miner, amount in wei, denyTimeout) of `reclaims[id]` at the block, as the getter answers."""
+        base = mapping_slot(reclaim_request_id.to_bytes(32, "big"), self._layout()["reclaims"])
+        executor_id, miner, amount, deny_timeout = await self._storage_at_block_hash([base + i for i in range(4)], block_hash)
+        return (
+            _low(executor_id, 16),
+            AsyncWeb3.to_checksum_address(_low(miner, 20)),
+            int.from_bytes(amount, "big"),
+            int.from_bytes(_low(deny_timeout, 8), "big"),
         )
-        [result] = pinned_outputs(by_hash, block, [size])
-        if not pinned_outputs(by_number, block, [size]) == child_outputs(at_child, block, [size]) == [result]:
-            raise RpcReadError("the reads at the block and at its child disagree")
-        decoded = self.w3.codec.decode(outputs, result)
-        return decoded[0] if len(outputs) == 1 else tuple(decoded)
+
+    def _layout(self) -> dict[str, int]:
+        layout = STORAGE_LAYOUTS.get(self.contract_address)
+        if layout is None:
+            raise RpcReadError(f"no storage layout is known for contract {self.contract_address}")
+        return layout
+
+    async def _storage_at_block_hash(self, slots: list[int], block_hash) -> list[bytes]:
+        """The contract's storage words at the EVM block named by `block_hash`.
+
+        An eth_call cannot be pinned to a block: Frontier answers a hash it does not know from its pending state,
+        and a number can reach a sibling. So the words are read from pallet-evm's AccountStorages with
+        state_getStorage at the Substrate block that built the EVM block. A Substrate node answers a state query at
+        a hash only from that block's own state and refuses a hash it does not have, so every answer of the batch
+        is that block's, whichever backend serves it. The batch also reads pallet-ethereum's BlockHash[number] at
+        the same hash, which must be `block_hash`: a backend whose block at that number is another one fails it."""
+        hash_hex = AsyncWeb3.to_hex(block_hash)
+        (block,) = await self._read_together(("eth_getBlockByHash", [hash_hex, False]))
+        if not isinstance(block, dict) or not same_hash(block.get("hash"), hash_hex):
+            raise RpcReadError("the RPC does not have the block the read is pinned to")
+        number = block_number(block)
+        (substrate_hash,) = await self._read_together(("chain_getBlockHash", [number]))
+        if not isinstance(substrate_hash, str) or len(hash_text(substrate_hash)) != 64:
+            raise RpcReadError("the RPC has no Substrate block at the pinned block's number")
+        built, *words = await self._read_together(
+            ("state_getStorage", [ethereum_block_hash_key(number), substrate_hash]),
+            *(("state_getStorage", [evm_storage_key(self.contract_address, slot), substrate_hash]) for slot in slots),
+        )
+        if not same_hash(built, hash_hex):
+            raise RpcReadError("the Substrate block at that number did not build the block the read is pinned to")
+        return [storage_word(word) for word in words]
 
     async def _reclaim_events_at(self, finalized) -> list[ReclaimRequest] | None:
         """The open requests at the finalized block, or None when a block or log is not on its chain, or a block's
