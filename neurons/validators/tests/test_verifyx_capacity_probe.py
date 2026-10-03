@@ -118,7 +118,9 @@ def _judge(network_execution: dict, *, network_flag: bool = False) -> dict:
         return _perform_verification_checks(payload)
 
 
-async def _run_check(context_factory, verification_result: dict, *, prev_ema=None, specs=None):
+async def _run_check(
+    context_factory, verification_result: dict, *, prev_ema=None, prev_upload=None, specs=None
+):
     # The double spreads `updated_specs` over its own `success: True`, so the judged result's
     # `success` (True or False) is what the check reads, as after `evaluate_verifyx_capture`.
     verifyx_service = DummyVerifyXService(success=True, updated_specs=verification_result)
@@ -126,7 +128,7 @@ async def _run_check(context_factory, verification_result: dict, *, prev_ema=Non
     config = build_context_config(verifyx_enabled=True)
     state = build_state(
         specs=specs if specs is not None else {"gpu": {"count": 8}, "network": {}},
-        rented_data=_rented_data_with_ema("executor-123", download=prev_ema),
+        rented_data=_rented_data_with_ema("executor-123", download=prev_ema, upload=prev_upload),
     )
     ctx = context_factory(services=services, config=config, state=state)
     return await VerifyXCheck().run(ctx)
@@ -270,17 +272,78 @@ async def test_cloudflare_unreachable_uses_the_package_reading_and_does_not_feed
 async def test_cloudflare_unreachable_for_five_cycles_does_not_delist_an_honest_host(
     context_factory,
 ):
-    """Five Cloudflare outages feed the package reading, not zeros. The host stays above the gate."""
+    """Five Cloudflare outages feed the package reading, not zeros. The host stays above the gate,
+    and its upload EMA is not halved five times (1900 → 59): it stays at 1900."""
     ema = HOST_CAPACITY_MBPS
+    upload_ema = HOST_UPLOAD_MBPS
     outcomes = []
     for _ in range(5):
         verification = _judge(_cloudflare_unreachable_payload())
-        result = await _run_check(context_factory, verification, prev_ema=ema)
-        ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
+        result = await _run_check(
+            context_factory, verification, prev_ema=ema, prev_upload=upload_ema
+        )
+        net = result.updates["state"].specs["network"]
+        ema = net["ema_verifyx_download_speed"]
+        upload_ema = net["ema_verifyx_upload_speed"]
         outcomes.append(result.passed)
 
     assert all(outcomes)
     assert ema > MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+    assert upload_ema == HOST_UPLOAD_MBPS
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_unreachable_keeps_the_upload_ema_and_marks_upload_unmeasured(
+    context_factory,
+):
+    """The probe reports upload 0.0 when it cannot reach Cloudflare. That is no upload reading:
+    the previous upload EMA stands, no raw `verifyx_upload_speed` is written, and the event says
+    upload was not measured."""
+    verification = _judge(_cloudflare_unreachable_payload())
+    assert verification["network"]["upload_speed"] == 0.0
+
+    result = await _run_check(
+        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
+    )
+
+    net = result.updates["state"].specs["network"]
+    assert net["ema_verifyx_upload_speed"] == HOST_UPLOAD_MBPS
+    assert "verifyx_upload_speed" not in net
+    assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_unreachable_on_a_never_measured_host_seeds_no_upload_ema(
+    context_factory,
+):
+    """No previous upload EMA and no upload reading: nothing to keep, and no 0 is seeded."""
+    verification = _judge(_cloudflare_unreachable_payload())
+
+    result = await _run_check(context_factory, verification, prev_ema=HOST_CAPACITY_MBPS)
+
+    net = result.updates["state"].specs["network"]
+    assert "ema_verifyx_upload_speed" not in net
+    assert "verifyx_upload_speed" not in net
+
+
+@pytest.mark.asyncio
+async def test_a_measured_zero_upload_outside_a_fallback_still_lowers_the_upload_ema(
+    context_factory,
+):
+    """Outside a Cloudflare fallback the probe reached Cloudflare, so an upload of 0.0 is the
+    host's own failed upload: it is a measurement and halves the EMA (1900 → 950)."""
+    verification = _judge(_probe_payload(upload_mbps=0.0))
+    assert verification["network"].get("cloudflare_fallback") is not True
+    assert verification["network"]["upload_speed"] == 0.0
+
+    result = await _run_check(
+        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
+    )
+
+    net = result.updates["state"].specs["network"]
+    assert net["verifyx_upload_speed"] == 0.0
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(compute_ema(HOST_UPLOAD_MBPS, 0.0))
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(950.0)
 
 
 @pytest.mark.asyncio

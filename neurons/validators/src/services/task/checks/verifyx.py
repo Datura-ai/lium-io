@@ -9,7 +9,11 @@ from protocol.vc_protocol.compute_requests import NetworkEMA
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.verifyx_validation_service import NETWORK_GATE_TALLY, _is_speed_reading
+from services.verifyx_validation_service import (
+    NETWORK_GATE_TALLY,
+    _is_positive_number,
+    _is_speed_reading,
+)
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -177,11 +181,13 @@ class VerifyXCheck:
             )
 
             # Always compute verifyx network EMA. A Cloudflare probe failure that fell back to
-            # the package download feeds that number, never 0. A malformed reading never reaches
-            # compute_ema: the previous EMA stands.
+            # the package download feeds that number, never 0, and leaves no upload reading, so the
+            # previous upload EMA stands. A malformed reading never reaches compute_ema: the
+            # previous EMA stands.
             if "network" not in updated_specs:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
+            cloudflare_fallback = bool(verifyx_network.get("cloudflare_fallback"))
             unavailable_readings: list[str] = []
             ema_download = _feed_ema(
                 ctx,
@@ -190,15 +196,16 @@ class VerifyXCheck:
                 download_speed,
                 prev_ema.ema_verifyx_download_speed if prev_ema else None,
                 unavailable_readings,
-                keep_previous_on_none=bool(verifyx_network.get("cloudflare_fallback")),
+                keep_previous_on_none=cloudflare_fallback,
             )
             _feed_ema(
                 ctx,
                 updated_specs["network"],
                 "upload",
-                verifyx_network.get("upload_speed"),
+                _fallback_upload_reading(verifyx_network.get("upload_speed"), cloudflare_fallback),
                 prev_ema.ema_verifyx_upload_speed if prev_ema else None,
                 unavailable_readings,
+                keep_previous_on_none=cloudflare_fallback,
             )
 
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
@@ -381,6 +388,16 @@ def _feed_ema(
     ema = compute_ema(prev, reading if reading is not None else 0.0)
     network[f"ema_verifyx_{direction}_speed"] = ema
     return ema
+
+
+def _fallback_upload_reading(reading: object, cloudflare_fallback: bool) -> object:
+    """The upload reading `_feed_ema` gets. The upload test goes to Cloudflare too, so on a
+    Cloudflare fallback the 0.0 (or missing value) the probe reports is no measurement: None,
+    and the previous upload EMA stands. Outside a fallback a 0.0 is a host-caused failure and
+    still lowers the EMA; a positive upload reading under a fallback is still a measurement."""
+    if cloudflare_fallback and not _is_positive_number(reading):
+        return None
+    return reading
 
 
 def _ema_if_gated(prev: float | None, reading: object) -> float | None:
