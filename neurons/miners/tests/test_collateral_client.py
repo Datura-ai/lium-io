@@ -122,6 +122,7 @@ class FakeProvider(AsyncBaseProvider):
         # "logs-lagging" a gateway that sends the batch's blocks to A and its receipts to a lagging backend,
         # "logs-empty" one that sends the receipts to a backend that knows each block but answers each with null
         self.batch_backends = []
+        self.sibling_calls = {}
         self.fork_b_hash = FORK_B
         # transactions of a listed block whose receipt is answered with null, as by a partly synced backend
         self.withheld_receipts = set()
@@ -150,6 +151,15 @@ class FakeProvider(AsyncBaseProvider):
                     answer = self.pinned_run(params, known=False)
                 else:
                     answer = await self.make_request(method, params)
+            elif backend == "sibling":
+                # a gateway that sends the numbered call to a backend whose block at that height is a sibling
+                # with the same number, parent and timestamp but other state
+                self.requests.append((method, params))
+                answer = self.pinned_run(params)
+                if method == "eth_call" and "blockNumber" in params[1]:
+                    calls, self.calls = self.calls, {**self.calls, **self.sibling_calls}
+                    answer = self.pinned_run(params)
+                    self.calls = calls
             elif backend == "logs-empty":
                 self.requests.append((method, params))
                 answer = {"result": None}
@@ -1074,7 +1084,7 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
     assert reclaim[2] == 10**17
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert [block for _, block in details] == [{"blockNumber": hex(5000)}]
+    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}]
 
 
 async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
@@ -1118,6 +1128,39 @@ async def test_remove_executor_fails_when_its_pinned_read_is_split_across_backen
 
     provider.batch_backends = ["a", "split"]
     with pytest.raises(collateral_module.RpcReadError, match="an error answer"):
+        await utils.versions_holding_collateral(EXECUTOR)
+    assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
+
+
+async def test_a_pinned_read_that_reaches_a_sibling_block_fails():
+    """Review 5397874705 at aca7529: the numbered call can reach a backend whose block at that height is a sibling
+    with the same number, parent and timestamp. The call pinned by hash runs on the block itself; the two answers
+    disagree, so the read fails instead of reporting the sibling's amount."""
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.sibling_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    provider.block_number = provider.finalized_number = 5000
+    client = client_with(provider)
+    block_hash = await client.latest_block_hash()
+
+    provider.batch_backends = ["a", "sibling"]
+    with pytest.raises(collateral_module.RpcReadError, match="disagree"):
+        await client.get_executor_collateral(EXECUTOR, block_hash=block_hash)
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=block_hash) == Decimal("0.01")
+
+
+async def test_remove_executor_fails_when_its_pinned_read_reaches_a_sibling_block(monkeypatch):
+    """Review 5397874705: the removal guard's numbered read, sent to a sibling block that shows no collateral,
+    fails instead of letting the executor's local row go while TAO is still locked."""
+    from core import utils
+
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.sibling_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    client = client_with(provider)
+    monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
+    monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
+
+    provider.batch_backends = ["a", "sibling"]
+    with pytest.raises(collateral_module.RpcReadError, match="disagree"):
         await utils.versions_holding_collateral(EXECUTOR)
     assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
 
@@ -1183,7 +1226,8 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
 
     assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockNumber": hex(5000)} for _, block in details)
+    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}]
+    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}] for _, block in details)
 
 
 async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_requests():
@@ -1224,11 +1268,11 @@ async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_block
 
     assert [request.reclaim_request_id for request in requests] == [5]
     # the finalized block, batches of headers down to the first pruned one (4744), the logs of the one block whose
-    # bloom may hold the event, and the one request's state
+    # bloom may hold the event, and the one request's state, read pinned by hash and by number
     methods = [method for method, _ in provider.requests]
     header_batches = -(-(5000 - provider.oldest_kept + 1) // collateral_module.CHAIN_READ_BATCH)
     assert methods.count("eth_getBlockByNumber") == 1 + header_batches * collateral_module.CHAIN_READ_BATCH
-    assert methods.count("eth_getTransactionReceipt") == methods.count("eth_call") == 1
+    assert (methods.count("eth_getTransactionReceipt"), methods.count("eth_call")) == (1, 2)
     assert "eth_getLogs" not in methods
     assert "no longer keeps block 4000" in caplog.text
 
@@ -1248,7 +1292,8 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
     numbers = [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"]
     assert numbers[0] == "finalized" and max(int(number, 16) for number in numbers[1:]) == 4999
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and all(block == {"blockNumber": hex(5000)} for _, block in details)
+    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}]
+    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}] for _, block in details)
 
 
 async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():

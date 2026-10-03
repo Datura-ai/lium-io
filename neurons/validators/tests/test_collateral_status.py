@@ -69,6 +69,7 @@ class FakeRpc:
         self.batches: list[list[dict]] = []
         self.head_tags: list[str] = []
         self.pending = PENDING
+        self.sibling: tuple[str, Decimal] | None = None
 
     async def __call__(self, batch):
         if self.fail:
@@ -77,18 +78,23 @@ class FakeRpc:
             self.head_tags.append(batch[0]["params"][0])
             return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": HEADER}]
         self.batches.append(batch)
-        [req] = batch
+        return [self._run(req) for req in batch]
+
+    def _run(self, req):
         at = req["params"][1]
         # as Finney's Frontier answers: an unknown number is "header not found", an unknown hash runs on pending
         if "blockNumber" in at:
             if not (self.has_block and at["blockNumber"] == HEADER["number"]):
-                return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "header not found"}}]
+                return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "header not found"}}
             header = HEADER
         else:
             header = HEADER if self.has_block and at.get("blockHash") == BLOCK_HASH else self.pending
         owner, tao = (
             (self.owner, self.collateral_tao) if header is HEADER else (self.pending_owner, self.pending_collateral_tao)
         )
+        if "blockNumber" in at and self.sibling is not None:
+            # a backend whose block at that height is a sibling with the same number, parent and timestamp
+            owner, tao = self.sibling
         results = {
             executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID): _address_word(owner),
             executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID): _tao_word(tao),
@@ -97,7 +103,7 @@ class FakeRpc:
         out += int(header["timestamp"], 16).to_bytes(32, "big")
         for data, size in _pinned_inner_calls(bytes.fromhex(req["params"][0]["data"][2:])):
             out += bytes.fromhex(results[data][2:])[:size]
-        return [{"jsonrpc": "2.0", "id": req["id"], "result": "0x" + out.hex()}]
+        return {"jsonrpc": "2.0", "id": req["id"], "result": "0x" + out.hex()}
 
 
 class Clock:
@@ -146,9 +152,10 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert status.contract_version == ("1.0.2" if deposited else None)
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
-    [[req]] = rpc.batches
+    [[req, by_number]] = rpc.batches
     assert "to" not in req["params"][0]
-    assert req["params"][1] == {"blockNumber": HEADER["number"]}
+    assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
+    assert by_number["params"] == [req["params"][0], {"blockNumber": HEADER["number"]}]
     assert rpc.head_tags == ["finalized"]
     contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
     assert req["params"][0]["data"].count("73" + contract) == 2
@@ -195,6 +202,21 @@ async def test_a_pending_block_with_the_pinned_number_parent_and_timestamp_is_ne
     status, cached = await _status(_reader(rpc))
 
     assert (status.deposited, status.read_failed, cached) == (False, True, False)
+
+
+@pytest.mark.asyncio
+async def test_a_sibling_block_with_the_pinned_number_parent_and_timestamp_is_never_read():
+    """Review at aca7529: the numbered call can reach a backend whose block at that height is a sibling of the
+    finalized one, with the same number, parent and timestamp but the miner's deposit. The read pinned by hash runs
+    on the finalized block itself, the two disagree, and the read fails instead of caching collateral_deposited."""
+    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
+    rpc.sibling = (MINER_EVM, Decimal(9))
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    rpc.sibling = None
+    status, _ = await _status(_reader(rpc))
+    assert (status.deposited, status.read_failed) == (False, False)
 
 
 @pytest.mark.asyncio

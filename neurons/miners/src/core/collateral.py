@@ -965,9 +965,10 @@ class CollateralClient:
         looks the hash up and sends the call by number; here the header is read by hash first.
 
         Frontier ignores requireCanonical and answers a hash it does not know from its pending state, which can
-        carry the block's number, parent and timestamp. So the call is pinned by the header's number, which a
-        backend without that block answers with "header not found", and it runs inside pinned_read_code, whose
-        header words must match the header. Every output of the contract's view functions is a static type."""
+        carry the block's number, parent and timestamp; a call pinned by number can reach a sibling block with the
+        same three. So it runs inside pinned_read_code, whose header words must match the header, once pinned by
+        hash and once by number, and the two answers must agree. Every output of the contract's view functions is
+        a static type."""
         hash_hex = AsyncWeb3.to_hex(block_hash)
         outputs = [output["type"] for output in function.abi["outputs"]]
         size = 32 * len(outputs)
@@ -975,9 +976,15 @@ class CollateralClient:
         (block,) = await self._read_together(("eth_getBlockByHash", [hash_hex, False]))
         if not isinstance(block, dict) or block.get("hash") != hash_hex:
             raise RpcReadError("the RPC does not have the block the read is pinned to")
-        # by number: a backend without that block answers "header not found", where an unknown hash runs on pending
-        (result,) = await self._read_together(("eth_call", [{"data": code}, {"blockNumber": block["number"]}]))
-        [result] = pinned_outputs(result, block, [size])
+        # Neither pin names the block alone: an unknown hash runs on pending state, and a number can reach a
+        # sibling block with the same number, parent and timestamp. Both runs must match the header and agree.
+        by_hash, by_number = await self._read_together(
+            ("eth_call", [{"data": code}, {"blockHash": hash_hex, "requireCanonical": True}]),
+            ("eth_call", [{"data": code}, {"blockNumber": block["number"]}]),
+        )
+        [result] = pinned_outputs(by_hash, block, [size])
+        if pinned_outputs(by_number, block, [size]) != [result]:
+            raise RpcReadError("the reads pinned by hash and by number disagree")
         decoded = self.w3.codec.decode(outputs, result)
         return decoded[0] if len(outputs) == 1 else tuple(decoded)
 

@@ -267,24 +267,27 @@ class CollateralStatusReader:
             (bytes.fromhex(executor_call_data(selector, executor_uuid)[2:]), 32)
             for selector in (EXECUTOR_TO_MINER_SELECTOR, COLLATERALS_SELECTOR)
         ]
-        [answer] = await self._rpc(
+        # Neither pin names the block alone: an unknown hash runs on pending state that can carry the block's
+        # number, parent and timestamp, and a number can reach a sibling block with the same three words. So the
+        # read runs under both, and its answer counts only when both runs match the header and agree.
+        code = pinned_read_code(to, calls)
+        pins = ({"blockHash": header["hash"], "requireCanonical": True}, {"blockNumber": header["number"]})
+        answers = await self._rpc(
             [
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "eth_call",
-                    "params": [
-                        {"data": pinned_read_code(to, calls)},
-                        # by number: a backend without that block answers "header not found", where an unknown
-                        # hash runs on pending state that can carry the block's number, parent and timestamp
-                        {"blockNumber": header["number"]},
-                    ],
-                }
+                {"jsonrpc": "2.0", "id": i, "method": "eth_call", "params": [{"data": code}, pin]}
+                for i, pin in enumerate(pins, start=1)
             ]
         )
-        if not isinstance(answer, dict) or "error" in answer or "result" not in answer:
+        if not isinstance(answers, list) or len(answers) != len(pins):
             raise ValueError("eth_call has no result")
-        owner, collateral = pinned_outputs(answer["result"], header, [32, 32])
+        runs = []
+        for answer in sorted(answers, key=lambda a: a.get("id", -1) if isinstance(a, dict) else -1):
+            if not isinstance(answer, dict) or "error" in answer or "result" not in answer:
+                raise ValueError("eth_call has no result")
+            runs.append(pinned_outputs(answer["result"], header, [32, 32]))
+        if runs[0] != runs[1]:
+            raise ValueError("the reads pinned by hash and by number disagree")
+        owner, collateral = runs[0]
         return decide(
             executor_uuid=executor_uuid,
             evm_address=evm_address,
