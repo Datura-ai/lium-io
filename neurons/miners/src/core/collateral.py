@@ -228,6 +228,23 @@ def pinned_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
     return outputs
 
 
+def child_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
+    """The view call outputs of a pinned_read_code answer that ran on a child of `header`: NUMBER is one past it
+    and BLOCKHASH(NUMBER - 1) is its hash, which only a chain holding that block can answer."""
+    if not isinstance(result, str):
+        raise RpcReadError("the pinned read has no answer")
+    raw = bytes.fromhex(result.removeprefix("0x"))
+    if len(raw) != 0x60 + sum(sizes):
+        raise RpcReadError(f"the pinned read answered {len(raw)} bytes")
+    if int.from_bytes(raw[0:32], "big") != block_number(header) + 1 or not same_hash(raw[32:64], header.get("hash")):
+        raise RpcReadError("the read did not run on a child of the block it is pinned to")
+    outputs, at = [], 0x60
+    for size in sizes:
+        outputs.append(raw[at : at + size])
+        at += size
+    return outputs
+
+
 def bloom_may_hold(bloom, *values: bytes) -> bool:
     """Whether a block's 2048-bit logs bloom may hold a log with every one of `values` (address, topics): False
     only when the bloom proves it does not. A missing or malformed bloom proves nothing."""
@@ -966,8 +983,9 @@ class CollateralClient:
 
         Frontier ignores requireCanonical and answers a hash it does not know from its pending state, which can
         carry the block's number, parent and timestamp; a call pinned by number can reach a sibling block with the
-        same three. So it runs inside pinned_read_code, whose header words must match the header, once pinned by
-        hash and once by number, and the two answers must agree. Every output of the contract's view functions is
+        same three. So it runs inside pinned_read_code twice: pinned by hash, where the header words must match the
+        header, and on the block's child, where BLOCKHASH(NUMBER - 1) must be the block's hash, which only a chain
+        holding the block answers. The two answers must agree; no child yet fails closed. Every output of the contract's view functions is
         a static type."""
         hash_hex = AsyncWeb3.to_hex(block_hash)
         outputs = [output["type"] for output in function.abi["outputs"]]
@@ -976,15 +994,13 @@ class CollateralClient:
         (block,) = await self._read_together(("eth_getBlockByHash", [hash_hex, False]))
         if not isinstance(block, dict) or block.get("hash") != hash_hex:
             raise RpcReadError("the RPC does not have the block the read is pinned to")
-        # Neither pin names the block alone: an unknown hash runs on pending state, and a number can reach a
-        # sibling block with the same number, parent and timestamp. Both runs must match the header and agree.
-        by_hash, by_number = await self._read_together(
+        by_hash, at_child = await self._read_together(
             ("eth_call", [{"data": code}, {"blockHash": hash_hex, "requireCanonical": True}]),
-            ("eth_call", [{"data": code}, {"blockNumber": block["number"]}]),
+            ("eth_call", [{"data": code}, {"blockNumber": hex(block_number(block) + 1)}]),
         )
         [result] = pinned_outputs(by_hash, block, [size])
-        if pinned_outputs(by_number, block, [size]) != [result]:
-            raise RpcReadError("the reads pinned by hash and by number disagree")
+        if child_outputs(at_child, block, [size]) != [result]:
+            raise RpcReadError("the reads at the block and at its child disagree")
         decoded = self.w3.codec.decode(outputs, result)
         return decoded[0] if len(outputs) == 1 else tuple(decoded)
 

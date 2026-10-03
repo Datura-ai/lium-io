@@ -128,6 +128,10 @@ class FakeProvider(AsyncBaseProvider):
         self.withheld_receipts = set()
         # what a backend's pending state answers, by selector, when it runs a call pinned to a hash it does not know
         self.pending_calls = {}
+        # False: no backend has a child of the head block yet; True: one past the head is a canonical child
+        self.has_child = True
+        # the hash a sibling-canonical backend answers BLOCKHASH(NUMBER - 1) with on the child it runs on
+        self.sibling_parent = None
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -160,6 +164,19 @@ class FakeProvider(AsyncBaseProvider):
                     calls, self.calls = self.calls, {**self.calls, **self.sibling_calls}
                     answer = self.pinned_run(params)
                     self.calls = calls
+                    if self.sibling_parent and "result" in answer:
+                        raw = answer["result"]
+                        answer = {**answer, "result": raw[:66] + self.sibling_parent[2:] + raw[130:]}
+            elif backend == "lagging-sibling":
+                # the hash-pinned call reaches a backend one block behind, whose pending sibling carries the block's
+                # number, parent and timestamp and the sibling's state
+                self.requests.append((method, params))
+                calls, self.calls = self.calls, {**self.calls, **self.sibling_calls}
+                answer = self.pinned_run(params)
+                self.calls = calls
+                if "blockNumber" in params[1] and "result" in answer:
+                    raw = answer["result"]
+                    answer = {**answer, "result": raw[:66] + self.sibling_parent[2:] + raw[130:]}
             elif backend == "logs-empty":
                 self.requests.append((method, params))
                 answer = {"result": None}
@@ -215,9 +232,11 @@ class FakeProvider(AsyncBaseProvider):
         number = self.block_number + 1
         if "blockNumber" in params[1]:
             # Frontier: a number the backend does not have is an error, never its pending state
-            if not known or int(params[1]["blockNumber"], 16) > self.block_number:
+            if not known or int(params[1]["blockNumber"], 16) > self.block_number + self.has_child:
                 return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "header not found"}}
             number = int(params[1]["blockNumber"], 16)
+            if number == self.block_number + 1:
+                return self._run_code(code, self.block(number), self.calls)
         elif known:
             found = next((n for n in range(self.block_number + 1) if self.chain_hash(n) == params[1]["blockHash"]), None)
             number = found if found is not None else number
@@ -225,6 +244,9 @@ class FakeProvider(AsyncBaseProvider):
             "number": hex(number), "parentHash": self.chain_hash(self.block_number), "timestamp": hex(1_800_000_000)
         }
         calls = self.calls if number <= self.block_number else {**self.calls, **self.pending_calls}
+        return self._run_code(code, header, calls)
+
+    def _run_code(self, code: bytes, header: dict, calls: dict) -> dict:
         out = int(header["number"], 16).to_bytes(32, "big") + bytes.fromhex(header["parentHash"][2:])
         out += int(header["timestamp"], 16).to_bytes(32, "big")
         at = 0
@@ -1084,7 +1106,7 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
     assert reclaim[2] == 10**17
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}]
+    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
 
 
 async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
@@ -1165,6 +1187,36 @@ async def test_remove_executor_fails_when_its_pinned_read_reaches_a_sibling_bloc
     assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
 
 
+async def test_a_lagging_pending_sibling_and_a_backend_where_the_sibling_is_canonical_fail():
+    """Review at 8a84360: the hash-pinned call runs on a lagging backend's pending sibling and the other call on a
+    backend where that sibling is canonical, so both see the sibling's amount. The second call runs on the block's
+    child, where BLOCKHASH(NUMBER - 1) is the sibling's hash, so the read fails instead of reporting it."""
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.sibling_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    provider.sibling_parent = "0x" + "5b" * 32
+    provider.block_number = provider.finalized_number = 5000
+    client = client_with(provider)
+    block_hash = await client.latest_block_hash()
+
+    provider.batch_backends = ["a", "sibling"]
+    with pytest.raises(collateral_module.RpcReadError, match="child"):
+        await client.get_executor_collateral(EXECUTOR, block_hash=block_hash)
+    provider.batch_backends = ["a", "lagging-sibling"]
+    with pytest.raises(collateral_module.RpcReadError, match="child"):
+        await client.get_executor_collateral(EXECUTOR, block_hash=block_hash)
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=block_hash) == Decimal("0.01")
+
+
+async def test_a_pinned_read_fails_closed_until_the_block_has_a_child():
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.block_number = provider.finalized_number = 5000
+    provider.has_child = False
+    client = client_with(provider)
+
+    with pytest.raises(collateral_module.RpcReadError):
+        await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash())
+
+
 FORK_B = "0x" + "0b" * 32
 # the batches of one listing: the headers below the finalized block, then the receipts of the one block with a log
 LIST_BATCHES = collateral_module.RECLAIM_LOOKBACK_BLOCKS // collateral_module.CHAIN_READ_BATCH + 1
@@ -1226,8 +1278,8 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
 
     assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}]
-    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}] for _, block in details)
+    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
+    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}] for _, block in details)
 
 
 async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_requests():
@@ -1292,8 +1344,8 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
     numbers = [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"]
     assert numbers[0] == "finalized" and max(int(number, 16) for number in numbers[1:]) == 4999
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}]
-    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5000)}] for _, block in details)
+    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
+    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}] for _, block in details)
 
 
 async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():

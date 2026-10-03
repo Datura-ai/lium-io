@@ -121,6 +121,26 @@ def pinned_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> lis
     return outputs
 
 
+def child_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
+    """The view call outputs of a pinned_read_code answer that ran on a child of `header`: NUMBER is one past it
+    and BLOCKHASH(NUMBER - 1) is its hash, which only a chain holding that block can answer."""
+    if not isinstance(result, str):
+        raise ValueError("pinned read has no answer")
+    raw = bytes.fromhex(result.removeprefix("0x"))
+    if len(raw) != 0x60 + sum(sizes):
+        raise ValueError(f"pinned read answered {len(raw)} bytes")
+    if (
+        int.from_bytes(raw[0:32], "big") != int(header["number"], 16) + 1
+        or "0x" + raw[32:64].hex() != str(header["hash"]).lower()
+    ):
+        raise ValueError("the read did not run on a child of the block it is pinned to")
+    outputs, at = [], 0x60
+    for size in sizes:
+        outputs.append(raw[at : at + size])
+        at += size
+    return outputs
+
+
 def required_deposit_tao(gpu_model: str | None, gpu_count: int) -> Decimal | None:
     unit = shared_client.config.required_deposit_amount.get(gpu_model) if gpu_model else None
     if unit is None:
@@ -267,11 +287,15 @@ class CollateralStatusReader:
             (bytes.fromhex(executor_call_data(selector, executor_uuid)[2:]), 32)
             for selector in (EXECUTOR_TO_MINER_SELECTOR, COLLATERALS_SELECTOR)
         ]
-        # Neither pin names the block alone: an unknown hash runs on pending state that can carry the block's
-        # number, parent and timestamp, and a number can reach a sibling block with the same three words. So the
-        # read runs under both, and its answer counts only when both runs match the header and agree.
+        # Neither a hash nor a number pin names the block alone: an unknown hash runs on pending state that can
+        # carry the block's number, parent and timestamp, and a number can reach a sibling with the same three. A
+        # run on the block's child can: BLOCKHASH(NUMBER - 1) there is the block's own hash. The answer counts only
+        # when the run pinned by hash matches the header and agrees with the child's run; no child yet fails closed.
         code = pinned_read_code(to, calls)
-        pins = ({"blockHash": header["hash"], "requireCanonical": True}, {"blockNumber": header["number"]})
+        pins = (
+            {"blockHash": header["hash"], "requireCanonical": True},
+            {"blockNumber": hex(int(header["number"], 16) + 1)},
+        )
         answers = await self._rpc(
             [
                 {"jsonrpc": "2.0", "id": i, "method": "eth_call", "params": [{"data": code}, pin]}
@@ -280,13 +304,14 @@ class CollateralStatusReader:
         )
         if not isinstance(answers, list) or len(answers) != len(pins):
             raise ValueError("eth_call has no result")
-        runs = []
+        results = []
         for answer in sorted(answers, key=lambda a: a.get("id", -1) if isinstance(a, dict) else -1):
             if not isinstance(answer, dict) or "error" in answer or "result" not in answer:
                 raise ValueError("eth_call has no result")
-            runs.append(pinned_outputs(answer["result"], header, [32, 32]))
+            results.append(answer["result"])
+        runs = [pinned_outputs(results[0], header, [32, 32]), child_outputs(results[1], header, [32, 32])]
         if runs[0] != runs[1]:
-            raise ValueError("the reads pinned by hash and by number disagree")
+            raise ValueError("the reads at the block and at its child disagree")
         owner, collateral = runs[0]
         return decide(
             executor_uuid=executor_uuid,

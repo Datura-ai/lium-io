@@ -46,6 +46,8 @@ def _tao_word(tao: Decimal) -> str:
 
 
 HEADER = {"hash": BLOCK_HASH, "number": hex(16), "parentHash": "0x" + "aa" * 32, "timestamp": hex(1_700_000_000)}
+CHILD = {"number": hex(17), "parentHash": BLOCK_HASH, "timestamp": hex(1_700_000_012)}
+SIBLING_CHILD = {"number": hex(17), "parentHash": "0x" + "cc" * 32, "timestamp": hex(1_700_000_012)}
 # the pending state a backend without BLOCK_HASH runs a call on, as Frontier does
 PENDING = {"number": hex(17), "parentHash": "0x" + "bb" * 32, "timestamp": hex(1_700_000_012)}
 
@@ -70,6 +72,8 @@ class FakeRpc:
         self.head_tags: list[str] = []
         self.pending = PENDING
         self.sibling: tuple[str, Decimal] | None = None
+        # False: the backend has not imported a child of HEADER yet
+        self.has_child = True
 
     async def __call__(self, batch):
         if self.fail:
@@ -84,13 +88,16 @@ class FakeRpc:
         at = req["params"][1]
         # as Finney's Frontier answers: an unknown number is "header not found", an unknown hash runs on pending
         if "blockNumber" in at:
-            if not (self.has_block and at["blockNumber"] == HEADER["number"]):
+            if not ((self.has_block or self.sibling is not None) and self.has_child and at["blockNumber"] == CHILD["number"]):
                 return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "header not found"}}
-            header = HEADER
+            # a backend where a sibling is canonical runs on the sibling's child, whose parent hash is the sibling's
+            header = SIBLING_CHILD if self.sibling is not None else CHILD
         else:
             header = HEADER if self.has_block and at.get("blockHash") == BLOCK_HASH else self.pending
         owner, tao = (
-            (self.owner, self.collateral_tao) if header is HEADER else (self.pending_owner, self.pending_collateral_tao)
+            (self.owner, self.collateral_tao)
+            if header is HEADER or header is CHILD
+            else (self.pending_owner, self.pending_collateral_tao)
         )
         if "blockNumber" in at and self.sibling is not None:
             # a backend whose block at that height is a sibling with the same number, parent and timestamp
@@ -152,10 +159,10 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert status.contract_version == ("1.0.2" if deposited else None)
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
-    [[req, by_number]] = rpc.batches
+    [[req, at_child]] = rpc.batches
     assert "to" not in req["params"][0]
     assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
-    assert by_number["params"] == [req["params"][0], {"blockNumber": HEADER["number"]}]
+    assert at_child["params"] == [req["params"][0], {"blockNumber": CHILD["number"]}]
     assert rpc.head_tags == ["finalized"]
     contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
     assert req["params"][0]["data"].count("73" + contract) == 2
@@ -217,6 +224,31 @@ async def test_a_sibling_block_with_the_pinned_number_parent_and_timestamp_is_ne
     rpc.sibling = None
     status, _ = await _status(_reader(rpc))
     assert (status.deposited, status.read_failed) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_a_lagging_pending_sibling_and_a_backend_where_the_sibling_is_canonical_are_never_read():
+    """Review at 8a84360: the hash-pinned call reaches a backend one block behind, which runs on its pending block,
+    a sibling with the finalized number, parent and timestamp; the other call reaches a backend where that sibling
+    is canonical. Both see the sibling's deposit. The second run is on a child, where BLOCKHASH(NUMBER - 1) is the
+    sibling's hash rather than the finalized one, so the read fails instead of caching collateral_deposited."""
+    rpc = FakeRpc("0x" + "0" * 40, Decimal(0))
+    rpc.has_block = False
+    rpc.pending = {k: HEADER[k] for k in ("number", "parentHash", "timestamp")}
+    rpc.pending_owner, rpc.pending_collateral_tao = MINER_EVM, Decimal(9)
+    rpc.sibling = (MINER_EVM, Decimal(9))
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+
+
+@pytest.mark.asyncio
+async def test_a_finalized_block_with_no_child_yet_is_a_failed_read():
+    rpc = FakeRpc(MINER_EVM, Decimal(9))
+    rpc.has_child = False
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
 
 
 @pytest.mark.asyncio
