@@ -129,8 +129,9 @@ class FakeProvider(AsyncBaseProvider):
         self.withheld_receipts = set()
         # what a backend's pending state answers, by selector, when it runs a call pinned to a hash it does not know
         self.pending_calls = {}
-        # False: no backend has a child of the head block yet; True: one past the head is a canonical child
-        self.has_child = True
+        # False, as on a real chain: no backend has a child of the head block yet; True: one past the head is a
+        # canonical child
+        self.has_child = False
         # the hash a sibling-canonical backend answers BLOCKHASH(NUMBER - 1) with on the child it runs on
         self.sibling_parent = None
         # True: EVM::DisableWhitelistCheck is off and WhitelistedCreators is empty, so a contract-creation call fails
@@ -1112,7 +1113,7 @@ async def test_the_record_directory_is_synced_before_the_broadcast(monkeypatch):
 
 async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    provider.block_number = provider.finalized_number = 5000
+    provider.block_number, provider.finalized_number = 5001, 5000
     client = client_with(provider)
 
     block_hash = await client.finalized_block_hash()
@@ -1261,7 +1262,7 @@ async def test_a_pinned_read_fails_closed_until_the_block_has_a_child():
     client = client_with(provider)
 
     with pytest.raises(collateral_module.RpcReadError):
-        await client.get_executor_collateral(EXECUTOR, block_hash=provider.chain_hash(5000))
+        await client.get_executor_collateral(EXECUTOR, block_hash=bytes.fromhex(provider.chain_hash(5000)[2:]))
 
 
 async def test_remove_executor_reads_at_the_head_parent_on_a_chain_whose_head_has_no_child(monkeypatch):
@@ -1323,7 +1324,7 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
     one on another fork (reviews of 21ec2fd: A's log with B's amount; B's empty log answer). The list is A's, or an
     error."""
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim(amount)})
-    provider.block_number = provider.finalized_number = 5000
+    provider.block_number, provider.finalized_number = 5001, 5000
     at = {"blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}
     started = {**started_log(url="https://fork-a/reclaim"), **at}
     provider.logs = [started]
@@ -1354,7 +1355,7 @@ async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_re
     """Review of a7a2820: a block holds this contract's Reclaimed and the old contract's ReclaimProcessStarted, so
     its bloom holds this address and the started topic, though no log holds both."""
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    provider.block_number = provider.finalized_number = 5000
+    provider.block_number, provider.finalized_number = 5001, 5000
     at = {"blockNumber": hex(4500), "blockHash": provider.chain_hash(4500)}
     provider.logs = [{**reclaimed_log(), **at}, {**started_log(), **at, "address": OLD_CONTRACT, "logIndex": "0x1"}]
 
@@ -1379,7 +1380,7 @@ async def test_a_rate_limited_list_backs_off_and_reads_a_bounded_number_of_block
     after about 100 reads and keeps only about 256 blocks."""
     monkeypatch.setattr(collateral_module, "RATE_LIMIT_RETRY_SEC", (0, 0, 0))
     provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()})
-    provider.block_number = provider.finalized_number = 5000
+    provider.block_number, provider.finalized_number = 5001, 5000
     provider.logs = [{**started_log(), "blockNumber": hex(4900), "blockHash": provider.chain_hash(4900)}]
     provider.oldest_kept = 5000 - 255
     provider.batch_backends = ["429", "429"]
