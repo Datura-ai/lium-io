@@ -18,6 +18,7 @@ from web3.providers.async_base import AsyncBaseProvider
 
 from core import collateral as collateral_module
 from core.collateral import (
+    PINNED_READ_ADDRESS,
     CollateralClient,
     CollateralConfigError,
     CollateralOutcomeUnknownError,
@@ -132,6 +133,10 @@ class FakeProvider(AsyncBaseProvider):
         self.has_child = True
         # the hash a sibling-canonical backend answers BLOCKHASH(NUMBER - 1) with on the child it runs on
         self.sibling_parent = None
+        # True: EVM::DisableWhitelistCheck is off and WhitelistedCreators is empty, so a contract-creation call fails
+        self.creator_whitelist = False
+        # False: the RPC drops eth_call's state override, so a call to an address with no code answers "0x"
+        self.honours_overrides = True
 
     async def is_connected(self, show_traceback: bool = False) -> bool:
         return True
@@ -228,7 +233,16 @@ class FakeProvider(AsyncBaseProvider):
     def pinned_run(self, params, known: bool = True) -> dict:
         """A pinned_read_code eth_call: the header words of the block it runs on, then each inner call's answer.
         A hash this backend does not know runs on its pending state, as Frontier does, with `pending_calls`."""
-        code = bytes.fromhex(params[0]["data"].removeprefix("0x"))
+        if "to" not in params[0]:
+            if self.creator_whitelist:
+                return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "evm error: NotAllowed"}}
+            code_hex = params[0]["data"]
+        else:
+            overrides = params[2] if len(params) > 2 and self.honours_overrides else {}
+            code_hex = overrides.get(params[0]["to"], {}).get("code", "0x")
+            if code_hex == "0x":
+                return {"jsonrpc": "2.0", "id": 1, "result": "0x"}
+        code = bytes.fromhex(code_hex.removeprefix("0x"))
         number = self.block_number + 1
         if "blockNumber" in params[1]:
             # Frontier: a number the backend does not have is an error, never its pending state
@@ -262,7 +276,7 @@ class FakeProvider(AsyncBaseProvider):
 
     async def make_request(self, method, params):
         self.requests.append((method, params))
-        if method == "eth_call" and "to" not in params[0]:
+        if method == "eth_call" and ("to" not in params[0] or params[0]["to"] == PINNED_READ_ADDRESS):
             return self.pinned_run(params)
         if method == "eth_call":
             data = params[0]["data"].removeprefix("0x")
@@ -1106,7 +1120,7 @@ async def test_a_reclaim_request_read_at_a_block_hash_names_that_block():
 
     assert reclaim[2] == 10**17
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert [block for _, block in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
+    assert [block for _, block, *_override in details] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
 
 
 async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
@@ -1119,6 +1133,37 @@ async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
     with pytest.raises(collateral_module.RpcReadError, match="does not have the block"):
         await client.get_executor_collateral(EXECUTOR, block_hash=bytes.fromhex("ee" * 32))
     assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash()) == Decimal("0.01")
+
+
+@pytest.mark.parametrize("creator_whitelist", [False, True], ids=["whitelist-check-disabled", "whitelist-check-on"])
+async def test_a_pinned_read_does_not_depend_on_the_evm_creator_whitelist(creator_whitelist, monkeypatch):
+    """Review 5397591319 at 78c163c: Subtensor runs a contract-creation eth_call through WhitelistedCreators unless
+    EVM::DisableWhitelistCheck is set. Every pinned read, the removal guard's included, is a plain call to
+    PINNED_READ_ADDRESS with its code set by the state override, so it answers the same with the check on or off."""
+    from core import utils
+
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.block_number = provider.finalized_number = 5000
+    provider.creator_whitelist = creator_whitelist
+    client = client_with(provider)
+    monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
+    monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
+
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash()) == Decimal("0.01")
+    assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
+    pinned = [params for method, params in provider.requests if method == "eth_call" and len(params) == 3]
+    assert pinned and all(params[0] == {"to": PINNED_READ_ADDRESS, "data": "0x"} for params in pinned)
+    assert all("to" in params[0] for method, params in provider.requests if method == "eth_call")
+
+
+async def test_a_pinned_read_on_an_rpc_that_drops_the_state_override_fails():
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.block_number = provider.finalized_number = 5000
+    provider.honours_overrides = False
+    client = client_with(provider)
+
+    with pytest.raises(collateral_module.RpcReadError, match="state overrides"):
+        await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash())
 
 
 async def test_a_pinned_read_split_across_backends_fails_instead_of_reading_pending_state():
@@ -1278,8 +1323,8 @@ async def test_the_open_reclaim_list_never_mixes_logs_and_state_of_two_forks(bac
 
     assert [(request.url, request.block_number) for request in requests] == [(urls[0], 4500)]
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
-    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}] for _, block in details)
+    assert details and [block for _, block, *_override in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
+    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}] for _, block, *_override in details)
 
 
 async def test_a_block_with_events_of_both_contracts_lists_each_contracts_own_requests():
@@ -1344,8 +1389,8 @@ async def test_the_open_reclaim_list_is_read_at_the_finalized_block_not_the_head
     numbers = [params[0] for method, params in provider.requests if method == "eth_getBlockByNumber"]
     assert numbers[0] == "finalized" and max(int(number, 16) for number in numbers[1:]) == 4999
     details = [params for method, params in provider.requests if method == "eth_call"]
-    assert details and [block for _, block in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
-    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}] for _, block in details)
+    assert details and [block for _, block, *_override in details[:2]] == [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}]
+    assert all(block in [{"blockHash": provider.chain_hash(5000), "requireCanonical": True}, {"blockNumber": hex(5001)}] for _, block, *_override in details)
 
 
 async def test_a_refused_broadcast_keeps_the_record_and_the_next_run_sends_the_same_bytes():

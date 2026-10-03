@@ -82,6 +82,10 @@ CHAIN_READ_BATCH = 50
 KEPT_BLOCKS_MIN = 128
 # The default finney RPC answers HTTP 429 after about 100 reads in 30 s; a batch waits this long before each retry.
 RATE_LIMIT_RETRY_SEC = (2, 5, 10)
+# An address with no code and no precompile. A pinned read is a call to it with pinned_read_code set as its code
+# by eth_call's state override. A contract-creation eth_call would go through the runtime's creator whitelist
+# (WhitelistedCreators, DisableWhitelistCheck), which a plain call does not.
+PINNED_READ_ADDRESS = "0x00000000000000000000000000000000000c0113"
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
 
 SS58_FORMAT = 42
@@ -167,9 +171,9 @@ def block_number(block) -> int:
 
 
 def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
-    """Init code for a contract-creation eth_call that makes each (calldata, output size) view call to `to` in one
-    EVM run and returns NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run
-    reads one state on one backend, and the three header words prove which block that state is."""
+    """Code that makes each (calldata, output size) view call to `to` in one EVM run and returns NUMBER,
+    BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run reads one state on one
+    backend, and the header words prove which block that state is. It is run by pinned_call."""
 
     def push2(value: int) -> bytes:
         return b"\x61" + value.to_bytes(2, "big")
@@ -206,14 +210,27 @@ def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
     return "0x" + bytes(code).hex() + b"".join(data for data, _ in calls).hex()
 
 
-def pinned_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
-    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
-    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
+def pinned_call(code: str, pin: dict) -> list:
+    """eth_call params that run `code` at the block `pin` names, as the code of PINNED_READ_ADDRESS."""
+    return [{"to": PINNED_READ_ADDRESS, "data": "0x"}, pin, {PINNED_READ_ADDRESS: {"code": code}}]
+
+
+def _pinned_answer(result: str, sizes: list[int]) -> bytes:
     if not isinstance(result, str):
         raise RpcReadError("the pinned read has no answer")
     raw = bytes.fromhex(result.removeprefix("0x"))
+    if not raw:
+        # a call to an address with no code answers nothing: the RPC did not apply the state override
+        raise RpcReadError("the pinned read answered 0 bytes; the RPC must support eth_call state overrides")
     if len(raw) != 0x60 + sum(sizes):
         raise RpcReadError(f"the pinned read answered {len(raw)} bytes")
+    return raw
+
+
+def pinned_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
+    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
+    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
+    raw = _pinned_answer(result, sizes)
     number, parent, timestamp = (raw[i : i + 32] for i in (0, 32, 64))
     if (
         int.from_bytes(number, "big") != block_number(header)
@@ -231,11 +248,7 @@ def pinned_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
 def child_outputs(result: str, header: dict, sizes: list[int]) -> list[bytes]:
     """The view call outputs of a pinned_read_code answer that ran on a child of `header`: NUMBER is one past it
     and BLOCKHASH(NUMBER - 1) is its hash, which only a chain holding that block can answer."""
-    if not isinstance(result, str):
-        raise RpcReadError("the pinned read has no answer")
-    raw = bytes.fromhex(result.removeprefix("0x"))
-    if len(raw) != 0x60 + sum(sizes):
-        raise RpcReadError(f"the pinned read answered {len(raw)} bytes")
+    raw = _pinned_answer(result, sizes)
     if int.from_bytes(raw[0:32], "big") != block_number(header) + 1 or not same_hash(raw[32:64], header.get("hash")):
         raise RpcReadError("the read did not run on a child of the block it is pinned to")
     outputs, at = [], 0x60
@@ -330,9 +343,8 @@ class CollateralClient:
         return self._w3
 
     async def _read_together(self, *requests: tuple[str, list]) -> list:
-        """The results of JSON-RPC reads sent as one batch. A batch is one HTTP request, which a load balancer
-        hands to one backend, so its answers come from one view of the chain; separate reads can each reach
-        another backend, a lagging one or one on another fork."""
+        """The results of JSON-RPC reads sent as one batch, in request order. A gateway may send each item of a
+        batch to another backend, so the answers are not taken to come from one view of the chain."""
         for delay in (*RATE_LIMIT_RETRY_SEC, None):
             try:
                 answers = await self.w3.provider.make_batch_request(list(requests))
@@ -985,8 +997,9 @@ class CollateralClient:
         carry the block's number, parent and timestamp; a call pinned by number can reach a sibling block with the
         same three. So it runs inside pinned_read_code twice: pinned by hash, where the header words must match the
         header, and on the block's child, where BLOCKHASH(NUMBER - 1) must be the block's hash, which only a chain
-        holding the block answers. The two answers must agree; no child yet fails closed. Every output of the contract's view functions is
-        a static type."""
+        holding the block answers. The two answers must agree; no child yet fails closed. Both runs are plain calls
+        (pinned_call), so the creator whitelist does not apply. Every output of the contract's view functions is a
+        static type."""
         hash_hex = AsyncWeb3.to_hex(block_hash)
         outputs = [output["type"] for output in function.abi["outputs"]]
         size = 32 * len(outputs)
@@ -995,8 +1008,8 @@ class CollateralClient:
         if not isinstance(block, dict) or block.get("hash") != hash_hex:
             raise RpcReadError("the RPC does not have the block the read is pinned to")
         by_hash, at_child = await self._read_together(
-            ("eth_call", [{"data": code}, {"blockHash": hash_hex, "requireCanonical": True}]),
-            ("eth_call", [{"data": code}, {"blockNumber": hex(block_number(block) + 1)}]),
+            ("eth_call", pinned_call(code, {"blockHash": hash_hex, "requireCanonical": True})),
+            ("eth_call", pinned_call(code, {"blockNumber": hex(block_number(block) + 1)})),
         )
         [result] = pinned_outputs(by_hash, block, [size])
         if child_outputs(at_child, block, [size]) != [result]:

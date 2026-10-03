@@ -74,6 +74,10 @@ class FakeRpc:
         self.sibling: tuple[str, Decimal] | None = None
         # False: the backend has not imported a child of HEADER yet
         self.has_child = True
+        # True: EVM::DisableWhitelistCheck is off and WhitelistedCreators is empty, so a contract-creation call fails
+        self.creator_whitelist = False
+        # False: the RPC drops eth_call's state override, so a call to an address with no code answers "0x"
+        self.honours_overrides = True
 
     async def __call__(self, batch):
         if self.fail:
@@ -84,8 +88,21 @@ class FakeRpc:
         self.batches.append(batch)
         return [self._run(req) for req in batch]
 
+    def _code(self, params) -> str | None:
+        """The code an eth_call runs: a creation call's data (None while the creator whitelist refuses it), or the
+        code a state override sets at the called address ("0x" when there is none)."""
+        if "to" not in params[0]:
+            return None if self.creator_whitelist else params[0]["data"]
+        overrides = params[2] if len(params) > 2 and self.honours_overrides else {}
+        return overrides.get(params[0]["to"], {}).get("code", "0x")
+
     def _run(self, req):
         at = req["params"][1]
+        code = self._code(req["params"])
+        if code is None:
+            return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32603, "message": "evm error: NotAllowed"}}
+        if code == "0x":
+            return {"jsonrpc": "2.0", "id": req["id"], "result": "0x"}
         # as Finney's Frontier answers: an unknown number is "header not found", an unknown hash runs on pending
         if "blockNumber" in at:
             if not ((self.has_block or self.sibling is not None) and self.has_child and at["blockNumber"] == CHILD["number"]):
@@ -108,7 +125,7 @@ class FakeRpc:
         }
         out = int(header["number"], 16).to_bytes(32, "big") + bytes.fromhex(header["parentHash"][2:])
         out += int(header["timestamp"], 16).to_bytes(32, "big")
-        for data, size in _pinned_inner_calls(bytes.fromhex(req["params"][0]["data"][2:])):
+        for data, size in _pinned_inner_calls(bytes.fromhex(code[2:])):
             out += bytes.fromhex(results[data][2:])[:size]
         return {"jsonrpc": "2.0", "id": req["id"], "result": "0x" + out.hex()}
 
@@ -160,16 +177,43 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
     [[req, at_child]] = rpc.batches
-    assert "to" not in req["params"][0]
+    address = collateral_status.PINNED_READ_ADDRESS
+    assert req["params"][0] == {"to": address, "data": "0x"}
     assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
-    assert at_child["params"] == [req["params"][0], {"blockNumber": CHILD["number"]}]
+    assert at_child["params"] == [req["params"][0], {"blockNumber": CHILD["number"]}, req["params"][2]]
     assert rpc.head_tags == ["finalized"]
     contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
-    assert req["params"][0]["data"].count("73" + contract) == 2
-    assert _pinned_inner_calls(bytes.fromhex(req["params"][0]["data"][2:])) == [
+    code = req["params"][2][address]["code"]
+    assert code.count("73" + contract) == 2
+    assert _pinned_inner_calls(bytes.fromhex(code[2:])) == [
         (executor_call_data(EXECUTOR_TO_MINER_SELECTOR, EXECUTOR_UUID), 32),
         (executor_call_data(COLLATERALS_SELECTOR, EXECUTOR_UUID), 32),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("creator_whitelist", [False, True], ids=["whitelist-check-disabled", "whitelist-check-on"])
+async def test_the_pinned_read_does_not_depend_on_the_evm_creator_whitelist(creator_whitelist):
+    """Review 5397591319 at 78c163c: Subtensor runs a contract-creation eth_call through WhitelistedCreators unless
+    EVM::DisableWhitelistCheck is set. The pinned read is a plain call to PINNED_READ_ADDRESS with its code set by
+    the state override, so it reads the same answer with the check on or off."""
+    rpc = FakeRpc(MINER_EVM, Decimal(9))
+    rpc.creator_whitelist = creator_whitelist
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (True, False, False)
+    assert status.collateral_tao == Decimal(9)
+
+
+@pytest.mark.asyncio
+async def test_an_rpc_that_drops_the_state_override_is_a_failed_read():
+    rpc = FakeRpc(MINER_EVM, Decimal(9))
+    rpc.honours_overrides = False
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    with pytest.raises(ValueError, match="state overrides"):
+        collateral_status.pinned_outputs("0x", HEADER, [32, 32])
 
 
 @pytest.mark.asyncio

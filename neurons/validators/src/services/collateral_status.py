@@ -6,9 +6,15 @@ meaning CollateralContractService gave it: the miner hotkey's associated EVM add
 executor on the contract, and the executor's collateral covers
 required_deposit_amount[gpu_model] × gpu_count × COLLATERAL_DAYS. It has no score effect.
 
-Two view calls (`executorToMiner(bytes16)`, `collaterals(bytes16)`) go out as one JSON-RPC batch
-of eth_call. A read is kept per executor for COLLATERAL_STATUS_CACHE_SECONDS; a failed read
-reports the last answer for that executor when there is one.
+The finalized header is read first. Then two view calls (`executorToMiner(bytes16)`,
+`collaterals(bytes16)`) run in one EVM run (pinned_read_code), twice: pinned by the header's hash,
+where the run's NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP must match the header, and on the
+header's child, where BLOCKHASH(NUMBER - 1) must be the header's hash. The two runs must agree. A
+backend without the block or its child answers an error, and the read fails. The code runs as the
+code of PINNED_READ_ADDRESS through eth_call's state override, a plain call, so Subtensor's EVM
+creator whitelist does not apply to it. A read is kept per executor for
+COLLATERAL_STATUS_CACHE_SECONDS; a failed read reports the last answer for that executor when there
+is one.
 """
 
 from __future__ import annotations
@@ -42,6 +48,11 @@ WEI_PER_TAO = Decimal(10) ** 18
 # 7,000 transactions; the two eth_call answers are ~200 bytes.
 MAX_RPC_ANSWER_BYTES = 512 * 1024
 
+# An address with no code and no precompile. A pinned read is a call to it with pinned_read_code set as its code
+# by eth_call's state override. A contract-creation eth_call would go through the runtime's creator whitelist
+# (WhitelistedCreators, DisableWhitelistCheck), which a plain call does not.
+PINNED_READ_ADDRESS = "0x00000000000000000000000000000000000c0113"
+
 RpcBatch = Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]]
 
 
@@ -61,9 +72,9 @@ def executor_call_data(selector: str, executor_uuid: str) -> str:
 
 
 def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
-    """Init code for a contract-creation eth_call that makes each (calldata, output size) view call to `to` in one
-    EVM run and returns NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run
-    reads one state on one backend, and the three header words prove which block that state is."""
+    """Code that makes each (calldata, output size) view call to `to` in one EVM run and returns NUMBER,
+    BLOCKHASH(NUMBER - 1) and TIMESTAMP, then each call's first `size` bytes. One run reads one state on one
+    backend, and the header words prove which block that state is. It is run by pinned_call."""
     def push2(value: int) -> bytes:
         return b"\x61" + value.to_bytes(2, "big")
 
@@ -99,14 +110,27 @@ def pinned_read_code(to: str, calls: list[tuple[bytes, int]]) -> str:
     return "0x" + bytes(code).hex() + b"".join(data for data, _ in calls).hex()
 
 
-def pinned_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
-    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
-    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
+def pinned_call(code: str, pin: dict[str, Any]) -> list[Any]:
+    """eth_call params that run `code` at the block `pin` names, as the code of PINNED_READ_ADDRESS."""
+    return [{"to": PINNED_READ_ADDRESS, "data": "0x"}, pin, {PINNED_READ_ADDRESS: {"code": code}}]
+
+
+def _pinned_answer(result: str, sizes: list[int]) -> bytes:
     if not isinstance(result, str):
         raise ValueError("pinned read has no answer")
     raw = bytes.fromhex(result.removeprefix("0x"))
+    if not raw:
+        # a call to an address with no code answers nothing: the RPC did not apply the state override
+        raise ValueError("pinned read answered 0 bytes; the RPC must support eth_call state overrides")
     if len(raw) != 0x60 + sum(sizes):
         raise ValueError(f"pinned read answered {len(raw)} bytes")
+    return raw
+
+
+def pinned_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
+    """The view call outputs of a pinned_read_code answer, once its header words match `header`. Frontier answers
+    a block hash it does not know from its pending state, which carries another number, parent or timestamp."""
+    raw = _pinned_answer(result, sizes)
     number, parent, timestamp = (raw[i : i + 32] for i in (0, 32, 64))
     if (
         int.from_bytes(number, "big") != int(header["number"], 16)
@@ -124,11 +148,7 @@ def pinned_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> lis
 def child_outputs(result: str, header: dict[str, Any], sizes: list[int]) -> list[bytes]:
     """The view call outputs of a pinned_read_code answer that ran on a child of `header`: NUMBER is one past it
     and BLOCKHASH(NUMBER - 1) is its hash, which only a chain holding that block can answer."""
-    if not isinstance(result, str):
-        raise ValueError("pinned read has no answer")
-    raw = bytes.fromhex(result.removeprefix("0x"))
-    if len(raw) != 0x60 + sum(sizes):
-        raise ValueError(f"pinned read answered {len(raw)} bytes")
+    raw = _pinned_answer(result, sizes)
     if (
         int.from_bytes(raw[0:32], "big") != int(header["number"], 16) + 1
         or "0x" + raw[32:64].hex() != str(header["hash"]).lower()
@@ -298,7 +318,7 @@ class CollateralStatusReader:
         )
         answers = await self._rpc(
             [
-                {"jsonrpc": "2.0", "id": i, "method": "eth_call", "params": [{"data": code}, pin]}
+                {"jsonrpc": "2.0", "id": i, "method": "eth_call", "params": pinned_call(code, pin)}
                 for i, pin in enumerate(pins, start=1)
             ]
         )
