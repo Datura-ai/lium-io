@@ -125,6 +125,11 @@ class DockerCommand:
         return "/usr/bin/docker volume ls -qf dangling=true"
 
     @staticmethod
+    def volume_ls_names() -> str:
+        """Build docker volume ls command listing every volume name."""
+        return "/usr/bin/docker volume ls -q"
+
+    @staticmethod
     def inspect_created_timestamp(container_id: str) -> str:
         """Build docker inspect command to get creation timestamp in seconds."""
         return (

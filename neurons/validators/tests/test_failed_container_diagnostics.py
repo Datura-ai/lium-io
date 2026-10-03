@@ -131,6 +131,36 @@ async def test_cleanup_still_removes_container_when_diagnostics_capture_fails(do
     assert "ssh channel died" in extras[0]["diagnostics_capture_error"]
 
 
+@pytest.mark.parametrize(
+    ("remove_volume", "expected_volume_commands"),
+    [
+        (
+            True,
+            [
+                "/usr/bin/docker volume rm volume_x volume_x_docker volume_x_workspace"
+                " 2>/dev/null || true"
+            ],
+        ),
+        (False, []),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cleanup_drops_the_dind_volumes_only_with_the_pod_volume(
+    docker_service, remove_volume, expected_volume_commands
+):
+    ssh_client = _FakeSSHClient()
+
+    await docker_service.cleanup_failed_container_creation(
+        ssh_client=ssh_client,
+        default_extra=DEFAULT_EXTRA,
+        container_name="pod_x",
+        volume_name="volume_x",
+        remove_volume=remove_volume,
+    )
+
+    assert [c for c in ssh_client.commands if "volume rm" in c] == expected_volume_commands
+
+
 @pytest.mark.asyncio
 async def test_diagnostics_reports_missing_container_without_failing(docker_service):
     # Arrange: container already gone — inspect exits non-zero
