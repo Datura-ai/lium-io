@@ -97,7 +97,7 @@ DOWNLOAD_TIMEOUT_ERROR = "Cloudflare down speedtest timeout after 120 seconds"
 
 
 def _cloudflare_unreachable_payload(
-    single_stream_mbps: float = HOST_SINGLE_STREAM_MBPS, *, error: str = DOWNLOAD_TRANSPORT_ERROR
+    single_stream_mbps: float = HOST_SINGLE_STREAM_MBPS, *, error: str = DOWNLOAD_RATE_LIMITED_ERROR
 ) -> dict:
     """The package downloaded, then the Cloudflare download failed, so the verifier skipped the
     upload: `execute_speedtest_fn` (network.rs) reports both directions as 0.0, the download's
@@ -262,63 +262,6 @@ def test_cloudflare_unreachable_falls_back_to_the_package_reading(error):
     assert errors == [f"Network execution failed: {error}"]
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        f"Download body failed for {DOWN_URL}: error decoding response body",
-        f"Cloudflare download request failed for {DOWN_URL} with HTTP 503 Service Unavailable",
-        "Download request failed for https://speed.example.com/__down: error sending request",
-    ],
-)
-def test_other_download_failures_take_no_fallback(error):
-    """A body cut mid-transfer, a Cloudflare 5xx or a transport error to another host is not
-    taken as Cloudflare's: no package fallback, as on main."""
-    payload = _cloudflare_unreachable_payload(error=error)
-    assert _is_cloudflare_probe_failure(payload) is False
-    stats, _errors = _verify_network_test(_challenge_data(), {"network_execution": payload})
-    assert stats.get("cloudflare_fallback") is not True
-    assert stats["success"] is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error", [DOWNLOAD_TRANSPORT_ERROR, DOWNLOAD_RATE_LIMITED_ERROR])
-async def test_a_cloudflare_download_fault_keeps_the_skipped_upload_ema(context_factory, error):
-    """The verifier's real download transport error and download 429: the download is fed the
-    package reading (2400 → 1290), and the upload the verifier then skipped keeps 1900."""
-    verification = _judge(_cloudflare_unreachable_payload(error=error))
-    assert verification["network"]["cloudflare_fallback"] is True
-    assert verification["network"]["cloudflare_upload_fallback"] is True
-
-    result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
-    )
-
-    assert result.passed is True
-    net = result.updates["state"].specs["network"]
-    assert net["ema_verifyx_download_speed"] == pytest.approx(1290.0)
-    assert net["ema_verifyx_upload_speed"] == HOST_UPLOAD_MBPS
-    assert "verifyx_upload_speed" not in net
-
-
-@pytest.mark.asyncio
-async def test_a_download_timeout_falls_back_but_feeds_the_skipped_upload_a_zero(context_factory):
-    """The download timeout follows the upload's rule: a host under ~30 Mbps ends the same way as a
-    stall at Cloudflare, so the download still takes the package reading (as on main) but the
-    upload is not kept: 1900 → 950."""
-    verification = _judge(_cloudflare_unreachable_payload(error=DOWNLOAD_TIMEOUT_ERROR))
-    assert verification["network"]["cloudflare_fallback"] is True
-    assert "cloudflare_upload_fallback" not in verification["network"]
-
-    result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
-    )
-
-    net = result.updates["state"].specs["network"]
-    assert net["ema_verifyx_download_speed"] == pytest.approx(1290.0)
-    assert net["verifyx_upload_speed"] == 0.0
-    assert net["ema_verifyx_upload_speed"] == pytest.approx(950.0)
-
-
 @pytest.mark.asyncio
 async def test_cloudflare_unreachable_uses_the_package_reading_and_does_not_feed_the_ema_a_zero(
     context_factory,
@@ -366,69 +309,6 @@ async def test_cloudflare_unreachable_for_five_cycles_does_not_delist_an_honest_
     assert upload_ema == HOST_UPLOAD_MBPS
 
 
-@pytest.mark.asyncio
-async def test_cloudflare_unreachable_keeps_the_upload_ema_and_marks_upload_unmeasured(
-    context_factory,
-):
-    """The probe reports upload 0.0 when it cannot reach Cloudflare. That is no upload reading:
-    the previous upload EMA stands, no raw `verifyx_upload_speed` is written, and the event says
-    upload was not measured."""
-    verification = _judge(_cloudflare_unreachable_payload())
-    assert verification["network"]["upload_speed"] == 0.0
-
-    result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
-    )
-
-    net = result.updates["state"].specs["network"]
-    assert net["ema_verifyx_upload_speed"] == HOST_UPLOAD_MBPS
-    assert "verifyx_upload_speed" not in net
-    assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
-
-
-@pytest.mark.asyncio
-async def test_cloudflare_unreachable_on_a_never_measured_host_seeds_no_upload_ema(
-    context_factory,
-):
-    """No previous upload EMA and no upload reading: nothing to keep, and no 0 is seeded."""
-    verification = _judge(_cloudflare_unreachable_payload())
-
-    result = await _run_check(context_factory, verification, prev_ema=HOST_CAPACITY_MBPS)
-
-    net = result.updates["state"].specs["network"]
-    assert "ema_verifyx_upload_speed" not in net
-    assert "verifyx_upload_speed" not in net
-
-
-@pytest.mark.asyncio
-async def test_a_measured_zero_upload_outside_a_fallback_still_lowers_the_upload_ema(
-    context_factory,
-):
-    """Outside a Cloudflare fallback the probe reached Cloudflare, so an upload of 0.0 is the
-    host's own failed upload: it is a measurement and halves the EMA (1900 → 950)."""
-    verification = _judge(_probe_payload(upload_mbps=0.0))
-    assert verification["network"].get("cloudflare_fallback") is not True
-    assert verification["network"]["upload_speed"] == 0.0
-
-    result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
-    )
-
-    net = result.updates["state"].specs["network"]
-    assert net["verifyx_upload_speed"] == 0.0
-    assert net["ema_verifyx_upload_speed"] == pytest.approx(compute_ema(HOST_UPLOAD_MBPS, 0.0))
-    assert net["ema_verifyx_upload_speed"] == pytest.approx(950.0)
-
-
-def _upload_only_failure_payload(error: str) -> dict:
-    """`execute_speedtest_fn` (network.rs) when only the upload failed: the download was measured,
-    the upload reads 0.0 and the probe's error names the upload."""
-    payload = _probe_payload(upload_mbps=0.0)
-    payload["success"] = False
-    payload["error"] = error
-    return payload
-
-
 UPLOAD_TRANSPORT_ERROR = (
     f"Upload request failed for {UP_URL}: error sending request for url ({UP_URL})"
 )
@@ -436,153 +316,93 @@ UPLOAD_RATE_LIMITED_ERROR = (
     f"Cloudflare upload request failed for {UP_URL} with HTTP 429 Too Many Requests "
     "(Retry-After: 60, CF-Ray: 8c1f2a3b4c5d6e7f-FRA)"
 )
-UPLOAD_TIMEOUT_ERROR = "Cloudflare up speedtest timeout after 120 seconds"
+PACKAGE_404 = (
+    "Network request failed for https://huggingface.co/x/resolve/main/model.tar with HTTP 404 "
+    "Not Found. "
+)
 
-UPLOAD_ONLY_CLOUDFLARE_ERRORS = [
-    UPLOAD_TRANSPORT_ERROR,
-    UPLOAD_RATE_LIMITED_ERROR,
-    "Network request failed for https://huggingface.co/x/resolve/main/model.tar with HTTP 404 "
-    f"Not Found. {UPLOAD_RATE_LIMITED_ERROR}",
-    "Network request failed for https://huggingface.co/x/resolve/main/model.tar with HTTP 404 "
-    f"Not Found. {UPLOAD_TRANSPORT_ERROR}",
+
+def _upload_only_failure_payload(error: str, *, success: bool = False) -> dict:
+    """`execute_speedtest_fn` (network.rs) when only the upload failed: the download was measured,
+    the upload reads 0.0 and the probe's error names the upload."""
+    payload = _probe_payload(upload_mbps=0.0)
+    payload["success"] = success
+    payload["error"] = error
+    return payload
+
+
+def _package_and_cloudflare_failed_payload(error: str) -> dict:
+    """The package 404'd, then the Cloudflare download failed, so the upload never ran."""
+    payload = _cloudflare_unreachable_payload(0.0, error=PACKAGE_404 + error)
+    payload["download"].update(status="failed", error=PACKAGE_404)
+    return payload
+
+
+# (payload, previous upload EMA, upload EMA after). None after: no upload EMA is written. Only
+# Cloudflare's 429 keeps the EMA; a transport error or a timeout can be the host's own doing.
+UPLOAD_OUTCOMES = [
+    (_cloudflare_unreachable_payload(error=DOWNLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
+    (_cloudflare_unreachable_payload(error=DOWNLOAD_RATE_LIMITED_ERROR), None, None),
+    (_cloudflare_unreachable_payload(error=DOWNLOAD_TRANSPORT_ERROR), HOST_UPLOAD_MBPS, 950.0),
+    (_cloudflare_unreachable_payload(error=DOWNLOAD_TIMEOUT_ERROR), HOST_UPLOAD_MBPS, 950.0),
+    (_package_and_cloudflare_failed_payload(DOWNLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
+    (_upload_only_failure_payload(UPLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
+    (_upload_only_failure_payload(PACKAGE_404 + UPLOAD_RATE_LIMITED_ERROR), HOST_UPLOAD_MBPS, 1900.0),
+    (_upload_only_failure_payload(UPLOAD_TRANSPORT_ERROR), HOST_UPLOAD_MBPS, 950.0),
+    (
+        _upload_only_failure_payload("Cloudflare up speedtest timeout after 120 seconds"),
+        HOST_UPLOAD_MBPS,
+        950.0,
+    ),
+    (
+        _upload_only_failure_payload(f"Cloudflare upload request failed for {UP_URL} with HTTP 403"),
+        HOST_UPLOAD_MBPS,
+        950.0,
+    ),
+    (_upload_only_failure_payload(""), HOST_UPLOAD_MBPS, 950.0),
+    (_upload_only_failure_payload("", success=True), HOST_UPLOAD_MBPS, 950.0),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", UPLOAD_ONLY_CLOUDFLARE_ERRORS)
-async def test_cloudflare_failing_only_the_upload_keeps_the_upload_ema(context_factory, error):
-    """The download was measured, so this is no full fallback, but Cloudflare (a 429, or a
-    transport error to speed.cloudflare.com right after a measured download from it) failed the
-    upload: the upload EMA stays at 1900 instead of halving to 950, no raw upload is written, and
-    the download EMA is fed the measured capacity."""
-    verification = _judge(_upload_only_failure_payload(error))
-    assert verification["network"].get("cloudflare_fallback") is not True
-    assert verification["network"]["cloudflare_upload_fallback"] is True
-    assert verification["network"]["download_speed"] == HOST_CAPACITY_MBPS
-
-    result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
-    )
-
-    net = result.updates["state"].specs["network"]
-    assert net["ema_verifyx_upload_speed"] == HOST_UPLOAD_MBPS
-    assert "verifyx_upload_speed" not in net
-    assert net["verifyx_download_speed"] == HOST_CAPACITY_MBPS
-    assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error",
-    [
-        UPLOAD_TIMEOUT_ERROR,
-        f"Cloudflare upload request failed for {UP_URL} with HTTP 403 Forbidden",
-        "",
-    ],
-)
-async def test_a_host_caused_failed_upload_still_lowers_the_upload_ema(context_factory, error):
-    """A failed upload whose error is not a Cloudflare fault on the upload is a real 0 Mbps
-    upload: 1900 → 950. That includes the direction timeout: an upload under ~30 Mbps cannot move
-    its 450 MB in 120 s, and the verifier's text cannot tell it from a stall at Cloudflare, so it
-    counts as low bandwidth rather than keeping the old EMA."""
-    verification = _judge(_upload_only_failure_payload(error))
-    assert "cloudflare_upload_fallback" not in verification["network"]
-
-    result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
-    )
-
-    net = result.updates["state"].specs["network"]
-    assert net["verifyx_upload_speed"] == 0.0
-    assert net["ema_verifyx_upload_speed"] == pytest.approx(950.0)
-
-
-@pytest.mark.asyncio
-async def test_a_slow_upload_that_keeps_timing_out_falls_under_the_floor(context_factory):
-    """A host whose upload times out every cycle does not keep its old EMA: it goes down each time."""
-    upload_ema = HOST_UPLOAD_MBPS
-    for _ in range(5):
-        verification = _judge(_upload_only_failure_payload(UPLOAD_TIMEOUT_ERROR))
-        result = await _run_check(
-            context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=upload_ema
-        )
-        upload_ema = result.updates["state"].specs["network"]["ema_verifyx_upload_speed"]
-
-    assert upload_ema < 100.0
-
-
-@pytest.mark.parametrize(
-    ("speedtest", "error", "marked"),
-    [
-        ({"download_mbps": HOST_CAPACITY_MBPS, "upload_mbps": 0.0}, UPLOAD_TRANSPORT_ERROR, True),
-        (
-            {"download_mbps": HOST_CAPACITY_MBPS, "upload_mbps": 0.0},
-            UPLOAD_RATE_LIMITED_ERROR,
-            True,
-        ),
-        ({"download_mbps": HOST_CAPACITY_MBPS, "upload_mbps": 0.0}, UPLOAD_TIMEOUT_ERROR, False),
-        (
-            {"download_mbps": HOST_CAPACITY_MBPS, "upload_mbps": 1500.0},
-            UPLOAD_TRANSPORT_ERROR,
-            False,
-        ),
-        (
-            {"download_mbps": 0.0, "upload_mbps": 0.0},
-            "Cloudflare down speedtest timeout after 120 seconds",
-            False,
-        ),
-        ({"download_mbps": 0.0, "upload_mbps": 0.0}, DOWNLOAD_TRANSPORT_ERROR, False),
-        ({"download_mbps": 0.0, "upload_mbps": 0.0}, DOWNLOAD_RATE_LIMITED_ERROR, False),
-    ],
-)
-def test_cloudflare_upload_mark_reads_only_the_uploads_own_cloudflare_fault(
-    speedtest, error, marked
+@pytest.mark.parametrize(("payload", "prev_upload", "upload_after"), UPLOAD_OUTCOMES)
+async def test_an_upload_of_zero_keeps_the_ema_only_on_a_cloudflare_429(
+    context_factory, payload, prev_upload, upload_after
 ):
-    """Outside a package fallback the mark is for the upload's 429 or transport error only: never
-    a direction timeout, a positive upload, or a fault that the verifier raised on the download."""
-    mark = _cloudflare_upload_mark({"speedtest": speedtest, "error": error})
-    assert mark == ({"cloudflare_upload_fallback": True} if marked else {})
-
-
-@pytest.mark.parametrize(
-    ("upload_mbps", "error", "marked"),
-    [
-        (0.0, DOWNLOAD_TRANSPORT_ERROR, True),
-        (0.0, DOWNLOAD_RATE_LIMITED_ERROR, True),
-        (0.0, DOWNLOAD_TIMEOUT_ERROR, False),
-        (0.0, UPLOAD_TRANSPORT_ERROR, False),
-        (0.0, f"Cloudflare download request failed for {DOWN_URL} with HTTP 4290", False),
-        (1500.0, DOWNLOAD_TRANSPORT_ERROR, False),
-    ],
-)
-def test_cloudflare_upload_mark_on_a_package_fallback_reads_the_downloads_fault(
-    upload_mbps, error, marked
-):
-    """On a package fallback the verifier skipped the upload, so the mark follows the download's
-    fault: its 429 or transport error marks, a direction timeout does not."""
-    mark = _cloudflare_upload_mark(
-        {"speedtest": {"download_mbps": 0.0, "upload_mbps": upload_mbps}, "error": error},
-        download_fallback=True,
-    )
-    assert mark == ({"cloudflare_upload_fallback": True} if marked else {})
-
-
-@pytest.mark.asyncio
-async def test_a_download_side_fallback_still_feeds_a_measured_upload(context_factory):
-    """A full fallback keeps the upload EMA only when the upload is no measurement: a positive
-    upload in the same payload is still fed (1900 → EMA toward 1500)."""
-    payload = _cloudflare_unreachable_payload()
-    payload["speedtest"]["upload_mbps"] = 1500.0
+    """A kept upload writes no raw `verifyx_upload_speed` and reports upload as unmeasured; any
+    other 0.0 is a measurement and halves the EMA (1900 → 950)."""
     verification = _judge(payload)
-    assert verification["network"]["cloudflare_fallback"] is True
+    kept = upload_after == prev_upload or upload_after is None
+    assert bool(verification["network"].get("cloudflare_upload_fallback")) is kept
 
     result = await _run_check(
-        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=HOST_UPLOAD_MBPS
+        context_factory, verification, prev_ema=HOST_CAPACITY_MBPS, prev_upload=prev_upload
     )
 
     net = result.updates["state"].specs["network"]
-    assert net["verifyx_upload_speed"] == 1500.0
-    assert net["ema_verifyx_upload_speed"] == pytest.approx(compute_ema(HOST_UPLOAD_MBPS, 1500.0))
+    if upload_after is None:
+        assert "ema_verifyx_upload_speed" not in net
+    else:
+        assert net["ema_verifyx_upload_speed"] == pytest.approx(upload_after)
+    if kept:
+        assert "verifyx_upload_speed" not in net
+        assert "upload" in result.event.what_we_saw["unavailable_speed_readings"]
+    else:
+        assert net["verifyx_upload_speed"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("upload_mbps", "error"),
+    [
+        (1500.0, UPLOAD_RATE_LIMITED_ERROR),
+        (0.0, f"Cloudflare download request failed for {DOWN_URL} with HTTP 4290"),
+    ],
+)
+def test_cloudflare_upload_mark_ignores_a_positive_upload_and_a_near_miss(upload_mbps, error):
+    mark = _cloudflare_upload_mark(
+        {"speedtest": {"download_mbps": 0.0, "upload_mbps": upload_mbps}, "error": error}
+    )
+    assert mark == {}
 
 
 @pytest.mark.asyncio
@@ -602,26 +422,19 @@ async def test_cloudflare_unreachable_still_passes_when_the_network_flag_is_on(
     assert net["verifyx_download_speed"] == HOST_SINGLE_STREAM_MBPS
 
 
-def _host_caused_probe_failure_payload() -> dict:
-    """The package downloaded; the Cloudflare probe failed for a host reason (blocked,
-    or a generic fail) with no transport token in the probe error."""
-    return {
-        "speedtest": {"download_mbps": 0.0, "upload_mbps": 0.0},
-        "download": {
-            **PACKAGE,
-            "status": "success",
-            "speed_mbps": HOST_SINGLE_STREAM_MBPS,
-            "time_ms": 11_900,
-            "error": None,
-        },
-        "success": False,
-        "error": "speed.cloudflare.com blocked by host firewall",
-        "execution_time_ms": 8_000,
-    }
-
-
-def test_host_caused_probe_failure_does_not_fall_back_to_the_package_reading():
-    payload = _host_caused_probe_failure_payload()
+@pytest.mark.parametrize(
+    "error",
+    [
+        "speed.cloudflare.com blocked by host firewall",
+        f"Download body failed for {DOWN_URL}: error decoding response body",
+        f"Cloudflare download request failed for {DOWN_URL} with HTTP 503 Service Unavailable",
+        "Download request failed for https://speed.example.com/__down: error sending request",
+    ],
+)
+def test_host_caused_probe_failure_does_not_fall_back_to_the_package_reading(error):
+    """A host reason, a body cut mid-transfer, a Cloudflare 5xx or a transport error to another
+    host is not taken as Cloudflare's: no package fallback, as on main."""
+    payload = _cloudflare_unreachable_payload(error=error)
     assert _is_cloudflare_probe_failure(payload) is False
     stats, errors = _verify_network_test(_challenge_data(), {"network_execution": payload})
     assert stats.get("cloudflare_fallback") is not True

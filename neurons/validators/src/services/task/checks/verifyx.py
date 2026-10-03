@@ -391,7 +391,7 @@ def _feed_ema(
 
 def _fallback_upload_reading(reading: object, upload_blocked: bool) -> object:
     """The upload reading `_feed_ema` gets. When Cloudflare failed the upload, or failed the
-    download so the upload never ran (`cloudflare_upload_fallback`: a 429 or a transport error),
+    download so the upload never ran (`cloudflare_upload_fallback`: Cloudflare's 429),
     the 0.0 (or missing value) the probe reports is no measurement: None, and the previous upload
     EMA stands. Otherwise a 0.0, a direction timeout included, still lowers the EMA; a positive
     upload is always a measurement."""
