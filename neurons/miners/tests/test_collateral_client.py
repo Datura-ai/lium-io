@@ -505,7 +505,7 @@ async def lost_receipt(*_args, **_kwargs):
 async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_reads_it_and_sends_nothing_new(
     monkeypatch, caplog
 ):
-    provider = FakeProvider()
+    provider = FakeProvider(logs=[started_log(reclaim_request_id=12)])
     provider.mine_sent = False
     client = client_with(provider)
 
@@ -526,7 +526,7 @@ async def test_a_lost_receipt_is_an_unknown_outcome_and_the_retry_reads_it_and_s
     # mined: the retry reports it and sends nothing
     provider.mined.add(AsyncWeb3.keccak(hexstr=provider.sent[0]).hex())
     provider.nonce = NONCE + 1
-    with pytest.raises(CollateralTransactionError, match="succeeded in block 16; no new transaction was sent"):
+    with pytest.raises(CollateralTransactionError, match="succeeded in block 16; it started reclaim request 12; no new transaction was sent"):
         await client.reclaim_collateral(EXECUTOR)
     assert len(provider.sent) == 2
 
@@ -1738,3 +1738,24 @@ async def test_finalize_names_a_closed_or_unknown_reclaim_request():
     assert "No open reclaim request 9 on this contract" in str(raised.value)
     assert "never opened" in str(raised.value)
     assert provider.sent == []
+
+
+async def test_a_mined_reclaim_whose_receipt_lacks_its_event_keeps_the_record_until_a_receipt_has_it(monkeypatch):
+    """Review of e02f9ff: a status=1 receipt with no ReclaimProcessStarted cleared the record, and a retry reverts
+    AmountZero, so the request ID was lost."""
+    provider = FakeProvider(logs=[])
+    client = client_with(provider)
+    with pytest.raises(CollateralOutcomeUnknownError, match="no ReclaimProcessStarted event"):
+        await client.reclaim_collateral(EXECUTOR)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralOutcomeUnknownError, match="no ReclaimProcessStarted event"):
+        await client.settle_earlier_send()
+    assert client._read_sent_record(CHAIN_ID) is not None
+
+    provider.logs = [started_log(reclaim_request_id=12)]
+    with pytest.raises(CollateralTransactionError, match="it started reclaim request 12;"):
+        await client.settle_earlier_send()
+    assert client._read_sent_record(CHAIN_ID) is None
+    assert len(provider.sent) == 1

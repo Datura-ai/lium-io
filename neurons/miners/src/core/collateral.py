@@ -488,6 +488,7 @@ class CollateralClient:
             reason = await self._revert_reason(transaction, receipt["blockNumber"])
             message = f"Transaction {signed_hash} reverted"
             raise CollateralTransactionError(f"{message}: {reason}" if reason else message)
+        self._raise_if_started_request_missing(AsyncWeb3.to_hex(raw_transaction), signed_hash, receipt)
         self._clear_after_logging(
             chain_id, signed_hash, f"Transaction {signed_hash} succeeded in block {receipt['blockNumber']}"
             f"{self._started_request(receipt)}"
@@ -528,9 +529,27 @@ class CollateralClient:
             )
 
     def _report_settled(self, chain_id: int, tx_hash: str, receipt, replaced: bool = False) -> None:
+        self._raise_if_started_request_missing(self._read_sent_record(chain_id)["raw"], tx_hash, receipt)
         message = self._settled_message(tx_hash, receipt, replaced)
         self._clear_after_logging(chain_id, self._read_sent_record(chain_id)["hash"], message)
         raise CollateralTransactionError(message)
+
+    def _raise_if_started_request_missing(self, raw: str, tx_hash: str, receipt) -> None:
+        # A mined reclaim puts the whole collateral under a pending request, so a retry reverts AmountZero and the
+        # request ID in this receipt may be the only way to finalize it: the record stays until a receipt has it.
+        if receipt["status"] != 1:
+            return
+        selector = AsyncWeb3.to_hex(AsyncWeb3.keccak(text=SENT_FUNCTIONS[0])[:4])
+        if not decode_legacy_transaction(raw)["data"].startswith(selector):
+            return
+        if self.contract.events.ReclaimProcessStarted().process_receipt(receipt, errors=DISCARD):
+            return
+        raise CollateralOutcomeUnknownError(
+            f"Transaction {tx_hash} succeeded in block {receipt['blockNumber']}, but this RPC's receipt has no "
+            "ReclaimProcessStarted event, so its reclaim request ID is unknown; the send record is kept. Run this "
+            "again with SUBTENSOR_EVM_RPC_URL set to an RPC that serves the full receipt, or read the request ID "
+            "from the transaction on the explorer"
+        )
 
     def _started_request(self, receipt) -> str:
         if receipt["status"] != 1:
