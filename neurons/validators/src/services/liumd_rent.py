@@ -79,7 +79,7 @@ LIUMD_STEP_NAMES = frozenset(
 LIUMD_FAILED_STEP_NAMES = LIUMD_STEP_NAMES | {step for step, _ in _VOLUME_SETUP_EXEC_FAILURES.values()}
 # the `error` codes of design §2.3; any other code is reported as `unknown`
 LIUMD_ERROR_CODES = frozenset(
-    {"not_connected", "send_failed", "reply_lost", "protocol", "ineligible", "busy", "step_failed", "deadline", "cancelled"}
+    {"not_connected", "send_failed", "reply_lost", "protocol", "ineligible", "busy", "held", "step_failed", "deadline", "cancelled"}
 )
 # compute-app's codes for a rent it may have handed to the agent: they cannot know the host's state, whatever
 # their flags say
@@ -385,6 +385,11 @@ class LiumdRentService:
             return created
 
         code = reply.get("code") if reply.get("code") in LIUMD_ERROR_CODES else "unknown"
+        if code == "held":
+            # compute-app holds the node while an earlier rent's end is unknown: a plain create failure frees it now,
+            # RentingInProgress would leave the pod PENDING for the backend's 30-min retry (LIUM-252 G3)
+            _log_rent_result(log_extra, attempt=attempt, path="failed", reason=code, steps=steps)
+            return _failed(payload, "The node is still settling its previous rent", "liumd_held")
         if code == "busy":
             _log_rent_result(log_extra, attempt=attempt, path="failed", reason=code, steps=steps)
             return _failed(

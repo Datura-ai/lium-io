@@ -18,6 +18,7 @@ from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     CustomOptions,
+    FailedContainerErrorCodes,
     FailedContainerRequest,
     LiumdAgentFrame,
     LiumdRentRequest,
@@ -256,6 +257,21 @@ async def test_agent_error_that_could_not_clean_up_fails_the_rent_without_todays
     assert isinstance(reply, FailedContainerRequest)
     assert reply.failure_step == "liumd_started"
     miner_service._handle_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rent_on_a_node_compute_app_holds_fails_at_once_as_a_plain_failure_without_todays_path(miner_service):
+    # LIUM-252 G3: RentingInProgress would leave the pod PENDING until the backend's 30-min retry
+    relay = relay_for(
+        miner_service, answer_rent_with(lambda rent: error_frame(rent, "held", host_touched=False, cleaned=True))
+    )
+
+    reply = await miner_service.handle_container(make_rent_payload())
+
+    assert isinstance(reply, FailedContainerRequest)
+    assert (reply.error_code, reply.failure_step) == (FailedContainerErrorCodes.UnknownError, "liumd_held")
+    miner_service._handle_container.assert_not_awaited()
+    assert [frame["type"] for frame in relay.sent] == ["rent"]
 
 
 @pytest.mark.asyncio
