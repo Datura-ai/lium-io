@@ -33,6 +33,7 @@ from services.docker_service import (
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
+    GpuDockerConfig,
     RentalDockerOperationError,
     _wrap_error_message,
     build_gpu_docker_config,
@@ -1193,13 +1194,9 @@ def _dind_delete_payload() -> ContainerDeleteRequest:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "flag", ["RENTAL_DIND_PERSISTENT_STORE_ENABLED", "RENTAL_DIND_WORKSPACE_VOLUME_ENABLED"]
-)
 async def test_delete_container_removes_the_pods_inner_docker_store_and_workspace(
-    docker_service, monkeypatch, retry_ssh_mock, flag
+    docker_service, monkeypatch, retry_ssh_mock
 ):
-    monkeypatch.setattr(f"services.docker_service.settings.{flag}", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     payload = _dind_delete_payload()
 
@@ -1222,13 +1219,47 @@ async def test_delete_container_removes_the_pods_inner_docker_store_and_workspac
 
 
 @pytest.mark.asyncio
-async def test_delete_container_with_the_dind_volume_flags_off_runs_no_dind_volume_rm(
+async def test_a_pod_created_with_the_dind_volume_flags_on_loses_its_volumes_when_deleted_after_they_go_off(
     docker_service, monkeypatch, retry_ssh_mock
 ):
-    monkeypatch.setattr("services.docker_service.settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED", False)
-    monkeypatch.setattr("services.docker_service.settings.RENTAL_DIND_WORKSPACE_VOLUME_ENABLED", False)
-    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    for flag in (
+        "RENTAL_DIND_PERSISTENT_STORE_ENABLED",
+        "RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED",
+        "RENTAL_DIND_WORKSPACE_VOLUME_ENABLED",
+    ):
+        monkeypatch.setattr(f"services.docker_service.settings.{flag}", True)
     payload = _dind_delete_payload()
+    spec = docker_service._build_rental_container_run_spec(
+        payload=ContainerCreateRequest(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            docker_image="daturaai/pytorch:dind",
+            gpu_uuids=["g0"],
+            is_sysbox=True,
+            workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        ),
+        container_name=payload.container_name,
+        custom_options=CustomOptions(),
+        port_maps=[],
+        local_volume=payload.local_volume,
+        local_volume_path="/root",
+        encrypted_local_volume=True,
+        external_volume_name=None,
+        gpu_devices=GpuDockerConfig(),
+        effective_storage_limit_gb=None,
+        cpu_count=None,
+    )
+    companions = sorted({volume.source for volume in spec.volumes} - {payload.local_volume})
+    assert companions == ["volume_dind_docker", "volume_dind_workspace"]
+
+    for flag in (
+        "RENTAL_DIND_PERSISTENT_STORE_ENABLED",
+        "RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED",
+        "RENTAL_DIND_WORKSPACE_VOLUME_ENABLED",
+    ):
+        monkeypatch.setattr(f"services.docker_service.settings.{flag}", False)
+    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
 
     result = await docker_service.delete_container(
         payload=payload,
@@ -1239,14 +1270,13 @@ async def test_delete_container_with_the_dind_volume_flags_off_runs_no_dind_volu
 
     assert isinstance(result, ContainerDeleted)
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert not any("volume_dind_docker" in command for command in commands)
+    assert f"/usr/bin/docker volume rm {' '.join(companions)} 2>/dev/null || true" in commands
 
 
 @pytest.mark.asyncio
 async def test_delete_container_is_not_failed_by_a_dind_volume_removal_error(
     docker_service, monkeypatch, retry_ssh_mock
 ):
-    monkeypatch.setattr("services.docker_service.settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
 
     async def _run(command, *args, **kwargs):

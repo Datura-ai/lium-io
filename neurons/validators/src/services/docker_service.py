@@ -114,7 +114,6 @@ from services.rental_dind import (
     dind_store_version_probe_command,
     dind_store_version_record_command,
     dind_store_volume_name,
-    dind_volumes_enabled,
     dind_workspace_volume_name,
     format_dockerd_version,
     is_dind_store_downgrade,
@@ -8578,14 +8577,14 @@ class DockerService:
                             log,
                             retry_in_use=retry_volume_in_use,
                         )
-                    # The pod's inner Docker store and /workspace, whichever it has
-                    if dind_volumes_enabled(settings):
-                        with _best_effort_delete_step(
-                            log, "remove_volume_dind", volume_name=payload.local_volume
-                        ):
-                            await ssh_client.run(
-                                DockerCommand.volume_remove(*dind_companion_volume_names(payload.local_volume))
-                            )
+                    # The pod's inner Docker store and /workspace, whichever it has, whatever
+                    # the flags are now: the pod may have been created while one was on
+                    with _best_effort_delete_step(
+                        log, "remove_volume_dind", volume_name=payload.local_volume
+                    ):
+                        await ssh_client.run(
+                            DockerCommand.volume_remove(*dind_companion_volume_names(payload.local_volume))
+                        )
 
                 if payload.external_volume:
                     with _best_effort_delete_step(

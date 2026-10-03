@@ -10,7 +10,7 @@ from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
 from services.rental_dind import (
-    dind_volumes_enabled,
+    has_dind_companion_volumes,
     orphaned_dind_companion_volumes,
     stale_dind_probe_containers,
     stale_dind_probe_list_command,
@@ -230,8 +230,7 @@ class ContainerCleanup:
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
-        if dind_volumes_enabled(settings):
-            await self.prune_orphaned_dind_volumes(ssh_client, rented_data, executor_uuid)
+        await self.prune_orphaned_dind_volumes(ssh_client, rented_data, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
 
@@ -280,14 +279,18 @@ class ContainerCleanup:
         Orphaned = no container references it (dangling), its pod volume is no longer on the host,
         and the backend does not list its pod on this executor. Covers a pod volume removed by a
         path that predates the companions, or by hand. Without rented data nothing is removed.
+        It runs whatever the flags are now, since a pod made while one was on keeps its companions;
+        when no unreferenced companion is on the host it stops after the dangling list.
         Best-effort: never raises; returns how many it asked docker to remove.
         """
         extra = {"executor_uuid": executor_uuid}
         if rented_data is None:
             return 0
         try:
-            listed = await ssh_client.run(DockerCommand.volume_ls_names())
             dangling = await ssh_client.run(DockerCommand.volume_ls_dangling())
+            if dangling.exit_status == 0 and not has_dind_companion_volumes(_names(dangling.stdout)):
+                return 0
+            listed = await ssh_client.run(DockerCommand.volume_ls_names())
             if listed.exit_status != 0 or dangling.exit_status != 0:
                 logger.warning(_m("Listing volumes for the DinD orphan sweep failed", extra=extra))
                 return 0
