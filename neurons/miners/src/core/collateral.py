@@ -395,8 +395,10 @@ class CollateralClient:
     async def finalized_block_hash(self):
         return (await self.w3.eth.get_block("finalized"))["hash"]
 
-    async def latest_block_hash(self):
-        return (await self.w3.eth.get_block("latest"))["hash"]
+    async def head_parent_hash(self):
+        """The newest block a pinned read can run on: the head's parent. `_call_at_block_hash` also runs the read on
+        the pinned block's child, and no node has a child of the head yet ("header not found")."""
+        return (await self.w3.eth.get_block("latest"))["parentHash"]
 
     async def _pinned_chain_id(self) -> int:
         if self.miner_account is None:

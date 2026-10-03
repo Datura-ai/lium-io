@@ -87,7 +87,7 @@ def chain(monkeypatch):
         state.after_collateral_read()
         return found
 
-    async def latest_block_hash(self):
+    async def head_parent_hash(self):
         return state.latest_hash
 
     async def get_reclaim_request(self, reclaim_request_id, block_hash=None):
@@ -105,7 +105,7 @@ def chain(monkeypatch):
     monkeypatch.setattr(CollateralClient, "get_executor_collateral", get_executor_collateral)
     monkeypatch.setattr(CollateralClient, "get_reclaim_request", get_reclaim_request)
     monkeypatch.setattr(CollateralClient, "finalized_block_hash", finalized_block_hash)
-    monkeypatch.setattr(CollateralClient, "latest_block_hash", latest_block_hash)
+    monkeypatch.setattr(CollateralClient, "head_parent_hash", head_parent_hash)
     # the earlier-send check still runs, lock and temp record included, without asking finney for its chain ID
     monkeypatch.setattr(CollateralClient, "_pinned_chain_id", AsyncMock(return_value=964))
     return state

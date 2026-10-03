@@ -117,15 +117,16 @@ def get_collateral_contract(
 async def versions_holding_collateral(executor_uuid: str) -> list[str]:
     """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor.
 
-    Every contract is read twice: at one latest block named by its hash (`_call_at_block_hash`: that block's header
+    Every contract is read twice: at one block named by its hash (`_call_at_block_hash`: that block's header
     first, then one pinned read whose header words must match it and whose run on the block's child must agree, so
     a backend without the block or its child fails the read instead of answering from another state), and at
-    `latest`. A version counts when
+    `latest`. The pinned block is the head's parent, the newest block that has a child. A version counts when
     either read sees collateral, so the answer errs towards "still held": reads at `latest` alone, one after
     another, can straddle a deposit landing on one contract and a reclaim finalizing on the other and report
-    neither, and removing the executor then drops the record of collateral that is still held. Latest, not
-    finalized: a deposit that is mined but not yet final must still count."""
-    block_hash = await get_collateral_contract().latest_block_hash()
+    neither, and removing the executor then drops the record of collateral that is still held. Near the head, not
+    finalized: a deposit that is mined but not yet final must still count, and the `latest` read sees one mined in
+    the head block itself."""
+    block_hash = await get_collateral_contract().head_parent_hash()
     versions = []
     for version in settings.CONTRACT_VERSIONS:
         contract = get_collateral_contract(version=version)

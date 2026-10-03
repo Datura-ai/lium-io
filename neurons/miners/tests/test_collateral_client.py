@@ -1132,7 +1132,7 @@ async def test_a_read_pinned_to_a_block_the_rpc_does_not_have_fails():
 
     with pytest.raises(collateral_module.RpcReadError, match="does not have the block"):
         await client.get_executor_collateral(EXECUTOR, block_hash=bytes.fromhex("ee" * 32))
-    assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash()) == Decimal("0.01")
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.head_parent_hash()) == Decimal("0.01")
 
 
 @pytest.mark.parametrize("creator_whitelist", [False, True], ids=["whitelist-check-disabled", "whitelist-check-on"])
@@ -1149,7 +1149,7 @@ async def test_a_pinned_read_does_not_depend_on_the_evm_creator_whitelist(creato
     monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
     monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
 
-    assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash()) == Decimal("0.01")
+    assert await client.get_executor_collateral(EXECUTOR, block_hash=await client.head_parent_hash()) == Decimal("0.01")
     assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
     pinned = [params for method, params in provider.requests if method == "eth_call" and len(params) == 3]
     assert pinned and all(params[0] == {"to": PINNED_READ_ADDRESS, "data": "0x"} for params in pinned)
@@ -1163,7 +1163,7 @@ async def test_a_pinned_read_on_an_rpc_that_drops_the_state_override_fails():
     client = client_with(provider)
 
     with pytest.raises(collateral_module.RpcReadError, match="state overrides"):
-        await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash())
+        await client.get_executor_collateral(EXECUTOR, block_hash=await client.head_parent_hash())
 
 
 async def test_a_pinned_read_split_across_backends_fails_instead_of_reading_pending_state():
@@ -1174,7 +1174,7 @@ async def test_a_pinned_read_split_across_backends_fails_instead_of_reading_pend
     provider.pending_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
     provider.block_number = provider.finalized_number = 5000
     client = client_with(provider)
-    block_hash = await client.latest_block_hash()
+    block_hash = await client.head_parent_hash()
 
     provider.batch_backends = ["a", "split"]
     with pytest.raises(collateral_module.RpcReadError, match="an error answer"):
@@ -1189,6 +1189,7 @@ async def test_remove_executor_fails_when_its_pinned_read_is_split_across_backen
 
     provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
     provider.pending_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    provider.has_child = False
     client = client_with(provider)
     monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
     monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
@@ -1207,7 +1208,7 @@ async def test_a_pinned_read_that_reaches_a_sibling_block_fails():
     provider.sibling_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
     provider.block_number = provider.finalized_number = 5000
     client = client_with(provider)
-    block_hash = await client.latest_block_hash()
+    block_hash = await client.head_parent_hash()
 
     provider.batch_backends = ["a", "sibling"]
     with pytest.raises(collateral_module.RpcReadError, match="disagree"):
@@ -1222,6 +1223,7 @@ async def test_remove_executor_fails_when_its_pinned_read_reaches_a_sibling_bloc
 
     provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
     provider.sibling_calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    provider.has_child = False
     client = client_with(provider)
     monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
     monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
@@ -1241,7 +1243,7 @@ async def test_a_lagging_pending_sibling_and_a_backend_where_the_sibling_is_cano
     provider.sibling_parent = "0x" + "5b" * 32
     provider.block_number = provider.finalized_number = 5000
     client = client_with(provider)
-    block_hash = await client.latest_block_hash()
+    block_hash = await client.head_parent_hash()
 
     provider.batch_backends = ["a", "sibling"]
     with pytest.raises(collateral_module.RpcReadError, match="child"):
@@ -1259,7 +1261,28 @@ async def test_a_pinned_read_fails_closed_until_the_block_has_a_child():
     client = client_with(provider)
 
     with pytest.raises(collateral_module.RpcReadError):
-        await client.get_executor_collateral(EXECUTOR, block_hash=await client.latest_block_hash())
+        await client.get_executor_collateral(EXECUTOR, block_hash=provider.chain_hash(5000))
+
+
+async def test_remove_executor_reads_at_the_head_parent_on_a_chain_whose_head_has_no_child(monkeypatch):
+    """Read b at 56e94df: a real chain has no block past its head, so a read pinned to the head fails its run on the
+    child ("header not found") every time. The removal guard pins to the head's parent, whose child is the head,
+    and keeps both runs: by hash on the parent and by number on the head."""
+    from core import utils
+
+    provider = FakeProvider(calls={selector("collaterals(bytes16)"): hex_encode(["uint256"], [10**16])})
+    provider.block_number = 5000
+    provider.has_child = False
+    client = client_with(provider)
+    monkeypatch.setattr(utils, "get_collateral_contract", lambda version=None: client)
+    monkeypatch.setattr(utils.settings, "CONTRACT_VERSIONS", {"1.0.2": CONTRACT})
+
+    assert await utils.versions_holding_collateral(EXECUTOR) == ["1.0.2"]
+    pinned = [params[1] for method, params in provider.requests if method == "eth_call" and len(params) == 3]
+    assert pinned == [{"blockHash": provider.chain_hash(4999), "requireCanonical": True}, {"blockNumber": hex(5000)}]
+
+    provider.calls = {selector("collaterals(bytes16)"): hex_encode(["uint256"], [0])}
+    assert await utils.versions_holding_collateral(EXECUTOR) == []
 
 
 FORK_B = "0x" + "0b" * 32
