@@ -999,7 +999,9 @@ class CollateralClient:
         carry the block's number, parent and timestamp; a call pinned by number can reach a sibling block with the
         same three. So it runs inside pinned_read_code twice: pinned by hash, where the header words must match the
         header, and on the block's child, where BLOCKHASH(NUMBER - 1) must be the block's hash, which only a chain
-        holding the block answers. The two answers must agree; no child yet fails closed. Both runs are plain calls
+        holding the block answers. The child's run sees the child's state, so a third run pinned by the block's
+        number, which a backend without the block refuses, must agree as well. The answers must agree; no child yet
+        fails closed. Both runs are plain calls
         (pinned_call), so the creator whitelist does not apply. Every output of the contract's view functions is a
         static type."""
         hash_hex = AsyncWeb3.to_hex(block_hash)
@@ -1009,12 +1011,13 @@ class CollateralClient:
         (block,) = await self._read_together(("eth_getBlockByHash", [hash_hex, False]))
         if not isinstance(block, dict) or block.get("hash") != hash_hex:
             raise RpcReadError("the RPC does not have the block the read is pinned to")
-        by_hash, at_child = await self._read_together(
+        by_hash, by_number, at_child = await self._read_together(
             ("eth_call", pinned_call(code, {"blockHash": hash_hex, "requireCanonical": True})),
+            ("eth_call", pinned_call(code, {"blockNumber": hex(block_number(block))})),
             ("eth_call", pinned_call(code, {"blockNumber": hex(block_number(block) + 1)})),
         )
         [result] = pinned_outputs(by_hash, block, [size])
-        if child_outputs(at_child, block, [size]) != [result]:
+        if not pinned_outputs(by_number, block, [size]) == child_outputs(at_child, block, [size]) == [result]:
             raise RpcReadError("the reads at the block and at its child disagree")
         decoded = self.w3.codec.decode(outputs, result)
         return decoded[0] if len(outputs) == 1 else tuple(decoded)

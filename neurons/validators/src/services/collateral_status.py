@@ -9,7 +9,8 @@ required_deposit_amount[gpu_model] × gpu_count × COLLATERAL_DAYS. It has no sc
 The finalized header is read first. Then two view calls (`executorToMiner(bytes16)`,
 `collaterals(bytes16)`) run in one EVM run (pinned_read_code), twice: pinned by the header's hash,
 where the run's NUMBER, BLOCKHASH(NUMBER - 1) and TIMESTAMP must match the header, and on the
-header's child, where BLOCKHASH(NUMBER - 1) must be the header's hash. The two runs must agree. A
+header's child, where BLOCKHASH(NUMBER - 1) must be the header's hash, and a third time pinned by the
+header's number, since the child's run sees the child's state. The three runs must agree. A
 backend without the block or its child answers an error, and the read fails. The code runs as the
 code of PINNED_READ_ADDRESS through eth_call's state override, a plain call, so Subtensor's EVM
 creator whitelist does not apply to it. A read is kept per executor for
@@ -311,9 +312,12 @@ class CollateralStatusReader:
         # carry the block's number, parent and timestamp, and a number can reach a sibling with the same three. A
         # run on the block's child can: BLOCKHASH(NUMBER - 1) there is the block's own hash. The answer counts only
         # when the run pinned by hash matches the header and agrees with the child's run; no child yet fails closed.
+        # The child's run sees the child's state, so a third run pinned by the block's number must agree too: a
+        # backend without the block answers "header not found", one holding it answers from the block's own state.
         code = pinned_read_code(to, calls)
         pins = (
             {"blockHash": header["hash"], "requireCanonical": True},
+            {"blockNumber": header["number"]},
             {"blockNumber": hex(int(header["number"], 16) + 1)},
         )
         answers = await self._rpc(
@@ -329,8 +333,12 @@ class CollateralStatusReader:
             if not isinstance(answer, dict) or "error" in answer or "result" not in answer:
                 raise ValueError("eth_call has no result")
             results.append(answer["result"])
-        runs = [pinned_outputs(results[0], header, [32, 32]), child_outputs(results[1], header, [32, 32])]
-        if runs[0] != runs[1]:
+        runs = [
+            pinned_outputs(results[0], header, [32, 32]),
+            pinned_outputs(results[1], header, [32, 32]),
+            child_outputs(results[2], header, [32, 32]),
+        ]
+        if not runs[0] == runs[1] == runs[2]:
             raise ValueError("the reads at the block and at its child disagree")
         owner, collateral = runs[0]
         return decide(

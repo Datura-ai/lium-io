@@ -72,6 +72,10 @@ class FakeRpc:
         self.head_tags: list[str] = []
         self.pending = PENDING
         self.sibling: tuple[str, Decimal] | None = None
+        # True: a gateway sends the hash-pinned call to a backend one block behind, which answers from PENDING
+        self.hash_lags = False
+        # the state after HEADER's child, when the child changed the executor's owner or collateral
+        self.child_state: tuple[str, Decimal] | None = None
         # False: the backend has not imported a child of HEADER yet
         self.has_child = True
         # True: EVM::DisableWhitelistCheck is off and WhitelistedCreators is empty, so a contract-creation call fails
@@ -105,17 +109,23 @@ class FakeRpc:
             return {"jsonrpc": "2.0", "id": req["id"], "result": "0x"}
         # as Finney's Frontier answers: an unknown number is "header not found", an unknown hash runs on pending
         if "blockNumber" in at:
-            if not ((self.has_block or self.sibling is not None) and self.has_child and at["blockNumber"] == CHILD["number"]):
+            known = self.has_block or self.sibling is not None
+            if known and at["blockNumber"] == HEADER["number"]:
+                header = HEADER
+            elif known and self.has_child and at["blockNumber"] == CHILD["number"]:
+                # a backend where a sibling is canonical runs on the sibling's child, whose parent hash is the sibling's
+                header = SIBLING_CHILD if self.sibling is not None else CHILD
+            else:
                 return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "header not found"}}
-            # a backend where a sibling is canonical runs on the sibling's child, whose parent hash is the sibling's
-            header = SIBLING_CHILD if self.sibling is not None else CHILD
         else:
-            header = HEADER if self.has_block and at.get("blockHash") == BLOCK_HASH else self.pending
-        owner, tao = (
-            (self.owner, self.collateral_tao)
-            if header is HEADER or header is CHILD
-            else (self.pending_owner, self.pending_collateral_tao)
-        )
+            known = self.has_block and not self.hash_lags
+            header = HEADER if known and at.get("blockHash") == BLOCK_HASH else self.pending
+        if header is CHILD and self.child_state is not None:
+            owner, tao = self.child_state
+        elif header is HEADER or header is CHILD:
+            owner, tao = self.owner, self.collateral_tao
+        else:
+            owner, tao = self.pending_owner, self.pending_collateral_tao
         if "blockNumber" in at and self.sibling is not None:
             # a backend whose block at that height is a sibling with the same number, parent and timestamp
             owner, tao = self.sibling
@@ -176,10 +186,11 @@ async def test_deposited_means_owned_by_the_miner_and_covers_the_requirement(
     assert status.contract_version == ("1.0.2" if deposited else None)
     assert cached is False
     assert (status.error_message is None) if error_part is None else (error_part in status.error_message)
-    [[req, at_child]] = rpc.batches
+    [[req, by_number, at_child]] = rpc.batches
     address = collateral_status.PINNED_READ_ADDRESS
     assert req["params"][0] == {"to": address, "data": "0x"}
     assert req["params"][1] == {"blockHash": BLOCK_HASH, "requireCanonical": True}
+    assert by_number["params"] == [req["params"][0], {"blockNumber": HEADER["number"]}, req["params"][2]]
     assert at_child["params"] == [req["params"][0], {"blockNumber": CHILD["number"]}, req["params"][2]]
     assert rpc.head_tags == ["finalized"]
     contract = settings.COLLATERAL_CONTRACT_ADDRESS[2:].lower()
@@ -268,6 +279,33 @@ async def test_a_sibling_block_with_the_pinned_number_parent_and_timestamp_is_ne
     rpc.sibling = None
     status, _ = await _status(_reader(rpc))
     assert (status.deposited, status.read_failed) == (False, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "at_block, in_sibling_and_child, deposited",
+    [
+        pytest.param(("0x" + "0" * 40, Decimal(0)), (MINER_EVM, Decimal(9)), False, id="deposit-after-the-block"),
+        pytest.param((MINER_EVM, Decimal(9)), ("0x" + "0" * 40, Decimal(0)), True, id="reclaim-after-the-block"),
+    ],
+)
+async def test_a_pending_sibling_that_agrees_with_the_child_is_never_read(at_block, in_sibling_and_child, deposited):
+    """Review 5398736862 at d391eb0: the hash-pinned call reaches a backend one block behind, whose pending sibling
+    carries the block's number, parent and timestamp, and the child changed the executor the same way the sibling
+    did. The sibling's and the child's runs agree; the run pinned by the block's number reads the block's own state,
+    so the read fails instead of caching either answer."""
+    rpc = FakeRpc(*at_block)
+    rpc.hash_lags = True
+    rpc.pending = {k: HEADER[k] for k in ("number", "parentHash", "timestamp")}
+    rpc.pending_owner, rpc.pending_collateral_tao = in_sibling_and_child
+    rpc.child_state = in_sibling_and_child
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    rpc.hash_lags = False
+    rpc.child_state = None
+    status, _ = await _status(_reader(rpc))
+    assert (status.deposited, status.read_failed) == (deposited, False)
 
 
 @pytest.mark.asyncio
