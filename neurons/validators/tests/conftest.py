@@ -110,7 +110,7 @@ def no_docker_hub_digest_on_rent_path():
 
 @pytest.fixture(autouse=True)
 def no_kept_upload_probes_carried_between_tests():
-    """The VerifyX check counts kept upload probes per executor uuid for the process; tests share uuids."""
+    """The VerifyX check counts kept upload probes per (hotkey, uuid) for the process; tests share both."""
     yield
     for name in ("services.task.checks.verifyx", "neurons.validators.src.services.task.checks.verifyx"):
         module = sys.modules.get(name)

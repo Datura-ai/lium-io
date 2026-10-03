@@ -28,8 +28,9 @@ _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 # before each probe. So a 429 keeps the upload EMA for at most this many probes in a row; after
 # that the probe's 0.0 is fed. One probe per job cycle (BLOCKS_FOR_JOB, ~15 min): 8 is ~2 h,
 # well past Cloudflare's Retry-After. Per process, so a validator restart starts the count again.
+# Keyed by (miner hotkey, executor uuid): two miners can list the same executor uuid.
 MAX_KEPT_UPLOAD_PROBES = 8
-_kept_upload_probes: dict[str, int] = {}
+_kept_upload_probes: dict[tuple[str, str], int] = {}
 
 
 @dataclass(frozen=True)
@@ -401,12 +402,12 @@ def _feed_ema(
 def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
     """`upload_blocked`, until this host's upload EMA has been kept MAX_KEPT_UPLOAD_PROBES probes
     in a row; a probe that does not keep it starts the count again."""
-    uuid = ctx.executor.uuid
+    key = (ctx.miner_hotkey, ctx.executor.uuid)
     if not upload_blocked:
-        _kept_upload_probes.pop(uuid, None)
+        _kept_upload_probes.pop(key, None)
         return False
-    kept = _kept_upload_probes.get(uuid, 0) + 1
-    _kept_upload_probes[uuid] = kept
+    kept = _kept_upload_probes.get(key, 0) + 1
+    _kept_upload_probes[key] = kept
     if kept <= MAX_KEPT_UPLOAD_PROBES:
         return True
     logger.warning(

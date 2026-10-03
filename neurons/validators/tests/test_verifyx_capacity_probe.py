@@ -136,7 +136,13 @@ def _judge(network_execution: dict, *, network_flag: bool = False) -> dict:
 
 
 async def _run_check(
-    context_factory, verification_result: dict, *, prev_ema=None, prev_upload=None, specs=None
+    context_factory,
+    verification_result: dict,
+    *,
+    prev_ema=None,
+    prev_upload=None,
+    specs=None,
+    miner_hotkey: str = "miner-hotkey",
 ):
     # The double spreads `updated_specs` over its own `success: True`, so the judged result's
     # `success` (True or False) is what the check reads, as after `evaluate_verifyx_capture`.
@@ -147,7 +153,7 @@ async def _run_check(
         specs=specs if specs is not None else {"gpu": {"count": 8}, "network": {}},
         rented_data=_rented_data_with_ema("executor-123", download=prev_ema, upload=prev_upload),
     )
-    ctx = context_factory(services=services, config=config, state=state)
+    ctx = context_factory(services=services, config=config, state=state, miner_hotkey=miner_hotkey)
     return await VerifyXCheck().run(ctx)
 
 
@@ -330,6 +336,54 @@ async def test_a_429_keeps_the_upload_ema_for_at_most_max_kept_upload_probes_in_
 
     measured = await upload_after(_probe_payload(), HOST_UPLOAD_MBPS)
     assert await upload_after(_cloudflare_unreachable_payload(), measured) == measured
+
+
+_KEPT = [HOST_UPLOAD_MBPS] * MAX_KEPT_UPLOAD_PROBES
+_TWO_MINERS_ONE_UUID = {
+    "B's measured upload does not reset A's count": (
+        [("A", "429"), ("B", "measured")] * MAX_KEPT_UPLOAD_PROBES + [("A", "429")],
+        {"A": _KEPT + [950.0], "B": _KEPT},
+    ),
+    "A's exhausted count does not halve B's first 429": (
+        [("A", "429")] * (MAX_KEPT_UPLOAD_PROBES + 1) + [("B", "429")],
+        {"A": _KEPT + [950.0], "B": [HOST_UPLOAD_MBPS]},
+    ),
+    "a timeout zero resets A only; B still runs out": (
+        [("A", "429"), ("B", "429")] * MAX_KEPT_UPLOAD_PROBES
+        + [("A", "timeout"), ("A", "429"), ("B", "429")],
+        {"A": _KEPT + [950.0, 950.0], "B": _KEPT + [950.0]},
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "steps, expected", _TWO_MINERS_ONE_UUID.values(), ids=list(_TWO_MINERS_ONE_UUID)
+)
+async def test_two_miner_hotkeys_on_one_executor_uuid_count_kept_upload_probes_apart(
+    context_factory, steps, expected
+):
+    """Two miners can list one executor uuid; each (hotkey, uuid) keeps its own count of 429
+    probes in a row, so one miner's probes never extend, reset or use up the other's."""
+    payloads = {
+        "429": _cloudflare_unreachable_payload,
+        "measured": _probe_payload,
+        "timeout": lambda: _cloudflare_unreachable_payload(error=DOWNLOAD_TIMEOUT_ERROR),
+    }
+    uploads = {hotkey: [HOST_UPLOAD_MBPS] for hotkey in expected}
+    for hotkey, kind in steps:
+        result = await _run_check(
+            context_factory,
+            _judge(payloads[kind]()),
+            prev_ema=HOST_CAPACITY_MBPS,
+            prev_upload=uploads[hotkey][-1],
+            miner_hotkey=hotkey,
+        )
+        uploads[hotkey].append(result.updates["state"].specs["network"]["ema_verifyx_upload_speed"])
+
+    assert {hotkey: seq[1:] for hotkey, seq in uploads.items()} == {
+        hotkey: pytest.approx(seq) for hotkey, seq in expected.items()
+    }
 
 
 UPLOAD_TRANSPORT_ERROR = (
