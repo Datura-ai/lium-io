@@ -1,5 +1,5 @@
 """get_sysbox_version() in machine_scrape.py: the host's `sysbox-runc --version`, recorded as
-specs.sysbox_version. Telemetry only (Conductor 3 Oct 2026 16:07Z): nothing scores or gates on it.
+specs.sysbox_version. Telemetry only: nothing scores or gates on it.
 Sysbox absent or the command failing reads None and never fails the scrape.
 
 machine_scrape.py is a script, not a module, so the helper is extracted by ast (helpers.build_scrape_namespace).
