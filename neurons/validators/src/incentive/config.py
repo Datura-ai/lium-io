@@ -40,6 +40,9 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
 # from the AC entry, so a re-price of the AC card moves both names.
 RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300`: Fish, 4 Oct 2026, "same rates as b300 for now". A different card from the B300, so its own base
+# model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300 per owner 4 Oct; revisit when GB300 market data exists
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -151,6 +154,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "GTX 1060": {},
     "Tesla M40": {},
 }
+MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300 per owner 4 Oct; revisit when GB300 market data exists
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
@@ -269,6 +273,7 @@ BASE_GPU_MAP = {
     "NVIDIA Tesla M40": "Tesla M40",
 }
 BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
+BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):
