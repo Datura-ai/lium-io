@@ -45,7 +45,7 @@ def test_a100_and_l40s_caps_and_nothing_else_moved():
     assert MAX_UNRENTED_GPUS_BY_TYPE["A100"] == {1: 10, 8: 40}
     assert MAX_UNRENTED_GPUS_BY_TYPE["L40S"] == {1: 10, 8: 16}
     for family, buckets in MAX_UNRENTED_GPUS_BY_TYPE.items():
-        if family in ("B300", "GB300", "A100", "L40S"):  # GB300 takes the B300 caps (Fish, 4 Oct 2026)
+        if family in ("B300", "GB300", "A100", "L40S"):  # GB300 takes the B300 caps
             continue
         assert buckets in ({}, {1: 10, 8: 64}), family
 

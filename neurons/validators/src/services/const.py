@@ -97,7 +97,7 @@ GPU_MODEL_RATES = {
 }
 # `NVIDIA B300 SXM6 PC` is derived from the AC entry, never a row of its own (incentive/config.py says why).
 GPU_MODEL_RATES["NVIDIA B300 SXM6 PC"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
-# `NVIDIA GB300`: Fish, 4 Oct 2026, "same rates as b300 for now"; mirrors B300 per owner 4 Oct; revisit when GB300 market data exists.
+# `NVIDIA GB300` is priced like B300 for now; revisit when GB300 market data exists.
 GPU_MODEL_RATES["NVIDIA GB300"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
 
 MAX_UPLOAD_SPEED = 1000

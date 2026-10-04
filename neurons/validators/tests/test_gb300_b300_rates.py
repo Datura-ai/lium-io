@@ -1,5 +1,4 @@
-"""GB300 at the B300 rates for now (Fish, 4 Oct 2026, Discord msg 1556173474572279860: "please add it with the same
-rates as b300 for now").
+"""GB300 is priced like B300 for now, until it has its own market data.
 
 GB300 is a different card, so it is its own base model with its own idle tier at the B300 caps (1x: 4, 8x: 32); an
 idle GB300 never fills the B300 tier. Its idle rate, score rate and VRAM size are the B300 AC entries.

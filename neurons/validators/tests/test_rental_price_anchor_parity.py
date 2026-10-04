@@ -47,7 +47,7 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
     B300 is pinned at 6.40 by DAH-3542. `NVIDIA B300 SXM6 PC` is the one key the pin may ADD: the
     AC card's alias (derived from the AC entry, never its own price), in the lium-core source table
     but not yet in the release the lock installs — the union is a no-op once the lock carries it.
-    `NVIDIA GB300` is the other: priced at the B300 AC rate by the owner (4 Oct 2026), its own base model."""
+    `NVIDIA GB300` is the other: priced at the B300 AC rate for now, its own base model."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300"}
