@@ -7374,6 +7374,7 @@ class DockerService:
                                     }),
                                 )
                             )
+                            container_vanished = False
                             raise
                         killed = self._explain_container_killed_during_bootstrap(
                             post_run_exc,

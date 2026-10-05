@@ -17,7 +17,12 @@ import asyncssh
 import pytest
 import requests
 from docker.errors import APIError, NotFound
-from payload_models.payloads import ContainerCreated, CustomOptions, FailedContainerRequest
+from payload_models.payloads import (
+    ContainerCreated,
+    CustomOptions,
+    FailedContainerErrorCodes,
+    FailedContainerRequest,
+)
 from services.docker_service import (
     KILLED_DURING_BOOTSTRAP_EVENT,
     KILLED_DURING_BOOTSTRAP_STEP,
@@ -428,6 +433,9 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
         _swept_at_inspect(api, 2, older)
     else:
         _swept_at_inspect(api, 2, this)
+    if swept == "during-bootstrap":
+        # the cleanup's inspect answers "No such object" for the swept ID
+        monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock(return_value=True))
 
     result = await _create(svc, payload)
 
@@ -441,6 +449,7 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
     assert result.failure_step == "ssh_bootstrap"
     assert "stopped by the node" not in result.detail
     assert _events(caplog) == []
+    assert result.error_code != FailedContainerErrorCodes.ContainerVanished
     assert any(getattr(r.msg, "extra", {}).get("reason") == "removed_by_own_sweep" for r in caplog.records)
 
 
