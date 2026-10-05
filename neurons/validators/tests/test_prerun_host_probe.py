@@ -836,7 +836,7 @@ async def test_port_check_with_probe_nothing_lingering_runs_nothing(docker_servi
         executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
         ssh_client=ssh, probed_container_names=(),
     )
-    assert (ok, msg) == (True, "No port check containers found")
+    assert (ok, msg) == (False, "No port check containers found")
     assert _cmds(ssh) == []
 
 
@@ -1220,7 +1220,7 @@ def _wire_real_docker_run(svc, monkeypatch, *, refusals: int) -> list[str]:
     async def port_check_wait(**kwargs) -> tuple[bool, str]:
         listing = "early" if kwargs.get("probed_container_names") is not None else "live"
         calls.append(f"port_check_wait:{listing}")
-        return True, "No port check containers found"
+        return False, "No port check containers found"
 
     async def run_container(spec) -> None:
         calls.append("docker_run")
@@ -1255,3 +1255,36 @@ async def test_the_first_port_refusal_reads_the_port_check_listing_live_before_t
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert calls == ["port_check_wait:early", "docker_run", "port_check_wait:live", "docker_run", "docker_run"]
+
+
+@pytest.mark.asyncio
+async def test_a_port_check_removed_live_is_not_followed_by_the_five_second_wait(svc_fixture, monkeypatch):
+    """The live listing removed the port check that held the port: the retry runs at once."""
+    svc = svc_fixture
+    calls = _wire_real_docker_run(svc, monkeypatch, refusals=1)
+    monkeypatch.setattr("services.docker_service._PORT_ALLOCATED_RETRY_SLEEP_SEC", 5)
+
+    async def port_check_wait(**kwargs) -> tuple[bool, str]:
+        if kwargs.get("probed_container_names") is not None:
+            calls.append("port_check_wait:early")
+            return False, "No port check containers found"
+        calls.append("port_check_wait:live")
+        return True, "Port check containers forcefully removed"
+
+    svc.wait_for_port_check_containers = port_check_wait
+    real_sleep = asyncio.sleep
+    retry_sleeps: list[float] = []
+
+    async def recording_sleep(delay, *args, **kwargs):
+        if delay == 5:
+            retry_sleeps.append(delay)
+            delay = 0
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert calls == ["port_check_wait:early", "docker_run", "port_check_wait:live", "docker_run"]
+    assert retry_sleeps == []

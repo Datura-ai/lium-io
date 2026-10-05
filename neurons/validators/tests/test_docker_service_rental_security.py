@@ -1065,7 +1065,7 @@ async def test_port_check_filters_quote_hostile_miner_hotkey(
         ssh_client=ssh_client,
     )
 
-    assert result == (True, "No port check containers found")
+    assert result == (False, "No port check containers found")
     assert len(ssh_client.commands) == 1
     _assert_shell_arg_is_single_token(
         ssh_client.commands[0],

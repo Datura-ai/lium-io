@@ -1597,7 +1597,8 @@ class DockerService:
         carries the port the pod really got. No free candidate, or a second bind refusal, fails the
         create as `RentalPortCollisionError`. Flag off: the DAH-1991 same-command wait as before.
 
-        `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry.
+        `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry;
+        when it removed a port check, the run is retried at once on the same mapping.
         """
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
@@ -1639,8 +1640,18 @@ class DockerService:
                 if port_allocation_phrase and remove_port_checks_listed_live is not None:
                     # the pre-run wait used the listing taken at SSH connect; a port check started
                     # since then holds the port and only a live listing sees it
-                    await remove_port_checks_listed_live()
+                    port_check_removed, _ = await remove_port_checks_listed_live()
                     remove_port_checks_listed_live = None
+                    if port_check_removed:
+                        # the removal freed the port: no wait, no remap
+                        attempt += 1
+                        await self._remove_failed_rental_container_for_retry(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="PORT_RETRY_STALE_RM_FAILED",
+                        )
+                        continue
                 if port_allocation_phrase and remapped:
                     # the one retry on the new mapping was refused too: no third candidate
                     error_text = str(exc)
@@ -2597,10 +2608,11 @@ class DockerService:
                 None runs the listing here.
 
         Returns:
-            Tuple of (success: bool, message: str). Always succeeds — removal is
-            best-effort and the rental proceeds regardless:
-            - (True, "No port check containers found")
+            Tuple of (removed: bool, message: str). Removal is best-effort and the
+            rental proceeds regardless:
+            - (False, "No port check containers found")
             - (True, "Port check containers forcefully removed")
+            - (False, "Unable to check for port check containers, proceeding")
         """
         listing_command = port_check_containers_command(miner_hotkey)
 
@@ -2612,7 +2624,7 @@ class DockerService:
                 names = list(probed_container_names)
 
             if not names:
-                return True, "No port check containers found"
+                return False, "No port check containers found"
 
             # Found lingering probe container(s). Force-remove IMMEDIATELY and let
             # the rental proceed — the customer-facing create request must not wait
@@ -2646,7 +2658,7 @@ class DockerService:
                 return await _run_checks(ssh_client)
             except Exception as e:
                 logger.error(f"Error checking for port check containers: {e}")
-                return True, "Unable to check for port check containers, proceeding"
+                return False, "Unable to check for port check containers, proceeding"
 
         # No reusable session — open a dedicated SSH connection.
         decrypted_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -2671,7 +2683,7 @@ class DockerService:
         except Exception as e:
             logger.error(f"Error connecting to check for port check containers: {e}")
             # If we can't connect, assume it's safe to proceed
-            return True, "Unable to check for port check containers, proceeding"
+            return False, "Unable to check for port check containers, proceeding"
 
     async def clean_existing_containers(
         self,
@@ -6753,7 +6765,7 @@ class DockerService:
                 probed_port_check_names = (
                     docker_listing_probe.port_check_container_names if docker_listing_probe is not None else None
                 )
-                wait_ok, wait_msg = await self.wait_for_port_check_containers(
+                port_check_removed, wait_msg = await self.wait_for_port_check_containers(
                     executor_info=executor_info,
                     miner_hotkey=payload.miner_hotkey,
                     keypair=keypair,
@@ -6764,7 +6776,7 @@ class DockerService:
                 logger.info(
                     _m(
                         f"Port check container pre-run wait result: {wait_msg}",
-                        extra=get_extra_info({**default_extra, "ok": wait_ok}),
+                        extra=get_extra_info({**default_extra, "removed": port_check_removed}),
                     )
                 )
 

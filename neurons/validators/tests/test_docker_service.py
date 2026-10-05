@@ -5268,7 +5268,7 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
             private_key="encrypted-private-key",
         )
 
-    assert ok is True
+    assert ok is False
     assert msg == "No port check containers found"
     # Inspect the docker ps command
     ps_cmd = next((c for c in seen_commands if "docker ps" in c), "")
@@ -5332,7 +5332,7 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
             private_key="x",
         )
 
-    assert ok is True
+    assert ok is False
     assert msg == "No port check containers found"
 
 
@@ -5544,7 +5544,7 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
             ssh_client=ssh_client,
         )
 
-    assert ok is True
+    assert ok is False
     assert msg == "No port check containers found"
     # The reused-session path must skip the connect dance entirely.
     connect_mock.assert_not_called()
