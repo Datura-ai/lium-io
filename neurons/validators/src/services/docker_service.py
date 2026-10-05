@@ -902,7 +902,7 @@ FINAL_STATE_INSPECT_RETRY_DELAY_S = 1.0
 
 
 async def _raise_unless_running_before_created(
-    docker_client: RentalDockerSdkClient, *, container_name: str
+    docker_client: RentalDockerSdkClient, *, container_name: str, container_id: str | None = None
 ) -> None:
     """The last State read before the pod is cached as rented. Unlike _raise_if_killed_after_exec,
     no exec result stands behind it: an inspect that keeps failing fails the create (the backend can
@@ -910,9 +910,11 @@ async def _raise_unless_running_before_created(
     included — raises ContainerGoneBeforeExec, whose cause decides between a kill and the step's own
     failure."""
     failure = "the bootstrap's last exec ended"
+    # by this create's own ID: a concurrent retry can sweep it and start another under the same name
+    target = container_id or container_name
     for attempt in range(1, FINAL_STATE_INSPECT_ATTEMPTS + 1):
         try:
-            state = await docker_client.inspect_container_state(container_name=container_name)
+            state = await docker_client.inspect_container_state(container_name=target)
             break
         except Exception as inspect_exc:  # noqa: BLE001 — retried, then the create fails
             if is_docker_not_found_error(inspect_exc):
@@ -7285,7 +7287,9 @@ class DockerService:
                     # the validator, no environment and ships_sshd, no exec runs after the key step. Read
                     # after the log drain, which awaits, so a kill while it drains is seen too.
                     current_step = soft_failed_step or "final_state_check"
-                    await _raise_unless_running_before_created(docker_client, container_name=container_name)
+                    await _raise_unless_running_before_created(
+                        docker_client, container_name=container_name, container_id=container_id
+                    )
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.

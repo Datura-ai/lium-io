@@ -981,6 +981,38 @@ async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(s
 
 
 @pytest.mark.asyncio
+async def test_the_final_state_check_reads_this_creates_container_id_not_its_name(svc, monkeypatch, caplog):
+    """A concurrent retry can sweep this create's container and start its own under the same name: the
+    last State read goes by the ID this create saved, so the sibling's running container is not ours."""
+    api = FakeApiClient()
+    api.container_states = [_RUNNING, _RUNNING]
+    _bootstrapping_create(svc, monkeypatch, api, skip_ssh_bootstrap=True)
+    looks: list[str] = []
+    real_inspect = api.inspect_container
+
+    def inspect(ref):
+        looks.append(ref)
+        if ref in swept_ids:
+            raise NotFound("No such container: " + ref)
+        return real_inspect(ref)
+
+    swept_ids: set[str] = set()
+    api.inspect_container = inspect
+
+    async def swept_while_draining():
+        swept_ids.add(_container_id(looks[0]))
+
+    monkeypatch.setattr(svc, "finish_stream_logs", swept_while_draining)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert looks[-1] == _container_id(looks[0])
+    assert isinstance(result, FailedContainerRequest)
+    svc.redis_service.add_rented_pod.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_kill_while_the_logs_drain_is_not_a_created_container(svc, monkeypatch, caplog):
     """The log drain awaits before the pod is cached; a SIGKILL while it runs is read by the final State check."""
     api = FakeApiClient()
