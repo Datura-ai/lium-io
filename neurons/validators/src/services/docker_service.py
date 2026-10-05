@@ -3652,8 +3652,12 @@ class DockerService:
         container_name: str,
         volume_name: str | None = None,
         remove_volume: bool = False,
+        container_id: str | None = None,
     ) -> bool:
         """Remove the failed container's artifacts; report whether it was already gone.
+
+        ``container_id``, once the create has one, is what gets read and removed: a concurrent
+        retry for the same pod can be running its own container under ``container_name``.
 
         DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
         on missing evidence.
@@ -3666,11 +3670,11 @@ class DockerService:
             diagnostics = await self.capture_failed_container_diagnostics(
                 ssh_client=ssh_client,
                 default_extra=default_extra,
-                container_name=container_name,
+                container_name=container_id or container_name,
             )
             container_missing = diagnostics.container_missing
 
-            container = shlex.quote(container_name)
+            container = shlex.quote(container_id or container_name)
             await retry_ssh_command(
                 ssh_client,
                 f"/usr/bin/docker rm -fv {container} 2>/dev/null || true",
@@ -7327,6 +7331,7 @@ class DockerService:
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
+                        container_id=container_id,
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.

@@ -43,6 +43,7 @@ from test_deploy_optimizations import (
 )
 from test_rental_docker_sdk import FakeApiClient, _container_state
 
+from services import docker_service as docker_service_module
 from services import rental_docker_sdk
 from services.prerun_host_probe import parse_container_listing
 
@@ -1003,11 +1004,23 @@ async def test_the_final_state_check_reads_this_creates_container_id_not_its_nam
         swept_ids.add(_container_id(looks[0]))
 
     monkeypatch.setattr(svc, "finish_stream_logs", swept_while_draining)
+    real_retry = docker_service_module.retry_ssh_command
+    removals: list[str] = []
+
+    async def recording_retry(ssh_client, command, *args, **kwargs):
+        if "docker rm -fv" in command:
+            removals.append(command)
+        return await real_retry(ssh_client, command, *args, **kwargs)
+
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", recording_retry)
     caplog.set_level(logging.WARNING)
 
     result = await _create(svc, _payload())
 
-    assert looks[-1] == _container_id(looks[0])
+    own_id = _container_id(looks[0])
+    assert looks[-1] == own_id
+    # the cleanup removes this create's container by its ID, never the sibling's under the shared name
+    assert removals and all(own_id in cmd and f" {looks[0]} " not in cmd for cmd in removals)
     assert isinstance(result, FailedContainerRequest)
     svc.redis_service.add_rented_pod.assert_not_awaited()
 
