@@ -606,6 +606,35 @@ async def test_enable_jupyter_feature(
 
 
 @pytest.mark.asyncio
+async def test_generate_portMappings_does_not_leak_ports_into_the_next_rent(
+    docker_service, test_executor_id, test_miner_hotkey, monkeypatch
+):
+    # Arrange: a fresh copy of the real list, so a failure here cannot leak into other tests
+    preferred_ports = list(docker_service_module.PREFERRED_POD_PORTS)
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", preferred_ports)
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in range(20000, 20100)
+    ]
+    await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        initial_port_count=None, enable_jupyter=True,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=[],
+    )
+
+    # Act
+    mappings, jupyter_port_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        initial_port_count=10, enable_jupyter=False,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=[],
+    )
+
+    # Assert
+    assert [docker_port for docker_port, _, _ in mappings] == [22, *range(20000, 20010)]
+    assert jupyter_port_map is None
+    assert preferred_ports == list(range(20000, 20010))
+
+
+@pytest.mark.asyncio
 async def test_pod_mapping_reuse(docker_service, test_executor_id, test_miner_hotkey):
     """Test that existing pod mappings are reused when pod_id is provided."""
     pod_id = uuid4()
