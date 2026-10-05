@@ -89,6 +89,42 @@ async def test_warm_up_redial_waits_for_the_chain_read_in_its_thread():
 
 
 @pytest.mark.asyncio
+async def test_warm_up_endpoint_switch_after_a_failed_load_waits_for_the_chain_read_in_its_thread():
+    # Arrange: the warm-up's first load fails while a rent's chain read holds the websocket
+    client = SubtensorClient.__new__(SubtensorClient)
+    client.default_extra = {}
+    client._chain_reads_in_thread = True
+    client._chain_read_lock = asyncio.Lock()
+    client._return_to_first_endpoint = MagicMock()
+    client.set_subtensor = MagicMock()
+    client._switch_endpoint_after_read_failure = MagicMock()
+    started = threading.Event()
+    release = threading.Event()
+    reads: list[asyncio.Task] = []
+
+    async def failing_load_beside_a_rent_read():
+        reads.append(asyncio.create_task(client._run_chain_read(_hold_chain_read_until(release, started))))
+        assert await asyncio.to_thread(started.wait, 1)
+        raise RuntimeError("chain read failed")
+
+    client.get_miners = failing_load_beside_a_rent_read
+
+    with patch.object(SubtensorClient, "_subtensor", MagicMock()):
+        # Act
+        warm_up = asyncio.create_task(client._warm_up_subtensor())
+        await asyncio.sleep(0.15)
+        switched_during_the_read = client._switch_endpoint_after_read_failure.called
+        release.set()
+        await reads[0]
+        await asyncio.sleep(0.05)
+        warm_up.cancel()
+
+    # Assert: the switch drops the subtensor and closes the websocket the thread is reading from
+    assert not switched_during_the_read
+    assert client._switch_endpoint_after_read_failure.called
+
+
+@pytest.mark.asyncio
 async def test_shutdown_returns_after_the_cancelled_warm_up_read_thread_ends():
     # Arrange: the warm-up is cancelled while its chain read runs in a thread
     client = SubtensorClient.__new__(SubtensorClient)

@@ -146,6 +146,48 @@ async def test_connector_connects_to_backend_while_the_first_miners_load_is_pend
     assert connect_attempted
 
 
+@pytest.mark.asyncio
+async def test_only_the_connector_reads_the_chain_in_a_thread() -> None:
+    # Arrange
+    bare_client = SubtensorClient.__new__(SubtensorClient)
+    running_warm_up = MagicMock(done=MagicMock(return_value=False))
+    connector_initialize = AsyncMock()
+
+    async def _backend_never_answering():
+        await asyncio.Event().wait()
+        yield
+
+    compute_client = ComputeClient.__new__(ComputeClient)
+    compute_client.logging_extra = {}
+    compute_client.connect = MagicMock(side_effect=_backend_never_answering)
+
+    # Act
+    with (
+        patch.object(SubtensorClient, "get_instance", return_value=bare_client),
+        patch.object(SubtensorClient, "_warm_up_task", running_warm_up),
+    ):
+        main_validator_client = await SubtensorClient.initialize()
+    with (
+        patch.object(SubtensorClient, "initialize", connector_initialize),
+        patch.multiple(
+            ComputeClient,
+            handle_send_messages=AsyncMock(),
+            subscribe_mesages_from_redis=AsyncMock(),
+            poll_rented_machines=AsyncMock(),
+            poll_executors_uptime=AsyncMock(),
+            poll_revenue_per_gpu_type=AsyncMock(),
+        ),
+    ):
+        run_forever = asyncio.create_task(compute_client.run_forever())
+        await asyncio.sleep(0.05)
+        run_forever.cancel()
+
+    # Assert
+    assert SubtensorClient._chain_reads_in_thread is False
+    assert main_validator_client._chain_reads_in_thread is False
+    connector_initialize.assert_awaited_once_with(chain_reads_in_thread=True)
+
+
 def _make_main_validator_subtensor_client() -> SubtensorClient:
     client = _make_connector_subtensor_client()
     client._chain_reads_in_thread = False

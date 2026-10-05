@@ -1118,7 +1118,7 @@ class SubtensorClient:
                 pass
         if cls._instance is not None and cls._instance._chain_reads_in_thread:
             # a read cancelled with the warm-up still runs in its thread; the next instance would
-            # share the websocket with it
+            # share its websocket if the new instance's own dial failed
             async with cls._instance._chain_read_lock:
                 pass
         cls._warm_up_task = None
