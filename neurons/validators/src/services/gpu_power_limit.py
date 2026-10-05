@@ -633,9 +633,10 @@ async def raise_low_power_limits_to_default(
     floor and the default are left alone (a miner may legitimately run there). ``gpu_uuids=None``
     means every host GPU. Best-effort (never raises); returns the raised count.
 
-    Always a live query, never the pre-run probe (DAH-3257): volume creation and a bootstrap
-    restore run between the probe and this call, so the probe's power state can be minutes old,
-    and this net is the last read before the customer's container starts.
+    Always a live query, never the pre-run probe (DAH-3257): a bootstrap restore runs between the
+    probe and this call, so the probe's power state can be minutes old. It is the create's last
+    power read, not its last step: outside a bootstrap restore it runs beside the volume create and
+    the GPU flags, which may finish after it, before the customer's container starts.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
