@@ -24,8 +24,10 @@ from payload_models.payloads import (
     FailedContainerRequest,
 )
 from services.docker_service import (
+    CANCELLED_BY_CREATE_STEP,
     KILLED_DURING_BOOTSTRAP_EVENT,
     KILLED_DURING_BOOTSTRAP_STEP,
+    ContainerKilledDuringBootstrap,
     DockerService,
     container_gone_cause,
     inflight_creates,
@@ -294,10 +296,7 @@ _DEAD_1 = _container_state(status="dead", running=False, dead=True, exit_code=1)
 _SIGINT = _container_state(status="exited", running=False, exit_code=130)
 _EXITED_137 = _container_state(status="exited", running=False, exit_code=137)
 _BY_NODE = "the container was stopped by the node before it was ready: "
-_OOM = (
-    "the container ran out of memory before it was ready: its memory limit was reached, "
-    "by the node or by its own command"
-)
+_OOM = "the container was killed for lack of memory before it was ready"
 _ENDED_ON = "the container stopped before it was ready: its command ended on "
 
 
@@ -446,7 +445,8 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
         assert logged["container_name"] == name
         assert logged["cause"] == ("oom" if swept.endswith("-oom") else "killed")
         return
-    assert result.failure_step == "ssh_bootstrap"
+    assert result.failure_step == CANCELLED_BY_CREATE_STEP
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
     assert "stopped by the node" not in result.detail
     assert _events(caplog) == []
     assert result.error_code != FailedContainerErrorCodes.ContainerVanished
@@ -623,6 +623,84 @@ async def test_a_replacement_filler_is_ours_once_its_rm_is_handed_to_ssh(svc, mo
     await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
 
     assert own_sweep_removals.sent_rm_for(replacement_id) == (after != "rm-never-sent")
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_replacement_filler_rm_fails_the_create_at_the_cleanup_deadline(svc, monkeypatch):
+    """SSH stays up but `docker rm -fv` never answers: the shared deadline fails the cleanup, and the ID
+    stays ours, since the `rm` may have run."""
+    monkeypatch.setattr(docker_service_module, "_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    replacement_id = _container_id("filler_swept-1", generation=1)
+    ssh = _sweep_host("")
+    listing = ssh.run.side_effect
+
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker rm -fv "):
+            await asyncio.Event().wait()
+        return await listing(command, **kwargs)
+
+    ssh.run = AsyncMock(side_effect=run)
+
+    with pytest.raises(Exception, match=r"\[clean_existing_containers\] replacement filler removal did not finish"):
+        await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
+
+    assert own_sweep_removals.sent_rm_for(replacement_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["docker_run", "container_health_check"])
+async def test_a_failed_create_cleans_up_by_its_own_container_id(svc, monkeypatch, stage):
+    """A sibling retry may hold the pod's name by now: once `docker run` returned an ID, the cleanup
+    removes that ID, never the name. Before it, there is no ID and the name is all there is."""
+    api = FakeApiClient()
+    api.container_states = [_RUNNING]
+    _bootstrapping_create(svc, monkeypatch, api)
+    if stage == "docker_run":
+        svc._run_rental_docker_create_with_port_retry.side_effect = RuntimeError("docker run failed")
+    svc.check_container_running = AsyncMock(return_value=False)
+    cleanup = AsyncMock(return_value=False)
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", cleanup)
+    payload = _payload()
+
+    result = await _create(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == stage
+    expected = None if stage == "docker_run" else _container_id(f"pod_{payload.pod_id}")
+    assert cleanup.await_args.kwargs["container_id"] == expected
+
+
+def _snapshot(status: str, *, running: bool, restarting: bool, exit_code: int, oom: bool) -> ContainerStateSnapshot:
+    return ContainerStateSnapshot(
+        status=status, running=running, restarting=restarting, exit_code=exit_code, restart_count=0,
+        error=None, oom_killed=oom,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("status", "running", "restarting", "exit_code", "oom", "cause"),
+    [("removing", False, False, 137, True, "oom"), ("exited", False, False, 137, True, "oom"),
+     ("restarting", True, True, 137, True, "oom"), ("exited", False, False, 130, False, "signaled"),
+     ("restarting", False, True, 143, False, "exited")],
+    ids=["oom-removing", "oom-exited", "oom-restarting", "signaled-exited", "own-exit-restarting"],
+)  # fmt: skip
+def test_the_killed_diagnosis_names_the_cause_and_the_status_it_was_read_in(
+    status, running, restarting, exit_code, oom, cause
+):
+    """The wire contract the backend's host classification reads: cause and status for every OOM state,
+    restarting included, and the signaled controls, whose renter text never claims a memory kill."""
+    killed = ContainerKilledDuringBootstrap(
+        container_name="pod_x",
+        bootstrap_step="ssh_bootstrap",
+        state=_snapshot(status, running=running, restarting=restarting, exit_code=exit_code, oom=oom),
+        detail="",
+    )
+    assert killed.cause == cause
+    assert f"cause={cause}" in str(killed)
+    assert f"status={status!r}" in str(killed)
+    assert f"oom_killed={str(oom).lower()}" in str(killed)
+    assert (killed.renter_sentence == _OOM) == oom
+    assert "memory limit" not in killed.renter_sentence
 
 
 @pytest.mark.asyncio

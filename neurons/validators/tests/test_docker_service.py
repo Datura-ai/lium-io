@@ -7745,7 +7745,7 @@ async def _create_failing_at_add_public_keys(
     if failure_step == "killed_during_bootstrap":
         # a kill's msg is its renter-safe cause sentence; the diagnosis stays in detail
         assert result.msg.startswith(
-            ("the container was stopped by the node", "the container stopped before", "the container ran out of memory")
+            ("the container was stopped by the node", "the container stopped before", "the container was killed for lack of memory")
         )
         assert "cause=" not in result.msg
     else:

@@ -840,6 +840,8 @@ class ImageExitedDuringKeyInjection(Exception):
 
 
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
+# failure_step of a create whose container another create on this node swept: not the host's failure
+CANCELLED_BY_CREATE_STEP = "cancelled_by_create"
 KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
 
 
@@ -972,10 +974,7 @@ class ContainerKilledDuringBootstrap(Exception):
         # Renter-facing text once the backend shows failure_step first; until then the renter's text
         # is unchanged (the backend picks its message from `detail`).
         if self.cause == "oom":
-            return (
-                "the container ran out of memory before it was ready: its memory limit was reached, "
-                "by the node or by its own command"
-            )
+            return "the container was killed for lack of memory before it was ready"
         if self.cause == "killed":
             if self.signal == "SIGKILL":
                 return "the container was stopped by the node before it was ready: it was killed (SIGKILL)"
@@ -1323,6 +1322,10 @@ class _OwnSweepRegistry:
 
 
 own_sweep_removals = _OwnSweepRegistry()
+
+
+# The `rm` and its confirmation share it. A timeout leaves the IDs marked as ours: the `rm` may have run.
+_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS = 60
 
 
 class _MarkOwnRemovalsOnSubmit:
@@ -3068,6 +3071,23 @@ class DockerService:
         as in the sweep (_MarkOwnRemovalsOnSubmit), whatever the `rm` answers or the confirmation lists. A failure
         is logged; a filler that still survives is reported by the confirmation, and the create goes on."""
         ids = list(replacements.values())
+        try:
+            async with asyncio.timeout(_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS):
+                await self._remove_replacement_fillers_once(ssh_client, default_extra, pod_name, replacements, ids)
+        except TimeoutError as exc:
+            raise Exception(
+                "[clean_existing_containers] replacement filler removal did not finish in "
+                f"{_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS} s"
+            ) from exc
+
+    async def _remove_replacement_fillers_once(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        replacements: dict[str, str],
+        ids: list[str],
+    ) -> None:
         try:
             await self._rm_containers(ssh_client, ids, max_attempts=1, own_ids=ids)
         except Exception as exc:
@@ -7013,6 +7033,7 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.PORT_CHECK_WAIT, prev_timestamp))
                 prev_timestamp = now_ms()
 
+                container_id = None
                 try:
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
@@ -7098,6 +7119,7 @@ class DockerService:
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
+                        container_id=container_id,
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
@@ -7375,6 +7397,7 @@ class DockerService:
                                 )
                             )
                             container_vanished = False
+                            current_step = CANCELLED_BY_CREATE_STEP
                             raise
                         killed = self._explain_container_killed_during_bootstrap(
                             post_run_exc,
