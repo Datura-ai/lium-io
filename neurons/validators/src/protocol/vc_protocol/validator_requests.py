@@ -222,6 +222,10 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None until
     # the cycle probes; an older backend ignores the key.
     pod_ssh: list[PodSshObservation] | None = None
+    # The node's SSH host public key, the one this cycle pinned when it connected. The node signs its
+    # heartbeats with the matching private key, and the backend trusts a heartbeat key only from here.
+    # None when the miner did not report one; an older backend ignores the key.
+    ssh_host_key: str | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

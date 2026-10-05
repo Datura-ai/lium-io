@@ -449,3 +449,33 @@ async def test_the_published_spec_carries_the_observations_and_the_backend_reads
     )
     assert spec.pod_ssh[0].result is PodSshResult.REFUSED
     assert spec.validation_event.reason_code == EXECUTOR_RESULT_MISSING
+
+
+@pytest.mark.asyncio
+async def test_the_published_spec_carries_the_ssh_host_key():
+    from services.miner_service import MinerService
+
+    results = pod_ssh_only_results(
+        _rented({"E2": [_pod("p2")]}),
+        {"e2": [_obs("p2")]},
+        reported=set(),
+        job_batch_id=JOB_BATCH_ID,
+    )["hk-E2"]
+    results[0].executor_info.ssh_host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey root@node"
+    service = MinerService.__new__(MinerService)
+    service.redis_service = AsyncMock()
+
+    with patch("services.miner_service.settings") as settings:
+        settings.DRY_RUN = False
+        settings.POD_STATES_REPORT_ENABLED = False
+        await MinerService.publish_machine_specs(
+            service, results, "hk-E2", "ck-E2", is_whole_miner_batch=False
+        )
+
+    (_channel, payload), _ = service.redis_service.publish.call_args
+    assert payload["ssh_host_key"] == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey root@node"
+    spec = ExecutorSpecRequest(
+        **{k: v for k, v in payload.items() if k in ExecutorSpecRequest.model_fields},
+        validator_hotkey="v",
+    )
+    assert spec.ssh_host_key == payload["ssh_host_key"]

@@ -1210,6 +1210,7 @@ class MinerService:
                         "executor_port": result.executor_info.port,
                         "executor_ssh_port": result.executor_info.ssh_port,
                         "price_per_gpu": result.executor_info.price_per_gpu,
+                        "ssh_host_key": result.executor_info.ssh_host_key,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
                         "job_batch_id": result.job_batch_id,

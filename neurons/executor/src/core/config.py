@@ -161,5 +161,10 @@ class Settings(BaseSettings):
     # How far the intent's issued_at may be from this host's clock (seconds, either way).
     LOCAL_VERIFY_INTENT_WINDOW_SECONDS: int = Field(env="LOCAL_VERIFY_INTENT_WINDOW_SECONDS", default=120)
 
+    # Signed node heartbeat (services/heartbeat_service.py): POST {COMPUTE_REST_API_URL}/v1/node-heartbeat every
+    # interval, signed with this host's SSH ed25519 host key. Off by default.
+    NODE_HEARTBEAT_ENABLED: bool = Field(env="NODE_HEARTBEAT_ENABLED", default=False)
+    NODE_HEARTBEAT_INTERVAL_SECONDS: int = Field(env="NODE_HEARTBEAT_INTERVAL_SECONDS", default=60, ge=10)
+
 
 settings = Settings()
