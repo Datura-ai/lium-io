@@ -871,6 +871,31 @@ async def test_the_volume_create_beside_an_eight_gpu_restore_gets_its_own_sessio
 
 
 @pytest.mark.asyncio
+async def test_the_raise_beside_the_volume_create_keeps_to_its_concurrency() -> None:
+    # 8 GPUs capped at 315 W of a 450 W default and no records left: the raise sets all 8
+    _, state_csv, _ = _capped_gpus(8)
+    ssh = SuspendingSsh(state_csv)
+    create_concurrency = POWER_LIMIT_SET_CONCURRENCY - 2
+
+    raised = await raise_low_power_limits_to_default(ssh, EXECUTOR_ID, None, concurrency=create_concurrency)
+
+    assert raised == 8
+    assert ssh.peak_in_flight == create_concurrency
+
+
+@pytest.mark.asyncio
+async def test_the_whole_node_restore_beside_the_volume_create_keeps_to_its_concurrency() -> None:
+    _, state_csv, records = _capped_gpus(8)
+    ssh = SuspendingSsh(state_csv)
+    create_concurrency = POWER_LIMIT_SET_CONCURRENCY - 2
+
+    restored = await restore_all_host_gpu_power_limits(ssh, FakeRedis(records), concurrency=create_concurrency)
+
+    assert restored == 8
+    assert ssh.peak_in_flight == create_concurrency
+
+
+@pytest.mark.asyncio
 async def test_apply_fails_closed_when_the_host_refuses_the_pl_session() -> None:
     # The cap loop is serial; a refused session on the hard gate (-pl) is the host's, so the cap is a
     # failed set and apply undoes GPU-a and clears the state, never raising into create_container.

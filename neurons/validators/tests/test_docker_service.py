@@ -5261,15 +5261,15 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
         keypair_mock = MagicMock()
         keypair_mock.ss58_address = "5Test"
 
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=executor_info,
             miner_hotkey="5TestMiner",
             keypair=keypair_mock,
             private_key="encrypted-private-key",
         )
 
-    assert ok is False
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
     # Inspect the docker ps command
     ps_cmd = next((c for c in seen_commands if "docker ps" in c), "")
     assert ps_cmd, f"No docker ps command issued. Commands seen: {seen_commands}"
@@ -5325,15 +5325,15 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
         keypair_mock = MagicMock()
         keypair_mock.ss58_address = "5Test"
 
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=executor_info,
             miner_hotkey="5OurHotkey",
             keypair=keypair_mock,
             private_key="x",
         )
 
-    assert ok is False
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
 
 
 # ---------------------------------------------------------------------------
@@ -5536,7 +5536,7 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
 
     with patch("services.docker_service.asyncssh.connect") as connect_mock, \
          patch("services.docker_service.asyncssh.import_private_key") as pkey_mock:
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=MagicMock(),
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
@@ -5544,8 +5544,8 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
             ssh_client=ssh_client,
         )
 
-    assert ok is False
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
     # The reused-session path must skip the connect dance entirely.
     connect_mock.assert_not_called()
     pkey_mock.assert_not_called()
@@ -5581,10 +5581,10 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
                     stdout="health_check_1777635787\n",
                     stderr="", exit_status=0,
                 )
-            # The xargs force-rm command — return success.
-            return MagicMock(stdout="", stderr="", exit_status=0)
+            # The xargs force-rm command — docker rm prints the removed container's ID.
+            return MagicMock(stdout="3f2a9c1d7e4b\n", stderr="", exit_status=0)
 
-    ok, msg = await docker_service.wait_for_port_check_containers(
+    removed, message = await docker_service.wait_for_port_check_containers(
         executor_info=MagicMock(),
         miner_hotkey="5TestMiner",
         keypair=MagicMock(),
@@ -5592,8 +5592,8 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
         ssh_client=FakeSSHClient(),
     )
 
-    assert ok is True
-    assert "forcefully removed" in msg
+    assert removed is True
+    assert "forcefully removed" in message
     # Must have issued the force-rm xargs command targeting both prefixes.
     assert any(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
@@ -5620,7 +5620,7 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
             FakeSSHClient.seen.append(cmd)
             if "docker ps --format" in cmd:
                 return MagicMock(stdout="container_5TestMiner_9101\n", stderr="", exit_status=0)
-            return MagicMock(stdout="", stderr="", exit_status=0)
+            return MagicMock(stdout="3f2a9c1d7e4b\n", stderr="", exit_status=0)
 
     sleep_calls = {"n": 0}
 
@@ -5631,7 +5631,7 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
     real_sleep = svc_mod.asyncio.sleep
     svc_mod.asyncio.sleep = counting_sleep
     try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=MagicMock(),
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
@@ -5641,8 +5641,8 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
     finally:
         svc_mod.asyncio.sleep = real_sleep
 
-    assert ok is True
-    assert "forcefully removed" in msg
+    assert removed is True
+    assert "forcefully removed" in message
     assert sleep_calls["n"] == 0, "the rental path must never sleep waiting on a probe"
     ps_checks = [c for c in FakeSSHClient.seen if "docker ps --format" in c]
     assert len(ps_checks) == 1, f"expected exactly 1 docker ps check, saw: {ps_checks}"

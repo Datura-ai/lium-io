@@ -833,22 +833,22 @@ async def test_restore_tracked_limits_with_probe_uses_it_for_before_values():
 @pytest.mark.asyncio
 async def test_port_check_with_probe_nothing_lingering_runs_nothing(docker_service):
     ssh = _ssh()
-    ok, msg = await docker_service.wait_for_port_check_containers(
+    removal = await docker_service.wait_for_port_check_containers(
         executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
         ssh_client=ssh, probed_container_names=(),
     )
-    assert (ok, msg) == (False, "No port check containers found")
+    assert removal == (False, "No port check containers found")
     assert _cmds(ssh) == []
 
 
 @pytest.mark.asyncio
 async def test_port_check_with_probe_lingering_removes_the_same_as_the_live_listing(docker_service):
-    live_ssh = _ssh(_ssh_result(stdout="health_check_1\n"), _ssh_result(stdout=""))
+    live_ssh = _ssh(_ssh_result(stdout="health_check_1\n"), _ssh_result(stdout="3f2a9c1d7e4b\n"))
     live = await docker_service.wait_for_port_check_containers(
         executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
         ssh_client=live_ssh,
     )
-    probed_ssh = _ssh(_ssh_result(stdout=""))
+    probed_ssh = _ssh(_ssh_result(stdout="3f2a9c1d7e4b\n"))
     probed = await docker_service.wait_for_port_check_containers(
         executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
         ssh_client=probed_ssh, probed_container_names=("health_check_1",),
@@ -856,6 +856,34 @@ async def test_port_check_with_probe_lingering_removes_the_same_as_the_live_list
     assert live == probed == (True, "Port check containers forcefully removed")
     assert _cmds(live_ssh) == [port_check_containers_command(_HOTKEY), _cmds(probed_ssh)[0]]
     assert _cmds(probed_ssh)[0].endswith("| xargs -r /usr/bin/docker rm -fv")
+
+
+@pytest.mark.asyncio
+async def test_a_probed_port_check_gone_by_now_is_not_reported_removed(docker_service):
+    # the probe at SSH connect listed health_check_1; it exited before the pre-run wait, so xargs -r ran no rm
+    ssh = _ssh(_ssh_result(stdout=""))
+
+    removal = await docker_service.wait_for_port_check_containers(
+        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
+        ssh_client=ssh, probed_container_names=("health_check_1",),
+    )
+
+    assert removal == (False, "Port check containers listed but none removed")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_docker_rm_is_not_reported_removed(docker_service):
+    # the live listing names a port check; its removal fails on the host
+    ssh = _ssh(
+        _ssh_result(stdout="health_check_1\n"),
+        _ssh_result(exit_status=1, stderr="Error response from daemon: removal already in progress"),
+    )
+
+    removal = await docker_service.wait_for_port_check_containers(
+        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="", ssh_client=ssh,
+    )
+
+    assert removal.removed is False
 
 
 # ------------------------------------------------------------------

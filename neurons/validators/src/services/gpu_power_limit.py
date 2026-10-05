@@ -95,7 +95,8 @@ MIN_POWER_LIMIT_RATIO = 0.9
 # node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
 # backend's 30 s preemption wait is for (Loki, 48 h to 15 Sep 2026: 8-GPU PEARL deletes p50
 # 27.7 s, 65 % over 25 s; 1-GPU 7.3 s). Each in-flight set holds one SSH channel; OpenSSH's
-# default MaxSessions is 10, so this stays under it with room for the caller's own channel. A host
+# default MaxSessions is 10. Beside a create's volume step the restore runs at 2 fewer
+# (`create_container`: restore 6 + the create's one session + its volume probe = 8). A host
 # whose sshd allows fewer refuses the extra channel opens (asyncssh.ChannelOpenError); those GPUs
 # are set again one at a time once the others are done (_set_side_by_side), so a low MaxSessions
 # costs time, never a GPU left capped.

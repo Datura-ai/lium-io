@@ -1242,6 +1242,11 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
     )
 
 
+class PortCheckRemoval(NamedTuple):
+    removed: bool
+    message: str
+
+
 class AnswerWithOwnDuration(NamedTuple):
     answer: Any
     own_duration_step: ProfilerStep
@@ -1586,7 +1591,7 @@ class DockerService:
         log_tag: str = "container_creation",
         port_maps: list[tuple[int, int, int]] | None = None,
         spare_port_pairs: list[PayloadPortMapping] | None = None,
-        remove_port_checks_listed_live: Callable[[], Awaitable[tuple[bool, str]]] | None = None,
+        remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
     ) -> None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
@@ -2569,7 +2574,7 @@ class DockerService:
         *,
         ssh_client: asyncssh.SSHClientConnection | None = None,
         probed_container_names: tuple[str, ...] | None = None,
-    ) -> tuple[bool, str]:
+    ) -> PortCheckRemoval:
         """Force-remove lingering port-check / probe containers before a rental.
 
         Matches two prefix patterns:
@@ -2593,8 +2598,9 @@ class DockerService:
 
         DAH-2018: when the caller already holds an open SSH connection, pass it in
         via ``ssh_client`` to reuse the session (avoids a second connect and a
-        wider TOCTOU gap); the late re-check inside ``create_container`` runs
-        right before ``docker run``.
+        wider TOCTOU gap); ``create_container`` calls it right before ``docker run``. DAH-3980:
+        with the pre-run host probe on, it passes the listing the probe took at SSH connect and
+        lists live only after ``docker run`` is refused a port.
 
         Args:
             executor_info: Executor SSH connection info (ignored when
@@ -2609,15 +2615,16 @@ class DockerService:
                 None runs the listing here.
 
         Returns:
-            Tuple of (removed: bool, message: str). Removal is best-effort and the
+            PortCheckRemoval(removed, message). Removal is best-effort and the
             rental proceeds regardless:
             - (False, "No port check containers found")
             - (True, "Port check containers forcefully removed")
+            - (False, "Port check containers listed but none removed")
             - (False, "Unable to check for port check containers, proceeding")
         """
         listing_command = port_check_containers_command(miner_hotkey)
 
-        async def _run_checks(client: asyncssh.SSHClientConnection) -> tuple[bool, str]:
+        async def _run_checks(client: asyncssh.SSHClientConnection) -> PortCheckRemoval:
             if probed_container_names is None:
                 result = await client.run(listing_command)
                 names = [n for n in (result.stdout or "").strip().split("\n") if n]
@@ -2625,7 +2632,7 @@ class DockerService:
                 names = list(probed_container_names)
 
             if not names:
-                return False, "No port check containers found"
+                return PortCheckRemoval(False, "No port check containers found")
 
             # Found lingering probe container(s). Force-remove IMMEDIATELY and let
             # the rental proceed — the customer-facing create request must not wait
@@ -2649,17 +2656,21 @@ class DockerService:
                 f"/usr/bin/docker ps -q {port_check_container_filters(miner_hotkey)} "
                 "| xargs -r /usr/bin/docker rm -fv"
             )
-            await client.run(remove_cmd)
+            removal = await client.run(remove_cmd)
+            # docker rm prints each container it removed; a listed probe that has exited since, or a
+            # failed rm, prints nothing, and the caller must not count on a freed port
+            if not (removal.stdout or "").strip():
+                return PortCheckRemoval(False, "Port check containers listed but none removed")
 
             logger.info("Forced removal of stale port check containers completed")
-            return True, "Port check containers forcefully removed"
+            return PortCheckRemoval(True, "Port check containers forcefully removed")
 
         if ssh_client is not None:
             try:
                 return await _run_checks(ssh_client)
             except Exception as e:
                 logger.error(f"Error checking for port check containers: {e}")
-                return False, "Unable to check for port check containers, proceeding"
+                return PortCheckRemoval(False, "Unable to check for port check containers, proceeding")
 
         # No reusable session — open a dedicated SSH connection.
         decrypted_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -2684,7 +2695,7 @@ class DockerService:
         except Exception as e:
             logger.error(f"Error connecting to check for port check containers: {e}")
             # If we can't connect, assume it's safe to proceed
-            return False, "Unable to check for port check containers, proceeding"
+            return PortCheckRemoval(False, "Unable to check for port check containers, proceeding")
 
     async def clean_existing_containers(
         self,
@@ -6468,8 +6479,9 @@ class DockerService:
                 # DAH-3980: a pod without its own power cap gets its GPUs' power back while its volume
                 # is sized and created. Only after the cleanup (a PEARL filler must be gone before its
                 # cap is lifted) and never before a bootstrap restore (minutes would age the query).
-                # Two sessions fewer than alone: the volume create and the discarded volume probe
-                # share this connection, and all of it fits an sshd that allows 8 sessions.
+                # Two sessions fewer than alone: the create's steps open one SSH session at a time on
+                # this connection, beside the discarded volume probe, so restore 6 + create 1 + probe 1
+                # fit an sshd that allows 8. A create step that opens sessions side by side breaks it.
                 early_gpu_power_restore = (
                     asyncio.create_task(
                         _with_own_duration(
