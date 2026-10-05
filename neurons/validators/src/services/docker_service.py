@@ -2924,8 +2924,8 @@ class DockerService:
         pod_name: str,
         replacements: dict[str, str],
     ) -> None:
-        """`docker rm -fv` the replacement fillers by their IDs (one attempt, under the first removal's
-        bound), then confirm again. A timeout fails the create like the first removal's; any other
+        """`docker rm -fv` the replacement fillers by their IDs (one attempt, bounded by its own
+        _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS), then confirm again. A timeout fails the create like the first removal's; any other
         failure is logged, a filler that still survives is reported by the confirmation, and the
         create goes on."""
         try:

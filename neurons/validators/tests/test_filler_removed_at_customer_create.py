@@ -557,10 +557,11 @@ async def test_a_replacement_filler_removal_that_hangs_fails_the_cleanup(docker_
     ssh_client.run = AsyncMock(side_effect=run)
     monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.05)
 
-    with pytest.raises(Exception, match="did not finish"):
+    with pytest.raises(Exception, match="replacement filler did not finish"):
         await asyncio.wait_for(
             _clean_for_customer(docker_service, ssh_client, active_volume_names=["volume_x"]), 5
         )
+    assert events == [_LISTED_ID]  # the first removal ran; the hang was the replacement's
 
 
 @pytest.mark.asyncio
