@@ -289,6 +289,10 @@ _DEAD_1 = _container_state(status="dead", running=False, dead=True, exit_code=1)
 _SIGINT = _container_state(status="exited", running=False, exit_code=130)
 _EXITED_137 = _container_state(status="exited", running=False, exit_code=137)
 _BY_NODE = "the container was stopped by the node before it was ready: "
+_OOM = (
+    "the container ran out of memory before it was ready: its memory limit was reached, "
+    "by the node or by its own command"
+)
 _ENDED_ON = "the container stopped before it was ready: its command ended on "
 
 
@@ -296,7 +300,7 @@ _ENDED_ON = "the container stopped before it was ready: its command ended on "
 @pytest.mark.parametrize(
     ("step", "states", "setup", "sentence", "event"),
     [
-        ("ssh_bootstrap", [_RUNNING, _oom_killed_state()], None, _BY_NODE + "it ran out of memory",
+        ("ssh_bootstrap", [_RUNNING, _oom_killed_state()], None, _OOM,
          {"cause": "oom", "oom_killed": True, "exit_code": 137, "signal": "SIGKILL", "status": "removing"}),
         ("ssh_bootstrap", [_RUNNING, _SIGKILLED], None, _BY_NODE + "it was killed (SIGKILL)",
          {"cause": "killed", "oom_killed": False, "exit_code": 137, "signal": "SIGKILL", "status": "removing"}),
@@ -309,7 +313,7 @@ _ENDED_ON = "the container stopped before it was ready: its command ended on "
          _BY_NODE + "it was killed (SIGKILL)", {"cause": "killed", "exit_code": 137, "status": "dead"}),
         ("ssh_bootstrap", [_RUNNING] * 3, _exec_exits_then_gone(4, 0, 0, 137), _BY_NODE + "it was removed",
          {"cause": "removed", "exit_code": None, "status": None}),
-        ("add_public_keys", [_oom_killed_state()], None, _BY_NODE + "it ran out of memory", {"cause": "oom"}),
+        ("add_public_keys", [_oom_killed_state()], None, _OOM, {"cause": "oom"}),
         # a SIGTERM-handling CMD exits 0 on a host stop, then the node removes the container
         ("add_public_keys", [_REMOVING_0], None, _BY_NODE + "it was removed", {"cause": "removed"}),
         # `dead`: a removal the daemon could not finish, whatever the exit code; not the image's exit
@@ -968,7 +972,7 @@ async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(s
     svc.redis_service.add_rented_pod.assert_not_awaited()
     if outcome in ("exited", "unread"):
         # the image's own exit, or a State never read: the step's own failure, not a kill on the node
-        assert result.failure_step == "final_state_check"
+        assert result.failure_step == "finalize"
         assert _events(caplog) == []
         if outcome == "unread":
             assert "could not read the container State before caching the pod (3 attempts)" in result.detail
@@ -977,7 +981,7 @@ async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(s
         return
     assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
     (logged,) = _events(caplog)
-    assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == outcome
+    assert logged["bootstrap_step"] == "finalize" and logged["cause"] == outcome
     assert "is not running" not in result.detail
 
 
@@ -1044,7 +1048,7 @@ async def test_a_kill_while_the_logs_drain_is_not_a_created_container(svc, monke
     assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
     svc.redis_service.add_rented_pod.assert_not_awaited()
     (logged,) = _events(caplog)
-    assert logged["bootstrap_step"] == "final_state_check" and logged["cause"] == "killed"
+    assert logged["bootstrap_step"] == "finalize" and logged["cause"] == "killed"
 
 
 @pytest.mark.asyncio

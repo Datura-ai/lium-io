@@ -972,7 +972,10 @@ class ContainerKilledDuringBootstrap(Exception):
         # Renter-facing text once the backend shows failure_step first; until then the renter's text
         # is unchanged (the backend picks its message from `detail`).
         if self.cause == "oom":
-            return "the container was stopped by the node before it was ready: it ran out of memory"
+            return (
+                "the container ran out of memory before it was ready: its memory limit was reached, "
+                "by the node or by its own command"
+            )
         if self.cause == "killed":
             if self.signal == "SIGKILL":
                 return "the container was stopped by the node before it was ready: it was killed (SIGKILL)"
@@ -7295,7 +7298,7 @@ class DockerService:
                     # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
                     # the validator, no environment and ships_sshd, no exec runs after the key step. Read
                     # after the log drain, which awaits, so a kill while it drains is seen too.
-                    current_step = soft_failed_step or "final_state_check"
+                    current_step = soft_failed_step or "finalize"
                     await _raise_unless_running_before_created(
                         docker_client, container_name=container_name, container_id=container_id
                     )
