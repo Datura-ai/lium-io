@@ -1329,6 +1329,49 @@ async def test_customer_create_removes_the_filler_at_ssh_connect_by_the_id_it_wa
     assert _removal_commands(ssh_client) == [_remove_and_list_containers_command([filler_id], [])]
 
 
+_REMOVED_AT_SSH_CONNECT_ID = "a" * 64
+_RECREATED_ID = "b" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("id_in_cleanup_listing", "removals"),
+    [
+        # the instance removed at SSH connect, in a listing read before that removal: not removed twice
+        (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID]),
+        # a filler created again under the same name since: it goes too, by its own ID
+        (_RECREATED_ID, [_REMOVED_AT_SSH_CONNECT_ID, _RECREATED_ID]),
+    ],
+    ids=["same_instance", "recreated_filler"],
+)
+async def test_the_cleanup_skips_only_the_filler_instance_removed_at_ssh_connect(
+    svc_fixture, monkeypatch, id_in_cleanup_listing, removals
+):
+    svc = svc_fixture
+    probe = _probe_with_containers("filler_x")
+    probe.container_ids["filler_x"] = id_in_cleanup_listing
+    ssh_client = _wire_customer_create_over_the_host(
+        svc, monkeypatch, probe=probe, container_ids={"filler_x": _REMOVED_AT_SSH_CONNECT_ID}
+    )
+    events: list[str] = []
+    host = ssh_client.run.side_effect
+
+    async def recording_host(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker rm -fv"):
+            events.append(cmd)
+        return await host(cmd, *args, **kwargs)
+
+    ssh_client.run.side_effect = recording_host
+    svc._run_rental_docker_create_with_port_retry = AsyncMock(
+        side_effect=lambda *args, **kwargs: events.append("docker run")
+    )
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert events == [_remove_and_list_containers_command([target], []) for target in removals] + ["docker run"]
+
+
 _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
 _POD_OLD_REMOVAL = _remove_and_list_containers_command(["pod_old"], ["volume_old"])
 

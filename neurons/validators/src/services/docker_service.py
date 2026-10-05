@@ -651,7 +651,8 @@ class CustomerContainerRemoval(NamedTuple):
 
 
 class FillerRemovalAtSshConnect(NamedTuple):
-    filler_names: list[str]
+    # each filler it removed (or tried to) -> the full ID it was listed under ("" when none)
+    filler_ids: dict[str, str]
     removed_cleanly_without_volume_rm: bool
 
 
@@ -2925,12 +2926,12 @@ class DockerService:
     ) -> FillerRemovalAtSshConnect:
         """DAH-3980: a customer create's `filler_*` removal, started as soon as the SSH session is up
         so the kill overlaps the image inspect and the host probes. The same removal and confirmation
-        as the cleanup step's, which skips the names returned here; a listing that cannot be read
+        as the cleanup step's, which skips the instances returned here; a listing that cannot be read
         returns none and leaves every filler to that step."""
         names_on_host, listed_ids = await self._list_all_containers(ssh_client) or ((), {})
         filler_names_on_host = [name for name in names_on_host if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not filler_names_on_host:
-            return FillerRemovalAtSshConnect(filler_names=[], removed_cleanly_without_volume_rm=False)
+            return FillerRemovalAtSshConnect(filler_ids={}, removed_cleanly_without_volume_rm=False)
         logger.info(
             _m(
                 "Removing fillers at SSH connect",
@@ -2953,7 +2954,7 @@ class DockerService:
             {name: listed_ids[name] for name in filler_names_on_host if name in listed_ids},
         )
         return FillerRemovalAtSshConnect(
-            filler_names=filler_names_on_host,
+            filler_ids={name: listed_ids.get(name, "") for name in filler_names_on_host},
             removed_cleanly_without_volume_rm=removed_cleanly and not volumes_to_remove,
         )
 
@@ -2969,14 +2970,16 @@ class DockerService:
         host_probe: PrerunHostProbe | None = None,
         remove_every_filler: bool = False,
         report: ContainerCleanupReport | None = None,
-        removed_at_ssh_connect: list[str] | None = None,
+        removed_at_ssh_connect: dict[str, str] | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
-        DAH-3980: ``removed_at_ssh_connect`` names the fillers `remove_fillers_at_ssh_connect` already
-        removed (or tried to): the listing may predate that removal, and they are never removed twice.
+        DAH-3980: ``removed_at_ssh_connect`` holds the fillers `remove_fillers_at_ssh_connect` already
+        removed (or tried to), each with the ID it was listed under: the listing may predate that
+        removal, and such an instance is never removed twice; a same-name filler listed under another
+        ID was created since, and goes.
 
         DAH-3706: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
         whatever ``active_container_names`` says -- a paying pod never shares the node with a
@@ -3012,7 +3015,7 @@ class DockerService:
             # the customer's only copy; the parked twin of every active pod name is protected too
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
             active_volume_set = set(active_volume_names) if active_volume_names else set()
-            fillers_already_removed = set(removed_at_ssh_connect or ())
+            fillers_already_removed = removed_at_ssh_connect or {}
             pod_containers = [
                 name for name in all_names
                 if name == pod_name
@@ -3021,7 +3024,11 @@ class DockerService:
             ]
             stale_containers = []
             for name in pod_containers:
-                if name in active_set or name in fillers_already_removed:
+                if name in active_set:
+                    continue
+                if name in fillers_already_removed and (
+                    listed_ids.get(name, fillers_already_removed[name]) == fillers_already_removed[name]
+                ):
                     continue
                 stale_containers.append(name)
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
@@ -6893,7 +6900,7 @@ class DockerService:
                 # DAH-3980: everything after the cleanup (power restore, cache reclaim, docker run) still
                 # waits for the fillers to be removed and confirmed; an error fails the create here.
                 fillers_removed_at_ssh_connect = FillerRemovalAtSshConnect(
-                    filler_names=[], removed_cleanly_without_volume_rm=False
+                    filler_ids={}, removed_cleanly_without_volume_rm=False
                 )
                 if filler_removal_at_ssh_connect is not None:
                     filler_removal, filler_removal_at_ssh_connect = filler_removal_at_ssh_connect, None
@@ -6912,7 +6919,7 @@ class DockerService:
                     # keeps protecting its listed sibling bundle (DAH-2465).
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                     report=cleanup_report,
-                    removed_at_ssh_connect=fillers_removed_at_ssh_connect.filler_names,
+                    removed_at_ssh_connect=fillers_removed_at_ssh_connect.filler_ids,
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, and frees
@@ -6921,11 +6928,11 @@ class DockerService:
                     (cleanup_report.removed_cleanly_without_volume_rm or not removed_containers)
                     and (
                         fillers_removed_at_ssh_connect.removed_cleanly_without_volume_rm
-                        or not fillers_removed_at_ssh_connect.filler_names
+                        or not fillers_removed_at_ssh_connect.filler_ids
                     )
                     and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in removed_containers)
                 )
-                removed_containers = fillers_removed_at_ssh_connect.filler_names + removed_containers
+                removed_containers = [*fillers_removed_at_ssh_connect.filler_ids, *removed_containers]
                 if removed_containers and not removed_only_fillers_cleanly:
                     docker_listing_probe = None
                 elif removed_containers and docker_listing_probe is not None:
