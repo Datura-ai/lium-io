@@ -13,6 +13,7 @@ DAH-3980: the customer's rm, that re-read and the unprotected volumes' rm are on
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shlex
@@ -540,6 +541,27 @@ async def test_customer_removal_removes_the_listed_container_not_a_same_name_rep
     assert events == removals
     assert ssh_client.containers == left_on_host
     assert len(_events(caplog)) == survivor_events
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_filler_removal_that_hangs_fails_the_cleanup(docker_service, monkeypatch):
+    events: list[str] = []
+    ssh_client = _host_where_a_same_name_container_replaces_the_listed_one("filler_x", events)
+    answer_like_the_host = ssh_client.run.side_effect
+
+    async def run(cmd, *args, **kwargs):
+        if cmd == ds_module._docker_rm_command([_REPLACEMENT_ID]):
+            await asyncio.Event().wait()  # a hung dockerd
+        return await answer_like_the_host(cmd, *args, **kwargs)
+
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(Exception, match="did not finish"):
+        await asyncio.wait_for(
+            _clean_for_customer(docker_service, ssh_client, active_volume_names=["volume_x"]), 5
+        )
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

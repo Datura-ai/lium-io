@@ -2924,16 +2924,25 @@ class DockerService:
         pod_name: str,
         replacements: dict[str, str],
     ) -> None:
-        """`docker rm -fv` the replacement fillers by their IDs (one attempt), then confirm again. A
-        failure is logged; a filler that still survives is reported by the confirmation, and the
+        """`docker rm -fv` the replacement fillers by their IDs (one attempt, under the first removal's
+        bound), then confirm again. A timeout fails the create like the first removal's; any other
+        failure is logged, a filler that still survives is reported by the confirmation, and the
         create goes on."""
         try:
-            await retry_ssh_command(
-                ssh_client,
-                _docker_rm_command(list(replacements.values())),
-                'clean_existing_containers',
-                max_attempts=1,
+            await asyncio.wait_for(
+                retry_ssh_command(
+                    ssh_client,
+                    _docker_rm_command(list(replacements.values())),
+                    'clean_existing_containers',
+                    max_attempts=1,
+                ),
+                _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS,
             )
+        except TimeoutError as exc:
+            raise Exception(
+                "[clean_existing_containers] docker rm -fv of a replacement filler did not finish in "
+                f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from exc
         except Exception as exc:
             logger.warning(
                 _m(
