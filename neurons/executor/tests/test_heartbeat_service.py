@@ -110,8 +110,8 @@ def test_refused_answers_back_off_up_to_the_cap():
     assert 60 <= hb.next_delay(60, 204, 0) <= 70
 
 
-@pytest.mark.asyncio
-async def test_send_loop_logs_one_refusal_resets_on_success_and_survives_errors():
+def test_send_loop_logs_one_refusal_resets_on_success_and_survives_errors():
+    # the executor suite has no async pytest plugin; drive the loop with asyncio.run
     key = Ed25519PrivateKey.generate()
     answers = iter([404, 404, RuntimeError("down"), 204, 500])
     delays = []
@@ -131,7 +131,7 @@ async def test_send_loop_logs_one_refusal_resets_on_success_and_survives_errors(
         hb, "logger"
     ) as logger:
         with pytest.raises(asyncio.CancelledError):
-            await hb._send_loop(None, "http://x/v1/node-heartbeat", key, None, 60)
+            asyncio.run(hb._send_loop(None, "http://x/v1/node-heartbeat", key, None, 60))
 
     assert delays[0] == 120 and delays[1] == 240
     assert all(60 <= d <= 70 for d in delays[2:])
