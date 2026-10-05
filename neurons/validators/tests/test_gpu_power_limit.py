@@ -834,6 +834,42 @@ async def test_raise_retries_the_gpus_the_host_refused_one_at_a_time() -> None:
     assert ssh.refused == 12  # -pm 1 and -pl refused on each of the six, then set alone
 
 
+class RefusesPastEightSessions(SuspendingSsh):
+    """sshd MaxSessions 8: the ninth concurrent channel open fails before any command runs."""
+
+    async def run(self, command: str, timeout: float | None = None) -> FakeRun:
+        if self.in_flight >= 8:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+        if command.startswith("docker volume"):
+            self.in_flight += 1
+            try:
+                return await asyncio.sleep(0.001, FakeRun())
+            finally:
+                self.in_flight -= 1
+        return await super().run(command, timeout)
+
+
+@pytest.mark.asyncio
+async def test_the_volume_create_beside_an_eight_gpu_restore_gets_its_own_session() -> None:
+    # #1506 runs a create's restore beside its volume create and the discarded volume probe, on the
+    # same connection; with the create's concurrency all three fit an sshd that allows 8 sessions
+    uuids, state_csv, records = _capped_gpus(8)
+    ssh = RefusesPastEightSessions(state_csv)
+    create_concurrency = POWER_LIMIT_SET_CONCURRENCY - 2
+
+    async def volume_probe_and_create_while_the_sets_run() -> None:
+        while ssh.in_flight < create_concurrency:
+            await asyncio.sleep(0)
+        await asyncio.gather(ssh.run("docker volume ls"), ssh.run("docker volume create volume_pod"))
+
+    restored, _ = await asyncio.gather(
+        restore_tracked_gpu_power_limits(ssh, FakeRedis(records), uuids, concurrency=create_concurrency),
+        volume_probe_and_create_while_the_sets_run(),
+    )
+
+    assert restored == 8
+
+
 @pytest.mark.asyncio
 async def test_apply_fails_closed_when_the_host_refuses_the_pl_session() -> None:
     # The cap loop is serial; a refused session on the hard gate (-pl) is the host's, so the cap is a

@@ -80,6 +80,7 @@ from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_moun
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
 from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
+    POWER_LIMIT_SET_CONCURRENCY,
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
     restore_all_host_gpu_power_limits,
@@ -5712,6 +5713,7 @@ class DockerService:
         payload: ContainerCreateRequest,
         host_probe: PrerunHostProbe | None,
         default_extra: dict,
+        concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
     ) -> None:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
@@ -5724,11 +5726,16 @@ class DockerService:
                 payload.gpu_uuids,
                 log_extra=default_extra,
                 host_probe=host_probe,
+                concurrency=concurrency,
             )
         else:
             # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
             await restore_all_host_gpu_power_limits(
-                ssh_client, self.redis_service, log_extra=default_extra, host_probe=host_probe
+                ssh_client,
+                self.redis_service,
+                log_extra=default_extra,
+                host_probe=host_probe,
+                concurrency=concurrency,
             )
         # State-free last-resort net: if a pre-cap record was lost, the record-based
         # restore above did nothing — lift anything still below the check's floor back
@@ -5739,6 +5746,7 @@ class DockerService:
             payload.executor_id,
             payload.gpu_uuids or None,
             log_extra=default_extra,
+            concurrency=concurrency,
         )
 
     async def create_container(
@@ -6460,11 +6468,17 @@ class DockerService:
                 # DAH-3980: a pod without its own power cap gets its GPUs' power back while its volume
                 # is sized and created. Only after the cleanup (a PEARL filler must be gone before its
                 # cap is lifted) and never before a bootstrap restore (minutes would age the query).
+                # Two sessions fewer than alone: the volume create and the discarded volume probe
+                # share this connection, and all of it fits an sshd that allows 8 sessions.
                 early_gpu_power_restore = (
                     asyncio.create_task(
                         _with_own_duration(
                             self._restore_gpu_power_for_uncapped_pod(
-                                ssh_client, payload, host_probe, default_extra
+                                ssh_client,
+                                payload,
+                                host_probe,
+                                default_extra,
+                                concurrency=POWER_LIMIT_SET_CONCURRENCY - 2,
                             ),
                             ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
                         )

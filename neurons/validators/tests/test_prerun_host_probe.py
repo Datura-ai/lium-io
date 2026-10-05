@@ -32,6 +32,7 @@ from core.config import settings
 from services import nvidia_devices as nd
 from services.docker_service import DockerService, _ENCRYPTED_VOLUME_IMAGE_LABEL
 from services.gpu_power_limit import (
+    POWER_LIMIT_SET_CONCURRENCY,
     POWER_STATE_CMD,
     raise_low_power_limits_to_default,
     restore_tracked_gpu_power_limits,
@@ -949,6 +950,21 @@ async def test_create_container_flag_on_probes_once_and_hands_it_to_every_consum
     assert port_check["probed_container_names"] is probe.port_check_container_names
     # the last-resort raise runs minutes after the probe and never takes it
     assert "host_probe" not in ds.raise_low_power_limits_to_default.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_the_early_gpu_power_restore_leaves_two_sessions_for_the_volume_steps(svc_fixture, monkeypatch):
+    svc = svc_fixture
+    monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    from services import docker_service as ds
+
+    for power_step in (ds.restore_tracked_gpu_power_limits, ds.raise_low_power_limits_to_default):
+        assert power_step.await_args.kwargs["concurrency"] == POWER_LIMIT_SET_CONCURRENCY - 2, power_step
 
 
 @pytest.mark.asyncio
