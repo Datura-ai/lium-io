@@ -1023,6 +1023,35 @@ async def test_a_filler_cap_after_the_early_gpu_power_restore_is_restored_before
 
 
 @pytest.mark.asyncio
+async def test_a_power_limit_lowered_without_a_record_after_the_early_raise_is_raised_before_docker_run(
+    svc_fixture, monkeypatch
+):
+    svc = svc_fixture
+    monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+    events: list[str] = []
+    early_raise_done = asyncio.Event()
+
+    async def live_raise(*_args, **_kwargs) -> int:
+        events.append("live raise")
+        early_raise_done.set()
+        return 0
+
+    async def volume_create_while_the_host_lowers_a_limit(*_args, **_kwargs) -> None:
+        await asyncio.wait_for(early_raise_done.wait(), 1)
+        events.append("limit lowered, no record")
+
+    monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", AsyncMock(side_effect=live_raise))
+    monkeypatch.setattr(svc, "create_local_volume", AsyncMock(side_effect=volume_create_while_the_host_lowers_a_limit))
+    svc._run_rental_docker_create_with_port_retry.side_effect = lambda *_a, **_k: events.append("docker run")
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert events == ["live raise", "limit lowered, no record", "live raise", "docker run"]
+
+
+@pytest.mark.asyncio
 async def test_create_container_withdraws_docker_listings_after_a_removal(svc_fixture, monkeypatch):
     svc = svc_fixture
     monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
@@ -1175,11 +1204,13 @@ async def test_cleanup_that_removed_a_volume_measures_the_volume_facts_again(svc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("bootstrap_restore", "raised_during_volume_creation"), [(False, 1), (True, 0)])
+@pytest.mark.parametrize(
+    ("bootstrap_restore", "raised_during_volume_creation", "live_raises"), [(False, 1, 2), (True, 0, 1)]
+)
 async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
-    svc_fixture, monkeypatch, bootstrap_restore, raised_during_volume_creation
+    svc_fixture, monkeypatch, bootstrap_restore, raised_during_volume_creation, live_raises
 ):
-    """DAH-3980: the live power query costs no round trip of its own, unless a restore runs first."""
+    """DAH-3980: the live power query overlaps the volume create, unless a restore runs first."""
     svc = svc_fixture
     _wire_early_probes(svc, monkeypatch, image_present=True)
     monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
@@ -1200,7 +1231,7 @@ async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert raised_at_volume_creation == [raised_during_volume_creation]
-    raise_low.assert_awaited_once()
+    assert raise_low.await_count == live_raises
 
 
 _OVERLAPPED_ROWS = (

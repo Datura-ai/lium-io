@@ -394,6 +394,9 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
         '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the live power floor read twice: beside the volume create, and again right before docker run
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
