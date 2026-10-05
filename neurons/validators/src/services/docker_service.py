@@ -1088,6 +1088,9 @@ class _EditSwap:
         # sshd, so the restore goes through the same steps as start_existing_container
         # (start, remount with allow_init=False, sshd bootstrap). None falls back to `docker start`.
         self.bring_up: Callable[[str], Awaitable[None]] | None = None
+        # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
+        # a concurrent retry may hold the pod name by then, and removing by name would delete it.
+        self.replacement_id: str | None = None
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1180,7 +1183,8 @@ class _EditSwap:
         ``start_existing_container`` does. Park stopped it, so the FUSE mount is gone; a bare
         ``docker start`` would hand the customer ciphertext in the workspace."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
-        await self.ssh_client.run(f"/usr/bin/docker rm -fv {q_name} 2>/dev/null || true")
+        q_replacement = shlex.quote(self.replacement_id) if self.replacement_id else q_name
+        await self.ssh_client.run(f"/usr/bin/docker rm -fv {q_replacement} 2>/dev/null || true")
         renamed = await self.ssh_client.run(f"/usr/bin/docker rename {q_parked} {q_name}")
         error: str | None = None
         if renamed.exit_status != 0:
@@ -7022,6 +7026,7 @@ class DockerService:
                         port_maps=port_maps,
                         spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
                     )
+                    edit_swap.replacement_id = container_id
                     if jupyter_port_map:
                         # a port collision may have moved the Jupyter mapping: the URL below
                         # and the answer to the backend read the port the pod really got

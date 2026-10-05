@@ -272,3 +272,18 @@ async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, m
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_run" and "gocryptfs: EPERM" in result.detail
     assert "Connection lost" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_undo_removes_the_replacement_by_its_id_so_a_sibling_retry_under_the_pod_name_survives():
+    from services.docker_service import _EditSwap
+
+    ssh = _ssh_recording()
+    swap = _EditSwap(ssh, "pod_abc", {})
+    swap.parked_name = "pod_abc" + EDIT_PARKED_SUFFIX
+    swap.replacement_id = "a" * 64
+
+    await swap.restore()
+
+    assert _docker(ssh.commands, "rm -fv") == [f"/usr/bin/docker rm -fv {'a' * 64} 2>/dev/null || true"]
+    assert "/usr/bin/docker rm -fv pod_abc 2>/dev/null || true" not in ssh.commands
