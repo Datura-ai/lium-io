@@ -50,11 +50,14 @@ def fake_run(answers: dict[str, Any], calls: list[str]):
     return run
 
 
+def fake_subprocess(run) -> SimpleNamespace:
+    return SimpleNamespace(PIPE=-1, SubprocessError=subprocess.SubprocessError, run=run)
+
+
 def test_present_on_path(scrape):
     calls: list[str] = []
-    scrape["subprocess"] = SimpleNamespace(
-        PIPE=-1,
-        run=fake_run({"sysbox-runc": SimpleNamespace(returncode=0, stdout=SYSBOX_VERSION_OUTPUT)}, calls),
+    scrape["subprocess"] = fake_subprocess(
+        fake_run({"sysbox-runc": SimpleNamespace(returncode=0, stdout=SYSBOX_VERSION_OUTPUT)}, calls),
     )
     assert scrape["get_sysbox_version"]() == "0.6.4"
     assert calls == ["sysbox-runc"]
@@ -62,9 +65,8 @@ def test_present_on_path(scrape):
 
 def test_present_only_under_the_host_root(scrape):
     calls: list[str] = []
-    scrape["subprocess"] = SimpleNamespace(
-        PIPE=-1,
-        run=fake_run({"/proc/1/root/usr/bin/sysbox-runc": SimpleNamespace(returncode=0, stdout=SYSBOX_VERSION_OUTPUT)}, calls),
+    scrape["subprocess"] = fake_subprocess(
+        fake_run({"/proc/1/root/usr/bin/sysbox-runc": SimpleNamespace(returncode=0, stdout=SYSBOX_VERSION_OUTPUT)}, calls),
     )
     assert scrape["get_sysbox_version"]() == "0.6.4"
     assert calls == ["sysbox-runc", "/proc/1/root/usr/bin/sysbox-runc"]
@@ -72,7 +74,7 @@ def test_present_only_under_the_host_root(scrape):
 
 def test_absent_is_none(scrape):
     calls: list[str] = []
-    scrape["subprocess"] = SimpleNamespace(PIPE=-1, run=fake_run({}, calls))
+    scrape["subprocess"] = fake_subprocess(fake_run({}, calls))
     assert scrape["get_sysbox_version"]() is None
     assert len(calls) == 3
 
@@ -84,15 +86,35 @@ def test_absent_is_none(scrape):
         SimpleNamespace(returncode=0, stdout="unexpected output\n"),
         subprocess.TimeoutExpired("sysbox-runc", 10),
         PermissionError("denied"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
     ],
 )
 def test_command_error_is_none(scrape, answer):
-    scrape["subprocess"] = SimpleNamespace(
-        PIPE=-1, run=fake_run({candidate: answer for candidate in ("sysbox-runc", "/proc/1/root/usr/bin/sysbox-runc", "/proc/1/root/usr/local/bin/sysbox-runc")}, [])
+    scrape["subprocess"] = fake_subprocess(
+        fake_run({candidate: answer for candidate in ("sysbox-runc", "/proc/1/root/usr/bin/sysbox-runc", "/proc/1/root/usr/local/bin/sysbox-runc")}, [])
     )
     assert scrape["get_sysbox_version"]() is None
 
 
-def test_scrape_key_is_renamed_to_sysbox_version():
-    service = (SRC / "services" / "file_encrypt_service.py").read_text()
-    assert "'data_sysbox_version': \"sysbox_version\"" in service
+def test_an_unexpected_error_is_not_swallowed(scrape):
+    scrape["subprocess"] = fake_subprocess(fake_run({"sysbox-runc": RuntimeError("bug")}, []))
+    with pytest.raises(RuntimeError):
+        scrape["get_sysbox_version"]()
+
+
+def test_an_overlong_version_is_cut_to_32_characters(scrape):
+    output = "sysbox-runc\n\tversion: \t" + "9" * 200 + "\n"
+    scrape["subprocess"] = fake_subprocess(
+        fake_run({"sysbox-runc": SimpleNamespace(returncode=0, stdout=output)}, [])
+    )
+    assert scrape["get_sysbox_version"]() == "9" * 32
+
+
+def test_the_scraped_key_reaches_the_validator_as_sysbox_version():
+    from services.file_encrypt_service import FileEncryptService
+    from services.task.checks.machine_spec_scrape import _deobfuscate
+
+    key_mapping, _ = FileEncryptService.__new__(FileEncryptService).generate_key_mappings()
+    scraped = {key_mapping["data_sysbox_version"]: "0.6.4"}
+
+    assert _deobfuscate(scraped, key_mapping) == {"sysbox_version": "0.6.4"}

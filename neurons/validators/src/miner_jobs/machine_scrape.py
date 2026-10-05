@@ -977,12 +977,12 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
 
 
 SYSBOX_RUNC_CANDIDATES = ("sysbox-runc", "/usr/bin/sysbox-runc", "/usr/local/bin/sysbox-runc")
-SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*(\S+)", re.MULTILINE)
+SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*([0-9A-Za-z.+~_-]{1,32})", re.MULTILINE)
 
 
 def get_sysbox_version() -> str | None:
     """The host's `sysbox-runc --version` (e.g. "0.6.4"), telemetry only. None when Sysbox is absent
-    or the command fails; never raises. The absolute paths are tried through PID 1's root, since the
+    or the command fails or cannot run. The absolute paths are tried through PID 1's root, since the
     executor container does not carry the host's binary on its PATH."""
     for candidate in SYSBOX_RUNC_CANDIDATES:
         binary = HOST_ROOT_PREFIX + candidate if candidate.startswith("/") else candidate
@@ -990,7 +990,7 @@ def get_sysbox_version() -> str | None:
             result = subprocess.run(
                 [binary, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
             )
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             continue
         if result.returncode != 0:
             continue
