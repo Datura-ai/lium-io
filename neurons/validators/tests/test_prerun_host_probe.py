@@ -992,7 +992,34 @@ async def test_the_early_gpu_power_restore_leaves_two_sessions_for_the_volume_st
     from services import docker_service as ds
 
     for power_step in (ds.restore_tracked_gpu_power_limits, ds.raise_low_power_limits_to_default):
-        assert power_step.await_args.kwargs["concurrency"] == POWER_LIMIT_SET_CONCURRENCY - 2, power_step
+        assert power_step.await_args_list[0].kwargs["concurrency"] == POWER_LIMIT_SET_CONCURRENCY - 2, power_step
+
+
+@pytest.mark.asyncio
+async def test_a_filler_cap_after_the_early_gpu_power_restore_is_restored_before_docker_run(svc_fixture, monkeypatch):
+    svc = svc_fixture
+    monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
+    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
+    events: list[str] = []
+    early_restore_done = asyncio.Event()
+
+    async def restore(*_args, **_kwargs) -> int:
+        events.append("restore")
+        early_restore_done.set()
+        return 0
+
+    async def volume_create_while_a_filler_caps(*_args, **_kwargs) -> None:
+        await asyncio.wait_for(early_restore_done.wait(), 1)
+        events.append("filler cap")
+
+    monkeypatch.setattr("services.docker_service.restore_tracked_gpu_power_limits", AsyncMock(side_effect=restore))
+    monkeypatch.setattr(svc, "create_local_volume", AsyncMock(side_effect=volume_create_while_a_filler_caps))
+    svc._run_rental_docker_create_with_port_retry.side_effect = lambda *_a, **_k: events.append("docker run")
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert events == ["restore", "filler cap", "restore", "docker run"]
 
 
 @pytest.mark.asyncio

@@ -6726,6 +6726,21 @@ class DockerService:
                 elif early_gpu_power_restore is not None:
                     _, early_gpu_power_restore_step = await early_gpu_power_restore
                     profilers.append(early_gpu_power_restore_step)
+                    # A filler create for this executor may have capped these GPUs since the early
+                    # restore. A cap stores its restore records before it lowers anything, so this
+                    # second pass is a Redis read when there is none, with no host command.
+                    if payload.gpu_uuids:
+                        await restore_tracked_gpu_power_limits(
+                            ssh_client,
+                            self.redis_service,
+                            payload.gpu_uuids,
+                            log_extra=default_extra,
+                            host_probe=host_probe,
+                        )
+                    else:
+                        await restore_all_host_gpu_power_limits(
+                            ssh_client, self.redis_service, log_extra=default_extra, host_probe=host_probe
+                        )
                 else:
                     await self._restore_gpu_power_for_uncapped_pod(
                         ssh_client, payload, host_probe, default_extra
