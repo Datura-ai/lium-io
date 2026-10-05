@@ -190,6 +190,9 @@ class CheckResult(BaseModel):
     event: ValidationEvent
     updates: dict[str, Any] = {}
     halt: bool = False
+    # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
+    # when the node has no live rental). None = fall back to the check's class default.
+    fatal: bool | None = None
 
 
 class Context(BaseModel):
@@ -476,7 +479,8 @@ def merge_state(current: ContextState, before: ContextState, after: ContextState
 
 
 def _stops_run(chk: Check, res: CheckResult) -> bool:
-    return (not res.passed and getattr(chk, "fatal", False)) or res.halt
+    fatal = res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
+    return (not res.passed and fatal) or res.halt
 
 
 class Pipeline:
@@ -574,7 +578,9 @@ class Pipeline:
                 # the cancel ran, but the run does not report them.
                 steps.append((chk.check_id, res.event.context["execution_time_ms"]))
                 elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
-                failed = not res.passed and getattr(chk, "fatal", False)
+                failed = not res.passed and (
+                    res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
+                )
                 last_of_run = index == last_index and position == len(ran_checks) - 1
                 if failed or res.halt or last_of_run:
                     res.event.what_we_saw.update(

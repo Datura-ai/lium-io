@@ -4,7 +4,12 @@ from core.config import settings
 
 from ..messages import BannedGpuMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from .banned_provider import kernel_gpu_uuids, reported_gpu_uuids, uuids_to_match_bans_against
+from .banned_provider import (
+    has_live_rental,
+    kernel_gpu_uuids,
+    reported_gpu_uuids,
+    uuids_to_match_bans_against,
+)
 
 
 class BannedGpuCheck:
@@ -51,6 +56,7 @@ class BannedGpuCheck:
                 passed=False,
                 event=event,
                 updates={"clear_verified_job_info": True},
+                fatal=not has_live_rental(ctx),
             )
 
         event = render_message(Msg.GPU_ALLOWED, ctx=ctx, check_id=self.check_id, what=what)

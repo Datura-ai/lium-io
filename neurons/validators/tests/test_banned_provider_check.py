@@ -7,9 +7,18 @@ from neurons.validators.src.services.task.checks.banned_provider import BannedPr
 from neurons.validators.src.services.task.messages import BannedProviderMessages as Msg
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import (
+    build_context_config,
+    build_services,
+    build_state,
+    default_executor,
+)
 
 
 def build_rented_data(
@@ -157,3 +166,61 @@ async def test_provider_ban_reaches_job_result(context_factory):
     assert success is False
     assert final_ctx.clear_verified_job_info is False
     assert job_result.is_provider_banned is True
+
+
+@pytest.mark.asyncio
+async def test_rented_provider_ban_is_not_fatal(context_factory):
+    """A banned node with a live pod must keep being verified.
+
+    Fatal here would abort the run, the node would stop being upserted, go stale and be
+    flipped inactive by the hourly sweep, which stops renter billing and its payouts.
+    """
+    executor = default_executor()
+    rented_data = RentedExecutorsResponse(
+        executors={
+            executor.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address=executor.address,
+                executor_ip_port=str(executor.port),
+                pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
+            )
+        },
+        banned_hotkeys=["miner-hotkey"],
+    )
+    state = build_state(gpu_uuids="gpu-1", rented_data=rented_data)
+    ctx = context_factory(
+        executor=executor,
+        services=build_services(),
+        config=build_context_config(),
+        state=state,
+        miner_hotkey="miner-hotkey",
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is False
+
+    pipeline = Pipeline(checks=[BannedProviderCheck()], sink=AsyncMock())
+    success, _, final_ctx = await pipeline.run(ctx)
+    assert success is True
+    assert final_ctx.is_provider_banned is True
+
+
+@pytest.mark.asyncio
+async def test_idle_provider_ban_stays_fatal(context_factory):
+    state = build_state(
+        gpu_uuids="gpu-1",
+        rented_data=build_rented_data(banned_hotkeys=["miner-hotkey"]),
+    )
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(),
+        state=state,
+        miner_hotkey="miner-hotkey",
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is True
