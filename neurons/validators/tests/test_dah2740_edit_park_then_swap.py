@@ -17,7 +17,7 @@ from payload_models.payloads import ContainerCreated, FailedContainerRequest
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
 
 from core.utils import retry_ssh_command
-from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply
+from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
 
 
 @pytest.fixture
@@ -188,6 +188,42 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     first_parked_removal = ssh.commands.index(f"/usr/bin/docker rm -fv {parked}")
     assert len(parks) == 2
     assert first_parked_removal < parks[1]
+
+
+@pytest.mark.asyncio
+async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+    inspector_may_start = asyncio.Event()
+
+    async def inspector_start_held(**kwargs) -> None:
+        await inspector_may_start.wait()
+
+    monkeypatch.setattr(svc, "_run_inspector_collector_lifecycle", inspector_start_held)
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+    create = dict(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    async def tracked_edit():
+        with inflight_creates.track(payload.pod_id):
+            return await svc.create_container(**create)
+
+    await svc.create_container(**create)
+    second_edit = asyncio.create_task(tracked_edit())
+    await asyncio.sleep(0.1)
+    inflight_creates.cancel(payload.pod_id)
+    inspector_may_start.set()
+    second_edit_result = await asyncio.wait_for(second_edit, 10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+
+    assert isinstance(second_edit_result, FailedContainerRequest)
+    assert ssh.commands.count(f"/usr/bin/docker rename {name} {parked}") == 1
 
 
 @pytest.mark.asyncio

@@ -6741,10 +6741,12 @@ class DockerService:
                     ):
                         logger.warning(
                             _m(
-                                "Cancelled the earlier create's steps after its reply; editing without them",
+                                "The earlier create's steps after its reply ran out of time and were cancelled; parking now",
                                 extra=get_extra_info(default_extra),
                             )
                         )
+                    # a delete that landed during the wait must find the pod as it was, not parked
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     parked_name = await edit_swap.park()
                     if parked_name:
                         protected_container_names.append(parked_name)
