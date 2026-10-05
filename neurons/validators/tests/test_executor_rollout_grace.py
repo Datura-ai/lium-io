@@ -411,12 +411,11 @@ def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monke
     assert rollout_grace_reason(validator_snapshot_was_stale, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
 
 
-@pytest.mark.parametrize("halt_reason", ["RENTED", "RENTED_POD_SSH_UNREACHABLE", "RENTED_POD_SECRETS_LOST"])
+@pytest.mark.parametrize("halt_reason", ["RENTED", "RENTED_POD_SECRETS_LOST"])
 def test_every_rented_halt_reason_withholds_an_outdated_zero_inside_the_window(monkeypatch, halt_reason: str) -> None:
-    """The tenant-enforcement halt ends a rented run on RENTED, or on RENTED_POD_SSH_UNREACHABLE when
-    the renter's SSH is being reported (DAH-2870), or on RENTED_POD_SECRETS_LOST when a pod's secrets
+    """The tenant-enforcement halt ends a rented run on RENTED, or on RENTED_POD_SECRETS_LOST when a pod's secrets
     tmpfs came back empty. It is the same halt (passed, score kept) each time, so an OUTDATED image
-    inside the window is withheld for all three. Regression: a reason missing from
+    inside the window is withheld for both. Regression: a reason missing from
     RUN_ENDED_WITHOUT_FAILING turns that halt's 0 into a verdict during the rollout."""
     monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
     window = _open_window()
@@ -540,6 +539,7 @@ async def test_a_refused_connect_records_its_reason_code_for_the_classifier(monk
 
     assert result.score == 0
     assert result.failure_reason_code == "EXECUTOR_SSH_UNREACHABLE"
+    assert result.validation_event.reason_code == "EXECUTOR_SSH_UNREACHABLE"
     assert rollout_grace_reason(result, _open_window(), J0) == "EXECUTOR_SSH_UNREACHABLE"
 
 
@@ -565,6 +565,30 @@ async def test_a_shell_that_dies_under_a_check_records_the_transport_code(monkey
     assert rollout_grace_reason(died, _open_window(), J0) == "EXECUTOR_TRANSPORT_UNREACHABLE"
     assert crashed.failure_reason_code is None
     assert rollout_grace_reason(crashed, _open_window(), J0) is None
+
+
+@pytest.mark.asyncio
+async def test_a_shell_that_dies_under_a_check_sends_the_transport_code_in_the_structured_event(monkeypatch) -> None:
+    """The backend stores the cycle's reason from `validation_event`. Regression: a transport death
+    after the connect sent no event, so the cycle reached the backend with no reason at all; a
+    crash of our own must still send none."""
+    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
+    service = _task_service_that_reaches_the_ssh_connect()
+    service.pipeline_factory = MagicMock()
+    miner, executor = _a_job_for("node-9")
+
+    service.pipeline_factory.build_context = AsyncMock(side_effect=asyncssh.Error(code=1, reason="x" * 2000))
+    died = await _run_cycle(service, miner, executor)
+
+    service.pipeline_factory.build_context = AsyncMock(side_effect=ValueError("a bug of our own"))
+    crashed = await _run_cycle(service, miner, executor)
+
+    event = died.validation_event
+    assert event.reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" == died.failure_reason_code
+    assert event.category == "transport"
+    assert event.what_we_saw["executor_uuid"] == "node-9"
+    assert len(event.what_we_saw["transport_error"]) <= 500
+    assert crashed.validation_event is None
 
 
 @pytest.mark.asyncio

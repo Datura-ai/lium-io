@@ -2998,6 +2998,35 @@
       "title": "FailedGetPodLogs",
       "type": "object"
     },
+    "FillerRevenueByGpuConfig": {
+      "description": "What Lium's fillers earned per GPU-hour, on average, on one GPU configuration (\"8x B200\"),\nover the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per\n(base model, GPU count).",
+      "properties": {
+        "base_model": {
+          "title": "Base Model",
+          "type": "string"
+        },
+        "gpu_count": {
+          "title": "Gpu Count",
+          "type": "integer"
+        },
+        "gpu_hours": {
+          "title": "Gpu Hours",
+          "type": "number"
+        },
+        "usd_per_gpu_hour": {
+          "title": "Usd Per Gpu Hour",
+          "type": "number"
+        }
+      },
+      "required": [
+        "base_model",
+        "gpu_count",
+        "usd_per_gpu_hour",
+        "gpu_hours"
+      ],
+      "title": "FillerRevenueByGpuConfig",
+      "type": "object"
+    },
     "FillerRunActiveResponse": {
       "properties": {
         "active": {
@@ -4633,6 +4662,14 @@
           "title": "Filler Ports By Executor",
           "type": "object"
         },
+        "filler_revenue_by_gpu_config": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FillerRevenueByGpuConfig"
+          },
+          "title": "Filler Revenue By Gpu Config",
+          "type": "array"
+        },
         "gpu_splitting_config": {
           "additionalProperties": {
             "type": "integer"
@@ -4679,6 +4716,14 @@
           ],
           "default": null,
           "title": "Provider Discord Connected Executor Ids"
+        },
+        "provider_spot_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Spot Executor Ids",
+          "type": "array"
         },
         "spot_executor_ids": {
           "default": [],
@@ -5703,7 +5748,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.5.0",
+  "protocol_version": "1.6.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

@@ -332,11 +332,6 @@ PASSED_BUT_ZERO = [
         {"is_rented": True},
     ),
     (
-        TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason,
-        "No action needed. WARNING: Collateral required but not deposited",
-        {"is_rented": True},
-    ),
-    (
         TenantEnforcementMessages.RENTED_POD_SECRETS_LOST.reason,
         "No action needed. WARNING: Collateral required but not deposited",
         {"is_rented": True},
@@ -349,7 +344,7 @@ PASSED_BUT_ZERO = [
 @pytest.mark.parametrize(
     ("event_reason", "remediation", "overrides"),
     PASSED_BUT_ZERO,
-    ids=["finalize", "rented", "rented_pod_ssh", "rented_pod_secrets_lost"],
+    ids=["finalize", "rented", "rented_pod_secrets_lost"],
 )
 async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, event_reason, remediation, overrides):
     result = _passed_but_zero(event_reason, remediation, **overrides)

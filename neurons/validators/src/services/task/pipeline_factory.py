@@ -57,6 +57,7 @@ from .checks import (
     RegistryPullCheck,
     RentalProbeCheck,
     RentalVerificationCheck,
+    RentedGpuDropCheck,
     ScoreCheck,
     SpecChangeCheck,
     StaleContainerCleanupCheck,
@@ -77,6 +78,7 @@ from .pipeline import (
     ParallelStage,
     Pipeline,
     PodRecoverer,
+    StatusChangeTracker,
 )
 from .runner import SSHCommandRunner
 from .score_calculator import calculate_scores
@@ -135,6 +137,8 @@ class PipelineFactory:
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
         self.container_cleanup = ContainerCleanup(dry_run=dry_run)
+        # One tracker for the factory's lifetime: build_pipeline() makes a new sink every cycle.
+        self.status_tracker = StatusChangeTracker()
 
     async def build_context(
         self,
@@ -287,6 +291,10 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
+                # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
+                # TenantEnforcementCheck; this reports it to the backend on that same cycle.
+                RentedGpuDropCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -425,6 +433,7 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                RentedGpuDropCheck(),
                 CollateralPrefetchCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
@@ -490,6 +499,8 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
+                RentedGpuDropCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),
@@ -547,4 +558,4 @@ class PipelineFactory:
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger))
+        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker))
