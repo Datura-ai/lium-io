@@ -26,8 +26,8 @@ from tests.test_verifyx_capacity_probe import _challenge_data, _probe_payload
 
 SERVICE = "neurons.validators.src.services.verifyx_validation_service"
 REPO = pathlib.Path(__file__).resolve().parents[3]
-# celium-gpu-verifier main @ dd0f994 (#25 merged), "verifyx build" run 35977025920 SHA256SUMS
-LIBRARY_SHA256 = "c44146556cd0a415c6f6da888fdd6597d6aa3cfa342dfc9b66d4797cb216e08a"
+# celium-gpu-verifier 669fc62, "verifyx build" run 36966276569 SHA256SUMS
+LIBRARY_SHA256 = "c393ae12e7e81dee4d66c190e3bdc361fb238337715b5ff30169161e426841bb"
 STALE_SHA256 = "16b9a5012f8e6b4438fbedfe722b9c30de9e2f2e98373aed33094c6ff6be564f"
 
 
