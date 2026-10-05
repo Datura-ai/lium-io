@@ -61,7 +61,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, inflight_creates
+from services.docker_service import DockerService, customer_creates, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
@@ -1408,7 +1408,7 @@ class MinerService:
         # quicker would otherwise reach the executor first and see a pod that does not exist yet.
         if not isinstance(payload, ContainerCreateRequest):
             return await self._route_container(payload)
-        with inflight_creates.track(payload.pod_id):
+        with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
             return await self._route_container(payload)
 
     async def _route_container(self, payload: ContainerBaseRequest):

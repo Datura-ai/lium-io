@@ -10,6 +10,7 @@ import re
 import secrets
 import shlex
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
@@ -831,6 +832,10 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
+class _FillerRefusedForCustomerCreate(Exception):
+    """Raised before a filler's `docker run` while a customer create runs on the same executor."""
+
+
 class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
@@ -1084,6 +1089,39 @@ class _InflightCreateRegistry:
 # In-process: a pod's create and delete are driven by the same validator event loop. Move it to
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
+
+
+class _CustomerCreateRegistry:
+    """Customer creates this connector is running right now, counted per executor.
+
+    The customer's create lists and removes the node's fillers before its own `docker run`; a filler
+    create for the same executor that reaches `docker run` after that listing would start beside the
+    renter, so it stands down instead. Keyed by executor id: other executors are not affected.
+    """
+
+    def __init__(self) -> None:
+        self._running_by_executor_id: Counter[str] = Counter()
+
+    @contextlib.contextmanager
+    def track(self, payload: ContainerCreateRequest) -> Iterator[None]:
+        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+            yield
+            return
+        self._running_by_executor_id[payload.executor_id] += 1
+        try:
+            yield
+        finally:
+            self._running_by_executor_id[payload.executor_id] -= 1
+            if self._running_by_executor_id[payload.executor_id] <= 0:
+                del self._running_by_executor_id[payload.executor_id]
+
+    def is_running(self, executor_id: str) -> bool:
+        return executor_id in self._running_by_executor_id
+
+
+# In-process like inflight_creates: both creates for one executor go through the connector of the
+# validator that owns it.
+customer_creates = _CustomerCreateRegistry()
 
 
 class _PendingDeletionRegistry:
@@ -5632,6 +5670,24 @@ class DockerService:
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
 
+    async def _refuse_filler_during_customer_create(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> None:
+        """Stop a filler create while this connector runs a customer create on the same executor."""
+        if payload.workload_kind != WorkloadKind.FILLER or not customer_creates.is_running(payload.executor_id):
+            return
+        # Called before `docker run`, so there is no container to remove first; the PEARL cap applied
+        # above must not stay on the GPUs the customer is about to get (DAH-2356).
+        await restore_filler_pod_gpu_power_limits(
+            ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+        )
+        raise _FillerRefusedForCustomerCreate(
+            f"a customer create is running on executor {payload.executor_id}; filler {payload.pod_id} not started"
+        )
+
     @staticmethod
     async def _connect_ssh_and_docker(
         connections: AsyncExitStack,
@@ -6648,6 +6704,7 @@ class DockerService:
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._refuse_filler_during_customer_create(ssh_client, payload, default_extra)
                     await self.stream_log("Creating docker container", "success", log_tag)
                     await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
@@ -7015,6 +7072,8 @@ class DockerService:
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
+            elif isinstance(e, _FillerRefusedForCustomerCreate):
+                current_step = "customer_create_in_flight"
             # `error_class` (e.g. `port_collision`: dockerd could not bind the pod's host port)
             # rides in the event's detail next to the stage so the backend can count the class
             error_class = port_collision_error_class(e)
@@ -7043,6 +7102,13 @@ class DockerService:
                             "reason": "cancelled_by_delete",
                             "failure_step": current_step,
                         }),
+                    )
+                )
+            elif isinstance(e, _FillerRefusedForCustomerCreate):
+                logger.info(
+                    _m(
+                        "filler create refused: a customer create is running on this executor",
+                        extra=get_extra_info({**default_extra, "reason": current_step}),
                     )
                 )
             elif isinstance(
@@ -7093,6 +7159,8 @@ class DockerService:
                 error_code=(
                     FailedContainerErrorCodes.ContainerVanished
                     if container_vanished
+                    else FailedContainerErrorCodes.RentingInProgress
+                    if isinstance(e, _FillerRefusedForCustomerCreate)
                     else FailedContainerErrorCodes.UnknownError
                 ),
                 failure_step=current_step,
