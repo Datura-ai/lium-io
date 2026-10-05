@@ -44,6 +44,13 @@ RPC_URLS = {
 # finney against the contract's getters for every open reclaim request.
 EXECUTOR_TO_MINER_SLOT = 3  # mapping(bytes16 => address)
 COLLATERALS_SLOT = 4  # mapping(bytes16 => uint256)
+# Each deployed contract's version and its (executorToMiner, collaterals) slots. 1.0.0 (f7ce73e) has no BURN_ADDRESS,
+# so each mapping sits one slot lower (the miner's STORAGE_LAYOUTS in neurons/miners/src/core/collateral.py). A
+# COLLATERAL_CONTRACT_ADDRESS not listed here fails the read: another layout's slots would decode as a false status.
+STORAGE_LAYOUTS = {
+    "0x8a4023fdd1eaa7b242f3723a7d096b6cc693c7c6": ("1.0.2", EXECUTOR_TO_MINER_SLOT, COLLATERALS_SLOT),
+    "0x999f9a49a85e9d6e981cad42f197349f50172beb": ("1.0.0", 2, 3),
+}
 
 WEI_PER_TAO = Decimal(10) ** 18
 
@@ -108,8 +115,9 @@ def decide(
     owner_word: str,
     collateral_word: str,
     required_tao: Decimal | None,
+    contract_version: str | None = None,
 ) -> CollateralStatus:
-    version = settings.COLLATERAL_CONTRACT_VERSION
+    version = contract_version or settings.COLLATERAL_CONTRACT_VERSION
     owner = "0x" + _word(owner_word)[-40:]
     collateral_tao = Decimal(int(_word(collateral_word), 16)) / WEI_PER_TAO
     if int(owner, 16) == 0:
@@ -228,11 +236,15 @@ class CollateralStatusReader:
 
     async def _read(self, executor_uuid: str, evm_address: str, required_tao: Decimal | None) -> CollateralStatus:
         to = settings.COLLATERAL_CONTRACT_ADDRESS
+        layout = STORAGE_LAYOUTS.get(to.lower())
+        if layout is None:
+            raise ValueError("COLLATERAL_CONTRACT_ADDRESS has no known storage layout")
+        version, owner_slot, collateral_slot = layout
         [head] = await self._rpc([{"jsonrpc": "2.0", "id": 0, "method": "chain_getFinalizedHead", "params": []}])
         block_hash = head.get("result") if isinstance(head, dict) else None
         if not isinstance(block_hash, str) or len(block_hash.removeprefix("0x")) != 64:
             raise ValueError("chain_getFinalizedHead has no block hash")
-        slots = (mapping_slot(executor_uuid, EXECUTOR_TO_MINER_SLOT), mapping_slot(executor_uuid, COLLATERALS_SLOT))
+        slots = (mapping_slot(executor_uuid, owner_slot), mapping_slot(executor_uuid, collateral_slot))
         answers = await self._rpc(
             [
                 {"jsonrpc": "2.0", "id": i, "method": "state_getStorage", "params": [evm_storage_key(to, slot), block_hash]}
@@ -255,6 +267,7 @@ class CollateralStatusReader:
             owner_word=owner,
             collateral_word=collateral,
             required_tao=required_tao,
+            contract_version=version,
         )
 
 

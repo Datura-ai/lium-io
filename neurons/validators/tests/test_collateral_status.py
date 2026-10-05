@@ -303,6 +303,35 @@ async def test_a_failed_first_read_reports_not_deposited():
 
 
 @pytest.mark.asyncio
+async def test_a_contract_with_no_known_storage_layout_is_a_failed_read_and_makes_no_rpc(monkeypatch):
+    monkeypatch.setattr(settings, "COLLATERAL_CONTRACT_ADDRESS", "0x" + "33" * 20)
+    rpc = FakeRpc(MINER_EVM, Decimal(9))
+    status, cached = await _status(_reader(rpc))
+
+    assert (status.deposited, status.read_failed, cached) == (False, True, False)
+    assert (rpc.heads, rpc.batches) == (0, [])
+
+
+@pytest.mark.asyncio
+async def test_the_1_0_0_contract_is_read_one_slot_lower_and_reports_its_version(monkeypatch):
+    contract = "0x999F9A49A85e9D6E981cad42f197349f50172bEB"
+    monkeypatch.setattr(settings, "COLLATERAL_CONTRACT_ADDRESS", contract)
+    storage = {
+        evm_storage_key(contract, mapping_slot(EXECUTOR_UUID, 2)): _address_word(MINER_EVM),
+        evm_storage_key(contract, mapping_slot(EXECUTOR_UUID, 3)): _tao_word(Decimal(9)),
+    }
+
+    async def rpc(batch):
+        if batch[0]["method"] == "chain_getFinalizedHead":
+            return [{"jsonrpc": "2.0", "id": batch[0]["id"], "result": BLOCK_HASH}]
+        return [{"jsonrpc": "2.0", "id": req["id"], "result": storage.get(req["params"][0])} for req in batch]
+
+    status, _ = await _status(_reader(rpc))
+
+    assert (status.deposited, status.contract_version, status.collateral_tao) == (True, "1.0.0", Decimal(9))
+
+
+@pytest.mark.asyncio
 async def test_an_rpc_error_answer_is_a_failed_read():
     async def rpc(batch):
         return [{"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": "x"}} for req in batch]
