@@ -6734,6 +6734,17 @@ class DockerService:
                         default_extra=default_extra,
                     )
                     current_step = "park_current_container"
+                    # DAH-3980: an earlier edit's steps after its reply remove `<name>_parked`; parked
+                    # before they ran, this edit's parked container would be the one removed
+                    if not await create_steps_after_reply.wait_until_done(
+                        payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+                    ):
+                        logger.warning(
+                            _m(
+                                "Cancelled the earlier create's steps after its reply; editing without them",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
                     parked_name = await edit_swap.park()
                     if parked_name:
                         protected_container_names.append(parked_name)

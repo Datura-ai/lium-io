@@ -154,6 +154,43 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(svc, monkeypatch):
+    """The first edit's steps after its reply remove `<name>_parked`; a second edit of the same pod
+    that parked before them would lose its parked container, the pod's only copy until it succeeds."""
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+    inspector_may_start = asyncio.Event()
+
+    async def inspector_start_held(**kwargs) -> None:
+        await inspector_may_start.wait()
+
+    monkeypatch.setattr(svc, "_run_inspector_collector_lifecycle", inspector_start_held)
+    name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
+    create = dict(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    first_edit = await svc.create_container(**create)
+    second_edit = asyncio.create_task(svc.create_container(**create))
+    await asyncio.sleep(0.1)
+    inspector_may_start.set()
+    second_edit_result = await asyncio.wait_for(second_edit, 10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+
+    assert isinstance(first_edit, ContainerCreated)
+    assert isinstance(second_edit_result, ContainerCreated)
+    parks = [i for i, command in enumerate(ssh.commands) if command == f"/usr/bin/docker rename {name} {parked}"]
+    first_parked_removal = ssh.commands.index(f"/usr/bin/docker rm -fv {parked}")
+    assert len(parks) == 2
+    assert first_parked_removal < parks[1]
+
+
+@pytest.mark.asyncio
 async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
     payload = _edit_payload()
     ssh = _ssh_recording()
