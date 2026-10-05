@@ -3021,8 +3021,8 @@ class DockerService:
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
         for nothing. So on an rm error the listing decides: names already gone are not an error; names
-        still there get retry_ssh_command's full budget (and raise as before), and the volume rm runs
-        again after them. A listing that cannot be read even on its own re-raises the rm error. A
+        still there get retry_ssh_command's attempts within one more _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+        (and raise as before; a timeout fails the create too), and the volume rm runs again after them. A listing that cannot be read even on its own re-raises the rm error. A
         listed ID is looked for by that ID: a same-name container created since is not a stale one.
         """
         command = _remove_and_list_containers_command(targets, volumes_to_remove)
@@ -3084,7 +3084,16 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "container_names": still_present}),
                 ),
             )
-            await retry_ssh_command(ssh_client, _docker_rm_command(still_present), 'clean_existing_containers')
+            try:
+                await asyncio.wait_for(
+                    retry_ssh_command(ssh_client, _docker_rm_command(still_present), 'clean_existing_containers'),
+                    _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise Exception(
+                    "[clean_existing_containers] docker rm -fv retry of a surviving container did not finish in "
+                    f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+                ) from exc
             listing_after = await self._list_all_containers(ssh_client)
         if volumes_to_remove:
             await self._remove_volumes(ssh_client, volumes_to_remove)

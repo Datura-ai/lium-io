@@ -565,6 +565,24 @@ async def test_a_replacement_filler_removal_that_hangs_fails_the_cleanup(docker_
 
 
 @pytest.mark.asyncio
+async def test_a_survivor_retry_that_hangs_fails_the_cleanup_within_the_bound(docker_service, monkeypatch):
+    # the rm exits 1 with the filler still listed; the retry of that name hangs on a wedged dockerd
+    replies = [_listing("pod_target\nfiller_busy\n"), _removal("filler_busy", rm_exit=1)]
+
+    async def run(cmd, *args, **kwargs):
+        if replies:
+            return replies.pop(0)
+        await asyncio.Event().wait()  # a hung dockerd
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(Exception, match="retry of a surviving container did not finish"):
+        await asyncio.wait_for(_clean_for_customer(docker_service, ssh_client), 2)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("workload_kind", "every_filler"),
     [(WorkloadKind.CUSTOMER_RENTAL, True), (WorkloadKind.FILLER, False)],
