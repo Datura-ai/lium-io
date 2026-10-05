@@ -418,6 +418,48 @@ async def test_create_container_answers_with_the_port_the_pod_really_got(
 
 
 @pytest.mark.asyncio
+async def test_the_ssh_port_line_follows_a_remap_of_port_22(service, executor, monkeypatch, flag_on):
+    # the port line goes out before `docker run`; the renter's starting command must not keep
+    # naming the port dockerd refused
+    _patch_create_harness(monkeypatch, service, RecordingSSHClient())
+    client = service.rental_docker_client_factory.client
+    errors = [
+        RentalDockerOperationError(
+            "Docker SDK run container failed: failed to bind host port for 0.0.0.0:22:172.17.0.2:22/tcp: "
+            "address already in use"
+        )
+    ]
+
+    async def run_container(spec):
+        client.run_specs.append(spec)
+        if errors:
+            raise errors.pop(0)
+
+    monkeypatch.setattr(client, "run_container", run_container)
+    monkeypatch.setattr(service, "_listening_host_ports", AsyncMock(return_value={22, 20000}))
+    streamed: list[str] = []
+    stream_log = service.stream_log
+
+    async def recording_stream_log(message, *args, **kwargs):
+        streamed.append(message)
+        return await stream_log(message, *args, **kwargs)
+
+    monkeypatch.setattr(service, "stream_log", recording_stream_log)
+
+    result = await service.create_container(
+        payload=_create_payload_with_spare_pairs(),
+        executor_info=executor,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted-private-key",
+    )
+
+    assert not isinstance(result, FailedContainerRequest), getattr(result, "detail", result)
+    port_lines = [line for line in streamed if line.startswith("Port mappings ready: 22->")]
+    assert port_lines == ["Port mappings ready: 22->30022", f"Port mappings ready: 22->{dict(result.port_maps)[22]}"]
+    assert dict(result.port_maps)[22] != 30022
+
+
+@pytest.mark.asyncio
 async def test_create_failure_event_carries_the_stage_and_the_port_collision_class(
     service, executor, monkeypatch, flag_on
 ):

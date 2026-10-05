@@ -1228,16 +1228,20 @@ class _CreateStepsAfterReplyRegistry:
             self._tasks_by_pod_id.pop(pod_id, None)
 
     async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
-        """Wait for this pod's steps; cancel what is left after the timeout. False on a cancel."""
+        """Wait for this pod's steps; cancel what is left after the timeout and wait for it once more
+        as long. False on a cancel."""
         tasks = set(self._tasks_by_pod_id.get(pod_id, ()))
         if not tasks:
             return True
         _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if not pending:
+            return True
         for task in pending:
             task.cancel()
-        # a cancelled step still closes its sessions before the delete opens its own
-        await asyncio.gather(*pending, return_exceptions=True)
-        return not pending
+        # a cancelled step still closes its sessions before the delete opens its own; bounded, since its
+        # cleanup (the parked container's `docker rm`) can hang on a wedged dockerd
+        await asyncio.wait(pending, timeout=timeout)
+        return False
 
 
 # In-process like inflight_creates.
@@ -1491,8 +1495,9 @@ def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
 
 def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
     if allow_init:
-        # scrypt N=2^10, not the default 2^16 (0.44 s less per create): the passphrase is 256
-        # random bits from HKDF, so key stretching adds nothing. A volume keeps the N it was made with.
+        # scrypt N=2^10, not the default 2^16 (0.44 s less per create). The passphrase is HKDF of
+        # VOLUME_MASTER_SECRET, so N only slows guessing that secret (2^16 is 64x slower); a random
+        # secret of 128 bits or more needs no stretching. A volume keeps the N it was made with.
         return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -scryptn 10 -passfile "$_pf"'
     return (
         f'  echo "gocryptfs.conf missing under {_LIUM_CIPHER_MOUNT};'
@@ -1874,6 +1879,7 @@ class DockerService:
                     and port_maps is not None
                     and spare_port_pairs
                 ):
+                    ssh_port_map_before = self._find_mapping_by_docker_port(port_maps, 22)
                     remapped_spec = await self._remap_colliding_port(
                         exc=exc,
                         ssh_client=ssh_client,
@@ -1883,6 +1889,10 @@ class DockerService:
                         default_extra=default_extra,
                     )
                     if remapped_spec is not None:
+                        ssh_port_map = self._find_mapping_by_docker_port(port_maps, 22)
+                        if ssh_port_map and ssh_port_map != ssh_port_map_before:
+                            # the UI's SSH command still names the port dockerd just refused
+                            await self.stream_log(f"Port mappings ready: 22->{ssh_port_map[2]}", "success", log_tag)
                         run_spec = remapped_spec
                         remapped = True
                         attempt += 1
@@ -3986,7 +3996,12 @@ class DockerService:
                 f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
                 check=False,
             ),
+            return_exceptions=True,
         )
+        # both settled: a failed inspect must not leave the setup running beside the failure cleanup
+        for outcome in (setup_result, user_inspect_result):
+            if isinstance(outcome, BaseException):
+                raise outcome
         if setup_result.exit_status != 0:
             step, message = _VOLUME_SETUP_EXEC_FAILURES.get(
                 setup_result.exit_status, _VOLUME_SETUP_UPLOAD_FAILURE

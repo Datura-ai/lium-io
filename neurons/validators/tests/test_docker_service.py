@@ -7185,6 +7185,41 @@ async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
 
 
 @pytest.mark.asyncio
+async def test_a_refused_inspect_channel_leaves_no_volume_setup_running(docker_service):
+    # the setup exec and `docker inspect` run side by side; the inspect's channel is refused
+    setup_states: list[str] = []
+
+    async def host(cmd, *args, **kwargs):
+        if kwargs.get("input") is not None:
+            setup_states.append("started")
+            await asyncio.sleep(0.2)
+            setup_states.append("completed")
+            return _make_ssh_command_result()
+        raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=host)
+
+    with (
+        patch.object(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"),
+        pytest.raises(asyncssh.ChannelOpenError),
+    ):
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name="pod_test",
+            plaintext_path="/root",
+            volume_name="volume_test",
+            pod_id="pod-id",
+            log_tag="test",
+            log_extra={},
+            authorized_keys=["ssh-ed25519 AAAA renter"],
+        )
+
+    # the create's failure cleanup starts only after the setup has settled
+    assert setup_states == ["started", "completed"]
+
+
+@pytest.mark.asyncio
 async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, caplog):
     from services.volume_keys import derive_volume_passphrase
 

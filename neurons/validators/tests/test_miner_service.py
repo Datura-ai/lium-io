@@ -192,6 +192,29 @@ async def test_a_cancelled_key_removal_after_the_reply_is_logged(mocker, miner_s
     assert str(my_key) not in cancelled.getMessage()
 
 
+@pytest.mark.asyncio
+async def test_a_step_stuck_after_its_cancel_does_not_hold_the_wait_past_its_bound():
+    """A cancelled step stuck in its own cleanup (a `docker rm` on a hung dockerd) must not hold a delete or an edit."""
+    registry = docker_service_module._CreateStepsAfterReplyRegistry()
+
+    async def step_stuck_in_its_cleanup() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()
+
+    registry.start("pod-1", step_stuck_in_its_cleanup())
+    [stuck_step] = registry._tasks_by_pod_id["pod-1"]
+    await asyncio.sleep(0)
+
+    try:
+        steps_finished = await asyncio.wait_for(registry.wait_until_done("pod-1", 0.05), 1)
+    finally:
+        stuck_step.cancel()
+
+    assert steps_finished is False
+
+
 # ---------------------------------------------------------------------------
 # DAH-3338: an executor the miner KNOWS but could not reach is ExecutorUnreachable;
 # InvalidExecutorId is kept for an id the miner does not list at all, worded by DAH-3508's
