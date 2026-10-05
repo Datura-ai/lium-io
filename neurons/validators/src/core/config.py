@@ -1,3 +1,4 @@
+import logging
 import pathlib
 from datetime import datetime
 from enum import Enum
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
 
 from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureFlag(str, Enum):
@@ -833,11 +836,13 @@ class Settings(BaseSettings):
                     "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
                     "of at least 32 characters"
                 )
-            # one unit of up to 8 characters repeated holds at most 8 characters of entropy (< 53 bits)
-            # however long it is; a random secret of 32+ characters is never one (odds about 2^-96 for hex)
-            if any(secret[period:] == secret[:-period] for period in range(1, 9)):
-                raise ValueError(
-                    "VOLUME_MASTER_SECRET repeats a unit of at most 8 characters; use a random secret"
+            # one unit of up to 8 bytes repeated holds at most 64 bits however long it is; a random secret
+            # of 32+ characters is never one (odds about 2^-96 for hex). A warning, not a refusal: the
+            # remedy, a new secret, leaves every volume encrypted under the old one unreadable
+            encoded = secret.encode()
+            if any(encoded[period:] == encoded[:-period] for period in range(1, 9)):
+                logger.warning(
+                    "VOLUME_MASTER_SECRET repeats a unit of at most 8 bytes, so it holds at most 64 bits"
                 )
         return self
 
