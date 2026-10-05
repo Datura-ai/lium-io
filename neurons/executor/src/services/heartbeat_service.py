@@ -80,7 +80,8 @@ def build_heartbeat(
 def _executor_version() -> str | None:
     try:
         return (Path(__file__).resolve().parents[2] / "version.txt").read_text().strip() or None
-    except Exception:
+    except OSError as e:
+        logger.debug(f"Node heartbeat sends no executor_version: version.txt unreadable ({type(e).__name__})")
         return None
 
 
@@ -103,7 +104,7 @@ async def run_node_heartbeat() -> None:
     try:
         key = load_host_key(path)
     except Exception as e:
-        logger.warning(f"Node heartbeat disabled: cannot read the SSH host key at {path}: {e}")
+        logger.warning(f"Node heartbeat disabled: cannot read the SSH host key at {path} ({type(e).__name__})")
         return
 
     url = settings.COMPUTE_REST_API_URL.rstrip("/") + HEARTBEAT_PATH

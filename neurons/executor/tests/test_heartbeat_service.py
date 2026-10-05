@@ -50,8 +50,11 @@ def test_build_heartbeat_verifies_with_the_reported_public_key():
 
 
 def test_every_heartbeat_has_a_fresh_nonce():
+    # the backend refuses a replayed (key, nonce); a fixed nonce would make every second heartbeat a replay
     key = Ed25519PrivateKey.generate()
-    assert hb.build_heartbeat(key, now=1)["nonce"] != hb.build_heartbeat(key, now=1)["nonce"]
+    nonces = {hb.build_heartbeat(key, now=1)["nonce"] for _ in range(20)}
+    assert len(nonces) == 20
+    assert all(len(n) == 32 and int(n, 16) >= 0 for n in nonces)
 
 
 def test_host_key_is_read_from_next_to_the_public_key(tmp_path, monkeypatch):
