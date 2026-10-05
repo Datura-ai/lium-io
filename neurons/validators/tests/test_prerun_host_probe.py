@@ -1629,7 +1629,8 @@ async def test_power_restore_cache_reclaim_and_docker_run_wait_for_the_early_rem
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert events[:2] == ["removal issued", "removal confirmed"]
-    assert sorted(events[2:]) == ["cache reclaim", "docker run", "power restore"]
+    # power restore twice: beside the volume create, and again right before docker run
+    assert sorted(events[2:]) == ["cache reclaim", "docker run", "power restore", "power restore"]
 
 
 def _removals_at_ssh_connect_left_running() -> list[asyncio.Task]:
