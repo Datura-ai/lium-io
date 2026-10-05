@@ -82,8 +82,8 @@ def _probe_payload(
     }
 
 
-# The verifier's own texts (celium-gpu-verifier network.rs at dd0f994, the vendored libverifyx.so
-# c44146556cd0 links reqwest 0.12.23, whose Display prints no cause): the package error comes
+# The verifier's own texts (celium-gpu-verifier network.rs at cb94a7f, the vendored libverifyx.so
+# c393ae12e7e8 links reqwest 0.12.23, whose Display prints no cause): the package error comes
 # first, joined with ". ", then the speedtest's.
 UP_URL = "https://speed.cloudflare.com/__up?bytes=75000000&r=0-0"
 DOWN_URL = "https://speed.cloudflare.com/__down?bytes=75000000&r=0-0"
