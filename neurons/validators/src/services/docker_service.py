@@ -2893,8 +2893,10 @@ class DockerService:
                 await self._remove_volumes(ssh_client, volumes_to_remove)
             return False
 
+        # one deadline for the whole customer cleanup: the steps after the first removal get what is left of it
+        cleanup_deadline = asyncio.get_running_loop().time() + _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
         removed_at_once, listing_after = await self._remove_stale_containers_tolerantly(
-            ssh_client, default_extra, stale_containers, targets, volumes_to_remove
+            ssh_client, default_extra, stale_containers, targets, volumes_to_remove, cleanup_deadline
         )
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not removed_fillers:
@@ -2913,7 +2915,9 @@ class DockerService:
             if container_id and name in listed_ids and container_id != listed_ids[name]
         }
         if replacements:
-            await self._remove_replacement_fillers(ssh_client, default_extra, pod_name, replacements)
+            await self._remove_replacement_fillers(
+                ssh_client, default_extra, pod_name, replacements, cleanup_deadline
+            )
             return False
         return removed_at_once and survivors == {}
 
@@ -2923,21 +2927,20 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         replacements: dict[str, str],
+        cleanup_deadline: float,
     ) -> None:
-        """`docker rm -fv` the replacement fillers by their IDs (one attempt, bounded by its own
-        _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS), then confirm again. A timeout fails the create like the first removal's; any other
+        """`docker rm -fv` the replacement fillers by their IDs (one attempt, within the cleanup's
+        ``cleanup_deadline``), then confirm again. A timeout fails the create like the first removal's; any other
         failure is logged, a filler that still survives is reported by the confirmation, and the
         create goes on."""
         try:
-            await asyncio.wait_for(
-                retry_ssh_command(
+            async with asyncio.timeout_at(cleanup_deadline):
+                await retry_ssh_command(
                     ssh_client,
                     _docker_rm_command(list(replacements.values())),
                     'clean_existing_containers',
                     max_attempts=1,
-                ),
-                _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS,
-            )
+                )
         except TimeoutError as exc:
             raise Exception(
                 "[clean_existing_containers] docker rm -fv of a replacement filler did not finish in "
@@ -3013,6 +3016,7 @@ class DockerService:
         stale_containers: list[str],
         targets: list[str],
         volumes_to_remove: list[str],
+        cleanup_deadline: float,
     ) -> CustomerContainerRemoval:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
@@ -3021,8 +3025,9 @@ class DockerService:
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
         for nothing. So on an rm error the listing decides: names already gone are not an error; names
-        still there get retry_ssh_command's attempts within one more _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
-        (and raise as before; a timeout fails the create too), and the volume rm runs again after them. A listing that cannot be read even on its own re-raises the rm error. A
+        still there get retry_ssh_command's attempts (and raise as before), and the volume rm runs again
+        after them. Those steps, the listings among them, share ``cleanup_deadline``; a timeout fails the
+        create too. A listing that cannot be read even on its own re-raises the rm error. A
         listed ID is looked for by that ID: a same-name container created since is not a stale one.
         """
         command = _remove_and_list_containers_command(targets, volumes_to_remove)
@@ -3063,40 +3068,38 @@ class DockerService:
         if rm_exit_status == 0:
             return CustomerContainerRemoval(True, listing_after)
 
-        if listing_after is None:
-            listing_after = await self._list_all_containers(ssh_client)
-            if listing_after is None:
-                raise rm_error
-        names_on_host, ids_on_host = listing_after
-        on_host = set(names_on_host) | set(ids_on_host.values())
-        still_present = [target for target in targets if target in on_host]
-        if not still_present:
-            logger.info(
-                _m(
-                    "docker rm -fv reported an error but every stale container is gone; continuing",
-                    extra=get_extra_info({**default_extra, "container_names": stale_containers}),
-                ),
-            )
-        else:
-            logger.info(
-                _m(
-                    "docker rm -fv failed with containers still on the host; retrying those",
-                    extra=get_extra_info({**default_extra, "container_names": still_present}),
-                ),
-            )
-            try:
-                await asyncio.wait_for(
-                    retry_ssh_command(ssh_client, _docker_rm_command(still_present), 'clean_existing_containers'),
-                    _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS,
-                )
-            except TimeoutError as exc:
-                raise Exception(
-                    "[clean_existing_containers] docker rm -fv retry of a surviving container did not finish in "
-                    f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
-                ) from exc
-            listing_after = await self._list_all_containers(ssh_client)
-        if volumes_to_remove:
-            await self._remove_volumes(ssh_client, volumes_to_remove)
+        try:
+            async with asyncio.timeout_at(cleanup_deadline):
+                if listing_after is None:
+                    listing_after = await self._list_all_containers(ssh_client)
+                    if listing_after is None:
+                        raise rm_error
+                names_on_host, ids_on_host = listing_after
+                on_host = set(names_on_host) | set(ids_on_host.values())
+                still_present = [target for target in targets if target in on_host]
+                if not still_present:
+                    logger.info(
+                        _m(
+                            "docker rm -fv reported an error but every stale container is gone; continuing",
+                            extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                        ),
+                    )
+                else:
+                    logger.info(
+                        _m(
+                            "docker rm -fv failed with containers still on the host; retrying those",
+                            extra=get_extra_info({**default_extra, "container_names": still_present}),
+                        ),
+                    )
+                    await retry_ssh_command(ssh_client, _docker_rm_command(still_present), 'clean_existing_containers')
+                    listing_after = await self._list_all_containers(ssh_client)
+                if volumes_to_remove:
+                    await self._remove_volumes(ssh_client, volumes_to_remove)
+        except TimeoutError as exc:
+            raise Exception(
+                "[clean_existing_containers] the steps after a failed docker rm -fv did not finish in "
+                f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from exc
         return CustomerContainerRemoval(False, listing_after)
 
     @staticmethod

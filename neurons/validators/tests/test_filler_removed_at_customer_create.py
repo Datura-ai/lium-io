@@ -565,21 +565,37 @@ async def test_a_replacement_filler_removal_that_hangs_fails_the_cleanup(docker_
 
 
 @pytest.mark.asyncio
-async def test_a_survivor_retry_that_hangs_fails_the_cleanup_within_the_bound(docker_service, monkeypatch):
-    # the rm exits 1 with the filler still listed; the retry of that name hangs on a wedged dockerd
+@pytest.mark.parametrize(
+    ("answers_before_the_hang", "hung_command"),
+    [
+        # the retry of the surviving filler hangs
+        (1, "/usr/bin/docker rm -fv "),
+        # the retry and its re-listing answer; the volume rm after them hangs
+        (3, "/usr/bin/docker volume rm "),
+    ],
+    ids=["survivor_retry", "fallback_volume_rm"],
+)
+async def test_a_survivor_retry_that_hangs_fails_the_cleanup_within_the_bound(
+    docker_service, monkeypatch, answers_before_the_hang, hung_command
+):
+    # the rm exits 1 with the filler still listed; a step after it hangs on a wedged dockerd
     replies = [_listing("pod_target\nfiller_busy\n"), _removal("filler_busy", rm_exit=1)]
+    replies += [_listing("")] * (answers_before_the_hang - 1)
+    hung: list[str] = []
 
     async def run(cmd, *args, **kwargs):
         if replies:
             return replies.pop(0)
+        hung.append(cmd)
         await asyncio.Event().wait()  # a hung dockerd
 
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(side_effect=run)
     monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.05)
 
-    with pytest.raises(Exception, match="retry of a surviving container did not finish"):
+    with pytest.raises(Exception, match="after a failed docker rm -fv did not finish"):
         await asyncio.wait_for(_clean_for_customer(docker_service, ssh_client), 2)
+    assert [cmd.startswith(hung_command) for cmd in hung] == [True]
 
 
 @pytest.mark.asyncio
