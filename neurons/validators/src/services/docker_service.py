@@ -7384,7 +7384,7 @@ class DockerService:
                         if gone_cause != "oom" and own_sweep_removals.sent_rm_for(container_id):
                             # Another create on this node swept this very container (a customer's
                             # create removes every filler): the validator removed it, not the node.
-                            # A sweep's `rm -f` never sets OOMKilled, so an observed OOM is the node's.
+                            # A sweep's `rm -f` never sets OOMKilled, so an observed OOM was not our sweep.
                             logger.warning(
                                 _m(
                                     "Container removed by another create's sweep during bootstrap",
