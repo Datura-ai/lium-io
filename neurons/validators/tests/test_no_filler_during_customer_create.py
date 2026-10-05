@@ -49,19 +49,26 @@ async def test_filler_create_is_refused_before_docker_run_while_a_customer_creat
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("same_miner", "same_executor_id", "refused"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+    ids=["same_executor", "same_executor_id_of_another_miner", "another_executor_of_the_miner"],
+)
 @pytest.mark.asyncio
-async def test_customer_create_on_another_executor_does_not_block_a_filler(
-    svc: DockerService, monkeypatch: pytest.MonkeyPatch
+async def test_customer_create_blocks_a_filler_only_on_its_own_executor(
+    svc: DockerService, monkeypatch: pytest.MonkeyPatch, same_miner: bool, same_executor_id: bool, refused: bool
 ) -> None:
     _patch_happy(svc, monkeypatch, _ssh_client())
     filler = _payload(workload_kind=WorkloadKind.FILLER)
-    customer_elsewhere = _payload()
+    customer = _payload(
+        miner_hotkey=filler.miner_hotkey if same_miner else "other-miner",
+        executor_id=filler.executor_id if same_executor_id else _payload().executor_id,
+    )
 
-    with customer_creates.track(customer_elsewhere):
+    with customer_creates.track(customer):
         result = await _run(svc, filler)
 
-    assert isinstance(result, ContainerCreated)
-    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert isinstance(result, FailedContainerRequest if refused else ContainerCreated)
 
 
 @pytest.mark.asyncio
@@ -93,7 +100,7 @@ async def test_customer_create_is_tracked_only_while_it_runs(miner_service: Mine
     seen_while_running: list[bool] = []
 
     async def tracked_route(routed):
-        seen_while_running.append(customer_creates.is_running(routed.executor_id))
+        seen_while_running.append(customer_creates.is_running(routed.miner_hotkey, routed.executor_id))
         return await route(routed)
 
     miner_service._route_container = tracked_route
@@ -102,7 +109,7 @@ async def test_customer_create_is_tracked_only_while_it_runs(miner_service: Mine
         await miner_service.handle_container(customer)
 
     assert seen_while_running == [True]
-    assert customer_creates.is_running(customer.executor_id) is False
+    assert customer_creates.is_running(customer.miner_hotkey, customer.executor_id) is False
 
 
 @pytest.mark.asyncio
@@ -117,13 +124,13 @@ async def test_cancelled_customer_create_is_untracked(miner_service: MinerServic
     miner_service._route_container = hanging_route
     create_task = asyncio.create_task(miner_service.handle_container(customer))
     await route_entered.wait()
-    assert customer_creates.is_running(customer.executor_id) is True
+    assert customer_creates.is_running(customer.miner_hotkey, customer.executor_id) is True
 
     create_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await create_task
 
-    assert customer_creates.is_running(customer.executor_id) is False
+    assert customer_creates.is_running(customer.miner_hotkey, customer.executor_id) is False
 
 
 @pytest.mark.asyncio
@@ -133,7 +140,7 @@ async def test_filler_create_does_not_count_as_a_customer_create(miner_service: 
     seen_while_running: list[bool] = []
 
     async def tracked_route(routed):
-        seen_while_running.append(customer_creates.is_running(routed.executor_id))
+        seen_while_running.append(customer_creates.is_running(routed.miner_hotkey, routed.executor_id))
         return "created"
 
     miner_service._route_container = tracked_route

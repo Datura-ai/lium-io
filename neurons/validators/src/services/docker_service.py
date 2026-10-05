@@ -1096,27 +1096,29 @@ class _CustomerCreateRegistry:
 
     The customer's create lists and removes the node's fillers before its own `docker run`; a filler
     create for the same executor that reaches `docker run` after that listing would start beside the
-    renter, so it stands down instead. Keyed by executor id: other executors are not affected.
+    renter, so it stands down instead. Keyed by (miner hotkey, executor id): an executor id is unique
+    only within its miner, and other executors are not affected.
     """
 
     def __init__(self) -> None:
-        self._running_by_executor_id: Counter[str] = Counter()
+        self._running_by_executor: Counter[tuple[str, str]] = Counter()
 
     @contextlib.contextmanager
     def track(self, payload: ContainerCreateRequest) -> Iterator[None]:
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             yield
             return
-        self._running_by_executor_id[payload.executor_id] += 1
+        executor = (payload.miner_hotkey, payload.executor_id)
+        self._running_by_executor[executor] += 1
         try:
             yield
         finally:
-            self._running_by_executor_id[payload.executor_id] -= 1
-            if self._running_by_executor_id[payload.executor_id] <= 0:
-                del self._running_by_executor_id[payload.executor_id]
+            self._running_by_executor[executor] -= 1
+            if self._running_by_executor[executor] <= 0:
+                del self._running_by_executor[executor]
 
-    def is_running(self, executor_id: str) -> bool:
-        return executor_id in self._running_by_executor_id
+    def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
+        return (miner_hotkey, executor_id) in self._running_by_executor
 
 
 # In-process like inflight_creates: both creates for one executor go through the connector of the
@@ -5677,7 +5679,9 @@ class DockerService:
         default_extra: dict,
     ) -> None:
         """Stop a filler create while this connector runs a customer create on the same executor."""
-        if payload.workload_kind != WorkloadKind.FILLER or not customer_creates.is_running(payload.executor_id):
+        if payload.workload_kind != WorkloadKind.FILLER or not customer_creates.is_running(
+            payload.miner_hotkey, payload.executor_id
+        ):
             return
         # Called before `docker run`, so there is no container to remove first; the PEARL cap applied
         # above must not stay on the GPUs the customer is about to get (DAH-2356).
