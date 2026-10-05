@@ -32,6 +32,11 @@ logger = get_logger(__name__)
 HEARTBEAT_DOMAIN = "lium-node-heartbeat/v1"
 HEARTBEAT_PATH = "/v1/node-heartbeat"
 REQUEST_TIMEOUT_SECONDS = 10
+MIN_INTERVAL_SECONDS = 10
+# 401/404 mean the backend has the feature off or does not know this key yet; back off instead of
+# sending (and logging) every interval forever.
+BACKOFF_STATUSES = (401, 404)
+MAX_BACKOFF_SECONDS = 3600
 
 
 def heartbeat_message(public_key: str, timestamp: int, nonce: str) -> bytes:
@@ -102,18 +107,47 @@ async def run_node_heartbeat() -> None:
         return
 
     url = settings.COMPUTE_REST_API_URL.rstrip("/") + HEARTBEAT_PATH
-    interval = max(10, settings.NODE_HEARTBEAT_INTERVAL_SECONDS)
+    interval = heartbeat_interval()
     version = _executor_version()
     # spread a fleet that restarts together over one interval
     await asyncio.sleep(random.uniform(0, interval))
     async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                status = await send_heartbeat(session, url, key, version)
+        await _send_loop(session, url, key, version, interval)
+
+
+def heartbeat_interval() -> int:
+    interval = settings.NODE_HEARTBEAT_INTERVAL_SECONDS
+    if interval < MIN_INTERVAL_SECONDS:
+        logger.warning(
+            f"NODE_HEARTBEAT_INTERVAL_SECONDS={interval} is below {MIN_INTERVAL_SECONDS}; using {MIN_INTERVAL_SECONDS}"
+        )
+        return MIN_INTERVAL_SECONDS
+    return interval
+
+
+def next_delay(interval: int, status: int | None, refused_in_a_row: int) -> float:
+    """Seconds to wait before the next send. Doubles per refused answer in a row, up to MAX_BACKOFF_SECONDS."""
+    if status in BACKOFF_STATUSES and refused_in_a_row > 0:
+        return min(interval * 2 ** refused_in_a_row, MAX_BACKOFF_SECONDS)
+    return interval + random.uniform(0, 10)
+
+
+async def _send_loop(session, url: str, key: Ed25519PrivateKey, version: str | None, interval: int) -> None:
+    refused_in_a_row = 0
+    while True:
+        status = None
+        try:
+            status = await send_heartbeat(session, url, key, version)
+            if status in BACKOFF_STATUSES:
+                refused_in_a_row += 1
+                if refused_in_a_row == 1:
+                    logger.info(f"Node heartbeat answered {status}; backing off")
+            else:
+                refused_in_a_row = 0
                 if status != 204:
                     logger.info(f"Node heartbeat answered {status}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.info(f"Node heartbeat not sent: {type(e).__name__}")
-            await asyncio.sleep(interval + random.uniform(0, 10))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.info(f"Node heartbeat not sent: {type(e).__name__}")
+        await asyncio.sleep(next_delay(interval, status, refused_in_a_row))

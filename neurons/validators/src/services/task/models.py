@@ -86,6 +86,9 @@ class JobResult(BaseModel):
     # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
     # None when the node has no rented pod with an ssh_port or the probe did not run.
     pod_ssh: list[PodSshObservation] | None = None
+    # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
+    # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
+    ssh_host_key_verified: bool = False
 
     inspector_outcome: str = "SKIPPED"
 

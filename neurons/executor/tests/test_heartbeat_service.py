@@ -89,3 +89,48 @@ def test_run_returns_when_the_host_key_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(hb.settings, "NODE_HEARTBEAT_ENABLED", True)
     monkeypatch.setattr(hb.settings, "SSH_HOST_KEY_PATH", str(tmp_path / "missing.pub"))
     asyncio.run(asyncio.wait_for(hb.run_node_heartbeat(), timeout=1))
+
+
+def test_an_interval_below_the_floor_is_clamped_not_rejected():
+    from core.config import Settings
+
+    assert Settings(NODE_HEARTBEAT_INTERVAL_SECONDS=5).NODE_HEARTBEAT_INTERVAL_SECONDS == 5
+    with patch.object(hb.settings, "NODE_HEARTBEAT_INTERVAL_SECONDS", 5), patch.object(hb, "logger") as logger:
+        assert hb.heartbeat_interval() == hb.MIN_INTERVAL_SECONDS
+    logger.warning.assert_called_once()
+
+
+def test_refused_answers_back_off_up_to_the_cap():
+    assert hb.next_delay(60, 404, 1) == 120
+    assert hb.next_delay(60, 401, 3) == 480
+    assert hb.next_delay(60, 404, 20) == hb.MAX_BACKOFF_SECONDS
+    assert 60 <= hb.next_delay(60, 204, 0) <= 70
+
+
+@pytest.mark.asyncio
+async def test_send_loop_logs_one_refusal_resets_on_success_and_survives_errors():
+    key = Ed25519PrivateKey.generate()
+    answers = iter([404, 404, RuntimeError("down"), 204, 500])
+    delays = []
+
+    async def fake_send(*_args):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) == 5:
+            raise asyncio.CancelledError
+
+    with patch.object(hb, "send_heartbeat", fake_send), patch.object(hb.asyncio, "sleep", fake_sleep), patch.object(
+        hb, "logger"
+    ) as logger:
+        with pytest.raises(asyncio.CancelledError):
+            await hb._send_loop(None, "http://x/v1/node-heartbeat", key, None, 60)
+
+    assert delays[0] == 120 and delays[1] == 240
+    assert all(60 <= d <= 70 for d in delays[2:])
+    refusal_logs = [c for c in logger.info.call_args_list if "backing off" in c.args[0]]
+    assert len(refusal_logs) == 1

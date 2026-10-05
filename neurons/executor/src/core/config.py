@@ -164,7 +164,8 @@ class Settings(BaseSettings):
     # Signed node heartbeat (services/heartbeat_service.py): POST {COMPUTE_REST_API_URL}/v1/node-heartbeat every
     # interval, signed with this host's SSH ed25519 host key. Off by default.
     NODE_HEARTBEAT_ENABLED: bool = Field(env="NODE_HEARTBEAT_ENABLED", default=False)
-    NODE_HEARTBEAT_INTERVAL_SECONDS: int = Field(env="NODE_HEARTBEAT_INTERVAL_SECONDS", default=60, ge=10)
+    # No lower bound here: a bad value must never stop the executor. The service clamps it to 10 with a warning.
+    NODE_HEARTBEAT_INTERVAL_SECONDS: int = Field(env="NODE_HEARTBEAT_INTERVAL_SECONDS", default=60)
 
 
 settings = Settings()
