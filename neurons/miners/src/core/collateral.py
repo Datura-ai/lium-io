@@ -27,7 +27,7 @@ from eth_account import Account
 from eth_utils import event_abi_to_log_topic
 from web3 import AsyncHTTPProvider, AsyncWeb3
 from web3._utils.method_formatters import log_entry_formatter
-from web3._utils.request import async_make_post_request
+from web3._utils.request import async_get_response_from_post_request
 from web3.exceptions import ContractLogicError, TransactionNotFound
 from web3.logs import DISCARD
 
@@ -79,6 +79,10 @@ DEFAULT_MAX_GAS_PRICE_GWEI = 100
 RECLAIM_LOOKBACK_BLOCKS = 1000
 # Reads per JSON-RPC batch. The default finney RPC refuses a batch of more than 50 (-32010).
 CHAIN_READ_BATCH = 50
+# The longest RPC answer read. The largest the client asks for, a batch of CHAIN_READ_BATCH block headers with their
+# transaction hashes or of receipts, is far below it. A longer answer is refused unread, so a faulty or hostile RPC
+# cannot fill the memory of the miner container the executors share.
+MAX_RPC_ANSWER_BYTES = 4 * 1024 * 1024
 # A pruning RPC keeps at least this many blocks below its finalized one (the default finney RPC about 256); a block
 # missing nearer the top is a backend that lags behind, not pruning.
 KEPT_BLOCKS_MIN = 128
@@ -116,10 +120,43 @@ class RpcReadError(Exception):
     """A batch of reads the RPC did not answer; the text is local, never the RPC's (it can echo a keyed URL)."""
 
 
+class RpcAnswerTooLargeError(ValueError):
+    """An RPC answer longer than MAX_RPC_ANSWER_BYTES; it is refused before it is decoded."""
+
+    def __init__(self, limit: int):
+        super().__init__(f"the RPC answer is longer than {limit} bytes")
+
+
 class BatchHTTPProvider(AsyncHTTPProvider):
+    """web3's HTTP provider with every answer, single or batch, read up to MAX_RPC_ANSWER_BYTES only."""
+
+    async def _post(self, body) -> bytes:
+        response = await async_get_response_from_post_request(
+            self.endpoint_uri, data=body, **self.get_request_kwargs()
+        )
+        try:
+            response.raise_for_status()
+            if (response.content_length or 0) > MAX_RPC_ANSWER_BYTES:
+                raise RpcAnswerTooLargeError(MAX_RPC_ANSWER_BYTES)
+            answer = bytearray()
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                answer += chunk
+                if len(answer) > MAX_RPC_ANSWER_BYTES:
+                    raise RpcAnswerTooLargeError(MAX_RPC_ANSWER_BYTES)
+            return bytes(answer)
+        except RpcAnswerTooLargeError:
+            # Drop the connection: back in the pool it would still hold the unread rest of the body.
+            response.close()
+            raise
+        finally:
+            response.release()
+
+    async def make_request(self, method, params):
+        return self.decode_rpc_response(await self._post(self.encode_rpc_request(method, params)))
+
     async def make_batch_request(self, requests: list[tuple[str, list]]):
         body = json.dumps([{"jsonrpc": "2.0", "id": i, "method": m, "params": p} for i, (m, p) in enumerate(requests)])
-        return json.loads(await async_make_post_request(self.endpoint_uri, body, **self.get_request_kwargs()))
+        return json.loads(await self._post(body))
 
 
 @dataclass

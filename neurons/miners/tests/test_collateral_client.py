@@ -1,5 +1,7 @@
 """CollateralClient against a fake JSON-RPC provider: what it signs and sends, and when it needs an RPC URL."""
 
+import contextlib
+import json
 import logging
 import traceback
 from decimal import Decimal
@@ -1775,3 +1777,61 @@ async def test_a_replaced_reclaim_whose_receipt_lacks_its_event_keeps_the_record
     with pytest.raises(CollateralOutcomeUnknownError, match="no ReclaimProcessStarted event"):
         await client.replace_earlier_send()
     assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider, -1)
+
+
+@pytest.fixture
+async def rpc_server():
+    """A local HTTP JSON-RPC endpoint; `answers` holds the body of each next answer and whether it is chunked."""
+    from aiohttp import web
+
+    answers = []
+
+    async def handle(request):
+        body, chunked = answers.pop(0)
+        if not chunked:
+            return web.Response(body=body, content_type="application/json")
+        response = web.StreamResponse(headers={"Content-Type": "application/json"})
+        response.enable_chunked_encoding()
+        await response.prepare(request)
+        with contextlib.suppress(ConnectionError):
+            for start in range(0, len(body), 16 * 1024):
+                await response.write(body[start : start + 16 * 1024])
+            await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    yield SimpleNamespace(url=f"http://127.0.0.1:{port}/", answers=answers)
+    await runner.cleanup()
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+async def test_an_rpc_answer_over_the_byte_ceiling_is_refused_before_it_is_decoded(
+    rpc_server, chunked, monkeypatch
+):
+    """Review of 5be7004: an answer was read whole before json.loads, so an RPC could fill memory."""
+    monkeypatch.setattr(collateral_module, "MAX_RPC_ANSWER_BYTES", 64 * 1024)
+    big_result = "0x" + "00" * 512 * 1024
+    oversized = json.dumps([{"jsonrpc": "2.0", "id": 0, "result": big_result}]).encode()
+    client = CollateralClient(network="finney", contract_address=CONTRACT, rpc_url=rpc_server.url)
+
+    rpc_server.answers.append((oversized, chunked))
+    with pytest.raises(collateral_module.RpcReadError, match="RpcAnswerTooLargeError"):
+        await client._read_together(("eth_getBlockByNumber", ["finalized", False]))
+
+    oversized_single = json.dumps({"jsonrpc": "2.0", "id": 0, "result": big_result}).encode()
+    rpc_server.answers.append((oversized_single, chunked))
+    with pytest.raises(collateral_module.RpcAnswerTooLargeError):
+        await client.get_balance(MINER)
+
+    small = json.dumps([{"jsonrpc": "2.0", "id": 0, "result": "0x1"}]).encode()
+    rpc_server.answers.append((small, chunked))
+    assert await client._read_together(("eth_blockNumber", [])) == ["0x1"]
+    one_tao = json.dumps({"jsonrpc": "2.0", "id": 1, "result": hex(10**18)}).encode()
+    rpc_server.answers.append((one_tao, chunked))
+    assert await client.get_balance(MINER) == Decimal(1)
