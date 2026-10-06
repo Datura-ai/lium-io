@@ -1,0 +1,67 @@
+services:
+  executor:
+    build:
+      context: .
+      additional_contexts:
+        datura: ../../datura
+    image: compute-subnet-executor:local
+    env_file: ./.env
+    restart: always
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+      - ${SSH_PORT}:22
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/docker/daemon.json:/etc/docker/daemon.json
+      - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
+      - reserve_data:/var/lium-reserve
+      - pod_logs:/var/lib/executor-pod-logs
+    pid: host
+    privileged: true
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    labels:
+      autoheal: true
+    healthcheck:
+      # probe the app itself on the loopback (no docker networking involved):
+      # a wedged agent goes unhealthy and autoheal restarts it, while nvidia-smi
+      # only proved the GPU driver was alive. Conservative thresholds so a
+      # host-IO storm (~2.5 min of continuous failure needed) cannot trigger
+      # false restarts.
+      test: [ "CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${INTERNAL_PORT}/version || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+  monitor:
+    image: compute-subnet-executor:local
+    env_file: ./.env
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /dev/kmsg:/dev/kmsg:ro
+      - pod_logs:/var/lib/executor-pod-logs
+    pid: host
+    command: pdm run src/monitor.py
+    depends_on:
+      - executor
+
+  autoheal:
+    restart: always
+    image: willfarrell/autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  reserve_data:
+  pod_logs:

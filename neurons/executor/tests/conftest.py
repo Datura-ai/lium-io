@@ -61,7 +61,6 @@ sys.modules["sqlmodel"] = types.SimpleNamespace(
 
 # Required env vars consumed by core.config.Settings at import time.
 os.environ.setdefault("MINER_HOTKEY_SS58_ADDRESS", "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
-os.environ.setdefault("DB_URI", "sqlite:///tmp/test.db")
 
 # Add src/ to sys.path so tests can import executor modules directly.
 _src = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src"))

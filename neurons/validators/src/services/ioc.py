@@ -2,17 +2,14 @@ import asyncio
 
 from clients.backend_client import BackendClient
 from core.config import settings
-from daos.port_mapping_dao import PortMappingDao
-from services.collateral_contract_service import CollateralContractService
 from services.docker_service import DockerService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
-from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
+from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity.persister import PortResultPersister
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
@@ -27,8 +24,6 @@ ioc = {}
 
 
 async def initiate_services():
-    ioc["PortMappingDao"] = PortMappingDao()
-
     # Backend clients
     keypair = settings.get_bittensor_wallet().get_hotkey()
     ioc["BackendClient"] = BackendClient(
@@ -43,8 +38,7 @@ async def initiate_services():
     )
     ioc["ValidationService"] = ValidationService()
     ioc["VerifyXValidationService"] = VerifyXValidationService()
-    ioc["CollateralContractService"] = CollateralContractService()
-    ioc["AttestationService"] = AttestationService()
+    ioc["AttestationService"] = AttestationService(redis_service=ioc["RedisService"])
     port_tester = PortTester()
     runner = ContainerRunner()
     ioc["ExecutorConnectivityService"] = ExecutorConnectivityService(
@@ -52,34 +46,31 @@ async def initiate_services():
             PortSelector(),
             PortProbe(
                 BatchVerifier(port_tester, runner),
+                SemiBatchVerifier(port_tester, runner),
                 FallbackVerifier(port_tester, runner),
             ),
             DindProbe(DindVerifier(ioc["SSHService"])),
         ),
-        persister=PortResultPersister(ioc["PortMappingDao"]),
+    )
+    ioc["DockerService"] = DockerService(
+        ssh_service=ioc["SSHService"],
+        redis_service=ioc["RedisService"],
+        attestation_service=ioc["AttestationService"],
     )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
         validation_service=ioc["ValidationService"],
         verifyx_validation_service=ioc["VerifyXValidationService"],
-        collateral_contract_service=ioc["CollateralContractService"],
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
-        port_mapping_dao=ioc["PortMappingDao"],
         backend_client=ioc["BackendClient"],
         attestation_service=ioc["AttestationService"],
-    )
-    ioc["DockerService"] = DockerService(
-        ssh_service=ioc["SSHService"],
-        redis_service=ioc["RedisService"],
-        port_mapping_dao=ioc["PortMappingDao"],
-        attestation_service=ioc["AttestationService"],
+        pod_recovery=ioc["DockerService"],
     )
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
         redis_service=ioc["RedisService"],
-        port_mapping_dao=ioc["PortMappingDao"],
         attestation_service=ioc["AttestationService"],
     )
 

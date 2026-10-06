@@ -2,7 +2,7 @@ import asyncio
 
 from asyncssh import SSHClientConnection
 
-from services.executor_connectivity.docker_command import DockerCommand
+from core.docker_utils import DockerCommand
 from services.executor_connectivity.models import ContainerStartResult
 
 
@@ -64,4 +64,4 @@ class ContainerRunner:
 
     async def cleanup(self, ssh_client: SSHClientConnection, name: str):
         """Remove container."""
-        await ssh_client.run(DockerCommand.remove(name))
+        await ssh_client.run(DockerCommand.remove_with_volumes(name))

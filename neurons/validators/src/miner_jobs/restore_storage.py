@@ -1,21 +1,83 @@
 import logging
 import subprocess
+import tempfile
+import re
+
+from workspace_mount import VolumeAccess, detect_volume_access
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restore_storage")
 
-plugin_name = "s3fs-restore"
+MAX_ERROR_DETAIL_CHARS = 1200
+# These scripts are copied to executor hosts and report status through the public API.
+# Some diagnostic path strings can be rejected before they reach the backend, so
+# normalize stream paths before sending status updates or writing command logs.
+STREAM_PATH_REPLACEMENTS = {
+    "/dev/stdout": "stdout",
+    "/dev/stderr": "stderr",
+    "/dev/stdin": "stdin",
+}
+GENERIC_RESTORE_FAILURE_MESSAGE = "Restore failed. Detailed error could not be reported; check executor logs."
 
 
-def run_command(command):
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+def sanitize_report_text(text: str | None) -> str:
+    if not text:
+        return ""
+    # Use one sanitizer for backend payloads and local executor logs so credentials
+    # cannot leak and diagnostic text does not block FAILED status updates.
+    text = re.sub(
+        r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)",
+        r"\1=<redacted>",
+        text,
+    )
+    for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
+        text = text.replace(unsafe_path, replacement)
+    return text
+
+
+def compact_output(label: str, output: str | None, limit: int = 500) -> str:
+    output = sanitize_report_text((output or "").strip())
+    if not output:
+        return ""
+    output = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+    if len(output) > limit:
+        output = f"{output[:limit]}...<truncated>"
+    return f"{label}: {output}"
+
+
+def restore_failure_message(
+    aws_status: int,
+    tar_status: int,
+    aws_stderr: str | None,
+    tar_stdout: str | None,
+    tar_stderr: str | None,
+) -> str:
+    parts = [f"Restore failed: aws_status={aws_status}, tar_status={tar_status}"]
+    parts.extend(
+        detail
+        for detail in [
+            compact_output("aws stderr", aws_stderr),
+            compact_output("tar stdout", tar_stdout),
+            compact_output("tar stderr", tar_stderr),
+        ]
+        if detail
+    )
+    message = "; ".join(parts)
+    if len(message) > MAX_ERROR_DETAIL_CHARS:
+        message = f"{message[:MAX_ERROR_DETAIL_CHARS]}...<truncated>"
+    return message
+
+
+def run_command_args(command: list[str], command_label: str = "command"):
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command}")
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
-    else:
-        logger.info(f"Command succeeded: {command}")
+        logger.error(f"Command failed: {command_label}")
+        raise RuntimeError(
+            f"{command_label} failed with exit code {result.returncode}\n"
+            f"{compact_output('stderr', result.stderr)}"
+        )
+    logger.info(f"Command succeeded: {command_label}")
     return result
 
 
@@ -31,46 +93,164 @@ def update_restore_log(
     import requests
 
     url = f"{api_url}/restore-logs/{restore_log_id}/progress"
+    payload = {
+        "status": status,
+        "logs": [sanitize_report_text(log) for log in logs],
+        "error_message": sanitize_report_text(error_message),
+        "progress": progress,
+    }
+    headers = {"Authorization": f"Bearer {auth_token}"}
     response = requests.put(
         url,
-        json={"status": status, "logs": logs, "error_message": error_message, "progress": progress},
-        headers={"Authorization": f"Bearer {auth_token}"},
+        json=payload,
+        headers=headers,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        if status != "FAILED":
+            raise
+        # If a future diagnostic string is still rejected by the API edge, preserve
+        # state correctness by marking the job failed with a known-safe message.
+        logger.warning("Detailed restore failure update was rejected; retrying with a generic error message")
+        fallback_payload = dict(payload)
+        fallback_payload["error_message"] = GENERIC_RESTORE_FAILURE_MESSAGE
+        fallback_response = requests.put(url, json=fallback_payload, headers=headers)
+        fallback_response.raise_for_status()
 
 
 def pull_aws_cli():
-    run_command("/usr/bin/docker pull daturaai/aws-cli")
+    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"], command_label="docker pull daturaai/aws-cli")
 
 
-def aws_restore(args):
+def docker_base_command(args, volumes=None, volume_args=None, entrypoint=None, interactive=False):
+    command = ["/usr/bin/docker", "run", "--rm"]
+    if interactive:
+        command.append("-i")
+    for volume in volumes or []:
+        command.extend(["-v", volume])
+    command.extend(volume_args or [])
+    if entrypoint:
+        command.extend(["--entrypoint", entrypoint])
+    command.extend(
+        [
+            "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
+            "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
+            "-e", "AWS_DEFAULT_REGION=us-east-1",
+            "daturaai/aws-cli",
+        ]
+    )
+    return command
+
+
+def workspace_command(args, volume_access: VolumeAccess, entrypoint: str, interactive: bool = False) -> list[str]:
+    if volume_access.encrypted:
+        return volume_access.docker_exec_args(entrypoint, interactive=interactive)
+    return docker_base_command(
+        args,
+        volume_args=volume_access.docker_run_args(),
+        entrypoint=entrypoint,
+        interactive=interactive,
+    )
+
+
+def aws_head_object(args):
+    command = docker_base_command(args, entrypoint="aws") + [
+        "s3api",
+        "head-object",
+        "--bucket",
+        args.backup_volume_name,
+        "--key",
+        args.backup_source_path,
+        "--output",
+        "json",
+    ]
+    run_command_args(command, command_label="docker run aws s3api head-object")
+
+
+def ensure_restore_path(args, volume_access: VolumeAccess, restore_path: str):
+    # tar's -C target must exist before the S3 stream starts. Creating it in the
+    # same mounted-volume context avoids a broken pipe from aws when tar exits early.
+    command = workspace_command(args, volume_access, "mkdir") + [
+        "-p",
+        restore_path,
+    ]
+    run_command_args(command, command_label="docker run mkdir restore target")
+
+    # The mkdir above runs as uid 0, and `tar --strip-components=1` drops the
+    # archive's top-level entry, so nothing else ever gives this directory back
+    # to a non-root renter (DAH-2534). Not recursive: the extracted members keep
+    # the ownership tar restored for them.
+    image_user: str | None = volume_access.container_image_user() if volume_access.encrypted else None
+    if image_user:
+        run_command_args(
+            workspace_command(args, volume_access, "chown") + [image_user, restore_path],
+            command_label="docker exec chown restore target",
+        )
+
+
+def aws_restore(args, volume_access: VolumeAccess, restore_path: str):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
     # | tar -xzpf - -C $RESTORE_PATH
-    command = (
-        "docker run --rm "
-        f"-v {args.target_volume}:{args.target_volume_path} "
-        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
-        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
-        f"-e AWS_DEFAULT_REGION=us-east-1 "
-        "--entrypoint sh "
-        "daturaai/aws-cli  -lc "
-        f'"aws s3 cp s3://{args.backup_volume_name}/{args.backup_source_path} - '
-        f'| tar --xattrs --acls -xzpf - -C {args.restore_path} --strip-components=1 "'
-    )
-    run_command(command)
+    aws_command = docker_base_command(args, entrypoint="aws") + [
+        "s3",
+        "cp",
+        f"s3://{args.backup_volume_name}/{args.backup_source_path}",
+        "-",
+    ]
+    tar_command = workspace_command(args, volume_access, "tar", interactive=True) + [
+        "--xattrs",
+        "--acls",
+        "-xzpf",
+        "-",
+        "-C",
+        restore_path,
+        "--strip-components=1",
+    ]
+
+    logger.info("Starting S3-to-tar streaming restore")
+    tar_proc = None
+    with tempfile.TemporaryFile() as aws_stderr_file:
+        aws_proc = subprocess.Popen(aws_command, stdout=subprocess.PIPE, stderr=aws_stderr_file)
+        try:
+            # tar reads the S3 object stream directly; no local archive is written.
+            tar_proc = subprocess.Popen(
+                tar_command,
+                stdin=aws_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            aws_proc.stdout.close()
+            tar_stdout, tar_stderr = tar_proc.communicate()
+            aws_status = aws_proc.wait()
+            aws_stderr_file.seek(0)
+            aws_stderr = aws_stderr_file.read().decode(errors="replace")
+        except Exception:
+            aws_proc.kill()
+            if tar_proc:
+                tar_proc.kill()
+            raise
+
+    if aws_status != 0 or tar_proc.returncode != 0:
+        raise RuntimeError(restore_failure_message(aws_status, tar_proc.returncode, aws_stderr, tar_stdout, tar_stderr))
+
+    logger.info("S3-to-tar streaming restore completed")
 
 
 def restore_storage(args):
     progress = 0
     try:
+        volume_access = detect_volume_access(args.target_volume, args.target_volume_path)
+
         logger.info("=" * 70)
         logger.info("Restore operation started")
         logger.info("=" * 70)
 
-        logger.info("Step 1: Pulling aws cli...")
+        logger.info("Step 1: Preparing workspace and pulling aws cli...")
         pull_aws_cli()
         logger.info("Aws cli pulled")
-        progress += 30  # 30
+        progress = 10
         update_restore_log(
             args.api_url,
             "IN_PROGRESS",
@@ -81,14 +261,54 @@ def restore_storage(args):
             args.restore_log_id,
         )
 
-        logger.info("Step 2: Restoring from aws s3...")
-        aws_restore(args)
+        logger.info("Step 2: Verifying aws s3 object...")
+        aws_head_object(args)
+        logger.info("Aws s3 object verified")
+        progress = 20
+        update_restore_log(
+            args.api_url,
+            "IN_PROGRESS",
+            ["Info: Restore source object verified"],
+            "",
+            progress,
+            args.auth_token,
+            args.restore_log_id,
+        )
+
+        logger.info("Step 3: Preparing restore destination...")
+        restore_path = volume_access.normalized_path(args.restore_path)
+        ensure_restore_path(args, volume_access, restore_path)
+        logger.info("Restore destination verified")
+
+        logger.info("Step 4: Restoring from aws s3...")
+        progress = 30
+        update_restore_log(
+            args.api_url,
+            "IN_PROGRESS",
+            ["Info: Restore stream started"],
+            "",
+            progress,
+            args.auth_token,
+            args.restore_log_id,
+        )
+        aws_restore(args, volume_access, restore_path)
         logger.info("Restore from aws s3 completed")
-        progress += 70  # 100
+        progress = 90
+        update_restore_log(
+            args.api_url,
+            "IN_PROGRESS",
+            ["Info: Restore from aws s3 completed"],
+            "",
+            progress,
+            args.auth_token,
+            args.restore_log_id,
+        )
+
+        progress = 100
         update_restore_log(
             args.api_url,
             "COMPLETED",
-            ["Info: Restore from aws s3 completed"],
+            ["Info: Restore completed"],
             "",
             progress,
             args.auth_token,
@@ -96,16 +316,19 @@ def restore_storage(args):
         )
     except Exception as e:
         logger.error(f"Restore failed: {e}", exc_info=True)
-        update_restore_log(
-            args.api_url,
-            "FAILED",
-            ["Error: Restore failed"],
-            str(e),
-            progress,
-            args.auth_token,
-            args.restore_log_id,
-        )
-        raise e
+        try:
+            update_restore_log(
+                args.api_url,
+                "FAILED",
+                ["Error: Restore failed"],
+                str(e),
+                progress,
+                args.auth_token,
+                args.restore_log_id,
+            )
+        except Exception:
+            logger.error("Failed to update restore log after restore failure", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

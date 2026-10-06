@@ -13,8 +13,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-OS_IMAGE_NAME=${OS:-dstack-nvidia-0.5.5}
-OS_IMAGE_URL="https://download.dstack.org/os-images/$OS_IMAGE_NAME.tar.gz"
+OS_IMAGE_NAME=${OS:-dstack-nvidia-0.5.11}
+# DAH-2338: default to the official upstream image (NVIDIA driver 595.58.03 = R595 TRD1,
+# sysbox baked in). To run the legacy Lium-built 0.5.5 image, set OS=dstack-nvidia-0.5.5
+# and OS_IMAGE_URL to the private-ml-sdk v0.5.5 release asset.
+OS_IMAGE_URL="${OS_IMAGE_URL:-https://github.com/Dstack-TEE/meta-dstack/releases/download/v0.5.11/$OS_IMAGE_NAME.tar.gz}"
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY_PROVIDER_DIR="$THIS_DIR/key-provider"
 SCRIPTS_DIR="$THIS_DIR/scripts"
@@ -24,6 +27,12 @@ IMAGE_DIR="$RUN_DIR/images"
 INIT_SCRIPT="$THIS_DIR/app/init_script.sh"
 PRE_LAUNCH_SCRIPT="$THIS_DIR/app/pre_launch_script.sh"
 PORT_BIND_IP=0.0.0.0
+
+# Host lock, CVM disk inventory and the pinned key-provider image (DAH-3188).
+# new/run hold the same lock as a key-provider upgrade, so neither can slip
+# between the other's inventory check and its image switch.
+# shellcheck source=cvm_upgrade_guard.sh
+source "$THIS_DIR/cvm_upgrade_guard.sh"
 
 # Logging functions
 log_info() {
@@ -180,7 +189,7 @@ check_requirements() {
         if pgrep -f "gramine-sealing-key-provider" >/dev/null 2>&1; then
             log_success "Key-provider (gramine-sealing-key-provider) is running"
         else
-            log_warning "Key-provider process not running. Use 'docker-compose up -d' in $KEY_PROVIDER_DIR"
+            log_warning "Key-provider process not running. Use 'sudo $THIS_DIR/cvm_upgrade_guard.sh start'"
         fi
     else
         log_error "Key-provider configuration not found at $KEY_PROVIDER_DIR"
@@ -429,6 +438,36 @@ new_cvm() {
     # Ensure VMs directory exists
     mkdir -p "$VMS_DIR"
 
+    # Serialize with a key-provider upgrade and record this VM root for the
+    # host-wide inventory; the lock is released when this process exits.
+    cvm_guard_lock || return $?
+    cvm_guard_register_vms_dir "$VMS_DIR" || return 1
+
+    # G2 (CVM attestation) — stamp the pinned executor-runner digest into the
+    # measured compose BEFORE dstack.py measures it into compose_hash. The
+    # resolved copy (not the template) is what gets attested, so the runner
+    # release is inside the trust boundary the validator whitelists.
+    if grep -q '${EXECUTOR_RUNNER_IMAGE_DIGEST}' "$compose_file"; then
+        if [ -z "$EXECUTOR_RUNNER_IMAGE_DIGEST" ]; then
+            log_error "EXECUTOR_RUNNER_IMAGE_DIGEST is not set (required to pin the measured executor-runner)"
+            log_info "Set it in $env_file to the approved runner release, e.g."
+            log_info "  EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<digest>"
+            return 1
+        fi
+        case "$EXECUTOR_RUNNER_IMAGE_DIGEST" in
+        sha256:*) ;;
+        *)
+            log_error "EXECUTOR_RUNNER_IMAGE_DIGEST must start with 'sha256:' (got: $EXECUTOR_RUNNER_IMAGE_DIGEST)"
+            return 1
+            ;;
+        esac
+        local resolved_compose="$VMS_DIR/$cvm_name-docker-compose.yml"
+        EXECUTOR_RUNNER_IMAGE_DIGEST="$EXECUTOR_RUNNER_IMAGE_DIGEST" \
+            envsubst '${EXECUTOR_RUNNER_IMAGE_DIGEST}' <"$compose_file" >"$resolved_compose"
+        log_info "Pinned executor-runner digest into measured compose: $EXECUTOR_RUNNER_IMAGE_DIGEST"
+        compose_file="$resolved_compose"
+    fi
+
     # Build the command
     python3 $SCRIPTS_DIR/dstack.py new "$compose_file" \
         --init-script "$INIT_SCRIPT" \
@@ -447,7 +486,7 @@ new_cvm() {
 
     if [ $? -eq 0 ]; then
         log_success "CVM '$cvm_name' created successfully at $VMS_DIR/$cvm_name"
-        MY_IP=$(curl -s ifconfig.me)
+        MY_IP=$(curl -s -m 10 ifconfig.me)
         log_success "Executor endpoint: $MY_IP:$EXTERNAL_PORT"
     else
         log_error "Failed to create CVM '$cvm_name'"
@@ -491,23 +530,27 @@ run_cvm() {
         return 1
     fi
 
-    # Start key-provider if not running
-    log_info "Ensuring key-provider is running..."
-    if ! pgrep -f "gramine-sealing-key-provider" >/dev/null 2>&1; then
-        log_info "Starting key-provider..."
-        cd "$KEY_PROVIDER_DIR"
-        docker-compose up -d
-        sleep 3
-
-        # Verify it started
-        if pgrep -f "gramine-sealing-key-provider" >/dev/null 2>&1; then
-            log_success "Key-provider started successfully"
-        else
-            log_warning "Key-provider may not have started properly"
-        fi
-    else
-        log_success "Key-provider is already running"
+    # Under the host lock: register this VM root, start the key provider on its
+    # pinned image (never an implicit build), and create the data disk so the
+    # inventory sees it before the lock is released. dstack.py keeps an
+    # existing hda.img.
+    log_info "Ensuring key-provider is running (pinned image, host lock)..."
+    cvm_guard_lock || return $?
+    cvm_guard_register_vms_dir "$VMS_DIR" || return 1
+    local guard_rc=0
+    cvm_guard_start || guard_rc=$?
+    if [ "$guard_rc" -ne 0 ]; then
+        log_error "Key-provider not started (cvm_upgrade_guard.sh exit $guard_rc); the CVM is not started either"
+        return "$guard_rc"
     fi
+    log_success "Key-provider is running on the pinned image"
+    if [ -z "$dry_run" ] && [ ! -f "$VMS_DIR/$cvm_name/hda.img" ]; then
+        local disk_size
+        disk_size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["disk_size"])' "$VMS_DIR/$cvm_name/vm-manifest.json")
+        qemu-img create -f qcow2 "$VMS_DIR/$cvm_name/hda.img" "${disk_size}G"
+        log_info "Created data disk $VMS_DIR/$cvm_name/hda.img (${disk_size}G)"
+    fi
+    cvm_guard_unlock
 
     # Run the CVM
     log_info "Starting CVM '$cvm_name'..."
@@ -593,6 +636,8 @@ show_help() {
     echo "  stop <name> [--timeout N] [--force]"
     echo "                            Gracefully stop a running CVM"
     echo "  list                      List available CVMs"
+    echo "  inventory                 List every CVM disk on this host (all checkouts); says whether a"
+    echo "                            key-provider upgrade is allowed (cvm_upgrade_guard.sh inventory)"
     echo "  lsgpu                     List available GPUs"
     echo "  help                      Show this help message"
     echo
@@ -618,7 +663,11 @@ show_help() {
     echo "  $0 stop my-cvm"
     echo "  $0 stop my-cvm --force --timeout 60"
     echo "  $0 list"
+    echo "  $0 inventory"
     echo "  $0 lsgpu"
+    echo
+    echo "Key-provider upgrade (rebuild): $THIS_DIR/cvm_upgrade_guard.sh upgrade"
+    echo "  Refused while any CVM disk exists on the host; see docs/host-setup.md §6."
 }
 
 # Main script logic
@@ -648,6 +697,9 @@ case "$1" in
     ;;
 "list")
     list_cvms
+    ;;
+"inventory")
+    cvm_guard_main inventory
     ;;
 "lsgpu")
     list_gpus

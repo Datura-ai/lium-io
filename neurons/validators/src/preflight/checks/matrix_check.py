@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import suppress_library_output, get_gpu_info
+from services.gpu_precheck import GpuPrecheckError, precheck_gpu_spec
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,11 @@ class MatrixValidationCheck(PreflightCheck):
         challenge_uuid: str,
     ) -> str:
         """Generate cipher text (encryption side)."""
+        # NOTE: machine_info MUST exactly match what libdmcompverify reconstructs
+        # locally via getGPUInfo() on the decrypt side — otherwise the hash-derived
+        # AES key will not match and decrypt will fail. The Python-side pre-check
+        # below uses gpu_memory_mb directly from gpu_info; it is NEVER embedded
+        # in machine_info.
         machine_info = json.dumps(
             {
                 "uuids": gpu_info["gpu_uuids"],
@@ -244,6 +250,15 @@ class MatrixValidationCheck(PreflightCheck):
             },
             sort_keys=True,
         )
+
+        # Python-side pre-check before any native allocation.
+        try:
+            precheck_gpu_spec(
+                gpu_model=gpu_info.get("gpu_model", ""),
+                gpu_capacity_mb=int(gpu_info.get("gpu_memory_mb", 0) or 0),
+            )
+        except GpuPrecheckError as e:
+            raise CipherGenError(f"precheck rejected: {e}") from e
 
         with suppress_library_output():
             encrypt_verifier = wrapper.create_verifier(10, 10)

@@ -16,7 +16,7 @@ import host_api
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, TypedDict
 from functools import reduce
 
 logging.basicConfig(
@@ -56,6 +56,65 @@ def test_merge2():
 
 def merge_dicts(*dicts):
     return reduce(merge2, dicts, {})
+
+
+class AppCompose(TypedDict, total=False):
+    """The keys of app-compose.json; dstack measures the whole file into compose_hash."""
+
+    manifest_version: int
+    name: str
+    version: str
+    features: list[str]
+    runner: str
+    docker_compose_file: str
+    local_key_provider_enabled: bool
+    public_logs: bool
+    secure_time: bool
+    public_sysinfo: bool
+    public_tcbinfo: bool
+    init_script: str
+    pre_launch_script: str
+
+
+def build_app_compose(
+    compose_content: str,
+    *,
+    local_key_provider: bool,
+    enable_logs: bool,
+    enable_sysinfo: bool,
+    init_script: Optional[str] = None,
+    pre_launch_script: Optional[str] = None,
+) -> AppCompose:
+    """The app-compose.json document dstack measures into compose_hash (RTMR3).
+
+    Kept as one pure function so the validator's whitelist test and the release-notes step
+    (scripts/compose_hash.py) rebuild exactly what `new` writes: every key, its order and its
+    default is part of the measurement, so a change here moves the hash of every CVM.
+    """
+    app_compose: AppCompose = {
+        "manifest_version": 1,
+        "name": "example",
+        "version": "1.0.0",
+        "features": [],
+        "runner": "docker-compose",
+        "docker_compose_file": compose_content,
+        "local_key_provider_enabled": local_key_provider,
+        "public_logs": enable_logs,
+        "secure_time": False,
+    }
+    if enable_sysinfo:
+        app_compose["public_sysinfo"] = True
+        app_compose["public_tcbinfo"] = True
+    if init_script is not None:
+        app_compose["init_script"] = init_script
+    if pre_launch_script is not None:
+        app_compose["pre_launch_script"] = pre_launch_script
+    return app_compose
+
+
+def app_compose_json(app_compose: AppCompose) -> str:
+    """The exact bytes written to shared/app-compose.json; compose_hash is their sha256."""
+    return json.dumps(app_compose, indent=4)
 
 
 def test_merge_dicts():
@@ -141,7 +200,7 @@ class QemuConfig:
                 self.pic = False
 
 
-def gen_vm_config(vm_dir, host_port, manifest=None, os_image_hash=None):
+def gen_vm_config(vm_dir, host_port, manifest=None, os_image_hash=None, ovmf_variant=None):
     shared_dir = os.path.join(vm_dir, "shared")
     for filename in ["config.json", ".sys-config.json"]:
         config_file = os.path.join(shared_dir, filename)
@@ -160,28 +219,27 @@ def gen_vm_config(vm_dir, host_port, manifest=None, os_image_hash=None):
 
             qemu_cfg = QemuConfig()
             qemu_version_str = get_qemu_version_string()
-            update_guest_config(
-                config_file,
-                {
-                    "vm_config": json.dumps(
-                        {
-                            "spec_version": 1,
-                            "os_image_hash": os_image_hash,
-                            "cpu_count": manifest["vcpu"],
-                            "memory_size": manifest["memory"] * 1024 * 1024,
-                            "qemu_single_pass_add_pages": qemu_cfg.single_pass_add_pages,
-                            "pic": qemu_cfg.pic,
-                            "pci_hole64_size": qemu_cfg.pci_hole64_size,
-                            "num_gpus": num_gpus,
-                            "num_nvswitches": num_nvswitches,
-                            "hugepages": False,
-                            "hotplug_off": qemu_cfg.hotplug_off,
-                            "qemu_version": qemu_version_str,
-                            "image": manifest.get("image"),
-                        }
-                    )
-                },
-            )
+            vm_config = {
+                "spec_version": 1,
+                "os_image_hash": os_image_hash,
+                "cpu_count": manifest["vcpu"],
+                "memory_size": manifest["memory"] * 1024 * 1024,
+                "qemu_single_pass_add_pages": qemu_cfg.single_pass_add_pages,
+                "pic": qemu_cfg.pic,
+                "pci_hole64_size": qemu_cfg.pci_hole64_size,
+                "num_gpus": num_gpus,
+                "num_nvswitches": num_nvswitches,
+                "hugepages": False,
+                "hotplug_off": qemu_cfg.hotplug_off,
+                "qemu_version": qemu_version_str,
+                "image": manifest.get("image"),
+            }
+            # The verifier prefers an explicit OVMF variant over inferring it from
+            # the image name (which mis-picks Stable202505 for dstack-nvidia-0.5.11);
+            # stamp it from the image metadata like upstream dstack-vmm does.
+            if ovmf_variant:
+                vm_config["ovmf_variant"] = ovmf_variant
+            update_guest_config(config_file, {"vm_config": json.dumps(vm_config)})
 
 
 @dataclass
@@ -222,7 +280,7 @@ class DStackManager:
         """Read and validate compose file."""
         if not os.path.isfile(compose_file):
             raise FileNotFoundError(f"Compose file not found: {compose_file}")
-        with open(compose_file, "r") as f:
+        with open(compose_file, "r", encoding="utf-8") as f:
             return f.read()
 
     def _create_directories(self, work_dir: str) -> tuple[str, str]:
@@ -285,28 +343,24 @@ class DStackManager:
             compose_content = self._read_compose_file(args.compose_file)
 
             # Create app-compose.json
-            app_compose = {
-                "manifest_version": 1,
-                "name": "example",
-                "version": "1.0.0",
-                "features": [],
-                "runner": "docker-compose",
-                "docker_compose_file": compose_content,
-                "local_key_provider_enabled": args.local_key_provider,
-                "public_logs": args.enable_logs,
-                "secure_time": False,
-            }
-            if args.enable_sysinfo:
-                app_compose["public_sysinfo"] = True
-                app_compose["public_tcbinfo"] = True
-            if args.init_script:
-                app_compose["init_script"] = open(args.init_script, "r").read()
-            if args.pre_launch_script:
-                app_compose["pre_launch_script"] = open(
-                    args.pre_launch_script, "r"
-                ).read()
-            with open(os.path.join(shared_dir, "app-compose.json"), "w") as f:
-                json.dump(app_compose, f, indent=4)
+            app_compose = build_app_compose(
+                compose_content,
+                local_key_provider=args.local_key_provider,
+                enable_logs=args.enable_logs,
+                enable_sysinfo=args.enable_sysinfo,
+                init_script=(
+                    open(args.init_script, "r", encoding="utf-8").read()
+                    if args.init_script
+                    else None
+                ),
+                pre_launch_script=(
+                    open(args.pre_launch_script, "r", encoding="utf-8").read()
+                    if args.pre_launch_script
+                    else None
+                ),
+            )
+            with open(os.path.join(shared_dir, "app-compose.json"), "w", encoding="utf-8") as f:
+                f.write(app_compose_json(app_compose))
             # Read image metadata and create config.json
 
             if self.config.docker_registry:
@@ -523,7 +577,13 @@ class DStackManager:
             img_metadata = json.load(f)
 
         os_image_hash = open(os.path.join(image_path, "digest.txt"), "r").read().strip()
-        gen_vm_config(vm_dir, host_port, manifest, os_image_hash)
+        gen_vm_config(
+            vm_dir,
+            host_port,
+            manifest,
+            os_image_hash,
+            ovmf_variant=img_metadata.get("ovmf_variant"),
+        )
 
         mem_gb = manifest["memory"] // 1024
         vcpu_count = manifest["vcpu"]
@@ -635,7 +695,15 @@ class DStackManager:
                 )
                 bus_nr += count + 1
         if gpus:
-            cmd_args.extend(["-object", "iommufd,id=iommufd0"])
+            # QEMU 9.2.1 (dstack fork) fails VFIO_DEVICE_BIND_IOMMUFD (EINVAL)
+            # against mainline 6.16+ kernels; fall back to the legacy type1
+            # container there (needs a raised vfio_iommu_type1.dma_entry_limit —
+            # TDX shared/private conversions exhaust the default 65535 entries).
+            qemu_ver = get_qemu_version()
+            use_iommufd = bool(qemu_ver and qemu_ver >= (10, 0, 0))
+            iommufd_suffix = ",iommufd=iommufd0" if use_iommufd else ""
+            if use_iommufd:
+                cmd_args.extend(["-object", "iommufd,id=iommufd0"])
             if not hugepages:
                 for dev in gpus:
                     slot = dev["slot"]
@@ -644,7 +712,7 @@ class DStackManager:
                             "-device",
                             f"pcie-root-port,id=pci.{dev_num},bus=pcie.0,chassis={dev_num}",
                             "-device",
-                            f"vfio-pci,host={slot},bus=pci.{dev_num},iommufd=iommufd0",
+                            f"vfio-pci,host={slot},bus=pci.{dev_num}{iommufd_suffix}",
                         ]
                     )
                     dev_num += 1
@@ -657,7 +725,7 @@ class DStackManager:
                             "-device",
                             f"pcie-root-port,id=pci.{dev_num},bus=pcie.node{node},chassis={dev_num}",
                             "-device",
-                            f"vfio-pci,host={slot},bus=pci.{dev_num},iommufd=iommufd0",
+                            f"vfio-pci,host={slot},bus=pci.{dev_num}{iommufd_suffix}",
                         ]
                     )
                     dev_num += 1
@@ -668,7 +736,7 @@ class DStackManager:
                         "-device",
                         f"pcie-root-port,id=pci.{dev_num},bus=pcie.0,chassis={dev_num}",
                         "-device",
-                        f"vfio-pci,host={slot},bus=pci.{dev_num},iommufd=iommufd0",
+                        f"vfio-pci,host={slot},bus=pci.{dev_num}{iommufd_suffix}",
                     ]
                 )
                 dev_num += 1
@@ -773,7 +841,7 @@ def shutdown_instance(vm_dir: str, timeout: int = 30, force: bool = False) -> No
             "\r\n"
         )
         sock.sendall(request.encode())
-        response = sock.recv(4096)
+        sock.recv(4096)
         sock.close()
         logger.info("shutdown request sent successfully")
     except Exception as e:

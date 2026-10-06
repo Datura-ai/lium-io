@@ -1,8 +1,10 @@
 import enum
+from datetime import datetime
+from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -45,7 +47,6 @@ class CustomOptions(BaseModel):
     @staticmethod
     def _sanitize_volumes(volumes: list[str]) -> list[str]:
         """Sanitize volume mounts to prevent command injection."""
-        import re
         sanitized = []
         for volume in volumes:
             if not volume or not volume.strip():
@@ -156,6 +157,9 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
+    # DAH-2794: the same obfuscated source the binary was frozen from, so a pipeline that can
+    # deliver it over stdin needs no upload and one that cannot still has the binary.
+    machine_scrape_source: str
     # score_file_name: str
 
 
@@ -191,7 +195,23 @@ class ContainerRequestType(enum.Enum):
     AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
     BackupContainerRequest = "BackupContainerRequest"
     RestoreContainerRequest = "RestoreContainerRequest"
+    CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+
+
+class ForcedValidationCycleRequest(BaseModel):
+    """Ask the validator to start its validation cycle now, not at the next block window.
+
+    A staging development tool: it removes the wait for the next cycle. It carries no executor
+    -- the cycle validates the whole fleet, exactly as the scheduled one does.
+    """
+
+    message_type: Literal["ForcedValidationCycleRequest"]
+
+
+class WorkloadKind(enum.Enum):
+    CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
+    FILLER = "FILLER"
 
 
 class BaseServerRequest(BaseRequest):
@@ -204,13 +224,29 @@ class BaseServerRequest(BaseRequest):
 
 class ContainerBaseRequest(BaseServerRequest):
     pod_id: str
+    workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
 
 
 class ExternalVolumeInfo(BaseModel):
     name: str
     plugin: str
-    iam_user_access_key: str
-    iam_user_secret_key: str
+    iam_user_access_key: str = Field(repr=False)
+    iam_user_secret_key: str = Field(repr=False)
+    session_token: str | None = Field(default=None, repr=False)
+
+
+class BootstrapRestoreSpec(BaseModel):
+    restore_log_id: str
+    backup_engine: str
+    repository_pod_id: str
+    repository_password: str | None = Field(default=None, repr=False)
+    backup_volume_info: ExternalVolumeInfo
+    snapshot_id: str | None = None
+    legacy_object_key: str | None = None
+    legacy_object_size_bytes: int | None = None
+    auth_token: str = Field(repr=False)
+    restore_path: str
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class PayloadPortMapping(BaseModel):
@@ -219,7 +255,53 @@ class PayloadPortMapping(BaseModel):
     external_port: int
 
 
+class GpuPowerLimit(BaseModel):
+    # DAH-2356: one GPU's power cap for the Lium PEARL default job (see gpu_power_limits below).
+    # gt=0: reject a buggy backend value (0/negative) at the boundary, not as a hardware-minimum cap.
+    gpu_uuid: str
+    watts: int = Field(gt=0)
+
+
+class CacheVolume(BaseModel):
+    # One persistent, stable-named docker volume mounted into a FILLER container so its model/runtime
+    # cache survives container teardown (a DPHN cold start otherwise re-downloads ~37 GB per start).
+    # Honored by the validator ONLY for workload_kind == FILLER; the delete request never names these,
+    # so they persist across stops. `name` must be a safe docker volume name and must NOT use the
+    # ephemeral `volume_` prefix (that prefix marks the run volumes every GC path deletes).
+    name: str
+    target: str
+
+
+class ClusterMembership(BaseModel):
+    """Set by the backend when this pod is one node of an atomic multi-node group rental (DAH-2620).
+
+    The validator uses it to mint this node's WireGuard overlay config and join it to the group so
+    NCCL's socket bootstrap can reach the peers; the tensors still travel over InfiniBand. Absent on
+    an ordinary single-node rental, which then behaves exactly as before.
+    """
+
+    node_index: int
+    # This node's fully-rendered wg-quick config, minted by the backend for the whole group so every
+    # node's keys and peer list agree. The validator only injects it; it generates nothing itself.
+    # `repr=False` because every container create logs the whole request as `str(payload)` and this
+    # holds the node's WireGuard PrivateKey; the wire format still carries it.
+    wireguard_conf: str = Field(repr=False)
+    # DAH-2664: one SSH login shared by the whole group, so a pod can start a process on its peers —
+    # which is how mpirun, pdsh and every nccl-tests recipe launch. Empty from an older backend.
+    ssh_private_key: str = Field(default="", repr=False)
+    ssh_authorized_key: str = ""
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
+    """Container creation request from the backend.
+
+    Disk sizing contract: when ``disk_share`` is set, the validator computes
+    effective volume/storage limits from fresh on-host disk state and
+    ``volume_limit_gb``/``storage_limit_gb`` act only as upper-bound caps.
+    When ``disk_share`` is absent, ``volume_limit_gb``/``storage_limit_gb``
+    are exact sizes (legacy behavior).
+    """
+
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_keys: list[str] = []
@@ -231,17 +313,75 @@ class ContainerCreateRequest(ContainerBaseRequest):
     local_volume: str | None = None
     volume_limit_gb: int | None = None
     storage_limit_gb: int | None = None
+    disk_share: float | None = None  # pod's share of machine disk (rented_gpus/total_gpus); None -> legacy sizing
+    min_volume_gb: int | None = None  # reject floor for fresh sizing; None -> never reject (shrink only)
     external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
-    docker_password: str | None = None  # when edit pod, docker_password is required
+    # when edit pod, docker_password is required
+    docker_password: str | None = Field(default=None, repr=False)
     timestamp: int | None = None
+    # DAH-2458: backend-measured pre-dispatch profiler spans (e.g. filler preemption, rent prep),
+    # as wire dicts {name, duration}. create_container seeds the deploy profile with these so the
+    # persisted profile is one ordered backend -> subnet -> backend timeline. Optional/defaulted so
+    # an older backend that omits it degrades gracefully to the subnet-only profile.
+    pre_dispatch_profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
+    bootstrap_restore: BootstrapRestoreSpec | None = None
     enable_jupyter: bool | None = None
+    enable_volume_encryption: bool | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
+    cluster_membership: ClusterMembership | None = None
+    active_volume_names: list[str] | None = None
+    # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
+    # builds the image from this Dockerfile on the executor host instead of pulling
+    # `docker_image`. None or "" keeps the normal image-pull path.
+    dockerfile_content: str | None = None
+    # DAH-1524 / DAH-2265 (default-image / cached-template deploy): set truthy by the
+    # backend when the user selects the default Docker image or default cache template.
+    # Such images run their own start.sh, so the validator skips work the image already
+    # does:
+    #   * SSH: skip the ENTIRE post-creation sshd bootstrap
+    #     (install_open_ssh_server_and_start_ssh_service -> sshd_bootstrap.sh), which
+    #     otherwise provides FOUR guarantees, ALL surrendered when this flag is set —
+    #     the image ASSERTS it provides them itself:
+    #       (a) starts the sshd daemon                 (sshd_bootstrap.sh:110-117, main 166)
+    #       (b) generates host keys via `ssh-keygen -A` (sshd_bootstrap.sh:106)
+    #       (c) hardens config: PasswordAuthentication/KbdInteractive/ChallengeResponse no
+    #                                                  (sshd_bootstrap.sh:89-99)
+    #       (d) installs a 30s self-heal restart watchdog (sshd_bootstrap.sh:119-156)
+    #     The validator then only re-ensures ~/.ssh for key injection.
+    #   * Jupyter: skip the validator's run_jupyter path. Instead, when `enable_jupyter`
+    #     is also set, the validator forwards a validator-chosen JUPYTER_PASSWORD as a
+    #     `docker run -e` env var so the image's start.sh launches Jupyter itself and
+    #     serves it as that token. JUPYTER_PASSWORD is the only Jupyter variable these
+    #     images read (start.sh gates on it and hardcodes the in-container port 8888).
+    # CAVEAT — this only holds when the image's own start.sh actually runs. start.sh is
+    # the image CMD, exec'd by the ENTRYPOINT (/pytorch-entrypoint.sh). A renter-supplied
+    # `startup_commands` is passed as the container command and REPLACES that CMD, and a
+    # renter `entrypoint` replaces the ENTRYPOINT — either way start.sh never runs and the
+    # image starts no sshd/Jupyter. The validator therefore only takes the skip path when
+    # BOTH are empty (see docker_service.create_container `image_manages_services`); with
+    # an override present it falls back to the full bootstrap + run_jupyter.
+    # None/False (default) preserves the always-bootstrap + run_jupyter behavior.
+    # Set by lium-io-backend as `ships_sshd=is_cached` (DAH-1524) for default/cached-template
+    # images, independent of startup_commands — so the skip path is reachable in production.
+    ships_sshd: bool | None = None
+    # DAH-2356: per-GPU power caps for the Lium PEARL default-job (FILLER) container. Applied
+    # host-side via `nvidia-smi -pl` (clamped to the GPU's live min/max) before the filler starts;
+    # the pre-cap limit is recorded and restored on delete. None -> no cap (customer rentals, DPHN,
+    # miner default jobs). MUST be declared here or pydantic drops it on deserialization of the
+    # backend's request.
+    gpu_power_limits: list[GpuPowerLimit] | None = None
+    # Extra persistent named volumes mounted into a FILLER container (DPHN model/runtime cache, so a
+    # restart reuses the warm cache instead of re-downloading ~37 GB). FILLER-only: the validator
+    # appends these mounts only for workload_kind == FILLER and never for a customer rental. None ->
+    # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
+    # drops it on deserialization of the backend's request.
+    cache_volumes: list[CacheVolume] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -251,6 +391,7 @@ class ExecutorRentFinishedRequest(ContainerBaseRequest):
 class ContainerStartRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
+    local_volume_path: str
 
 
 class AddSshPublicKeyRequest(ContainerBaseRequest):
@@ -302,8 +443,14 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_path: str
     source_volume_path: str
     backup_target_path: str
-    auth_token: str  # JWT for progress updates
+    auth_token: str = Field(repr=False)  # JWT for progress updates
     backup_log_id: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
+    backup_engine: str = "tar_aws_cli"
+    repository_pod_id: str | None = None
+    repository_password: str | None = Field(default=None, repr=False)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -312,9 +459,22 @@ class RestoreContainerRequest(ContainerBaseRequest):
     backup_volume_info: ExternalVolumeInfo  # S3 backup volume with credentials
     backup_source_path: str  # path in backup S3 volume
     target_volume_path: str  # local volume mounted path
-    auth_token: str  # JWT for progress updates
+    auth_token: str = Field(repr=False)  # JWT for progress updates
     restore_log_id: str
     restore_path: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
+    backup_engine: str = "tar_aws_cli"
+    repository_pod_id: str | None = None
+    repository_password: str | None = Field(default=None, repr=False)
+    snapshot_id: str | None = None
+    legacy_object_size_bytes: int | None = None
+    failure_timeout_seconds: int = Field(default=600, gt=0)
+
+
+class CancelStorageOperationRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.CancelStorageOperationRequest
+    operation_id: str
 
 
 ##############################################################
@@ -337,7 +497,15 @@ class ContainerResponseType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
-class BaseValidatorResponse(BaseRequest):
+class DeliveryStamps(BaseModel):
+    # DAH-2792: epoch seconds; sent_at by the producer, forwarded_at/queue_depth by the connector
+    # before ws.send(). Mixed into every model the connector queues, since its send loop stamps them all.
+    sent_at: float | None = None
+    forwarded_at: float | None = None
+    queue_depth: int | None = None
+
+
+class BaseValidatorResponse(BaseRequest, DeliveryStamps):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str
@@ -347,22 +515,156 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
 
 
+class VolumeEncryptionStatus(str, enum.Enum):
+    ENABLED = "ENABLED"
+    UNSUPPORTED_IMAGE = "UNSUPPORTED_IMAGE"
+    DISABLED = "DISABLED"
+    FAILED = "FAILED"
+
+
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
+    workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
+
+class ProfilerStepName(str, enum.Enum):
+    """Stable identifiers for each deploy-profiling step (DAH-1524).
+
+    The string *values* double as Loki query keys and are consumed by
+    lium-io-backend, so they must not be changed without coordinating both.
+    Adding a new deploy step means adding a member here.
+    """
+
+    REQUESTED_FROM_BACKEND = "Requested from backend"
+    STARTED_IN_SUBNET = "Started in subnet"
+    PORT_MAPPINGS_GENERATED = "Port mappings generated"
+    SSH_CONNECTION_ESTABLISHED = "SSH connection established"
+    DOCKER_LOGIN = "Docker login step finished"
+    # DAH-3246: the image-presence probe, once folded into DOCKER_PULL (whose value was ~0.4 s
+    # of probe on a rental whose pull was skipped). Its own step from here on.
+    DOCKER_IMAGE_INSPECT = "Docker image inspect step finished"
+    CUSTOM_DOCKER_BUILD = "Custom docker build step finished"
+    DOCKER_PULL = "Docker pull step finished"
+    CONTAINER_CLEANING = "Container cleaning step finished"
+    DOCKER_VOLUME_CREATION = "Docker volume creation step finished"
+    DOCKER_VOLUME_CREATION_FAILED = "Docker volume creation step failed"
+    GPU_DEVICE_PROBE = "GPU device probe step finished"
+    PORT_CHECK_WAIT = "Port-check wait step finished"
+    DOCKER_RUN = "Docker run step finished"
+    CONTAINER_RUNNING_CHECK = "Container running check step finished"
+    ENCRYPTED_VOLUME_SETUP = "Encrypted volume setup step finished"
+    SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
+    ADDING_PUBLIC_KEYS = "Adding public keys step finished"
+    INSPECTOR_START = "Inspector collector start step finished"
+    FINISHED_IN_SUBNET = "Finished in subnet."
+    # DAH-3980: host work started early that runs beside the steps above; each row is that
+    # work's own start->end, overlapping the step rows (which keep only the residual wait),
+    # so it is never part of a sum of the profile.
+    PRERUN_HOST_PROBE_PARALLEL = "Prerun host probe (parallel)"
+    VOLUME_HOST_PROBE_PARALLEL = "Volume host probe (parallel)"
+    GPU_POWER_RESTORE_PARALLEL = "GPU power restore (parallel)"
+    # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
+    # appends these to its own profiler and passes the pre-dispatch ones in
+    # ContainerCreateRequest.pre_dispatch_profilers; the subnet seeds its profile from them so the
+    # persisted list is one ordered backend -> subnet -> backend timeline. FILLER_PREEMPTION and
+    # BACKEND_PREP precede REQUESTED_FROM_BACKEND; BACKEND_FINALIZE is appended backend-side on
+    # container-creation success.
+    FILLER_PREEMPTION = "Filler preemption"
+    BACKEND_PREP = "Backend rent prep"
+    BACKEND_FINALIZE = "Backend finalize"
+
+
+PARALLEL_PROFILER_STEP_NAMES = frozenset({
+    ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+    ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+    ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
+})
+
+
+def now_ms() -> int:
+    """Current wall-clock time as integer milliseconds (the deploy-profiling clock)."""
+    return int(datetime.utcnow().timestamp() * 1000)
+
+
+class ProfilerStep(BaseModel):
+    """One step in a deploy profile (DAH-1524).
+
+    Typed replacement for the former free-form ``dict``. The anchor step
+    carries ``timestamp`` (no ``duration``); every other step carries a
+    ``duration`` in ms; ``skipped`` marks a short-circuited step.
+
+    ``_serialize`` reproduces the historical wire shape exactly — it emits
+    only the keys that were present before this became a model — so
+    lium-io-backend keeps receiving byte-identical JSON.
+    """
+
+    name: ProfilerStepName
+    duration: int | None = None
+    timestamp: int | None = None
+    skipped: bool = False
+
+    @classmethod
+    def since(
+        cls, name: ProfilerStepName, prev_ms: int, *, skipped: bool = False
+    ) -> "ProfilerStep":
+        """Build a step whose ``duration`` is the time elapsed since ``prev_ms`` (ms).
+
+        Collapses the repeated ``ProfilerStep(name=..., duration=now_ms() -
+        prev_timestamp)`` at every deploy step into one readable call.
+        """
+        return cls(name=name, duration=now_ms() - prev_ms, skipped=skipped)
+
+    @classmethod
+    def from_wire(cls, data: dict) -> "ProfilerStep | None":
+        """Rebuild a step from its wire dict (DAH-2458 backend pre-dispatch pass-through).
+
+        Used by ``create_container`` to seed the subnet profile with the backend's own
+        pre-dispatch spans. Returns ``None`` for any step this validator version can't rebuild —
+        an unknown or missing name, a non-dict payload, OR a known name carrying a bad-typed
+        ``duration``/``timestamp`` — so a backend that emits something unexpected can never break
+        the deploy; the step is simply dropped.
+
+        The model construction stays INSIDE the guard: the seeding loop runs on the
+        container-creation path, so a ``ValidationError`` escaping here would abort a real
+        deploy. ``ValidationError`` subclasses ``ValueError``, but it is listed explicitly so
+        that guarantee stays visible if the model's field types are ever refactored.
+        """
+        try:
+            return cls(
+                name=ProfilerStepName(data["name"]),
+                duration=data.get("duration"),
+                timestamp=data.get("timestamp"),
+                skipped=bool(data.get("skipped", False)),
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            return None
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        data: dict = {"name": self.name.value}
+        if self.timestamp is not None:
+            data["timestamp"] = self.timestamp
+        if self.duration is not None:
+            data["duration"] = self.duration
+        if self.skipped:
+            data["skipped"] = self.skipped
+        return data
+
 
 class ContainerCreated(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
     container_name: str
     volume_name: str
     port_maps: list[tuple[int, int]]
-    profilers: list[dict] = []
+    profilers: list[ProfilerStep] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
+    restore_log_id: str | None = None
     jupyter_url: str | None = None
     warnings: list[ContainerWarningCode] | None = None
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -401,13 +703,20 @@ class FailedContainerErrorCodes(enum.Enum):
     UnknownError = "UnknownError"
     NoSshKeys = "NoSshKeys"
     ContainerNotRunning = "ContainerNotRunning"
+    DeletionInProgress = "DeletionInProgress"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
+    # DAH-3338: the miner lists the executor but the node did not accept the validator's key. Was
+    # reported as InvalidExecutorId, which the backend cannot tell from an id nobody knows.
+    ExecutorUnreachable = "ExecutorUnreachable"
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
     NoJupyterPortMapping = "NoJupyterPortMapping"
     AttestationError = "AttestationError"
+    # DAH-2703: the container we created was gone from the host before creation finished — a
+    # host-side reaper, not a container that failed on its own.
+    ContainerVanished = "ContainerVanished"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -422,8 +731,23 @@ class FailedContainerErrorTypes(enum.Enum):
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
+    # Renter-safe HEADLINE only. The backend surfaces this in customer-facing events, so it must never
+    # carry executor host details (IP, SSH port/username, hotkey) — those go in `detail`.
     msg: str
+    # DAH-2475: full structured text (headline + extra dict) for diagnosis — filler_run.failure_reason
+    # and ops logs on the backend, never customer events. Optional so old peers keep parsing.
+    detail: str | None = None
     error_code: FailedContainerErrorCodes | None = None
+    failure_step: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-2211 follow-up: for a custom-Dockerfile build that failed, the last lines the build printed
+    # (docker_build), the timeout (build_timeout) or a fixed one-line reason for build_export and the
+    # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
+    # host data. None for every other failure and from old validators.
+    build_log_tail: str | None = Field(default=None, repr=False)
+    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
+    # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
+    step_detail: str | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):
@@ -457,3 +781,14 @@ class JupyterServerInstalled(ContainerBaseResponse):
 class JupyterInstallationFailed(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str
+
+
+class GetEstimateRequest(BaseModel):
+    request_id: str = ""
+    gpu_model: str
+    gpu_count: int = 1
+    is_rented: bool = False
+    gpu_splitting: bool = False
+    gpu_splitting_min_count: int | None = None
+    sysbox_runtime: bool = True
+    collateral_deposited: bool = True

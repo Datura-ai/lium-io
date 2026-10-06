@@ -1,7 +1,14 @@
 from typing import TYPE_CHECKING
-from payload_models.payloads import BackupContainerRequest, RestoreContainerRequest
+
+from payload_models.payloads import (
+    BackupContainerRequest,
+    CancelStorageOperationRequest,
+    RestoreContainerRequest,
+)
+
 if TYPE_CHECKING:
     from clients.compute_client import ComputeClient
+
 
 class BackupHandler:
     def __init__(self, compute_client: "ComputeClient"):
@@ -13,4 +20,7 @@ class BackupHandler:
 
     async def handle_restore_container_req(self, job_request: RestoreContainerRequest):
         """Handle restore container request."""
+        await self.compute_client.miner_service.handle_container(job_request)
+
+    async def handle_cancel_storage_operation_req(self, job_request: CancelStorageOperationRequest):
         await self.compute_client.miner_service.handle_container(job_request)

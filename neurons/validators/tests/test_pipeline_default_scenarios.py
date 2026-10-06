@@ -6,7 +6,6 @@ complete validation flow.
 """
 
 import pytest
-from unittest.mock import Mock
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
@@ -14,7 +13,7 @@ from neurons.validators.src.services.task.pipeline import Pipeline, LoggerSink
 from neurons.validators.src.services.task.checks import (
     BannedGpuCheck,
     CapabilityCheck,
-    CollateralCheck,
+    CollateralStatusCheck,
     DuplicateExecutorCheck,
     FinalizeCheck,
     GpuCountCheck,
@@ -34,13 +33,13 @@ from neurons.validators.src.services.task.checks import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
 
-from datura.requests.miner_requests import ExecutorSSHInfo
-from helpers import build_context_config, build_services, build_state
-from protocol.vc_protocol.compute_requests import (
-    RentedExecutor,
-    RentedExecutorsResponse,
-    RentedPod,
-)
+from helpers import FERNET_TOKEN, build_context_config, build_services, build_state
+
+
+class MockContainerCleanup:
+    """Mock container cleanup service for tests."""
+    async def cleanup(self, ssh_client, rented_data, executor_uuid):
+        return 0, []
 
 
 def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
@@ -54,40 +53,6 @@ def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
         python_path="/usr/bin/python3",
         root_dir="/root/app",
     )
-
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
-
-class DummyKeypair:
-    """Keypair that can be serialized (unlike Mock)."""
-
-    def __init__(self):
-        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-
-    def sign(self, data: bytes) -> bytes:
-        return b"\x00" * 64
-
-
-def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
-    """Create a real ExecutorSSHInfo for tests."""
-    return ExecutorSSHInfo(
-        uuid=uuid,
-        address="192.168.1.100",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-    )
-
-
-class DummyKeypair:
-    """Keypair that can be serialized (unlike Mock)."""
-
-    def __init__(self):
-        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-
-    def sign(self, data: bytes) -> bytes:
-        return b"\x00" * 64
 
 
 class DummyLogger:
@@ -109,11 +74,11 @@ class DummyLogger:
 class DummySSHCommandRunner:
     """Mock SSH command runner for successful operations."""
 
-    def __init__(self, machine_specs_encrypted: str = "encrypted_payload"):
+    def __init__(self, machine_specs_encrypted: str = FERNET_TOKEN):
         self.machine_specs_encrypted = machine_specs_encrypted
         self.commands_called = []
 
-    async def run(self, command: str, timeout: int = 300, retryable: bool = False):
+    async def run(self, command: str, timeout: int = 300, retryable: bool = False, stdin_text=None):
         self.commands_called.append(command)
 
         from neurons.validators.src.services.task.runner import SSHCommandResult
@@ -224,12 +189,32 @@ class DummyRedisService:
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str):
         return False  # Not renting in progress
 
+    # DAH-2870: the rented check keeps per-pod SSH-probe marks; a bare dict is enough here.
+    def __init__(self):
+        self.store: dict[str, str] = {}
 
-class DummyCollateralService:
-    """Mock collateral contract service."""
+    async def get(self, key: str):
+        return self.store.get(key)
 
-    async def is_eligible_executor(self, miner_hotkey: str, executor_uuid: str, gpu_model: str, gpu_count: int):
-        return True, None, "v1.0.0"  # collateral_deposited, error_message, contract_version
+    async def set(self, key: str, value: str, ex: int | None = None):
+        self.store[key] = value
+
+    async def delete(self, key: str):
+        self.store.pop(key, None)
+
+    # the per-cycle fleet and due hashes of the probe's cycle-end gate
+    async def hset(self, key: str, field: str, value: str):
+        self.store.setdefault(key, {})[field] = value
+
+    async def hgetall(self, key: str):
+        return dict(self.store.get(key) or {})
+
+    async def expire(self, key: str, seconds: int):
+        pass
+
+    async def write_atomically(self, writes):
+        for name, args, kwargs in writes.ops:
+            await getattr(self, name)(*args, **kwargs)
 
 
 class DummyValidationService:
@@ -296,11 +281,6 @@ class DummyConnectivityService:
         return ConnectivityResult(kwargs.get("sysbox_runtime", True)).result
 
 
-class DummyPortMappingService:
-    """Mock port mapping service."""
-
-    async def get_successful_ports_count(self, executor_uuid: str) -> int:
-        return 10  # Sufficient ports
 
 
 class DummyKeypair:
@@ -337,30 +317,24 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     # Setup real executor (not Mock - to avoid Pydantic serialization issues)
     executor = make_executor("executor-123")
 
-    # Create encrypted payload
-    encrypted_payload = "encrypted_machine_specs_here"
-
     # Setup mocks
-    runner = DummySSHCommandRunner(machine_specs_encrypted=encrypted_payload)
+    runner = DummySSHCommandRunner(machine_specs_encrypted=FERNET_TOKEN)
     ssh_client = DummySSHClient()
     ssh_service = DummySSHService()
     redis_service = DummyRedisService()
-    collateral_service = DummyCollateralService()
     validation_service = DummyValidationService()
     verifyx_service = DummyVerifyXService()
     connectivity_service = DummyConnectivityService()
-    port_mapping_service = DummyPortMappingService()
 
     # Setup services
     services = build_services(
         ssh=ssh_service,
         redis=redis_service,
-        collateral=collateral_service,
         validation=validation_service,
         verifyx=verifyx_service,
         connectivity=connectivity_service,
-        port_mapping=port_mapping_service,
         score_calculator=dummy_score_calculator,
+        container_cleanup=MockContainerCleanup(),
     )
 
     # Setup config with all required fields
@@ -374,7 +348,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         max_gpu_count=8,
         gpu_model_rates={"NVIDIA RTX 4090": 1.0},
         nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
-        enable_no_collateral=False,
         verifyx_enabled=True,
         port_private_key="private_key",
         port_public_key="public_key",
@@ -413,11 +386,11 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         GpuCountCheck(),
         GpuModelValidCheck(),
         NvmlDigestCheck(),
-        SpecChangeCheck(),
         GpuFingerprintCheck(),
+        SpecChangeCheck(),
         BannedGpuCheck(),
         DuplicateExecutorCheck(),
-        CollateralCheck(),
+        CollateralStatusCheck(),
         TenantEnforcementCheck(),
         GpuUsageCheck(),
         PortConnectivityCheck(),
@@ -446,7 +419,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     assert final_ctx.state.gpu_model_count == "NVIDIA RTX 4090:2"
     assert final_ctx.state.gpu_uuids == "GPU-abc123,GPU-def456"
     assert final_ctx.state.sysbox_runtime is True
-    assert final_ctx.collateral_deposited is True
+    assert final_ctx.collateral_deposited is False
 
     # Verify all checks emitted events
     assert all(event.reason_code is not None for event in events)
@@ -530,7 +503,6 @@ async def test_successful_rented_pipeline_flow(context_factory):
                     )
                 ],
                 owner_flag=False,
-                rented_ports=[],
             )
         },
         banned_guids=[],
@@ -539,16 +511,13 @@ async def test_successful_rented_pipeline_flow(context_factory):
     # Create runner and other services
     runner = DummySSHCommandRunner()
     redis_service = DummyRedisService()
-    collateral_service = DummyCollateralService()
-    port_mapping_service = DummyPortMappingService()
 
     # Setup services
     services = build_services(
         ssh=ssh_service,
         redis=redis_service,
-        collateral=collateral_service,
-        port_mapping=port_mapping_service,
         score_calculator=dummy_score_calculator,
+        container_cleanup=MockContainerCleanup(),
     )
 
     # Setup config
@@ -601,11 +570,11 @@ async def test_successful_rented_pipeline_flow(context_factory):
         GpuCountCheck(),
         GpuModelValidCheck(),
         NvmlDigestCheck(),
-        SpecChangeCheck(),
         GpuFingerprintCheck(),
+        SpecChangeCheck(),
         BannedGpuCheck(),
         DuplicateExecutorCheck(),
-        CollateralCheck(),
+        CollateralStatusCheck(),
         TenantEnforcementCheck(),
         # These checks below should NOT run because pipeline halts
         GpuUsageCheck(),

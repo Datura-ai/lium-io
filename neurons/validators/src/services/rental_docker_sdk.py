@@ -1,0 +1,1473 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import socket as socket_module
+import tempfile
+import threading
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
+
+from core.utils import _m, get_extra_info
+from datura.requests.miner_requests import ExecutorSSHInfo
+
+
+# 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
+# A stuck pull looks like a slow pull, so only this deadline stops it.
+DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 60 * 60
+_REGISTRY_DIGEST_TIMEOUT_SECONDS = 10
+_DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
+_DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
+_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
+_DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
+# DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
+# the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
+# a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
+# them and every new Redis/WebSocket connection times out before it ever reaches the socket. A thread
+# pool is FIFO, so a bigger default pool does not help — the queue has to be a separate one.
+_DOCKER_EXECUTOR_MAX_WORKERS = 32
+_DOCKER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_DOCKER_EXECUTOR_MAX_WORKERS, thread_name_prefix="docker-sdk"
+)
+# DAH-3199: every rental on a host shares this user-defined bridge instead of docker0. The daemon's
+# default bridge allows inter-container traffic, and a pod holds NET_ADMIN, so two rentals on a split
+# host could otherwise reach each other's unpublished ports. Docker enforces ICC=false with a FORWARD
+# drop between ports of this bridge; published ports still arrive through the host and NAT egress is
+# untouched. One network per host — nothing to remove at teardown.
+RENTAL_NETWORK_NAME = "lium-rentals"
+RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
+RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
+RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+logger = logging.getLogger(__name__)
+
+
+async def _in_docker_thread(func: Callable, /, *args, **kwargs):
+    # runs a blocking Docker SDK call in the dedicated pool instead of the loop's default executor
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_DOCKER_EXECUTOR, partial(func, *args, **kwargs))
+
+
+class RentalDockerConnectionError(RuntimeError):
+    """Raised when Docker SDK over SSH cannot be constructed safely."""
+
+
+class RentalDockerOperationError(RuntimeError):
+    """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class ContainerGoneBeforeExec(RentalDockerOperationError):
+    """The exec target has left the running state for good — `removing`, `exited`, `dead`, or
+    already "No such container" — so no exec was attempted (a `restarting` container is waited
+    for, a `paused` one is the plain error). ``state`` is the last inspect read while the
+    container still answered, None once it is gone: OOMKilled and ExitCode are read from here,
+    because the next inspect may find nothing.
+
+    ``kill_detail`` is the text a kill reports: the message without Docker's refused-exec text
+    ("is not running"), which the backend reads as the image exiting. The message keeps it for an
+    image whose own command ended."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        container_name: str,
+        state: ContainerStateSnapshot | None,
+        kill_detail: str | None = None,
+    ):
+        super().__init__(message)
+        self.container_name = container_name
+        self.state = state
+        self.kill_detail = kill_detail or message
+
+
+class RentalDockerContainerRestartingError(RentalDockerOperationError):
+    """The workload container kept restarting for the whole exec retry budget (DAH-3593).
+
+    Docker answers every exec on a restarting container with the same 409, which says nothing
+    about why the workload keeps exiting. The message here names the container state and its last
+    exit code instead, so the reader sees the cause (a workload image that crashes at start on this
+    node) rather than the daemon's conflict text. The container's own log line is NOT included: the
+    text lands in the create failure the backend's GPU-fault check reads, and a renter image must
+    not be able to print its way into a provider fault (review, taiberium 21 Sep).
+    """
+
+
+def is_docker_not_found_error(exc: BaseException) -> bool:
+    """True when the exception, or any cause under it, is a Docker 404 (no such container/volume)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, Exception) and _is_docker_not_found_error(current):
+            return True
+        current = current.__cause__  # explicit `raise ... from` links only
+    return False
+
+
+def is_docker_container_not_running_error(exc: BaseException) -> bool:
+    """True when the exception, or any cause under it, is Docker's 409 refusing an exec on a stopped container."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, Exception) and _is_docker_container_not_running_error(current):
+            return True
+        current = current.__cause__
+    return False
+
+
+def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
+    """Return the host key required by rental Docker SDK SSH connections."""
+    # ExecutorSSHInfo keeps this optional for non-connectable placeholder/error
+    # records; the rental Docker SDK path requires it to build known_hosts.
+    host_key = executor_info.ssh_host_key.strip() if executor_info.ssh_host_key else ""
+    if not host_key:
+        raise RentalDockerConnectionError(
+            "Executor is missing ssh_host_key; rental Docker operations require the executor SSH host public key"
+        )
+    return host_key
+
+
+@dataclass(slots=True)
+class PortBinding:
+    container_port: int
+    host_port: int
+    protocol: str = "tcp"
+
+
+@dataclass(slots=True)
+class VolumeMount:
+    source: str
+    target: str
+    read_only: bool = False
+
+
+@dataclass(slots=True)
+class DeviceMount:
+    path_on_host: str
+    path_in_container: str | None = None
+    permissions: str = "rwm"
+
+
+@dataclass(slots=True)
+class GpuDeviceRequest:
+    count: int | None = None
+    device_ids: tuple[str, ...] = ()
+    capabilities: tuple[tuple[str, ...], ...] = (("gpu",),)
+
+
+@dataclass(slots=True)
+class GpuDockerConfig:
+    device_requests: tuple[GpuDeviceRequest, ...] = ()
+    device_mounts: tuple[DeviceMount, ...] = ()
+
+
+@dataclass(slots=True)
+class ContainerUlimit:
+    name: str
+    soft: int
+    hard: int
+
+
+@dataclass(slots=True)
+class ContainerRunSpec:
+    image: str
+    name: str
+    command: tuple[str, ...] = ()
+    environment: dict[str, str] = field(default_factory=dict)
+    ports: tuple[PortBinding, ...] = ()
+    volumes: tuple[VolumeMount, ...] = ()
+    restart_policy: str | None = "unless-stopped"
+    runtime: str | None = None
+    cap_add: tuple[str, ...] = ()
+    sysctls: dict[str, str] = field(default_factory=dict)
+    ulimits: tuple[ContainerUlimit, ...] = ()
+    devices: tuple[DeviceMount, ...] = ()
+    device_requests: tuple[GpuDeviceRequest, ...] = ()
+    cpu_count: int | None = None
+    memory_gb: int | None = None
+    storage_limit_gb: int | None = None
+    shm_size: str | None = None
+    entrypoint: str | None = None
+    # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
+    network: str | None = None
+
+
+@dataclass(slots=True)
+class ContainerExecSpec:
+    container_name: str
+    argv: tuple[str, ...]
+    stdin: str | bytes | None = None
+    environment: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ContainerExecResult:
+    exit_status: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclass(slots=True)
+class _ContainerExecReadiness:
+    ready: bool
+    terminal: bool
+    detail: str
+    # terminal because the container is gone for good (removing / exited / dead), with the State
+    # read at that moment; a paused container is terminal without being gone
+    gone: bool = False
+    state: ContainerStateSnapshot | None = None
+
+
+# `docker inspect` State.Status values after which the container will not run again by itself.
+_CONTAINER_GONE_STATUSES = frozenset({"removing", "exited", "dead"})
+
+
+# Exit codes a signal from the host leaves (128 + signal): what `docker kill` (SIGKILL), `docker stop`
+# (SIGTERM, or the image's STOPSIGNAL — SIGINT/SIGQUIT/SIGHUP on some images) and the kernel's OOM
+# killer produce. A CMD that itself exits with one of these cannot be told apart from a stop; the
+# classification fails toward "killed by the host" so a renter is never blamed for a kill.
+HOST_KILL_EXIT_CODES: dict[int, str] = {129: "SIGHUP", 130: "SIGINT", 131: "SIGQUIT", 137: "SIGKILL", 143: "SIGTERM"}
+
+
+@dataclass(slots=True)
+class ContainerStateSnapshot:
+    """`docker inspect` State plus RestartCount, read once at a moment of interest."""
+
+    status: str | None
+    running: bool
+    restarting: bool
+    exit_code: int | None
+    restart_count: int
+    error: str | None
+    oom_killed: bool
+
+    @property
+    def killed_by_host(self) -> bool:
+        """The kernel OOM killer or a host signal (HOST_KILL_EXIT_CODES: `docker kill` 137, `docker
+        stop` 143 …) ended it, not the image's own command."""
+        return self.oom_killed or self.exit_code in HOST_KILL_EXIT_CODES
+
+    @property
+    def kill_signal(self) -> str | None:
+        """The signal name the exit code implies (`SIGKILL`, `SIGTERM` …), or None."""
+        return HOST_KILL_EXIT_CODES.get(self.exit_code) if self.exit_code is not None else None
+
+    @property
+    def exited_since_start(self) -> bool:
+        """The container's main process has ended at least once since `docker run`.
+
+        Not running now (exited/dead/removing), mid-restart, or running again after Docker's
+        restart policy brought it back (RestartCount > 0). A `created` container never started,
+        so it is not an exit.
+        """
+        if self.restarting or self.restart_count > 0:
+            return True
+        return not self.running and (self.status or "").lower() != "created"
+
+    def describe(self) -> str:
+        return (
+            f"status={self.status!r} running={self.running!r} restarting={self.restarting!r} "
+            f"exit_code={self.exit_code!r} restart_count={self.restart_count!r} error={self.error!r}"
+        )
+
+
+class RentalDockerSdkClient:
+    def __init__(
+        self,
+        api_client,
+        *,
+        pull_timeout_seconds: int | float | None = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
+    ):
+        self._api_client = api_client
+        self._pull_timeout_seconds = pull_timeout_seconds
+
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        # docker-py stores the credential under docker.io unless the registry
+        # is passed explicitly, so resolve it from the image the pull will use.
+        from docker import auth, utils
+
+        repository, _ = utils.parse_repository_tag(image)
+        registry, _ = auth.resolve_repository_name(repository)
+        registry = None if registry == auth.INDEX_NAME else registry
+        await self._call_api(
+            operation_label="login" if registry is None else f"login for {registry}",
+            api_method=self._api_client.login,
+            username=username,
+            password=password,
+            registry=registry,
+            reauth=True,
+        )
+
+    async def pull(self, *, image: str) -> None:
+        timeout_seconds = self._normalized_pull_timeout_seconds()
+        try:
+            pull_call = _in_docker_thread(self._pull_sync, image)
+            if timeout_seconds is not None:
+                await asyncio.wait_for(
+                    pull_call,
+                    timeout=timeout_seconds,
+                )
+            else:
+                await pull_call
+        except asyncio.TimeoutError as exc:
+            with suppress(Exception):
+                await self.aclose()
+            raise RentalDockerOperationError(
+                f"Docker SDK pull timed out after {timeout_seconds} seconds"
+            ) from exc
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK pull failed", exc)
+            ) from exc
+
+    async def image_exists(self, *, image: str) -> bool:
+        try:
+            await _in_docker_thread(self._api_client.inspect_image, image)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return False
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect image failed", exc)
+            ) from exc
+        return True
+
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        """The local image's RepoDigests (`repo@sha256:…`); None when the image is not on the host."""
+        try:
+            local_image = await _in_docker_thread(self._api_client.inspect_image, image)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect image failed", exc)
+            ) from exc
+        return tuple(local_image.get("RepoDigests") or ())
+
+    async def local_image_is_current(
+        self, *, image: str, auth_config: dict[str, str] | None = None
+    ) -> bool:
+        """True when the local image has the digest that the registry has now for this tag."""
+        if "@sha256:" in image:
+            return True  # a digest reference cannot move
+        try:
+            local_image = await _in_docker_thread(self._api_client.inspect_image, image)
+            distribution = await asyncio.wait_for(
+                _in_docker_thread(
+                    self._api_client.inspect_distribution, image, auth_config=auth_config
+                ),
+                timeout=_REGISTRY_DIGEST_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK registry digest check failed", exc)
+            ) from exc
+        remote_digest = distribution["Descriptor"]["digest"]
+        return any(
+            repo_digest.endswith(f"@{remote_digest}")
+            for repo_digest in local_image.get("RepoDigests") or ()
+        )
+
+    async def run_container(self, spec: ContainerRunSpec) -> str | None:
+        """Creates and starts the container; returns its ID (None if Docker gave none)."""
+        try:
+            return await _in_docker_thread(self._run_container_sync, spec)
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK run container failed", exc)
+            ) from exc
+
+    async def exec_in_container(self, spec: ContainerExecSpec) -> ContainerExecResult:
+        last_restart_error: Exception | None = None
+        for attempt in range(len(_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS) + 1):
+            retry_result: ContainerExecResult | None = None
+            # A container can pass start/running checks while still moving through
+            # transient restart/runtime states where exec is rejected or runc cannot
+            # enter its namespaces/cgroups. Inspect first, then keep a narrow retry
+            # for the remaining inspect-vs-exec race.
+            await self._wait_for_container_exec_ready(spec.container_name)
+            try:
+                result = await _in_docker_thread(self._exec_in_container_sync, spec)
+            except Exception as exc:
+                if not _is_docker_container_restarting_error(exc):
+                    message = _wrap_error_message("Docker SDK exec failed", exc)
+                    if _is_docker_container_not_running_error(exc) or _is_docker_not_found_error(exc):
+                        # The container left (409 "is not running") or was removed (404) between
+                        # the readiness inspect and the exec: read its State now, while `inspect`
+                        # may still answer.
+                        await self._raise_if_container_gone(spec.container_name, message)
+                    raise RentalDockerOperationError(message) from exc
+                last_restart_error = exc
+                retry_reason = "container_restarting"
+                retry_error = str(exc)
+            else:
+                if not _is_transient_oci_exec_result(result):
+                    return result
+                retry_result = result
+                retry_reason = "oci_runtime_exec_transient"
+                retry_error = _format_exec_result_failure(result)
+
+            delay_seconds = _retry_delay_for_exec_attempt(attempt)
+            if delay_seconds is None:
+                # Nonzero exec results keep the existing caller behavior after
+                # retry budget is exhausted. Exception-based failures have no
+                # result, so preserve the original Docker daemon detail below.
+                if retry_result is not None:
+                    return retry_result
+                break
+
+            _log_transient_exec_retry(
+                spec=spec,
+                retry_reason=retry_reason,
+                retry_error=retry_error,
+                attempt=attempt + 1,
+                delay_seconds=delay_seconds,
+            )
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+        assert last_restart_error is not None
+        # DAH-3593: the 409 text hides the cause, so the container's state leads. Docker's own text
+        # stays in the message: the backend recognises a renter image that exits at start by its
+        # `is restarting` (IMAGE_EXITED_MARKERS) and must not blame the provider for it.
+        detail = await _in_docker_thread(
+            self._describe_restarting_container_sync, spec.container_name
+        )
+        raise RentalDockerContainerRestartingError(
+            f"container restarting, {detail}; "
+            f"{_wrap_error_message('Docker SDK exec failed', last_restart_error)}"
+        ) from last_restart_error
+
+    def _describe_restarting_container_sync(self, container_name: str) -> str:
+        """`exit_code=N` for a container Docker keeps restarting; best effort. Only the daemon's
+        exit code, never the container's log output: the message reaches the backend's failure
+        detail, which the GPU-fault check reads."""
+        try:
+            state = self._api_client.inspect_container(container_name).get("State") or {}
+            exit_code = state.get("ExitCode")
+        except Exception:
+            exit_code = None
+        return f"exit_code={exit_code}"
+
+    async def start(self, *, container_name: str) -> None:
+        await self._call_api(
+            container_name,
+            operation_label="start",
+            api_method=self._api_client.start,
+        )
+
+    async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
+        # stop_grace_seconds is the SIGTERM grace window: dockerd waits this many seconds for
+        # the container to exit before escalating to SIGKILL (docker stop -t semantics). Named
+        # distinctly because `timeout` on this class means the HTTP client timeout (create_volume).
+        await self._call_api(
+            container_name,
+            operation_label="stop",
+            api_method=self._api_client.stop,
+            timeout=stop_grace_seconds,
+        )
+
+    async def remove_container(
+        self,
+        *,
+        container_name: str,
+        force: bool = True,
+        remove_volumes: bool = True,
+    ) -> None:
+        await self._call_api(
+            container_name,
+            operation_label="remove container",
+            api_method=self._api_client.remove_container,
+            force=force,
+            v=remove_volumes,
+        )
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        try:
+            return await _in_docker_thread(self._inspect_container_state_sync, container_name)
+        except RentalDockerOperationError:
+            raise
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+
+    async def container_status(self, *, container_name: str) -> str | None:
+        """Return the container's ``State.Status`` (``running``, ``exited``, ``removing``, …), or
+        None when dockerd no longer knows the name (404)."""
+        try:
+            inspect_result = await _in_docker_thread(
+                self._api_client.inspect_container, container_name
+            )
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+        state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
+        status = state.get("Status") if isinstance(state, dict) else None
+        return str(status).lower() if status else ""
+
+    async def mount_source_for_destination(
+        self,
+        *,
+        container_name: str,
+        destination: str,
+    ) -> str | None:
+        try:
+            return await _in_docker_thread(
+                self._mount_source_for_destination_sync,
+                container_name,
+                destination,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+
+    async def create_volume(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None = None,
+        driver_opts: dict[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> None:
+        try:
+            await _in_docker_thread(
+                self._create_volume_sync,
+                volume_name=volume_name,
+                driver=driver,
+                driver_opts=driver_opts,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK create volume failed", exc)
+            ) from exc
+
+    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+        await self._call_api(
+            volume_name,
+            operation_label="remove volume",
+            api_method=self._api_client.remove_volume,
+            force=force,
+        )
+
+    async def prune_images(self) -> None:
+        await self._call_api(
+            operation_label="prune images",
+            api_method=self._api_client.prune_images,
+        )
+
+    async def aclose(self) -> None:
+        close = getattr(self._api_client, "close", None)
+        if close is not None:
+            await _in_docker_thread(close)
+
+    async def _call_api(self, *args, operation_label: str, api_method, **kwargs) -> None:
+        try:
+            await _in_docker_thread(api_method, *args, **kwargs)
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message(f"Docker SDK {operation_label} failed", exc)
+            ) from exc
+
+    async def _wait_for_container_exec_ready(
+        self,
+        container_name: str,
+        *,
+        timeout_seconds: int | float | None = None,
+    ) -> None:
+        if timeout_seconds is None:
+            timeout_seconds = _DOCKER_EXEC_READY_TIMEOUT_SECONDS
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            readiness = await _in_docker_thread(
+                self._inspect_container_exec_readiness,
+                container_name,
+            )
+            if readiness.ready:
+                return
+            if readiness.terminal:
+                message = f"Docker container is not ready for exec: {readiness.detail}"
+                if readiness.gone:
+                    raise ContainerGoneBeforeExec(
+                        message, container_name=container_name, state=readiness.state
+                    )
+                raise RentalDockerOperationError(message)
+
+            remaining_seconds = deadline - loop.time()
+            if remaining_seconds <= 0:
+                raise RentalDockerOperationError(
+                    "Docker container did not become ready for exec "
+                    f"after {timeout_seconds} seconds: {readiness.detail}"
+                )
+
+            await asyncio.sleep(
+                min(_DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS, remaining_seconds)
+            )
+
+    async def _raise_if_container_gone(self, container_name: str, message: str) -> None:
+        """After an exec was refused with "is not running": raise ContainerGoneBeforeExec carrying
+        the State read now if the container has left for good; return when it is merely paused,
+        restarting, or the inspect itself failed (the caller raises its own error then)."""
+        try:
+            readiness = await _in_docker_thread(self._inspect_container_exec_readiness, container_name)
+        except ContainerGoneBeforeExec as gone:
+            raise ContainerGoneBeforeExec(
+                f"{message}; {gone}",
+                container_name=container_name,
+                state=None,
+                kill_detail=f"Docker refused the exec; {gone}",
+            ) from gone
+        except Exception:  # noqa: BLE001 — the exec error is the one to report
+            return
+        if readiness.gone:
+            state_after = f"container state after the refused exec: {readiness.detail}"
+            raise ContainerGoneBeforeExec(
+                f"{message}; {state_after}",
+                container_name=container_name,
+                state=readiness.state,
+                kill_detail=f"Docker refused the exec; {state_after}",
+            )
+
+    def _inspect_container_exec_readiness(
+        self,
+        container_name: str,
+    ) -> _ContainerExecReadiness:
+        inspect_container = getattr(self._api_client, "inspect_container", None)
+        if inspect_container is None:
+            raise RentalDockerOperationError(
+                "Docker SDK inspect container is unavailable"
+            )
+
+        try:
+            inspect_result = inspect_container(container_name)
+        except Exception as exc:
+            message = _wrap_error_message("Docker SDK inspect container failed", exc)
+            if _is_docker_not_found_error(exc):
+                # Already removed: nothing left to read, and no exec to attempt.
+                raise ContainerGoneBeforeExec(message, container_name=container_name, state=None) from exc
+            raise RentalDockerOperationError(message) from exc
+
+        state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
+        if not isinstance(state, dict):
+            return _ContainerExecReadiness(
+                ready=False,
+                terminal=False,
+                detail="Docker inspect did not include container State",
+            )
+
+        running = bool(state.get("Running"))
+        restarting = bool(state.get("Restarting"))
+        paused = bool(state.get("Paused"))
+        dead = bool(state.get("Dead"))
+        status = str(state.get("Status") or "").lower()
+        gone = dead or status in _CONTAINER_GONE_STATUSES
+        ready = running and not restarting and not paused and not gone
+        terminal = gone or paused or (not running and not restarting and status != "created")
+        return _ContainerExecReadiness(
+            ready=ready,
+            terminal=terminal,
+            detail=_format_container_state_detail(state),
+            gone=gone,
+            state=_state_snapshot(inspect_result, state) if gone else None,
+        )
+
+    def _inspect_container_state_sync(self, container_name: str) -> ContainerStateSnapshot:
+        info = self._api_client.inspect_container(container_name)
+        state = info.get("State") if isinstance(info, dict) else None
+        if not isinstance(state, dict):
+            raise RentalDockerOperationError("Docker inspect did not include container State")
+        return _state_snapshot(info, state)
+
+    def _mount_source_for_destination_sync(
+        self, container_name: str, destination: str
+    ) -> str | None:
+        info = self._api_client.inspect_container(container_name)
+        for mount in info.get("Mounts", []) or ():
+            if mount.get("Destination") == destination:
+                return mount.get("Name") or mount.get("Source") or None
+        return None
+
+    def _run_container_sync(self, spec: ContainerRunSpec) -> str | None:
+        if spec.network:
+            self._ensure_rental_network_sync(spec.network)
+        host_config = self._api_client.create_host_config(
+            **_build_host_config_kwargs(spec)
+        )
+        created = self._api_client.create_container(
+            image=spec.image,
+            command=list(spec.command) or None,
+            detach=True,
+            ports=_container_ports(spec.ports) or None,
+            environment=spec.environment or None,
+            volumes=_container_volumes(spec.volumes) or None,
+            name=spec.name,
+            entrypoint=spec.entrypoint or None,
+            host_config=host_config,
+        )
+        self._api_client.start(spec.name)
+        container_id = created.get("Id") if isinstance(created, dict) else None
+        return container_id if isinstance(container_id, str) and container_id else None
+
+    def _ensure_rental_network_sync(self, name: str) -> None:
+        """The container's network exists on the host and has inter-container traffic off.
+
+        Runs before every rental `create_container`, so the isolation holds on a host that has never
+        seen a rental, on one whose network was removed by hand, and for two creates racing on the
+        same host (the loser's `create_network` conflicts and the network is inspected again). A
+        network of that name whose options do not turn ICC off is refused rather than used: running
+        the pod on it would silently restore the docker0 behaviour this network exists to end.
+        """
+        network = self._inspect_network_or_none(name)
+        if network is None:
+            try:
+                self._api_client.create_network(
+                    name,
+                    driver="bridge",
+                    options=dict(RENTAL_NETWORK_OPTIONS),
+                    labels=dict(RENTAL_NETWORK_LABELS),
+                )
+            except Exception as exc:
+                network = self._inspect_network_or_none(name)
+                if network is None:
+                    raise RentalDockerOperationError(
+                        _wrap_error_message(f"Docker SDK create network {name} failed", exc)
+                    ) from exc
+            else:
+                network = self._inspect_network_or_none(name)
+                if network is None:
+                    raise RentalDockerOperationError(
+                        f"Docker network {name} was created but cannot be inspected"
+                    )
+        _require_icc_off(name, network)
+
+    def _inspect_network_or_none(self, name: str) -> dict | None:
+        try:
+            return self._api_client.inspect_network(name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise
+
+    def _create_volume_sync(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None,
+        driver_opts: dict[str, str] | None,
+        timeout: int | None,
+    ) -> None:
+        original_timeout = getattr(self._api_client, "timeout", None)
+        should_override_timeout = timeout is not None and hasattr(
+            self._api_client,
+            "timeout",
+        )
+        if should_override_timeout:
+            self._api_client.timeout = None if timeout == 0 else timeout
+        try:
+            self._api_client.create_volume(
+                name=volume_name,
+                driver=driver,
+                driver_opts=driver_opts,
+            )
+        finally:
+            if should_override_timeout:
+                self._api_client.timeout = original_timeout
+
+    def _pull_sync(self, image: str) -> None:
+        # docker.APIClient.pull() hardcodes timeout=None for /images/create.
+        # Call the same endpoint directly so rental image pulls keep the
+        # create_container timeout cap instead of waiting forever.
+        from docker import auth, utils
+
+        repository, image_tag = utils.parse_repository_tag(image)
+        tag = image_tag or "latest"
+        registry, _ = auth.resolve_repository_name(repository)
+        response = self._api_client._post(
+            self._api_client._url("/images/create"),
+            params={"tag": tag, "fromImage": repository},
+            headers=_build_pull_headers(self._api_client, registry),
+            stream=True,
+            timeout=self._normalized_pull_timeout_seconds(),
+        )
+        self._api_client._raise_for_status(response)
+
+        for event in self._api_client._stream_helper(response, decode=True) or ():
+            _raise_pull_event_error(event)
+
+    def _normalized_pull_timeout_seconds(self) -> int | float | None:
+        if self._pull_timeout_seconds is None or self._pull_timeout_seconds <= 0:
+            return None
+        return self._pull_timeout_seconds
+
+    def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
+        stdin_data = _encode_exec_stdin(spec.stdin)
+        # Every spec routed here is rental bootstrap writing to /root or /etc, so
+        # it must not inherit a non-root image USER (DAH-2534). Numeric uid, so no
+        # root entry in the image's /etc/passwd is required. The renter's own
+        # workload still runs as the image's USER — only these execs are pinned.
+        exec_create_result = self._api_client.exec_create(
+            container=spec.container_name,
+            cmd=list(spec.argv),
+            stdin=stdin_data is not None,
+            environment=spec.environment or None,
+            user="0",
+        )
+        exec_id = exec_create_result["Id"]
+
+        if stdin_data is None:
+            output = self._api_client.exec_start(exec_id, demux=True)
+        else:
+            exec_socket = self._api_client.exec_start(exec_id, socket=True)
+            output = _write_stdin_and_read_exec_output(exec_socket, stdin_data)
+
+        inspect_result = self._api_client.exec_inspect(exec_id)
+        stdout, stderr = _decode_exec_output(output)
+        return ContainerExecResult(
+            exit_status=int(inspect_result.get("ExitCode") or 0),
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+@dataclass(slots=True)
+class RentalDockerSdkClientFactory:
+    api_client_factory: Callable[..., object] | None = None
+    timeout: int = 60
+    pull_timeout_seconds: int = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
+
+    @asynccontextmanager
+    async def connect(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+    ) -> AsyncIterator[RentalDockerSdkClient]:
+        host_key = require_rental_docker_ssh_host_key(executor_info)
+
+        with tempfile.TemporaryDirectory(prefix="lium-rental-docker-ssh-") as temp_dir:
+            ssh_home = Path(temp_dir)
+            ssh_dir = ssh_home / ".ssh"
+            ssh_dir.mkdir(mode=0o700)
+
+            key_path = ssh_dir / "id_executor"
+            key_path.write_text(private_key)
+            key_path.chmod(0o600)
+
+            known_hosts_path = ssh_dir / "known_hosts"
+            known_hosts_path.write_text(
+                _build_known_hosts_text(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    host_key=host_key,
+                )
+            )
+            known_hosts_path.chmod(0o600)
+            _validate_paramiko_known_hosts(known_hosts_path)
+
+            try:
+                api_client = await _in_docker_thread(
+                    self._create_api_client,
+                    _build_docker_ssh_base_url(executor_info),
+                    key_path,
+                    known_hosts_path,
+                )
+            except Exception as exc:
+                raise RentalDockerConnectionError(
+                    _wrap_error_message("Docker SDK client construction failed", exc)
+                ) from exc
+
+            client = RentalDockerSdkClient(
+                api_client,
+                pull_timeout_seconds=self.pull_timeout_seconds,
+            )
+            try:
+                yield client
+            finally:
+                await client.aclose()
+
+    def _create_api_client(
+        self,
+        base_url: str,
+        key_path: Path,
+        known_hosts_path: Path,
+    ):
+        with _DOCKER_SDK_SSH_ADAPTER_LOCK:
+            if self.api_client_factory is not None:
+                return self.api_client_factory(
+                    base_url=base_url,
+                    timeout=self.timeout,
+                    use_ssh_client=False,
+                )
+
+            return _default_docker_api_client_factory(
+                base_url=base_url,
+                timeout=self.timeout,
+                use_ssh_client=False,
+                key_path=key_path,
+                known_hosts_path=known_hosts_path,
+            )
+
+
+def build_container_command_argv(startup_commands: str | None) -> tuple[str, ...]:
+    if not startup_commands or not startup_commands.strip():
+        return ()
+    import shlex
+
+    try:
+        return tuple(shlex.split(startup_commands))
+    except ValueError:
+        return ()
+
+
+def build_gpu_docker_config(
+    gpu_uuids: tuple[str, ...] | list[str] | None,
+    *,
+    device_nodes: tuple[str, ...] | list[str] = (),
+) -> GpuDockerConfig:
+    requested_uuids = tuple(gpu_uuids or ())
+    device_request = (
+        GpuDeviceRequest(device_ids=requested_uuids)
+        if requested_uuids
+        else GpuDeviceRequest(count=-1)
+    )
+    return GpuDockerConfig(
+        device_requests=(device_request,),
+        device_mounts=tuple(
+            DeviceMount(path_on_host=node, path_in_container=node)
+            for node in device_nodes
+        ),
+    )
+
+
+def build_authorized_keys_exec_spec(
+    *,
+    container_name: str,
+    public_keys: list[str] | tuple[str, ...],
+    target_path: str = "/root/.ssh/authorized_keys",
+) -> ContainerExecSpec:
+    import shlex
+
+    key_data = "".join(f"{public_key}\n" for public_key in public_keys)
+    # chmod up front: key injection now runs before the sshd bootstrap's own
+    # `chmod 700` (DAH-2341), and sshd may come up in between.
+    quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=(
+            "sh",
+            "-c",
+            f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} "
+            f"&& cat >> {shlex.quote(target_path)}",
+        ),
+        stdin=key_data,
+    )
+
+
+def build_remove_authorized_keys_exec_spec(
+    *,
+    container_name: str,
+    public_keys: list[str] | tuple[str, ...],
+    target_path: str = "/root/.ssh/authorized_keys",
+) -> ContainerExecSpec:
+    import shlex
+
+    key_data = "".join(f"{public_key}\n" for public_key in public_keys)
+    quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
+    quoted_path = shlex.quote(target_path)
+    # This shell runs inside the target container. Public keys are supplied via
+    # stdin and matched from a temp file, so key contents are never interpolated
+    # into host-side Docker shell text or into this argv.
+    script = (
+        "set -e; "
+        f"mkdir -p {quoted_dir} && "
+        f"touch {quoted_path} && "
+        "keys=$(mktemp) && filtered=$(mktemp) && "
+        "trap 'rm -f \"$keys\" \"$filtered\"' EXIT && "
+        "cat > \"$keys\" && "
+        f"if grep -vxF -f \"$keys\" {quoted_path} > \"$filtered\"; then "
+        ":; else status=$?; "
+        "[ \"$status\" -eq 1 ] || exit \"$status\"; fi; "
+        f"cat \"$filtered\" > {quoted_path}"
+    )
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=("sh", "-c", script),
+        stdin=key_data,
+    )
+
+
+def build_environment_exec_spec(
+    *,
+    container_name: str,
+    environment: dict[str, str] | None,
+) -> ContainerExecSpec | None:
+    env_lines = [
+        f"{key}={value}"
+        for key, value in (environment or {}).items()
+        if key and value and key.strip() and str(value).strip()
+    ]
+    if not env_lines:
+        return None
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=("sh", "-c", "cat >> /etc/environment"),
+        stdin="".join(f"{line}\n" for line in env_lines),
+    )
+
+
+def _default_docker_api_client_factory(**kwargs):
+    import docker
+
+    key_path = kwargs.pop("key_path", None)
+    known_hosts_path = kwargs.pop("known_hosts_path", None)
+    if key_path is not None and known_hosts_path is not None:
+        return _create_docker_api_client_with_rental_ssh_adapter(
+            docker_module=docker,
+            key_path=key_path,
+            known_hosts_path=known_hosts_path,
+            **kwargs,
+        )
+
+    return docker.APIClient(**kwargs)
+
+
+def _create_docker_api_client_with_rental_ssh_adapter(
+    *,
+    docker_module,
+    key_path: Path,
+    known_hosts_path: Path,
+    **kwargs,
+):
+    import docker.api.client as docker_api_client
+
+    # docker-py normally discovers SSH identity/known_hosts via ~/.ssh. Patch
+    # its adapter only during construction so this rental client uses our
+    # operation-scoped files without mutating process-global HOME.
+    original_adapter = docker_api_client.SSHHTTPAdapter
+    docker_api_client.SSHHTTPAdapter = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    try:
+        return docker_module.APIClient(**kwargs)
+    finally:
+        docker_api_client.SSHHTTPAdapter = original_adapter
+
+
+# The Docker SDK SSH session idles through a long build, so it needs a keepalive.
+RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+
+
+def _build_rental_ssh_http_adapter_class(
+    *,
+    key_path: Path,
+    known_hosts_path: Path,
+):
+    from docker.transport.sshconn import SSHHTTPAdapter
+
+    class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _connect(self) -> None:
+            super()._connect()
+            transport = self.ssh_client.get_transport() if self.ssh_client else None
+            if transport is not None:
+                transport.set_keepalive(RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC)
+
+        def _create_paramiko_client(self, base_url):
+            import logging
+            import urllib.parse
+
+            import paramiko
+
+            logging.getLogger("paramiko").setLevel(logging.WARNING)
+            parsed_base_url = urllib.parse.urlparse(base_url)
+            self.ssh_client = paramiko.SSHClient()
+            self.ssh_params = {
+                "hostname": parsed_base_url.hostname,
+                "port": parsed_base_url.port,
+                "username": parsed_base_url.username,
+                "key_filename": str(key_path),
+                "look_for_keys": False,
+                "allow_agent": False,
+            }
+            self.ssh_client.load_host_keys(str(known_hosts_path))
+            self.ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    RentalSSHHTTPAdapter.__name__ = "RentalSSHHTTPAdapter"
+    return RentalSSHHTTPAdapter
+
+
+def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
+    kwargs = {
+        "port_bindings": _port_bindings(spec.ports),
+        "binds": _binds(spec.volumes),
+        "restart_policy": _restart_policy(spec.restart_policy),
+        "runtime": spec.runtime,
+        "cap_add": list(spec.cap_add) or None,
+        "sysctls": spec.sysctls or None,
+        "ulimits": _ulimits(spec.ulimits),
+        "devices": _devices(spec.devices),
+        "device_requests": _device_requests(spec.device_requests),
+        "nano_cpus": spec.cpu_count * 1_000_000_000 if spec.cpu_count else None,
+        "mem_limit": f"{spec.memory_gb}g" if spec.memory_gb else None,
+        "storage_opt": (
+            {"size": f"{spec.storage_limit_gb}g"}
+            if spec.storage_limit_gb
+            else None
+        ),
+        "shm_size": spec.shm_size,
+        "network_mode": spec.network,
+    }
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _require_icc_off(name: str, network: dict) -> None:
+    options = network.get("Options") or {}
+    if network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false":
+        return
+    raise RentalDockerOperationError(
+        f"Docker network {name} exists on the executor but is not a bridge with "
+        f"{RENTAL_NETWORK_ICC_OPTION}=false (driver={network.get('Driver')!r}, options={options!r}); "
+        "refusing to run the rental on it. Remove the network once it is empty so the validator "
+        "recreates it with inter-container traffic off."
+    )
+
+
+def _ulimits(ulimits: tuple[ContainerUlimit, ...]) -> list | None:
+    if not ulimits:
+        return None
+    from docker.types import Ulimit
+
+    return [Ulimit(name=ulimit.name, soft=ulimit.soft, hard=ulimit.hard) for ulimit in ulimits]
+
+
+def _container_ports(ports: tuple[PortBinding, ...]) -> list[tuple[int, str]]:
+    return [(port.container_port, port.protocol) for port in ports]
+
+
+def _port_bindings(ports: tuple[PortBinding, ...]) -> dict[str, int]:
+    return {_port_key(port): port.host_port for port in ports}
+
+
+def _port_key(port: PortBinding) -> str:
+    return f"{port.container_port}/{port.protocol}"
+
+
+def _container_volumes(volumes: tuple[VolumeMount, ...]) -> list[str]:
+    return [volume.target for volume in volumes]
+
+
+def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
+    return [
+        f"{volume.source}:{volume.target}:{'ro' if volume.read_only else 'rw'}"
+        for volume in volumes
+    ]
+
+
+def _restart_policy(policy: str | None) -> dict[str, str] | None:
+    if not policy:
+        return None
+    return {"Name": policy}
+
+
+def _devices(devices: tuple[DeviceMount, ...]) -> list[str]:
+    return [_device_arg(device) for device in devices]
+
+
+def _device_arg(device: DeviceMount) -> str:
+    target = device.path_in_container or device.path_on_host
+    return f"{device.path_on_host}:{target}:{device.permissions}"
+
+
+def _device_requests(device_requests: tuple[GpuDeviceRequest, ...]) -> list:
+    if not device_requests:
+        return []
+
+    from docker.types import DeviceRequest
+
+    return [
+        DeviceRequest(
+            count=device_request.count,
+            device_ids=list(device_request.device_ids) or None,
+            capabilities=[list(capability) for capability in device_request.capabilities],
+        )
+        for device_request in device_requests
+    ]
+
+
+def _encode_exec_stdin(value: str | bytes | None) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    return value.encode()
+
+
+def _write_stdin_and_read_exec_output(exec_socket, stdin_data: bytes):
+    try:
+        _write_socket_data(exec_socket, stdin_data)
+        _shutdown_socket_write(exec_socket)
+        return _read_exec_socket_output(exec_socket)
+    finally:
+        close = getattr(exec_socket, "close", None)
+        if close is not None:
+            close()
+
+
+def _write_socket_data(exec_socket, data: bytes) -> None:
+    if not data:
+        return
+
+    write_socket = _socket_write_target(exec_socket)
+    sendall = getattr(write_socket, "sendall", None)
+    if sendall is not None:
+        sendall(data)
+        return
+
+    write = getattr(write_socket, "write", None)
+    if write is not None:
+        write(data)
+        flush = getattr(write_socket, "flush", None)
+        if flush is not None:
+            flush()
+        return
+
+    send = getattr(write_socket, "send", None)
+    if send is None:
+        raise TypeError("Docker SDK exec socket does not support stdin writes")
+
+    sent = 0
+    while sent < len(data):
+        bytes_sent = send(data[sent:])
+        if bytes_sent == 0:
+            raise RuntimeError("Docker SDK exec socket write failed")
+        sent += bytes_sent
+
+
+def _shutdown_socket_write(exec_socket) -> None:
+    write_socket = _socket_write_target(exec_socket)
+
+    shutdown_write = getattr(write_socket, "shutdown_write", None)
+    if shutdown_write is not None:
+        shutdown_write()
+        return
+
+    shutdown = getattr(write_socket, "shutdown", None)
+    if shutdown is not None:
+        shutdown(socket_module.SHUT_WR)
+
+
+def _socket_write_target(exec_socket):
+    return getattr(exec_socket, "_sock", exec_socket)
+
+
+def _read_exec_socket_output(exec_socket):
+    from docker.utils.socket import consume_socket_output, demux_adaptor, frames_iter
+
+    demuxed_frames = (
+        demux_adaptor(stream, frame)
+        for stream, frame in frames_iter(exec_socket, tty=False)
+    )
+    return consume_socket_output(demuxed_frames, demux=True)
+
+
+def _decode_exec_output(output) -> tuple[str, str]:
+    if isinstance(output, tuple):
+        stdout, stderr = output
+    else:
+        stdout, stderr = output, b""
+    return _decode_output_part(stdout), _decode_output_part(stderr)
+
+
+def _decode_output_part(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _build_pull_headers(api_client, registry: str) -> dict[str, str]:
+    auth_configs = getattr(api_client, "_auth_configs", None)
+    if not auth_configs or getattr(auth_configs, "is_empty", True):
+        return {}
+
+    from docker import auth
+
+    header = auth.get_config_header(api_client, registry)
+    return {"X-Registry-Auth": header} if header else {}
+
+
+def _raise_pull_event_error(event) -> None:
+    if not isinstance(event, dict):
+        return
+
+    message = event.get("error")
+    error_detail = event.get("errorDetail")
+    if not message and isinstance(error_detail, dict):
+        message = error_detail.get("message")
+    if not message:
+        return
+
+    from docker.errors import APIError
+
+    raise APIError("Docker image pull failed", explanation=str(message))
+
+
+def _is_docker_not_found_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ in {"ImageNotFound", "NotFound"}:
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 404
+
+
+def _is_docker_container_restarting_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    message = str(exc).lower()
+    is_restart_conflict = (
+        "is restarting" in message
+        and "wait until the container is running" in message
+    )
+    if status_code is not None:
+        return status_code == 409 and is_restart_conflict
+    return "409" in message and "conflict" in message and is_restart_conflict
+
+
+def _is_docker_container_not_running_error(exc: Exception) -> bool:
+    """Docker's 409 for an exec on a container that has stopped: `Container <id> is not running`
+    (exec create) or `container is not running` (exec start); a restarting one is the other 409."""
+    if _is_docker_container_restarting_error(exc):
+        return False
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    message = str(exc).lower()
+    is_not_running = "is not running" in message
+    if status_code is not None:
+        return status_code == 409 and is_not_running
+    return "409" in message and "conflict" in message and is_not_running
+
+
+def _is_transient_oci_exec_result(result: ContainerExecResult) -> bool:
+    if result.exit_status == 0:
+        return False
+
+    message = f"{result.stdout}\n{result.stderr}".lower()
+    if "oci runtime exec failed" not in message:
+        return False
+
+    return any(
+        transient_marker in message
+        for transient_marker in (
+            "executing setns process caused",
+            "cgroup.procs",
+            "init.scope (deleted)",
+        )
+    )
+
+
+def _format_exec_result_failure(result: ContainerExecResult) -> str:
+    return (
+        f"exit_status={result.exit_status}; "
+        f"stderr={result.stderr}; stdout={result.stdout}"
+    )
+
+
+def _state_snapshot(info: dict, state: dict) -> ContainerStateSnapshot:
+    exit_code = state.get("ExitCode")
+    restart_count = info.get("RestartCount")
+    return ContainerStateSnapshot(
+        status=state.get("Status"),
+        running=bool(state.get("Running")),
+        restarting=bool(state.get("Restarting")),
+        exit_code=int(exit_code) if isinstance(exit_code, int) else None,
+        restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
+        error=state.get("Error") or None,
+        oom_killed=bool(state.get("OOMKilled")),
+    )
+
+
+def _format_container_state_detail(state: dict) -> str:
+    fields = {
+        "status": state.get("Status"),
+        "running": state.get("Running"),
+        "restarting": state.get("Restarting"),
+        "paused": state.get("Paused"),
+        "dead": state.get("Dead"),
+        "exit_code": state.get("ExitCode"),
+        "error": state.get("Error"),
+    }
+    return " ".join(f"{key}={value!r}" for key, value in fields.items())
+
+
+def _retry_delay_for_exec_attempt(attempt: int) -> int | float | None:
+    if attempt >= len(_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS):
+        return None
+    return _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS[attempt]
+
+
+def _log_transient_exec_retry(
+    *,
+    spec: ContainerExecSpec,
+    retry_reason: str,
+    retry_error: str,
+    attempt: int,
+    delay_seconds: int | float,
+) -> None:
+    logger.warning(
+        _m(
+            "Docker SDK exec hit transient container state; retrying",
+            extra=get_extra_info(
+                {
+                    "container_name": spec.container_name,
+                    "attempt": attempt,
+                    "retry_delay_seconds": delay_seconds,
+                    "retry_reason": retry_reason,
+                    "error": retry_error,
+                }
+            ),
+        )
+    )
+
+
+def _build_docker_ssh_base_url(executor_info: ExecutorSSHInfo) -> str:
+    return f"ssh://{executor_info.ssh_username}@{executor_info.address}:{executor_info.ssh_port}"
+
+
+def _build_known_hosts_text(*, host: str, port: int, host_key: str) -> str:
+    key = host_key.strip()
+    entries = [f"{host} {key}"]
+    if port != 22:
+        entries.append(f"[{host}]:{port} {key}")
+    return "\n".join(entries) + "\n"
+
+
+def _validate_paramiko_known_hosts(known_hosts_path: Path) -> None:
+    try:
+        import paramiko
+
+        host_keys = paramiko.HostKeys(str(known_hosts_path))
+        if not host_keys:
+            raise ValueError("no usable host keys loaded")
+    except Exception as exc:
+        raise RentalDockerConnectionError(
+            _wrap_error_message(
+                "Executor SSH host key is not usable by Docker SDK SSH",
+                exc,
+            )
+        ) from exc
+
+
+def _wrap_error_message(message: str, exc: Exception) -> str:
+    detail = str(exc) or exc.__class__.__name__
+    return f"{message}: {detail}"

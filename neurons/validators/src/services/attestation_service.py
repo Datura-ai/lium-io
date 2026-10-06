@@ -1,22 +1,85 @@
+import base64
+import binascii
 import hashlib
+import json
 import logging
-from datetime import datetime
-from typing import Optional, Tuple
+import secrets
+import time
+from dataclasses import dataclass, field
+from typing import Annotated, Any
 
 import aiohttp
 import asyncssh
-from services.const import TDX_WHITELIST
-
 from datura.requests.miner_requests import ExecutorSSHInfo
+from fastapi import Depends
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import TDX_WHITELIST
+from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
+
+# Redis set of executor UUIDs that have ever presented a valid TDX quote.
+# Minimal-G5 ratchet: once an executor is known-CVM, an omitted quote is treated
+# as a bypass attempt (fail-closed under ENABLE_TCB_ENFORCEMENT), not as a
+# bare-metal node.
+TDX_ATTESTED_EXECUTOR_SET = "tdx_attested_executors"
+
+# Redis key prefix recording the last nonce-bound attestation event per miner,
+# used to bound re-attestation cadence (G3: freshness = provably recent, not
+# every wave).
+TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
 
 
 class AttestationError(RuntimeError):
     """Raised when attestation or host verification fails."""
+
+
+@dataclass
+class AttestationNonce:
+    """Validator-minted challenge binding one attestation event (G3 + G1).
+
+    The hex value rides inside the signed SSHPubKeySubmitRequest, is folded by
+    the executor into TDX report_data[32:64] and into the NVIDIA GPU-evidence
+    nonce, and is asserted on the way back. One nonce is minted per attestation
+    event (a validation request to one miner) and fans out to that miner's
+    executors; per-executor uniqueness comes from the identity half of
+    report_data, freshness from the nonce half.
+    """
+
+    value_hex: str
+    issued_at: float = field(default_factory=time.time)
+
+    @classmethod
+    def issue(cls) -> "AttestationNonce":
+        return cls(value_hex=secrets.token_hex(32))
+
+    @property
+    def value_bytes(self) -> bytes:
+        return bytes.fromhex(self.value_hex)
+
+    def is_expired(self, ttl_seconds: int) -> bool:
+        return (time.time() - self.issued_at) > ttl_seconds
+
+
+@dataclass
+class HostPolicyResult:
+    """Outcome of prepare_host_policy.
+
+    attestation_passed enforces the G1 invariant: it requires the TDX digest AND
+    that GPU verification did not fail (a verified-bad GPU can never surface as
+    passed; None = GPU verification not performed).
+    """
+
+    known_hosts: asyncssh.SSHKnownHosts | None = None
+    attestation_digest: str | None = None
+    tee_type: str | None = None
+    gpu_attestation_passed: bool | None = None
+
+    @property
+    def attestation_passed(self) -> bool:
+        return self.attestation_digest is not None and self.gpu_attestation_passed is not False
 
 
 class AttestationService:
@@ -30,14 +93,59 @@ class AttestationService:
 
     REPORT_PREFIX = b"SSH_HOST_KEY:"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        redis_service: Annotated[RedisService | None, Depends(RedisService)] = None,
+    ) -> None:
         self.enabled: bool = bool(
             settings.ENABLE_TDX_ATTESTATION and settings.TDX_VERIFIER_URL)
-        self.verifier_url: Optional[str] = settings.TDX_VERIFIER_URL
+        self.verifier_url: str | None = settings.TDX_VERIFIER_URL
         self.quote_timeout: int = 60
+        # Injected by FastAPI DI or passed explicitly (ioc / validator core).
+        # Used for the minimal-G5 CVM ratchet and the re-attest cadence; both
+        # degrade gracefully (log-only) when Redis is absent (e.g. unit tests).
+        self.redis_service = redis_service
 
     def _should_verify(self, executor: ExecutorSSHInfo) -> bool:
         return self.enabled and bool(executor.tdx_quote)
+
+    # ------------------------------------------------------------------
+    # G3 — attestation-event cadence + nonce issuance
+    # ------------------------------------------------------------------
+
+    @property
+    def nonce_enabled(self) -> bool:
+        return self.enabled and settings.ENABLE_ATTESTATION_NONCE
+
+    async def maybe_issue_nonce(self, miner_hotkey: str) -> AttestationNonce | None:
+        """Mint a fresh attestation nonce when this miner is due for a
+        nonce-bound attestation event.
+
+        Freshness is bounded by TDX_REATTEST_INTERVAL_SECONDS rather than
+        demanded every validation wave — GPU evidence collection is seconds per
+        node, so the cadence is load-shed (see remediation plan §4). The event
+        timestamp is recorded at issuance so a persistently failing executor
+        cannot force per-wave collection. Without Redis the interval cannot be
+        tracked, so a nonce is issued every wave (safe, just not load-shed).
+        """
+        if not self.nonce_enabled:
+            return None
+
+        if self.redis_service is not None:
+            key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
+            try:
+                raw = await self.redis_service.get(key)
+                last = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else 0.0
+                if (time.time() - last) < settings.TDX_REATTEST_INTERVAL_SECONDS:
+                    return None
+                await self.redis_service.set(key, str(time.time()))
+            except Exception as exc:
+                logger.warning(_m(
+                    "Failed to read/record attestation-event cadence; issuing nonce",
+                    extra=get_extra_info({"miner_hotkey": miner_hotkey, "error": str(exc)}),
+                ))
+
+        return AttestationNonce.issue()
 
     def _expected_report_data(self, host_key: str) -> str:
         digest = hashlib.sha256(self.REPORT_PREFIX +
@@ -74,7 +182,7 @@ class AttestationService:
                         "Verifier response was not JSON") from exc
 
     @staticmethod
-    def _normalise_report_data(value: Optional[str]) -> Optional[bytes]:
+    def _normalise_report_data(value: str | None) -> bytes | None:
         if not value:
             return None
         token = value.strip().lower()
@@ -85,13 +193,100 @@ class AttestationService:
         except ValueError:
             return None
 
-    async def _check_whitelist(self, compose_hash: str, os_image_hash: str) -> bool:
-        """Check if an attestation digest is in the whitelist for the given TEE type."""
-        if compose_hash in TDX_WHITELIST["COMPOSE_HASH"][settings.DEPLOY_ENV] and os_image_hash in TDX_WHITELIST["OS_IMAGE_HASH"]:
-            return True
-        return False
+    async def _check_whitelist(self, compose_hash: str, os_image_hash: str, executor: ExecutorSSHInfo) -> bool:
+        """Check the attestation digest against the whitelist.
 
-    def _validate_verifier_response(self, verifier_payload: dict, expected_report_hex: str, executor: ExecutorSSHInfo) -> None:
+        G2: compose hashes carry a monotonic release version; acceptance requires
+        the version to be at/above TDX_MINIMUM_COMPOSE_VERSION so a below-floor
+        (rotated-back or known-bad) runner release is rejected immediately
+        instead of aging out of a rolling window.
+        """
+        if os_image_hash not in TDX_WHITELIST["OS_IMAGE_HASH"]:
+            return False
+
+        compose_version = TDX_WHITELIST["COMPOSE_HASH"][settings.DEPLOY_ENV].get(compose_hash)
+        if compose_version is None:
+            return False
+
+        if compose_version < settings.TDX_MINIMUM_COMPOSE_VERSION:
+            logger.warning(_m(
+                "Attestation rejected: measured compose release below the minimum version floor",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "reason": "runner_below_floor",
+                    "compose_hash": compose_hash,
+                    "compose_version": compose_version,
+                    "minimum_version": settings.TDX_MINIMUM_COMPOSE_VERSION,
+                }),
+            ))
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # G4 — TCB status / advisory enforcement
+    # ------------------------------------------------------------------
+
+    def _collect_tcb_violations(self, details: dict) -> list[tuple[str, Any]]:
+        """Collect (reason_code, offending_value) pairs from the verifier response.
+
+        Checked explicitly rather than leaning on the aggregate is_valid flag:
+        tcb_status, advisory_ids, event_log_verified, os_image_hash_verified.
+        The TDX debug attribute is not currently surfaced by dstack-verifier
+        (absent from its response schema); when it appears it must be asserted
+        off here — tracked as a plan follow-up.
+        """
+        violations: list[tuple[str, Any]] = []
+
+        tcb_status = details.get("tcb_status")
+        if tcb_status not in settings.get_allowed_tcb_statuses():
+            violations.append(("tcb_status_not_allowed", tcb_status))
+
+        advisory_ids = details.get("advisory_ids") or []
+        unexpected_advisories = sorted(set(advisory_ids) - settings.get_allowed_advisory_ids())
+        if unexpected_advisories:
+            violations.append(("advisory_present", unexpected_advisories))
+
+        if not details.get("event_log_verified"):
+            violations.append(("event_log_not_verified", details.get("event_log_verified")))
+
+        if not details.get("os_image_hash_verified"):
+            violations.append(("os_image_hash_not_verified", details.get("os_image_hash_verified")))
+
+        return violations
+
+    def _enforce_tcb(self, details: dict, executor: ExecutorSSHInfo) -> None:
+        violations = self._collect_tcb_violations(details)
+        if not violations:
+            return
+
+        extra = get_extra_info({
+            "executor": f"{executor.address}:{executor.port}",
+            "violations": [
+                {"reason": reason, "value": value} for reason, value in violations
+            ],
+            "enforced": settings.ENABLE_TCB_ENFORCEMENT,
+        })
+
+        if settings.ENABLE_TCB_ENFORCEMENT:
+            reason, value = violations[0]
+            logger.warning(_m("TCB enforcement rejected TDX quote", extra=extra))
+            raise AttestationError(
+                f"TCB enforcement failed for executor {executor.address}:{executor.port}: "
+                f"{reason}={value!r}"
+                + (f" (+{len(violations) - 1} more violations)" if len(violations) > 1 else "")
+            )
+
+        # Warn-only telemetry window: size the blast radius before enforcing.
+        logger.warning(_m("TCB enforcement warning (not enforced)", extra=extra))
+
+    def _validate_verifier_response(
+        self,
+        verifier_payload: dict,
+        expected_report_hex: str,
+        executor: ExecutorSSHInfo,
+        nonce: AttestationNonce | None = None,
+    ) -> None:
         details = verifier_payload.get("details")
         if not isinstance(details, dict):
             raise AttestationError(
@@ -114,10 +309,244 @@ class AttestationService:
                 f"Verifier rejected TDX quote for executor {executor.address}:{executor.port}"
             )
 
+        # G3 — the quote must echo the issued challenge in report_data[32:64].
+        if nonce is not None:
+            if nonce.is_expired(settings.ATTESTATION_NONCE_TTL_SECONDS):
+                logger.warning(_m(
+                    "Attestation rejected: issued nonce expired before verification",
+                    extra=get_extra_info({
+                        "executor": f"{executor.address}:{executor.port}",
+                        "reason": "nonce_stale",
+                        "nonce_age_seconds": int(time.time() - nonce.issued_at),
+                    }),
+                ))
+                raise AttestationError(
+                    f"Attestation nonce expired for executor {executor.address}:{executor.port}"
+                )
+
+            echoed = returned_bytes[32:64] if returned_bytes and len(returned_bytes) >= 64 else b""
+            if echoed != nonce.value_bytes:
+                logger.warning(_m(
+                    "Attestation rejected: report_data does not echo the issued nonce",
+                    extra=get_extra_info({
+                        "executor": f"{executor.address}:{executor.port}",
+                        "reason": "nonce_mismatch",
+                        "expected_nonce": nonce.value_hex,
+                        "echoed": echoed.hex(),
+                    }),
+                ))
+                raise AttestationError(
+                    f"TDX quote for executor {executor.address}:{executor.port} does not echo "
+                    "the issued attestation nonce (stale or replayed quote)"
+                )
+
+        # G4 — enforce TCB/advisory posture (warn-only unless ENABLE_TCB_ENFORCEMENT).
+        self._enforce_tcb(details, executor)
+
+    # ------------------------------------------------------------------
+    # G1 — NVIDIA GPU confidential-compute attestation (verification side)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_jwt_claims(jwt_token: str) -> dict:
+        """Decode the claims segment of a JWT without signature verification.
+
+        The NRAS response is fetched by this validator directly over TLS, so
+        transport authenticates the origin (interim posture — the local
+        nv-verifier replaces NRAS before fleet enforcement, removing both the
+        outbound SPOF and this trust-on-TLS).
+        """
+        try:
+            payload_b64 = jwt_token.split(".")[1]
+            padded = payload_b64 + "=" * ((4 - len(payload_b64) % 4) % 4)
+            return json.loads(base64.urlsafe_b64decode(padded).decode())
+        except (IndexError, ValueError, binascii.Error) as exc:
+            raise AttestationError(f"Malformed NRAS attestation token: {exc}") from exc
+
+    async def _post_nras(self, payload: dict, executor: ExecutorSSHInfo) -> Any:
+        timeout = aiohttp.ClientTimeout(total=self.quote_timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(settings.NVIDIA_NRAS_URL, json=payload) as response:
+                    if response.status >= 400:
+                        snippet = (await response.text())[:200]
+                        raise AttestationError(
+                            f"NRAS returned {response.status} for executor "
+                            f"{executor.address}:{executor.port}: {snippet}"
+                        )
+                    return await response.json()
+        except AttestationError:
+            raise
+        except Exception as exc:
+            raise AttestationError(
+                f"NRAS unreachable for executor {executor.address}:{executor.port}: {exc}"
+            ) from exc
+
+    def _check_gpu_claims(
+        self,
+        nras_response: Any,
+        expected_nonce_hex: str | None,
+        executor: ExecutorSSHInfo,
+    ) -> tuple[bool, list[str]]:
+        """Evaluate the NRAS response: overall verdict, nonce echo, per-GPU claims.
+
+        Returns (passed, failure_reasons). The overall verdict is the
+        load-bearing check (matching the private-ml-sdk reference verifier);
+        optional per-GPU claims (measres, eat_nonce, dbgstat, secboot, hwmodel)
+        are asserted when present.
+        """
+        failures: list[str] = []
+
+        if not (isinstance(nras_response, list) and nras_response
+                and isinstance(nras_response[0], list | tuple) and len(nras_response[0]) >= 2):
+            return False, ["nras_response_malformed"]
+
+        overall_claims = self._decode_jwt_claims(nras_response[0][1])
+        if overall_claims.get("x-nvidia-overall-att-result") is not True:
+            failures.append("gpu_att_failed:overall_result")
+
+        if expected_nonce_hex:
+            overall_nonce = overall_claims.get("eat_nonce")
+            if isinstance(overall_nonce, str) and overall_nonce.lower() != expected_nonce_hex.lower():
+                failures.append("gpu_att_failed:eat_nonce_mismatch")
+
+        allowed_hwmodels = settings.get_allowed_gpu_hwmodels()
+        per_gpu = nras_response[1] if len(nras_response) > 1 and isinstance(nras_response[1], dict) else {}
+        for gpu_name, gpu_token in per_gpu.items():
+            if not isinstance(gpu_token, str):
+                continue
+            claims = self._decode_jwt_claims(gpu_token)
+            if claims.get("measres") not in (None, "success"):
+                failures.append(f"gpu_att_failed:{gpu_name}:measres")
+            if expected_nonce_hex:
+                gpu_nonce = claims.get("eat_nonce")
+                if isinstance(gpu_nonce, str) and gpu_nonce.lower() != expected_nonce_hex.lower():
+                    failures.append(f"gpu_att_failed:{gpu_name}:eat_nonce_mismatch")
+            dbgstat = claims.get("dbgstat")
+            if dbgstat is not None and dbgstat != "disabled":
+                failures.append(f"gpu_att_failed:{gpu_name}:dbgstat={dbgstat}")
+            secboot = claims.get("secboot")
+            if secboot is not None and secboot is not True:
+                failures.append(f"gpu_att_failed:{gpu_name}:secboot={secboot}")
+            hwmodel = claims.get("hwmodel")
+            if allowed_hwmodels and isinstance(hwmodel, str):
+                if not any(hwmodel.startswith(allowed) for allowed in allowed_hwmodels):
+                    failures.append(f"gpu_att_failed:{gpu_name}:hwmodel={hwmodel}")
+
+        return not failures, failures
+
+    async def _verify_gpu(
+        self,
+        executor: ExecutorSSHInfo,
+        nonce: AttestationNonce | None,
+    ) -> bool | None:
+        """Verify the executor's NVIDIA CC GPU evidence.
+
+        Enforcement (ENABLE_GPU_ATTESTATION_ENFORCEMENT) applies on attestation
+        events (a nonce was issued): missing/unbound/failed evidence raises
+        AttestationError. Outside events, or with enforcement off, verification
+        is observe-only: the result is logged and recorded but never raises.
+
+        Returns True (verified), False (verified-bad), or None (not performed /
+        undeterminable). Never returns True unless NRAS accepted the evidence.
+        """
+        enforce_event = settings.ENABLE_GPU_ATTESTATION_ENFORCEMENT and nonce is not None
+        payload_raw = executor.nvidia_payload
+        log_extra = {"executor": f"{executor.address}:{executor.port}"}
+
+        if not payload_raw:
+            if enforce_event:
+                logger.warning(_m(
+                    "GPU attestation rejected: evidence missing on attestation event",
+                    extra=get_extra_info({**log_extra, "reason": "payload_missing"}),
+                ))
+                raise AttestationError(
+                    f"Executor {executor.address}:{executor.port} did not provide NVIDIA GPU "
+                    "evidence while GPU attestation enforcement is enabled"
+                )
+            return None
+
+        try:
+            payload = json.loads(payload_raw)
+            if not isinstance(payload, dict) or "evidence_list" not in payload:
+                raise ValueError("missing evidence_list")
+        except (ValueError, TypeError) as exc:
+            if enforce_event:
+                raise AttestationError(
+                    f"Malformed NVIDIA GPU evidence from executor {executor.address}:{executor.port}: {exc}"
+                ) from exc
+            logger.warning(_m(
+                "Malformed NVIDIA GPU evidence (observe-only)",
+                extra=get_extra_info({**log_extra, "reason": "payload_malformed", "error": str(exc)}),
+            ))
+            return False
+
+        # On an attestation event the GPU evidence must be bound to the issued
+        # nonce — a self-generated (phase-0) nonce is replayable and rejected.
+        payload_nonce = payload.get("nonce")
+        if nonce is not None and payload_nonce != nonce.value_hex:
+            if enforce_event:
+                logger.warning(_m(
+                    "GPU attestation rejected: evidence nonce is not the issued challenge",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "reason": "gpu_nonce_unbound",
+                        "expected_nonce": nonce.value_hex,
+                        "payload_nonce": payload_nonce,
+                    }),
+                ))
+                raise AttestationError(
+                    f"NVIDIA GPU evidence from executor {executor.address}:{executor.port} is not "
+                    "bound to the issued attestation nonce"
+                )
+            logger.info(_m(
+                "GPU evidence nonce differs from issued challenge (observe-only, likely phase-0 self-nonce)",
+                extra=get_extra_info({**log_extra, "payload_nonce": payload_nonce}),
+            ))
+
+        expected_nonce_hex = nonce.value_hex if (nonce is not None and payload_nonce == nonce.value_hex) else (
+            payload_nonce if isinstance(payload_nonce, str) else None
+        )
+
+        try:
+            nras_response = await self._post_nras(payload, executor)
+            passed, failures = self._check_gpu_claims(nras_response, expected_nonce_hex, executor)
+        except AttestationError as exc:
+            if enforce_event:
+                raise
+            logger.warning(_m(
+                "GPU attestation verification undeterminable (observe-only)",
+                extra=get_extra_info({**log_extra, "reason": "nras_unreachable", "error": str(exc)}),
+            ))
+            return None
+
+        if passed:
+            logger.info(_m(
+                "NVIDIA GPU attestation verified",
+                extra=get_extra_info({
+                    **log_extra,
+                    "nonce_bound": bool(nonce is not None and payload_nonce == nonce.value_hex),
+                    "gpu_count": len(nras_response[1]) if len(nras_response) > 1 and isinstance(nras_response[1], dict) else None,
+                }),
+            ))
+            return True
+
+        logger.warning(_m(
+            "NVIDIA GPU attestation failed",
+            extra=get_extra_info({**log_extra, "reason": "gpu_att_failed", "failures": failures}),
+        ))
+        if enforce_event:
+            raise AttestationError(
+                f"NVIDIA GPU attestation failed for executor {executor.address}:{executor.port}: "
+                + "; ".join(failures)
+            )
+        return False
+
     async def _verify_tdx(
         self,
         executor: ExecutorSSHInfo,
-    ) -> Tuple[Optional[str], Optional[str]]:
+        nonce: AttestationNonce | None = None,
+    ) -> tuple[str | None, str | None]:
         """Verify TDX quote and return (attestation_digest, tee_type).
 
         Validates the quote string, calls the external verifier, extracts
@@ -135,7 +564,7 @@ class AttestationService:
 
         expected_report = self._expected_report_data(executor.ssh_host_key)
         verifier_payload = await self._call_verifier(quote.strip(), executor)
-        self._validate_verifier_response(verifier_payload, expected_report, executor)
+        self._validate_verifier_response(verifier_payload, expected_report, executor, nonce=nonce)
 
         details = verifier_payload.get("details", {})
         app_info = details.get("app_info", {})
@@ -167,7 +596,7 @@ class AttestationService:
                 )
 
             is_whitelisted = await self._check_whitelist(
-                compose_hash=compose_hash, os_image_hash=os_image_hash
+                compose_hash=compose_hash, os_image_hash=os_image_hash, executor=executor
             )
             if not is_whitelisted:
                 raise AttestationError(
@@ -190,10 +619,53 @@ class AttestationService:
 
         return attestation_digest, tee_type
 
+    async def _record_attested_executor(self, executor: ExecutorSSHInfo) -> None:
+        """Ratchet: remember that this executor is a CVM (minimal-G5)."""
+        if self.redis_service is None:
+            return
+        try:
+            await self.redis_service.sadd(TDX_ATTESTED_EXECUTOR_SET, str(executor.uuid))
+        except Exception as exc:
+            logger.warning(_m(
+                "Failed to record attested executor in ratchet set",
+                extra=get_extra_info({"executor_uuid": executor.uuid, "error": str(exc)}),
+            ))
+
+    async def _reject_omitted_quote_if_ratcheted(self, executor: ExecutorSSHInfo) -> None:
+        """Minimal-G5 fail-closed: a previously attested executor cannot silently
+        drop its quote to skip verification (host-key-only bypass)."""
+        if not (self.enabled and settings.ENABLE_TCB_ENFORCEMENT):
+            return
+        if executor.tdx_quote or self.redis_service is None:
+            return
+        try:
+            is_ratcheted = await self.redis_service.is_elem_exists_in_set(
+                TDX_ATTESTED_EXECUTOR_SET, str(executor.uuid)
+            )
+        except Exception as exc:
+            logger.warning(_m(
+                "Failed to check attested-executor ratchet set",
+                extra=get_extra_info({"executor_uuid": executor.uuid, "error": str(exc)}),
+            ))
+            return
+        if is_ratcheted:
+            logger.warning(_m(
+                "Attestation rejected: previously attested executor omitted its TDX quote",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "executor_uuid": executor.uuid,
+                    "reason": "quote_omitted_ratcheted",
+                }),
+            ))
+            raise AttestationError(
+                f"Executor {executor.address}:{executor.port} previously attested as a CVM "
+                "but omitted its TDX quote (fail-closed)"
+            )
+
     def _build_known_hosts(
         self,
         executor: ExecutorSSHInfo,
-    ) -> Optional[asyncssh.SSHKnownHosts]:
+    ) -> asyncssh.SSHKnownHosts | None:
         """Build an asyncssh known-hosts policy from executor.ssh_host_key.
 
         Constructs a known_hosts entry that covers both the bare address and the
@@ -228,17 +700,23 @@ class AttestationService:
     async def prepare_host_policy(
         self,
         executor: ExecutorSSHInfo,
-    ) -> Tuple[Optional[asyncssh.SSHKnownHosts], Optional[str], Optional[str]]:
-        """Verify TDX attestation and build SSH known_hosts policy for the executor.
+        nonce: AttestationNonce | None = None,
+    ) -> HostPolicyResult:
+        """Verify TDX (and, when supplied, NVIDIA GPU) attestation and build the
+        SSH known_hosts policy for the executor.
 
-        Returns (known_hosts, attestation_digest, tee_type):
+        Returns a HostPolicyResult carrying:
         - known_hosts: SSH host key policy built from the verified TDX quote
         - attestation_digest: os_image_hash + compose_hash identifying the CVM software stack
-        - tee_type: TEE technology, e.g. "dstack/tdx"
+        - tee_type: "dstack/tdx", upgraded to "dstack/tdx+nvcc" when nonce-bound
+          GPU evidence verified
+        - gpu_attestation_passed: True / False / None (None = not performed)
 
-        All three values are None when attestation is disabled or the executor has no
-        host key.  Raises AttestationError if verification is enabled but fails.
+        All fields are None when attestation is disabled or the executor has no
+        host key. Raises AttestationError if verification is enabled but fails.
         """
+        await self._reject_omitted_quote_if_ratcheted(executor)
+
         should_verify = self._should_verify(executor)
 
         if not executor.ssh_host_key:
@@ -246,11 +724,24 @@ class AttestationService:
                 raise AttestationError(
                     f"Executor {executor.address}:{executor.port} missing SSH host key for attestation"
                 )
-            return None, None, None
+            return HostPolicyResult()
 
         attestation_digest, tee_type = None, None
+        gpu_attestation_passed: bool | None = None
         if should_verify:
-            attestation_digest, tee_type = await self._verify_tdx(executor)
+            attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce)
+            await self._record_attested_executor(executor)
+
+            gpu_attestation_passed = await self._verify_gpu(executor, nonce)
+            # tee_type only claims verified GPU CC when the evidence was bound
+            # to the validator-issued challenge (an unbound pass is replayable).
+            if gpu_attestation_passed is True and nonce is not None:
+                tee_type = "dstack/tdx+nvcc"
 
         known_hosts = self._build_known_hosts(executor)
-        return known_hosts, attestation_digest, tee_type
+        return HostPolicyResult(
+            known_hosts=known_hosts,
+            attestation_digest=attestation_digest,
+            tee_type=tee_type,
+            gpu_attestation_passed=gpu_attestation_passed,
+        )

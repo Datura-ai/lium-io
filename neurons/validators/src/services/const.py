@@ -11,10 +11,33 @@ GPU_MODEL_RATES = {
     "NVIDIA H800 80GB HBM3": 0.02,
     "NVIDIA H800 NVL": 0.01,
     "NVIDIA H800 PCIe": 0.01,
+    # Supported operationally, but excluded from the unrented pool by default.
+    "NVIDIA GeForce RTX 5080": 0.0,
+    "NVIDIA GeForce RTX 5070 Ti": 0.0,
+    "NVIDIA GeForce RTX 5070": 0.0,
+    "NVIDIA GeForce RTX 5060 Ti": 0.0,
+    "NVIDIA GeForce RTX 5060": 0.0,
     "NVIDIA GeForce RTX 5090": 0.025,
+    # Supported operationally, but excluded from the unrented pool by default.
+    "NVIDIA GeForce RTX 4080 SUPER": 0.0,
+    "NVIDIA GeForce RTX 4080": 0.0,
+    "NVIDIA GeForce RTX 4070 Ti": 0.0,
+    "NVIDIA GeForce RTX 4070 Ti SUPER": 0.0,
+    "NVIDIA GeForce RTX 4070 SUPER": 0.0,
+    "NVIDIA GeForce RTX 4070": 0.0,
+    "NVIDIA GeForce RTX 4060 Ti": 0.0,
+    "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
+    "NVIDIA RTX PRO 2000 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4000 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4500 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.0,
+    "NVIDIA RTX PRO 5000 Blackwell": 0.0,
+    "NVIDIA RTX 4500 Ada Generation": 0.0,
+    "NVIDIA RTX 5000 Ada Generation": 0.0,
+    "NVIDIA RTX 5880 Ada Generation": 0.0,
     "NVIDIA RTX 6000 Ada Generation": 0.01,
     "NVIDIA L4": 0.01,
     "NVIDIA L40S": 0.01,
@@ -22,83 +45,60 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
+    "NVIDIA A800 80GB PCIe": 0.0,
+    "NVIDIA CMP 170HX": 0.0,
+    "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.027, # 2.7x 6000 ada
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": 0.0,
+    "NVIDIA RTX 6000D": 0.0,
     "NVIDIA RTX A5000": 0.002,
     "NVIDIA RTX A4500": 0.002,
     "NVIDIA RTX A4000": 0.002,
+    "NVIDIA RTX A2000": 0.0,
     # "NVIDIA A40": 0.002,
     # "NVIDIA A30": 0.002,
+    "NVIDIA T4 Tensor Core GPU": 0.0,
+    "NVIDIA Tesla V100 Tensor Core GPU": 0.0,
+    "NVIDIA TITAN V": 0.0,
+    "NVIDIA GeForce RTX 3090 Ti": 0.0,
     "NVIDIA GeForce RTX 3090": 0.02,
+    "NVIDIA GeForce RTX 3080 Ti": 0.0,
+    "NVIDIA GeForce RTX 3080": 0.0,
+    "NVIDIA GeForce RTX 3070 Ti": 0.0,
+    "NVIDIA GeForce RTX 3070": 0.0,
+    "NVIDIA GeForce RTX 3060 Ti": 0.0,
+    "NVIDIA GeForce RTX 3060 Laptop GPU": 0.0,
+    "NVIDIA GeForce RTX 3060": 0.0,
+    "NVIDIA GeForce RTX 3050": 0.0,
+    "NVIDIA Quadro RTX 8000": 0.0,
+    "NVIDIA Quadro RTX 6000": 0.0,
+    "NVIDIA Quadro RTX 5000": 0.0,
+    "NVIDIA TITAN RTX": 0.0,
+    "NVIDIA GeForce RTX 2080 Ti": 0.0,
+    "NVIDIA GeForce RTX 2080 SUPER": 0.0,
+    "NVIDIA GeForce RTX 2070 SUPER": 0.0,
+    "NVIDIA GeForce RTX 2060 SUPER": 0.0,
+    "NVIDIA GeForce RTX 2060": 0.0,
+    "NVIDIA GeForce GTX 1660 Ti": 0.0,
+    "NVIDIA GeForce GTX 1660 SUPER": 0.0,
+    "NVIDIA GeForce GTX 1660": 0.0,
+    "NVIDIA Tesla P100": 0.0,
+    "NVIDIA Tesla P40": 0.0,
+    "NVIDIA Quadro P4000": 0.0,
+    "NVIDIA TITAN Xp": 0.0,
+    "NVIDIA GeForce GTX 1080 Ti": 0.0,
+    "NVIDIA GeForce GTX 1080": 0.0,
+    "NVIDIA GeForce GTX 1070 Ti": 0.0,
+    "NVIDIA GeForce GTX 1070": 0.0,
+    "NVIDIA GeForce GTX 1060": 0.0,
+    "NVIDIA Tesla M40": 0.0,
 }
-
-# GPU Price * 24 / TAO Price
-REQUIRED_DEPOSIT_AMOUNT = {
-    'NVIDIA B300 SXM6 AC': 0.274,
-    'NVIDIA B200': 0.223,
-    'NVIDIA H200': 0.158,
-    'NVIDIA H200 NVL': 0.131,
-    'NVIDIA H100 80GB HBM3': 0.103,
-    'NVIDIA H100 NVL': 0.086,
-    'NVIDIA H100 PCIe': 0.086,
-    'NVIDIA H800 80GB HBM3': 0.051,
-    'NVIDIA H800 NVL': 0.045,
-    'NVIDIA H800 PCIe': 0.045,
-    'NVIDIA GeForce RTX 5090': 0.014,
-    'NVIDIA GeForce RTX 4090': 0.010,
-    'NVIDIA GeForce RTX 4090 D': 0.008,
-    # 'NVIDIA RTX 4000 Ada Generation': 0.009,
-    'NVIDIA RTX 6000 Ada Generation': 0.017,
-    'NVIDIA L4': 0.008,
-    'NVIDIA L40S': 0.027,
-    'NVIDIA L40': 0.024,
-    # 'NVIDIA RTX 2000 Ada Generation': 0.005,
-    'NVIDIA A100 80GB PCIe': 0.027,
-    'NVIDIA A100-SXM4-80GB': 0.031,
-    'NVIDIA RTX A6000': 0.018,
-    'NVIDIA RTX PRO 6000 Blackwell Server Edition': 0.0425, # 2.5x 6000 ada
-    'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 0.0459, # 2.7x 6000 ada
-    'NVIDIA RTX A5000': 0.009,
-    'NVIDIA RTX A4500': 0.008,
-    'NVIDIA RTX A4000': 0.008,
-    # 'NVIDIA A40': 0.008,
-    # 'NVIDIA A30': 0.005,
-    'NVIDIA GeForce RTX 3090': 0.008
-}
-
-MACHINE_PRICES = {
-    "NVIDIA B300 SXM6 AC": 3.67,
-    "NVIDIA B200": 2.99,
-    "NVIDIA H200": 1.90,
-    "NVIDIA H200 NVL": 1.67, # same rate as "NVIDIA H100 NVL" / "NVIDIA H100 80GB HBM3"
-    "NVIDIA H100 80GB HBM3": 1.26,
-    "NVIDIA H100 NVL": 1.11,
-    "NVIDIA H100 PCIe": 1.11,
-    "NVIDIA H800 80GB HBM3": 0.88,
-    "NVIDIA H800 NVL": 0.80,
-    "NVIDIA H800 PCIe": 0.80,
-    "NVIDIA GeForce RTX 5090": 0.17,
-    "NVIDIA GeForce RTX 4090": 0.14,
-    "NVIDIA GeForce RTX 4090 D": 0.11,
-    "NVIDIA RTX 4000 Ada Generation": 0.16,
-    "NVIDIA RTX 6000 Ada Generation": 0.31,
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.77, # 2.5x 6000 ada
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.84, # 2.7x 6000 ada
-    "NVIDIA L4": 0.11,
-    "NVIDIA L40S": 0.34,
-    "NVIDIA L40": 0.29,
-    "NVIDIA RTX 2000 Ada Generation": 0.07,
-    "NVIDIA A100 80GB PCIe": 0.36,
-    "NVIDIA A100-SXM4-80GB": 0.43,
-    "NVIDIA RTX A6000": 0.24,
-    "NVIDIA RTX A5000": 0.16,
-    "NVIDIA RTX A4500": 0.13,
-    "NVIDIA RTX A4000": 0.12,
-    "NVIDIA A40": 0.12,
-    "NVIDIA A30": 0.10,
-    "NVIDIA GeForce RTX 3090": 0.13
-}
+# `NVIDIA B300 SXM6 PC` is derived from the AC entry, never a row of its own (incentive/config.py says why).
+GPU_MODEL_RATES["NVIDIA B300 SXM6 PC"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300` is priced like B300 for now; revisit when GB300 market data exists.
+GPU_MODEL_RATES["NVIDIA GB300"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
 
 MAX_UPLOAD_SPEED = 1000
 MAX_DOWNLOAD_SPEED = 1000
@@ -114,14 +114,36 @@ UNRENTED_MULTIPLIER = 1
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
+# DAH-2735: NVML memory-utilization is bus load, not VRAM fill — a foreign rental holding
+# 22 GB at idle reads ~0%. Judge held VRAM in absolute MB instead; the floor sits above the
+# driver-reserved block NVML counts (measured up to 728 MB on B200).
+GPU_HELD_VRAM_MB_LIMIT = 2048
+
+# DAH-2427 ghost GPU: an orphaned CUDA kernel left by a hard-killed GPU process pins the
+# card at full utilization with no memory and no process attached (observed for days on
+# RTX PRO 6000 nodes). The "no memory" half is expressed in whichever unit each data source
+# provides: the periodic check reads NVML memory-utilization percent, the teardown sweep
+# reads nvidia-smi used MiB.
+GPU_WEDGE_UTILIZATION_MIN = 95  # percent
+GPU_WEDGE_MEMORY_MAX = 1  # percent (periodic check, NVML memory-utilization)
+GPU_WEDGE_SWEEP_MEMORY_MAX_MIB = 16  # teardown sweep, nvidia-smi memory.used
+GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is removed
+
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
+# Declared ports are tallied per bucket of this width (by external port), so a wide range
+# forwarded only in part shows which part answered; at most 14 tallies over 1-65535 per pass
+# (28 per event, both passes).
+PORT_RANGE_BUCKET_WIDTH = 5000
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
 VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
-TOTAL_BURN_EMISSION = 0.91
+# Emission split between the rented "mining" pool and the unrented + burn pool is
+# sourced from shared config at runtime via core.config.get_total_burn_emission()
+# (DAH-2274) — the backend is the source of truth. The expected production value
+# used by the test suite lives in tests/constants.py.
 BURNER_EMISSION = 0.01
 
 # Rental Price Incentive Constants
@@ -130,7 +152,7 @@ SECONDS_PER_BLOCK = 12  # seconds per block
 FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
 
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
-DOCKER_DIND_IMAGE = "daturaai/dind:0.0.0"
+DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
 LIB_NVIDIA_ML_DIGESTS = {
     "535.54.03": "49e63c42aa95bba6b9aa562ee57e496c:15a37892671187547b6dd21a07e8149315e529211dc30ca6ee8d8d089a338d53",
@@ -196,8 +218,19 @@ LIB_NVIDIA_ML_DIGESTS = {
     "580.126.16": "602c2f2fdfdbbfeadbeda157a12c89b4:1195dafd6b9e41645240ea97c4bb8e2e5c53a87a8b4bd18e4bf1befcb2f3da7b",
     "580.126.18": "c743bd753c2a72562ba81cd53655b482:1a0f5afd550344d357b071d70c84ea1cf2553675b4c68268ccc14da64d562ab5",
     "580.126.20": "aeb23ff04f08663f8d29699b7166965a:85f43e9c005904dbd3cb3dea42042236d4ade1b635739581af204b8383bcc1ac",
+    "580.142": "ba092110c430e70382ee1274bf561796:f2e0fe7110fcc12cbeaf685f60a0c1bfd37d748010b1f8fba9c4f3c8bdd2aa93",
+    "580.159.03": "e20a51c15ea69c8689c870cfff8a274c:a610e3e6a9ebb901372dcd2b912a7a040c35406ced930290dd902b3fbf1c797c",
+    "580.159.04": "112ed00d4a4880bb33ccc001df34c2f0:941c7f7999351d8b9b69f275a20ebd2818e3314678fc12dba6da8a6f12b74d27",
+    "580.167.08": "fa0c084327835d0369e5307a1ba3a882:c7eac74626efce631035360d6a5d1f9d72b02d81739ab0adbf0521f6c6a0f10a",
+    "580.173.02": "bcc62db30ccee22da8c64ecde69ead52:82d7b58d3f870b0635e8999c56eb8fd2d795c920daa2661e628ca523eee5f557",
     "590.44.01": "b5f88f19314d6e0b951e350129d018dc:560b1aff40089484c67d63889db11e7be9bfdae6f476006d5ef3bd3c37b547bd",
     "590.48.01": "7c4674fdfdeb75c20af25bd41e3a0de6:12f3bcd4ba447599a2077297e3a4ff4288205b082c2e76346718ae85c058c4b2",
+    "595.45.04": "1dbe78234657c5522cb8fe9c9cfde141:f7d1d0eb39f16e8e88a77e9c5127e9a2a93e4b5b1344be1f18faedcfb67bc58f",
+    "595.58.03": "af7923894f6ad89eafb78c03daf422a9:9a0ef13c817030b07f931cbe6115a70f7674ecbd3bee6047417ffc7ae699ed1b",
+    "595.71.05": "020cd1156cbce5ebbf12963d0c70496e:9eb4358b7fea76556657670a6ae6b0017eaa4256b56c421a36626bf8c2b5f3f5",
+    "595.84": "4de0188efc8bb6c7485e599fcc718978:6d8a58eb15a1c2e6067ec977e9de57b42a3d632b4073818ab648370fecfc82b1",
+    "595.91.07": "815eeecaf87fd8f947c66b2ef1ca7525:7515da5b856b805fc07811dfd72a37545c1bd9e78f4d8c16421e155ac8f4aec4",
+    "610.43.02": "5ad6c02411f730682597558ae8f3a9f8:2dc828b3f5027f98e05c7607c1d8129d11bd28de4c2091c5cd7e32dbc21ec172",
 }
 
 # VerifyX Validation Constants
@@ -212,29 +245,144 @@ NETWORK_MIN_DOWNLOAD_SPEED_MBPS = 50.0
 PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009]
 
 POD_CONTAINER_PREFIX = "pod_"
+FILLER_CONTAINER_PREFIX = "filler_"
+# DAH-2740: the name a pod's current container is parked under while an edit builds its replacement.
+# Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to
+# every protected pod name) and reap it once the pod is gone.
+EDIT_PARKED_SUFFIX = "__prev"
+# DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
+# name with the model + runtime version baked in; the validator only needs the prefix, to recognise
+# which volumes belong to the cache when sweeping or reclaiming them.
+DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
+# volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
+ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
+# DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
+# downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
+# of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
+# above that floor. Duplicated here on purpose: only the host knows whether the cache already exists,
+# so the affordability decision has to live next to that fact. Keep in step with the backend.
+DPHN_CACHE_SIZE_GB = 40
+DPHN_CACHE_LISTING_FLOOR_GB = 100
+DPHN_CACHE_FREE_MARGIN_GB = 50
+FILLER_CONTAINER_GRACE_MINUTES = 15
+# DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
+# container lives until the sweep above collects it, so the bound follows that grace with one cycle
+# of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
+# let a provider reuse the name of their own broken pod for a foreign workload.
+BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
+# How long after a rental closes its pod container still counts as the unrent flow's teardown rather
+# than an orphan: with RENTAL_TEARDOWN_DEFERRAL_ENABLED on, the GPU usage check defers instead of
+# scoring 0 until this long after the close, which covers one run and occasionally two. A run is
+# shorter than this, so a rental that ends while the run is inside it always lands here. It must stay
+# short for the same reason as the grace above: the pod's name must not shield a workload for long.
+RENTAL_TEARDOWN_GRACE_MINUTES = 15
+# How far ahead of the validator's clock a rental's close time may sit and still read as a rental
+# that just ended. A close time further ahead is not trusted, so the container stays an orphan.
+RENTAL_CLOSE_CLOCK_SKEW_MINUTES = 5
+# ISSUE-050: a filler run younger than this is not penalized for a missing container —
+# it may still be finishing its create/stop race with the backend snapshot.
+FILLER_LIVENESS_GRACE_MINUTES = 10
+
+# Owner of an executor's active default job, as reported by compute-app.
+# An executor running the miner's OWN default job earns no unrented incentive.
+DEFAULT_JOB_OWNER_MINER = "miner"
+# A Lium-owned default job (e.g. the PEARL idle filler) — Lium keeps the unrented incentive and may
+# lower the node's GPU power limit, so GpuPowerLimitCheck exempts these nodes (DAH-2356).
+DEFAULT_JOB_OWNER_LIUM = "lium"
+
+# Container name prefixes that count as "rental-related" on an executor.
+# All producers of short-lived containers competing for the 9100-9130 port range
+# MUST be listed here so that container_cleanup and wait_for_port_check_containers
+# both see them. Adding a new prefix is a one-line edit that both guards inherit.
+#   pod_*          — long-lived user rentals (validator-owned)
+#   filler_*       — long-lived filler runtime (validator-owned, not customer-rented)
+#   container_*    — validator DinD/port-check probes (hotkey-scoped)
+#   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
+RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+
+# DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
+# without importing the probe service: that module reaches services.task.models, which pulls
+# services/task/__init__ and the checks back in.
+PROBE_CONTAINER_NAME = "lium_roce_probe"
+
+# DAH-2805: the throwaway helper that sweeps abandoned download temporaries out of the filler cache
+# volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
+# of CPU it holds instead of counting our own housekeeping against the miner.
+CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
+# Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
+# them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
+# provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
+# them BY NAME. A name is forgeable, which is why this tier only ever excuses load and never
+# grants the rental status `pod_*` and `filler_*` get from the backend.
+# Add a new Lium infra container here and the gate inherits it.
+# `executor-` is the compose project the executor stack runs under: the runner, watchtower,
+# autoheal and postgres beside the executor itself. They are Lium's, they idle, and the gate
+# caps this whole tier, so the name buys a forger nothing.
+LIUM_INFRA_CONTAINER_PREFIXES = (
+    "container_",
+    "health_check_",
+    "executor-",
+    # the s3 backup helper (miner_jobs/backup_storage.py) copies a renter's volume, which costs
+    # real CPU while it runs
+    "s3fs-backup",
+    PROBE_CONTAINER_NAME,
+    CACHE_SWEEP_CONTAINER_NAME,
+)
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
 TDX_WHITELIST = {
     "OS_IMAGE_HASH": set(
         [
-            "9b69bb1698bacbb6985409a2c272bcb892e09cdcea63d5399c6768b67d3ff677",
+            # DAH-2338 — official upstream dstack-nvidia 0.5.11 (meta-dstack v0.5.11
+            # release, git_revision ce04e924, NVIDIA driver 595.58.03, prod/non-dev
+            # image). Single-image policy: the legacy 0.5.5 hashes (upstream 9b69bb16…
+            # and DAH-2311 rebuilt dbfde543…) are removed — CVMs still booting them
+            # must be redeployed on 0.5.11.
+            "a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02",
         ]
     ),
-    "COMPOSE_HASH": { # compose file hash will be vary depending on the environment (depends on lium-watchtower)
-        "PROD": set(
-            [
-                "a77f05d55bdb6c8fe86f2cd76271192a0b95617f198da4700d92c20d8798d4ee",
-            ]
-        ),
-        "STAGE": set(
-            [
-                "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11",
-            ]
-        ),
-        "LOCAL": set( 
-            [
-                "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828",
-            ]
-        ),
+    # Compose-file hashes vary per environment. G2: each approved hash carries a
+    # monotonically increasing release version — append-only, next release gets the
+    # next integer. Acceptance requires version >= settings.TDX_MINIMUM_COMPOSE_VERSION
+    # ("at/above the floor", newest-wins) so a known-bad release is retired by raising
+    # the floor instead of aging out of a rolling window. Membership checks
+    # (`hash in TDX_WHITELIST["COMPOSE_HASH"][env]`) keep working on the dict keys.
+    "COMPOSE_HASH": {
+        "PROD": {
+            # DAH-2861 — measured compose of the latest runner, daturaai/compute-subnet-executor-runner
+            # @ sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7 (pushed
+            # 2026-08-19, executor @ sha256:8dbf5395…, a prod build with no config_override.py).
+            # Seen in the event log of the 146.88.195.16 CVM on 2026-09-03. Covers app/
+            # docker-compose.yml, init_script.sh and pre_launch_script.sh at 880cb585 plus default
+            # `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo). Editing any of those
+            # three files moves the hash and needs the next version here: the checkout's hash is
+            # rebuilt by neurons/executor/dstacktee/scripts/compose_hash.py and
+            # tests/test_tdx_compose_hash_whitelist.py fails CI while it is missing. Kept: CVMs
+            # created from executor-v1.127 and earlier still attest with it.
+            "8224d58801af6333561f116e2d566b179b399f1d1d700f0e8a5ab9326ae901d9": 4,
+            # DAH-3602 — the same runner digest with the measured files at c102a332 (lium-io#1339,
+            # DAH-2834, three settings added to init_script.sh; executor-v1.128 to v1.130 and main).
+            # Missing here from 2026-09-14 to this entry, so every CVM created from those releases
+            # would score zero with the whitelist on. Version 5; DAH-2780's pre_launch_script.sh
+            # rewrite (lium-io#1266) takes 6.
+            "87d3430000bb7046a19eeaa6efe074fd8b5f7856bbfe2906addab238174c542d": 5,
+            # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
+            # that runner bakes the STAGING validator hotkey via config_override.py and answers every
+            # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.
+        },
+        "STAGE": {
+            "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,
+            # DAH-2338 — 0.5.11 staging compose: executor-runner pinned to
+            # daturaai/compute-subnet-executor-runner:dev digest sha256:58db7cd5…
+            # (pushed 2026-07-06), pre-launch sysbox force-install included.
+            # Assumes default `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
+            "feedf7cb08a9905f3ef66eb9bab4af310310965589e5aed070594c326bf44e16": 2,
+        },
+        "LOCAL": {
+            "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828": 1,
+        },
     }
 }

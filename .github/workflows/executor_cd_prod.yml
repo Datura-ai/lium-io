@@ -2,18 +2,20 @@ name: "CD: executor (prod)"
 
 on:
   push:
-    branches:
-      - 'prod_executor'
+    tags:
+      - 'executor-v*'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dockerhub-push
     env:
       TAG: "latest" 
       TARGET_FILE: "docker-compose.app.yml"
-      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -25,15 +27,80 @@ jobs:
           chmod +x neurons/executor/docker_runner_build.sh
           chmod +x neurons/executor/docker_runner_publish.sh
 
-      - name: Build and publish executor image
+      # Build before the login: the base images (python, docker) are public docker.io images, and once
+      # the OIDC token is the docker.io credential every pull uses it. It covers only the daturaai push
+      # repositories, so a build after the login fails with `insufficient scope`.
+      - name: Build the executor image
         run: |
           cd neurons/executor
           source ./docker_build.sh
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+
+      - name: Log in to Docker Hub (OIDC, no stored token)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The exchanged token is the docker password for the rest of the job (default 300 s);
+          # the pushes must finish inside it, so 30 min leaves room for a cold cache or a slow runner.
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
+
+      - name: Publish the executor image
+        run: |
+          cd neurons/executor
           source ./docker_publish.sh
           echo "EXECUTOR_IMAGE_SHA256=${EXECUTOR_IMAGE_SHA256}" >> $GITHUB_ENV
 
-      - name: Build and publish runner image
+      # The runner image needs the executor digest from the push above, so it is built between two
+      # logins: logged out, it pulls docker:26-cli anonymously like the executor build.
+      # No server argument: the login is stored under https://index.docker.io/v1/, and
+      # `docker logout docker.io` leaves that entry in place.
+      - name: Log out before the runner build
+        run: docker logout
+
+      - name: Build the runner image
         run: |
           cd neurons/executor
           source ./docker_runner_build.sh
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+
+      - name: Log in to Docker Hub again for the runner push (OIDC)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The exchanged token is the docker password for the rest of the job (default 300 s);
+          # the pushes must finish inside it, so 30 min leaves room for a cold cache or a slow runner.
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
+
+      - name: Publish the runner image
+        run: |
+          cd neurons/executor
           source ./docker_runner_publish.sh
+
+  # DAH-3602: a provider sets up a CVM from the release notes. The notes of executor-v1.130 carried no
+  # runner digest, so one provider was about to pin a retired one, and no note said which compose hash
+  # a correct CVM measures to. This job writes both into the GitHub release of the tag, after the
+  # images are published: an existing release (the one a human created with generated notes) gets
+  # the section appended once, a section that is not the generated one (a moved tag, a stale digest next
+  # to the current hash, a doubled heading) is replaced, a missing release is created with generated
+  # notes plus the section. The script is
+  # neurons/executor/dstacktee/scripts/release_notes_update.sh; the validator's
+  # tests/test_tdx_compose_hash_whitelist.py runs it against a stubbed `gh` for each of those cases.
+  release-notes:
+    name: "Release notes: CVM attestation section"
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add the approved runner digest and the expected compose hash to the release
+        run: bash neurons/executor/dstacktee/scripts/release_notes_update.sh "$TAG"

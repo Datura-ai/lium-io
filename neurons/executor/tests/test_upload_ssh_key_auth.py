@@ -9,6 +9,7 @@ Ephemeral bittensor keypairs are created inside the test fixtures so no real
 production keys are needed and every test run uses fresh cryptographic material.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import bittensor
@@ -18,6 +19,7 @@ from fastapi.testclient import TestClient
 
 # conftest.py already inserted src/ into sys.path and set required env vars.
 from core.config import settings
+import middlewares.miner as miner_middleware
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.miner_service import MinerService
@@ -71,7 +73,7 @@ def client(validator_keypair, miner_keypair, monkeypatch):
       - settings.MINER_HOTKEY_SS58_ADDRESS → test miner's ss58 address
       - settings.DEFAULT_MINER_HOTKEY      → same (prevents accidental match
                                              via the fallback hotkey)
-      - routes.apis.VALIDATOR_HOTKEY_SS58  → test validator's ss58 address
+      - dependencies.auth.VALIDATOR_HOTKEYS_SS58 → {"current": test validator's ss58 address}
 
     MinerService is overridden so no real SSH or TDX operations occur.
     """
@@ -82,7 +84,9 @@ def client(validator_keypair, miner_keypair, monkeypatch):
     monkeypatch.setattr(settings, "DEFAULT_MINER_HOTKEY", miner_keypair.ss58_address)
 
     # --- patch validator auth ---
-    monkeypatch.setattr("routes.apis.VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address)
+    monkeypatch.setattr(
+        "dependencies.auth.VALIDATOR_HOTKEYS_SS58", {"current": validator_keypair.ss58_address}
+    )
 
     # --- build minimal app ---
     app = FastAPI()
@@ -95,6 +99,7 @@ def client(validator_keypair, miner_keypair, monkeypatch):
         return_value={"ssh_username": "testuser", "ssh_port": 2200}
     )
     mock_service.remove_ssh_key = AsyncMock(return_value=None)
+    app.state.mock_miner_service = mock_service
     app.dependency_overrides[MinerService] = lambda: mock_service
 
     return TestClient(app)
@@ -133,6 +138,36 @@ def test_valid_miner_and_validator_signatures_accepted(endpoint, client, miner_k
 
     # Assert — only when both auth layers pass should the request succeed
     assert response.status_code == 200
+
+
+def test_authenticated_request_timeout_returns_structured_504(
+    client,
+    miner_keypair,
+    validator_keypair,
+    monkeypatch,
+):
+    """Miner auth passes, but the downstream route does not respond before the timeout."""
+    # Arrange
+    monkeypatch.setattr(miner_middleware, "AUTHENTICATED_REQUEST_TIMEOUT_SECONDS", 0.01)
+
+    async def slow_upload_ssh_key(_payload):
+        await asyncio.sleep(0.05)
+        return {"ssh_username": "testuser", "ssh_port": 2200}
+
+    client.app.state.mock_miner_service.upload_ssh_key.side_effect = slow_upload_ssh_key
+    payload = _build_payload(_SSH_KEY, miner_keypair, validator_keypair)
+
+    # Act
+    response = client.post("/upload_ssh_key", json=payload)
+
+    # Assert
+    assert response.status_code == 504
+    assert response.json() == {
+        "status": "failed",
+        "failure_code": "EXECUTOR_AUTHENTICATED_REQUEST_TIMEOUT",
+        "stage": "call_next",
+        "message": "Request authenticated but executor route did not return before timeout",
+    }
 
 
 # ---------------------------------------------------------------------------
