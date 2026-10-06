@@ -24,6 +24,7 @@ from payload_models.payloads import (
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerStateSnapshot,
     RentalDockerOperationError,
     build_gpu_docker_config,
 )
@@ -110,6 +111,12 @@ class RecordingRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)

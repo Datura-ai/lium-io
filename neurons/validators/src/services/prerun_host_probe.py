@@ -20,7 +20,7 @@ as a whole and every consumer runs as before. The probe reads, never writes.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # The probe reads the same commands the per-command path runs, so the two paths cannot drift.
 from services.gpu_power_limit import POWER_STATE_CMD
@@ -61,7 +61,23 @@ PROBE_OUTPUT_LOG_CAP = 512
 
 # The docker listings, shared with the per-command path in docker_service.py (imported there, so
 # the two paths run the same text).
-DOCKER_PS_ALL_NAMES_CMD = '/usr/bin/docker ps -a --format "{{.Names}}"'
+# The stale sweep's listing: the full ID next to each name, so the sweep removes and records the
+# container instance it listed without another round trip (a retry reuses the name).
+DOCKER_PS_ALL_NAMES_IDS_CMD = '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"'
+
+
+def parse_container_listing(lines) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Names in listing order, and name -> full ID for the lines that carry a 64-hex ID."""
+    names: list[str] = []
+    ids: dict[str, str] = {}
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        names.append(parts[0])
+        if len(parts) == 2 and len(parts[1]) == 64 and all(c in "0123456789abcdef" for c in parts[1]):
+            ids[parts[0]] = parts[1]
+    return tuple(names), ids
 DOCKER_VOLUME_LS_NAME_DRIVER_CMD = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
 DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
     "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
@@ -125,6 +141,8 @@ class PrerunHostProbe:
     )  # raw nvidia-smi CSV for `_parse_power_state_csv`; None when not asked
     image_label_value: str | None  # the label's value, stripped; None when inspect failed
     port_check_container_names: tuple[str, ...] | None  # `port_check_containers_command` output
+    # name -> full container ID from the same listing as container_names; {} when none was read
+    container_ids: dict[str, str] = field(default_factory=dict)
 
     @property
     def volume_names(self) -> tuple[str, ...] | None:
@@ -165,7 +183,7 @@ def prerun_host_probe_command(
         'if [ -n "$out" ]; then printf \'%s\\n\' "$out" | awk -v t="$tag" \'{ print t "\\t" $0 }\' '
         f"|| echo {PREFIX_FAILED_MARKER}; fi; "
         f'printf \'%s{_RC_SUFFIX}\\t%s\\n\' "$tag" "$rc"; }}',
-        _section(PS_TAG, DOCKER_PS_ALL_NAMES_CMD),
+        _section(PS_TAG, DOCKER_PS_ALL_NAMES_IDS_CMD),
         _section(VOL_TAG, DOCKER_VOLUME_LS_NAME_DRIVER_CMD),
         _section(MNT_TAG, DOCKER_MOUNTED_VOLUME_NAMES_CMD),
         _section(GPU_MINOR_MAP_TAG, PROC_GPU_INFO_CMD),
@@ -251,8 +269,10 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
         # arrives as several LABEL lines and is joined back before the strip.
         label_value = "\n".join(lines.get(LABEL_TAG, ())).strip()
 
+    container_names, container_ids = parse_container_listing(stripped_lines(PS_TAG))
     return PrerunHostProbe(
-        container_names=stripped_lines(PS_TAG) if ok(PS_TAG) else None,
+        container_names=container_names if ok(PS_TAG) else None,
+        container_ids=container_ids if ok(PS_TAG) else {},
         volumes=volumes,
         mounted_volume_names=stripped_lines(MNT_TAG) if ok(MNT_TAG) else None,
         gpu_minor_map_stdout="\n".join(lines.get(GPU_MINOR_MAP_TAG, ()))
