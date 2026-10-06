@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 from typing import Any
 
 import asyncssh
@@ -126,6 +127,21 @@ def diagnose_dind_log(log_text: str | None) -> DindLogCause:
             return cause
     return DIND_SSHD_NOT_READY
 
+# DAH-3593: failures that come from the node or the network between us — a connect/login timeout,
+# a refused or dropped socket, an SSH error from the container's sshd. Logged at WARNING without a
+# traceback; every other exception in the probe is ours and stays ERROR.
+_NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    asyncssh.Error,
+    ConnectionError,  # refused, reset, aborted
+    socket.gaierror,
+    socket.timeout,
+)
+
+
+# How long the removal of the probe container may take on the way out of a probe.
+REMOVE_TIMEOUT_SECONDS = 20
+
 
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
@@ -164,9 +180,12 @@ class DindVerifier:
                 # same host, so a refusal without sysbox-runc has the same cause
                 cause = diagnose_docker_run_error(error_msg)
                 cause_code = cause.code if cause else None
-                failure_extra = get_extra_info({**log_ctx, "error": error_msg, "cause": cause_code})
-                logger.error(_m("DinD creation failed", extra=failure_extra))
-                await ssh_client.run(DockerCommand.remove_with_volumes(name))
+                # DAH-3593: the host's dockerd refused the run (a port already bound on the host,
+                # most of the time) — the provider's state; the verdict line scores it.
+                failure_extra = get_extra_info(
+                    {**log_ctx, "reason": "dind_run_refused_by_host", "error": error_msg, "cause": cause_code}
+                )
+                logger.warning(_m("DinD creation failed", extra=failure_extra))
                 return DindProbeResult(
                     success=False,
                     log_text=f"dind: check failed port={port.internal}",
@@ -187,7 +206,6 @@ class DindVerifier:
                 if sysbox:
                     sysbox = await self._sysbox_works(ssh, log_ctx)
 
-            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
             return DindProbeResult(
@@ -198,20 +216,47 @@ class DindVerifier:
             )
 
         except Exception as e:
-            logger.error(
-                _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
-                exc_info=True,
-            )
+            if isinstance(e, _NODE_SIDE_ERRORS):
+                # DAH-3593: sshd inside the DinD container never answered, or the node dropped the
+                # connection — one WARNING per executor per cycle, no traceback. Anything else is
+                # the validator's own failure and keeps ERROR with the traceback.
+                logger.warning(
+                    _m(
+                        "DinD check failed",
+                        extra=get_extra_info(
+                            {**log_ctx, "reason": "dind_node_unreachable", "error": str(e) or type(e).__name__}
+                        ),
+                    )
+                )
+            else:
+                logger.error(
+                    _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
+                    exc_info=True,
+                )
             error: DindLogCause | None = None
             if created and not sshd_answered and sysbox:
                 error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
-            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
                 error=error,
+            )
+        finally:
+            # One removal on every way out — ok, failed, raised, and cancelled (the validation
+            # fast path cancels this check when the sibling lane stops), so no probe container
+            # keeps its port bound until the next wave's stale-container cleanup. The diagnosis
+            # above has already read the container's logs by the time this runs.
+            await self._remove_container(ssh_client, name, log_ctx)
+
+    async def _remove_container(self, ssh_client: SSHClientConnection, name: str, log_ctx: dict[str, Any]) -> None:
+        try:
+            async with asyncio.timeout(REMOVE_TIMEOUT_SECONDS):
+                await ssh_client.run(DockerCommand.remove_with_volumes(name))
+        except Exception as e:  # noqa: BLE001 — the probe's own verdict is already decided
+            logger.warning(
+                _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
     async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
@@ -332,7 +377,9 @@ class DindVerifier:
             )
             return connection
 
-        logger.warning(
+        # DAH-3593: DEBUG — the caller logs the error this raises, so this was a second line for
+        # the same outcome.
+        logger.debug(
             _m(
                 "DinD SSH not ready before deadline",
                 extra=get_extra_info(

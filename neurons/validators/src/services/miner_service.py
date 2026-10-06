@@ -95,6 +95,14 @@ def _get_error_details(error: Exception) -> str:
     return f"{type(error).__name__}: {str(error)}"
 
 
+def _is_miner_unreachable_error(error: Exception) -> bool:
+    """A timeout or a refused/dropped connection: the miner is offline, not misbehaving (DAH-3593)."""
+    last_attempt = getattr(error, "last_attempt", None)
+    if last_attempt is not None and last_attempt.exception() is not None:
+        error = last_attempt.exception()
+    return isinstance(error, (asyncio.TimeoutError, aiohttp.ClientConnectionError))
+
+
 def _storage_repository_spec(
     volume_info,
     password: str | None,
@@ -288,9 +296,14 @@ class MinerService:
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
-        Flag off: list returned as is.
+        Flag off: the list minus repeats.
+
+        An executor uuid the miner lists more than once is kept once (its first entry), with or
+        without the flag: each entry starts its own pipeline, and a repeat would be validated,
+        and counted in its idle tier, twice in one cycle.
         """
         self._stop_awaiting_wave_list(payload)
+        executors = self._first_entry_per_uuid(executors, default_extra)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -307,13 +320,41 @@ class MinerService:
             claimed.append(executor)
         return claimed
 
+    @staticmethod
+    def _first_entry_per_uuid(
+        executors: list[ExecutorSSHInfo], default_extra: dict
+    ) -> list[ExecutorSSHInfo]:
+        unique: dict[str, ExecutorSSHInfo] = {}
+        repeats: dict[str, int] = {}
+        for executor in executors:
+            if executor.uuid in unique:
+                repeats[executor.uuid] = repeats.get(executor.uuid, 0) + 1
+                continue
+            unique[executor.uuid] = executor
+        for executor_uuid, dropped in repeats.items():
+            logger.warning(
+                _m(
+                    "Executor listed twice by miner; scored once",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": executor_uuid,
+                            "listed_count": dropped + 1,
+                            "dropped_count": dropped,
+                        }
+                    ),
+                ),
+            )
+        return list(unique.values())
+
     def _only_requested(
         self, executors: list[ExecutorSSHInfo], executor_id: str, default_extra: dict
     ) -> list[ExecutorSSHInfo]:
         """The express lane asked the miner for one executor; run the pipeline on that one only.
         A miner that answers with more (an old miner ignoring the filter, or a misbehaving one)
         would otherwise get every extra executor verified here, concurrently with the wave that
-        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958)."""
+        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958).
+        Repeats of the requested uuid are dropped too: each entry would start its own pipeline."""
         requested = [executor for executor in executors if executor.uuid == executor_id]
         if len(requested) != len(executors):
             logger.warning(
@@ -328,7 +369,7 @@ class MinerService:
                     ),
                 )
             )
-        return requested
+        return self._first_entry_per_uuid(requested, default_extra)
 
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
@@ -1204,6 +1245,12 @@ class MinerService:
                         # The spec carries at most the backend's bound; the rest of the list goes
                         # in PodStatesReport chunks below, or waits for the next cycle.
                         "pod_states": self._pod_states_capped_for_spec(result, default_extra),
+                        # None when the cycle's probe saw no rented pod with an ssh_port on this node
+                        "pod_ssh": (
+                            [observation.model_dump(mode="json") for observation in result.pod_ssh]
+                            if result.pod_ssh is not None
+                            else None
+                        ),
                     },
                 )
             except Exception as e:
@@ -2215,7 +2262,9 @@ class MinerService:
                     response_data = await response.json()
                     return response.status, response_data
         except asyncio.TimeoutError:
-            logger.error(
+            # DAH-3593: DEBUG — the caller logs the outcome once; a timeout here is the miner
+            # not answering, and this line doubled every one of them.
+            logger.debug(
                 _m(
                     f"REST API {operation_name} timed out after {timeout}s",
                     extra=get_extra_info({
@@ -2227,7 +2276,7 @@ class MinerService:
             )
             raise
         except aiohttp.ClientError as e:
-            logger.error(
+            logger.debug(
                 _m(
                     f"REST API {operation_name} client error",
                     extra=get_extra_info({
@@ -2311,11 +2360,16 @@ class MinerService:
             return True
 
         except Exception as e:
-            logger.warning(
+            # DAH-3593: a miner that does not answer is the offline-miner case the job request
+            # already reported at WARNING; anything else keeps its WARNING.
+            unreachable = _is_miner_unreachable_error(e)
+            log = logger.info if unreachable else logger.warning
+            log(
                 _m(
                     "Failed to remove SSH key via REST API. Validator key may still be present on miner",
                     extra=get_extra_info({
                         **log_extra,
+                        "reason": "miner_unreachable" if unreachable else "remove_failed",
                         "error": _get_error_details(e),
                         "miner_hotkey": miner_hotkey,
                         "executor_id": executor_id,
@@ -2535,28 +2589,60 @@ class MinerService:
                 payload,
                 "Requesting job to miner via REST API was cancelled",
             )
-        except asyncio.TimeoutError:
-            logger.error(
-                _m("Requesting job to miner via REST API was timed out", extra=get_extra_info(default_extra)),
-            )
+        except asyncio.TimeoutError as e:
+            self._log_miner_unreachable(payload, rented_data, default_extra, e)
             return self._build_failed_job_result(
                 payload,
                 "Requesting job to miner via REST API was timed out",
             )
         except Exception as e:
-            logger.error(
-                _m(
-                    "Requesting job to miner via REST API resulted in an exception",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "error": _get_error_details(e),
-                    }),
-                ),
-            )
+            if _is_miner_unreachable_error(e):
+                self._log_miner_unreachable(payload, rented_data, default_extra, e)
+            else:
+                logger.error(
+                    _m(
+                        "Requesting job to miner via REST API resulted in an exception",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": _get_error_details(e),
+                        }),
+                    ),
+                )
             return self._build_failed_job_result(
                 payload,
                 "Requesting job to miner via REST API resulted in an exception",
             )
+
+    @staticmethod
+    def _log_miner_unreachable(
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+        default_extra: dict,
+        error: Exception,
+    ) -> None:
+        """One WARNING per miner per cycle for a miner that does not answer (DAH-3593).
+
+        The miner being offline is the provider's state, not a validator fault: it was one ERROR
+        per call here plus one in `_make_rest_request`, 31,700 lines in two days for one miner.
+        The line carries the miner and how many of its rented executors this cycle could not
+        reach; the validator learns the miner's full executor list only from the miner itself.
+        """
+        rented_executors_skipped = sum(
+            1
+            for executor in (rented_data.executors.values() if rented_data else ())
+            if executor.miner_hotkey == payload.miner_hotkey
+        )
+        logger.warning(
+            _m(
+                "Miner did not answer the REST job request; its executors are skipped this cycle",
+                extra=get_extra_info({
+                    **default_extra,
+                    "reason": "miner_unreachable",
+                    "error": _get_error_details(error),
+                    "rented_executors_skipped": rented_executors_skipped,
+                }),
+            ),
+        )
 
     async def _handle_container(self, payload: ContainerBaseRequest):
         """REST API version of handle_container."""
