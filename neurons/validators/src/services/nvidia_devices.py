@@ -37,15 +37,21 @@ executor-side issues.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import shlex
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from typing import TYPE_CHECKING, NamedTuple
 
 import asyncssh
 
 from core.config import settings
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
+
+if TYPE_CHECKING:
+    from services.prerun_host_probe import PrerunHostProbe
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +150,11 @@ def _emit_kernel_xml_disagreement(
     )
 
 
-_PROC_GPU_INFO_CMD = (
+# Bound on the per-cycle procfs read in read_kernel_gpu_view (DAH-2662): reading a few procfs files
+# is instant on a live host; the same bound CpuTruthCheck puts on its sysfs read.
+KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS = 15
+
+PROC_GPU_INFO_CMD = (
     "for f in /proc/driver/nvidia/gpus/*/information; do "
     '[ -r "$f" ] || continue; '
     "awk -F: '"
@@ -194,16 +204,26 @@ async def build_gpu_docker_config_for_executor(
     *,
     executor_id: str | None = None,
     default_extra: dict | None = None,
+    host_probe: PrerunHostProbe | None = None,
 ) -> GpuDockerConfig:
-    """Resolve structured GPU Docker options for SDK container creation."""
+    """Resolve structured GPU Docker options for SDK container creation.
+
+    DAH-3257: with ``host_probe`` the kernel minor map, the /dev/nvidiaN list and the shared
+    nodes are read from the pre-run probe instead of three SSH commands; the nvidia-smi XML
+    fallback and every verdict below are unchanged.
+    """
     try:
         if gpu_uuids:
             per_gpu, host_total = await _query_gpu_nodes_for_uuids(
-                ssh_client, gpu_uuids, executor_id=executor_id, default_extra=default_extra
+                ssh_client,
+                gpu_uuids,
+                executor_id=executor_id,
+                default_extra=default_extra,
+                host_probe=host_probe,
             )
             is_partial_rental = len(per_gpu) < host_total
         else:
-            per_gpu = await _query_all_gpu_nodes(ssh_client)
+            per_gpu = await _query_all_gpu_nodes(ssh_client, host_probe=host_probe)
             is_partial_rental = False
 
         # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
@@ -211,7 +231,9 @@ async def build_gpu_docker_config_for_executor(
         # manipulate another tenant's GPU, and the RDMA verbs devices belong to cards the other
         # tenant may be renting (DAH-2571). We don't sell MIG slices today, but stripping both
         # under partial rental closes the leak before either ever ships.
-        shared = await _query_shared_nodes(ssh_client, is_whole_host_rental=not is_partial_rental)
+        shared = await _query_shared_nodes(
+            ssh_client, is_whole_host_rental=not is_partial_rental, host_probe=host_probe
+        )
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception as exc:
         # 1a: the kernel-truth verdict (a rented UUID absent from procfs) otherwise dies as a bare
@@ -246,8 +268,17 @@ def _device_flags(nodes: Sequence[str]) -> str:
     return " ".join(f"--device={node}" for node in nodes)
 
 
-async def _query_all_gpu_nodes(ssh: asyncssh.SSHClientConnection) -> tuple[str, ...]:
-    res = await ssh.run("ls -1d /dev/nvidia[0-9]* 2>/dev/null || true")
+GPU_DEVICE_NODES_CMD = "ls -1d /dev/nvidia[0-9]* 2>/dev/null || true"
+
+
+async def _query_all_gpu_nodes(
+    ssh: asyncssh.SSHClientConnection,
+    *,
+    host_probe: PrerunHostProbe | None = None,
+) -> tuple[str, ...]:
+    if host_probe is not None and host_probe.gpu_device_nodes is not None:
+        return host_probe.gpu_device_nodes
+    res = await ssh.run(GPU_DEVICE_NODES_CMD)
     return _stdout_lines(res.stdout)
 
 
@@ -257,6 +288,7 @@ async def _query_gpu_nodes_for_uuids(
     *,
     executor_id: str | None = None,
     default_extra: dict | None = None,
+    host_probe: PrerunHostProbe | None = None,
 ) -> tuple[tuple[str, ...], int]:
     """Resolve requested UUIDs to /dev/nvidiaN nodes, plus return host GPU count.
 
@@ -265,11 +297,11 @@ async def _query_gpu_nodes_for_uuids(
     """
     errors: list[str] = []
     try:
-        uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh)
+        uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh, host_probe=host_probe)
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
-    # An empty map is the real signal, not the exception: _PROC_GPU_INFO_CMD swallows an
+    # An empty map is the real signal, not the exception: PROC_GPU_INFO_CMD swallows an
     # unreadable procfs (unexpanded glob, `|| continue`, stderr discarded) and exits 0, so an
     # honest host with no readable procfs would otherwise log identically to a spoof.
     proc_unreadable = not uuid_to_minor
@@ -343,10 +375,148 @@ def _missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) 
     return [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
 
 
+PROC_NVIDIA_GPUS_PATH = "/proc/driver/nvidia/gpus"
+PROC_GPU_INFO_GLOB = f"{PROC_NVIDIA_GPUS_PATH}/*/information"
+# One round-trip: the mounts that sit on /proc/driver/nvidia (raw /proc/self/mountinfo lines), the
+# filesystem each information file really lives on (`stat -f %T`: "proc" for procfs), then the
+# kernel's UUID list. The evidence comes first so a read through an overlay is recognised before
+# its UUIDs are trusted.
+KERNEL_GPU_FS_SEPARATOR = "--kernel-gpu-fs--"
+KERNEL_GPU_VIEW_SEPARATOR = "--kernel-gpu-uuids--"
+KERNEL_GPU_VIEW_CMD = (
+    "grep -F ' /proc/driver/nvidia' /proc/self/mountinfo 2>/dev/null; "
+    f"echo {KERNEL_GPU_FS_SEPARATOR}; stat -f -c '%n %T' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
+    f"stat -c '%n|%F' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
+    f"echo {KERNEL_GPU_VIEW_SEPARATOR}; {PROC_GPU_INFO_CMD}"
+)
+# procfs reports size 0 for the card's `information` node, so `stat -c %F` on a real node answers
+# "regular empty file"; a file the peer wrote into the runtime's tmpfs answers "regular file".
+INFORMATION_FILE_KINDS = ("regular file", "regular empty file")
+FOREIGN_MOUNTS_NAMED = 8  # the event names this many; the peer writes mountinfo, so it is capped
+_INFORMATION_FILE_RE = re.compile(
+    rf"{re.escape(PROC_NVIDIA_GPUS_PATH)}/[0-9a-fA-F]{{4,8}}:[0-9a-fA-F]{{2}}:[0-9a-fA-F]{{2}}\.[0-7]/information"
+)
+
+
+class KernelGpuView(NamedTuple):
+    """What the kernel says about the cards, and whether anything sits between us and the kernel."""
+
+    uuids: list[str] | None  # None = unreadable, empty, or read through a foreign mount
+    foreign_mounts: list[str]  # "<path> <fstype>" per mount or file on the gpus path that is not procfs
+
+
+def foreign_mounts_over_proc_nvidia_gpus(mountinfo: str, file_fs: str = "") -> list[str]:
+    """Mounts or files at or under /proc/driver/nvidia/gpus whose filesystem is not procfs.
+
+    The 2026-08-19 ban (providerban ddae45d9) recorded a tmpfs overlay on exactly this path: the
+    "kernel" list on that host was the operator's. The executor runs in a GPU container, where
+    libnvidia-container itself mounts a tmpfs at /proc/driver/nvidia and bind-mounts each host
+    gpus/<bus id> directory into it; a bind of the real procfs shows fstype `proc`, a bind taken
+    from a host overlay shows the overlay's fstype. Only the gpus subtree is judged, so the
+    runtime's own tmpfs one level up is not a finding. `file_fs` is the `stat -f '%n %T'` row per
+    information file: a plain file written into that tmpfs, with the card's proc bind removed, is
+    on no mount of its own, and shows here as `tmpfs` instead of `proc`. The `stat '%n|%F'` rows
+    (no -L) in the same text catch the last shape: a symlink to some other procfs file, which is on
+    procfs too but is not a regular file. A `proc` mount on the gpus subtree must be the bind of
+    its own path (mountinfo root == mount point without /proc), not of another procfs file.
+    """
+    found: list[str] = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        # mountinfo: id parent major:minor root mount_point options [optional…] - fstype source super
+        if len(fields) < 7 or "-" not in fields[6:]:
+            continue
+        root, mount_point, fstype = fields[3], fields[4], fields[fields.index("-", 6) + 1]
+        on_gpus = mount_point == PROC_NVIDIA_GPUS_PATH or mount_point.startswith(
+            PROC_NVIDIA_GPUS_PATH + "/"
+        )
+        if on_gpus and fstype != "proc":
+            found.append(f"{mount_point} {fstype}")
+        elif on_gpus and root != mount_point[len("/proc") :]:
+            found.append(f"{mount_point} proc:{root}")
+    for line in file_fs.splitlines():
+        if not line.strip():
+            continue
+        if "|" in line:
+            path, _, kind = line.strip().partition("|")
+        elif " " in line.strip():
+            path, _, kind = line.strip().rpartition(" ")
+            kind = "" if kind == "proc" else kind
+        else:
+            path, kind = line.strip(), ""
+        # a stat row whose path is not <gpus>/<pci bus id>/information is foreign too: the peer
+        # names the directories under a tmpfs, so a name with a newline would split its own row
+        if kind not in ("", *INFORMATION_FILE_KINDS) or not _INFORMATION_FILE_RE.fullmatch(path):
+            found.append(f"{path} {kind or 'unexpected path'}")
+    return found[:FOREIGN_MOUNTS_NAMED]
+
+
+async def read_kernel_gpu_view(ssh: asyncssh.SSHClientConnection) -> KernelGpuView:
+    """GPU UUIDs as the kernel driver reports them in /proc/driver/nvidia/gpus/*/information.
+
+    DAH-2662: the ban list is matched against the UUIDs the host *reports* (NVML, which an
+    `ld.so.preload` shim rewrites — the 2026-08-10 case incremented the last hex digit). procfs is
+    the one inventory that shim does not author, so bans are matched against it too. `uuids` is
+    None when the read fails or procfs is empty/unreadable: the caller falls back to the reported
+    list (fail-open, as before), never treats "unreadable" as a spoof.
+
+    A foreign mount over the gpus path (the 2026-08-19 kit: tmpfs on /proc/driver/nvidia/gpus) is
+    different: what it serves is not the kernel's, so `uuids` is None and `foreign_mounts` names
+    the mounts for the caller to judge.
+
+    The read is bounded: it runs on the fatal-check path of every executor every cycle, and a
+    wedged host would otherwise hold the check open for the executor's whole validation budget.
+    A timeout is one more "unreadable" (None), never a failure of the host.
+    """
+    try:
+        res = await asyncio.wait_for(
+            ssh.run(KERNEL_GPU_VIEW_CMD), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
+        )
+        if res.exit_status != 0:
+            raise RuntimeError(
+                "NVIDIA /proc GPU view query failed on executor: "
+                f"exit_status={res.exit_status}, stdout={res.stdout!r}, stderr={res.stderr!r}"
+            )
+        mountinfo, _, rest = (res.stdout or "").partition(KERNEL_GPU_FS_SEPARATOR)
+        file_fs, _, uuid_lines = rest.partition(KERNEL_GPU_VIEW_SEPARATOR)
+    except Exception as exc:
+        # fail-open by design; the line is what tells ops the kernel view was missing on this host
+        logger.warning(
+            "kernel GPU UUID read failed, bans matched on the reported list only: %s",
+            repr(exc)[:500],
+            extra={"executor_peer": _ssh_peer(ssh)},
+        )
+        return KernelGpuView(uuids=None, foreign_mounts=[])
+    foreign_mounts = foreign_mounts_over_proc_nvidia_gpus(mountinfo, file_fs)
+    if foreign_mounts:
+        logger.warning(
+            "foreign mount over %s: %s",
+            PROC_NVIDIA_GPUS_PATH,
+            foreign_mounts,
+            extra={"executor_peer": _ssh_peer(ssh)},
+        )
+        return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
+    uuids = list(_parse_uuid_minor_csv(uuid_lines))
+    # positive evidence: every UUID row must come from a file stat placed on procfs; a host whose
+    # stat printed nothing is unreadable (None), not a finding
+    procfs_rows = [line for line in file_fs.splitlines() if line.strip().endswith(" proc")]
+    if len(procfs_rows) < len(uuids):
+        logger.warning(
+            "kernel GPU UUID read had no procfs evidence for every card; withheld",
+            extra={"executor_peer": _ssh_peer(ssh)},
+        )
+        return KernelGpuView(uuids=None, foreign_mounts=[])
+    return KernelGpuView(uuids=uuids or None, foreign_mounts=[])
+
+
 async def _query_gpu_minor_map_from_proc(
     ssh: asyncssh.SSHClientConnection,
+    *,
+    host_probe: PrerunHostProbe | None = None,
 ) -> dict[str, int]:
-    res = await ssh.run(_PROC_GPU_INFO_CMD)
+    if host_probe is not None and host_probe.gpu_minor_map_stdout is not None:
+        return _parse_uuid_minor_csv(host_probe.gpu_minor_map_stdout)
+    res = await ssh.run(PROC_GPU_INFO_CMD)
     if res.exit_status != 0:
         raise RuntimeError(
             "NVIDIA /proc GPU minor query failed on executor: "
@@ -367,10 +537,43 @@ async def _query_gpu_minor_map_from_nvidia_smi_xml(
     return _parse_nvidia_smi_xml_minor_map(res.stdout)
 
 
+def shared_device_nodes_command(*, is_whole_host_rental: bool, whole_host_only: bool = False) -> str:
+    """The `sh` command listing the shared device nodes a rental of this shape gets.
+
+    ``whole_host_only`` prints just the nodes a whole-host rental gets ON TOP of a partial one (the
+    RDMA verbs devices and the caps/IMEX directories), in the order the full command prints them
+    after the common nodes — the pre-run probe (DAH-3257) lists both parts once and picks later.
+    """
+    common_globs = (
+        "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
+        "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
+        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
+    )
+    whole_host_globs = "/dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
+    if whole_host_only:
+        globs = whole_host_globs
+    elif is_whole_host_rental:
+        globs = f"{common_globs} {whole_host_globs}"
+    else:
+        globs = common_globs
+    cmd = (
+        f"for p in {globs}; do "
+        '[ -e "$p" ] && printf "%s\\n" "$p"; '
+        "done"
+    )
+    if is_whole_host_rental:
+        cmd += (
+            "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
+            "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
+        )
+    return cmd
+
+
 async def _query_shared_nodes(
     ssh: asyncssh.SSHClientConnection,
     *,
     is_whole_host_rental: bool = True,
+    host_probe: PrerunHostProbe | None = None,
 ) -> tuple[str, ...]:
     """Enumerate shared NVIDIA control nodes, and the RDMA verbs nodes, that exist on the host.
 
@@ -387,24 +590,11 @@ async def _query_shared_nodes(
     that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
     holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
-    globs = (
-        "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
-        "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
-        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
-    )
-    if is_whole_host_rental:
-        globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
-    cmd = (
-        f"for p in {globs}; do "
-        '[ -e "$p" ] && printf "%s\\n" "$p"; '
-        "done"
-    )
-    if is_whole_host_rental:
-        cmd += (
-            "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
-            "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
-        )
-    res = await ssh.run(cmd)
+    if host_probe is not None:
+        probed = host_probe.shared_nodes_for(is_whole_host_rental=is_whole_host_rental)
+        if probed is not None:
+            return probed
+    res = await ssh.run(shared_device_nodes_command(is_whole_host_rental=is_whole_host_rental))
     return _stdout_lines(res.stdout)
 
 

@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 
+from core.config import settings
 from services.executor_image_policy import (
     ImageVerdict,
     normalize_sha256_digest,
@@ -80,6 +81,21 @@ class ExecutorImageCheck:
         if report.status is ImageVerdict.CURRENT:
             event = render_message(Msg.CURRENT, ctx=ctx, check_id=self.check_id, what=what)
             passed = True
+        elif not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
+            # Warning only (DAH-2701 paused until DAH-3419 restores auto-update): the verdict
+            # and both digests are logged, the check passes, and the score is left alone.
+            passed = True
+            event = render_message(
+                Msg.OUTDATED_WARNING,
+                ctx=ctx,
+                check_id=self.check_id,
+                what=what,
+                remediation=outdated_image_remediation(report.expected_ref, enforced=False),
+                extra={
+                    "executor_image_status": report.status.value,
+                    "executor_image_check_enforced": False,
+                },
+            )
         else:
             rented_data = ctx.state.rented_data
             rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
@@ -95,8 +111,11 @@ class ExecutorImageCheck:
                     if is_rented
                     else "Validation failed - executor unavailable for rent until the image is current"
                 ),
-                remediation=outdated_image_remediation(report.expected_ref),
-                extra={"executor_image_status": report.status.value},
+                remediation=outdated_image_remediation(report.expected_ref, enforced=True),
+                extra={
+                    "executor_image_status": report.status.value,
+                    "executor_image_check_enforced": True,
+                },
             )
         return CheckResult(
             passed=passed,

@@ -95,6 +95,10 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce GTX 1060": 0.0,
     "NVIDIA Tesla M40": 0.0,
 }
+# `NVIDIA B300 SXM6 PC` is derived from the AC entry, never a row of its own (incentive/config.py says why).
+GPU_MODEL_RATES["NVIDIA B300 SXM6 PC"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300` is priced like B300 for now; revisit when GB300 market data exists.
+GPU_MODEL_RATES["NVIDIA GB300"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
 
 MAX_UPLOAD_SPEED = 1000
 MAX_DOWNLOAD_SPEED = 1000
@@ -127,6 +131,10 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
+# Declared ports are tallied per bucket of this width (by external port), so a wide range
+# forwarded only in part shows which part answered; at most 14 tallies over 1-65535 per pass
+# (28 per event, both passes).
+PORT_RANGE_BUCKET_WIDTH = 5000
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
@@ -144,7 +152,7 @@ SECONDS_PER_BLOCK = 12  # seconds per block
 FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
 
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
-DOCKER_DIND_IMAGE = "daturaai/dind:0.0.1"
+DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
 LIB_NVIDIA_ML_DIGESTS = {
     "535.54.03": "49e63c42aa95bba6b9aa562ee57e496c:15a37892671187547b6dd21a07e8149315e529211dc30ca6ee8d8d089a338d53",
@@ -221,6 +229,7 @@ LIB_NVIDIA_ML_DIGESTS = {
     "595.58.03": "af7923894f6ad89eafb78c03daf422a9:9a0ef13c817030b07f931cbe6115a70f7674ecbd3bee6047417ffc7ae699ed1b",
     "595.71.05": "020cd1156cbce5ebbf12963d0c70496e:9eb4358b7fea76556657670a6ae6b0017eaa4256b56c421a36626bf8c2b5f3f5",
     "595.84": "4de0188efc8bb6c7485e599fcc718978:6d8a58eb15a1c2e6067ec977e9de57b42a3d632b4073818ab648370fecfc82b1",
+    "595.91.07": "815eeecaf87fd8f947c66b2ef1ca7525:7515da5b856b805fc07811dfd72a37545c1bd9e78f4d8c16421e155ac8f4aec4",
     "610.43.02": "5ad6c02411f730682597558ae8f3a9f8:2dc828b3f5027f98e05c7607c1d8129d11bd28de4c2091c5cd7e32dbc21ec172",
 }
 
@@ -237,6 +246,10 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 
 POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
+# DAH-2740: the name a pod's current container is parked under while an edit builds its replacement.
+# Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to
+# every protected pod name) and reap it once the pod is gone.
+EDIT_PARKED_SUFFIX = "__prev"
 # DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
@@ -259,6 +272,15 @@ FILLER_CONTAINER_GRACE_MINUTES = 15
 # of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
 # let a provider reuse the name of their own broken pod for a foreign workload.
 BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
+# How long after a rental closes its pod container still counts as the unrent flow's teardown rather
+# than an orphan: with RENTAL_TEARDOWN_DEFERRAL_ENABLED on, the GPU usage check defers instead of
+# scoring 0 until this long after the close, which covers one run and occasionally two. A run is
+# shorter than this, so a rental that ends while the run is inside it always lands here. It must stay
+# short for the same reason as the grace above: the pod's name must not shield a workload for long.
+RENTAL_TEARDOWN_GRACE_MINUTES = 15
+# How far ahead of the validator's clock a rental's close time may sit and still read as a rental
+# that just ended. A close time further ahead is not trusted, so the container stays an orphan.
+RENTAL_CLOSE_CLOCK_SKEW_MINUTES = 5
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
 FILLER_LIVENESS_GRACE_MINUTES = 10
@@ -330,15 +352,26 @@ TDX_WHITELIST = {
     # (`hash in TDX_WHITELIST["COMPOSE_HASH"][env]`) keep working on the dict keys.
     "COMPOSE_HASH": {
         "PROD": {
-            # DAH-2338 — executor-v1.108 measured compose: executor-runner pinned to
-            # daturaai/compute-subnet-executor-runner:latest @
-            # sha256:f85b948b6cb280423b17e34ea28c0f98139243ecea32cd42106f90d19dc619f1
-            # (executor @ sha256:94b5e734…, pushed 2026-07-07), init/pre-launch as
-            # of 077f42c1 (G1 GPU attestation guest env whitelist). Replaces v2
-            # 0995e41b… (executor-v1.107 runner b58211e7…) — CVMs on the old digest
-            # must redeploy with EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:f85b948b… .
-            # Assumes default `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
-            "ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6": 3,
+            # DAH-2861 — measured compose of the latest runner, daturaai/compute-subnet-executor-runner
+            # @ sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7 (pushed
+            # 2026-08-19, executor @ sha256:8dbf5395…, a prod build with no config_override.py).
+            # Seen in the event log of the 146.88.195.16 CVM on 2026-09-03. Covers app/
+            # docker-compose.yml, init_script.sh and pre_launch_script.sh at 880cb585 plus default
+            # `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo). Editing any of those
+            # three files moves the hash and needs the next version here: the checkout's hash is
+            # rebuilt by neurons/executor/dstacktee/scripts/compose_hash.py and
+            # tests/test_tdx_compose_hash_whitelist.py fails CI while it is missing. Kept: CVMs
+            # created from executor-v1.127 and earlier still attest with it.
+            "8224d58801af6333561f116e2d566b179b399f1d1d700f0e8a5ab9326ae901d9": 4,
+            # DAH-3602 — the same runner digest with the measured files at c102a332 (lium-io#1339,
+            # DAH-2834, three settings added to init_script.sh; executor-v1.128 to v1.130 and main).
+            # Missing here from 2026-09-14 to this entry, so every CVM created from those releases
+            # would score zero with the whitelist on. Version 5; DAH-2780's pre_launch_script.sh
+            # rewrite (lium-io#1266) takes 6.
+            "87d3430000bb7046a19eeaa6efe074fd8b5f7856bbfe2906addab238174c542d": 5,
+            # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
+            # that runner bakes the STAGING validator hotkey via config_override.py and answers every
+            # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.
         },
         "STAGE": {
             "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,

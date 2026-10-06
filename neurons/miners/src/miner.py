@@ -7,7 +7,6 @@ from fastapi import FastAPI
 
 from core.config import settings
 from core.miner import Miner
-from routes.debug_routes import debug_apis_router
 from routes.validator_interface import validator_router
 from core.utils import configure_logs_of_other_modules, wait_for_services_sync
 
@@ -35,7 +34,6 @@ app = FastAPI(
 )
 
 app.include_router(validator_router)
-app.include_router(debug_apis_router)
 
 reload = True if settings.ENV == "dev" else False
 

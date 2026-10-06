@@ -162,6 +162,13 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Maxwell
     "NVIDIA Tesla M40":                                   [12288, 24576],  # 12/24 GB multi-variant
 }
+# `NVIDIA B300 SXM6 PC` (provider-observed on real hardware, 21 Sep 2026: memory.total 275040 MiB on all
+# 8 GPUs — the AC row's observed total, inside the [0.90, 1.05] band for both names; not in NVIDIA's
+# public chip list) takes the AC card's sizes. Derived, never a row of its own: a corrected AC size moves
+# both names. The precheck fails closed on a reading outside the window.
+GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
+# `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300, so the same nominal size; no GB300 reading observed yet.
+GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
@@ -188,6 +195,9 @@ NORMALIZATION_MAP: dict[str, str] = {
     "Tesla T4":                             "NVIDIA T4 Tensor Core GPU",
     "NVIDIA T4":                            "NVIDIA T4 Tensor Core GPU",
     "NVIDIA A10":                           "NVIDIA A10 Tensor Core GPU",
+    # A10G is the AWS-only SKU of the A10 (GA102, 24 GB GDDR6; g5 instances report it as
+    # "NVIDIA A10G"). Rentable as an A10; A10's rate is 0.0, so no incentive either way.
+    "NVIDIA A10G":                          "NVIDIA A10 Tensor Core GPU",
     # Add observed CUDA names here as production logs surface them.
 }
 
