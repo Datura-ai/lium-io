@@ -22,11 +22,11 @@ import bittensor
 import redis.exceptions
 from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
+    DOCKER_VOLUMES_DF_COMMAND,
     ContainerDeathDiagnostics,
     DockerCommand,
     collect_container_death_diagnostics,
     df_available_bytes,
-    df_command,
     parse_df_available_bytes,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -437,7 +437,7 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
-# the df that removal reads after its rm is optional: each of its two docker calls gets this bound
+# the df that removal reads after its rm is optional: its helper `docker run` gets this bound
 _DF_AFTER_REMOVAL_TIMEOUT_SECONDS = 5
 
 
@@ -595,7 +595,7 @@ class ContainerCleanupReport:
 
     # one `docker rm -fv` exited 0, the re-read `docker ps -a` lists no filler, no `docker volume rm` ran
     removed_cleanly_without_volume_rm: bool = False
-    # df of the docker root read by that removal command after its rm; None when not asked or not read
+    # df of docker's volumes read by that removal command after its rm; None when not asked or not read
     df_avail_bytes_after_removal: int | None = None
 
 
@@ -605,7 +605,7 @@ def _remove_and_list_containers_command(
     """One shell line for a customer create's removal (DAH-3980): `docker rm -fv` of the ``targets``
     (a listed ID, or the name when no ID was listed), its exit status, the `docker ps -a` names and
     full IDs left after it, that listing's exit status, then `docker volume rm` of the unprotected
-    volumes, if any, and ``with_df`` the volume probe's df of the docker root, read after all of
+    volumes, if any, and ``with_df`` the volume probe's df of docker's volumes, read after all of
     them when the rm and the listing exited 0 early enough, with the exit status of that step (0
     only for a df read to its end). Every output line is tagged so the parser never guesses."""
     names = " ".join(shlex.quote(target) for target in targets)
@@ -618,19 +618,18 @@ def _remove_and_list_containers_command(
         volumes = " ".join(shlex.quote(volume) for volume in volume_names)
         command += f"; /usr/bin/docker volume rm {volumes} >/dev/null 2>&1 || true"
     if with_df:
-        # ponytail: +1 `docker info` and +1 helper `docker run` (~0.4 s on the lab box) on every such
-        # removal; skip it when the early df already sizes the volume at the request cap, if it matters
-        df_cmd = df_command('"$root"')
+        # ponytail: +1 helper `docker run` (~0.3 s on the lab box) on every such removal; skip it when
+        # the early df already sizes the volume at the request cap, if it matters
         bound = f"timeout -k 1 {_DF_AFTER_REMOVAL_TIMEOUT_SECONDS}"
         # the df never fails the removal: it starts only after a clean rm and listing (any other
-        # removal drops it and needs what is left of the deadline) and while both bounded calls
-        # still end well inside the removal's timeout; a hung or failed one only leaves a non-zero status
+        # removal drops it and needs what is left of the deadline) and while the bounded df, at four
+        # times its worst case, still ends inside the removal's timeout; a hung or failed one only
+        # leaves a non-zero status
         latest_start = _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS - 4 * (_DF_AFTER_REMOVAL_TIMEOUT_SECONDS + 1)
         command = (
             f"t0=$(date +%s); {command}; [ \"$rm_rc\" = 0 ] && [ \"$ps_rc\" = 0 ] && [ -n \"$t0\" ] && "
             f"[ $(($(date +%s) - t0)) -lt {latest_start} ] && "
-            f"root=\"$({bound} /usr/bin/docker info --format '{{{{.DockerRootDir}}}}')\" && "
-            f"df_out=\"$({bound} {df_cmd})\"; "
+            f"df_out=\"$({bound} {DOCKER_VOLUMES_DF_COMMAND})\"; "
             "printf 'DF\\t%s\\t%s\\n' \"$?\" \"$(printf '%s' \"$df_out\" | tr '\\n' '\\r')\""
         )
     return command
@@ -695,10 +694,9 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
     list and the loopback plugin state, each output line tagged so the parser never guesses.
     Sections are joined with `;` — a failing section leaves its tag out (the volume list, whose
     empty output is legitimate, is followed by a `VOLS\\t<exit status>` line) and the parser raises."""
-    df_cmd = df_command('"$root"')
     df_part = (
         # df prints two lines; fold them onto one tagged line (\n → \r) so every record stays one line
-        f"printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\"; "
+        f"printf 'DF\\t%s\\n' \"$({DOCKER_VOLUMES_DF_COMMAND} | tr '\\n' '\\r')\"; "
         if with_df
         else ""
     )
@@ -3359,8 +3357,7 @@ class DockerService:
             # the renter's side and give the cache back unconditionally; the filler re-downloads it
             # after the rental, which is the filler's cost to pay, not the customer's.
             if requested_gb:
-                docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                free_bytes = await self._get_fs_available_bytes(ssh_client)
                 free_gb = free_bytes / (1024**3)
                 if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
                     return False
@@ -3428,8 +3425,7 @@ class DockerService:
             return list(payload.cache_volumes)
 
         try:
-            docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
-            free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+            free_gb: float = await self._get_fs_available_bytes(ssh_client) / (1024**3)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4863,15 +4859,11 @@ class DockerService:
             timeout_seconds=timeout,
         )
 
-    async def _get_fs_available_bytes(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        docker_root_dir: str,
-    ) -> int:
+    async def _get_fs_available_bytes(self, ssh_client: asyncssh.SSHClientConnection) -> int:
         # Delegates to the shared helper so the grant path (here) and the disk-tight reclaim
         # (container_cleanup) can never disagree on how free disk is measured — a df fix landing in
         # one copy only would make the validator grant a cache the backstop immediately reclaims.
-        return await df_available_bytes(ssh_client, docker_root_dir)
+        return await df_available_bytes(ssh_client)
 
     async def _get_existing_vloopback_bytes(
         self,
@@ -5040,7 +5032,7 @@ class DockerService:
                 )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                df_avail_bytes = await self._get_fs_available_bytes(ssh_client)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
         except asyncio.CancelledError:
             raise

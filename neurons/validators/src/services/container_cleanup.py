@@ -347,15 +347,11 @@ class ContainerCleanup:
         return bool((result.stdout or "").strip())
 
     async def _get_free_disk_gb(self, ssh_client: asyncssh.SSHClientConnection) -> float | None:
-        # The root is DISCOVERED, not assumed: a node with docker moved to a dedicated disk would
-        # otherwise be judged by its root filesystem, and the reclaim would either never fire while
-        # docker's disk is full or fire and delete a healthy cache the node had room for.
-        info = await ssh_client.run("/usr/bin/docker info --format '{{.DockerRootDir}}'")
-        if getattr(info, "exit_status", 0) != 0:
-            return None
-        docker_root: str = (info.stdout or "").strip() or "/var/lib/docker"
+        # Measured where docker keeps its volumes, not assumed: a node with docker moved to a dedicated
+        # disk would otherwise be judged by its root filesystem, and the reclaim would either never fire
+        # while docker's disk is full or fire and delete a healthy cache the node had room for.
         try:
-            return await df_available_bytes(ssh_client, docker_root) / (1024**3)
+            return await df_available_bytes(ssh_client) / (1024**3)
         except Exception:
             # A backstop that cannot measure declines rather than guesses; the caller treats None as
             # "leave the cache alone".
