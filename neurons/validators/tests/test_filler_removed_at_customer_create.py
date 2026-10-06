@@ -434,6 +434,8 @@ case "$1" in
   rm) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$RM_ARGS"; done ;;
   ps) printf 'NAME\\tpod_other\\n' ;;
   volume) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$VOLUME_RM_ARGS"; done ;;
+  info) printf '/var/lib/docker\\n' ;;
+  run) printf '%s\\0' "$@" >> "$RUN_ARGS"; printf 'Filesystem 1-blocks Used Available Use%% Mounted\\n/dev/vda1 9 2 4242 30%% /hostfs\\n' ;;
 esac
 """
 
@@ -461,7 +463,28 @@ def test_a_hostile_container_name_stays_one_argument_of_the_rm(tmp_path):
     assert list(tmp_path.glob("pwned*")) == []
     assert (tmp_path / "rm_args").read_text().split("\0")[:-1] == hostile_names
     assert (tmp_path / "volume_rm_args").read_text().split("\0")[:-1] == hostile_volumes
-    assert ds_module._parse_remove_and_list_containers(stdout) == (0, (("pod_other",), {}))
+    assert ds_module._parse_remove_and_list_containers(stdout) == (0, (("pod_other",), {}), None)
+
+
+def test_the_removal_reads_df_of_the_docker_root_after_the_rm(tmp_path):
+    stub = tmp_path / "docker"
+    stub.write_text(_DOCKER_STUB)
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    command = _remove_and_list_containers_command(["filler_x"], ["volume_x"], with_df=True).replace(
+        "/usr/bin/docker", str(stub)
+    )
+    env = {
+        **os.environ,
+        "RM_ARGS": str(tmp_path / "rm_args"),
+        "VOLUME_RM_ARGS": str(tmp_path / "volume_rm_args"),
+        "RUN_ARGS": str(tmp_path / "run_args"),
+    }
+
+    # bytes: text mode would turn the DF record's "\r" into "\n"
+    stdout = subprocess.run(["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, check=False).stdout
+
+    assert "/var/lib/docker:/hostfs:ro" in (tmp_path / "run_args").read_text().split("\0")
+    assert ds_module._parse_remove_and_list_containers(stdout.decode()) == (0, (("pod_other",), {}), 4242)
 
 
 @pytest.mark.asyncio
