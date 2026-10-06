@@ -1455,7 +1455,8 @@ create_steps_after_reply = _CreateStepsAfterReplyRegistry()
 
 
 class _OwnSweepRegistry:
-    """Container IDs this validator sent `docker rm` for in a create's stale sweep (clean_existing_containers).
+    """Container IDs this validator sent `docker rm` for in a create's stale sweep (clean_existing_containers)
+    or in a customer create's filler removal at SSH connect (remove_fillers_at_ssh_connect).
 
     A customer's create removes every `filler_*` on the node, including a filler whose own create is
     still bootstrapping. That create then finds its container gone; the validator removed it, so it is
