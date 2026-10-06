@@ -507,6 +507,10 @@ class Settings(BaseSettings):
     )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
+    # DAH-4001 — rolling idle settlement. off: submit the accumulator every tempo as before. shadow: also post
+    # every cycle's vector to the backend and claim its matured batches without submitting them (comparison only).
+    # enforce: submit only the backend's matured batches, a day behind; with none, resubmit the last accepted one.
+    SETTLEMENT_MODE: str = Field(env="SETTLEMENT_MODE", default="off")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
     EXECUTOR_IMAGE_REF: str = Field(

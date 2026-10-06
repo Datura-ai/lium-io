@@ -765,7 +765,8 @@ class SubtensorClient:
         self,
         miner_scores: dict[str, float],
         active_hotkeys: set[str] | None = None,
-    ) -> None:
+        wait_for_inclusion: bool = False,
+    ) -> bool:
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
@@ -794,7 +795,7 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            return
+            return False
 
         metagraph = self.get_metagraph()
         self._log_scored_hotkeys_missing_from_selected_miners(
@@ -903,7 +904,7 @@ class SubtensorClient:
             "weights": [int(w) for w in list(uint_weights)],
             "version_key": int(self.version_key),
             "wait_for_finalization": False,
-            "wait_for_inclusion": False,
+            "wait_for_inclusion": wait_for_inclusion,
             "current_block": current_block,
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
@@ -916,7 +917,7 @@ class SubtensorClient:
             weights=uint_weights,
             version_key=self.version_key,
             wait_for_finalization=False,
-            wait_for_inclusion=False,
+            wait_for_inclusion=wait_for_inclusion,
         )
         if result is True:
             logger.info(
@@ -937,6 +938,7 @@ class SubtensorClient:
                     ),
                 ),
             )
+        return result is True
 
     def get_last_update(self, block):
         try:

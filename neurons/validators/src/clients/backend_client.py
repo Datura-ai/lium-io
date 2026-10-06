@@ -41,6 +41,35 @@ VERIFICATION_STARTED_BATCH_MAX = 512
 T = TypeVar("T", bound=BaseModel)
 
 
+class CycleScoresReport(BaseModel):
+    """The backend's receipt for a cycle's vector (DAH-4001)."""
+
+    cycle_id: str
+    matures_at: datetime
+    created: bool
+
+
+class WeightBatch(BaseModel):
+    """One immutable weight vector the backend built from matured cycles (DAH-4001)."""
+
+    batch_id: str
+    cycle_ids: list[str]
+    hotkey_scores: dict[str, float]
+    attempts: int
+    status: str
+    first_attempt_block: int | None = None
+
+
+class WeightBatchNext(BaseModel):
+    batch: WeightBatch | None = None
+
+
+class WeightBatchResult(BaseModel):
+    batch_id: str
+    status: str
+    attempts: int
+
+
 class BackendClient:
     """HTTP client with session pooling and validator signature headers."""
 
@@ -501,3 +530,46 @@ class BackendClient:
             )
         except Exception as exc:
             logger.warning(_m("Failed to report unknown driver", extra={"driver": driver_version, "error": str(exc)}))
+
+    # DAH-4001 — rolling idle settlement
+
+    async def report_cycle_scores(
+        self,
+        *,
+        cycle_id: str,
+        cycle_started_at: datetime,
+        scored_at: datetime,
+        block: int,
+        burn_hotkey: str,
+        hotkey_scores: dict[str, float],
+    ) -> CycleScoresReport | None:
+        """Hand the cycle's per-hotkey vector to the backend, which settles it a day later."""
+        path = f"/validator/{self.keypair.ss58_address}/cycles"
+        return await self.post(
+            path,
+            CycleScoresReport,
+            json_data={
+                "cycle_id": cycle_id,
+                "cycle_started_at": cycle_started_at.isoformat(),
+                "scored_at": scored_at.isoformat(),
+                "block": block,
+                "burn_hotkey": burn_hotkey,
+                "hotkey_scores": hotkey_scores,
+            },
+        )
+
+    async def claim_weight_batch(self) -> WeightBatch | None:
+        """The batch to submit this tempo, or None when nothing matured (or the backend is unreachable)."""
+        path = f"/validator/{self.keypair.ss58_address}/weight-batches/next"
+        response = await self.post(path, WeightBatchNext)
+        return response.batch if response is not None else None
+
+    async def report_weight_batch_result(
+        self, batch_id: str, *, success: bool, block: int | None, error: str | None, shadow: bool
+    ) -> WeightBatchResult | None:
+        path = f"/validator/{self.keypair.ss58_address}/weight-batches/{batch_id}/result"
+        return await self.post(
+            path,
+            WeightBatchResult,
+            json_data={"success": success, "block": block, "error": error, "shadow": shadow},
+        )
