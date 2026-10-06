@@ -14,11 +14,35 @@ from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
 @dataclass(frozen=True)
 class DefaultPrice:
-    """Sentinel: resolve to MACHINE_PRICES[gpu_model] * multiplier."""
+    """Sentinel: resolve to rental_prices_per_hour[gpu_model] * multiplier."""
     multiplier: float = 1.0
 
 
 DEFAULT_PRICE = DefaultPrice()
+
+
+# Hourly anchor per GPU model for the unrented incentive. The table is lium-core's, installed from
+# PyPI at the version pinned in pdm.lock, which anchors the RTX PRO 6000 Server Edition at 0.86 and
+# the Workstation Edition at 1.0. The two are the same card for a renter (DAH-3230: the source table
+# in packages/lium-core and the backend's MACHINE_PRICES move the Server Edition to 1.0), so the
+# validator pins the two editions to parity here; the override can go once the validator's lock
+# carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
+# the pinned lium-core still has 5.10).
+RENTAL_PRICES_PER_HOUR: dict[str, float] = {
+    **DEFAULT_SHARED_CONFIG.machine_prices,
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+    ],
+    "NVIDIA B300 SXM6 AC": 6.4,
+}
+# `NVIDIA B300 SXM6 PC`: provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300
+# SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
+# only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
+# from the AC entry, so a re-price of the AC card moves both names.
+RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300` is priced like B300 for now. A different card from the B300, so its own base
+# model and idle tier (it never fills the B300 cap), at the B300 rate and caps.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]  # mirrors B300; revisit when GB300 market data exists
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -32,25 +56,39 @@ DEFAULT_PRICE = DefaultPrice()
 # subsidy (no buckets → no subsidy path).
 #
 # The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
-# bucket cap equals `machines × gpus_per_machine`. Eligible families use
+# bucket cap equals `machines × gpus_per_machine`. Eligible families default to
 # `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
+#
+# B300 1× bucket = 4 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
+# B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle.
+# The bucket pays for 4 cards, one below that p95 (Rustam, 18 Sep 2026). The
+# 8× bucket is unchanged. The 1× cap also dilutes the free GPUs of partially rented
+# split 8× nodes: their free portion is scored as a virtual result (DAH-2467) that is
+# always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
+# remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
+# those cards share the 4 with the idle single-card nodes.
+#
+# The A100 and L40S 8-card buckets use lower, demand-based caps than the default
+# 8-card bucket; the values are in the table below.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 10, 8: 64},
+    "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
     "RTX 4090": {1: 10, 8: 64},
-    "A100": {1: 10, 8: 64},
+    "A100": {1: 10, 8: 40},
     "RTX A6000": {1: 10, 8: 64},
     "RTX 3090": {1: 10, 8: 64},
     "H800": {},
+    "A800": {},
+    "CMP 170HX": {},
     "RTX 5090": {1: 10, 8: 64},
     "RTX 4000 Ada Generation": {},
     "RTX 6000 Ada Generation": {1: 10, 8: 64},
     "RTX PRO 6000": {1: 10, 8: 64},
     "L4": {},
-    "L40S": {1: 10, 8: 64},
+    "L40S": {1: 10, 8: 16},
     "L40": {1: 10, 8: 64},
     "RTX 2000 Ada Generation": {},
     "RTX A5000": {},
@@ -71,8 +109,12 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 4070": {},
     "RTX 4060 Ti": {},
     "RTX 4060": {},
+    "RTX PRO 2000": {},
     "RTX PRO 4000": {},
+    "RTX PRO 4500": {},
     "RTX PRO 5000": {},
+    "RTX PRO 6000D": {},
+    "RTX 4500 Ada Generation": {},
     "RTX 5000 Ada Generation": {},
     "RTX 5880 Ada Generation": {},
     "A10": {},
@@ -112,9 +154,10 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "GTX 1060": {},
     "Tesla M40": {},
 }
+MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300; revisit when GB300 market data exists
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
-# Use DEFAULT_PRICE sentinel to fall back to MACHINE_PRICES.
+# Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
 D = DEFAULT_PRICE
@@ -164,19 +207,27 @@ BASE_GPU_MAP = {
     "NVIDIA GeForce RTX 4060 Ti": "RTX 4060 Ti",
     "NVIDIA GeForce RTX 4060": "RTX 4060",
     "NVIDIA RTX 4000 Ada Generation": "RTX 4000 Ada Generation",
+    "NVIDIA RTX PRO 2000 Blackwell": "RTX PRO 2000",
     "NVIDIA RTX PRO 4000 Blackwell": "RTX PRO 4000",
+    "NVIDIA RTX PRO 4500 Blackwell": "RTX PRO 4500",
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": "RTX PRO 4500",
     "NVIDIA RTX PRO 5000 Blackwell": "RTX PRO 5000",
+    "NVIDIA RTX 4500 Ada Generation": "RTX 4500 Ada Generation",
     "NVIDIA RTX 5000 Ada Generation": "RTX 5000 Ada Generation",
     "NVIDIA RTX 5880 Ada Generation": "RTX 5880 Ada Generation",
     "NVIDIA RTX 6000 Ada Generation": "RTX 6000 Ada Generation",
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": "RTX PRO 6000",
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": "RTX PRO 6000",
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": "RTX PRO 6000D",
+    "NVIDIA RTX 6000D": "RTX PRO 6000D",
     "NVIDIA L4": "L4",
     "NVIDIA L40S": "L40S",
     "NVIDIA L40": "L40",
     "NVIDIA RTX 2000 Ada Generation": "RTX 2000 Ada Generation",
     "NVIDIA A100 80GB PCIe": "A100",
     "NVIDIA A100-SXM4-80GB": "A100",
+    "NVIDIA A800 80GB PCIe": "A800",
+    "NVIDIA CMP 170HX": "CMP 170HX",
     "NVIDIA A10 Tensor Core GPU": "A10",
     "NVIDIA RTX A6000": "RTX A6000",
     "NVIDIA RTX A5000": "RTX A5000",
@@ -221,6 +272,8 @@ BASE_GPU_MAP = {
     "NVIDIA GeForce GTX 1060": "GTX 1060",
     "NVIDIA Tesla M40": "Tesla M40",
 }
+BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
+BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):
@@ -256,13 +309,13 @@ class IncentiveConfig(BaseModel):
     )
 
     rental_prices_per_hour: dict[str, float] = Field(
-        default=DEFAULT_SHARED_CONFIG.machine_prices,
+        default=RENTAL_PRICES_PER_HOUR,
         description="Rental prices per GPU type in USD/hour"
     )
 
     gpu_count_custom_prices: dict[str, dict[str, float | DefaultPrice]] = Field(
         default=GPU_COUNT_CUSTOM_PRICES,
-        description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for MACHINE_PRICES fallback."
+        description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for rental_prices_per_hour fallback."
     )
 
     @field_validator("algorithm")

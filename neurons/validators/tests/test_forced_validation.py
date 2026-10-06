@@ -1,277 +1,154 @@
+"""DAH-2090: the forced validation cycle, and the gate that keeps it off production."""
+
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
-from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 
-import services.miner_service as miner_service_module
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.forced_validation import (
-    ForceValidationConflict,
-    ForceValidationNotFound,
-    ForceValidationRequestStore,
-)
+from clients.compute_client import ComputeClient
+from core.validator import Validator
+from payload_models.payloads import ForcedValidationCycleRequest
 from services.miner_service import MinerService
-from services.task_service import JobResult
+from services.redis_service import (
+    FORCED_VALIDATION_CYCLE_KEY,
+    FORCED_VALIDATION_CYCLE_TTL_SECONDS,
+    RedisService,
+)
+
+# The exact bytes the backend puts on the websocket, taken from
+# ForcedValidationCycleRequest().model_dump_json() in lium-io-backend.
+FORCED_CYCLE_MESSAGE_FROM_BACKEND = '{"message_type":"ForcedValidationCycleRequest"}'
 
 
-class FakeRedis:
-    def __init__(self):
-        self.data = {}
+def _make_client(monkeypatch, deploy_env: str) -> ComputeClient:
+    from core.config import settings
 
-    async def set(self, key, value, nx=False, ex=None):
-        if nx and key in self.data:
-            return None
-        self.data[key] = value
-        return True
-
-    async def get(self, key):
-        return self.data.get(key)
-
-    async def delete(self, key):
-        self.data.pop(key, None)
+    monkeypatch.setattr(settings, "DEPLOY_ENV", deploy_env)
+    client = ComputeClient.__new__(ComputeClient)
+    client.logging_extra = {"validator_hotkey": "validator-hotkey"}
+    client.miner_service = MagicMock(request_validation_cycle_now=AsyncMock())
+    client.lock = asyncio.Lock()
+    return client
 
 
-class FakeRedisService:
-    def __init__(self):
-        self.redis = FakeRedis()
+@pytest.fixture
+def shared_redis() -> FakeServer:
+    """One store, reached through two clients -- the connector's and the validator's."""
+    return FakeServer()
 
 
-def _executor(executor_id: str = "exec-1") -> ExecutorSSHInfo:
-    return ExecutorSSHInfo(
-        uuid=executor_id,
-        address="10.0.0.1",
-        port=8000,
-        ssh_username="root",
-        ssh_port=22,
-        python_path="/usr/bin/python3",
-        root_dir="/root",
-    )
-
-
-def _payload() -> MinerJobRequestPayload:
-    return MinerJobRequestPayload(
-        job_batch_id="forced-req",
-        miner_hotkey="miner-hotkey",
-        miner_coldkey="miner-coldkey",
-        miner_address="127.0.0.1",
-        miner_port=8000,
-    )
-
-
-def _encrypted_files() -> MinerJobEnryptedFiles:
-    return MinerJobEnryptedFiles(
-        encrypt_key="key",
-        all_keys={},
-        tmp_directory="/tmp",
-        machine_scrape_file_name="machine.py",
-    )
-
-
-def _job_result(executor: ExecutorSSHInfo) -> JobResult:
-    return JobResult(
-        spec={},
-        executor_info=executor,
-        score=1,
-        job_score=1,
-        job_batch_id="forced-req",
-        log_status="info",
-        log_text="ok",
-        gpu_model="H100",
-        gpu_count=1,
-    )
+def _redis_service(shared_redis: FakeServer) -> RedisService:
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis(server=shared_redis)
+    service.lock = asyncio.Lock()
+    return service
 
 
 @pytest.mark.asyncio
-async def test_store_accepts_request_and_returns_status():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
-    )
+async def test_the_backend_message_reaches_the_service_through_real_dispatch(monkeypatch) -> None:
+    """handle_message tries many models in turn, so the branch order is worth pinning."""
+    client = _make_client(monkeypatch, "STAGE")
 
-    record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-    loaded = await store.get_request(record.request_id)
+    await client.handle_message(FORCED_CYCLE_MESSAGE_FROM_BACKEND)
 
-    assert loaded.request_id == record.request_id
-    assert loaded.executor_id == "exec-1"
-    assert loaded.status == "queued"
+    client.miner_service.request_validation_cycle_now.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_store_returns_latest_request_for_executor():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
-    )
-    first_record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-    await store.update(first_record.request_id, status="failed", stage="completed")
-    await store.release_active_executor("exec-1", first_record.request_id)
-    second_record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
+async def test_production_ignores_the_backend_message(monkeypatch) -> None:
+    client = _make_client(monkeypatch, "PROD")
 
-    loaded = await store.get_latest_request("exec-1")
+    await client.handle_message(FORCED_CYCLE_MESSAGE_FROM_BACKEND)
 
-    assert loaded.request_id == second_record.request_id
+    client.miner_service.request_validation_cycle_now.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_store_rejects_duplicate_active_executor():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
+async def test_a_container_message_is_not_read_as_a_forced_cycle(monkeypatch) -> None:
+    client = _make_client(monkeypatch, "STAGE")
+    client.miner_drivers = asyncio.Queue()
+    client.miner_driver = MagicMock(return_value=asyncio.sleep(0))
+    delete_request = (
+        '{"message_type":"ContainerDeleteRequest","miner_hotkey":"h",'
+        '"executor_id":"e","pod_id":"p","container_name":"c","volume_name":"v"}'
     )
-    await store.create_request(executor_id="exec-1", miner_hotkey="miner-hotkey")
 
-    with pytest.raises(ForceValidationConflict):
-        await store.create_request(executor_id="exec-1", miner_hotkey="miner-hotkey")
+    await client.handle_message(delete_request)
+
+    client.miner_service.request_validation_cycle_now.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_store_releases_active_marker_after_terminal_state():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
-    )
-    record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-    await store.update(record.request_id, status="failed", stage="completed")
-    await store.release_active_executor("exec-1", record.request_id)
+async def test_the_connector_request_reaches_the_validator_process(monkeypatch, shared_redis) -> None:
+    """The two processes agree only through Redis, so mocks cannot prove this."""
+    from core.config import settings
 
-    next_record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-    assert next_record.request_id != record.request_id
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
+    connector_miner_service = MinerService.__new__(MinerService)
+    connector_miner_service.redis_service = _redis_service(shared_redis)
+    validator_process = Validator.__new__(Validator)
+    validator_process.redis_service = _redis_service(shared_redis)
+
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is False
+
+    await connector_miner_service.request_validation_cycle_now()
+
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is True
+    # A tick that gives up before starting a cycle must leave the request pending.
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is True
+
+    await validator_process.redis_service.clear_forced_validation_cycle_request()
+
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is False
 
 
-@pytest.mark.asyncio
-async def test_store_removes_latest_pointer_after_terminal_state():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
-    )
-    record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-
-    await store.update(record.request_id, status="failed", stage="completed")
-
-    loaded = await store.get_request(record.request_id)
-    assert loaded.status == "failed"
-    with pytest.raises(ForceValidationNotFound):
-        await store.get_latest_request("exec-1")
+def test_the_backend_bytes_still_parse_as_the_model_this_side_expects() -> None:
+    """The two repos agree only on this string; nothing else checks that they still match."""
+    assert ForcedValidationCycleRequest.model_validate_json(FORCED_CYCLE_MESSAGE_FROM_BACKEND)
 
 
 @pytest.mark.asyncio
-async def test_store_keeps_newer_latest_pointer_when_old_request_finishes_late():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
-    )
-    old_record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-    await store.release_active_executor("exec-1", old_record.request_id)
-    new_record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
+async def test_a_production_validator_ignores_a_stray_request(monkeypatch, shared_redis) -> None:
+    """The connector refuses to write on prod; this is the second gate, in the reading process."""
+    from core.config import settings
 
-    await store.update(old_record.request_id, status="failed", stage="completed")
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "PROD")
+    validator_process = Validator.__new__(Validator)
+    validator_process.redis_service = _redis_service(shared_redis)
+    await validator_process.redis_service.request_forced_validation_cycle()
 
-    loaded = await store.get_latest_request("exec-1")
-    assert loaded.request_id == new_record.request_id
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is False
 
 
 @pytest.mark.asyncio
-async def test_store_hides_existing_terminal_latest_request():
-    store = ForceValidationRequestStore(
-        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
-    )
-    record = await store.create_request(
-        executor_id="exec-1",
-        miner_hotkey="miner-hotkey",
-    )
-    await store.update(record.request_id, status="failed", stage="completed")
-    await store.redis_service.redis.set(store._latest_key("exec-1"), record.request_id)
+async def test_an_unreachable_redis_does_not_end_the_sync_tick(monkeypatch) -> None:
+    """sync() catches this, but it would lose the whole tick, cycle branch included."""
+    from core.config import settings
 
-    with pytest.raises(ForceValidationNotFound):
-        await store.get_latest_request("exec-1")
-    assert await store.redis_service.redis.get(store._latest_key("exec-1")) is None
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
+    validator_process = Validator.__new__(Validator)
+    validator_process.default_extra = {}
+    validator_process.redis_service = MagicMock(
+        is_forced_validation_cycle_requested=AsyncMock(side_effect=ConnectionError("redis down"))
+    )
+
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is False
 
 
 @pytest.mark.asyncio
-async def test_single_executor_validation_runs_matching_executor_and_cleans_up(monkeypatch):
-    executor = _executor("exec-1")
-    service = MinerService.__new__(MinerService)
-    service.ssh_service = MagicMock()
-    service.ssh_service.generate_ssh_key.return_value = (b"private", b"public")
-    service.task_service = MagicMock()
-    service.task_service.create_task = AsyncMock(return_value=_job_result(executor))
-    service._make_rest_request = AsyncMock(
-        return_value=(200, AcceptSSHKeyRequest(executors=[executor]).model_dump(mode="json"))
-    )
-    service._remove_ssh_key_via_rest = AsyncMock(return_value=True)
+async def test_a_request_nobody_picks_up_expires(monkeypatch, shared_redis) -> None:
+    """The TTL bounds a request the validator never consumed -- it was down, or Redis lagged."""
+    from core.config import settings
 
-    keypair = MagicMock(ss58_address="validator-hotkey")
-    keypair.sign.return_value = b"sig"
-    wallet = MagicMock()
-    wallet.get_hotkey.return_value = keypair
-    monkeypatch.setattr("services.miner_service.settings.USE_REST_API", True)
-    monkeypatch.setattr(
-        type(miner_service_module.settings),
-        "get_bittensor_wallet",
-        lambda self: wallet,
-    )
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
+    connector_miner_service = MinerService.__new__(MinerService)
+    connector_miner_service.redis_service = _redis_service(shared_redis)
+    validator_process = Validator.__new__(Validator)
+    validator_process.redis_service = _redis_service(shared_redis)
 
-    result = await service.request_single_executor_validation(
-        payload=_payload(),
-        encrypted_files=_encrypted_files(),
-        rented_data=RentedExecutorsResponse(executors={}),
-        executor_id="exec-1",
-    )
+    await connector_miner_service.request_validation_cycle_now()
+    ttl = await validator_process.redis_service.redis.ttl(FORCED_VALIDATION_CYCLE_KEY)
 
-    assert result.executor_info.uuid == "exec-1"
-    service.task_service.create_task.assert_awaited_once()
-    service._remove_ssh_key_via_rest.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_single_executor_validation_rejects_missing_executor_and_cleans_up(monkeypatch):
-    service = MinerService.__new__(MinerService)
-    service.ssh_service = MagicMock()
-    service.ssh_service.generate_ssh_key.return_value = (b"private", b"public")
-    service.task_service = MagicMock()
-    service.task_service.create_task = AsyncMock()
-    service._make_rest_request = AsyncMock(
-        return_value=(200, AcceptSSHKeyRequest(executors=[_executor("other")]).model_dump(mode="json"))
-    )
-    service._remove_ssh_key_via_rest = AsyncMock(return_value=True)
-
-    keypair = MagicMock(ss58_address="validator-hotkey")
-    keypair.sign.return_value = b"sig"
-    wallet = MagicMock()
-    wallet.get_hotkey.return_value = keypair
-    monkeypatch.setattr("services.miner_service.settings.USE_REST_API", True)
-    monkeypatch.setattr(
-        type(miner_service_module.settings),
-        "get_bittensor_wallet",
-        lambda self: wallet,
-    )
-
-    with pytest.raises(ValueError):
-        await service.request_single_executor_validation(
-            payload=_payload(),
-            encrypted_files=_encrypted_files(),
-            rented_data=RentedExecutorsResponse(executors={}),
-            executor_id="exec-1",
-        )
-
-    service.task_service.create_task.assert_not_called()
-    service._remove_ssh_key_via_rest.assert_awaited_once()
+    assert 0 < ttl <= FORCED_VALIDATION_CYCLE_TTL_SECONDS

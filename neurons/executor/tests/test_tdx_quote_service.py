@@ -12,7 +12,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 os.environ.setdefault("MINER_HOTKEY_SS58_ADDRESS", "5TestMinerHotkeyAddress")
-os.environ.setdefault("DB_URI", "sqlite:///tmp/test.db")
 
 from core.config import settings  # noqa: E402
 from neurons.executor.src.services.tdx_service import TDXQuoteService  # noqa: E402

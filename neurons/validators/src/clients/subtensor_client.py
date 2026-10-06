@@ -1,29 +1,56 @@
 import asyncio
-import bittensor
 import contextlib
-import numpy as np
-import time
-from typing import Self, TYPE_CHECKING
-from bittensor.utils.weight_utils import process_weights_for_netuid
-from websockets.protocol import State as WebSocketClientState
-from datetime import datetime
 import json
-import aiohttp
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Self, TypeVar
 
+import aiohttp
+import bittensor
+import numpy as np
+from bittensor.utils.weight_utils import process_weights_for_netuid
+from datura.chain import (
+    ChainConnection,
+    ChainEndpoint,
+    EndpointCursor,
+    EndpointSource,
+    is_chain_error,
+)
+from pydantic import BaseModel, Field, ValidationError
+
+from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
-from clients.validator_portal_api import ValidatorPortalAPI
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
+ChainReadResult = TypeVar("ChainReadResult")
 
 SYNC_CYCLE = 12
 SUBTENSOR_BACKOFF_INITIAL = 12
 SUBTENSOR_BACKOFF_MAX = 300
+PORTAL_MINERS_CACHE_KEY: str = "validator:portal:opted_in_miners:last_good"
+PORTAL_MINERS_CACHE_ALERT_SECONDS: int = 60 * 60
+
+
+class OptedInMinerSnapshot(BaseModel):
+    cached_at: float = Field(ge=0)
+    miners: list[OptedInMiner]
+
+
+@dataclass(frozen=True)
+class MissingScoredHotkeys:
+    active_in_last_cycle: list[str]
+    inactive_in_last_cycle: list[str]
+
+
+class ProviderPortalDataUnavailable(RuntimeError):
+    """No live or Redis-cached provider snapshot is available."""
 
 
 @contextlib.contextmanager
@@ -83,12 +110,95 @@ def _convert_weights_with_positive_floor(
     return out_uids, out_vals, floored
 
 
+def _select_floor_candidates(
+    uint_uids,
+    miners,
+    active_hotkeys: set[str],
+    burn_uids: set[int],
+) -> list[tuple[int, str]]:
+    """Pick the hotkeys that had a live executor last cycle but are missing from the
+    u16 vector. Burn uids are never candidates — they fund the floor, they don't take it.
+
+    Returns a list of `(uid, hotkey)` tuples sorted by uid so the transfer is deterministic.
+    """
+    present = {int(u) for u in uint_uids}
+    return sorted(
+        (int(miner.uid), miner.hotkey)
+        for miner in miners
+        if miner.hotkey in active_hotkeys
+        and int(miner.uid) not in present
+        and int(miner.uid) not in burn_uids
+    )
+
+
+def _largest_burn_index(uids: list[int], weights: list[int], burn_uids: set[int]) -> int | None:
+    """Index of the burn entry currently carrying the most u16 mass, or None when the vector has no burner."""
+    burn_indexes = [ind for ind, uid in enumerate(uids) if uid in burn_uids]
+    if not burn_indexes:
+        return None
+    return max(burn_indexes, key=lambda ind: weights[ind])
+
+
+def _apply_eligibility_floor(
+    uint_uids,
+    uint_weights,
+    miners,
+    active_hotkeys: set[str],
+    burn_uids: set[int],
+) -> tuple[list[int], list[int], list[str]]:
+    """Give one u16 unit to every live hotkey the vector dropped, taken from the largest
+    burn entry so no earning miner is diluted. Builds new lists, never mutates the inputs.
+
+    Returns (uids, weights, floored_hotkeys).
+    """
+    out_uids = [int(u) for u in uint_uids]
+    out_weights = [int(w) for w in uint_weights]
+    floored_hotkeys: list[str] = []
+    for uid, hotkey in _select_floor_candidates(out_uids, miners, active_hotkeys, burn_uids):
+        donor = _largest_burn_index(out_uids, out_weights, burn_uids)
+        if donor is None or out_weights[donor] <= 1:
+            break
+        out_weights[donor] -= 1
+        out_uids.append(uid)
+        out_weights.append(1)
+        floored_hotkeys.append(hotkey)
+    return out_uids, out_weights, floored_hotkeys
+
+
+def _classify_missing_scored_hotkeys(
+    miner_scores: dict[str, float],
+    selected_miner_hotkeys: set[str],
+    registered_hotkeys: set[str],
+    active_hotkeys: set[str],
+) -> MissingScoredHotkeys:
+    missing_hotkeys = sorted(
+        hotkey
+        for hotkey, score in miner_scores.items()
+        if score > 0
+        and hotkey in registered_hotkeys
+        and hotkey not in selected_miner_hotkeys
+    )
+    active_missing_hotkeys = [
+        hotkey for hotkey in missing_hotkeys if hotkey in active_hotkeys
+    ]
+    inactive_missing_hotkeys = [
+        hotkey for hotkey in missing_hotkeys if hotkey not in active_hotkeys
+    ]
+    return MissingScoredHotkeys(
+        active_in_last_cycle=active_missing_hotkeys,
+        inactive_in_last_cycle=inactive_missing_hotkeys,
+    )
+
+
 class SubtensorClient:
     # Static class variables (shared across all instances)
     _instance = None
     _initialized = False
     _subtensor = None
     _warm_up_task = None
+    # only the connector reads the chain in a thread: the main validator also calls the same
+    # websocket from the loop, and the sync substrate client cannot serve two threads at once
+    _chain_reads_in_thread = False
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
@@ -112,6 +222,9 @@ class SubtensorClient:
         self.netuid = settings.BITTENSOR_NETUID
         self.config = settings.get_bittensor_config()
         self.redis_service = RedisService()
+        self._has_alerted_for_stale_portal_snapshot = False
+        self._chain_read_lock = asyncio.Lock()
+        self._miners_fetch_lock = asyncio.Lock()
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
@@ -126,6 +239,10 @@ class SubtensorClient:
         if settings.debug.USE_LOCAL_MINER:
             self.debug_miner = settings.get_debug_miner()
 
+        self._endpoint_cursor = EndpointCursor(
+            settings.get_chain_endpoints(),
+            retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
+        )
         self.initialize_subtensor()
 
         SubtensorClient._initialized = True
@@ -142,6 +259,103 @@ class SubtensorClient:
     def subtensor(self):
         return SubtensorClient._subtensor
 
+    def _log_endpoint_switched(
+        self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
+    ) -> None:
+        logger.warning(
+            _m(
+                f"Subtensor endpoint switched from={previous.value} to={current.value}",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "from": previous.value,
+                        "to": current.value,
+                        "from_source": previous.source,
+                        "to_source": current.source,
+                        "reason": reason,
+                        "error": repr(error),  # a timeout has an empty str()
+                    }
+                ),
+            ),
+        )
+
+    def _connect_subtensor(self) -> ChainConnection[bittensor.Subtensor]:
+        """Dial the current entry of the ordered endpoint list; when it refuses, move to the next
+        one (`Subtensor endpoint switched from=… to=…`) until one answers, so a proxy outage never
+        leaves the validator without a chain client (metagraph sync and set_weights would stop).
+        Raises the last error when every entry failed. Returns the client and which setting chose
+        the endpoint."""
+        cursor = self._endpoint_cursor
+        last_error: Exception | None = None
+        for _attempt in range(len(cursor.candidates)):
+            endpoint = cursor.current
+            try:
+                subtensor = bittensor.Subtensor(network=endpoint.value, config=self.config)
+            except Exception as e:
+                last_error = e
+                if len(cursor.candidates) == 1:
+                    raise
+                previous, current = cursor.advance()
+                self._log_endpoint_switched(previous, current, "connect failed", e)
+                continue
+            return ChainConnection(subtensor, cursor.current_source_label())
+        assert last_error is not None
+        raise last_error
+
+    def _switch_endpoint_after_read_failure(self, error: Exception) -> None:
+        """A chain read on the connected endpoint failed: drop the client and move the cursor
+        to the next entry, so the redial that follows skips the failing one. A Redis or portal
+        error leaves the cursor on the healthy endpoint."""
+        if not is_chain_error(error):
+            return
+        if SubtensorClient._subtensor is None or len(self._endpoint_cursor.candidates) == 1:
+            return
+        self._drop_subtensor()
+        previous, current = self._endpoint_cursor.advance()
+        self._log_endpoint_switched(previous, current, "read failed", error)
+
+    def _return_to_first_endpoint(self) -> None:
+        """A sync cycle starts on the first entry that is not resting: after a cycle ran on a
+        fallback node, once the failed endpoint's retry window is over, the client is dropped and
+        the next dial tries it again (the proxy may be back). Inside the window the fallback client
+        stays, so a dead proxy is not redialled every cycle."""
+        if not self._endpoint_cursor.move_to_first_ready_endpoint():
+            return
+        self._drop_subtensor()
+
+    def _drop_subtensor(self) -> None:
+        """Close the client before it is forgotten: its websocket is still open."""
+        subtensor = SubtensorClient._subtensor
+        SubtensorClient._subtensor = None
+        if subtensor is None:
+            return
+        try:
+            subtensor.close()
+        except Exception as e:
+            logger.warning(
+                _m(
+                    "Failed to close subtensor cleanly",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                ),
+            )
+
+    def _log_subtensor_connected(
+        self, subtensor: bittensor.Subtensor, endpoint_source: EndpointSource
+    ) -> None:
+        logger.info(
+            _m(
+                "Subtensor connected",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "chain_endpoint": subtensor.chain_endpoint,
+                        "network": subtensor.network,
+                        "endpoint_source": endpoint_source,
+                    }
+                ),
+            ),
+        )
+
     def initialize_subtensor(self):
         try:
             logger.info(
@@ -150,7 +364,8 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            subtensor = bittensor.Subtensor(config=self.config)
+            subtensor, endpoint_source = self._connect_subtensor()
+            self._log_subtensor_connected(subtensor, endpoint_source)
 
             # check registered
             self.check_registered(subtensor)
@@ -239,18 +454,37 @@ class SubtensorClient:
     def get_evm_address_for_hotkey(self, hotkey):
         return self.hotkey_to_evm_address.get(hotkey, None)
 
-    def sync_evm_address_maps(self):
+    async def _run_chain_read(
+        self, chain_read: Callable[..., ChainReadResult], *args: object
+    ) -> ChainReadResult:
+        # a blocking chain read: in the connector off the event loop, one at a time
+        if not self._chain_reads_in_thread:
+            return chain_read(*args)
+        await self._chain_read_lock.acquire()
+        # cancelling the caller does not stop the thread: the lock is released when the thread
+        # ends, so no second read shares the websocket with it
+        read_in_thread = asyncio.ensure_future(asyncio.to_thread(chain_read, *args))
+        read_in_thread.add_done_callback(lambda _: self._chain_read_lock.release())
+        return await asyncio.shield(read_in_thread)
+
+    def _pause_chain_reads_in_thread(self) -> contextlib.AbstractAsyncContextManager:
+        # the loop-side redial closes or replaces the websocket a chain read thread may be using
+        return self._chain_read_lock if self._chain_reads_in_thread else contextlib.nullcontext()
+
+    def _read_uid_to_evm_address(self) -> dict[int, str]:
         with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
             node = self.get_node()
             associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
-            for uid, evm_address in associated_evms:
-                # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
-                evm_address_hex = evm_address[0]
-                self.uid_to_evm_address[uid] = evm_address_hex
+            # the query map pages lazily, so it is iterated here, inside the timed chain read;
+            # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
+            return {uid: evm_address[0] for uid, evm_address in associated_evms}
 
-            """Update the map of miner_hotkey -> evm_address for all miners."""
-            for miner in self.miners:
-                self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
+    async def sync_evm_address_maps(self) -> None:
+        # the maps are read by the loop, so they are updated here, never from the thread
+        self.uid_to_evm_address.update(await self._run_chain_read(self._read_uid_to_evm_address))
+
+        for miner in self.miners:
+            self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
 
         logger.info(
             _m(
@@ -268,45 +502,179 @@ class SubtensorClient:
     def get_tempo(self):
         return self.subtensor.tempo(self.netuid)
 
-    async def fetch_miners(self):
-        logger.info(
-            _m(
-                "[fetch_miners] Fetching miners",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
+    async def _load_cached_opted_in_miners_snapshot(
+        self,
+    ) -> OptedInMinerSnapshot | None:
+        try:
+            cached_json = await self.redis_service.get(PORTAL_MINERS_CACHE_KEY)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[fetch_miners] failed to read provider snapshot cache",
+                    extra=get_extra_info(
+                        {**self.default_extra, "error": str(exc)}
+                    ),
+                )
+            )
+            return None
 
+        if cached_json is None:
+            return None
+
+        try:
+            return OptedInMinerSnapshot.model_validate_json(cached_json)
+        except (ValidationError, TypeError) as exc:
+            logger.error(
+                _m(
+                    "[fetch_miners] invalid provider snapshot cache",
+                    extra=get_extra_info(
+                        {**self.default_extra, "error": str(exc)}
+                    ),
+                )
+            )
+            return None
+
+    async def _store_opted_in_miners_snapshot(
+        self,
+        miners: list[OptedInMiner],
+    ) -> None:
+        snapshot = OptedInMinerSnapshot(cached_at=time.time(), miners=miners)
+        try:
+            await self.redis_service.set(
+                PORTAL_MINERS_CACHE_KEY,
+                snapshot.model_dump_json(),
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[fetch_miners] failed to cache provider snapshot",
+                    extra=get_extra_info(
+                        {**self.default_extra, "error": str(exc)}
+                    ),
+                )
+            )
+
+    def _report_cached_opted_in_miners_usage(
+        self,
+        snapshot: OptedInMinerSnapshot,
+    ) -> None:
+        cache_age_seconds = int(max(0, time.time() - snapshot.cached_at))
+        log_context = {
+            **self.default_extra,
+            "provider_count": len(snapshot.miners),
+            "cache_age_seconds": cache_age_seconds,
+            "snapshot_source": "redis_cache",
+        }
+        logger.warning(
+            _m(
+                "[fetch_miners] using cached provider snapshot",
+                extra=get_extra_info(log_context),
+            )
+        )
+        if (
+            cache_age_seconds >= PORTAL_MINERS_CACHE_ALERT_SECONDS
+            and not self._has_alerted_for_stale_portal_snapshot
+        ):
+            logger.critical(
+                _m(
+                    "[fetch_miners] provider snapshot cache exceeded alert threshold",
+                    extra=get_extra_info(
+                        {
+                            **log_context,
+                            "alert_threshold_seconds": PORTAL_MINERS_CACHE_ALERT_SECONDS,
+                        }
+                    ),
+                )
+            )
+            self._has_alerted_for_stale_portal_snapshot = True
+
+    async def _resolve_opted_in_miners(self) -> list[OptedInMiner]:
+        live_miners = await ValidatorPortalAPI.get_opted_in_miners()
+        if live_miners is not None:
+            if not live_miners:
+                previous_snapshot = await self._load_cached_opted_in_miners_snapshot()
+                if previous_snapshot is not None and previous_snapshot.miners:
+                    logger.warning(
+                        _m(
+                            "[fetch_miners] opted-in provider count dropped to zero",
+                            extra=get_extra_info(
+                                {
+                                    **self.default_extra,
+                                    "previous_provider_count": len(previous_snapshot.miners),
+                                    "provider_count": 0,
+                                }
+                            ),
+                        )
+                    )
+            await self._store_opted_in_miners_snapshot(live_miners)
+            self._has_alerted_for_stale_portal_snapshot = False
+            logger.info(
+                _m(
+                    "[fetch_miners] resolved opted-in providers",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "provider_count": len(live_miners),
+                            "snapshot_source": "portal",
+                        }
+                    ),
+                )
+            )
+            return live_miners
+
+        cached_snapshot = await self._load_cached_opted_in_miners_snapshot()
+        if cached_snapshot is None:
+            raise ProviderPortalDataUnavailable(
+                "provider portal unavailable and no cached snapshot exists"
+            )
+        self._report_cached_opted_in_miners_usage(cached_snapshot)
+        return cached_snapshot.miners
+
+    def _build_serving_miners_with_opted_in_routing(
+        self,
+        opted_in_miners: Sequence[OptedInMiner],
+    ) -> list[bittensor.NeuronInfo]:
+        metagraph = self.get_metagraph()
+        opted_in_by_hotkey = {
+            opted_in.miner_hotkey: opted_in for opted_in in opted_in_miners
+        }
+        for neuron in metagraph.neurons:
+            opted_in = opted_in_by_hotkey.get(neuron.hotkey)
+            if opted_in is not None:
+                neuron.axon_info.ip = opted_in.central_miner_ip
+                neuron.axon_info.port = opted_in.central_miner_port
+
+        burner_uids = {*settings.BURNERS, *settings.NEW_BURNERS}
+        return [
+            neuron
+            for neuron in metagraph.neurons
+            if neuron.axon_info.is_serving or neuron.uid in burner_uids
+        ]
+
+    async def fetch_miners(self) -> None:
         if self.debug_miner:
             miners = [self.debug_miner]
         else:
-            metagraph = self.get_metagraph()
-
-            miners = metagraph.neurons
-
-            # Get miners that have opted in from portal BE
-            miners_with_opt_in_status = await ValidatorPortalAPI.get_opted_in_miners()
-
-            logger.info(
-                _m(
-                    f"[fetch_miners] Found {len(miners_with_opt_in_status)} opted-in miners from portal",
-                    extra=get_extra_info(self.default_extra),
-                ),
+            try:
+                opted_in_miners = await self._resolve_opted_in_miners()
+            except ProviderPortalDataUnavailable:
+                if not self.miners:
+                    raise
+                logger.warning(
+                    _m(
+                        "[fetch_miners] using in-memory provider snapshot",
+                        extra=get_extra_info(
+                            {
+                                **self.default_extra,
+                                "provider_count": len(self.miners),
+                            }
+                        ),
+                    )
+                )
+                return
+            miners = await self._run_chain_read(
+                self._build_serving_miners_with_opted_in_routing, opted_in_miners
             )
-            # Update miners in `miners` list based on miners_with_opt_in_status.
-            hotkey_to_opt_in = {
-                opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status if opt_in.get("miner_hotkey", None)
-            }
-            for miner in miners:
-                opt_in = hotkey_to_opt_in.get(miner.hotkey)
-                if opt_in is not None:
-                    miner.axon_info.ip = opt_in.get("central_miner_ip")
-                    miner.axon_info.port = opt_in.get("central_miner_port")
-                    
-            miners = [
-                neuron
-                for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving or neuron.uid in (settings.BURNERS + settings.NEW_BURNERS)
-            ]
 
         logger.info(
             _m(
@@ -327,7 +695,13 @@ class SubtensorClient:
 
     async def get_miners(self) -> list[bittensor.NeuronInfo]:
         if not self.miners:
-            await self.fetch_miners()
+            if not self._chain_reads_in_thread:
+                await self.fetch_miners()
+                return self.miners
+            # a caller arriving during the first load waits for it instead of reading the chain again
+            async with self._miners_fetch_lock:
+                if not self.miners:
+                    await self.fetch_miners()
         return self.miners
     
     async def send_weights_to_lium(self, payload: dict):
@@ -350,11 +724,55 @@ class SubtensorClient:
         except Exception as e:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
-    async def set_weights(self, miner_scores: dict[str, float]):
+    def _log_scored_hotkeys_missing_from_selected_miners(
+        self,
+        miner_scores: dict[str, float],
+        selected_miners: Sequence[bittensor.NeuronInfo],
+        registered_miners: Sequence[bittensor.NeuronInfo],
+        active_hotkeys: set[str],
+    ) -> None:
+        missing_hotkeys = _classify_missing_scored_hotkeys(
+            miner_scores=miner_scores,
+            selected_miner_hotkeys={miner.hotkey for miner in selected_miners},
+            registered_hotkeys={miner.hotkey for miner in registered_miners},
+            active_hotkeys=active_hotkeys,
+        )
+        if not (
+            missing_hotkeys.active_in_last_cycle
+            or missing_hotkeys.inactive_in_last_cycle
+        ):
+            return
+
+        log_diagnostic = (
+            logger.critical
+            if missing_hotkeys.active_in_last_cycle
+            else logger.warning
+        )
+        log_diagnostic(
+            _m(
+                "[set_weights] scored miners missing from selected miner set",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "active_missing_hotkeys": missing_hotkeys.active_in_last_cycle,
+                        "inactive_missing_hotkeys": missing_hotkeys.inactive_in_last_cycle,
+                    }
+                ),
+            ),
+        )
+
+    async def set_weights(
+        self,
+        miner_scores: dict[str, float],
+        active_hotkeys: set[str] | None = None,
+    ) -> None:
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
         called per cycle. This method just normalizes and sends to chain.
+
+        `active_hotkeys` are the hotkeys with at least one live executor in the last
+        completed cycle — they get the u16 floor when the vector would drop them.
         """
         miners = await self.get_miners()
         logger.info(
@@ -377,6 +795,14 @@ class SubtensorClient:
                 ),
             )
             return
+
+        metagraph = self.get_metagraph()
+        self._log_scored_hotkeys_missing_from_selected_miners(
+            miner_scores=miner_scores,
+            selected_miners=miners,
+            registered_miners=metagraph.neurons,
+            active_hotkeys=active_hotkeys or set(),
+        )
 
         # Build uids and weights arrays
         uids = np.zeros(len(miners), dtype=np.int64)
@@ -404,7 +830,6 @@ class SubtensorClient:
         await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
 
         # Process weights for blockchain
-        metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
@@ -422,6 +847,29 @@ class SubtensorClient:
 
         uint_uids, uint_weights, floored = _convert_weights_with_positive_floor(
             processed_uids, processed_weights
+        )
+
+        # DAH-2622: a hotkey that had a live executor last cycle keeps u16=1 even when it
+        # scored nothing, so the chain never deregisters it for a zero emission.
+        uint_uids, uint_weights, floor_hotkeys = _apply_eligibility_floor(
+            uint_uids,
+            uint_weights,
+            miners,
+            active_hotkeys or set(),
+            # only the uids that actually receive burn, mirroring BurnService.is_burner —
+            # a retired burner slot is an ordinary miner uid and must be able to take the floor
+            set(settings.NEW_BURNERS if settings.ENABLE_NEW_BURN_LOGIC else settings.BURNERS),
+        )
+
+        logger.info(
+            _m(
+                "[set_weights] eligibility floor applied",
+                extra=get_extra_info({
+                    **self.default_extra,
+                    "floor_hotkeys": floor_hotkeys,
+                    "floor_count": len(floor_hotkeys),
+                }),
+            ),
         )
 
         # Resolve floored uids back to hotkeys so the log row is human-debuggable.
@@ -596,24 +1044,43 @@ class SubtensorClient:
         backoff = SUBTENSOR_BACKOFF_INITIAL
         while True:
             try:
-                self.set_subtensor()
+                async with self._pause_chain_reads_in_thread():
+                    self._return_to_first_endpoint()
+                    self.set_subtensor()
 
                 if SubtensorClient._subtensor is None:
                     raise RuntimeError("subtensor is not initialized")
 
                 if count == 0:
-                    await self.fetch_miners()
-                    self.sync_evm_address_maps()
+                    # the connector's rents join this first load; the main validator fetches as on main
+                    if self._chain_reads_in_thread:
+                        await self.get_miners()
+                    else:
+                        await self.fetch_miners()
+                    await self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
                     await self.fetch_miners()
-                    self.sync_evm_address_maps()
+                    await self.sync_evm_address_maps()
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
                 await asyncio.sleep(SYNC_CYCLE)
+            except ProviderPortalDataUnavailable as exc:
+                logger.error(
+                    _m(
+                        "[_warm_up_subtensor] Provider portal snapshot unavailable",
+                        extra=get_extra_info(
+                            {**self.default_extra, "error": str(exc), "backoff": backoff}
+                        ),
+                    ),
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
+                async with self._pause_chain_reads_in_thread():
+                    self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(
                         "[_warm_up_subtensor] Failed to connect into subtensor",
@@ -629,9 +1096,10 @@ class SubtensorClient:
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
 
     @classmethod
-    async def initialize(cls) -> Self:
+    async def initialize(cls, chain_reads_in_thread: bool = False) -> Self:
         """Initialize the singleton instance asynchronously."""
         instance = cls.get_instance()
+        instance._chain_reads_in_thread = chain_reads_in_thread
 
         # Start warm-up task only once (static)
         if cls._warm_up_task is None or cls._warm_up_task.done():
@@ -647,6 +1115,11 @@ class SubtensorClient:
             try:
                 await cls._warm_up_task
             except asyncio.CancelledError:
+                pass
+        if cls._instance is not None and cls._instance._chain_reads_in_thread:
+            # a read cancelled with the warm-up still runs in its thread; the next instance would
+            # share its websocket if the new instance's own dial failed
+            async with cls._instance._chain_read_lock:
                 pass
         cls._warm_up_task = None
         cls._instance = None

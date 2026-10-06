@@ -17,6 +17,7 @@ Usage:
     uv run pytest tests/prod_snapshot/ -v --update-snapshot
 """
 
+import copy
 import csv
 import json
 from pathlib import Path
@@ -164,6 +165,11 @@ def _build_job_results(prod_snapshot: dict) -> dict[str, list[JobResult]]:
                 collateral_deposited=r["collateral_deposited"],
                 sysbox_runtime=r["sysbox_runtime"],
                 is_rented=r["is_rented"],
+                # Decides which sysbox rule the rented executor falls under: a rental created
+                # on or after SYSBOX_RENTED_CUTOFF scores 0 without sysbox, an older one only
+                # loses PORTION_FOR_SYSBOX. Absent in a snapshot = the older, lenient rule.
+                rental_created_at=r.get("rental_created_at"),
+                rented_gpu_count=r.get("rented_gpu_count"),
                 job_batch_id=r["job_batch_id"],
                 log_status=r["log_status"],
                 log_text=r["log_text"],
@@ -229,12 +235,21 @@ def _calc_hourly_emission_usd(prod_snapshot: dict) -> float:
 def _extract_actual_output(incentive: BaseIncentive) -> dict:
     """Extract actual results into the same shape as expected_output."""
     executor_mining_scores: dict[str, float] = {}
+    executor_incentives: dict[str, float | None] = {}
+    executor_gpu_counts: dict[str, int] = {}
     for _hotkey, results in incentive.job_results.items():
         for r in results:
             executor_mining_scores[r.executor_info.uuid] = r.mining_score
+            # The per-executor payout the backend accounts on, and the GPU count it is
+            # published with — a partially rented split node (DAH-2467) is scored as two
+            # portions and must arrive here merged back into one whole-box row.
+            executor_incentives[r.executor_info.uuid] = r.incentive
+            executor_gpu_counts[r.executor_info.uuid] = r.gpu_count
 
     return {
         "executor_mining_scores": executor_mining_scores,
+        "executor_incentives": executor_incentives,
+        "executor_gpu_counts": executor_gpu_counts,
         "total_mining_score": incentive.total_mining_score,
         "miner_incentives": dict(incentive.miner_incentives),
         "metrics": {
@@ -291,6 +306,36 @@ def _dump_results_csv(
                 })
 
 
+def _results_by_executor_id(incentive: BaseIncentive) -> dict[str, JobResult]:
+    return {
+        r.executor_info.uuid: r
+        for results in incentive.job_results.values()
+        for r in results
+    }
+
+
+def _partially_rented_split_rows(prod_snapshot: dict) -> list[dict]:
+    """Snapshot rows for split-opted-in executors with only part of their GPUs rented (DAH-2467)."""
+    return [
+        r
+        for results in prod_snapshot["job_results"].values()
+        for r in results
+        if r["is_rented"]
+        and r.get("supports_gpu_splitting")
+        and r.get("gpu_splitting_min_count")
+        and 0 < (r.get("rented_gpu_count") or 0) < r["gpu_count"]
+    ]
+
+
+def _snapshot_without_rented_gpu_counts(prod_snapshot: dict) -> dict:
+    """The same snapshot as a backend that does not report per-pod gpu_count would deliver it."""
+    downgraded = copy.deepcopy(prod_snapshot)
+    for results in downgraded["job_results"].values():
+        for r in results:
+            r.pop("rented_gpu_count", None)
+    return downgraded
+
+
 def _update_snapshot(snapshot_path: Path, algorithm: str, actual: dict) -> None:
     """Write actual results back to the snapshot JSON."""
     snapshot = json.loads(snapshot_path.read_text())
@@ -307,6 +352,19 @@ def _assert_snapshot(expected: dict, incentive: BaseIncentive) -> None:
             exp_score = expected["executor_mining_scores"].get(eid, 0.0)
             assert result.mining_score == pytest.approx(exp_score, abs=1e-15), (
                 f"Executor {eid}: got {result.mining_score}, expected {exp_score}"
+            )
+
+    # Per-executor incentive and published GPU count
+    for _hotkey, results in incentive.job_results.items():
+        for result in results:
+            eid = result.executor_info.uuid
+            exp_incentive = expected["executor_incentives"].get(eid)
+            assert result.incentive == pytest.approx(exp_incentive, rel=1e-12), (
+                f"Executor {eid} incentive: got {result.incentive}, expected {exp_incentive}"
+            )
+            exp_gpu_count = expected["executor_gpu_counts"].get(eid)
+            assert result.gpu_count == exp_gpu_count, (
+                f"Executor {eid} gpu_count: got {result.gpu_count}, expected {exp_gpu_count}"
             )
 
     # Total mining score
@@ -388,3 +446,87 @@ async def test_prod_snapshot_rental_price(
     await _run_snapshot_test(
         snapshot_dir, prod_snapshot, mock_redis_from_snapshot, "rental_price", update_snapshot,
     )
+
+
+async def _score_with_and_without_rented_gpu_counts(
+    prod_snapshot: dict,
+    mock_redis: AsyncMock,
+) -> tuple[BaseIncentive, BaseIncentive]:
+    """The same pool scored as (mixed pools, whole-box) — the latter is today's behavior."""
+    mixed = _create_incentive(prod_snapshot, mock_redis, "rental_price")
+    await mixed.calculate_mining_scores()
+    whole_box = _create_incentive(
+        _snapshot_without_rented_gpu_counts(prod_snapshot), mock_redis, "rental_price"
+    )
+    await whole_box.calculate_mining_scores()
+    return mixed, whole_box
+
+
+@pytest.mark.asyncio
+async def test_prod_snapshot_partially_rented_split_node_is_scored_in_both_pools(
+    snapshot_dir: Path,
+    prod_snapshot: dict,
+    mock_redis_from_snapshot: AsyncMock,
+    prod_settings: None,
+):
+    """DAH-2467 — the same prod pool scored with and without the backend's per-pod GPU counts.
+
+    Holds for every partially rented split node regardless of what its free GPUs end up
+    earning: the mining pool pays for the rented GPUs only, the free GPUs join the unrented
+    pool, and the executor still publishes as ONE row at its full GPU count.
+    """
+    split_rows = _partially_rented_split_rows(prod_snapshot)
+    if not split_rows:
+        pytest.skip("no partially rented split node in this snapshot")
+
+    mixed, whole_box = await _score_with_and_without_rented_gpu_counts(
+        prod_snapshot, mock_redis_from_snapshot
+    )
+    mixed_results = _results_by_executor_id(mixed)
+    whole_box_results = _results_by_executor_id(whole_box)
+    for row in split_rows:
+        executor_id = row["executor_id"]
+        mixed_result = mixed_results[executor_id]
+        # Merged back into one row: machine-spec publish still sees the whole box.
+        assert mixed_result.gpu_count == row["gpu_count"]
+        assert mixed_result.is_rented is True
+        # The mining pool now pays for the rented GPUs only.
+        assert mixed_result.mining_score < whole_box_results[executor_id].mining_score
+
+    # Every free GPU joined the unrented pool — that is what the second portion is for.
+    free_gpu_count = sum(row["gpu_count"] - row["rented_gpu_count"] for row in split_rows)
+    assert (
+        sum(mixed.unrented_count_by_bucket.values())
+        - sum(whole_box.unrented_count_by_bucket.values())
+    ) == free_gpu_count
+
+
+@pytest.mark.asyncio
+async def test_prod_snapshot_split_node_earns_more_when_its_free_gpus_can_earn(
+    snapshot_dir: Path,
+    prod_snapshot: dict,
+    mock_redis_from_snapshot: AsyncMock,
+    prod_settings: None,
+):
+    """DAH-2467 — the goal of the change, on a real fleet rather than a mocked rental share.
+
+    Scoped to split nodes whose free GPUs are actually admitted to the unrented pool, which
+    under this snapshot's rules means running sysbox. Such a node must come out ahead of
+    today's whole-box scoring: it gives up mining score for the rented GPUs and more than
+    makes it back on the free ones.
+    """
+    split_rows = [r for r in _partially_rented_split_rows(prod_snapshot) if r["sysbox_runtime"]]
+    if not split_rows:
+        pytest.skip("no partially rented split node with sysbox in this snapshot")
+
+    mixed, whole_box = await _score_with_and_without_rented_gpu_counts(
+        prod_snapshot, mock_redis_from_snapshot
+    )
+    mixed_results = _results_by_executor_id(mixed)
+    whole_box_results = _results_by_executor_id(whole_box)
+    for row in split_rows:
+        executor_id = row["executor_id"]
+        assert mixed_results[executor_id].incentive > whole_box_results[executor_id].incentive, (
+            f"Executor {executor_id} ({row['rented_gpu_count']} of {row['gpu_count']} GPUs "
+            f"rented) earns less than it does scored whole-box"
+        )

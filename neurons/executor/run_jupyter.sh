@@ -205,6 +205,7 @@ start_jupyter() {
         --ServerApp.disable_check_xsrf=True \
         --ServerApp.tornado_settings="{\"max_body_size\": 536870912}" \
         --ServerApp.log_level=ERROR \
+        --LabApp.log_level=ERROR \
         &> /jupyter.log &
     
     # Wait a moment for Jupyter to start
@@ -214,7 +215,6 @@ start_jupyter() {
     if pgrep -f "jupyter.*lab" > /dev/null || pgrep -f "/opt/jupyter-env/bin/jupyter" > /dev/null; then
         echo "✅ Jupyter Lab started successfully on port $JUPYTER_PORT"
         echo "Access Jupyter at: http://localhost:$JUPYTER_PORT"
-        echo "Password: $JUPYTER_PASSWORD"
         echo ""
         echo "Available commands:"
         echo "  - /opt/jupyter-env/bin/python3"

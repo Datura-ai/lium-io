@@ -5,11 +5,11 @@ import json
 import tempfile
 import re
 
+from workspace_mount import VolumeAccess, detect_volume_access
+
 # Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backup_storage")
-
-plugin_name = "s3fs-backup"
 
 # AWS CLI only needs --expected-size for very large stdin uploads. Passing a
 # large guessed value for small gzip streams can make aws-cli use multipart
@@ -88,8 +88,15 @@ def run_command(command, command_label: str = "command"):
     return result
 
 
-def run_command_args(command: list[str], input_stream=None, stdout=None, command_label: str = "command"):
-    result = subprocess.run(command, stdin=input_stream, stdout=stdout, capture_output=stdout is None, text=True)
+def run_command_args(command: list[str], input_stream=None, stdout=None, input_data=None, command_label: str = "command"):
+    result = subprocess.run(
+        command,
+        stdin=input_stream,
+        stdout=stdout,
+        input=input_data,
+        capture_output=stdout is None,
+        text=True,
+    )
     if result.returncode != 0:
         logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
@@ -98,84 +105,6 @@ def run_command_args(command: list[str], input_stream=None, stdout=None, command
         )
     logger.info(f"Command succeeded: {command_label}")
     return result
-
-
-def create_backup_container(args):
-    # install docker volume plugin
-    command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias {plugin_name} --grant-all-permissions --disable"
-    run_command(command, command_label="docker plugin install mochoa/s3fs-volume-plugin")
-
-    # disable volume plugin and set credential
-    command = f"/usr/bin/docker plugin disable {plugin_name} -f"
-    run_command(command, command_label="docker plugin disable s3fs-backup")
-    command = f"/usr/bin/docker plugin set {plugin_name} AWSACCESSKEYID={args.backup_volume_iam_user_access_key} AWSSECRETACCESSKEY={args.backup_volume_iam_user_secret_key}"
-    run_command(command, command_label="docker plugin set s3fs-backup credentials")
-    command = f'/usr/bin/docker plugin set s3fs-backup DEFAULT_S3FSOPTS="url=https://s3-accelerate.amazonaws.com"'
-    run_command(command, command_label="docker plugin set s3fs-backup options")
-    command = f"/usr/bin/docker plugin enable {plugin_name}"
-    run_command(command, command_label="docker plugin enable s3fs-backup")
-
-    # clean up all existing volumes and containers for s3 backup 
-    # Find and remove all containers whose names start with s3fs-backup
-    list_cmd = "/usr/bin/docker ps -a --filter 'name=^/s3fs-backup' --format '{{.Names}}'"
-    result = run_command(list_cmd, command_label="docker ps s3fs-backup containers")
-    container_names = [name for name in result.stdout.strip().split('\n') if name]
-    if container_names:
-        names_str = " ".join(container_names)
-        rm_cmd = f"/usr/bin/docker rm -f {names_str}"
-        run_command(rm_cmd, command_label="docker rm stale s3fs-backup containers")
-
-    # Find and remove all Docker volumes whose names start with "celium-backup-volume"
-    list_volumes_cmd = "/usr/bin/docker volume ls --format '{{.Name}}'"
-    result = run_command(list_volumes_cmd, command_label="docker volume ls")
-    volume_names = [name for name in result.stdout.strip().split('\n') if name.startswith("celium-backup-volume")]
-    if volume_names:
-        names_str = " ".join(volume_names)
-        rm_volumes_cmd = f"/usr/bin/docker volume rm {names_str}"
-        run_command(rm_volumes_cmd, command_label="docker volume rm stale backup volumes")
-    
-    # create volume
-    volume_name = args.backup_volume_name
-    command = " ".join([
-        "/usr/bin/docker", "volume", "create", "-d", plugin_name, volume_name,
-    ])
-    run_command(command, command_label="docker volume create s3fs-backup")
-
-    # create s3fs backup container
-    container_name = f"s3fs-backup-{args.backup_log_id}"
-    command = (
-        "/usr/bin/docker run -d "
-        f"--name {container_name} "
-        f"-v {volume_name}:/mnt "
-        f"-v {args.source_volume}:{args.source_volume_path} "
-        f"--entrypoint bash "
-        f'ubuntu -c "tail -f /dev/null"'
-    )
-    run_command(command, command_label="docker run s3fs-backup container")
-    return container_name
-
-
-def start_backup(args, container_name):
-    # Run cp command inside the container to copy from source_volume_path to /mnt
-    run_command(
-        f"/usr/bin/docker exec {container_name} sh -lc 'mkdir -p /mnt/{args.backup_target_path}'",
-        command_label="docker exec mkdir backup target",
-    )
-    command = f"/usr/bin/docker exec {container_name} sh -lc 'cp -a {args.backup_path} /mnt/{args.backup_target_path}'"
-    run_command(command, command_label="docker exec cp backup path")
-
-
-def clean_backup_container(container_name):
-    command = f"/usr/bin/docker rm -f {container_name}"
-    run_command(command, command_label="docker rm backup container")
-
-def clean_backup_volume(volume_name):
-    command = f"/usr/bin/docker volume rm {volume_name}"
-    run_command(command, command_label="docker volume rm backup volume")
-
-def disable_backup_volume_plugin():
-    command = f"/usr/bin/docker plugin disable {plugin_name} -f"
-    run_command(command, command_label="docker plugin disable s3fs-backup")
 
 
 def update_backup_log(
@@ -233,12 +162,13 @@ def pull_aws_cli():
     run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"], command_label="docker pull daturaai/aws-cli")
 
 
-def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
+def docker_base_command(args, volumes=None, volume_args=None, entrypoint=None, interactive=False):
     command = ["/usr/bin/docker", "run", "--rm"]
     if interactive:
         command.append("-i")
     for volume in volumes or []:
         command.extend(["-v", volume])
+    command.extend(volume_args or [])
     if entrypoint:
         command.extend(["--entrypoint", entrypoint])
     command.extend(
@@ -252,21 +182,31 @@ def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
     return command
 
 
-def estimate_backup_sizes(args, backup_path) -> tuple[int, int]:
-    source_volume = f"{args.source_volume}:{args.source_volume_path}"
+def workspace_command(args, volume_access: VolumeAccess, entrypoint: str, interactive: bool = False) -> list[str]:
+    if volume_access.encrypted:
+        return volume_access.docker_exec_args(entrypoint, interactive=interactive)
+    return docker_base_command(
+        args,
+        volume_args=volume_access.docker_run_args(),
+        entrypoint=entrypoint,
+        interactive=interactive,
+    )
+
+
+def estimate_backup_sizes(args, volume_access: VolumeAccess, backup_path: str) -> tuple[int, int]:
     # Run du inside Docker with the workload volume mounted; the miner host may not have this path.
-    du_command = docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sb", backup_path]
+    du_command = workspace_command(args, volume_access, "du") + ["-sb", backup_path]
     try:
         result = run_command_args(du_command, command_label="docker run du -sb <backup_path>")
         source_bytes = int(result.stdout.split()[0])
     except Exception:
         result = run_command_args(
-            docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sk", backup_path],
+            workspace_command(args, volume_access, "du") + ["-sk", backup_path],
             command_label="docker run du -sk <backup_path>",
         )
         source_bytes = int(result.stdout.split()[0]) * 1024
 
-    find_command = docker_base_command(args, volumes=[source_volume], entrypoint="find") + [backup_path, "-print"]
+    find_command = workspace_command(args, volume_access, "find") + [backup_path, "-print"]
     entry_count = count_command_output_lines(find_command, command_label="docker run find <backup_path> -print")
     entry_count = max(entry_count, 1)
 
@@ -277,8 +217,8 @@ def estimate_backup_sizes(args, backup_path) -> tuple[int, int]:
     return source_bytes, expected_upload_size
 
 
-def estimate_expected_size(args, backup_path):
-    _, expected_upload_size = estimate_backup_sizes(args, backup_path)
+def estimate_expected_size(args, volume_access: VolumeAccess, backup_path: str):
+    _, expected_upload_size = estimate_backup_sizes(args, volume_access, backup_path)
     return expected_upload_size
 
 
@@ -307,17 +247,15 @@ def count_command_output_lines(command: list[str], command_label: str = "command
     return count
 
 
-def aws_cp(args, expected_size: int | None = None):
-    backup_path = os.path.expanduser((args.backup_path or '').rstrip('/'))
+def aws_cp(args, volume_access: VolumeAccess, backup_path: str, expected_size: int | None = None):
     if not backup_path:
         raise ValueError("Backup path is required")
 
     backup_path_parent = os.path.dirname(backup_path) or "."
     backup_path_current = os.path.basename(backup_path)
-    source_volume = f"{args.source_volume}:{args.source_volume_path}"
 
     # tar runs inside Docker with the source volume mounted and writes the archive to stdout.
-    tar_command = docker_base_command(args, volumes=[source_volume], entrypoint="tar") + [
+    tar_command = workspace_command(args, volume_access, "tar") + [
         "--xattrs",
         "--acls",
         "-C",
@@ -388,59 +326,23 @@ def aws_head_object(args):
 def backup_storage(args):
     progress = 0
     try:
+        volume_access = detect_volume_access(args.source_volume, args.source_volume_path)
+
         logger.info("=" * 70)
         logger.info("Environment variables:")
         logger.info("=" * 70)
 
-        # logger.info(f"SOURCE_VOLUME: {args.source_volume}")
-        # logger.info(f"BACKUP_VOLUME_NAME: {args.backup_volume_name}")
-        # logger.info(f"BACKUP_VOLUME_IAM_USER_ACCESS_KEY: {args.backup_volume_iam_user_access_key}")
-        # logger.info(f"BACKUP_VOLUME_IAM_USER_SECRET_KEY: {args.backup_volume_iam_user_secret_key}")
-        # logger.info(f"BACKUP_PATH: {args.backup_path}")
-        # logger.info(f"AUTH_TOKEN: {args.auth_token}")
-        # logger.info(f"BACKUP_LOG_ID: {args.backup_log_id}")
-
-        # logger.info("Step 1: Creating backup container...")
-        # container_name = create_backup_container(args)
-        # logger.info(f"Backup container created: {container_name}")
-        # progress += 10 # 10
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container created"], "", progress, args.auth_token)
-
-        # logger.info("Step 2: Starting backup...")
-        # start_backup(args, container_name)
-        # logger.info("Backup started")
-        # progress += 20 # 30
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup started"], "", progress, args.auth_token)
-
-        # logger.info("Step 3: Cleanup backup container...")
-        # clean_backup_container(container_name)
-        # logger.info("Backup container cleaned")
-        # progress += 50 # 80
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container cleaned"], "", progress, args.auth_token)
-
-        # logger.info("Step 4: Cleanup backup volume...")
-        # clean_backup_volume(args.backup_volume_name)
-        # logger.info("Backup volume cleaned")
-        # progress += 10 # 90
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup volume cleaned"], "", progress, args.auth_token)
-
-        # logger.info("Step 5: Disable backup volume plugin...")
-        # disable_backup_volume_plugin()
-        # logger.info("Backup volume plugin disabled")
-        # progress += 10 # 100
-        # update_backup_log(args.api_url, "COMPLETED", [], "", progress, args.auth_token)
-
-        logger.info("Step 1: Pulling aws cli...")
+        logger.info("Step 1: Preparing workspace and pulling aws cli...")
         pull_aws_cli()
         logger.info("Aws cli pulled")
         progress = 10
         update_backup_log(args.api_url, args.backup_log_id, "IN_PROGRESS", ["Info: Aws cli pulled"], "", progress, args.auth_token)
 
-        backup_path = os.path.expanduser((args.backup_path or '').rstrip('/'))
+        backup_path = volume_access.normalized_path(args.backup_path)
         if not backup_path:
             raise ValueError("Backup path is required")
         logger.info("Step 2: Estimating backup size...")
-        estimated_backup_size_bytes, expected_upload_size = estimate_backup_sizes(args, backup_path)
+        estimated_backup_size_bytes, expected_upload_size = estimate_backup_sizes(args, volume_access, backup_path)
         progress = 20
         update_backup_log(
             args.api_url,
@@ -469,7 +371,7 @@ def backup_storage(args):
             progress,
             args.auth_token,
         )
-        aws_cp(args, expected_size=expected_size_arg)
+        aws_cp(args, volume_access, backup_path, expected_size=expected_size_arg)
         logger.info("Copying to aws s3 completed")
         progress = 90
         update_backup_log(

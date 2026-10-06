@@ -3,25 +3,40 @@
 import asyncio
 import json
 import logging
+import re
 import time
+from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
-from pydantic import BaseModel, ValidationError
-from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
-
-from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import (
     DefaultDockerImage,
     DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
+    FillerRunActiveResponse,
+    NvmlReportAckResponse,
+    PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
+    RentedGpuDropResponse,
+    VerificationStartedResponse,
 )
+from pydantic import BaseModel, ValidationError
+from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
+
+from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
+
+# The canonical 8-4-4-4-12 form only. Executor uuids are the miner's own strings; the backend parses
+# the batch as a list of UUIDs and rejects the whole request on one bad value, so a value that is not
+# a UUID is dropped here and the rest of the miner's batch still goes out.
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Most uuids one verification-started request carries; the backend refuses a longer list with 422.
+# Sized well above the largest miners seen on prod (two miners with 148 executors between them, 8 Sep 2026).
+VERIFICATION_STARTED_BATCH_MAX = 512
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -109,6 +124,7 @@ class BackendClient:
         add_signature: bool = True,
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
+        non_200_log_level: int = logging.ERROR,
     ) -> T | None:
         return await self._request(
             "POST",
@@ -118,6 +134,7 @@ class BackendClient:
             add_signature=add_signature,
             timeout=timeout,
             extra_headers=extra_headers,
+            non_200_log_level=non_200_log_level,
         )
 
     async def _request(
@@ -130,8 +147,11 @@ class BackendClient:
         add_signature: bool = True,
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
+        non_200_log_level: int = logging.ERROR,
     ) -> T | None:
-        # single signed round-trip, retrying connection-level errors per backoff schedule
+        # single signed round-trip, retrying connection-level errors per backoff schedule.
+        # `non_200_log_level`: an optional call whose route may not exist on the backend yet logs
+        # a non-200 as a warning instead of an error (report_verification_started).
         url = f"{self.base_url}/{path.lstrip('/')}"
         context = {"url": url, "method": method}
 
@@ -159,11 +179,12 @@ class BackendClient:
                             )
                         )
                         if resp.status != 200:
-                            logger.error(
+                            logger.log(
+                                non_200_log_level,
                                 _m(
                                     f"HTTP {method} failed",
                                     extra=get_extra_info({**context, "status": resp.status}),
-                                )
+                                ),
                             )
                             return None
 
@@ -215,7 +236,20 @@ class BackendClient:
         retry=retry_if_result(lambda x: x is None),
     )
     async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
-        """Fetch all rented executors with their ports from the backend."""
+        """Fetch all rented executors with their ports from the backend.
+
+        Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
+        cannot start. A check that asks mid-cycle uses `get_rented_executors_now` instead.
+        """
+        return await self.get_rented_executors_now()
+
+    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+        """One un-retried read of the rented executors and fillers as the backend sees them now.
+
+        For a check that re-asks after the cycle snapshot (DAH-3480): a backend that does not
+        answer within the 30 s timeout returns None, and the caller decides what that means;
+        nothing waits 60 s for two more attempts inside a running pipeline.
+        """
         return await self.get(
             "/internal/executors/rented",
             RentedExecutorsResponse,
@@ -249,6 +283,84 @@ class BackendClient:
             timeout=10,
         )
 
+    async def report_pod_host_reboot_recovered(
+        self, pod_id: str, container_finished_at: str
+    ) -> PodHostRebootRecoveredResponse | None:
+        """Tell the backend a pod was revived after its host rebooted, so the renter can be told.
+
+        container_finished_at is the container's exit time, which the backend uses to recognise
+        the same downtime reported by a later cycle while keeping a genuine second reboot of the
+        same pod a separate event. Older backends 404 and the caller treats that as nothing to do.
+        """
+        return await self.post(
+            f"/internal/pods/{pod_id}/host-reboot-recovered",
+            PodHostRebootRecoveredResponse,
+            json_data={"container_finished_at": container_finished_at},
+            timeout=10,
+        )
+
+    async def report_rented_gpu_drop(
+        self,
+        pod_id: str,
+        *,
+        state: str,
+        executor_id: str,
+        first_seen_at: str,
+        consecutive_cycles: int,
+        expected_gpu_count: int,
+        visible_gpu_count: int,
+        missing_uuids: list[str],
+        nvml_error_code: int | None,
+        faults: list[str],
+        pod_gpu_count: int | None,
+        rented_gpu_count: int | None,
+        nvml_gpu_count: int,
+    ) -> RentedGpuDropResponse | None:
+        """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
+        (``state="recovered"``).
+
+        The backend keeps one incident per pod until the recovery and tells the provider, support and
+        the renter once per incident. Older backends 404, which is no answer: the caller reports again
+        next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
+        ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
+        ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
+            RentedGpuDropResponse,
+            json_data={
+                "state": state,
+                "executor_id": executor_id,
+                "first_seen_at": first_seen_at,
+                "consecutive_cycles": consecutive_cycles,
+                "expected_gpu_count": expected_gpu_count,
+                "visible_gpu_count": visible_gpu_count,
+                "missing_uuids": missing_uuids,
+                "nvml_error_code": nvml_error_code,
+                "faults": faults,
+                "pod_gpu_count": pod_gpu_count,
+                "rented_gpu_count": rented_gpu_count,
+                "nvml_gpu_count": nvml_gpu_count,
+            },
+            timeout=10,
+            non_200_log_level=logging.WARNING,
+        )
+
+    async def get_filler_run_active(
+        self, filler_run_id: str, *, container_missing: bool = False
+    ) -> FillerRunActiveResponse | None:
+        """Fetch whether the backend still considers a Lium filler run active.
+
+        container_missing=True tells the backend this re-check was triggered by the filler
+        container being ABSENT on the host: the backend accumulates those reports and closes a
+        run the validator keeps seeing containerless (DAH-2471 zombie reconciliation). Older
+        backends simply ignore the query param.
+        """
+        path = f"/internal/filler-runs/{filler_run_id}/active"
+        if container_missing:
+            path += "?container_missing=true"
+        return await self.get(path, FillerRunActiveResponse, timeout=10)
+
     async def check_executor_health(
         self,
         miner_address: str,
@@ -257,6 +369,8 @@ class BackendClient:
         container_port: int,
         executor_id: str | None = None,
         rental_in_progress: bool = False,
+        gpu_uuids: list[str] | None = None,
+        cpu_count: int | None = None,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -269,6 +383,13 @@ class BackendClient:
             rental_in_progress: True if this validator already sees an active customer rental for the
                 executor. Lets the backend skip the container-creating check immediately; the backend
                 still re-checks the DB itself when this is False.
+            gpu_uuids: GPU UUIDs from the scrape this cycle. The backend's probe asks the container
+                runtime to resolve exactly these instead of `--gpus all`, which never names a card
+                and so let a host advertising GPUs it cannot hand over pass the check (DAH-2614).
+            cpu_count: Advertised CPU-core count from the scrape this cycle. The backend creates the
+                probe with `--cpus=<cpu_count>`, so a host claiming more cores than it physically has
+                is rejected by its own Docker daemon (CPU_QUOTA_EXCEEDS_HOST) rather than only in a
+                paying customer's rent (DAH-2671). None omits the flag.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -282,7 +403,16 @@ class BackendClient:
             "miner_hotkey": miner_hotkey,
             "container_port": container_port,
             "rental_in_progress": rental_in_progress,
+            # Sent from this cycle's scrape rather than read from the backend's stored specs: those
+            # are a cycle behind and absent entirely on an executor's first pass — the very check
+            # where a fabricated GPU matters most.
+            "gpu_uuids": gpu_uuids or [],
         }
+
+        # Same rationale as gpu_uuids: send the count this cycle's scrape produced, not the backend's
+        # stored specs. Omitted when unset so an unchanged backend keeps the pre-DAH-2671 behaviour.
+        if cpu_count is not None:
+            json_data["cpu_count"] = cpu_count
 
         if executor_id:
             json_data["executor_id"] = executor_id
@@ -294,3 +424,80 @@ class BackendClient:
             add_signature=True,  # Use standard signature headers
             timeout=300,  # 5 minutes - backend needs time to SSH and verify container
         )
+
+    async def report_verification_started(
+        self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime
+    ) -> None:
+        """Tell the backend a miner's executors have just started their validation pipelines (DAH-3019).
+
+        One signed POST per miner per cycle, `{job_batch_id, miner_hotkey, started_at, executor_uuids}`.
+        Per miner, not per executor: a miner's executors are launched in one `gather` and start within
+        a fraction of a second, and the whole cycle fires at once — per executor that was 483 requests
+        in 17 s (222 in one second) on prod, per miner it is 104 with a peak second of 39. The provider
+        portal turns the start, with the per-step durations of earlier runs, into "verifying · step
+        3/6 · ~70 s left".
+        Fire-and-forget: never raises, a 10-s timeout, no retry of its own (only `_request`'s two
+        connection-error retries that every call gets) — a missed report costs the provider a progress
+        bar, not a verdict. Until the backend has the route (lium-platform#120) the 404 is a warning,
+        not an error. Uuids that are not UUIDs are dropped; more than 512 are split.
+        """
+        uuids = [u for u in executor_uuids if UUID_RE.match(u or "")]
+        if len(uuids) < len(executor_uuids):
+            logger.warning(
+                _m(
+                    "Verification start not reported for executors whose uuid is not a UUID",
+                    extra={
+                        "miner_hotkey": miner_hotkey,
+                        "skipped": [str(u)[:80] for u in executor_uuids if not UUID_RE.match(u or "")],
+                    },
+                )
+            )
+        if not uuids:
+            return
+        path = f"/validator/{self.keypair.ss58_address}/verification-started"
+        for start in range(0, len(uuids), VERIFICATION_STARTED_BATCH_MAX):
+            chunk = uuids[start : start + VERIFICATION_STARTED_BATCH_MAX]
+            try:
+                await self.post(
+                    path,
+                    VerificationStartedResponse,
+                    json_data={
+                        "job_batch_id": job_batch_id,
+                        "miner_hotkey": miner_hotkey,
+                        "started_at": started_at.isoformat(),
+                        "executor_uuids": chunk,
+                    },
+                    add_signature=True,
+                    timeout=10,
+                    non_200_log_level=logging.WARNING,
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to report verification start",
+                        extra={
+                            "miner_hotkey": miner_hotkey,
+                            "job_batch_id": job_batch_id,
+                            "executors": len(chunk),
+                            "error": str(exc),
+                        },
+                    )
+                )
+
+    async def report_unknown_driver(self, driver_version: str) -> None:
+        """Ask the backend to verify an unknown NVIDIA driver (DAH-2451).
+
+        Fire-and-forget: the backend enqueues + resolves the driver against NVIDIA's
+        official installer, and the verdict reaches this validator later via shared
+        config. Never raises — a reporting failure must not disturb the pipeline.
+        """
+        try:
+            await self.post(
+                "/v1/nvml-driver/report-unknown",
+                NvmlReportAckResponse,
+                json_data={"driver_version": driver_version},
+                add_signature=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.warning(_m("Failed to report unknown driver", extra={"driver": driver_version, "error": str(exc)}))

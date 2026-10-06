@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from services import gpu_spec_table
+from incentive import config as incentive_config
+from services import const, gpu_spec_table
 from services.const import GPU_MODEL_RATES
 from services.gpu_precheck import (
     GpuPrecheckError,
@@ -93,6 +94,7 @@ def test_known_unranged_passthrough(monkeypatch):
     ("Tesla H100 80GB HBM3", "NVIDIA H100 80GB HBM3"),
     ("NVIDIA T4", "NVIDIA T4 Tensor Core GPU"),
     ("NVIDIA A10", "NVIDIA A10 Tensor Core GPU"),
+    ("NVIDIA A10G", "NVIDIA A10 Tensor Core GPU"),  # AWS g5 SKU of the A10
 ])
 def test_normalization_lookup(raw, expected):
     assert gpu_spec_table.normalize_gpu_model(raw) == expected
@@ -112,6 +114,25 @@ def test_normalize_passthrough_unmapped():
 
 
 # --- CI parity --------------------------------------------------------------
+B300_AC, B300_PC = "NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 PC"
+
+
+def test_b300_sxm6_pc_passes_the_precheck_at_the_observed_total():
+    # provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300 SXM6 PC, memory.total 275040 MiB,
+    # all 8 GPUs); the AC row records the same observed total, and the [0.90, 1.05] band admits it for both names
+    assert precheck_gpu_spec(B300_PC, 275040) is None
+    assert gpu_spec_table.get_expected_vram_windows(B300_PC) == gpu_spec_table.get_expected_vram_windows(B300_AC)
+
+
+@pytest.mark.parametrize("module", [incentive_config, const, gpu_spec_table], ids=lambda m: m.__name__)
+def test_every_table_naming_the_b300_ac_card_carries_the_pc_alias_at_the_same_value(module):
+    # the PC name is the AC card's alias, derived from the AC entry; a table added later that names AC joins by existing
+    tables = {name: t for name, t in vars(module).items() if isinstance(t, dict) and B300_AC in t}
+    assert tables, module.__name__
+    for name, table in tables.items():
+        assert table.get(B300_PC) == table[B300_AC], f"{module.__name__}.{name}"
+
+
 def test_gpu_model_rates_parity():
     """Every active key in const.GPU_MODEL_RATES MUST be covered by either
     GPU_VRAM_SIZES_MB or KNOWN_UNRANGED.
@@ -232,6 +253,8 @@ def test_get_expected_vram_windows_from_sizes():
 # exact values for every model, proving no pre-check value or range changed.
 _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA B300 SXM6 AC": [(265421, 309658)],
+    "NVIDIA B300 SXM6 PC": [(265421, 309658)],
+    "NVIDIA GB300": [(265421, 309658)],  # the B300 size
     "NVIDIA B200": [(176947, 206438)],
     "NVIDIA H200": [(129946, 151603)],
     "NVIDIA H200 NVL": [(129946, 151603)],
@@ -257,10 +280,16 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA GeForce RTX 4070": [(11059, 12902)],
     "NVIDIA GeForce RTX 4060 Ti": [(7373, 8602), (14746, 17203)],
     "NVIDIA GeForce RTX 4060": [(7373, 8602)],
+    "NVIDIA RTX PRO 2000 Blackwell": [(14746, 17203)],
     "NVIDIA RTX PRO 4000 Blackwell": [(22118, 25805)],
+    "NVIDIA RTX PRO 4500 Blackwell": [(29491, 34406)],
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": [(29491, 34406)],
     "NVIDIA RTX PRO 5000 Blackwell": [(44237, 51610), (66355, 77414)],
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": [(88474, 103219)],
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": [(88474, 103219)],
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [(77414, 90317)],
+    "NVIDIA RTX 6000D": [(77414, 90317)],
+    "NVIDIA RTX 4500 Ada Generation": [(22118, 25805)],
     "NVIDIA RTX 5000 Ada Generation": [(29491, 34406)],
     "NVIDIA RTX 5880 Ada Generation": [(44237, 51610)],
     "NVIDIA RTX 6000 Ada Generation": [(44237, 51610)],
@@ -269,7 +298,9 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA L40": [(44237, 51610)],
     "NVIDIA A100 80GB PCIe": [(73728, 86016)],
     "NVIDIA A100-SXM4-80GB": [(73728, 86016)],
+    "NVIDIA A800 80GB PCIe": [(73728, 86016)],
     "NVIDIA A10 Tensor Core GPU": [(22118, 25805)],
+    "NVIDIA CMP 170HX": [(7373, 8602), (36864, 43008), (58982, 68813)],
     "NVIDIA RTX A6000": [(44237, 51610)],
     "NVIDIA RTX A5000": [(22118, 25805)],
     "NVIDIA RTX A4500": [(18432, 21504)],
