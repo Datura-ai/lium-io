@@ -509,9 +509,6 @@ class Settings(BaseSettings):
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
-    # A GPU UUID is reported by the node, not attested: a node that copies another node's UUIDs
-    # would join it as a duplicate. Off, only the executor UUID and ip:port join copies.
-    DUPLICATE_EXECUTOR_MATCH_GPU_UUID: bool = Field(env="DUPLICATE_EXECUTOR_MATCH_GPU_UUID", default=True)
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",

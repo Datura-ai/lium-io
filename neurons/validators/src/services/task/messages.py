@@ -737,15 +737,6 @@ class DuplicateExecutorMessages:
         impact="Score set to 0 for this cycle; the other miner keeps it",
         remediation="One machine earns under one miner per cycle. Register it under one miner only.",
     )
-    ACROSS_MINERS_OBSERVED = MessageTemplate(
-        event="Executor also scored under another miner this cycle (observe mode)",
-        reason="EXECUTOR_DUPLICATE_ACROSS_MINERS_OBSERVED",
-        severity="warning",
-        category="policy",
-        impact="Detected; no score impact (observe mode)",
-        remediation="One machine earns under one miner per cycle. Register it under one miner only.",
-    )
-
 
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(

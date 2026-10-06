@@ -61,6 +61,43 @@ MINER_SCORES_KEY = "miner_scores"
 FAILED_MINER_EXECUTOR_UUID = "11111111-1111-1111-1111-111111111111"
 
 
+def settle_cycle_results(
+    all_job_results: dict[str, list[JobResult]], default_extra: dict
+) -> dict[str, int]:
+    """Settle machines scored under more than one hotkey, then count the scored GPUs per model.
+
+    The count comes after: a copy zeroed there must not count in its tier. A failure of the
+    duplicate pass is logged and the cycle scores its results as they are.
+    """
+    try:
+        keep_one_miner_per_executor(all_job_results, default_extra)
+    except Exception as exc:
+        logger.error(
+            _m("[sync] Duplicate-executor pass failed; results left as they are", extra=get_extra_info({**default_extra, "error": str(exc)})),
+            exc_info=True,
+        )
+    total_gpu_model_count_map: dict[str, int] = {}
+    for job_results in all_job_results.values():
+        for job_result in job_results:
+            if (
+                job_result.gpu_model
+                and job_result.gpu_count
+                and (job_result.score > 0 or job_result.job_score > 0)
+                and not job_result.is_spot
+                and not is_missing_discord_after_cutoff(job_result)
+                and not (
+                    job_result.is_new_rentals_paused and not job_result.is_rented
+                )
+            ):
+                total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
+    return total_gpu_model_count_map
+
+
+def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
+    """All but a zeroed duplicate under the keeper's own executor UUID: that backend row hears the keeper."""
+    return [result for result in results if not result.duplicate_shares_kept_row]
+
+
 class Validator:
     def __init__(self):
 
@@ -416,7 +453,6 @@ class Validator:
                     }
 
                 try:
-                    total_gpu_model_count_map = {}
                     all_job_results = {}
                     miner_coldkeys = {}
 
@@ -503,23 +539,9 @@ class Validator:
                             )
                             task.cancel()
 
-                    # Before the GPU totals: a copy zeroed here must not count in its tier.
-                    keep_one_miner_per_executor(
+                    total_gpu_model_count_map = settle_cycle_results(
                         all_job_results, {**self.default_extra, "job_batch_id": job_batch_id}
                     )
-                    for job_results in all_job_results.values():
-                        for job_result in job_results:
-                            if (
-                                job_result.gpu_model
-                                and job_result.gpu_count
-                                and (job_result.score > 0 or job_result.job_score > 0)
-                                and not job_result.is_spot
-                                and not is_missing_discord_after_cutoff(job_result)
-                                and not (
-                                    job_result.is_new_rentals_paused and not job_result.is_rented
-                                )
-                            ):
-                                total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 
                     try:
                         open_fd_count = len(os.listdir('/proc/self/fd'))
@@ -551,11 +573,12 @@ class Validator:
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
                     # withheld result (DAH-3405) got no verdict on that executor this cycle, so it
-                    # is treated as active as well.
+                    # is treated as active as well, and so is one whose passed copy another
+                    # hotkey kept the score for.
                     self.active_hotkeys = {
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
-                        if any(result.is_successful for result in results)
+                        if any(result.is_successful or result.duplicate_kept_by for result in results)
                     } | {withheld.miner_hotkey for withheld in withheld_results}
 
                     incentive = IncentiveFactory.create(
@@ -674,12 +697,10 @@ class Validator:
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(
-                                [result for result in results if result.duplicate_kept_by is None],
-                                miner_hotkey,
-                                miner_coldkey,
+                                specs_to_publish(results), miner_hotkey, miner_coldkey
                             )
-                            # a copy another hotkey kept is still handled by this cycle: the express
-                            # lane must not run it as a new node
+                            # an unpublished duplicate copy is still handled by this cycle: the
+                            # express lane must not run it as a new node
                             published_executor_ids.extend(
                                 result.executor_info.uuid
                                 for result in results
