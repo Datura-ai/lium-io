@@ -3317,7 +3317,8 @@ class DockerService:
         `docker volume rm` the given volumes. A customer create (DAH-3706) uses the tolerant rm and then
         confirms that no filler survived; True only when that rm exited 0 at once and the confirmation
         lists no filler, beside the df its command read after the rm (``with_df``; None otherwise).
-        The listed IDs are marked as ours when their `rm` is sent."""
+        The listed IDs are marked as ours when their `rm` is sent. After a replacement filler's rm, the
+        volume rm runs again."""
         targets = [listed_ids.get(name, name) for name in stale_containers]
         if not remove_every_filler:
             await self._rm_containers(ssh_client, targets, own_ids=listed_ids.values())
@@ -3351,6 +3352,16 @@ class DockerService:
             await self._remove_replacement_fillers(
                 ssh_client, default_extra, pod_name, replacements, cleanup_deadline
             )
+            # a replacement mounts its filler's volume_<id>, so the volume rm before its removal found it in use
+            if volumes_to_remove:
+                try:
+                    async with asyncio.timeout_at(cleanup_deadline):
+                        await self._remove_volumes(ssh_client, volumes_to_remove)
+                except TimeoutError as exc:
+                    raise Exception(
+                        "[clean_existing_containers] the volume rm after a replacement filler's removal did not "
+                        f"finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+                    ) from exc
             return False, None
         return removed_at_once and survivors == {}, df_avail_bytes_after_rm
 

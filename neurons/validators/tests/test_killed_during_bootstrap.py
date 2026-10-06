@@ -762,7 +762,7 @@ async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, 
             return Mock(stdout="", stderr="daemon unreachable", exit_status=1)
         if [new] in rms:  # the replacement is gone once its own rm ran
             text = "".join(line for line in text.splitlines(keepends=True) if new not in line)
-        if "--no-trunc" not in command:  # the names-only confirmation listing
+        if "--no-trunc" not in command:  # a names-only listing: none since the one command, every listing carries IDs
             text = "".join(f"{line.split()[0]}\n" for line in text.splitlines() if line.strip())
         return Mock(stdout=text, stderr="", exit_status=0)
 
@@ -776,7 +776,7 @@ async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, 
         with pytest.raises(Exception, match="exit_code 1"):
             await sweep
     elif case == "rm-sent-answer-lost-confirmation-failed":
-        # nothing shows the rm took effect: the sweep fails, and its finalizer still records the IDs
+        # nothing shows the rm took effect: the sweep fails, and the IDs marked when the one command was sent stay ours
         with pytest.raises(ConnectionResetError):
             await sweep
     else:

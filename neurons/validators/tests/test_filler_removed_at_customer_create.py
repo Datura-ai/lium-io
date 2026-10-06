@@ -550,9 +550,15 @@ _REPLACEMENT_ID = "b" * 64
 
 def _host_where_a_same_name_container_replaces_the_listed_one(name: str, events: list[str]) -> AsyncMock:
     """A host that lists ``name`` under _LISTED_ID; by the time the rm arrives that container is gone
-    and a new one runs under the same name (_REPLACEMENT_ID). `docker rm -fv` removes by ID or name."""
+    and a new one runs under the same name (_REPLACEMENT_ID). `docker rm -fv` removes by ID or name;
+    `docker volume rm` keeps the name's volume while either container mounts it."""
     containers = {name: _LISTED_ID}
+    volumes = {"volume_" + name.split("_", 1)[1]}
     listed = False
+
+    def remove_volume_unless_mounted() -> None:
+        if name not in containers:
+            volumes.clear()
 
     def listing() -> str:
         return "".join(f"{n} {i}\n" for n, i in containers.items())
@@ -565,6 +571,9 @@ def _host_where_a_same_name_container_replaces_the_listed_one(name: str, events:
                 listed = True
                 containers[name] = _REPLACEMENT_ID
             return _listing(stdout)
+        if cmd.startswith("/usr/bin/docker volume rm "):
+            remove_volume_unless_mounted()
+            return _listing("")
         assert cmd.startswith("/usr/bin/docker rm -fv "), cmd
         targets = shlex.split(cmd.split(">/dev/null")[0])[3:]
         events.append(" ".join(targets))
@@ -572,6 +581,8 @@ def _host_where_a_same_name_container_replaces_the_listed_one(name: str, events:
         for n in gone:
             del containers[n]
         rm_exit = 0 if len(gone) == len(targets) else 1
+        if "/usr/bin/docker volume rm " in cmd:
+            remove_volume_unless_mounted()
         if "printf 'RM" not in cmd:
             return _listing("", exit_status=rm_exit)
         names = "".join(f"NAME\t{line}\n" for line in listing().splitlines())
@@ -580,6 +591,7 @@ def _host_where_a_same_name_container_replaces_the_listed_one(name: str, events:
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(side_effect=run)
     ssh_client.containers = containers
+    ssh_client.volumes = volumes
     return ssh_client
 
 
@@ -606,6 +618,17 @@ async def test_customer_removal_removes_the_listed_container_not_a_same_name_rep
     assert events == removals
     assert ssh_client.containers == left_on_host
     assert len(_events(caplog)) == survivor_events
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_fillers_volume_is_removed_once_the_replacement_is_gone(docker_service):
+    # the replacement mounts its filler's volume_<id>: a volume rm before its removal finds it in use
+    ssh_client = _host_where_a_same_name_container_replaces_the_listed_one("filler_x", [])
+
+    await _clean_for_customer(docker_service, ssh_client)
+
+    assert ssh_client.containers == {}
+    assert ssh_client.volumes == set()
 
 
 @pytest.mark.asyncio
