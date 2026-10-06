@@ -57,7 +57,8 @@ class WeightBatch(BaseModel):
     hotkey_scores: dict[str, float]
     attempts: int
     status: str
-    first_attempt_block: int | None = None
+    # set by the validator on the cached copy: the block the chain accepted it at
+    submitted_block: int | None = None
 
 
 class WeightBatchNext(BaseModel):
@@ -533,35 +534,17 @@ class BackendClient:
 
     # DAH-4001 — rolling idle settlement
 
-    async def report_cycle_scores(
-        self,
-        *,
-        cycle_id: str,
-        cycle_started_at: datetime,
-        scored_at: datetime,
-        block: int,
-        burn_hotkey: str,
-        hotkey_scores: dict[str, float],
-    ) -> CycleScoresReport | None:
-        """Hand the cycle's per-hotkey vector to the backend, which settles it a day later."""
+    async def report_cycle_scores(self, payload: dict[str, Any]) -> CycleScoresReport | None:
+        """Hand a cycle's per-hotkey vector to the backend, which settles it a day later. `payload` is the
+        request body (see Validator.cycle_report_payload); the caller keeps it for replay when this returns None."""
         path = f"/validator/{self.keypair.ss58_address}/cycles"
-        return await self.post(
-            path,
-            CycleScoresReport,
-            json_data={
-                "cycle_id": cycle_id,
-                "cycle_started_at": cycle_started_at.isoformat(),
-                "scored_at": scored_at.isoformat(),
-                "block": block,
-                "burn_hotkey": burn_hotkey,
-                "hotkey_scores": hotkey_scores,
-            },
-        )
+        return await self.post(path, CycleScoresReport, json_data=payload)
 
-    async def claim_weight_batch(self) -> WeightBatch | None:
-        """The batch to submit this tempo, or None when nothing matured (or the backend is unreachable)."""
+    async def claim_weight_batch(self, mode: str) -> WeightBatch | None:
+        """The batch to submit this tempo, built from cycles recorded under `mode`; None when nothing matured
+        (or the backend is unreachable)."""
         path = f"/validator/{self.keypair.ss58_address}/weight-batches/next"
-        response = await self.post(path, WeightBatchNext)
+        response = await self.post(path, WeightBatchNext, json_data={"mode": mode})
         return response.batch if response is not None else None
 
     async def report_weight_batch_result(
