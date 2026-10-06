@@ -15,3 +15,7 @@ class Executor(SQLModel, table=True):
     executor_ssh_username: str
     executor_ssh_port: int
     rented: Optional[bool] = None
+    attestation_digest: Optional[str] = None
+    tee_type: Optional[str] = None
+    attestation_verified: Optional[bool] = None
+    attestation_verified_at: Optional[str] = None

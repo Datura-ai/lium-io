@@ -1,0 +1,15 @@
+version: '3.7'
+
+# G2 (CVM attestation): local variant — see docker-compose.yml for the full
+# rationale. The executor-runner is pinned by digest inside the measured
+# compose (stamped from .env by lium-cvm.sh) and lium-watchtower is retired
+# from the measured topology.
+
+services:
+  executor-runner:
+    image: daturaai/compute-subnet-executor-runner@${EXECUTOR_RUNNER_IMAGE_DIGEST}
+    container_name: executor-runner
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.env:/root/executor/.env

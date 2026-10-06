@@ -1,0 +1,110 @@
+import pytest
+
+from neurons.validators.src.services.task.checks.upload_files import UploadFilesCheck
+from neurons.validators.src.services.task.messages import UploadFilesMessages as Msg
+
+from tests.helpers import DummySSHClient, build_context_config, build_services, build_state
+
+
+@pytest.mark.parametrize(
+    "has_local_dir,has_executor_root,upload_success,error_msg,expected_pass,expected_reason",
+    [
+        # Missing local_dir
+        (False, True, True, "", False, Msg.CONFIG_MISSING.reason),
+        # Missing executor_root
+        (True, False, True, "", False, Msg.CONFIG_MISSING.reason),
+        # Upload succeeds
+        (True, True, True, "", True, Msg.UPLOAD_OK.reason),
+        # Upload fails with error
+        (True, True, False, "Permission denied", False, Msg.UPLOAD_FAILED.reason),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upload_files_check(
+    has_local_dir,
+    has_executor_root,
+    upload_success,
+    error_msg,
+    expected_pass,
+    expected_reason,
+    context_factory,
+):
+    # Create mock SSH client with SFTP
+    ssh_client = DummySSHClient(
+        sftp_should_raise=not upload_success,
+        sftp_error=error_msg,
+    )
+
+    # Setup services
+    services = build_services()
+
+    # Setup config
+    config = build_context_config(
+        executor_root="/root/app" if has_executor_root else None,
+    )
+
+    # Setup state
+    state = build_state(
+        upload_local_dir="/local/validator/files" if has_local_dir else None,
+    )
+
+    # Create context
+    ctx = context_factory(
+        services=services,
+        config=config,
+        state=state,
+        ssh=ssh_client,
+    )
+
+    # Run the check
+    result = await UploadFilesCheck().run(ctx)
+
+    # Verify result
+    assert result.passed is expected_pass
+    assert result.event.reason_code == expected_reason
+
+    # Verify SFTP interactions
+    if has_local_dir and has_executor_root:
+        # SFTP should have been called
+        assert ssh_client.sftp_client.put_called_with is not None
+        assert ssh_client.sftp_client.put_called_with.local_path == "/local/validator/files"
+        # Remote path should be executor_root + random hex (32 chars)
+        remote_path = ssh_client.sftp_client.put_called_with.remote_path
+        assert remote_path.startswith("/root/app/")
+        assert len(remote_path) == len("/root/app/") + 32  # UUID hex is 32 chars
+        assert ssh_client.sftp_client.put_called_with.recurse is True
+
+        # Verify state update on success
+        if expected_pass:
+            assert "state" in result.updates
+            updated_state = result.updates["state"]
+            assert updated_state.upload_remote_dir == remote_path
+            assert updated_state.remote_dir == remote_path
+    else:
+        # SFTP should not have been called if config is missing
+        assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.asyncio
+async def test_upload_files_check_uploads_nothing_when_the_scrape_can_travel_as_source(
+    context_factory,
+):
+    # DAH-2794: no probe, no round trip — whether this executor can run the source is answered
+    # by MachineSpecScrapeCheck actually running it, and it uploads the binary if it cannot.
+    # Arrange
+    ssh_client = DummySSHClient()
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(upload_local_dir="/local/validator/files"),
+        ssh=ssh_client,
+    )
+
+    # Act
+    result = await UploadFilesCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UPLOAD_SKIPPED.reason
+    assert ssh_client.sftp_client.put_called_with is None
+    assert result.updates == {}

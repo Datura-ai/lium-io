@@ -12,13 +12,28 @@ from daos.executor import ExecutorDao
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 from models.executor import Executor
-from core.utils import get_collateral_contract, _m
-from core.const import REQUIRED_DEPOSIT_AMOUNT
-from celium_collateral_contracts.address_conversion import h160_to_ss58
+from core.collateral import (
+    CollateralConfigError,
+    CollateralTransactionError,
+    h160_to_ss58,
+    rpc_origin,
+)
+from core.utils import get_collateral_contract, versions_holding_collateral, _m
 from bittensor.utils.balance import Balance
 from protocol.miner_portal_request import AddExecutorFailed
 
 logging.basicConfig(level=logging.INFO)
+
+
+def collateral_error(error: Exception) -> str:
+    """Log text for a collateral contract failure.
+
+    Only this module's own errors keep their message; any other error (a web3 or aiohttp
+    transport error) is named by its class, since its text can carry the RPC URL and its API key.
+    """
+    if isinstance(error, (CollateralTransactionError, CollateralConfigError)):
+        return str(error)
+    return type(error).__name__
 
 
 def require_executor_dao(func):
@@ -42,6 +57,7 @@ class CliService:
         self.config = settings.get_bittensor_config()
         self.hotkey = self.wallet.get_hotkey().ss58_address
         self.private_key = private_key
+        self.version = version
         self.collateral_contract = (
             get_collateral_contract(miner_key=private_key, version=version)
             if private_key else get_collateral_contract(version=version)
@@ -60,18 +76,37 @@ class CliService:
         self.default_extra = {
             "hotkey": self.hotkey,
             "netuid": self.netuid,
-            "contract_address": settings.COLLATERAL_CONTRACT_ADDRESS,
+            "contract_address": self.collateral_contract.contract_address,
             "network": settings.BITTENSOR_NETWORK,
-            "rpc_url": settings.SUBTENSOR_EVM_RPC_URL,
+            "rpc_url": rpc_origin(settings.SUBTENSOR_EVM_RPC_URL),
         }
 
     def get_node(self):
         """
         Get a SubstrateInterface node connection using the current config.
+        Tries each entry of the ordered endpoint list (our proxy first, the public
+        node last) so a down proxy does not fail the command.
         :return: SubstrateInterface instance
         """
-        self.subtensor = bt.subtensor(config=self.config)
-        return self.subtensor.substrate
+        endpoints = settings.get_chain_endpoints()
+        for index, endpoint in enumerate(endpoints):
+            try:
+                self.subtensor = bt.Subtensor(network=endpoint.value, config=self.config)
+                return self.subtensor.substrate
+            except Exception as e:
+                if index == len(endpoints) - 1:
+                    raise
+                next_endpoint = endpoints[index + 1]
+                self.logger.warning(_m(
+                    f"Subtensor endpoint switched from={endpoint.value} to={next_endpoint.value}",
+                    extra={
+                        **self.default_extra,
+                        "from": endpoint.value,
+                        "to": next_endpoint.value,
+                        "reason": "connect failed",
+                        "error": str(e),
+                    },
+                ))
 
     def print_extrinsic_receipt(self, receipt) -> dict:
         """
@@ -210,7 +245,7 @@ class CliService:
             print('Please enter your bittensor wallet password:')
             self.subtensor.transfer(
                 wallet=self.wallet,
-                dest=ss58_address,
+                destination_ss58=ss58_address,
                 amount=Balance.from_tao(amount, self.netuid),
                 wait_for_inclusion=True,
                 wait_for_finalization=True
@@ -225,8 +260,16 @@ class CliService:
                 extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
             ))
 
-    async def get_balance_of_eth_address(self) -> str:
-        balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+    async def get_balance_of_eth_address(self):
+        """The balance in TAO, or None after logging the failure."""
+        try:
+            balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+        except Exception as e:
+            self.logger.error(_m(
+                "❌ Failed to get the balance of the Eth address",
+                extra={**self.default_extra, "error": collateral_error(e)}
+            ))
+            return None
         self.logger.info(f"Balance of Eth address: {balance} TAO")
         return balance
 
@@ -243,8 +286,8 @@ class CliService:
         uid = self.get_uid_for_hotkey(self.hotkey)
         self.logger.info(f"UID for hotkey {self.hotkey}: {uid}")
         associated_evm = node.query(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid, uid])
-        address_bytes = associated_evm.value[0][0]
-        evm_address_hex = "0x" + bytes(address_bytes).hex()
+        # async-substrate-interface 2.x decodes the record: ("0x…", block_number)
+        evm_address_hex = associated_evm.value[0]
 
         self.logger.info(_m(
             f"EVM address for hotkey {self.hotkey}: {evm_address_hex}",
@@ -260,124 +303,28 @@ class CliService:
         port: int,
         price_per_gpu: float,
         validator: str | None = None,
-        deposit_amount: float | None = None,
-        gpu_type: str | None = None,
-        gpu_count: int | None = None
     ) -> bool:
         """
-        Add an executor to the database and deposit collateral.
+        Add an executor to the database.
         :param address: Executor IP address
         :param port: Executor port
         :param price_per_gpu: GPU price per hour in USD
         :param validator: Validator hotkey
-        :param deposit_amount: Amount of TAO to deposit (optional)
-        :param gpu_type: Type of GPU (optional)
-        :param gpu_count: Number of GPUs (optional)
         :return: True if successful, False otherwise
         """
         if validator is None:
             validator = settings.DEFAULT_VALIDATOR_HOTKEY
 
-        executor_uuid = uuid.uuid4()
         result = await self.executor_service.create(
             Executor(
-                uuid=executor_uuid,
+                uuid=uuid.uuid4(),
                 address=address,
                 port=port,
                 validator=validator,
                 price_per_gpu=price_per_gpu
             )
         )
-        if isinstance(result, AddExecutorFailed):
-            return False
-
-        if deposit_amount is None and gpu_type is None and gpu_count is None:
-            self.logger.info("No deposit amount provided, skipping deposit.")
-            return True
-
-        if deposit_amount is None:
-            if gpu_type is None or gpu_count is None:
-                self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
-                return False
-            if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
-                self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
-                return False
-            deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
-            if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-                deposit_amount = settings.REQUIRED_TAO_COLLATERAL
-            self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
-
-        if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-            self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
-            return False
-
-        try:
-            balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
-            self.logger.info(f"Miner balance: {balance} TAO for miner hotkey {self.hotkey}")
-            if balance < deposit_amount:
-                self.logger.error("Error: Insufficient balance in miner's address.")
-                return False
-            self.logger.info(
-                f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid} "
-                f"since miner {self.hotkey} is adding this executor"
-            )
-            await self.collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
-            self.logger.info("✅ Deposited collateral successfully.")
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to deposit collateral",
-                extra={**self.default_extra, "error": str(e)}
-            ))
-            return False
-
-    @require_executor_dao
-    async def deposit_collateral(self, address: str, port: int, deposit_amount: float | None = None, gpu_type: str | None = None, gpu_count: int | None = None):
-        """
-        Deposit collateral for an existing executor in the database.
-        :param address: Executor IP address
-        :param port: Executor port
-        :param deposit_amount: Amount of TAO to deposit (optional)
-        :param gpu_type: Type of GPU (optional)
-        :param gpu_count: Number of GPUs (optional)
-        :return: True if successful, False otherwise
-        """
-        if deposit_amount is None:
-            if gpu_type is None or gpu_count is None:
-                self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
-                return False
-            if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
-                self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
-                return False
-            deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
-            if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-                deposit_amount = settings.REQUIRED_TAO_COLLATERAL
-            self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
-
-        if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-            self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
-            return False
-        try:
-            executor = self.executor_dao.findOne(address, port)
-            executor_uuid = executor.uuid
-            balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
-            self.logger.info(f"Miner balance: {balance} TAO for miner hotkey {self.hotkey}")
-            if balance < deposit_amount:
-                self.logger.error("Error: Insufficient balance in miner's address.")
-                return False
-            self.logger.info(
-                f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid} "
-                f"since miner {self.hotkey} is going to add this executor"
-            )
-            await self.collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
-            self.logger.info("✅ Deposited collateral successfully.")
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to deposit collateral",
-                extra={**self.default_extra, "error": str(e)}
-            ))
-            return False
+        return not isinstance(result, AddExecutorFailed)
 
     async def reclaim_collateral(self, executor_uuid: str):
         """
@@ -393,7 +340,7 @@ class CliService:
                 f"Executor {executor_uuid} is being removed by miner {self.hotkey}. "
                 f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
             )
-            _, event = await self.collateral_contract.reclaim_collateral("Manual reclaim", executor_uuid)
+            event = await self.collateral_contract.reclaim_collateral(executor_uuid)
             import binascii
             json_payload = {
                 "reclaim_request_id": event['args']['reclaimRequestId'],
@@ -413,14 +360,14 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to reclaim collateral",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
     @require_executor_dao
     async def get_miner_collateral(self):
         """
-        Get the total miner collateral by summing up collateral from all registered executors.
+        Get the collateral of the registered executors on this client's contract version.
         :return: True if successful, False otherwise
         """
         try:
@@ -431,12 +378,16 @@ class CliService:
                 collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
                 total_collateral += float(collateral)
                 self.logger.info("Executor %s collateral: %f TAO", executor_uuid, collateral)
-            self.logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
+            self.logger.info(
+                "Collateral of the registered executors on contract version %s: %f TAO",
+                self.version,
+                total_collateral,
+            )
             return True
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed in getting miner collateral",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -449,7 +400,10 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = str(executor.uuid)
 
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
@@ -458,7 +412,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to get executor collateral",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -500,7 +454,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to get miner reclaim requests",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -518,7 +472,7 @@ class CliService:
         except Exception as e:
             self.logger.error(_m(
                 "❌ Failed to finalize reclaim request",
-                extra={**self.default_extra, "error": str(e)}
+                extra={**self.default_extra, "error": collateral_error(e)}
             ))
             return False
 
@@ -574,19 +528,25 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            executor = self.executor_dao.findOne(address, port)
+            executor = self.executor_dao.find_one(address, port)
+            if not executor:
+                self.logger.error("No executor at %s:%d", address, port)
+                return False
             executor_uuid = str(executor.uuid)
 
-            collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
-            if float(collateral) > 0:
-                self.logger.error("Executor %s has collateral %f TAO, cannot remove", executor_uuid, collateral)
+            versions = await versions_holding_collateral(executor_uuid)
+            if versions:
+                self.logger.error(
+                    "Executor %s holds collateral on contract version(s) %s; reclaim it first",
+                    executor_uuid, ", ".join(versions),
+                )
                 return False
 
             self.executor_dao.delete_by_address_port(address, port)
             self.logger.info("Removed an executor(%s:%d)", address, port)
             return True
         except Exception as e:
-            self.logger.error("Failed in removing an executor: %s", str(e))
+            self.logger.error("Failed in removing an executor: %s", collateral_error(e))
             return False
 
     @require_executor_dao
@@ -612,12 +572,3 @@ class CliService:
         except Exception as e:
             self.logger.error(f"Failed to update executor price: %s", str(e))
             return False
-
-    def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:
-        # Handle missing GPU model gracefully
-        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_type)
-        if unit_tao_amount is None:
-            raise ValueError(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
-
-        required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
-        return round(required_deposit_amount, 6)

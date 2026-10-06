@@ -2,18 +2,79 @@ import asyncio
 import contextvars
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from logging.config import dictConfig  # noqa
 from tenacity import retry, stop_after_attempt, wait_fixed
 import asyncssh
 
 from core.config import settings
-from celium_collateral_contracts import CollateralContract
-
-logger = logging.getLogger(__name__)
 
 # Create a ContextVar to hold the context information
 context = contextvars.ContextVar("context", default="TaskService")
 context.set("TaskService")
+
+
+class JSONFormatter(logging.Formatter):
+    """Reusable JSON formatter for structured logging across all modules."""
+
+    def __init__(self, include_validator_hotkey=True):
+        super().__init__()
+        self.include_validator_hotkey = include_validator_hotkey
+        self._validator_hotkey = None
+
+    def _get_validator_hotkey(self):
+        """Lazy load validator hotkey to avoid initialization issues."""
+        if self._validator_hotkey is None and self.include_validator_hotkey:
+            try:
+                self._validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
+            except Exception:
+                self._validator_hotkey = "unknown"
+        return self._validator_hotkey
+
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "file": record.filename,
+            "function": record.funcName,
+            "line": record.lineno,
+            "process": record.process,
+        }
+
+        # Add validator hotkey if enabled
+        if self.include_validator_hotkey:
+            hotkey = self._get_validator_hotkey()
+            if hotkey:
+                log_data["validator"] = hotkey
+
+        # Add context if available
+        if hasattr(record, 'context'):
+            log_data["context"] = record.context
+
+        # Extract extra data from _StructuredMessage if present
+        if hasattr(record, 'msg') and hasattr(record.msg, 'extra') and record.msg.extra:
+            log_data["extra"] = record.msg.extra
+
+        # Add exception info if present
+        if record.exc_info:
+            log_data["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_data, default=str)
+
+
+logger = logging.getLogger(__name__)
+
+
+def widen_default_thread_pool(loop: asyncio.AbstractEventLoop) -> None:
+    # asyncio sizes its default executor from os.cpu_count(), which in a container reports the node's
+    # cores and ignores the cgroup limit — 8 threads here. DNS resolution and the blocking bittensor
+    # SDK calls share that pool, so it needs headroom. Docker SDK calls have their own pool, see
+    # services/rental_docker_sdk.py.
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=32, thread_name_prefix="asyncio-default")
+    )
 
 
 def wait_for_services_sync(timeout=30):
@@ -27,7 +88,7 @@ def wait_for_services_sync(timeout=30):
     from core.config import settings
 
     # Initialize Redis client
-    redis_client = Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT)
+    redis_client = Redis.from_url(settings.get_redis_connection_url())
 
     start_time = time.time()
 
@@ -77,16 +138,67 @@ def get_extra_info(extra: dict) -> dict:
     return extra_info
 
 
-def configure_logs_of_other_modules():
-    validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
+def _apply_asyncssh_log_level(asyncssh_logger: logging.Logger | None = None) -> int:
+    """Set the asyncssh logger level from the ``SSH_DEBUG_LOGGING`` setting.
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f"Validator: {validator_hotkey} | Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
-    )
+    DAH-2272: defaults to WARNING (asyncssh is quiet); when the flag is on, raise
+    it to DEBUG and request debug level 2 (full handshake, no packet dumps — 3
+    can leak the private key) so the banner / key-exchange / auth phases are
+    logged per connection.
+    """
+    level = logging.DEBUG if settings.SSH_DEBUG_LOGGING else logging.WARNING
+    lg = asyncssh_logger or logging.getLogger("asyncssh")
+    lg.setLevel(level)
+    if settings.SSH_DEBUG_LOGGING:
+        # Level 2 = full debug logging; level 3 would dump packets (key material).
+        asyncssh.set_debug_level(2)
+    return level
+
+
+_warned_log_levels: set[str] = set()
+
+
+def root_log_level() -> int:
+    """``settings.LOG_LEVEL`` as a logging level; an unknown name falls back to INFO, with one warning."""
+    value = str(settings.LOG_LEVEL)
+    level = logging.getLevelName(value.strip().upper())
+    if isinstance(level, int):
+        return level
+    if value not in _warned_log_levels:
+        _warned_log_levels.add(value)
+        logging.getLogger(__name__).warning("LOG_LEVEL=%r is not a level name; logging at INFO", value)
+    return logging.INFO
+
+
+# Third-party protocol loggers that write frames, headers or bodies at DEBUG. A websocket frame to a miner
+# can carry an SSH private key, a registry password or a token (ComputeClient.send_model), so LOG_LEVEL=DEBUG
+# stops at the validator's own loggers.
+PROTOCOL_LOGGERS = ("websockets", "aiohttp", "httpx", "httpcore", "urllib3")
+
+
+def protocol_log_level() -> int:
+    return max(root_log_level(), logging.INFO)
+
+
+def configure_logs_of_other_modules():
+    # Configure root logger with JSON formatter
+    root_logger = logging.getLogger()
+    root_logger.setLevel(root_log_level())
+
+    # Remove existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Add new handler with JSON formatter
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(JSONFormatter())
+    root_logger.addHandler(console_handler)
 
     sqlalchemy_logger = logging.getLogger("sqlalchemy")
     sqlalchemy_logger.setLevel(logging.WARNING)
+
+    for name in PROTOCOL_LOGGERS:
+        logging.getLogger(name).setLevel(protocol_log_level())
 
     class ContextFilter(logging.Filter):
         """
@@ -97,34 +209,11 @@ def configure_logs_of_other_modules():
             record.context = context.get() or "Default"
             return True
 
-    # Create a custom formatter that adds the context to the log messages
-    class CustomFormatter(logging.Formatter):
-        def format(self, record):
-            try:
-                task = asyncio.current_task()
-                coro_name = task.get_coro().__name__ if task else "NoTask"
-                task_id = id(task) if task else "NoTaskID"
-                return f"{getattr(record, 'context', 'Default')} | {coro_name} | {task_id} | {super().format(record)}"
-            except Exception:
-                return ""
-
     asyncssh_logger = logging.getLogger("asyncssh")
-    asyncssh_logger.setLevel(logging.WARNING)
+    _apply_asyncssh_log_level(asyncssh_logger)
 
     # Add the filter to the logger
     asyncssh_logger.addFilter(ContextFilter())
-
-    # Create a handler for the logger
-    handler = logging.StreamHandler()
-
-    # Add the handler to the logger
-    asyncssh_logger.handlers = []
-    asyncssh_logger.addHandler(handler)
-
-    # Set the formatter for the handler
-    handler.setFormatter(
-        CustomFormatter("%(name)s %(asctime)s %(levelname)s %(filename)s %(process)d %(message)s")
-    )
 
 
 def get_logger(name: str):
@@ -132,19 +221,18 @@ def get_logger(name: str):
         "version": 1,
         "disable_existing_loggers": False,
         "formatters": {
-            "verbose": {
-                "format": "%(levelname)-8s %(asctime)s --- "
-                "%(lineno)-8s [%(name)s] %(funcName)-24s : %(message)s",
+            "json": {
+                "()": JSONFormatter,
             }
         },
         "handlers": {
             "console": {
                 "class": "logging.StreamHandler",
-                "formatter": "verbose",
+                "formatter": "json",
             },
         },
         "root": {
-            "level": "INFO",
+            "level": root_log_level(),
             "handlers": ["console"],
         },
         "loggers": {
@@ -154,9 +242,11 @@ def get_logger(name: str):
                 "propagate": False,
             },
             "asyncssh": {
-                "level": "WARNING",
+                # DAH-2272: DEBUG when SSH_DEBUG_LOGGING is set, else quiet.
+                "level": "DEBUG" if settings.SSH_DEBUG_LOGGING else "WARNING",
                 "propagate": True,
             },
+            **{name: {"level": protocol_log_level(), "propagate": True} for name in PROTOCOL_LOGGERS},
         },
     }
 
@@ -165,16 +255,24 @@ def get_logger(name: str):
     return logger
 
 
-class StructuredMessage:
-    def __init__(self, message, extra: dict):
+class _StructuredMessage:
+    """Holds message and extra data for structured logging."""
+    def __init__(self, message: str, extra: dict = None):
         self.message = message
-        self.extra = extra
+        self.extra = extra or {}
 
     def __str__(self):
-        return "%s >>> %s" % (self.message, json.dumps(self.extra, default=str))  # noqa
+        # Just return the message for JSON formatter (extra is extracted separately)
+        return self.message
+
+    def to_full_string(self) -> str:
+        """Return message with full JSON extra data for database storage."""
+        return "%s >>> %s" % (self.message, json.dumps(self.extra, default=str))
 
 
-_m = StructuredMessage
+def _m(message: str, extra: dict = None):
+    """Helper to create structured log messages."""
+    return _StructuredMessage(message, extra)
 
 
 async def retry_ssh_command(
@@ -184,7 +282,8 @@ async def retry_ssh_command(
     max_attempts: int = 5,
     wait_seconds: int = 10,
 ):
-    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds))
+    # reraise: the caller gets the last attempt's error (exit code, stderr), not RetryError[<Future>]
+    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds), reraise=True)
     async def execute_command():
         result = await ssh_client.run(command)
         if result.exit_status != 0:
@@ -192,29 +291,3 @@ async def retry_ssh_command(
 
     await execute_command()
 
-
-def get_collateral_contract(version: str = "1.0.2") -> CollateralContract:
-    """
-    Initializes and returns a CollateralContract instance.
-
-    Args:
-        network (str): The blockchain network to use ('local', 'test', 'finney', etc.).
-        contract_address (str): Address of the collateral contract.
-        owner_key (str): Ethereum owner key.
-        miner_key (str): Optional miner key required for contract operations.
-
-    Returns:
-        CollateralContract: The initialized contract instance.
-    """
-    network = settings.BITTENSOR_NETWORK
-    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
-    if version and settings.CONTRACT_VERSIONS.get(version):
-        contract_address = settings.CONTRACT_VERSIONS.get(version)["address"]
-
-    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
-
-    return CollateralContract(
-        network=network,
-        contract_address=contract_address,
-        rpc_url=rpc_url,
-    )

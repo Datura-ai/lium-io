@@ -2,7 +2,7 @@ import gc
 import pexpect
 import tempfile
 import os
-import re
+import shlex
 import asyncssh
 import asyncio
 import logging
@@ -22,11 +22,12 @@ class InteractiveShellService:
     port: int
     remote_dir: str | None = None
 
-    def __init__(self, host: str, username: str, private_key: str, port: int):
+    def __init__(self, host: str, username: str, private_key: str, port: int, known_hosts: asyncssh.SSHKnownHosts | None = None):
         self.host = host
         self.username = username
         self.private_key = private_key
         self.port = port
+        self.known_hosts = known_hosts
         self.log_extra = {
             "host": host,
             "username": username,
@@ -91,7 +92,9 @@ class InteractiveShellService:
             port=self.port,
             username=self.username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=self.known_hosts,
+            keepalive_interval=15,
+            keepalive_count_max=3,
         )
 
     async def __aenter__(self):
@@ -107,6 +110,20 @@ class InteractiveShellService:
                 os.remove(self.priv_key_path)
         except:
             pass
+
+        # Close the SSH connection to prevent file descriptor leaks
+        try:
+            if self.ssh_client:
+                self.ssh_client.close()
+                await self.ssh_client.wait_closed()
+        except Exception as e:
+            logger.error(_m(
+                "Error: closing SSH connection",
+                extra=get_extra_info({
+                    **self.log_extra,
+                    "error": str(e),
+                }),
+            ))
 
         # try:
         #     if self.i_shell:
@@ -163,7 +180,7 @@ class InteractiveShellService:
         try:
             await self.ssh_client.run(f"rm -rf {self.remote_dir}", timeout=10)
             # await self.exec_shell_command(f"rm -rf {self.remote_dir}")
-        except Exception as e:
+        except Exception:
             pass
 
     async def read_file_content_over_scp(self, file_path: str) -> bytes:
@@ -187,28 +204,21 @@ class InteractiveShellService:
         file_content = await self.read_file_content_over_scp(file_path)
         return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
 
-    # async def get_checksums_by_path(self, file_path: str):
-    #     md5_output = await self.exec_shell_command(f'md5sum {file_path}')
-    #     sha256_output = await self.exec_shell_command(f'sha256sum {file_path}')
+    async def get_sha256_checksum_by_path(self, file_path: str) -> str:
+        result = await self.ssh_client.run(
+            f"sha256sum {shlex.quote(file_path)}",
+            check=False,
+        )
+        if result.exit_status != 0:
+            return ""
 
-    #     # Extract the checksums from the command outputs
-    #     md5_sum = md5_output.replace(file_path, '').strip() if md5_output else None
-    #     sha256_sum = sha256_output.replace(file_path, '').strip() if sha256_output else None
+        output = result.stdout or ""
+        parts = output.split(maxsplit=1)
+        if not parts:
+            return ""
 
-    #     return f'{md5_sum}:{sha256_sum}'
+        digest = parts[0]
+        if len(digest) != 64:
+            return ""
 
-    # async def exec_shell_command(self, command: str):
-    #     # return await self.loop.run_in_executor(None, self._exec_shell_command, command)
-    #     return await asyncio.to_thread(self._exec_shell_command, command)
-
-    # def _exec_shell_command(self, command: str):
-    #     try:
-    #         self.i_shell.sendline(f"{command} && echo 'STOPPED'")
-    #         self.i_shell.expect(['STOPPED'], timeout=30)
-    #         self.i_shell.expect(['STOPPED'], timeout=30)
-    #         output_lines = [line.strip() for line in re.split(r'[\r\n]', self.i_shell.before.decode('utf-8')) if line.strip()]
-    #         return output_lines[-1]
-    #     except pexpect.TIMEOUT:
-    #         raise Exception("i-ssh connection Timeout")
-    #     except pexpect.EOF:
-    #         raise Exception("i-ssh connection EOF error")
+        return digest

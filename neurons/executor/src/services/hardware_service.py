@@ -1,9 +1,118 @@
+import subprocess
+import threading
+
 import psutil
 import pynvml
 import docker
 from core.logger import get_logger
 
 logger = get_logger(__name__)
+
+DF_TIMEOUT_SECONDS = 5.0
+DOCKER_CLIENT_TIMEOUT_SECONDS = 5.0
+
+_docker_client = None
+_docker_client_lock = threading.Lock()
+
+
+def get_docker_client() -> docker.DockerClient:
+    # one shared client with a bounded API timeout, so a wedged docker daemon cannot hold a call forever
+    global _docker_client
+    with _docker_client_lock:
+        if _docker_client is None:
+            _docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT_SECONDS)
+        return _docker_client
+
+
+def _parse_df_output(df_output: str) -> dict:
+    """
+    Parse `df -k` output to extract filesystem metrics.
+    
+    Args:
+        df_output: Output from `df -k` command
+    
+    Returns:
+        dict: {
+            "total": int,  # Total size in KB
+            "used": int,   # Used size in KB
+            "available": int  # Available size in KB,
+            "utilization": float  # Utilization percentage
+        }
+    """
+    lines = df_output.strip().split('\n')
+    if len(lines) < 2:
+        return {"total": 0, "used": 0, "available": 0, "utilization": 0.0}
+    
+    # Skip header line, get first data line
+    data_line = lines[1].split()
+    if len(data_line) < 4:
+        return {"total": 0, "used": 0, "available": 0, "utilization": 0.0}
+    
+    try:
+        # df -k output format: Filesystem 1K-blocks Used Available Use% Mounted on
+        total = int(data_line[1])
+        used = int(data_line[2])
+        available = int(data_line[3])
+        utilization = 0.0
+        if total > 0:
+            utilization = round((used / total) * 100.0, 2)
+        return {"total": total, "used": used, "available": available, "utilization": utilization}
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Error parsing df output: {e}, output: {df_output}")
+        return {"total": 0, "used": 0, "available": 0, "utilization": 0.0}
+
+
+def _get_filesystem_usage(container_name: str, mount_point: str) -> dict:
+    """
+    Get filesystem usage for a specific mount point inside the container.
+
+    Runs `docker exec ... df -k` as a subprocess instead of docker-py exec_run:
+    df against a dead FUSE mount hangs in uninterruptible D-state forever, and a
+    docker-py call stuck on it can never be reclaimed. As a subprocess the
+    `docker exec` client is killed on timeout, which frees the executor's pool
+    thread (the `df` inside the container stays wedged, but the agent is not).
+
+    Args:
+        container_name: Name of the Docker container
+        mount_point: Mount point path (e.g., "/", "/root")
+
+    Returns:
+        dict: {
+            "total": int,  # Total size in KB
+            "used": int,   # Used size in KB
+            "available": int,  # Available size in KB
+            "utilization": float  # Utilization percentage
+            "mount_point": str    # Mount point path
+            "stale": bool         # Present and True when collection timed out
+        }
+    """
+    zero_usage = {"total": 0, "used": 0, "available": 0, "utilization": 0.0, "mount_point": mount_point}
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-u", "root", container_name, "df", "-k", mount_point],
+            capture_output=True,
+            timeout=DF_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"df -k {mount_point} in {container_name} timed out after {DF_TIMEOUT_SECONDS}s, "
+            "returning stale zeros"
+        )
+        return {**zero_usage, "stale": True}
+    except Exception as e:
+        logger.warning(f"Error getting filesystem usage for {mount_point}: {e}")
+        return zero_usage
+
+    if result.returncode != 0:
+        logger.warning(
+            f"Failed to get filesystem usage for {mount_point}: "
+            f"{result.stderr.decode('utf-8', errors='replace')}"
+        )
+        return zero_usage
+
+    parsed = _parse_df_output(result.stdout.decode("utf-8", errors="replace"))
+    parsed["mount_point"] = mount_point
+    return parsed
 
 
 def get_system_metrics():
@@ -33,17 +142,21 @@ def get_system_metrics():
     gpus = []
     try:
         pynvml.nvmlInit()
-        gpu_count = pynvml.nvmlDeviceGetCount()
-        
-        for i in range(gpu_count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            gpus.append({
-                "utilization": util.gpu,                  # %
-                "memory": mem.used / mem.total * 100.0    # %
-            })
-        pynvml.nvmlShutdown()
+        # finally: a leaked NVML handle in the long-lived executor process blocks any later
+        # per-GPU maintenance with "in use by another client" (DAH-2427 review finding).
+        try:
+            gpu_count = pynvml.nvmlDeviceGetCount()
+
+            for i in range(gpu_count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpus.append({
+                    "utilization": util.gpu,                  # %
+                    "memory": mem.used / mem.total * 100.0    # %
+                })
+        finally:
+            pynvml.nvmlShutdown()
     except (pynvml.NVMLError, pynvml.NVMLError_NotSupported, pynvml.NVMLError_DriverNotLoaded) as e:
         # This is expected on systems without NVIDIA GPUs or drivers
         logger.debug(f"No GPU available: {e}")
@@ -70,15 +183,28 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
         dict: Container-specific hardware utilization metrics with the following structure:
             {
                 "cpu": {
-                    "usage": float,           # CPU usage percentage
+                    "utilization": float,     # CPU usage percentage
                     "limit": float            # CPU limit (number of cores)
                 },
                 "memory": {
-                    "usage": int,             # Memory usage in bytes
+                    "used": int,              # Memory usage in bytes
                     "limit": int,             # Memory limit in bytes
-                    "usage_percent": float    # Memory usage percentage
+                    "utilization": float      # Memory usage percentage
                 },
-                "storage": float,             # Storage utilization percentage (system-wide)
+                "storage": {
+                    "total": int,             # Total storage in KB
+                    "used": int,              # Used storage in KB
+                    "available": int,         # Available storage in KB
+                    "utilization": float,     # Storage usage percentage
+                    "mount_point": str        # Mount point path
+                },
+                "volume": {                   # Volume metrics (None if no vloopback volume)
+                    "total": int,             # Total volume size in KB
+                    "used": int,              # Used volume size in KB
+                    "available": int,         # Available volume size in KB
+                    "utilization": float,     # Volume usage percentage
+                    "mount_point": str        # Mount point path
+                } | None,
                 "gpu": [                      # Array of GPU metrics for assigned GPUs only
                     {
                         "uuid": str,
@@ -90,7 +216,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
     """
     try:
         # Get Docker client
-        client = docker.from_env()
+        client = get_docker_client()
         container = client.containers.get(container_name)
 
         # Get container stats (non-streaming, single sample)
@@ -103,7 +229,8 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
 
         cpu_usage_percent = 0.0
         if system_delta > 0 and cpu_delta > 0:
-            cpu_usage_percent = (cpu_delta / system_delta) * cpu_count * 100.0
+            # Calculate CPU percentage normalized to 0-100% regardless of core count
+            cpu_usage_percent = (cpu_delta / system_delta) * 100.0
 
         # Get CPU limit (from container spec)
         cpu_limit = cpu_count  # Default to all CPUs
@@ -113,45 +240,58 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
         # Calculate memory usage
         memory_usage = stats["memory_stats"].get("usage", 0)
         memory_limit = stats["memory_stats"].get("limit", 0)
-        memory_usage_percent = 0.0
+        memory_utilization = 0.0
         if memory_limit > 0:
-            memory_usage_percent = (memory_usage / memory_limit) * 100.0
+            memory_utilization = round((memory_usage / memory_limit) * 100.0, 2)
 
-        # Get storage usage (system-wide, same as get_system_metrics)
-        storage = psutil.disk_usage('/').percent
+        # Get actual filesystem usage from inside the container
+        storage_metrics = _get_filesystem_usage(container_name, "/")
+        
+        # Get volume metrics if there's a vloopback volume
+        volume_metrics = None
+        mounts = container.attrs.get("Mounts", [])
+        for mount in mounts:
+            # Check if it's a vloopback volume
+            if mount.get("Driver", "").startswith("vloopback"):
+                mount_point = mount.get("Destination", "")
+                if mount_point:
+                    volume_metrics = _get_filesystem_usage(container_name, mount_point)
+                    break
 
         # Get GPU metrics for specified UUIDs only
         gpus = []
         if gpu_uuids:
             try:
                 pynvml.nvmlInit()
+                # finally: a leaked NVML handle in the long-lived executor process blocks any
+                # later per-GPU maintenance with "in use by another client" (DAH-2427 review).
+                try:
+                    for gpu_uuid in gpu_uuids:
+                        try:
+                            # Get GPU handle by UUID
+                            handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
 
-                for gpu_uuid in gpu_uuids:
-                    try:
-                        # Get GPU handle by UUID
-                        handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+                            # Get utilization rates
+                            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
 
-                        # Get utilization rates
-                        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                            # Get memory info
+                            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
-                        # Get memory info
-                        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-
-                        gpus.append({
-                            "uuid": gpu_uuid,
-                            "utilization": util.gpu,                  # %
-                            "memory": mem.used / mem.total * 100.0    # %
-                        })
-                    except pynvml.NVMLError as e:
-                        logger.warning(f"Error getting metrics for GPU {gpu_uuid}: {e}")
-                        # Add entry with zero values if GPU not accessible
-                        gpus.append({
-                            "uuid": gpu_uuid,
-                            "utilization": 0.0,
-                            "memory": 0.0
-                        })
-
-                pynvml.nvmlShutdown()
+                            gpus.append({
+                                "uuid": gpu_uuid,
+                                "utilization": util.gpu,                  # %
+                                "memory": mem.used / mem.total * 100.0    # %
+                            })
+                        except pynvml.NVMLError as e:
+                            logger.warning(f"Error getting metrics for GPU {gpu_uuid}: {e}")
+                            # Add entry with zero values if GPU not accessible
+                            gpus.append({
+                                "uuid": gpu_uuid,
+                                "utilization": 0.0,
+                                "memory": 0.0
+                            })
+                finally:
+                    pynvml.nvmlShutdown()
             except (pynvml.NVMLError, pynvml.NVMLError_NotSupported, pynvml.NVMLError_DriverNotLoaded) as e:
                 logger.debug(f"No GPU available: {e}")
             except Exception as e:
@@ -159,15 +299,16 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
 
         return {
             "cpu": {
-                "usage": round(cpu_usage_percent, 2),
+                "utilization": round(cpu_usage_percent, 2),
                 "limit": cpu_limit
             },
             "memory": {
-                "usage": memory_usage,
+                "used": memory_usage,
                 "limit": memory_limit,
-                "usage_percent": round(memory_usage_percent, 2)
+                "utilization": memory_utilization
             },
-            "storage": storage,
+            "storage": storage_metrics,
+            "volume": volume_metrics,
             "gpu": gpus
         }
 

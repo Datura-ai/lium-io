@@ -9,13 +9,14 @@ dependencies = [
     "alembic>=1.16.5",
     "asyncssh>=2.21.0",
     "asgiref>=3.9.1",
-    "bittensor==9.10.1",
-    "bittensor-cli==9.11.0",
-    "bittensor-commit-reveal==0.4.0",
-    "celium-collateral==1.1.6",
+    "bittensor==10.5.0",
+    "async-substrate-interface>=2.0.4",
+    "bittensor-cli>=9.22.0",
+    "bittensor-commit-reveal>=0.4.0",
     "databases>=0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
     "fastapi>=0.110.3",
+    "lium-core>=0.1.1",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
     "python-json-logger>=3.3.0",
@@ -25,7 +26,8 @@ dependencies = [
     "tenacity>=9.1.2",
     "uvicorn>=0.35.0",
     "pytest>=8.4.2",
-    "httpx>=0.28.0",
+    "pytest-asyncio>=0.24.0",
+    "web3<7,>=6.20.3",
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
@@ -40,5 +42,5 @@ build-backend = "pdm.backend"
 distribution = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

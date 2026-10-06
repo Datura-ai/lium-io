@@ -127,6 +127,7 @@ env3/
 ENV/
 env.bak/
 venv.bak/
+venv
 
 # Spyder project settings
 .spyderproject
@@ -174,3 +175,17 @@ testing/
 notebooks/
 
 .vscode/*
+
+
+config_override.py
+.cursor
+.claude
+.omc
+
+CLAUDE.md
+neurons/validators/openspec/
+openspec/
+
+.omx/
+.codex/
+AGENTS.md

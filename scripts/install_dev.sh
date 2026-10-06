@@ -67,8 +67,8 @@ wait_for_user() {
 
 #install pre
 install_pre() {
-    sudo apt update
-    sudo apt install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
+    sudo apt-get update
+    sudo apt-get install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
     exit_on_error $?
 }
 
@@ -90,7 +90,7 @@ install_python() {
     else
         ohai "Installing Python 3.11"
         add-apt-repository ppa:deadsnakes/ppa
-        apt install python3.11
+        sudo apt-get install -y python3.11
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
         python -m pip install cffi
         python -m pip install cryptography

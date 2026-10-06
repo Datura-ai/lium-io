@@ -1,6 +1,7 @@
 MIN_JOB_TAKEN_TIME = 20
 
 GPU_MODEL_RATES = {
+    "NVIDIA B300 SXM6 AC": .05,
     "NVIDIA B200": .05,
     "NVIDIA H200": .56,
     "NVIDIA H200 NVL": .49,
@@ -10,10 +11,33 @@ GPU_MODEL_RATES = {
     "NVIDIA H800 80GB HBM3": 0.02,
     "NVIDIA H800 NVL": 0.01,
     "NVIDIA H800 PCIe": 0.01,
+    # Supported operationally, but excluded from the unrented pool by default.
+    "NVIDIA GeForce RTX 5080": 0.0,
+    "NVIDIA GeForce RTX 5070 Ti": 0.0,
+    "NVIDIA GeForce RTX 5070": 0.0,
+    "NVIDIA GeForce RTX 5060 Ti": 0.0,
+    "NVIDIA GeForce RTX 5060": 0.0,
     "NVIDIA GeForce RTX 5090": 0.025,
+    # Supported operationally, but excluded from the unrented pool by default.
+    "NVIDIA GeForce RTX 4080 SUPER": 0.0,
+    "NVIDIA GeForce RTX 4080": 0.0,
+    "NVIDIA GeForce RTX 4070 Ti": 0.0,
+    "NVIDIA GeForce RTX 4070 Ti SUPER": 0.0,
+    "NVIDIA GeForce RTX 4070 SUPER": 0.0,
+    "NVIDIA GeForce RTX 4070": 0.0,
+    "NVIDIA GeForce RTX 4060 Ti": 0.0,
+    "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
+    "NVIDIA RTX PRO 2000 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4000 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4500 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.0,
+    "NVIDIA RTX PRO 5000 Blackwell": 0.0,
+    "NVIDIA RTX 4500 Ada Generation": 0.0,
+    "NVIDIA RTX 5000 Ada Generation": 0.0,
+    "NVIDIA RTX 5880 Ada Generation": 0.0,
     "NVIDIA RTX 6000 Ada Generation": 0.01,
     "NVIDIA L4": 0.01,
     "NVIDIA L40S": 0.01,
@@ -21,49 +45,60 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
+    "NVIDIA A800 80GB PCIe": 0.0,
+    "NVIDIA CMP 170HX": 0.0,
+    "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.027, # 2.7x 6000 ada
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": 0.0,
+    "NVIDIA RTX 6000D": 0.0,
     "NVIDIA RTX A5000": 0.002,
     "NVIDIA RTX A4500": 0.002,
     "NVIDIA RTX A4000": 0.002,
+    "NVIDIA RTX A2000": 0.0,
     # "NVIDIA A40": 0.002,
     # "NVIDIA A30": 0.002,
+    "NVIDIA T4 Tensor Core GPU": 0.0,
+    "NVIDIA Tesla V100 Tensor Core GPU": 0.0,
+    "NVIDIA TITAN V": 0.0,
+    "NVIDIA GeForce RTX 3090 Ti": 0.0,
     "NVIDIA GeForce RTX 3090": 0.02,
+    "NVIDIA GeForce RTX 3080 Ti": 0.0,
+    "NVIDIA GeForce RTX 3080": 0.0,
+    "NVIDIA GeForce RTX 3070 Ti": 0.0,
+    "NVIDIA GeForce RTX 3070": 0.0,
+    "NVIDIA GeForce RTX 3060 Ti": 0.0,
+    "NVIDIA GeForce RTX 3060 Laptop GPU": 0.0,
+    "NVIDIA GeForce RTX 3060": 0.0,
+    "NVIDIA GeForce RTX 3050": 0.0,
+    "NVIDIA Quadro RTX 8000": 0.0,
+    "NVIDIA Quadro RTX 6000": 0.0,
+    "NVIDIA Quadro RTX 5000": 0.0,
+    "NVIDIA TITAN RTX": 0.0,
+    "NVIDIA GeForce RTX 2080 Ti": 0.0,
+    "NVIDIA GeForce RTX 2080 SUPER": 0.0,
+    "NVIDIA GeForce RTX 2070 SUPER": 0.0,
+    "NVIDIA GeForce RTX 2060 SUPER": 0.0,
+    "NVIDIA GeForce RTX 2060": 0.0,
+    "NVIDIA GeForce GTX 1660 Ti": 0.0,
+    "NVIDIA GeForce GTX 1660 SUPER": 0.0,
+    "NVIDIA GeForce GTX 1660": 0.0,
+    "NVIDIA Tesla P100": 0.0,
+    "NVIDIA Tesla P40": 0.0,
+    "NVIDIA Quadro P4000": 0.0,
+    "NVIDIA TITAN Xp": 0.0,
+    "NVIDIA GeForce GTX 1080 Ti": 0.0,
+    "NVIDIA GeForce GTX 1080": 0.0,
+    "NVIDIA GeForce GTX 1070 Ti": 0.0,
+    "NVIDIA GeForce GTX 1070": 0.0,
+    "NVIDIA GeForce GTX 1060": 0.0,
+    "NVIDIA Tesla M40": 0.0,
 }
-
-# GPU Price * 24 / TAO Price
-REQUIRED_DEPOSIT_AMOUNT = {
-    'NVIDIA B200': 0.223,
-    'NVIDIA H200': 0.158,
-    'NVIDIA H200 NVL': 0.131,
-    'NVIDIA H100 80GB HBM3': 0.103,
-    'NVIDIA H100 NVL': 0.086,
-    'NVIDIA H100 PCIe': 0.086,
-    'NVIDIA H800 80GB HBM3': 0.051,
-    'NVIDIA H800 NVL': 0.045,
-    'NVIDIA H800 PCIe': 0.045,
-    'NVIDIA GeForce RTX 5090': 0.014,
-    'NVIDIA GeForce RTX 4090': 0.010,
-    'NVIDIA GeForce RTX 4090 D': 0.008,
-    # 'NVIDIA RTX 4000 Ada Generation': 0.009,
-    'NVIDIA RTX 6000 Ada Generation': 0.017,
-    'NVIDIA L4': 0.008,
-    'NVIDIA L40S': 0.027,
-    'NVIDIA L40': 0.024,
-    # 'NVIDIA RTX 2000 Ada Generation': 0.005,
-    'NVIDIA A100 80GB PCIe': 0.027,
-    'NVIDIA A100-SXM4-80GB': 0.031,
-    'NVIDIA RTX A6000': 0.018,
-    'NVIDIA RTX PRO 6000 Blackwell Server Edition': 0.0425, # 2.5x 6000 ada
-    'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 0.0459, # 2.7x 6000 ada
-    'NVIDIA RTX A5000': 0.009,
-    'NVIDIA RTX A4500': 0.008,
-    'NVIDIA RTX A4000': 0.008,
-    # 'NVIDIA A40': 0.008,
-    # 'NVIDIA A30': 0.005,
-    'NVIDIA GeForce RTX 3090': 0.008
-}
+# `NVIDIA B300 SXM6 PC` is derived from the AC entry, never a row of its own (incentive/config.py says why).
+GPU_MODEL_RATES["NVIDIA B300 SXM6 PC"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300` is priced like B300 for now; revisit when GB300 market data exists.
+GPU_MODEL_RATES["NVIDIA GB300"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
 
 MAX_UPLOAD_SPEED = 1000
 MAX_DOWNLOAD_SPEED = 1000
@@ -79,311 +114,59 @@ UNRENTED_MULTIPLIER = 1
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
+# DAH-2735: NVML memory-utilization is bus load, not VRAM fill — a foreign rental holding
+# 22 GB at idle reads ~0%. Judge held VRAM in absolute MB instead; the floor sits above the
+# driver-reserved block NVML counts (measured up to 728 MB on B200).
+GPU_HELD_VRAM_MB_LIMIT = 2048
+
+# DAH-2427 ghost GPU: an orphaned CUDA kernel left by a hard-killed GPU process pins the
+# card at full utilization with no memory and no process attached (observed for days on
+# RTX PRO 6000 nodes). The "no memory" half is expressed in whichever unit each data source
+# provides: the periodic check reads NVML memory-utilization percent, the teardown sweep
+# reads nvidia-smi used MiB.
+GPU_WEDGE_UTILIZATION_MIN = 95  # percent
+GPU_WEDGE_MEMORY_MAX = 1  # percent (periodic check, NVML memory-utilization)
+GPU_WEDGE_SWEEP_MEMORY_MAX_MIB = 16  # teardown sweep, nvidia-smi memory.used
+GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is removed
+
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
+# Declared ports are tallied per bucket of this width (by external port), so a wide range
+# forwarded only in part shows which part answered; at most 14 tallies over 1-65535 per pass
+# (28 per event, both passes).
+PORT_RANGE_BUCKET_WIDTH = 5000
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
 VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
-TOTAL_BURN_EMISSION = 0.9
+# Emission split between the rented "mining" pool and the unrented + burn pool is
+# sourced from shared config at runtime via core.config.get_total_burn_emission()
+# (DAH-2274) — the backend is the source of truth. The expected production value
+# used by the test suite lives in tests/constants.py.
 BURNER_EMISSION = 0.01
 
-IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
-DOCKER_DIND_IMAGE = "daturaai/dind:0.0.0"
+# Rental Price Incentive Constants
+TEMPO = 360  # blocks per epoch (from subtensor)
+SECONDS_PER_BLOCK = 12  # seconds per block
+FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
 
-HASHCAT_CONFIGS = {
-    "NVIDIA RTX A5000": {
-        "digits": 11,
-        "average_time": [
-            24.251156330108643,
-            24.459399509429932,
-            25.07683423360189,
-            26.078879714012146,
-            27.233995351791386,
-            27.801182564099634,
-            29.58513449941363,
-            30.492227721214295,
-        ],
-    },
-    "NVIDIA RTX A6000": {
-        "digits": 11,
-        "average_time": [
-            24.251156330108643,
-            24.459399509429932,
-            25.07683423360189,
-            26.078879714012146,
-            27.233995351791386,
-            27.801182564099634,
-            29.58513449941363,
-            30.492227721214295,
-        ],
-    },
-    "NVIDIA RTX A4500": {
-        "digits": 11,
-        "average_time": [
-            24.251156330108643,
-            24.459399509429932,
-            25.07683423360189,
-            26.078879714012146,
-            27.233995351791386,
-            27.801182564099634,
-            29.58513449941363,
-            30.492227721214295,
-        ],
-    },
-    "NVIDIA RTX A4000": {
-        "digits": 11,
-        "average_time": [
-            32.62807669639587,
-            33.436131143569945,
-            33.88327717781067,
-            34.187138891220094,
-            35.52240489006042,
-            37.14521159331004,
-            39.016253103528705,
-            40.42734135985374,
-        ],
-    },
-    "NVIDIA GeForce RTX 3090": {
-        "digits": 11,
-        "average_time": [
-            22.13358383178711,
-            24.477075362205504,
-            26.968040720621747,
-            29.163842380046844,
-            31.934904451370237,
-            34.341850678126015,
-            37.18430421011789,
-            39.15856931209564,
-        ],
-    },
-    "NVIDIA RTX 6000 Ada Generation": {
-        "digits": 11,
-        "average_time": [
-            12.016858005523682,
-            13.232668924331666,
-            14.015261713663739,
-            14.904895508289338,
-            15.89838502883911,
-            16.701006396611533,
-            18.079130056926182,
-            19.553341883420945,
-        ],
-    },
-    "NVIDIA L40S": {
-        "digits": 11,
-        "average_time": [
-            10.906689882278442,
-            9.32911479473114,
-            12.892356348037719,
-            13.338897478580474,
-            14.28122389793396,
-            15.280945293108621,
-            15.630833080836705,
-            17.76026642918587,
-        ],
-    },
-    "NVIDIA L40": {
-        "digits": 11,
-        "average_time": [
-            10.906689882278442,
-            9.32911479473114,
-            12.892356348037719,
-            13.338897478580474,
-            14.28122389793396,
-            15.280945293108621,
-            15.630833080836705,
-            17.76026642918587,
-        ],
-    },
-    "NVIDIA L4": {
-        "digits": 11,
-        "average_time": [
-            27.768908500671387,
-            27.90283513069153,
-            27.773880004882812,
-            27.653605222702026,
-            27.88539433479309,
-            27.88539433479309,
-            27.88539433479309,
-            27.88539433479309,
-        ],
-    },
-    "NVIDIA RTX 4000 Ada Generation": {
-        "digits": 11,
-        "average_time": [
-            23.84185085296631,
-            25.37116765975952,
-            25.933285299936934,
-            27.255381512641907,
-            28.95430653572082,
-            30.480634721120204,
-            32.16756559780665,
-            33.507733607292174,
-        ],
-    },
-    "NVIDIA H100 PCIe": {
-        "digits": 11,
-        "average_time": [
-            18.3540611743927,
-            17.581688284873962,
-            19.558610963821412,
-            23.779386079311372,
-            25.929840545654294,
-            28.815886704126996,
-            29.60572577885219,
-            33.850944715738294,
-        ],
-    },
-    "NVIDIA H100 NVL": {
-        "digits": 11,
-        "average_time": [
-            18.3540611743927,
-            17.581688284873962,
-            19.558610963821412,
-            23.779386079311372,
-            25.929840545654294,
-            28.815886704126996,
-            29.60572577885219,
-            33.850944715738294,
-        ],
-    },
-    "NVIDIA H100 80GB HBM3": {
-        "digits": 11,
-        "average_time": [
-            18.3540611743927,
-            17.581688284873962,
-            19.558610963821412,
-            23.779386079311372,
-            25.929840545654294,
-            28.815886704126996,
-            29.60572577885219,
-            33.850944715738294,
-        ],
-    },
-    "NVIDIA A100 80GB PCIe": {
-        "digits": 11,
-        "average_time": [
-            18.69497232437134,
-            20.42860324382782,
-            22.53571968078613,
-            25.373827075958253,
-            26.749426555633544,
-            31.196198654174804,
-            32.80575948442732,
-            37.11309432387352,
-        ],
-    },
-    "NVIDIA A100-SXM4-80GB": {
-        "digits": 11,
-        "average_time": [
-            18.69497232437134,
-            20.42860324382782,
-            22.53571968078613,
-            25.373827075958253,
-            26.749426555633544,
-            31.196198654174804,
-            32.80575948442732,
-            37.11309432387352,
-        ],
-    },
-    "NVIDIA A40": {
-        "digits": 11,
-        "average_time": [
-            22.828101253509523,
-            23.189609861373903,
-            21.3694882551829,
-            23.657343721389772,
-            28.178246479034424,
-            27.75535701115926,
-            30.86851720128741,
-            34.388632106781,
-        ],
-    },
-    "NVIDIA A30": {
-        "digits": 11,
-        "average_time": [
-            22.828101253509523,
-            23.189609861373903,
-            21.3694882551829,
-            23.657343721389772,
-            28.178246479034424,
-            27.75535701115926,
-            30.86851720128741,
-            34.388632106781,
-        ],
-    },
-    "NVIDIA RTX 2000 Ada Generation": {
-        "digits": 11,
-        "average_time": [
-            22.828101253509523,
-            23.189609861373903,
-            21.3694882551829,
-            23.657343721389772,
-            28.178246479034424,
-            27.75535701115926,
-            30.86851720128741,
-            34.388632106781,
-        ],
-    },
-    "NVIDIA GeForce RTX 4090 D": {
-        "digits": 11,
-        "average_time": [
-            12.535813426971435,
-            13.367040371894836,
-            14.397390270233155,
-            15.773727321624756,
-            16.52033654212952,
-            18.87070236206055,
-            20.572682762145995,
-            22.169760519266127,
-        ],
-    },
-    "NVIDIA GeForce RTX 4090": {
-        "digits": 11,
-        "average_time": [
-            11.02204384803772,
-            11.871551060676575,
-            12.621799103418986,
-            13.46524715423584,
-            14.425264406204224,
-            12.915648317337036,
-            16.706109033312117,
-            17.858580154180526,
-        ],
-    },
-    "NVIDIA GeForce RTX 5090": {
-        "digits": 11,
-        "average_time": [
-            12.805432319641113,
-            12.805432319641113,
-            12.805432319641113,
-            13.46524715423584,
-            14.425264406204224,
-            12.915648317337036,
-            16.706109033312117,
-            17.858580154180526,
-        ],
-    },
-    "NVIDIA H200": {
-        "digits": 11,
-        "average_time": [
-            13.78846188,
-            13.20821786,
-            14.69337816,
-            17.86422935,
-            19.47975516,
-            21.64789315,
-            22.24125861,
-            25.43047319,
-        ],
-    },
-}
+IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
+DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
 LIB_NVIDIA_ML_DIGESTS = {
+    "535.54.03": "49e63c42aa95bba6b9aa562ee57e496c:15a37892671187547b6dd21a07e8149315e529211dc30ca6ee8d8d089a338d53",
+    "535.86.10": "7351f43a025ecdde1208a7a4e2f1cf26:ec9b270c4fdf2b51515c9eb5f185cbc0478322c43a3876caab80ebfb5cd1dab1",
+    "535.104.05": "01265268cdc362e02952c51fb4f49d11:f17ec20319ddfe5beeb0e80ee0a89fc312d23ec764bc8ac640c3df860a0b0566",
+    "535.129.03": "15da23a575907f6d455896dffb4cc8ab:82e40f00b57a91840b62386094c266bf962a1c6304f5e898300fdb186df12246",
+    "535.154.05": "79858da5e3a0283a76212fa92d361203:3e25c6fc550943319b475998d3154c48279ba3a92a32b1441adc1e2070a63378",
+    "535.161.07": "e1bd6e1ec1211ee5fea246f1635d8364:b3fdee85f8d01defb963e286d4faaad939b860a3dc5313f48d31e32e2048c8a0",
+    "535.161.08": "0507ce7072af817d9bd6efa0609f2738:fb0862f58f33e93e6709482dcafb44c4665ccd24e3d34ee10c91a9e122d04bce",
     "535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f",
     "535.183.06": "03ed7fa2134095b32f9d0d24a774c6ba:5899d928c18f39656d4c5a573a509acaf621b896644abe31e78ad715171c2ce6",
+    "535.261.03": "eece3d8387df42b9d1906710cebf784b:bff3d13ebff1ac22b8a1f5d2c0c05910564ec868c2e70bc5f971dcaf82a36765",
+    "535.274.02": "939800fdf0d88c143e416203d68a7d39:25e82746a4eb51597e9e901bc59d5a4e05c5971f8e0069df49c6d4f6cfeb4b51",
+    "535.288.01": "b67f475a5ac428ef45106c8c3718d24a:844e81737f3a5d0db3230f307e5e97fd1e3eae2e3588d9aaa1498c55083a0a5d",
     "535.216.01": "96479a06139fc5261d06f432970d6a7b:63ec13c213f50fc193f1b56f4d56ea1dddb5974d505d3dfc670a10824d800753",
     "535.216.03": "189634bf960b9a2efe1af8011d27ccf7:f9aec03b89ff0fba865b7059d8dce3258f2fda8f5ae748b3da98a65b5e06b46e",
     "535.230.02": "cc34ae85c2238b9a49067e683c1998cf:23767b1f9a39ace459e4d9950e1225ba6d89f4ac0299de9e7815b5c413f53acf",
@@ -392,6 +175,7 @@ LIB_NVIDIA_ML_DIGESTS = {
     "545.29.06": "85ad949d7553ab96cce5c811e229c7c7:f2ad84109af6facf93cb33f9ca79354c2c4672ed7d90a9e09a00954c6a82b438",
     "550.120": "48be49d0e792b5ee76f73857c0bef35a:3bc49d033d45882a0e71a6e99a64105ad1a4f00cdad06b33bfd37175b8584373",
     "550.127.05": "bfa2733eee442016792bcbf130156e3d:f196afa282f435e48b19561849d451e3de26932af8a76f75136f1dfc5533f247",
+    "550.54.14": "6137cba707dab1ab1b8e88e6a6fd89a0:ac63ee701ffc3611b4acfd9c612f772f8c1d038df3f135cea7d5a1377d279f84",
     "550.54.15": "9625642dcf8765f52e332c8e38fbef73:a12e4d671706b1e96abe91047611c6b413b9ec9ae0fb68eae8c4790a5df8cfaa",
     "550.78": "1f335d1f068931fe7f2ce13117d1602b:54b57e46525c3b1c9776442a65a5a010b92773a165b9f5f9e5b2a24be063b969",
     "550.90.07": "c95828f8a8ab7f17743b40561b812c96:03d713a02c4b20b08b00f4c67ea03956dd2a48d1b4ca930dffb6024387157f16",
@@ -418,20 +202,36 @@ LIB_NVIDIA_ML_DIGESTS = {
     "570.172.08": "021fa367c3fb8fa54422aa8c79a6a784:4ffe4baabaf73f76ce941269ce2e80da1b09ec5ab4af30bffebe6d1979a3e62e",
     "570.169": "9d1f189e783be38b52e86aada4ea721b:988e1c7f9dcfd30b15f2b55926bc38da46411c9b68ab7245a6d42760450bd30a",
     "570.195.03": "05481133d8b1ae692cf28a1cdb47e728:e50f81689bfc29408e1255207befbf5f9550fad74e22a2ad45cc9f2869637aa9",
+    "570.211.01": "d94663bcbcdcadcfc2ca3a2406bc8518:36b25540f20f5cbcf47faed0f386abcd4896e7c768145f5b7d87ff7e8dd2b021",
     "575.51.03": "d01d04bf5e770102cbf9fe3c2302d903:b2910dea374c6c038f860b3ebf9e1408ee5946dd5da59cab6023220f968e8eff",
     "575.57.08": "b49c325ff0d74199597d9b19b9b407a6:ba4159cd8797a30e275e46a17b174b3d9a4a7768f82da9ca7263832da3f6d816",
     "575.64.03": "ffad1bd4cfbf8abe4f2edd24e5687c64:6e2e60d6f2ad3957f33465626e7793286c741cf8a9e3a6da8fbaacf3fc453370",
+    "575.64.05": "e06f67418707f3ff4792cb270c6b36ef:3d9a6015bc20a7a15dda9aafa07174fd67723a59915964c2b7ba3f004fc14c8c",
+    "580.65.06": "c98bc1ae60a208db4db9f19e50aaf4a3:54658f1b05c647760509be6729e41e98a73bae855b5d09984d735abce4818bd7",
+    "580.76.05": "03fda3e528d0eabbf5ffa73670d2deaa:da6bcacfb548646e0318f54a74df766a975e459e08509a451b4140941ab896ea",
     "580.82.07": "f7e2623164324de58f1c3a5daf6ed475:008cc04afc61b8317ed4ddccfa2d1bd367ceb6e71334eb352dc846e0ac450340",
     "580.82.09": "175e6a907fbc54f344223f7da3164d19:68d2ee4a36fad63bf0507718376b67f9247de8402c041e7e68f63f29f536299c",
     "580.95.05": "abb3628879c4801b3e5f5e3351d01c96:9933cfe943ca96d9b3c352221154dd0afd5ed5406fcb9a3d15935ff4f2c380a9",
+    "580.105.08": "2ffbe6a28257332c99ba5bd4d9a115de:bee24a7507366126cdf7441c7fec4705e85c3a61c9669e08d70d7d86a8ed6f99",
+    "580.126.09": "09c22d9afa2e321bfeb63eb93eb3d1a8:7cf5b9e876f8a082616b5b632f426fdf2ac6fb2e04bfa90c5a3f4eebafe90910",
+    "580.119.02": "2a549d896267cd4537302a7c7f572a70:0b8424b9fb42caf4a718fb1cb820232a0cd37fb94ecf64cbaf93c57dea454acd",
+    "580.126.16": "602c2f2fdfdbbfeadbeda157a12c89b4:1195dafd6b9e41645240ea97c4bb8e2e5c53a87a8b4bd18e4bf1befcb2f3da7b",
+    "580.126.18": "c743bd753c2a72562ba81cd53655b482:1a0f5afd550344d357b071d70c84ea1cf2553675b4c68268ccc14da64d562ab5",
+    "580.126.20": "aeb23ff04f08663f8d29699b7166965a:85f43e9c005904dbd3cb3dea42042236d4ade1b635739581af204b8383bcc1ac",
+    "580.142": "ba092110c430e70382ee1274bf561796:f2e0fe7110fcc12cbeaf685f60a0c1bfd37d748010b1f8fba9c4f3c8bdd2aa93",
+    "580.159.03": "e20a51c15ea69c8689c870cfff8a274c:a610e3e6a9ebb901372dcd2b912a7a040c35406ced930290dd902b3fbf1c797c",
+    "580.159.04": "112ed00d4a4880bb33ccc001df34c2f0:941c7f7999351d8b9b69f275a20ebd2818e3314678fc12dba6da8a6f12b74d27",
+    "580.167.08": "fa0c084327835d0369e5307a1ba3a882:c7eac74626efce631035360d6a5d1f9d72b02d81739ab0adbf0521f6c6a0f10a",
+    "580.173.02": "bcc62db30ccee22da8c64ecde69ead52:82d7b58d3f870b0635e8999c56eb8fd2d795c920daa2661e628ca523eee5f557",
+    "590.44.01": "b5f88f19314d6e0b951e350129d018dc:560b1aff40089484c67d63889db11e7be9bfdae6f476006d5ef3bd3c37b547bd",
+    "590.48.01": "7c4674fdfdeb75c20af25bd41e3a0de6:12f3bcd4ba447599a2077297e3a4ff4288205b082c2e76346718ae85c058c4b2",
+    "595.45.04": "1dbe78234657c5522cb8fe9c9cfde141:f7d1d0eb39f16e8e88a77e9c5127e9a2a93e4b5b1344be1f18faedcfb67bc58f",
+    "595.58.03": "af7923894f6ad89eafb78c03daf422a9:9a0ef13c817030b07f931cbe6115a70f7674ecbd3bee6047417ffc7ae699ed1b",
+    "595.71.05": "020cd1156cbce5ebbf12963d0c70496e:9eb4358b7fea76556657670a6ae6b0017eaa4256b56c421a36626bf8c2b5f3f5",
+    "595.84": "4de0188efc8bb6c7485e599fcc718978:6d8a58eb15a1c2e6067ec977e9de57b42a3d632b4073818ab648370fecfc82b1",
+    "595.91.07": "815eeecaf87fd8f947c66b2ef1ca7525:7515da5b856b805fc07811dfd72a37545c1bd9e78f4d8c16421e155ac8f4aec4",
+    "610.43.02": "5ad6c02411f730682597558ae8f3a9f8:2dc828b3f5027f98e05c7607c1d8129d11bd28de4c2091c5cd7e32dbc21ec172",
 }
-
-DOCKER_DIGESTS = {
-    "26.1.3": "52d8fcc2c4370bf324cdf17cbc586784:90ca53cb65a70096c5767941c4518f26b1e350f903d134c0a0667c1477532ee9",
-}
-
-DOCKER_DIGEST = "52d8fcc2c4370bf324cdf17cbc586784:90ca53cb65a70096c5767941c4518f26b1e350f903d134c0a0667c1477532ee9"
-PYTHON_DIGEST = '805bdc61166863665f1ecfc80aca749c:a9db1b429b10a90962ac3600f3952c0ec2c6cb7e61a2ac6c8c9cc8f14d6884f4'
 
 # VerifyX Validation Constants
 MEMORY_ALLOCATION_PERCENTAGE = 75
@@ -443,3 +243,146 @@ NETWORK_TIMEOUT_SECONDS = 120
 NETWORK_MIN_DOWNLOAD_SPEED_MBPS = 50.0
 
 PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009]
+
+POD_CONTAINER_PREFIX = "pod_"
+FILLER_CONTAINER_PREFIX = "filler_"
+# DAH-2740: the name a pod's current container is parked under while an edit builds its replacement.
+# Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to
+# every protected pod name) and reap it once the pod is gone.
+EDIT_PARKED_SUFFIX = "__prev"
+# DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
+# name with the model + runtime version baked in; the validator only needs the prefix, to recognise
+# which volumes belong to the cache when sweeping or reclaiming them.
+DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
+# volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
+ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
+# DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
+# downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
+# of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
+# above that floor. Duplicated here on purpose: only the host knows whether the cache already exists,
+# so the affordability decision has to live next to that fact. Keep in step with the backend.
+DPHN_CACHE_SIZE_GB = 40
+DPHN_CACHE_LISTING_FLOOR_GB = 100
+DPHN_CACHE_FREE_MARGIN_GB = 50
+FILLER_CONTAINER_GRACE_MINUTES = 15
+# DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
+# container lives until the sweep above collects it, so the bound follows that grace with one cycle
+# of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
+# let a provider reuse the name of their own broken pod for a foreign workload.
+BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
+# How long after a rental closes its pod container still counts as the unrent flow's teardown rather
+# than an orphan: with RENTAL_TEARDOWN_DEFERRAL_ENABLED on, the GPU usage check defers instead of
+# scoring 0 until this long after the close, which covers one run and occasionally two. A run is
+# shorter than this, so a rental that ends while the run is inside it always lands here. It must stay
+# short for the same reason as the grace above: the pod's name must not shield a workload for long.
+RENTAL_TEARDOWN_GRACE_MINUTES = 15
+# How far ahead of the validator's clock a rental's close time may sit and still read as a rental
+# that just ended. A close time further ahead is not trusted, so the container stays an orphan.
+RENTAL_CLOSE_CLOCK_SKEW_MINUTES = 5
+# ISSUE-050: a filler run younger than this is not penalized for a missing container —
+# it may still be finishing its create/stop race with the backend snapshot.
+FILLER_LIVENESS_GRACE_MINUTES = 10
+
+# Owner of an executor's active default job, as reported by compute-app.
+# An executor running the miner's OWN default job earns no unrented incentive.
+DEFAULT_JOB_OWNER_MINER = "miner"
+# A Lium-owned default job (e.g. the PEARL idle filler) — Lium keeps the unrented incentive and may
+# lower the node's GPU power limit, so GpuPowerLimitCheck exempts these nodes (DAH-2356).
+DEFAULT_JOB_OWNER_LIUM = "lium"
+
+# Container name prefixes that count as "rental-related" on an executor.
+# All producers of short-lived containers competing for the 9100-9130 port range
+# MUST be listed here so that container_cleanup and wait_for_port_check_containers
+# both see them. Adding a new prefix is a one-line edit that both guards inherit.
+#   pod_*          — long-lived user rentals (validator-owned)
+#   filler_*       — long-lived filler runtime (validator-owned, not customer-rented)
+#   container_*    — validator DinD/port-check probes (hotkey-scoped)
+#   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
+RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+
+# DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
+# without importing the probe service: that module reaches services.task.models, which pulls
+# services/task/__init__ and the checks back in.
+PROBE_CONTAINER_NAME = "lium_roce_probe"
+
+# DAH-2805: the throwaway helper that sweeps abandoned download temporaries out of the filler cache
+# volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
+# of CPU it holds instead of counting our own housekeeping against the miner.
+CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
+# Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
+# them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
+# provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
+# them BY NAME. A name is forgeable, which is why this tier only ever excuses load and never
+# grants the rental status `pod_*` and `filler_*` get from the backend.
+# Add a new Lium infra container here and the gate inherits it.
+# `executor-` is the compose project the executor stack runs under: the runner, watchtower,
+# autoheal and postgres beside the executor itself. They are Lium's, they idle, and the gate
+# caps this whole tier, so the name buys a forger nothing.
+LIUM_INFRA_CONTAINER_PREFIXES = (
+    "container_",
+    "health_check_",
+    "executor-",
+    # the s3 backup helper (miner_jobs/backup_storage.py) copies a renter's volume, which costs
+    # real CPU while it runs
+    "s3fs-backup",
+    PROBE_CONTAINER_NAME,
+    CACHE_SWEEP_CONTAINER_NAME,
+)
+
+# For simplicity, store whitelist in code. Can be updated to use DB if needed. 
+TDX_WHITELIST = {
+    "OS_IMAGE_HASH": set(
+        [
+            # DAH-2338 — official upstream dstack-nvidia 0.5.11 (meta-dstack v0.5.11
+            # release, git_revision ce04e924, NVIDIA driver 595.58.03, prod/non-dev
+            # image). Single-image policy: the legacy 0.5.5 hashes (upstream 9b69bb16…
+            # and DAH-2311 rebuilt dbfde543…) are removed — CVMs still booting them
+            # must be redeployed on 0.5.11.
+            "a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02",
+        ]
+    ),
+    # Compose-file hashes vary per environment. G2: each approved hash carries a
+    # monotonically increasing release version — append-only, next release gets the
+    # next integer. Acceptance requires version >= settings.TDX_MINIMUM_COMPOSE_VERSION
+    # ("at/above the floor", newest-wins) so a known-bad release is retired by raising
+    # the floor instead of aging out of a rolling window. Membership checks
+    # (`hash in TDX_WHITELIST["COMPOSE_HASH"][env]`) keep working on the dict keys.
+    "COMPOSE_HASH": {
+        "PROD": {
+            # DAH-2861 — measured compose of the latest runner, daturaai/compute-subnet-executor-runner
+            # @ sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7 (pushed
+            # 2026-08-19, executor @ sha256:8dbf5395…, a prod build with no config_override.py).
+            # Seen in the event log of the 146.88.195.16 CVM on 2026-09-03. Covers app/
+            # docker-compose.yml, init_script.sh and pre_launch_script.sh at 880cb585 plus default
+            # `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo). Editing any of those
+            # three files moves the hash and needs the next version here: the checkout's hash is
+            # rebuilt by neurons/executor/dstacktee/scripts/compose_hash.py and
+            # tests/test_tdx_compose_hash_whitelist.py fails CI while it is missing. Kept: CVMs
+            # created from executor-v1.127 and earlier still attest with it.
+            "8224d58801af6333561f116e2d566b179b399f1d1d700f0e8a5ab9326ae901d9": 4,
+            # DAH-3602 — the same runner digest with the measured files at c102a332 (lium-io#1339,
+            # DAH-2834, three settings added to init_script.sh; executor-v1.128 to v1.130 and main).
+            # Missing here from 2026-09-14 to this entry, so every CVM created from those releases
+            # would score zero with the whitelist on. Version 5; DAH-2780's pre_launch_script.sh
+            # rewrite (lium-io#1266) takes 6.
+            "87d3430000bb7046a19eeaa6efe074fd8b5f7856bbfe2906addab238174c542d": 5,
+            # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
+            # that runner bakes the STAGING validator hotkey via config_override.py and answers every
+            # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.
+        },
+        "STAGE": {
+            "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,
+            # DAH-2338 — 0.5.11 staging compose: executor-runner pinned to
+            # daturaai/compute-subnet-executor-runner:dev digest sha256:58db7cd5…
+            # (pushed 2026-07-06), pre-launch sysbox force-install included.
+            # Assumes default `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
+            "feedf7cb08a9905f3ef66eb9bab4af310310965589e5aed070594c326bf44e16": 2,
+        },
+        "LOCAL": {
+            "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828": 1,
+        },
+    }
+}

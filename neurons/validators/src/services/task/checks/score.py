@@ -17,14 +17,7 @@ class ScoreCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         score_calculator = ctx.services.score_calculator
-        actual_score, job_score, warning_message = score_calculator(
-            ctx.state.gpu_model or "",
-            ctx.collateral_deposited,
-            ctx.is_rental_succeed,
-            ctx.contract_version or "",
-            ctx.rented,
-            ctx.port_count,
-        )
+        actual_score, job_score, warning_message = score_calculator(ctx, ctx.rented)
 
         event = render_message(
             Msg.SCORE_COMPUTED,

@@ -9,12 +9,14 @@ dependencies = [
     "alembic>=1.16.5",
     "asyncssh>=2.21.0",
     "asgiref>=3.9.1",
-    "bittensor==9.10.1",
-    "bittensor-cli==9.11.0",
-    "bittensor-commit-reveal==0.4.0",
-    "celium-collateral==1.1.6",
+    "bittensor==10.5.0",
+    "async-substrate-interface>=2.0.4",
+    "bittensor-cli>=9.22.0",
+    "bittensor-commit-reveal>=0.4.0",
+    "cryptography>=49.0.0",
     "databases>=0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
+    "lium-core>=0.1.8",
     "fastapi>=0.110.3",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
@@ -30,12 +32,8 @@ dependencies = [
     "sqlmodel>=0.0.24",
     "tenacity>=9.1.2",
     "uvicorn>=0.35.0",
-    "pytest>=8.4.2",
-    "pytest-asyncio>=0.25.0",
-    "pytest-mock>=3.15.0",
-    "aiosqlite>=0.21.0",
     "asyncpg>=0.30.0",
-    "greenlet>=3.3.0",
+    "docker[ssh]>=7.1.0",
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
@@ -50,10 +48,14 @@ build-backend = "pdm.backend"
 distribution = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "."]
+pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
-    "pytest-asyncio>=1.2.0",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=0.25.0",
+    "pytest-mock>=3.15.0",
+    "aiosqlite>=0.21.0",
+    "fakeredis>=2.34.1",
 ]

@@ -23,12 +23,119 @@
             "cwd": "${workspaceFolder}/neurons/validators"
         },
         {
+            "name": "Validator: App",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/validator.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/neurons/validators",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
+        },
+        {
+            "name": "Validator: Api",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/api.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/neurons/validators",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
+        },
+        {
             "name": "Validator: Connector",
             "type": "debugpy",
             "request": "launch",
             "program": "src/connector.py",
             "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}/neurons/validators"
+            "cwd": "${workspaceFolder}/neurons/validators",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
+        },
+        {
+            "name": "Miner: App",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/miner.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/neurons/miners",
+            "python": "${workspaceFolder}/neurons/miners/.venv/bin/python3",
+        },
+        {
+            "name": "Watchtower",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/watchtower.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/watchtower",
+            "python": "${workspaceFolder}/watchtower/.venv/bin/python3",
+        },
+        {
+            "name": "Debug Test: Validators",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "console": "integratedTerminal",
+            "args": [
+                ".",
+                "-v",
+                "-s"
+            ],
+            "cwd": "${workspaceFolder}/neurons/validators/tests",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
+            "env": {
+                "BITTENSOR_WALLET_NAME": "test_wallet",
+                "BITTENSOR_WALLET_HOTKEY_NAME": "test_hotkey",
+                "SQLALCHEMY_DATABASE_URI": "sqlite:///test.db",
+                "ASYNC_SQLALCHEMY_DATABASE_URI": "sqlite+aiosqlite:///test.db",
+                "ENABLE_TDX_ATTESTATION": "True",
+                "TDX_VERIFIER_URL": "http://localhost:8000/verify"
+            }
+        },
+        {
+            "name": "Debug Test: Executor",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "console": "integratedTerminal",
+            "args": [
+                ".",
+                "-v",
+                "-s"
+            ],
+            "cwd": "${workspaceFolder}/neurons/executor/tests",
+            "python": "${workspaceFolder}/neurons/executor/.venv/bin/python3",
+            "env": {
+                "DB_URI": "sqlite:///test.db",
+            }
+        },
+        {
+            "name": "Debug Test: Miners",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "console": "integratedTerminal",
+            "args": [
+                ".",
+                "-v",
+                "-s"
+            ],
+            "cwd": "${workspaceFolder}/neurons/miners/tests",
+            "python": "${workspaceFolder}/neurons/miners/.venv/bin/python3",
+            "env": {
+                "DB_SQLALCHEMY_DATABASE_URIURI": "sqlite:///test.db",
+            }
+        },
+        {
+            "name": "Debug Test: Watchtower",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "console": "integratedTerminal",
+            "args": [
+                ".",
+                "-v",
+                "-s"
+            ],
+            "cwd": "${workspaceFolder}/watchtower/tests",
+            "python": "${workspaceFolder}/watchtower/.venv/bin/python3",
         }
     ]
 }

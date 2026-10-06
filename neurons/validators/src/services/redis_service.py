@@ -3,9 +3,12 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import NamedTuple
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
+from redis.backoff import ExponentialBackoff
+from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
 from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
@@ -14,30 +17,174 @@ from services.const import GPU_MODEL_RATES
 
 MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
+INSPECTOR_EVENT_CHANNEL = "INSPECTOR_EVENT_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
+# DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
+POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
+# The anchor: the GPU UUID set of the executor's first successful verification, kept by every later write.
+GPU_ANCHOR_KEY = "uuids"
+# DAH-3457: field of a verified-job record, set once by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED and kept by
+# every later write; read back by the same check, which then fails the node without comparing the sets.
+GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
 BANNED_GUIDS = "banned_guids"
 PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
+GPU_ESTIMATES_CHANNEL = "gpu_estimates_channel"
+GPU_ESTIMATES_KEY = "gpu_estimates"
+INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
+# DAH-1932: every executor UUID the stale-container cleanup has run for. A UUID not in this set
+# gets one cycle without container removal (see StaleContainerCleanupCheck).
+CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
+# Written by the connector process, read by the validator process: they share no memory, so
+# this key is how an operator's request for a cycle crosses between them.
+FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
+# DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
+DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
+# One key per executor: when this validator first found it without its recommended default image
+# (epoch seconds). Opens CachedTemplateVerificationCheck's fresh-node grace.
+CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
+# One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
+# ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
+FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
+# DAH-2958: every executor uuid this validator has ever published a spec for. The express lane
+# treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
+# cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
+EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
+# DAH-3436 (review): the per-executor CREATE lock. `create_container` sweeps every `pod_*` container it
+# is not told about, so two creates on one node must not overlap: a renter's create holds this lock from
+# before its call until create_container returns (executor_create_exclusion); the rental probe takes it
+# without waiting, skips the node when it is held, and holds it for at most its idleness re-read budget
+# plus its create deadline (rental_probe.py: 30 s + _CREATE_DEADLINE_SECONDS 300 s). The TTL outlasts
+# that whole hold, so the lock cannot lapse while the probe's create is still to sweep, and a renter's
+# create waits as long: the wait ends when the probe's create returns, in practice tens of seconds, and
+# at the deadline on a host where the renter's own create would hang the same way. Distinct from
+# `lock:executor:` (port allocation), which create_container takes itself and would deadlock on if it
+# shared the key.
+EXECUTOR_CREATE_LOCK_TIMEOUT = 360  # TTL (seconds)
+EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT = 360  # a renter's create waits at most this long
+
+# DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
+# meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
+# connection, and the resulting thundering herd of new TCP connects timed out ("Timeout connecting to
+# server", 51/min at the 2026-07-22 08:35 wave). With no retry configured, every operation caught in
+# that window failed outright — which failed the creates and put healthy nodes into launch backoff.
+# Bounding the pool makes a burst QUEUE on an existing connection instead of opening a new one, and
+# the retry rides out a blip that lasts less than a second.
+REDIS_MAX_CONNECTIONS = 64
+# Subscriptions get their own small pool. `pubsub.listen()` is a BLOCKING read on channels that are
+# idle most of the time, and redis-py falls back to the connection's socket_timeout when the caller
+# passes no deadline — so a subscription sharing the command pool is torn down after
+# REDIS_SOCKET_TIMEOUT_SECONDS of silence, which for these channels is normal. Separate pool, no
+# socket_timeout: commands still fail fast, subscriptions are allowed to wait.
+REDIS_PUBSUB_MAX_CONNECTIONS = 8
+# Seconds a caller waits for a pooled connection once all of them are busy. The pool MUST be a
+# BlockingConnectionPool for this: the default pool raises MaxConnectionsError instead of waiting,
+# and it raises from get_connection() BEFORE the retry wrapper is reached, so a bounded default pool
+# would convert an overload burst into exactly the hard failures this hardening exists to remove.
+REDIS_POOL_WAIT_TIMEOUT_SECONDS = 10
+REDIS_SOCKET_TIMEOUT_SECONDS = 10
+REDIS_CONNECT_TIMEOUT_SECONDS = 5
+REDIS_RETRY_ATTEMPTS = 3
+# Validate a pooled connection that has been idle this long, so a silently-dropped connection is
+# discovered by the health check rather than by failing a caller's operation.
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
 
+class _PassThroughLock:
+    """`RedisService.lock` with REDIS_COMMAND_LOCK_ENABLED off (DAH-3006): every `async with
+    self.lock:` site stays as it is, but nothing waits — each call is one atomic Redis command
+    and the pool bounds the concurrency."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def locked(self) -> bool:
+        return False
+
+
+class RedisWrite(NamedTuple):
+    """One queued write of a `RedisWrites` batch."""
+
+    command: str
+    args: tuple[str | int, ...]
+    kwargs: dict[str, int | None]
+
+
+class RedisWrites:
+    """Writes that apply together or not at all: `RedisService.write_atomically` runs them as one
+    MULTI/EXEC. A state kept in several keys (a mark and a streak, a hash and its TTL) is moved in one
+    step, so a connection lost between two writes cannot leave half of it behind (DAH-2870: a
+    healthy SET followed by a failed DELETE kept the old streak next to a fresh ok mark).
+    Only the write commands the validator uses are offered; the methods chain."""
+
+    def __init__(self):
+        self.ops: list[RedisWrite] = []
+
+    def set(self, key: str, value: str, ex: int | None = None) -> "RedisWrites":
+        self.ops.append(RedisWrite("set", (key, value), {"ex": ex}))
+        return self
+
+    def delete(self, key: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("delete", (key,), {}))
+        return self
+
+    def hset(self, key: str, field: str, value: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("hset", (key, field, value), {}))
+        return self
+
+    def expire(self, key: str, seconds: int) -> "RedisWrites":
+        self.ops.append(RedisWrite("expire", (key, seconds), {}))
+        return self
+
+    def __len__(self) -> int:
+        return len(self.ops)
+
+
 class RedisService:
     def __init__(self):
-        self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
-        self.lock = asyncio.Lock()
+        self.redis = aioredis.Redis(
+            connection_pool=aioredis.BlockingConnectionPool.from_url(
+                settings.get_redis_connection_url(),
+                max_connections=REDIS_MAX_CONNECTIONS,
+                timeout=REDIS_POOL_WAIT_TIMEOUT_SECONDS,
+                socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_keepalive=True,
+                health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+                retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
+                retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+            )
+        )
+        self.pubsub_redis = aioredis.Redis(
+            connection_pool=aioredis.BlockingConnectionPool.from_url(
+                settings.get_redis_connection_url(),
+                max_connections=REDIS_PUBSUB_MAX_CONNECTIONS,
+                timeout=REDIS_POOL_WAIT_TIMEOUT_SECONDS,
+                # No socket_timeout on purpose — see REDIS_PUBSUB_MAX_CONNECTIONS.
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_keepalive=True,
+                retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
+                retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+            )
+        )
+        self.lock = asyncio.Lock() if settings.REDIS_COMMAND_LOCK_ENABLED else _PassThroughLock()
 
     @asynccontextmanager
     async def acquire_executor_lock(
@@ -66,20 +213,137 @@ class RedisService:
             )
             raise
 
+    def executor_create_lock(self, executor_id: str) -> aioredis.lock.Lock:
+        """The per-executor create lock (DAH-3436, review); see EXECUTOR_CREATE_LOCK_TIMEOUT.
+
+        Not taken here: a renter's create takes it through `executor_create_exclusion`, the rental probe
+        with `acquire(blocking=False)` so it never makes a renter wait.
+        """
+        return aioredis.lock.Lock(
+            self.redis,
+            f"lock:executor-create:{executor_id}",
+            timeout=EXECUTOR_CREATE_LOCK_TIMEOUT,
+            blocking_timeout=EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT,
+        )
+
+    @asynccontextmanager
+    async def executor_create_exclusion(self, executor_id: str):
+        """Hold the per-executor create lock around a renter's create_container (DAH-3436, review).
+
+        The lock keeps the rental probe off a node whose rent is being created (the probe's sweep would
+        remove the renter's `pod_*` container) and makes a renter's create wait while the probe's create
+        is on the host, at most EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT (a second renter create on the same
+        executor waits behind the first the same way). A lock that cannot be taken (Redis unreachable, or
+        still held at the deadline) is logged and the create goes ahead: the validator's own housekeeping
+        never refuses a renter. Yields whether the lock is held. A release after the TTL passed
+        (LockNotOwnedError) is expected for a slow create and ignored.
+        """
+        lock = self.executor_create_lock(executor_id)
+        held = False
+        try:
+            held = bool(await lock.acquire())
+            if not held:
+                logger.warning(
+                    _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
+                )
+        except Exception as e:
+            logger.warning(
+                _m(
+                    f"Create lock for executor {executor_id} could not be taken; creating without it",
+                    extra={"error": str(e)},
+                )
+            )
+        try:
+            yield held
+        finally:
+            if held:
+                try:
+                    await lock.release()
+                except Exception as e:
+                    logger.debug(
+                        _m(
+                            f"Create lock for executor {executor_id} was not released",
+                            extra={"error": str(e)},
+                        )
+                    )
+
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""
         await self.redis.publish(channel, json.dumps(message))
 
     async def subscribe(self, *channel: str):
-        """Subscribe to a Redis channel."""
-        pubsub = self.redis.pubsub()
-        await pubsub.subscribe(*channel)
+        """Subscribe to a Redis channel. Caller MUST `await pubsub.aclose()` when it stops reading —
+        the connection returns to the pool only then, and the pool is bounded."""
+        pubsub = self.pubsub_redis.pubsub()
+        try:
+            await pubsub.subscribe(*channel)
+        except BaseException:
+            # SUBSCRIBE acquires the pooled connection before it sends, and the caller never receives
+            # this pubsub, so nothing else can return the connection to the bounded pool.
+            await pubsub.aclose()
+            raise
         return pubsub
 
-    async def set(self, key: str, value: str):
-        """Set a key-value pair in Redis."""
+    async def request_forced_validation_cycle(self) -> None:
+        # The TTL is the backstop, not the normal path: the request is cleared when a cycle
+        # starts. It bounds a request that outlives its purpose -- a validator that is down,
+        # or a stale replica still serving the key after the delete.
         async with self.lock:
-            await self.redis.set(key, value)
+            await self.redis.set(
+                FORCED_VALIDATION_CYCLE_KEY, "1", ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
+            )
+
+    async def mark_executors_validated(self, executor_ids: list[str]) -> None:
+        """DAH-2958: remember that a spec was published for these executors (one round-trip)."""
+        if executor_ids:
+            async with self.lock:
+                await self.redis.sadd(EXPRESS_LANE_VALIDATED_SET, *executor_ids)
+
+    async def get_validated_executors(self) -> set[str]:
+        members = await self.smembers(EXPRESS_LANE_VALIDATED_SET)
+        return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def is_forced_validation_cycle_requested(self) -> bool:
+        return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
+
+    async def clear_forced_validation_cycle_request(self) -> None:
+        await self.delete(FORCED_VALIDATION_CYCLE_KEY)
+
+    @staticmethod
+    def _dind_probe_miss_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{DIND_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def record_dind_probe_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        """Record a DinD probe miss; True when none was on record (the first inside the window).
+
+        SET NX EX records and answers in one call, so two cycles cannot both read "first".
+        """
+        async with self.lock:
+            return bool(
+                await self.redis.set(
+                    self._dind_probe_miss_key(miner_hotkey, executor_id), "1", ex=ttl_seconds, nx=True
+                )
+            )
+
+    async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        """Forget the recorded miss: the probe reached its container again."""
+        await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
+
+    async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
+        """When this validator first found the executor without its recommended image (epoch s).
+
+        SET NX keeps the first sighting, so every later cycle inside the TTL reads the same instant.
+        """
+        key = f"{CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX}:{executor_id}"
+        async with self.lock:
+            await self.redis.set(key, repr(now), ex=ttl_seconds, nx=True)
+            value = await self.redis.get(key)
+        return float(value) if value is not None else now
+
+    async def set(self, key: str, value: str, ex: int | None = None):
+        """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
+        async with self.lock:
+            await self.redis.set(key, value, ex=ex)
 
     async def get(self, key: str):
         """Get a value by key from Redis."""
@@ -91,10 +355,15 @@ class RedisService:
         async with self.lock:
             await self.redis.delete(key)
 
-    async def sadd(self, key: str, elem: str):
-        """Add an element to a set in Redis."""
+    async def expire(self, key: str, seconds: int):
+        """Set (or refresh) a key's time to live."""
         async with self.lock:
-            await self.redis.sadd(key, elem)
+            await self.redis.expire(key, seconds)
+
+    async def sadd(self, key: str, elem: str) -> int:
+        """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
+        async with self.lock:
+            return await self.redis.sadd(key, elem)
 
     async def srem(self, key: str, elem: str):
         """Remove an element from a set in Redis."""
@@ -155,6 +424,22 @@ class RedisService:
     async def hdel(self, key: str, *fields: str):
         async with self.lock:
             await self.redis.hdel(key, *fields)
+
+    async def write_atomically(self, writes: RedisWrites) -> None:
+        """Apply every write in `writes` as one MULTI/EXEC, or none of them.
+
+        The server applies the queued commands at EXEC as one unit, so a connection lost before EXEC
+        reaches it applies nothing, and one lost after it applies all of it (the client raises either
+        way; the caller sees "this transition did not happen" or the whole transition). The server
+        refusing one command is a bug in the batch, not a Redis state.
+        """
+        if not writes.ops:
+            return
+        async with self.lock:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                for write in writes.ops:
+                    getattr(pipe, write.command)(*write.args, **write.kwargs)
+                await pipe.execute()
 
     async def clear_by_pattern(self, pattern: str):
         async with self.lock:
@@ -278,7 +563,7 @@ class RedisService:
         count = prev_info.get('count', 0)
         failed = prev_info.get('failed', 0)
         prev_spec = prev_info.get('spec', '')
-        prev_uuids = prev_info.get('uuids', '')
+        prev_uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
         if (success):
             count += 1
@@ -296,8 +581,11 @@ class RedisService:
             "count": count,
             "failed": failed,
             "spec": prev_spec if prev_spec else spec,
-            "uuids": prev_uuids if prev_uuids else uuids,
+            GPU_ANCHOR_KEY: prev_uuids if prev_uuids else uuids,
         }
+        # DAH-3457: the anchor and its broken mark outlive every write to the record; only a new executor id starts clean.
+        if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+            data[GPU_ANCHOR_BROKEN_KEY] = True
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
@@ -306,25 +594,37 @@ class RedisService:
         miner_hotkey: str,
         executor_id,
         prev_info: dict = {},
-        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
+        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
+        evidence: dict | None = None,
+        anchor_broken: bool = False,
     ):
         spec = prev_info.get('spec', '')
-        uuids = prev_info.get('uuids', '')
+        uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
         data = {
             "count": 0,
             "failed": 0,
             "spec": spec,
-            "uuids": uuids,
+            GPU_ANCHOR_KEY: uuids,
         }
+        if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+            data[GPU_ANCHOR_BROKEN_KEY] = True
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
+        # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
+        # penalty row (lium-platform DAH-3385). Optional on the wire: an older backend ignores the keys.
+        evidence = dict(evidence or {})
+        reason_code = evidence.pop("reason_code", None)
+        check_id = evidence.pop("check_id", None)
         await self.publish(
             RESET_VERIFIED_JOB_CHANNEL,
             {
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_id,
                 "reason": reason.value,
+                "reason_code": reason_code,
+                "check_id": check_id,
+                "evidence": evidence or None,
             },
         )
 
@@ -339,13 +639,20 @@ class RedisService:
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
 
     async def get_portion_per_gpu_type(self, gpu_type: str):
-        portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
-        portion = float(portion) if portion else 0
-        if not portion:
-            gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
-            return gpu_model_rate
+        try:
+            if gpu_type is None or not isinstance(gpu_type, str):
+                return 0
+            
+            portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
+            portion = float(portion) if portion else 0
+            if not portion:
+                gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+                return gpu_model_rate
 
-        return portion
+            return portion
+        except Exception as e:
+            logger.error(_m("Error getting portion per gpu type.", extra={"error": str(e), "gpu_type": gpu_type}), exc_info=True)
+            return 0
 
     async def set_banned_guids(self, guids: list[str]):
         await self.redis.set(BANNED_GUIDS, json.dumps(guids))
@@ -354,4 +661,29 @@ class RedisService:
         data = await self.redis.get(BANNED_GUIDS)
         if not data:
             return []
+        return json.loads(data)
+
+    async def set_gpu_estimates(self, estimates: dict) -> None:
+        """Serialize and store precomputed GPU estimates under GPU_ESTIMATES_KEY."""
+        serialized: dict[str, dict] = {}
+        for gpu_model, data in estimates.items():
+            serialized[gpu_model] = {k: v.model_dump() for k, v in data.items()}
+        await self.set(GPU_ESTIMATES_KEY, json.dumps(serialized))
+
+    async def get_gpu_estimates(self) -> dict | None:
+        """Read and deserialize precomputed GPU estimates from Redis."""
+        data = await self.get(GPU_ESTIMATES_KEY)
+        if not data:
+            return None
+        return json.loads(data)
+
+    async def set_incentive_snapshot(self, snapshot) -> None:
+        """Serialize and store the incentive snapshot under INCENTIVE_SNAPSHOT_KEY."""
+        await self.set(INCENTIVE_SNAPSHOT_KEY, snapshot.model_dump_json())
+
+    async def get_incentive_snapshot(self) -> dict | None:
+        """Read and deserialize the incentive snapshot from Redis."""
+        data = await self.get(INCENTIVE_SNAPSHOT_KEY)
+        if not data:
+            return None
         return json.loads(data)

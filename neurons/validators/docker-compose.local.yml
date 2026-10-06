@@ -13,6 +13,12 @@ services:
       - db_data:/var/lib/postgresql/data
     ports:
       - ${POSTGRES_PORT}:5432
+    
+  dstack-verifier:
+    image: dstacktee/dstack-verifier@sha256:3f36162ca8dd2d4207601a6302881de6b497e610eb44050bb0874776fc8ded07
+    restart: unless-stopped
+    ports:
+      - 8080:8080
 
   redis:
     image: daturaai/redis:7.4.2

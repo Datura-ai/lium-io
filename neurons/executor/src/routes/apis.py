@@ -1,40 +1,323 @@
-from typing import Annotated, Optional
+import asyncio
+import functools
+import ipaddress
+import json
+import logging
+import os
+import threading
+import time
+import tomllib
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from pathlib import Path
+from typing import Annotated, Any, Optional
 
 import docker
-from fastapi import APIRouter, Depends, Query, Header, HTTPException
+from datura.requests.validator_requests import ssh_pubkey_signing_blob
+from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
-from services.hardware_service import get_system_metrics, get_container_metrics
+from services.hardware_service import get_docker_client, get_system_metrics, get_container_metrics
+from services.update_status_service import ExpectedDigestCache, collect_update_status
+from core.config import settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
-from payloads.backend import ContainerUtilizationPayload
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
+from payloads.backend import ContainerUtilizationPayload, SignaturePayload
+from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
+from dependencies.auth import (
+    match_validator_hotkey,
+    verify_allowed_hotkey_signature,
+    verify_ping_signature,
+    verify_container_signature,
+    verify_container_logs_signature,
+    verify_signature,
+)
+from services.local_verify_service import (
+    BusyError,
+    LocalVerifyService,
+    NonceCache,
+    canonical_intent_message,
+    check_intent_target,
+    check_intent_window,
+)
+
+logger = logging.getLogger(__name__)
 
 apis_router = APIRouter()
+
+MAX_CONTAINER_LOG_TAIL_LINES = int(os.getenv("EXECUTOR_CONTAINER_LOGS_MAX_TAIL", "500"))
+MAX_FOLLOW_LOG_STREAMS = int(os.getenv("EXECUTOR_CONTAINER_LOGS_MAX_FOLLOW_STREAMS", "10"))
+FOLLOW_LOG_STREAM_MAX_SECONDS = float(os.getenv("EXECUTOR_CONTAINER_LOGS_FOLLOW_MAX_SECONDS", "300"))
+FOLLOW_LOG_STREAM_QUEUE_MAX_SIZE = max(1, int(os.getenv("EXECUTOR_CONTAINER_LOGS_QUEUE_MAX_SIZE", "100")))
+FOLLOW_LOG_STREAM_QUEUE_PUT_TIMEOUT_SECONDS = 0.1
+
+_CONTAINER_LOG_STREAM_END = object()
+_container_log_stream_executor = ThreadPoolExecutor(
+    max_workers=max(1, MAX_FOLLOW_LOG_STREAMS),
+    thread_name_prefix="container-log-stream",
+)
+_active_follow_log_streams = 0
+_active_follow_log_streams_lock = asyncio.Lock()
+
+# Upper bound on a peer-supplied authorized_keys line (the purge re-reads the file every minute):
+# 8192 less the 32 bytes the expiry marker takes (services/ssh_service.py). A real key is far
+# smaller — an ed25519 line is ~100 bytes, an rsa-4096 one ~750.
+MAX_PUBLIC_KEY_BYTES = 8192 - 32
+METRICS_MAX_CONCURRENT = 3
+METRICS_TIMEOUT_SECONDS = 8.0
+CONTAINER_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+# Dedicated pool for blocking metrics/docker work: psutil, pynvml and docker-py
+# calls must never run on the event loop (a single hung call there blocks /ping
+# and /upload_ssh_key for its whole duration). A separate pool also isolates
+# leaked threads: wait_for cancels the coroutine but cannot kill a stuck thread,
+# so a wedged docker daemon degrades metrics only, never the whole agent.
+_metrics_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="metrics")
+_metrics_semaphore = asyncio.Semaphore(METRICS_MAX_CONCURRENT)
+
+
+async def _run_in_metrics_pool(label: str, func: Callable[[], Any], timeout: float | None = None) -> Any:
+    # run one blocking call in the dedicated pool, bounded by a timeout read at call time
+    if timeout is None:
+        timeout = METRICS_TIMEOUT_SECONDS
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(_metrics_executor, func), timeout=timeout)
+    except TimeoutError:
+        logger.warning(
+            "%s timed out after %.1fs in the metrics pool, returning 503 "
+            "(worker thread may be leaked)",
+            label,
+            timeout,
+        )
+        raise HTTPException(status_code=503, detail="Executor busy, metrics collection timed out")
+
+
+async def _run_metrics_call(label: str, func: Callable[[], Any]) -> Any:
+    # reject immediately when all metrics slots are busy instead of queueing on the event loop
+    if _metrics_semaphore.locked():
+        logger.warning(
+            "%s rejected: %d concurrent metrics calls already running",
+            label,
+            METRICS_MAX_CONCURRENT,
+        )
+        raise HTTPException(
+            status_code=503, detail="Executor busy, too many concurrent metrics requests"
+        )
+    async with _metrics_semaphore:
+        return await _run_in_metrics_pool(label, func)
+
+
+def _normalize_log_tail(tail: Optional[int]) -> int:
+    if tail is None:
+        return MAX_CONTAINER_LOG_TAIL_LINES
+    return max(1, min(tail, MAX_CONTAINER_LOG_TAIL_LINES))
+
+
+def _queue_log_stream_item(loop, queue: asyncio.Queue, item, stop_event: threading.Event) -> bool:
+    if stop_event.is_set():
+        return False
+
+    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    while True:
+        try:
+            future.result(timeout=FOLLOW_LOG_STREAM_QUEUE_PUT_TIMEOUT_SECONDS)
+            return True
+        except FutureTimeoutError:
+            if stop_event.is_set():
+                future.cancel()
+                return False
+
+
+def _release_follow_log_stream_on_loop(loop) -> None:
+    loop.call_soon_threadsafe(lambda: asyncio.create_task(_release_follow_log_stream()))
+
+
+def _produce_follow_container_logs(
+    *,
+    container,
+    tail: int,
+    since: Optional[int],
+    stdout: bool,
+    stderr: bool,
+    loop,
+    queue: asyncio.Queue,
+    stop_event: threading.Event,
+    stream_ref: dict,
+) -> None:
+    log_iterator = None
+    try:
+        log_iterator = iter(
+            container.logs(
+                stream=True,
+                follow=True,
+                tail=tail,
+                since=since,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
+        stream_ref["iterator"] = log_iterator
+
+        for log in log_iterator:
+            if stop_event.is_set():
+                break
+            if not _queue_log_stream_item(loop, queue, log, stop_event):
+                break
+    except Exception as exc:
+        _queue_log_stream_item(loop, queue, exc, stop_event)
+    finally:
+        close = getattr(log_iterator, "close", None)
+        if close:
+            try:
+                close()
+            except Exception:
+                logger.debug("Failed to close container logs iterator", exc_info=True)
+        _queue_log_stream_item(loop, queue, _CONTAINER_LOG_STREAM_END, stop_event)
+        _release_follow_log_stream_on_loop(loop)
+
+
+async def _reserve_follow_log_stream() -> bool:
+    global _active_follow_log_streams
+    async with _active_follow_log_streams_lock:
+        if _active_follow_log_streams >= MAX_FOLLOW_LOG_STREAMS:
+            return False
+        _active_follow_log_streams += 1
+        return True
+
+
+async def _release_follow_log_stream() -> None:
+    global _active_follow_log_streams
+    async with _active_follow_log_streams_lock:
+        _active_follow_log_streams = max(0, _active_follow_log_streams - 1)
+
+
+def _get_version() -> str:
+    """Read version from pyproject.toml."""
+    try:
+        pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
+        with open(pyproject_path, "rb") as f:
+            pyproject_data = tomllib.load(f)
+            return pyproject_data.get("project", {}).get("version", "unknown")
+    except Exception as e:
+        logger.error(f"Failed to read version from pyproject.toml: {e}")
+        return "unknown"
+
+
+def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
+    """
+    Validate that public_key matches data_to_sign to prevent SSH key substitution attacks.
+    
+    Security: Issue #744 - Without this check, an attacker could intercept a request
+    and substitute a different public_key while keeping the valid signature for data_to_sign.
+    
+    Raises:
+        HTTPException: 400 if keys don't match after normalization
+    """
+    pk_normalized = payload.public_key.strip()
+    dts_normalized = payload.data_to_sign.strip()
+    
+    if pk_normalized != dts_normalized:
+        logger.warning(
+            "SSH key substitution attack detected or key mismatch: "
+            f"public_key length={len(pk_normalized)}, data_to_sign length={len(dts_normalized)}"
+        )
+        raise HTTPException(status_code=400, detail="Public key mismatch")
+    # DAH-3394: the key is appended as one authorized_keys line with an expiry marker; a second
+    # line inside it would be a second key without the marker, and so without the expiry
+    if "\n" in pk_normalized or "\r" in pk_normalized:
+        logger.warning("Rejecting a public_key that spans more than one line")
+        raise HTTPException(status_code=400, detail="Public key must be a single line")
+    # bounded input: the line goes into a file the purge re-reads every minute
+    if len(pk_normalized.encode()) > MAX_PUBLIC_KEY_BYTES:
+        logger.warning("Rejecting a public_key of %d bytes", len(pk_normalized.encode()))
+        raise HTTPException(status_code=400, detail=f"Public key longer than {MAX_PUBLIC_KEY_BYTES} bytes")
+
+
+def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:
+    """Require a valid validator signature over the SSH public key.
+
+    When the request carries an attestation nonce the signature must cover
+    public_key AND nonce (datura.ssh_pubkey_signing_blob) — stripping or swapping
+    the nonce invalidates the signature. Legacy requests without a nonce keep
+    the bare-public-key format. `require_nonce` is the G3 enforcement phase:
+    attestation-relevant requests without a nonce are rejected outright.
+    """
+    if require_nonce and not payload.nonce:
+        logger.warning("Rejecting SSH-key upload without an attestation nonce (enforcement on)")
+        raise HTTPException(status_code=401, detail="Attestation nonce required")
+    try:
+        signed_blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce)
+        if match_validator_hotkey(signed_blob, payload.validator_signature) is None:
+            raise HTTPException(status_code=401, detail="Invalid validator signature")
+        logger.info("Validator signature verification successful")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Validator signature verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid validator signature")
 
 
 @apis_router.post("/upload_ssh_key")
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
-    if payload.public_key != payload.data_to_sign:
-        raise HTTPException(status_code=400, detail="Public key mismatch")
-
-    return await miner_service.upload_ssh_key(payload)
+    logger.info("upload_ssh_key route entered")
+    _validate_ssh_key_consistency(payload)
+    logger.info("upload_ssh_key SSH key consistency validated")
+    # The nonce requirement applies only to uploads (the attestation-bearing
+    # request); removals never carry a nonce.
+    _validate_validator_signature(payload, require_nonce=settings.REQUIRE_ATTESTATION_NONCE)
+    logger.info("upload_ssh_key validator signature validated")
+    logger.info("upload_ssh_key service call started")
+    response = await miner_service.upload_ssh_key(payload)
+    logger.info("upload_ssh_key service call completed")
+    return response
 
 
 @apis_router.post("/remove_ssh_key")
 async def remove_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
-    return await miner_service.remove_ssh_key(payload)
+    logger.info("remove_ssh_key route entered")
+    _validate_ssh_key_consistency(payload)
+    logger.info("remove_ssh_key SSH key consistency validated")
+    _validate_validator_signature(payload)
+    logger.info("remove_ssh_key validator signature validated")
+    logger.info("remove_ssh_key service call started")
+    response = await miner_service.remove_ssh_key(payload)
+    logger.info("remove_ssh_key service call completed")
+    return response
+
+
+def _validate_pod_logs_consistency(payload: GetPodLogsPaylod) -> None:
+    """Require the signed string to be the container name the request reads.
+
+    MinerMiddleware verifies the miner's signature over `data_to_sign` and nothing
+    else, so without this check any string the miner ever signed (an SSH public key
+    sent to /upload_ssh_key, another container's name) authenticates a read of any
+    container's events. The miner signs the container name itself
+    (ExecutorService.get_pod_logs), same shape as `_validate_ssh_key_consistency`.
+
+    Raises:
+        HTTPException: 400 when data_to_sign is not the requested container name
+    """
+    if payload.container_name.strip() != payload.data_to_sign.strip():
+        logger.warning(
+            "pod_logs request signed over a different string: "
+            f"container_name length={len(payload.container_name.strip())}, "
+            f"data_to_sign length={len(payload.data_to_sign.strip())}"
+        )
+        raise HTTPException(status_code=400, detail="Container name mismatch")
 
 
 @apis_router.post("/pod_logs")
 async def get_pod_logs(
     payload: GetPodLogsPaylod, pod_log_service: Annotated[PodLogService, Depends(PodLogService)]
 ):
+    _validate_pod_logs_consistency(payload)
     return await pod_log_service.find_by_continer_name(payload.container_name)
 
 
@@ -49,7 +332,7 @@ async def hardware_utilization(
     Returns:
         dict: Hardware utilization metrics including CPU, memory, storage, and GPU
     """
-    return get_system_metrics()
+    return await _run_metrics_call("hardware_utilization", get_system_metrics)
 
 
 @apis_router.post("/containers/{container_name}")
@@ -69,7 +352,10 @@ async def container_hardware_utilization(
     Returns:
         dict: Container-specific hardware utilization metrics
     """
-    return get_container_metrics(container_name, payload.gpu_uuids)
+    return await _run_metrics_call(
+        f"container_utilization:{container_name}",
+        functools.partial(get_container_metrics, container_name, payload.gpu_uuids),
+    )
 
 
 @apis_router.post("/ping")
@@ -82,6 +368,166 @@ async def ping(_: None = Depends(verify_ping_signature)):
         dict: {"status": "pong"}
     """
     return {"status": "pong"}
+
+
+def _capabilities() -> list[str]:
+    # What a validator may call beyond the routes every executor has. Read per request so a flag
+    # flip is visible without a restart of anything but this process.
+    return [LOCAL_VERIFY_CAPABILITY] if settings.EXECUTOR_LOCAL_VERIFY_ENABLED else []
+
+
+@apis_router.get("/version")
+async def get_version():
+    """
+    Get the executor version information.
+
+    Returns:
+        dict: {"version": "x.y.z", "capabilities": [...]} plus, while `local_verify/1` is
+        advertised, `local_verify_port`: the loopback port the validator's SSH tunnel targets for
+        `POST /verify` (this process's own INTERNAL_PORT; the miner's EXTERNAL_PORT may differ).
+        Read over plain HTTP, so a proxy can change it: a wrong port only fails the tunnel's
+        connect, and the validator then runs its SSH checks as before.
+    """
+    version = {"version": _get_version(), "capabilities": _capabilities()}
+    if settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        version["local_verify_port"] = settings.INTERNAL_PORT
+    return version
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """True when the TCP peer is this host's loopback: the validator's SSH tunnel (a direct-tcpip
+    channel sshd opens to 127.0.0.1) lands here; a request from the network does not. executor.py
+    starts uvicorn with `proxy_headers=False`, so no `X-Forwarded-For` can stand in for the peer."""
+    client = request.client
+    if client is None or not client.host:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
+_local_verify_nonces = NonceCache()
+_local_verify_service: LocalVerifyService | None = None
+
+
+def _get_local_verify_service() -> LocalVerifyService:
+    global _local_verify_service
+    if _local_verify_service is None:
+        _local_verify_service = LocalVerifyService(
+            executor_version=_get_version(),
+            max_deadline_s=settings.LOCAL_VERIFY_MAX_DEADLINE_SECONDS,
+            port_range=settings.RENTING_PORT_RANGE,
+            port_mappings=settings.RENTING_PORT_MAPPINGS,
+            ssh_port=settings.SSH_PORT,
+        )
+    return _local_verify_service
+
+
+async def _admit_verify_intent(request: Request) -> VerifyIntent:
+    """The guards a `/verify` intent passes before anything runs: the flag, the loopback peer, the
+    body, the validator signature, the time window and the miner it names. Returns the admitted
+    intent; raises the HTTP refusal otherwise. Claims no nonce, so a refusal here leaves the signed
+    intent usable."""
+    if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not _is_loopback_client(request):
+        # Logged so a provider can see why a validator that still posts over the network gets the
+        # SSH checks instead: the peer is the docker gateway or the CVM's slirp address, not loopback.
+        logger.warning(
+            "local verify refused: not a loopback peer host=%s",
+            request.client.host if request.client else None,
+        )
+        raise HTTPException(
+            status_code=403, detail="/verify is served on the loopback only (the validator's SSH tunnel)"
+        )
+
+    try:
+        raw = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Body is not JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="Body is not an object")
+    try:
+        intent = VerifyIntent.model_validate(raw)
+    except ValidationError as exc:
+        # `exc.errors()` carries the raising ValueError object in `ctx` for a model_validator
+        # refusal (a shared card challenge): serialised here, or the 422 would be a 500.
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
+    # Signed as sent: the validator signs the document it puts on the wire, so a field it left at
+    # its default is not re-serialised here and a field it did send cannot be altered in flight.
+    await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
+
+    refused = check_intent_window(
+        intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
+    ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
+    if refused:
+        logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
+        raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    return intent
+
+
+@apis_router.post("/verify")
+async def local_verify(request: Request):
+    """Run the verification suite locally from one validator-signed intent (liumd phase 1).
+
+    Reached through the validator's SSH connection only: the validator opens a direct-tcpip
+    channel on the session it already holds (host key pinned to the TDX quote on a CVM) to this
+    process's loopback port and posts the intent through it. The answer is not signed (no
+    executor key exists, `payloads/verify.py`), so it must travel inside that channel: a request
+    whose TCP peer is not loopback is refused 403 before the body is read, and the miner's
+    port-forward from the network can neither read nor rewrite a result.
+
+    Auth is the validator hotkey signature every validator-facing route here uses
+    (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
+    (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
+    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    the validator treats every non-200 as "use SSH".)
+    """
+    intent = await _admit_verify_intent(request)
+    service = _get_local_verify_service()
+    # Busy is answered before the nonce is claimed, so a refused-because-busy intent is not burnt:
+    # the validator may re-send the same signed intent once the executor is free.
+    if service.busy:
+        raise HTTPException(status_code=409, detail="a verification is already running")
+    if not _local_verify_nonces.claim(intent.nonce, float(intent.expires_at)):
+        raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
+
+    try:
+        result = await service.run(intent)
+    except BusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    logger.info(
+        "local verify done nonce=%s elapsed_ms=%d deadline_hit=%s steps=%s",
+        intent.nonce,
+        result.elapsed_ms,
+        result.deadline_hit,
+        {name: step.status for name, step in result.steps.items()},
+    )
+    return result.model_dump(by_alias=True)
+
+
+_expected_digest_cache = ExpectedDigestCache()
+
+
+@apis_router.get("/update-status")
+async def get_update_status():
+    """
+    Self-check of the stack's update state (DAH-3419): the digest of the runner image
+    this node runs against the digest the validator signed, and the executor's own
+    image digest. `update_pending` is null when either digest is unknown.
+
+    Kept off `/version`, which the container healthcheck polls with a 5 s budget.
+
+    Returns:
+        dict: {"version": "x.y.z", "runner": {"container", "running_digest",
+        "expected_digest", "update_pending", "error"}, "executor": {"running_digest"}}
+    """
+    status = await _run_metrics_call(
+        "update_status",
+        functools.partial(collect_update_status, get_docker_client, _expected_digest_cache),
+    )
+    return {"version": _get_version(), **status}
 
 
 @apis_router.get("/containers/{container_name}/logs")
@@ -113,18 +559,100 @@ async def stream_container_logs(
     """
     await verify_container_logs_signature(container_name, x_timestamp, x_signature)
 
-    client = docker.from_env()
-    container = client.containers.get(container_name)
+    reserved_follow_stream = False
+    if follow:
+        reserved_follow_stream = await _reserve_follow_log_stream()
+        if not reserved_follow_stream:
+            raise HTTPException(status_code=429, detail="Too many active live log streams")
 
-    def generate():
-        for log in container.logs(
-            stream=True,
-            follow=follow,
-            tail=tail if tail else "all",
-            since=since,
-            stdout=stdout,
-            stderr=stderr,
-        ):
-            yield log
+    def _lookup_container():
+        client = docker.from_env()
+        return client.containers.get(container_name)
+
+    try:
+        container = await _run_in_metrics_pool(
+            f"container_logs_lookup:{container_name}",
+            _lookup_container,
+            timeout=CONTAINER_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        if reserved_follow_stream:
+            await _release_follow_log_stream()
+        raise
+
+    if not follow:
+        def generate():
+            for log in container.logs(
+                stream=True,
+                follow=False,
+                tail=tail if tail else "all",
+                since=since,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                yield log
+
+        return StreamingResponse(generate(), media_type="text/plain")
+
+    tail = _normalize_log_tail(tail)
+
+    async def generate():
+        loop = asyncio.get_running_loop()
+        started = time.monotonic()
+        queue = asyncio.Queue(maxsize=FOLLOW_LOG_STREAM_QUEUE_MAX_SIZE)
+        stop_event = threading.Event()
+        stream_ref = {}
+
+        try:
+            _container_log_stream_executor.submit(
+                _produce_follow_container_logs,
+                container=container,
+                tail=tail,
+                since=since,
+                stdout=stdout,
+                stderr=stderr,
+                loop=loop,
+                queue=queue,
+                stop_event=stop_event,
+                stream_ref=stream_ref,
+            )
+        except Exception:
+            await _release_follow_log_stream()
+            raise
+
+        try:
+            while True:
+                remaining_seconds = FOLLOW_LOG_STREAM_MAX_SECONDS - (time.monotonic() - started)
+                if remaining_seconds <= 0:
+                    logger.info(
+                        "Stopping live container log stream after %.1f seconds for %s",
+                        FOLLOW_LOG_STREAM_MAX_SECONDS,
+                        container_name,
+                    )
+                    break
+
+                try:
+                    log = await asyncio.wait_for(queue.get(), timeout=remaining_seconds)
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "Stopping live container log stream after %.1f seconds for %s",
+                        FOLLOW_LOG_STREAM_MAX_SECONDS,
+                        container_name,
+                    )
+                    break
+
+                if log is _CONTAINER_LOG_STREAM_END:
+                    break
+                if isinstance(log, Exception):
+                    raise log
+                yield log
+        finally:
+            stop_event.set()
+            close = getattr(stream_ref.get("iterator"), "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Failed to close container logs iterator", exc_info=True)
 
     return StreamingResponse(generate(), media_type="text/plain")

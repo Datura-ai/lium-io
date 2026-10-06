@@ -1,0 +1,158 @@
+# DStack TDX Executor Setup
+
+Run compute subnet executors inside Intel TDX confidential VMs with hardware attestation.
+
+## Prerequisites
+
+- Intel CPU with TDX and SGX support
+- Kernel with KVM TDX (Canonical intel kernel or mainline ≥ 6.16) and the boot parameters from [docs/host-setup.md](docs/host-setup.md)
+- Docker and Docker Compose
+- The dstack QEMU 9.2.1 build — **required for attestation to pass**; one-time install, see [docs/host-setup.md](docs/host-setup.md)
+- SGX devices: `/dev/sgx_enclave` and `/dev/sgx_provision`
+
+First-time host? Follow [docs/host-setup.md](docs/host-setup.md) end to end — it covers BIOS, kernel parameters, the QEMU build, and the key provider; the steps below assume a prepared host.
+
+## Quick Start
+
+### 1. Check System Requirements
+
+```bash
+./lium-cvm.sh check
+```
+
+### 2. Download OS Image
+
+```bash
+./lium-cvm.sh download
+```
+
+### 3. Configure Environment
+
+```bash
+cp .env.example .env
+# Edit .env with your settings:
+# - MINER_HOTKEY_SS58_ADDRESS
+# - SSH_PORT
+# - RENTING_PORT_RANGE
+# - CVM_VCPUS, CVM_MEMORY, CVM_DISK
+# - CVM_GPUS (e.g., "all" or "19:00.0,3b:00.0")
+```
+
+### 4. Create CVM Instance
+
+```bash
+./lium-cvm.sh new my-executor
+```
+
+### 5. Run CVM
+
+```bash
+./lium-cvm.sh run my-executor
+```
+
+`lium-cvm.sh` subcommands: `check`, `download`, `new <name> [--env local|staging|prod] [--enable-logs] [--enable-sysinfo]`
+(`--env` picks `app/docker-compose.local.yml`, `app/docker-compose.staging.yml` or `app/docker-compose.yml`; default `prod`),
+`run <name> [--dry-run]`, `stop <name> [--timeout N] [--force]`, `list`, `lsgpu`, `help`.
+
+## Architecture
+
+```mermaid
+sequenceDiagram
+    participant V as Validator
+    participant CVM as TDX VM<br/>(Executor)
+    participant Host as Host API<br/>(host_api.py)
+    participant KP as SGX Key Provider<br/>(Enclave)
+
+    Note over CVM: VM boots with TDX encryption
+    CVM->>CVM: Generate TDX quote<br/>(hardware-signed)
+    CVM->>Host: POST /api/GetSealingKey<br/>{quote: "..."}
+    Host->>KP: TCP binary protocol<br/>Send quote
+    KP->>KP: 1. Verify TDX quote<br/>2. Derive sealing key<br/>3. Encrypt key<br/>4. Generate SGX quote
+    KP-->>Host: {encrypted_key, provider_quote}
+    Host-->>CVM: Return encrypted data
+    CVM->>CVM: Decrypt sealing key<br/>(TDX-protected memory)
+    
+    Note over V,CVM: Attestation Flow
+    V->>CVM: POST /upload_ssh_key
+    CVM->>CVM: Generate TDX quote<br/>with SSH key hash
+    CVM-->>V: {ssh_host_key, tdx_quote}
+    V->>V: Verify TDX quote<br/>Check measurements
+    V->>CVM: SSH connection<br/>(verified)
+```
+
+## Key Components
+
+| Component | Purpose |
+|-----------|---------|
+| `lium-cvm.sh` | CLI for creating and running CVMs |
+| `cvm_upgrade_guard.sh` | Host-wide CVM disk inventory, pinned key-provider image, host lock; refuses a key-provider rebuild while any CVM disk exists |
+| `scripts/dstack.py` | VM manifest generator and QEMU orchestrator |
+| `scripts/host_api.py` | HTTP API bridge between VM and key provider |
+| `key-provider/` | SGX enclave containers for sealing key derivation |
+| `app/init_script.sh` | VM boot script for env var whitelisting + RTMR extension |
+| `app/docker-compose.yml` | Executor services running inside the VM |
+
+## Configuration
+
+Key `.env` settings:
+
+```bash
+# Network
+SSH_PORT=2200
+RENTING_PORT_RANGE="19001,19002,19003"
+
+# Identity
+MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here   # your provider hotkey (SS58)
+VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed per image: docker_build.sh writes src/core/config_override.py from VALIDATOR_HOTKEY_SS58 at build time (src/core/config.py holds the default)
+ENABLE_TDX_ATTESTATION=true
+ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
+# EXECUTOR_LOCAL_VERIFY_ENABLED=false        # optional; the validator's one-call POST /verify over its SSH tunnel (LOCAL_VERIFY_MAX_DEADLINE_SECONDS, LOCAL_VERIFY_INTENT_WINDOW_SECONDS tune it)
+
+# Measured executor-runner release (release notes, section "CVM attestation") — required
+EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
+
+# Resources
+CVM_VCPUS=16
+CVM_MEMORY=64G
+CVM_DISK=200G
+CVM_GPUS=all  # or "19:00.0,3b:00.0"
+```
+
+## How It Works
+
+1. **TDX VM** provides hardware-encrypted memory and attestation quotes
+2. **SGX Key Provider** derives deterministic sealing keys from VM measurements
+3. **Host API** bridges the VM to the key provider (VM can't talk to SGX directly)
+4. **Sealing Key** allows the VM to persist secrets across reboots
+5. **TDX Quote** proves to validators that the executor runs in genuine TDX hardware
+
+## Troubleshooting
+
+**Check key provider status:**
+```bash
+cd key-provider && docker compose logs -f
+```
+
+**Start or upgrade the key provider** (`docker compose build` in `key-provider/` builds nothing: the compose file has no `build:` section, the guard builds through `docker-compose.build.yaml`; a rebuild changes MRENCLAVE and locks every CVM out of its data disk):
+```bash
+sudo ./cvm_upgrade_guard.sh start      # pinned image; builds only on a host with no CVM disk
+sudo ./lium-cvm.sh inventory           # every CVM disk on the host
+sudo ./cvm_upgrade_guard.sh upgrade    # refused while any CVM disk exists; see docs/host-setup.md §6.1
+```
+
+**List running VMs:**
+```bash
+./lium-cvm.sh list
+```
+
+**Check GPU allocation:**
+```bash
+./lium-cvm.sh lsgpu
+```
+
+## Security Model
+
+- VM memory encrypted by Intel TDX hardware
+- Sealing keys derived in SGX enclave (host cannot access)
+- TDX quotes cryptographically bind SSH keys to VM measurements
+- Validators verify quotes before accepting executors

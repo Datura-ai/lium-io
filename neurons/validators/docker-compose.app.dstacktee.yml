@@ -1,0 +1,78 @@
+services:
+  db:
+    image: postgres:14.0-alpine
+    healthcheck:
+      test: pg_isready -U postgres || exit 1
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    env_file: ./.env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  redis:
+    image: daturaai/redis:7.4.2
+    healthcheck:
+      test: redis-cli ping
+    environment:
+      - REDIS_MODE=master
+      - REDIS_REPLICATION_MODE=master
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  dstack-verifier:
+    # DAH-2338: verifier 0.5.11 — dcap-qvl 0.3.10 (CVE-2026-22696) + dstack-mr support
+    # for dstack 0.5.11 OS images; still verifies the legacy 0.5.5 images.
+    image: dstacktee/dstack-verifier@sha256:06a20b777e59196c7f54b0cd02ffe567df6d05ae39a0b2fea9cb0642fb23c1fd
+    restart: unless-stopped
+    environment:
+      # Measurement bundles are hash-named (mr_<os_image_hash>.tar.gz), so this one URL
+      # template serves both the legacy 0.5.5 image and the upstream 0.5.11 image.
+      # {OS_IMAGE_HASH} is substituted by the verifier, not compose.
+      - DSTACK_VERIFIER_IMAGE_DOWNLOAD_URL=https://github.com/Datura-ai/private-ml-sdk/releases/download/v0.5.5/mr_{OS_IMAGE_HASH}.tar.gz
+
+  validator:
+    image: daturaai/compute-subnet-validator:latest
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ENABLE_TDX_ATTESTATION=true
+      - TDX_VERIFIER_URL=http://dstack-verifier:8080/verify
+      - ENABLE_ATTESTATION_WHITELIST=true
+      - DEPLOY_ENV=PROD
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+      - redis
+      - dstack-verifier
+
+  connector:
+    image: daturaai/compute-subnet-validator:latest
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - COMPUTE_APP_URI=wss://lium.io/api
+    command: pdm run src/connector.py
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  db_data:
+  redis_data:
