@@ -9,6 +9,13 @@ if TYPE_CHECKING:  # pragma: no cover
     from .pipeline import Context
 
 
+# Where every failing verdict sends the provider when its template names no page of its
+# own: the docs table that lists each reason code with its cause and fix. The miner portal
+# renders `help_uri` as the "Learn more" link on the node's error panel.
+REASON_CODE_DOCS_URL = "https://docs.lium.io/providers/troubleshooting#6-validator-reason-codes"
+_HELP_URI_SEVERITIES = frozenset({"error", "warning"})
+
+
 @dataclass(frozen=True)
 class MessageTemplate:
     event: str
@@ -34,10 +41,14 @@ def render_message(
     extra: dict[str, Any] | None = None,
 ) -> Any:
     """Render a `MessageTemplate` into a structured message via `build_msg`."""
+    resolved_severity = severity or template.severity
+    resolved_help_uri = help_uri or template.help_uri
+    if resolved_help_uri is None and resolved_severity in _HELP_URI_SEVERITIES:
+        resolved_help_uri = REASON_CODE_DOCS_URL
     return build_msg(
         event=template.event,
         reason=template.reason,
-        severity=severity or template.severity,
+        severity=resolved_severity,
         category=category or template.category,
         impact=impact or template.impact,
         remediation=(remediation if remediation is not None else template.remediation) or "",
@@ -45,7 +56,7 @@ def render_message(
         check_id=check_id,
         pipeline_id=ctx.pipeline_id,
         ctx={**ctx.default_extra, **(extra or {})},
-        help_uri=help_uri or template.help_uri,
+        help_uri=resolved_help_uri,
     )
 
 
@@ -140,6 +151,8 @@ class MachineSpecMessages:
         impact="Validation halted",
         remediation="Validator bug: missing SSH service in context",
     )
+    # What a validator before the split reported for every scrape failure below. Kept because the
+    # backend still reads it from those validators.
     SCRAPE_FAILED = MessageTemplate(
         event="Machine specs scrape failed",
         reason="SCRAPE_FAILED",
@@ -149,6 +162,71 @@ class MachineSpecMessages:
         remediation=(
             "Ensure the scrape script exists and is executable:"
             "\n  chmod +x <script>\nCheck stderr and environment on the executor."
+        ),
+    )
+    # Host side: the scrape ran on the executor and the host sent back an exit status (or a signal)
+    # with a failure.
+    SCRAPE_FAILED_NO_GPU = MessageTemplate(
+        event="Machine specs scrape found zero GPUs",
+        reason="SCRAPE_FAILED_NO_GPU",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "NVML answered on the host and listed zero GPUs. Run `nvidia-smi` on the host and make sure"
+            " the executor container starts with GPU access (NVIDIA container runtime, `--gpus all`)."
+        ),
+    )
+    SCRAPE_FAILED_DRIVER = MessageTemplate(
+        event="Machine specs scrape hit a GPU driver error",
+        reason="SCRAPE_FAILED_DRIVER",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "NVML raised on the host (driver unloaded, a GPU fallen off the bus, or a driver/library"
+            " version mismatch). Run `nvidia-smi` on the host, check `dmesg` for Xid errors, then"
+            " reboot or reinstall the driver."
+        ),
+    )
+    SCRAPE_FAILED_ON_HOST = MessageTemplate(
+        event="Machine specs scrape failed on the executor",
+        reason="SCRAPE_FAILED_ON_HOST",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The scrape exited with an error on the executor, or ended without output. Check the"
+            " stderr tail in this event, keep the executor image up to date, and make sure the host"
+            " has free disk and memory."
+        ),
+    )
+    # Undetermined: no exit status came back from the host, and a host fault and a validator fault
+    # both end this way.
+    SCRAPE_TIMEOUT = MessageTemplate(
+        event="Machine specs scrape timed out",
+        reason="SCRAPE_TIMEOUT",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The validator stopped waiting for the scrape at its timeout. Either side can cause this:"
+            " a GPU query that hangs on the host, a host link that drops packets, or a busy validator."
+            " If it repeats, check that `nvidia-smi` answers within seconds on the host."
+        ),
+    )
+    SCRAPE_TRANSPORT_FAILED = MessageTemplate(
+        event="Machine specs scrape returned no exit status",
+        reason="SCRAPE_TRANSPORT_FAILED",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The SSH session ended before the host sent the scrape's exit status, or the scrape could"
+            " not be delivered. Either side can cause this: the host's network, sshd or container going"
+            " down, a full disk on the host during the upload, or the validator's own network. The next"
+            " cycle retries; if it fails on every cycle, check that the host's SSH port answers from"
+            " outside and that the host has free disk."
         ),
     )
     SCRAPE_OK = MessageTemplate(
@@ -166,6 +244,23 @@ class MachineSpecMessages:
         impact="Validation halted — GPU unverified",
         remediation="Confirm encryption key, payload, and repo versions on both validator and executor.",
     )
+
+
+SCRAPE_HOST_SIDE_FAILURE_REASONS = frozenset(
+    {
+        MachineSpecMessages.SCRAPE_FAILED_NO_GPU.reason,
+        MachineSpecMessages.SCRAPE_FAILED_DRIVER.reason,
+        MachineSpecMessages.SCRAPE_FAILED_ON_HOST.reason,
+    }
+)
+# No split code is validator-side: each one without an exit status can come from the host's link,
+# sshd, disk or a hung GPU query as much as from the validator.
+SCRAPE_UNDETERMINED_FAILURE_REASONS = frozenset(
+    {
+        MachineSpecMessages.SCRAPE_TIMEOUT.reason,
+        MachineSpecMessages.SCRAPE_TRANSPORT_FAILED.reason,
+    }
+)
 
 
 class GpuCountMessages:
@@ -223,8 +318,11 @@ class GpuModelMessages:
         reason="GPU_DETAILS_MISMATCH",
         severity="warning",
         category="env",
-        impact="Job skipped; score set to 0",
-        remediation="GPU count and details length don't match. Check GPU detection.",
+        impact="Verification reset; score set to 0 until the scrape lists every GPU again",
+        remediation=(
+            "The GPUs the scrape enumerated do not match the count the node reports. Check `nvidia-smi -L` and `dmesg` on the host; "
+            "the node is verified again when every card is listed."
+        ),
     )
     MODEL_OK = MessageTemplate(
         event="GPU model validated",
@@ -248,6 +346,78 @@ class GpuVramMessages:
     VRAM_OK = MessageTemplate(
         event="GPU model/VRAM precheck passed",
         reason="GPU_VRAM_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
+class DiskHealthMessages:
+    NOT_WRITABLE = MessageTemplate(
+        event="Executor disk refuses writes",
+        reason="DISK_NOT_WRITABLE",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed (observation only until proven on live executors)",
+        remediation="The filesystem holding the docker root is mounted read-only or refused a write "
+        "probe (read_only, io_error, no_space or quota in write_probe_error). For no_space or quota: "
+        "free space on the docker root (docker system prune, a larger disk or quota). Otherwise: check "
+        "dmesg for I/O errors, run a filesystem check, replace the disk if it is failing, then remount "
+        "read-write and restart the executor.",
+    )
+    UNKNOWN = MessageTemplate(
+        event="Executor disk health not reported",
+        reason="DISK_HEALTH_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Executor disk health ok",
+        reason="DISK_HEALTH_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
+class RentedGpuDropMessages:
+    DROP = MessageTemplate(
+        event="Rented node lost a GPU",
+        reason="RENTED_GPU_DROP",
+        severity="error",
+        category="env",
+        impact="Proceed; score not changed here. Reported to the backend unless held for a second cycle or a dry "
+        "run (see pods[].posted, held and delivery); provider, support and renter are told once per incident",
+        remediation="A card fell out of NVML on a rented node (see faults, missing_uuids, nvml_error_code). Check "
+        "`nvidia-smi` and `dmesg` for Xid 79 / 'fallen off the bus', then reset or reboot the host; the renter's "
+        "workload on the missing card is already broken.",
+    )
+    RECOVERED = MessageTemplate(
+        event="Rented node shows every GPU again",
+        reason="RENTED_GPU_RECOVERED",
+        severity="info",
+        category="env",
+        impact="Proceed; the end of the incident is reported to the backend (see pods[].delivery; one with no "
+        "answer is sent again next cycle)",
+    )
+    OK = MessageTemplate(
+        event="Rented node shows every rented GPU",
+        reason="RENTED_GPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented GPU drop check skipped: no running rental",
+        reason="RENTED_GPU_DROP_NOT_RENTED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    DISABLED = MessageTemplate(
+        event="Rented GPU drop check disabled",
+        reason="RENTED_GPU_DROP_DISABLED",
         severity="info",
         category="env",
         impact="Proceed",
@@ -350,6 +520,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
+    # Warn mode (GPU_ANCHOR_HARD_ENABLED off): the legacy verdict. Its what_we_saw carries `anchor_hard_would_be`
+    # (GPU_MISSING or ANCHOR_BROKEN) so the hard rule can be read from a week of rows before it is switched on.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -357,6 +529,32 @@ class GpuFingerprintMessages:
         category="env",
         impact="Verification reset; score set to 0",
         remediation="Ensure the same physical GPUs remain attached and stable.",
+    )
+    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # scores again on the first cycle that shows the full set.
+    GPU_MISSING = MessageTemplate(
+        event="GPU missing from the listed set",
+        reason="GPU_MISSING",
+        severity="warning",
+        category="env",
+        impact="Verification reset; score set to 0 until every listed GPU is visible again",
+        remediation=(
+            "One or more GPUs this node listed are not visible. Check `nvidia-smi -L` and `dmesg` on the host. "
+            "The node scores again when the full set is back."
+        ),
+    )
+    # Hard mode: the scrape shows a GPU that is not in the anchored set (swap, added card, or a set
+    # replaced by a different one). Permanent for this executor id; re-registering the node is the only way out.
+    ANCHOR_BROKEN = MessageTemplate(
+        event="GPU set differs from the listed set",
+        reason="GPU_UUID_CHANGED",
+        severity="error",
+        category="env",
+        impact="Score 0 on every cycle for this node id; verification does not restart",
+        remediation=(
+            "A listed node keeps one fixed set of GPUs. To list a different set, re-register the node. "
+            "Uptime starts over; penalties stay."
+        ),
     )
     UUID_OK = MessageTemplate(
         event="GPU fingerprints stable",
@@ -409,6 +607,48 @@ class BannedProviderMessages:
         category="policy",
         impact="Proceed",
     )
+    # DAH-2662: a mount that is not procfs sits on /proc/driver/nvidia/gpus, so the kernel's GPU
+    # list cannot be read (the 2026-08-19 kit). Emitted only when KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    KERNEL_GPU_VIEW_OVERLAID = MessageTemplate(
+        event="A foreign mount covers the kernel's GPU list",
+        reason="KERNEL_GPU_VIEW_OVERLAID",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the mount is in place",
+        remediation="Remove the mount over /proc/driver/nvidia/gpus on the host.",
+    )
+
+
+class ExecutorImageMessages:
+    CURRENT = MessageTemplate(
+        event="Executor image is current",
+        reason="EXECUTOR_IMAGE_CURRENT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Executor image check skipped",
+        reason="EXECUTOR_IMAGE_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="No image penalty this cycle",
+    )
+    OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="error",
+        category="policy",
+        impact="Score set to 0 until the image is current",
+    )
+    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
+    OUTDATED_WARNING = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="warning",
+        category="policy",
+        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
+    )
 
 
 class SysboxRequiredMessages:
@@ -419,6 +659,33 @@ class SysboxRequiredMessages:
         category="policy",
         impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
         remediation="Install the sysbox runtime; unrented machines without sysbox are not allowed on the network.",
+    )
+    # DAH-3634: the probe's `docker run` was refused by the NVIDIA container hook, so no sysbox
+    # verdict was measured and the node cannot start any GPU container. Same impact as
+    # SYSBOX_MISSING (the check still fails, score 0); the reason code and the advice are truthful.
+    # The call site prefixes the remediation with the probe's cause (dind_probe.DOCKER_RUN_CAUSES).
+    # Same code as the executor updater's hold for this host condition (DAH-3481).
+    NVIDIA_RUNTIME_MISMATCH = MessageTemplate(
+        event="NVIDIA driver/library version mismatch on the host",
+        reason="NVIDIA_RUNTIME_MISMATCH",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Reboot the host after the NVIDIA driver update, or reinstall the NVIDIA container toolkit. "
+            "Sysbox was not measured; fix this first and the sysbox check runs again on the next cycle."
+        ),
+    )
+    NVIDIA_CONTAINER_HOOK_FAILED = MessageTemplate(
+        event="NVIDIA container hook refused the GPU container",
+        reason="NVIDIA_CONTAINER_HOOK_FAILED",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Make `nvidia-smi` work on the host (reset or reboot), then reinstall the NVIDIA container "
+            "toolkit; the sysbox check runs again on the next cycle."
+        ),
     )
     SYSBOX_OK = MessageTemplate(
         event="Sysbox requirement satisfied",
@@ -462,21 +729,27 @@ class DuplicateExecutorMessages:
     )
 
 
-class CollateralMessages:
-    VERIFIED = MessageTemplate(
+class CollateralStatusMessages:
+    DEPOSITED = MessageTemplate(
         event="Collateral verified",
         reason="COLLATERAL_OK",
         severity="info",
         category="policy",
-        impact="Proceed",
+        impact="None; collateral has no score effect",
     )
-    MISSING = MessageTemplate(
+    NOT_DEPOSITED = MessageTemplate(
         event="No collateral deposited",
         reason="COLLATERAL_MISSING",
-        severity="warning",
+        severity="info",
         category="policy",
-        impact="Score may be reduced or set to 0 based on policy",
-        remediation="Deposit collateral for this executor.",
+        impact="None; collateral has no score effect",
+    )
+    READ_FAILED = MessageTemplate(
+        event="Collateral read failed",
+        reason="COLLATERAL_READ_FAILED",
+        severity="info",
+        category="policy",
+        impact="None; the last known collateral status is reported, or none deposited when there is none",
     )
 
 
@@ -487,6 +760,13 @@ class StaleContainerCleanupMessages:
         severity="info",
         category="prep",
         impact="Proceed",
+    )
+    RENTED_LIST_UNKNOWN = MessageTemplate(
+        event="Stale container removal skipped: rented list empty or unknown",
+        reason="STALE_CLEANUP_RENTED_LIST_UNKNOWN",
+        severity="warning",
+        category="prep",
+        impact="No rental container removed this cycle; live pods and fillers are left alone",
     )
 
 
@@ -563,8 +843,15 @@ class InspectorMessages:
         reason="INSPECTOR_MALICIOUS_FINDINGS",
         severity="warning",
         category="runtime",
-        impact="Findings logged; score unchanged",
-        remediation="Review the libinspector report and tenant workload before taking action.",
+        impact="Provider-origin findings recorded; score unchanged",
+        remediation="Review the verdict's evidence; findings are recorded only, no score or marketplace effect.",
+    )
+    PLATFORM_ORIGIN_ONLY = MessageTemplate(
+        event="Inspector findings were the platform's own execs",
+        reason="INSPECTOR_PLATFORM_ORIGIN_ONLY",
+        severity="info",
+        category="runtime",
+        impact="Only validator/executor execs seen (sshd ancestry lost on this host); nothing provider-side",
     )
     VALIDATION_ERROR = MessageTemplate(
         event="Inspector validation error",
@@ -573,6 +860,20 @@ class InspectorMessages:
         category="runtime",
         impact="Inspector result unavailable; score unchanged",
         remediation="Check libinspector installation and executor SSH process logs.",
+    )
+    UNREADABLE = MessageTemplate(
+        event="Inspector executor response unreadable",
+        reason="INSPECTOR_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable on this executor; score unchanged; the node is counted as unreadable, not as clean",
+        remediation=(
+            "The inspector_executor.py --interactive stdout line for this command was not one JSON "
+            "object (payload_head / json_error_pos say where it broke; payload_terminated=false "
+            "means the line was cut at EOF or at the size cap). Check the executor container logs "
+            "for what else wrote to its stdout, and the response size against "
+            "INSPECTOR_RESPONSE_MAX_BYTES."
+        ),
     )
     FAILED_LIB_MISMATCH = MessageTemplate(
         event="Inspector libinspector.so mismatch",
@@ -713,13 +1014,53 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
+        "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
+        "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "
+        "starts it itself."
+    )
     ORPHANED_CONTAINER = MessageTemplate(
         event="Orphaned rental container detected",
         reason="ORPHANED_RENTAL_CONTAINER",
         severity="error",
         category="runtime",
         impact="Validation skipped; score set to 0",
-        remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
+        remediation=(
+            "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+            "node uses it: {rental_status}. Lium stops a pod's container when its rental ends and the "
+            "validator removes leftovers, so this one should not be holding the GPU. Before you touch "
+            "it, confirm it is not a live rental: the node's page in the Provider Portal must show no "
+            "active rental. Only then remove it: docker rm -f {orphaned_container}. If the portal "
+            "still shows a rental on the node, leave the container running and contact Lium support."
+        ),
+    )
+    ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
+        "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+        "node uses it: {rental_status}. Do not stop or remove it: contact Lium support with the "
+        "container name."
+    )
+    ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION = (
+        "{orphaned_container} is a Lium pod container{pod} of a rental on this node that is ending "
+        "or starting: {rental_status}. Lium stops or starts it itself, so do not stop or remove it; "
+        "the next cycle checks the node again."
+    )
+    TEARDOWN_IN_PROGRESS = MessageTemplate(
+        event="Rental teardown in progress",
+        reason="TEARDOWN_IN_PROGRESS",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle",
+        remediation=(
+            "A rental on this node has just ended and Lium is stopping its container; do not stop it yourself."
+        ),
+    )
+    RENTAL_STARTED_DURING_RUN = MessageTemplate(
+        event="Rental started during validation",
+        reason="RENTAL_STARTED_DURING_RUN",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle",
+        remediation="The GPU is held by a rental that started while this run was in progress.",
     )
     FOREIGN_PROCESS = MessageTemplate(
         event="Foreign GPU process on idle executor",
@@ -822,6 +1163,91 @@ class PortCountMessages:
         category="runtime",
         impact="Score set to 0",
         remediation="Increase port range or check port mappings configuration.",
+    )
+
+
+NO_OUTBOUND_INTERNET_REMEDIATION = (
+    "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
+)
+
+
+class OutboundInternetMessages:
+    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
+    NO_OUTBOUND_INTERNET = MessageTemplate(
+        event="Containers cannot reach the internet",
+        reason="NO_OUTBOUND_INTERNET",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
+    )
+
+
+REGISTRY_PULL_REMEDIATION = (
+    "this node's Docker daemon could not pull a small Docker Hub image, so a renter's template that is not "
+    "cached fails to start; check the registry mirrors in /etc/docker/daemon.json (`docker info`, Registry "
+    "Mirrors) resolve and answer from the host, or remove the broken mirror and restart docker, then "
+    "`docker pull hello-world` on the host must finish"
+)
+
+
+class RegistryPullMessages:
+    REGISTRY_PULL_FAILED = MessageTemplate(
+        event="Docker Hub image pull fails through this node's registry path",
+        reason="REGISTRY_PULL_FAILED",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=REGISTRY_PULL_REMEDIATION,
+    )
+    # the same finding while REGISTRY_PULL_ENFORCEMENT_ENABLED is off: logged, score unchanged
+    REGISTRY_PULL_FAILED_OBSERVED = MessageTemplate(
+        event="Docker Hub image pull fails through this node's registry path (not enforced)",
+        reason="REGISTRY_PULL_FAILED_OBSERVED",
+        severity="warning",
+        category="runtime",
+        impact="None: REGISTRY_PULL_ENFORCEMENT_ENABLED is off",
+        remediation=REGISTRY_PULL_REMEDIATION,
+    )
+    # one failed pull: a finding only once the next pull fails too
+    REGISTRY_PULL_FAILED_ONCE = MessageTemplate(
+        event="Docker Hub image pull failed once; the next pull decides",
+        reason="REGISTRY_PULL_FAILED_ONCE",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+        remediation=REGISTRY_PULL_REMEDIATION,
+    )
+    REGISTRY_PULL_OK = MessageTemplate(
+        event="Docker Hub image pull verified",
+        reason="REGISTRY_PULL_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # the pull failed, but the validator's own GET of Docker Hub failed too: an outage, not this node
+    REGISTRY_PULL_NO_VERDICT_HUB_DOWN = MessageTemplate(
+        event="Docker Hub image pull failed while Docker Hub was unreachable from the validator; no verdict",
+        reason="REGISTRY_PULL_NO_VERDICT_HUB_DOWN",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # the pull ran but says nothing about the path: Docker Hub's 429, an auth or unclassified error, or
+    # the probe itself did not run
+    REGISTRY_PULL_UNMEASURED = MessageTemplate(
+        event="Docker Hub image pull reached no verdict",
+        reason="REGISTRY_PULL_UNMEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Registry pull check skipped",
+        reason="REGISTRY_PULL_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
     )
 
 
@@ -968,6 +1394,17 @@ class CapabilityMessages:
         category="policy",
         impact="Active filler runtime preserved; capability probe would compete for VRAM.",
     )
+    RENTED_SKIPPED = MessageTemplate(
+        event="GPU capability verification not scored: a Lium workload took the cards during this cycle",
+        reason="GPU_VERIFY_SKIPPED_RENTED",
+        severity="info",
+        category="policy",
+        impact=(
+            "Score unchanged; the probe could not get the GPU because a Lium pod or default job "
+            "started after this cycle's rental snapshot. The next cycle verifies again."
+        ),
+        remediation="No action needed.",
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",
@@ -975,6 +1412,49 @@ class CapabilityMessages:
         category="env",
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
+    )
+    # One reason code per CUDA failure the probe can hit (DAH-3362, ticket-0318), as
+    # GPU_VERIFY_TIMEOUT and the VERIFYX_FAILED_* family already do; the full steps live in the
+    # reason-code table the default help_uri points at. Wording is provider-facing; no backticks,
+    # the portal renders it as plain text.
+    VERIFY_FAILED_CUDA_NOT_READY = MessageTemplate(
+        event="GPU capability verification failed: CUDA cannot start",
+        reason="GPU_VERIFY_CUDA_NOT_READY",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "CUDA cannot start on the GPU although nvidia-smi works (CUDA error 802, 'system not "
+            "yet initialized'); on HGX H100/H200 boards the NVLink fabric is not ready. Start "
+            "Fabric Manager, have the hosting provider activate the fabric partition, or on a "
+            "board without NVSwitch reinstall the driver; the steps per case are on the linked "
+            "page."
+        ),
+    )
+    VERIFY_FAILED_NO_CUDA_DEVICE = MessageTemplate(
+        event="GPU capability verification failed: no CUDA device in the container",
+        reason="GPU_VERIFY_NO_CUDA_DEVICE",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The probe found no usable CUDA device inside the executor container: the NVIDIA "
+            "Container Toolkit is not exposing the GPUs to it, or the host driver is older than "
+            "the probe's CUDA runtime. docker exec executor-executor-1 nvidia-smi must list every "
+            "GPU — the toolkit, nvidia_uvm and driver steps are on the linked page."
+        ),
+    )
+    VERIFY_FAILED_VRAM_UNAVAILABLE = MessageTemplate(
+        event="GPU capability verification could not allocate VRAM",
+        reason="GPU_VERIFY_VRAM_UNAVAILABLE",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The matrix-multiplication probe could not allocate GPU memory: another process held "
+            "VRAM while it ran. Check nvidia-smi for processes or leftover containers on the GPU; "
+            "the next verification cycle retries."
+        ),
     )
     VERIFY_TIMEOUT = MessageTemplate(
         event="GPU capability verification timed out",
@@ -986,6 +1466,53 @@ class CapabilityMessages:
             "The matrix-multiplication probe did not finish in time. Check nvidia-smi for "
             "stuck processes or leftover containers holding VRAM on the executor."
         ),
+    )
+
+
+class GpuFaultProbeMessages:
+    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (GPU_FAULT_PROBE_CHECK_ENABLED
+    without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
+    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+
+    DISABLED = MessageTemplate(
+        event="GPU kernel-fault probe disabled",
+        reason="GPU_FAULT_PROBE_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    FILLER_SKIPPED = MessageTemplate(
+        event="GPU kernel-fault probe skipped for active filler",
+        reason="GPU_FAULT_PROBE_SKIPPED_ACTIVE_FILLER",
+        severity="info",
+        category="policy",
+        impact="Active filler runtime preserved; the probe would compete for VRAM.",
+    )
+    PROBE_OK = MessageTemplate(
+        event="GPU kernel-fault probe passed",
+        reason="GPU_FAULT_PROBE_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    PROBE_FAILED = MessageTemplate(
+        event="GPU kernel-fault probe failed",
+        reason="GPU_FAULT_PROBE_FAILED",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "A GPU returned a CUDA error, wrong data or hung under indexed memory access, or NVML reported "
+            "new uncorrected ECC errors / remapped rows. Check `nvidia-smi -q -d ECC,ROW_REMAPPER` and the host "
+            "`dmesg` for NVRM Xid lines; reseat or replace the card, or reset it (`nvidia-smi -r`) and wait one cycle."
+        ),
+    )
+    UNKNOWN = MessageTemplate(
+        event="GPU kernel-fault probe could not run",
+        reason="GPU_FAULT_PROBE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed without penalty",
     )
 
 
@@ -1141,6 +1668,47 @@ class RentalVerificationMessages:
     )
 
 
+class RentalProbeMessages:
+    """DAH-3436: the synthetic rental probe. A failed step zeroes the score and clears the verified job
+    (RENTAL_PROBE_FAILED) until a probe passes; an idle node with the image pulled is probed again next cycle."""
+
+    DISABLED = MessageTemplate(
+        event="Rental probe disabled",
+        reason="RENTAL_PROBE_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Rental probe skipped",
+        reason="RENTAL_PROBE_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed; the probe runs on an idle node once per interval",
+    )
+    PROBE_OK = MessageTemplate(
+        event="Rental probe passed: a renter container started, sshd listened and the GPUs were visible",
+        reason="RENTAL_PROBE_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    PROBE_FAILED = MessageTemplate(
+        event="Rental probe failed: a renter could not use this node",
+        reason="RENTAL_PROBE_FAILED",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
+    )
+    INCONCLUSIVE = MessageTemplate(
+        event="Rental probe could not reach a verdict",
+        reason="RENTAL_PROBE_INCONCLUSIVE",
+        severity="warning",
+        category="runtime",
+        impact="Proceed without penalty; the probe runs again next cycle",
+    )
+
+
 class CpuTruthMessages:
     """DAH-2671 item 2a — corroborate advertised CPU(s) against sources the lscpu wrapper does not
     author. Shadow (CPU_TRUTH_CHECK_ENABLED without enforcement) emits CPU_MISMATCH as a warning and
@@ -1261,8 +1829,24 @@ class CachedTemplateMessages:
             "until the executor pre-pull catches up"
         ),
         remediation=(
-            "Executor cache pre-pull keeps the recommended image warm; "
-            "verify cache_template_service is running on the host."
+            "Pull the recommended image named in this event on the host to see why the "
+            "executor's pre-pull could not fetch it; the executor retries on its own."
+        ),
+    )
+    PENDING = MessageTemplate(
+        event="Recommended default image not cached yet on a newly seen executor",
+        reason="RECOMMENDED_IMAGE_PENDING",
+        severity="info",
+        category="runtime",
+        impact=(
+            "None this cycle — a newly seen node is not failed on this check until its first "
+            "pre-pull sweep completes or the grace window ends"
+        ),
+        remediation=(
+            "No action needed yet: the executor's pre-pull may still be fetching the image, or "
+            "the executor does not report its pre-pull state and the node gets the time bound "
+            "only. If the image is still missing when the grace ends, this check fails and "
+            "quotes the executor's pull error when it reported one."
         ),
     )
     SKIPPED = MessageTemplate(
@@ -1296,4 +1880,45 @@ class CachedTemplateMessages:
         severity="info",
         category="runtime",
         impact="None — digest unknown this cycle (no backend digest / unreadable RepoDigests)",
+    )
+
+
+class LocalVerifyMessages:
+    """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
+
+    DISABLED = MessageTemplate(
+        event="Local verification disabled",
+        reason="LOCAL_VERIFY_DISABLED",
+        severity="info",
+        category="transport",
+        impact="None — every check runs over SSH as before",
+    )
+    SKIPPED = MessageTemplate(
+        event="Local verification skipped",
+        reason="LOCAL_VERIFY_SKIPPED",
+        severity="info",
+        category="transport",
+        impact="None — nothing for the local path to run this cycle",
+    )
+    NOT_ADVERTISED = MessageTemplate(
+        event="Executor does not advertise local verification",
+        reason="LOCAL_VERIFY_NOT_ADVERTISED",
+        severity="info",
+        category="transport",
+        impact="None — the matmul and VerifyX run over SSH as before",
+        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+    )
+    FALLBACK = MessageTemplate(
+        event="Local verification not used, SSH path taken",
+        reason="LOCAL_VERIFY_FALLBACK",
+        severity="info",
+        category="transport",
+        impact="None on the verdict — the SSH-driven checks decide; only the time saved is lost",
+    )
+    CONSUMED = MessageTemplate(
+        event="Local verification answered in one call",
+        reason="LOCAL_VERIFY_OK",
+        severity="info",
+        category="transport",
+        impact="The matmul and VerifyX verdicts below come from the executor's local run, judged by the validator",
     )

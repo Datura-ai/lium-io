@@ -36,7 +36,7 @@ from payload_models.payloads import (
     now_ms,
 )
 from services.docker_service import DockerService
-from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
+from services.rental_docker_sdk import ContainerExecResult, ContainerStateSnapshot, build_gpu_docker_config
 
 # ------------------------------------------------------------------
 # Fixtures / helpers
@@ -94,13 +94,21 @@ class _FakeRentalDockerClient:
         self.image_exists_result = image_exists_result
         self.image_exists_error = image_exists_error
         self.image_exists_calls = []
+        self.repo_digests = ()
+        self.local_image_current = True
+        self.local_image_current_error = None
+        self.freshness_calls = []
         self.pulled_images = []
         self.run_specs = []
         self.exec_specs = []
         self.login_calls = []
+        self.login_error = None
+        self.pull_error = None
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         self.login_calls.append({"username": username, "password": password, "image": image})
+        if self.login_error is not None:
+            raise self.login_error
 
     async def image_exists(self, *, image: str) -> bool:
         self.image_exists_calls.append(image)
@@ -108,8 +116,19 @@ class _FakeRentalDockerClient:
             raise self.image_exists_error
         return self.image_exists_result
 
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return self.repo_digests if await self.image_exists(image=image) else None
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        self.freshness_calls.append({"image": image, "auth_config": auth_config})
+        if self.local_image_current_error is not None:
+            raise self.local_image_current_error
+        return self.local_image_current
+
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
+        if self.pull_error is not None:
+            raise self.pull_error
 
     async def run_container(self, spec) -> None:
         self.run_specs.append(spec)
@@ -117,6 +136,12 @@ class _FakeRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
 
 class _FakeRentalDockerFactory:
@@ -197,8 +222,8 @@ def _patch_happy(svc, monkeypatch, ssh_client):
         svc, "generate_portMappings",
         AsyncMock(return_value=([(22, 20001, 20001)], None)),
     )
-    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock())
-    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         svc, "resolve_volume_sizing",
         AsyncMock(return_value=Mock(volume_limit_gb=10, storage_limit_gb=20)),
@@ -294,6 +319,111 @@ async def test_probe_error_falls_through_to_pull(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     assert _pulled_images(svc) == ["daturaai/pytorch:9.9.9"]
+
+
+@pytest.mark.asyncio
+async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypatch):
+    """DAH-3873: a mutable tag (`:prod`) on the host is stale once the registry tag moves."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).local_image_current = False
+
+    result = await _run(svc, _payload(docker_image="ghcr.io/org/app:prod", **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    assert _pulled_images(svc) == ["ghcr.io/org/app:prod"]
+    assert _docker_client(svc).freshness_calls == [
+        {"image": "ghcr.io/org/app:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
+    ]
+    assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
+
+
+@pytest.mark.asyncio
+async def test_present_image_is_used_when_the_registry_check_fails(svc, monkeypatch):
+    """DAH-3873: fail open. A registry that does not answer must not block the rental."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).local_image_current_error = RuntimeError("registry down")
+
+    result = await _run(svc, _payload())
+
+    assert isinstance(result, ContainerCreated)
+    assert _pulled_images(svc) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("docker_hub_digest", "pulled"),
+    [("sha256:current", []), ("sha256:moved", ["daturaai/pytorch:prod"])],
+)
+async def test_docker_hub_digest_from_the_connector_replaces_the_daemon_registry_check(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path, docker_hub_digest, pulled
+):
+    """DAH-3980: the connector's own Docker Hub answer decides, the daemon is not asked (~2 s)."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
+    no_docker_hub_digest_on_rent_path.return_value = docker_hub_digest
+
+    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
+    assert _docker_client(svc).freshness_calls == []
+    assert _pulled_images(svc) == pulled
+
+
+@pytest.mark.asyncio
+async def test_daemon_checks_the_registry_when_docker_hub_gives_no_digest(svc, monkeypatch):
+    """No connector answer (another registry, a private image, Hub down) keeps the DAH-3873 path."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert [call["image"] for call in _docker_client(svc).freshness_calls] == ["daturaai/pytorch:prod"]
+
+
+@pytest.mark.asyncio
+async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path
+):
+    """The success path the bench measured: one lookup, one inspect, no daemon registry check."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
+    no_docker_hub_digest_on_rent_path.return_value = "sha256:current"
+
+    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
+    assert _docker_client(svc).image_exists_calls == ["daturaai/pytorch:prod"]
+    assert _docker_client(svc).freshness_calls == []
+    assert _docker_client(svc).login_calls == []
+    assert _pulled_images(svc) == []
+    assert _ssh_run_cmds(ssh_client) == [
+        '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the live power floor read twice: beside the volume create, and again right before docker run
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
+        "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+    ]
+    assert _exec_argv_texts(svc) == ["sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"]
+
+
+@pytest.mark.asyncio
+async def test_a_rent_with_registry_credentials_skips_the_anonymous_docker_hub_lookup(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path
+):
+    """An anonymous lookup of a private image only gets a 401; the daemon asks with the rent's credentials."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    result = await _run(svc, _payload(docker_image="private/repo:prod", **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_not_called()
+    assert _docker_client(svc).freshness_calls == [
+        {"image": "private/repo:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
+    ]
 
 
 @pytest.mark.asyncio
@@ -800,7 +930,7 @@ def test_container_created_profilers_round_trip():
 
 
 # ------------------------------------------------------------------
-# #4 — docker-login skip for default cache-template images
+# #4 — docker login only when a pull follows (DAH-3246)
 # ------------------------------------------------------------------
 
 _DEFAULT_IMAGE = "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind"
@@ -811,29 +941,77 @@ def _login_step(result):
     return next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_LOGIN)
 
 
-@pytest.mark.asyncio
-async def test_docker_login_skipped_for_default_image_even_with_credentials(svc, monkeypatch):
-    """The default images are public and pre-cached, so the login is pure latency —
-    skip it even though the backend attached the renter's saved credentials.
+def _inspect_step(result):
+    return next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_IMAGE_INSPECT)
 
-    `ships_sshd` IS the "renter selected a default image" signal: the backend sets it
-    from the same check that resolves the recommended image (`ships_sshd=is_cached`).
-    The validator trusts it rather than re-deriving default-ness from the image ref.
-    """
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ships_sshd", [False, True, None])
+async def test_docker_login_skipped_when_the_image_is_present(svc, monkeypatch, ships_sshd):
+    """DAH-3246: the login exists for the pull. An image already on the host is not pulled,
+    so the login is pure latency — skipped even though the backend attached the renter's
+    saved credentials, and whatever `ships_sshd` says."""
     ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    payload = _payload(docker_image="private/repo:1.0.0", **_CREDS)
+    payload.ships_sshd = ships_sshd
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert _docker_client(svc).login_calls == [], "docker login must NOT run when nothing is pulled"
+    assert _login_step(result).skipped is True
+    assert _inspect_step(result).skipped is False
+
+
+@pytest.mark.asyncio
+async def test_docker_login_runs_before_a_pull_even_for_a_default_image(svc, monkeypatch):
+    """DAH-3246: a default image that is NOT on the host must be pulled, and with credentials
+    attached that pull is authenticated. Before, `ships_sshd=True` skipped the login here and the
+    pull went anonymous into Docker Hub's unauthenticated rate limit."""
+    ssh_client = _ssh_client(inspect_exit=1)
     _patch_happy(svc, monkeypatch, ssh_client)
 
     result = await _run(svc, _payload(docker_image=_DEFAULT_IMAGE, ships_sshd=True, **_CREDS))
 
     assert isinstance(result, ContainerCreated)
-    assert _docker_client(svc).login_calls == [], "docker login must NOT run for a default image"
-    assert _login_step(result).skipped is True
+    assert _docker_client(svc).login_calls == [
+        {"username": "renter", "password": "renter-secret", "image": _DEFAULT_IMAGE}
+    ]
+    assert _login_step(result).skipped is False
+    assert _pulled_images(svc) == [_DEFAULT_IMAGE]
+    # the login step sits between the probe and the pull, in that order
+    names = [p.name for p in result.profilers]
+    inspect_at, login_at, pull_at = (
+        names.index(ProfilerStepName.DOCKER_IMAGE_INSPECT),
+        names.index(ProfilerStepName.DOCKER_LOGIN),
+        names.index(ProfilerStepName.DOCKER_PULL),
+    )
+    assert inspect_at < login_at < pull_at
+
+
+@pytest.mark.asyncio
+async def test_failed_login_then_failed_pull_is_reported_as_the_login(svc, monkeypatch):
+    """A saved credential for another registry fails the login (logged); docker-py then pulls
+    anonymously, and when that pull fails too the rental is reported as `docker_login` with the
+    login error appended — the attribution user images always had, now for default images."""
+    ssh_client = _ssh_client(inspect_exit=1)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    _docker_client(svc).login_error = RuntimeError("unauthorized: incorrect username or password")
+    _docker_client(svc).pull_error = RuntimeError("toomanyrequests: rate limit")
+
+    result = await _run(svc, _payload(docker_image=_DEFAULT_IMAGE, ships_sshd=True, **_CREDS))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_login"
+    assert "earlier login failure" in (result.detail or "") and "unauthorized" in (result.detail or "")
+    assert _pulled_images(svc) == [_DEFAULT_IMAGE]
 
 
 @pytest.mark.asyncio
 async def test_docker_login_runs_for_non_default_image_with_credentials(svc, monkeypatch):
-    """DEFAULT-PATH REGRESSION GUARD: a user image with credentials still logs in —
-    a private registry pull depends on it. The backend sends ships_sshd=False here."""
+    """DEFAULT-PATH REGRESSION GUARD: a user image with credentials still logs in before
+    its pull — a private registry pull depends on it."""
     ssh_client = _ssh_client(inspect_exit=1)
     _patch_happy(svc, monkeypatch, ssh_client)
 
@@ -850,8 +1028,8 @@ async def test_docker_login_runs_for_non_default_image_with_credentials(svc, mon
 
 @pytest.mark.asyncio
 async def test_docker_login_runs_when_ships_sshd_is_none(svc, monkeypatch):
-    """LEGACY-PATH REGRESSION GUARD: retry/filler rentals omit ships_sshd (None). That
-    is not a default-image signal, so the login must still run when credentials exist."""
+    """LEGACY-PATH REGRESSION GUARD: retry/filler rentals omit ships_sshd (None); with
+    credentials and a pull ahead the login must still run."""
     ssh_client = _ssh_client(inspect_exit=1)
     _patch_happy(svc, monkeypatch, ssh_client)
 
@@ -865,10 +1043,11 @@ async def test_docker_login_runs_when_ships_sshd_is_none(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_docker_login_step_marked_skipped_when_no_credentials(svc, monkeypatch):
-    """No credentials was always a no-op login; now the profile says so instead of
-    reporting a 0ms step that looks like real work."""
-    ssh_client = _ssh_client(inspect_exit=0)
+@pytest.mark.parametrize("inspect_exit", [0, 1])
+async def test_docker_login_step_marked_skipped_when_no_credentials(svc, monkeypatch, inspect_exit):
+    """No credentials was always a no-op login; the profile says so instead of
+    reporting a 0ms step that looks like real work — image present or not."""
+    ssh_client = _ssh_client(inspect_exit=inspect_exit)
     _patch_happy(svc, monkeypatch, ssh_client)
 
     result = await _run(svc, _payload(docker_image="private/repo:1.0.0"))
@@ -879,14 +1058,27 @@ async def test_docker_login_step_marked_skipped_when_no_credentials(svc, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_probe_failure_logs_in_and_pulls(svc, monkeypatch):
+    """Fail-open: when the presence probe raises, the rental pulls — and with credentials
+    attached, it logs in first, even for a default image (`ships_sshd=True` used to skip it)."""
+    ssh_client = _ssh_client(inspect_raises=True)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    result = await _run(svc, _payload(docker_image=_DEFAULT_IMAGE, ships_sshd=True, **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    assert len(_docker_client(svc).login_calls) == 1
+    assert _pulled_images(svc) == [_DEFAULT_IMAGE]
+
+
+@pytest.mark.asyncio
 async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
-    """Custom builds keep ships_sshd=False (the backend forces is_cached=False for them,
-    even when the base image happens to be a default ref), so they keep the login path
-    as-is. The DinD `docker build` never sees this SDK login; passing credentials into
-    it is a separate task."""
+    """A custom build has no image to probe, so it keeps the login it always had when
+    credentials are attached. The DinD `docker build` never sees this SDK login; passing
+    credentials into it is a separate task."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None)))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None, None)))
 
     result = await _run(
         svc,

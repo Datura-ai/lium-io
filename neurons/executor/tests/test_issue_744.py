@@ -9,7 +9,6 @@ a different public_key while keeping the valid signature for data_to_sign.
 """
 
 import unittest
-from unittest.mock import MagicMock
 import sys
 import os
 

@@ -48,6 +48,42 @@ class DockerCommand:
         return f"/usr/bin/docker rm -fv {name}"
 
     @staticmethod
+    def dind_diagnostics(name: str, lines: int = 40) -> str:
+        """What a DinD container whose sshd never answered has to say (DAH-2856).
+
+        The image's entrypoint waits for the inner dockerd before it runs the validator's
+        `service ssh start`; when that dockerd cannot start, sshd never does. supervisord in the
+        image writes dockerd's stderr to /var/log/dockerd.err.log, not to the container log, so
+        both are read: the container log first, then that file. Exit 0 always; the text is data.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"/usr/bin/docker logs --tail {lines} {quoted} 2>&1; "
+            f"/usr/bin/docker exec {quoted} tail -n {lines} /var/log/dockerd.err.log 2>&1; true"
+        )
+
+    @staticmethod
+    def kill_container_processes(name: str) -> str:
+        """SIGKILL a container's init and its containerd shim directly (DAH-2991).
+
+        For a container dockerd cannot kill ("tried to kill container, but did not receive an exit
+        event": the process is wedged, typically in uninterruptible I/O on a dead mount), `docker rm -f`
+        fails forever and the container keeps its published ports. The executor runs `pid: host` and
+        privileged, so the host pids are visible: killing the shim makes containerd report the task
+        as exited and dockerd then lets `docker rm -f` through. Prints what was killed; exit 0 always.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"pid=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {quoted} 2>/dev/null); "
+            "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ]; then "
+            "shim=$(awk '/^PPid:/{print $2}' /proc/$pid/status 2>/dev/null); "
+            "kill -9 $pid 2>/dev/null; "
+            "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
+            "then kill -9 $shim 2>/dev/null; else shim=; fi; "
+            "sleep 3; echo \"killed pid=$pid shim=${shim:-none}\"; fi; true"
+        )
+
+    @staticmethod
     def ps_filter(*name_patterns: str) -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
@@ -75,6 +111,15 @@ class DockerCommand:
         return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
 
     @staticmethod
+    def volume_remove_strict(volume_name: str) -> str:
+        """Build docker volume rm for ONE volume that reports its own exit status and stderr.
+
+        DAH-3436 (review): `volume_remove` masks every failure with `|| true`; the rental probe's
+        teardown has to know whether its volume is gone ("No such volume" counts as gone).
+        """
+        return f"/usr/bin/docker volume rm {shlex.quote(volume_name)}"
+
+    @staticmethod
     def volume_ls_dangling() -> str:
         """Build docker volume ls command listing dangling volume names."""
         return "/usr/bin/docker volume ls -qf dangling=true"
@@ -100,8 +145,16 @@ class DockerCommand:
         `-u 0` because the exec would otherwise inherit the image's USER and lose
         access to the root-owned paths we write to. Numeric, so it does not need a
         root entry in the image's /etc/passwd (DAH-2534).
+
+        The result runs through the executor host's root shell over SSH, so both
+        values are quoted: the container name stays one argv token and the command
+        reaches the container's `sh -c` verbatim (a single quote inside it cannot
+        end the quoting and continue on the host).
         """
-        return f"/usr/bin/docker exec -u 0 -i {container_name} sh -c '{command}'"
+        return (
+            f"/usr/bin/docker exec -u 0 -i {shlex.quote(container_name)} "
+            f"sh -c {shlex.quote(command)}"
+        )
 
 
 @dataclass
@@ -158,18 +211,30 @@ async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path
 
     Raises on anything unexpected; callers decide whether that is fatal.
     """
-    result = await ssh_client.run(
-        f"/usr/bin/docker run --rm -v {shlex.quote(host_path)}:/hostfs:ro "
-        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
-    )
+    result = await ssh_client.run(df_command(shlex.quote(host_path)))
     if getattr(result, "exit_status", 0) != 0:
         raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
-    lines = (result.stdout or "").strip().splitlines()
+    return parse_df_available_bytes(result.stdout or "")
+
+
+def df_command(host_path_shell_word: str) -> str:
+    """The helper-container df invocation `df_available_bytes` runs; shared with the volume host
+    probe so both measure free disk the same way. `host_path_shell_word` is already a shell word
+    (a quoted path, or a variable reference such as `"$root"`)."""
+    return (
+        f"/usr/bin/docker run --rm -v {host_path_shell_word}:/hostfs:ro "
+        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
+    )
+
+
+def parse_df_available_bytes(stdout: str) -> int:
+    """Column 4 of the data line of a POSIX `df -P -B1` output; raises when the shape is off."""
+    lines = stdout.strip().splitlines()
     if len(lines) < 2:
-        raise Exception(f"Unexpected df output: {result.stdout!r}")
+        raise Exception(f"Unexpected df output: {stdout!r}")
     columns = lines[1].split()
     if len(columns) < 4 or not columns[3].isdigit():
-        raise Exception(f"Unexpected df output: {result.stdout!r}")
+        raise Exception(f"Unexpected df output: {stdout!r}")
     return int(columns[3])
 
 
