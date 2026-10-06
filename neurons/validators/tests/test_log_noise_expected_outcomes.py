@@ -532,7 +532,7 @@ def _event(reason_code: str, severity: str) -> ValidationEvent:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reason_code",
-    ["COLLATERAL_MISSING", "EXECUTOR_IMAGE_OUTDATED", "PROVIDER_BANNED", "PROVIDER_SIDE_LOAD_ABOVE_LIMIT"],
+    ["EXECUTOR_IMAGE_OUTDATED", "PROVIDER_BANNED", "PROVIDER_SIDE_LOAD_ABOVE_LIMIT"],
 )
 async def test_provider_state_verdict_logs_at_info_and_keeps_its_severity(caplog, reason_code):
     caplog.set_level(logging.DEBUG, logger="test.sink")

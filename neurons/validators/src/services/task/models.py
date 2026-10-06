@@ -1,6 +1,4 @@
-import asyncio
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -331,18 +329,3 @@ def build_msg(
         when=datetime.now(UTC),
         context=ctx or {},
     )
-
-
-@dataclass(frozen=True)
-class CollateralReadArgs:
-    miner_hotkey: str
-    executor_uuid: str
-    gpu_model: str | None
-    gpu_count: int
-
-
-@dataclass(frozen=True)
-class CollateralPrefetch:
-    args: CollateralReadArgs
-    # deposited, error message, contract version: what CollateralContractService.is_eligible_executor returns
-    task: asyncio.Task[tuple[bool, str | None, str | None]]
