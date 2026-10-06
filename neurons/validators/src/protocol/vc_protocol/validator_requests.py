@@ -223,9 +223,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # the cycle probes; an older backend ignores the key.
     pod_ssh: list[PodSshObservation] | None = None
     # The node's SSH host public key, sent only when this cycle connected with known_hosts pinned to it.
-    # The node signs its heartbeats with the matching private key, and the backend trusts a heartbeat key
-    # only from here. None when the cycle did not reach the node or it has no key; an older backend
-    # ignores the field.
+    # The backend trusts a heartbeat key only from here; None when the cycle did not reach the node.
     ssh_host_key: str | None = None
 
 
