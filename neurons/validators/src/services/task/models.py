@@ -98,6 +98,10 @@ class JobResult(BaseModel):
     # itself failed). None on a scored run and on an error no check produced. Read by the
     # rollout-grace classifier at the end of the cycle.
     failure_reason_code: str | None = None
+    # The miner hotkey that keeps this executor's score this cycle, set on the other hotkeys' copies
+    # when duplicate enforcement zeroes them (checks/duplicate_executor.py). Their specs are not
+    # published, so the backend row of the shared machine only hears the copy that kept the score.
+    duplicate_kept_by: str | None = Field(default=None, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic

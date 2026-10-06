@@ -30,7 +30,7 @@ class MessageTemplate:
 def render_message(
     template: MessageTemplate,
     *,
-    ctx: Context,
+    ctx: Context | None,
     check_id: str,
     what: dict[str, Any] | None = None,
     severity: str | None = None,
@@ -40,7 +40,9 @@ def render_message(
     help_uri: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Any:
-    """Render a `MessageTemplate` into a structured message via `build_msg`."""
+    """Render a `MessageTemplate` into a structured message via `build_msg`.
+
+    `ctx` is None for a verdict the cycle reaches after every pipeline has ended."""
     resolved_severity = severity or template.severity
     resolved_help_uri = help_uri or template.help_uri
     if resolved_help_uri is None and resolved_severity in _HELP_URI_SEVERITIES:
@@ -54,8 +56,8 @@ def render_message(
         remediation=(remediation if remediation is not None else template.remediation) or "",
         what=what or {},
         check_id=check_id,
-        pipeline_id=ctx.pipeline_id,
-        ctx={**ctx.default_extra, **(extra or {})},
+        pipeline_id=ctx.pipeline_id if ctx is not None else None,
+        ctx={**(ctx.default_extra if ctx is not None else {}), **(extra or {})},
         help_uri=resolved_help_uri,
     )
 
@@ -726,6 +728,22 @@ class DuplicateExecutorMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    ACROSS_MINERS = MessageTemplate(
+        event="Executor also scored under another miner this cycle",
+        reason="EXECUTOR_DUPLICATE_ACROSS_MINERS",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; the other miner keeps it",
+        remediation="One machine earns under one miner per cycle. Register it under one miner only.",
+    )
+    ACROSS_MINERS_OBSERVED = MessageTemplate(
+        event="Executor also scored under another miner this cycle (observe mode)",
+        reason="EXECUTOR_DUPLICATE_ACROSS_MINERS_OBSERVED",
+        severity="warning",
+        category="policy",
+        impact="Detected; no score impact (observe mode)",
+        remediation="One machine earns under one miner per cycle. Register it under one miner only.",
     )
 
 

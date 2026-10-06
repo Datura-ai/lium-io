@@ -42,6 +42,7 @@ from services.redis_service import (
 )
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.duplicate_executor import keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
@@ -450,19 +451,6 @@ class Validator:
                                 all_job_results[miner_hotkey] = job_results
                                 miner_coldkeys[miner_hotkey] = miner_coldkey
 
-                                for job_result in job_results:
-                                    if (
-                                        job_result.gpu_model
-                                        and job_result.gpu_count
-                                        and (job_result.score > 0 or job_result.job_score > 0)
-                                        and not job_result.is_spot
-                                        and not is_missing_discord_after_cutoff(job_result)
-                                        and not (
-                                            job_result.is_new_rentals_paused and not job_result.is_rented
-                                        )
-                                    ):
-                                        total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
-
                             else:
                                 info = task_info.get(task, {})
                                 miner_hotkey = info.get("miner_hotkey", "unknown")
@@ -514,6 +502,24 @@ class Validator:
                                 ),
                             )
                             task.cancel()
+
+                    # Before the GPU totals: a copy zeroed here must not count in its tier.
+                    keep_one_miner_per_executor(
+                        all_job_results, {**self.default_extra, "job_batch_id": job_batch_id}
+                    )
+                    for job_results in all_job_results.values():
+                        for job_result in job_results:
+                            if (
+                                job_result.gpu_model
+                                and job_result.gpu_count
+                                and (job_result.score > 0 or job_result.job_score > 0)
+                                and not job_result.is_spot
+                                and not is_missing_discord_after_cutoff(job_result)
+                                and not (
+                                    job_result.is_new_rentals_paused and not job_result.is_rented
+                                )
+                            ):
+                                total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 
                     try:
                         open_fd_count = len(os.listdir('/proc/self/fd'))
@@ -667,7 +673,13 @@ class Validator:
                     for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
-                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
+                            await self.miner_service.publish_machine_specs(
+                                [result for result in results if result.duplicate_kept_by is None],
+                                miner_hotkey,
+                                miner_coldkey,
+                            )
+                            # a copy another hotkey kept is still handled by this cycle: the express
+                            # lane must not run it as a new node
                             published_executor_ids.extend(
                                 result.executor_info.uuid
                                 for result in results
