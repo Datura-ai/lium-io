@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 
 import bittensor
 from clients.referral_feed_client import ReferralFeedClient
+from services.executor_rollout import RUN_ENDED_WITHOUT_FAILING
+from services.task.messages import ExecutorImageMessages
 from services.task_service import JobResult
 
 from core.config import get_total_burn_emission, settings
@@ -96,6 +98,7 @@ class DefaultIncentive(BaseIncentive):
         """
         self.total_executors += 1
         result = await self.calculate_executor_score(result)
+        self._record_validation_failed_reason(result)
         self.total_mining_score += result.mining_score
         if result.job_score == 1.0:
             self.successful_executors += 1
@@ -105,6 +108,13 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
+        """True when an OUTDATED executor image excludes this result from both pools.
+
+        Only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, the report still
+        travels on the result and its specs, but no reason is recorded and nothing is zeroed.
+        """
+        if not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
+            return False
         report = result.executor_image_report or {}
         if report.get("status") != "OUTDATED":
             return False
@@ -116,6 +126,26 @@ class DefaultIncentive(BaseIncentive):
                 MinerLogLine.no_payout_because_outdated_executor_image(result)
             )
         return True
+
+    @staticmethod
+    def _record_validation_failed_reason(result: JobResult) -> None:
+        """A result whose run stopped at a failed check earns 0; record that check's code.
+
+        A run that passed every check and still scored 0 (CPU truth, an outdated
+        image, a rented node's halt) records nothing here: it names no check to fix.
+        """
+        if result.is_successful:
+            return
+        reason_code: str = MinerLogLine.validation_failure_code(result)
+        if reason_code in RUN_ENDED_WITHOUT_FAILING:
+            return
+        if reason_code == ExecutorImageMessages.OUTDATED.reason and any(
+            reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
+            for reason in result.zero_incentive_reasons
+        ):
+            # the image check failed on the outdated image: outdated_executor_image already says so
+            return
+        result.record_incentive_log(MinerLogLine.no_payout_because_validation_failed(result))
 
     async def _post_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Process a job result.
@@ -294,6 +324,8 @@ class DefaultIncentive(BaseIncentive):
         - **Rental-share keeps first claim.** ``burn_scores`` is already the burn left AFTER
           the rental-share (idle) pool took its cut, and the pool is capped at that residual,
           so a short burn shrinks referral — never the rental-share and never the miners.
+          Spot pay and secure-floor top-ups (``unbucketed_share``) are also taken before this
+          residual, so the referral pool shrinks first when they grow.
         - **Fail closed.** An unset/zero/NaN share, an unreachable/stale/empty feed, no
           residual burn, or no eligible referrer all leave the weight vector exactly as it
           was — no referral emission that cycle.

@@ -20,7 +20,6 @@ from storage.models import (
 )
 from storage.reporting import StorageEventReporter
 from storage.workspace import (
-    DockerEncryptedVolumeWorkspace,
     DockerUserNamespaceWorkspace,
     LocalWorkspace,
     ResolvedWorkspace,
@@ -32,23 +31,6 @@ TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
-ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
-set -eu
-passfile=/tmp/.lium-volume-passphrase
-umask 077
-printf '%s' "$LIUM_VOLUME_PASSPHRASE" > "$passfile"
-if [ ! -f /lium-cipher/gocryptfs.conf ]; then
-  /usr/local/bin/gocryptfs -init /lium-cipher -passfile "$passfile"
-fi
-/usr/local/bin/gocryptfs /lium-cipher /workspace -passfile "$passfile" -o allow_other -nonempty
-cleanup() {
-  /bin/fusermount3 -u /workspace >/dev/null 2>&1 || true
-  rm -f "$passfile"
-}
-trap cleanup EXIT INT TERM
-"$@"
-"""
-
 
 class ResticOperationError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
@@ -554,9 +536,6 @@ class ResticStorageRunner:
                 namespace_command = restic_command
             return self._encrypted_helper_command(namespace_command), None
 
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            return self._encrypted_volume_helper_command(restic_command, working_directory), None
-
         volume_mode = "ro" if self._workspace.read_only else "rw"
         command = [
             *self._docker_helper_base(),
@@ -617,8 +596,6 @@ class ResticStorageRunner:
             return pipeline_command, None
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
             return self._encrypted_helper_command(pipeline_command), None
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            return self._encrypted_volume_helper_command(pipeline_command, False), None
         return [
             *self._docker_helper_base(),
             "--security-opt",
@@ -651,45 +628,6 @@ class ResticStorageRunner:
             *namespace_command,
         ]
 
-    def _encrypted_volume_helper_command(
-        self,
-        command: list[str],
-        working_directory: bool,
-    ) -> list[str]:
-        if not isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            raise ResticOperationError(
-                "encrypted volume helper requested for a different workspace"
-            )
-        wrapped_command = command
-        if working_directory:
-            wrapped_command = [
-                "/bin/sh",
-                "-c",
-                ENCRYPTED_BACKUP_SCRIPT,
-                "sh",
-                str(self._workspace.path),
-                *command,
-            ]
-        return [
-            *self._docker_helper_base(),
-            "--privileged",
-            "--security-opt",
-            "label=disable",
-            "--device",
-            "/dev/fuse:/dev/fuse",
-            "--tmpfs",
-            "/workspace:rw,nosuid,nodev,size=67108864",
-            "-v",
-            f"{self._workspace.volume_name}:/lium-cipher:rw",
-            "--entrypoint",
-            "/bin/bash",
-            self._workspace.image,
-            "-c",
-            ENCRYPTED_BOOTSTRAP_SCRIPT,
-            "bash",
-            *wrapped_command,
-        ]
-
     def _docker_helper_base(self) -> list[str]:
         return [
             self._docker_binary,
@@ -714,8 +652,6 @@ class ResticStorageRunner:
             "RESTIC_REPOSITORY",
             "-e",
             "RESTIC_PASSWORD",
-            "-e",
-            "LIUM_VOLUME_PASSPHRASE",
         ]
 
     def _helper_container_name(self) -> str:
@@ -748,10 +684,6 @@ class ResticStorageRunner:
             environment["RESTIC_PASSWORD"] = repository.password
         else:
             environment.pop("RESTIC_PASSWORD", None)
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            environment["LIUM_VOLUME_PASSPHRASE"] = self._workspace.volume_passphrase
-        else:
-            environment.pop("LIUM_VOLUME_PASSPHRASE", None)
         if repository.session_token:
             environment["AWS_SESSION_TOKEN"] = repository.session_token
         else:
@@ -765,9 +697,6 @@ class ResticStorageRunner:
             repository.secret_access_key,
             repository.session_token or "",
             repository.password or "",
-            self._workspace.volume_passphrase
-            if isinstance(self._workspace, DockerEncryptedVolumeWorkspace)
-            else "",
         )
 
 

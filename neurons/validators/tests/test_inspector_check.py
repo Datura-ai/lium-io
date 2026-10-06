@@ -24,8 +24,9 @@ class DummyInspectorService:
         self.response = response
         self.called = False
 
-    async def validate_rented_executor(self, shell, ssh, executor, default_extra):
+    async def validate_rented_executor(self, shell, ssh, executor, default_extra, *, sensor_attested=False):
         self.called = True
+        self.sensor_attested = sensor_attested
         return self.response
 
 
