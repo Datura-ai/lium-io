@@ -40,6 +40,7 @@ from services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
 )
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
 from services.task.checks.duplicate_executor import keep_one_miner_per_executor
@@ -62,7 +63,9 @@ FAILED_MINER_EXECUTOR_UUID = "11111111-1111-1111-1111-111111111111"
 
 
 def settle_cycle_results(
-    all_job_results: dict[str, list[JobResult]], default_extra: dict
+    all_job_results: dict[str, list[JobResult]],
+    default_extra: dict,
+    rented_executors: RentedExecutorsResponse | None = None,
 ) -> dict[str, int]:
     """Settle machines scored under more than one hotkey, then count the scored GPUs per model.
 
@@ -70,7 +73,11 @@ def settle_cycle_results(
     duplicate pass is logged and the cycle scores its results as they are.
     """
     try:
-        keep_one_miner_per_executor(all_job_results, default_extra)
+        rental_hotkeys = {
+            str(executor_id).lower(): rented.miner_hotkey
+            for executor_id, rented in (rented_executors.executors if rented_executors else {}).items()
+        }
+        keep_one_miner_per_executor(all_job_results, default_extra, rental_hotkeys)
     except Exception as exc:
         logger.error(
             _m("[sync] Duplicate-executor pass failed; results left as they are", extra=get_extra_info({**default_extra, "error": str(exc)})),
@@ -540,7 +547,9 @@ class Validator:
                             task.cancel()
 
                     total_gpu_model_count_map = settle_cycle_results(
-                        all_job_results, {**self.default_extra, "job_batch_id": job_batch_id}
+                        all_job_results,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
+                        rented_executors,
                     )
 
                     try:

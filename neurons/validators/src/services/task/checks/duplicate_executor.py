@@ -112,11 +112,16 @@ def _reported_keys(result: JobResult) -> list[tuple[str, str]]:
     return keys
 
 
-def _keeper(copies: list[tuple[str, JobResult]]) -> str:
-    """A hotkey with a rented copy first (the rental is billed on that copy's row), then the
-    hotkey whose SS58 address sorts first."""
+def _keeper(copies: list[tuple[str, JobResult]], rental_hotkeys: dict[str, str]) -> str:
+    """The hotkey the backend's rental names, then a hotkey with a rented copy, then the hotkey
+    whose SS58 address sorts first. Copies under one executor UUID all read as rented, so the
+    rental's own hotkey decides between them."""
+    hotkeys = {hotkey for hotkey, _ in copies}
+    holders = {
+        rental_hotkeys.get(str(result.executor_info.uuid).lower()) for _, result in copies if result.is_rented
+    } & hotkeys
     rented = {hotkey for hotkey, result in copies if result.is_rented}
-    return min(rented or {hotkey for hotkey, _ in copies})
+    return min(holders or rented or hotkeys)
 
 
 def _log(duplicate: AcrossMinersDuplicate, result: JobResult, default_extra: dict | None) -> None:
@@ -153,18 +158,20 @@ def _log(duplicate: AcrossMinersDuplicate, result: JobResult, default_extra: dic
 def keep_one_miner_per_executor(
     job_results: dict[str, list[JobResult]],
     default_extra: dict | None = None,
+    rental_hotkeys: dict[str, str] | None = None,
 ) -> list[AcrossMinersDuplicate]:
     """One machine earns under one miner hotkey per cycle.
 
     Scored copies from different hotkeys that the validator reached on the same SSH endpoint
     (address and ssh_port) are one machine: each request installs its own fresh key, so a
     passing login there means that machine admitted that hotkey. One hotkey keeps the score
-    (`_keeper`); the copies of the others are logged with every hotkey involved and, with
+    (`_keeper`; `rental_hotkeys` maps a rented executor UUID to the hotkey its rental names); the copies of the others are logged with every hotkey involved and, with
     DUPLICATE_EXECUTOR_DRY_RUN off, score 0 with EXECUTOR_DUPLICATE_ACROSS_MINERS.
 
     Matches on what the node itself reports (executor UUID, listed ip:port, GPU UUIDs) are
     logged only, never zeroed: any miner can report another node's values. One hotkey's own
-    repeats are left to MinerService, and unscored copies have nothing to pay twice.
+    repeats are left to MinerService, unscored copies have nothing to pay twice, and a result
+    the validator did not log in for (a forced pass, `ssh_port` 0) proves no endpoint.
     """
     enforce = not settings.DUPLICATE_EXECUTOR_DRY_RUN
     scored = [
@@ -176,7 +183,8 @@ def keep_one_miner_per_executor(
 
     by_endpoint: dict[str, list[tuple[str, JobResult]]] = defaultdict(list)
     for hotkey, result in scored:
-        by_endpoint[_ssh_endpoint(result)].append((hotkey, result))
+        if result.executor_info.ssh_port > 0:
+            by_endpoint[_ssh_endpoint(result)].append((hotkey, result))
 
     duplicates: list[AcrossMinersDuplicate] = []
     zeroed: list[tuple[JobResult, str, bool, dict]] = []
@@ -184,7 +192,7 @@ def keep_one_miner_per_executor(
         hotkeys = {hotkey for hotkey, _ in copies}
         if len(hotkeys) < 2:
             continue
-        kept_by = _keeper(copies)
+        kept_by = _keeper(copies, rental_hotkeys or {})
         kept_uuids = {str(r.executor_info.uuid).lower() for h, r in copies if h == kept_by}
         for hotkey, result in copies:
             if hotkey == kept_by:

@@ -17,6 +17,7 @@ from core.config import settings
 from core.validator import settle_cycle_results, specs_to_publish
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from services.task.checks.duplicate_executor import (
     ACROSS_MINERS_OUTCOME,
     MATCH_EXECUTOR_UUID,
@@ -122,6 +123,33 @@ def test_a_rented_copy_keeps_the_score(enforce):
 
     _assert_untouched(rented)
     _assert_zeroed(idle, kept_by=ALICE)
+
+
+def test_the_hotkey_the_rental_names_keeps_a_shared_rented_executor(enforce):
+    # both copies read as rented: the rented list is keyed by executor UUID alone
+    holder, other = _result("uuid-a", is_rented=True), _result("uuid-a", is_rented=True)
+    rented = RentedExecutorsResponse(
+        executors={
+            "UUID-A": RentedExecutor(
+                miner_hotkey=ALICE, executor_ip_address="198.51.100.7", executor_ip_port="8001", pods=[]
+            )
+        }
+    )
+
+    settle_cycle_results({BOB: [other], ALICE: [holder]}, {}, rented)
+
+    _assert_untouched(holder)
+    _assert_zeroed(other, kept_by=ALICE)
+
+
+def test_a_forced_pass_the_validator_did_not_log_in_for_proves_no_endpoint(enforce):
+    first = _result("uuid-a", ssh_port=0, is_rented=True)
+    second = _result("uuid-b", ssh_port=0, is_rented=True)
+
+    keep_one_miner_per_executor({BOB: [first], ALICE: [second]})
+
+    _assert_untouched(first)
+    _assert_untouched(second)
 
 
 def test_every_other_hotkey_on_the_endpoint_loses_its_copy(enforce):
