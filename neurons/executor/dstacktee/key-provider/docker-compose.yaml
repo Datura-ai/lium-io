@@ -1,0 +1,47 @@
+# Runtime definition of the SGX services. It names the images and has no
+# `build:` section on purpose: a hand-run `docker compose build` here builds
+# nothing, and `docker compose up` cannot rebuild a missing image. The build
+# lives in docker-compose.build.yaml and only ../cvm_upgrade_guard.sh runs it,
+# after its CVM disk inventory. A rebuilt key provider has a new MRENCLAVE and
+# every CVM data disk on the host becomes unreadable (docs/host-setup.md §4).
+x-common: &common-config
+  restart: always
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "100m"
+      max-file: "5"
+
+services:
+  aesmd:
+    <<: *common-config
+    container_name: dstack-aesmd
+    image: lium-aesmd:local
+    privileged: true
+    devices:
+      - "/dev/sgx_enclave:/dev/sgx_enclave"
+      - "/dev/sgx_provision:/dev/sgx_provision"
+    volumes:
+      - "./sgx_default_qcnl.conf:/etc/sgx_default_qcnl.conf"
+      - "aesmd:/var/run/aesmd/"
+    network_mode: "host"
+  
+  gramine-sealing-key-provider:
+    <<: *common-config
+    container_name: dstack-key-provider
+    # Fixed name so cvm_upgrade_guard.sh can pin the exact image id and
+    # restart from it.
+    image: lium-key-provider:local
+    privileged: true
+    devices:
+      - "/dev/sgx_enclave:/dev/sgx_enclave"
+      - "/dev/sgx_provision:/dev/sgx_provision"
+    depends_on:
+      - aesmd
+    volumes:
+      - "aesmd:/var/run/aesmd/"
+    ports:
+      - "127.0.0.1:3443:3443"
+
+volumes:
+  aesmd:

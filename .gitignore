@@ -175,3 +175,17 @@ testing/
 notebooks/
 
 .vscode/*
+
+
+config_override.py
+.cursor
+.claude
+.omc
+
+CLAUDE.md
+neurons/validators/openspec/
+openspec/
+
+.omx/
+.codex/
+AGENTS.md

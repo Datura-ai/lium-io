@@ -1,0 +1,366 @@
+"""DAH-2250 — unrented incentive soft price limit.
+
+An unrented executor priced above the market p90 ceiling
+(machine_prices_p90[gpu] * the shared config's soft_limit_price_rate) forfeits the unrented rental
+incentive while staying active. Enforcement is gated by
+ENABLE_UNRENTED_SOFT_PRICE_LIMIT; while the flag is off the breach is only
+logged (shadow mode) and the payout is unchanged.
+"""
+
+from unittest.mock import AsyncMock
+
+import pytest
+from datura.requests.miner_requests import ExecutorSSHInfo
+
+from core.config import settings, shared_client
+from incentive.config import IncentiveConfig
+from incentive.rental_price import RentalPriceIncentive
+from services.task_service import JobResult
+
+H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
+
+
+def _build_incentive() -> RentalPriceIncentive:
+    return RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
+
+
+def _make_job(
+    price_per_gpu: float | None,
+    *,
+    gpu_model: str = H200,
+    is_rented: bool = False,
+    is_spot: bool = False,
+    is_new_rentals_paused: bool = False,
+    provider_discord_connected: bool = True,
+    default_job_owner: str | None = None,
+) -> JobResult:
+    return JobResult(
+        executor_info=ExecutorSSHInfo(
+            uuid="exec-1",
+            address="10.0.0.1",
+            port=8080,
+            ssh_username="root",
+            ssh_port=22,
+            python_path="/usr/bin/python3",
+            root_dir="/tmp",
+            price_per_gpu=price_per_gpu,
+        ),
+        score=1.0,
+        job_score=1.0,
+        job_batch_id="batch",
+        log_status="success",
+        log_text="ok",
+        gpu_model=gpu_model,
+        gpu_count=1,
+        is_rented=is_rented,
+        is_spot=is_spot,
+        is_new_rentals_paused=is_new_rentals_paused,
+        provider_discord_connected=provider_discord_connected,
+        default_job_owner=default_job_owner,
+        collateral_deposited=True,
+        sysbox_runtime=True,
+    )
+
+
+def _set_p90(monkeypatch, mapping: dict[str, float]) -> None:
+    new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": mapping})
+    monkeypatch.setattr(shared_client, "_config", new_cfg)
+
+
+def test_is_over_soft_price_limit_above_threshold(monkeypatch):
+    # Arrange — threshold = 2.0 * 1.1 = 2.2
+    _set_p90(monkeypatch, {H200: 2.0})
+    incentive = _build_incentive()
+
+    # Act
+    over = incentive._is_over_soft_price_limit(_make_job(2.3))
+
+    # Assert
+    assert over is True
+
+
+def test_is_over_soft_price_limit_at_threshold_is_not_over(monkeypatch):
+    # Arrange — exactly at the threshold (2.2) is allowed
+    _set_p90(monkeypatch, {H200: 2.0})
+    incentive = _build_incentive()
+
+    # Act
+    over = incentive._is_over_soft_price_limit(_make_job(2.2))
+
+    # Assert
+    assert over is False
+
+
+def _set_soft_rate(monkeypatch, rate: float) -> None:
+    new_cfg = shared_client.config.model_copy(update={"soft_limit_price_rate": rate})
+    monkeypatch.setattr(shared_client, "_config", new_cfg)
+
+
+def test_the_threshold_is_the_served_soft_limit_price_rate(monkeypatch):
+    # the backend serves 1.5 when the raised soft limit is on: threshold 2.0 * 1.5 = 3.0
+    _set_p90(monkeypatch, {H200: 2.0})
+    _set_soft_rate(monkeypatch, 1.5)
+    incentive = _build_incentive()
+
+    assert incentive._is_over_soft_price_limit(_make_job(2.3)) is False
+    assert incentive._is_over_soft_price_limit(_make_job(3.0)) is False
+    assert incentive._is_over_soft_price_limit(_make_job(3.01)) is True
+
+
+@pytest.mark.asyncio
+async def test_enforced_log_quotes_the_served_rate(monkeypatch):
+    _set_p90(monkeypatch, {H200: 2.0})
+    _set_soft_rate(monkeypatch, 1.5)
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(3.1))
+
+    log = "\n".join(result.incentive_logs)
+    assert result.eligible_for_rental_share is False
+    assert "$3.0 " in log  # the ceiling / price to set
+    assert "x 1.5)" in log
+
+
+def test_is_over_soft_price_limit_no_market_data(monkeypatch):
+    # Arrange — H200 absent from p90 map → cannot gate
+    _set_p90(monkeypatch, {})
+    incentive = _build_incentive()
+
+    # Act
+    over = incentive._is_over_soft_price_limit(_make_job(99.0))
+
+    # Assert
+    assert over is False
+
+
+def test_is_over_soft_price_limit_no_price(monkeypatch):
+    # Arrange — miner price unknown → cannot gate
+    _set_p90(monkeypatch, {H200: 2.0})
+    incentive = _build_incentive()
+
+    # Act
+    over = incentive._is_over_soft_price_limit(_make_job(None))
+
+    # Assert
+    assert over is False
+
+
+def test_enforcement_defaults_to_shadow_mode():
+    # Arrange / Act — rollout contract: first deploy must be shadow-only, so the
+    # flag default (not the env-resolved value) must stay False.
+    default = type(settings).model_fields["ENABLE_UNRENTED_SOFT_PRICE_LIMIT"].default
+
+    # Assert
+    assert default is False
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_keeps_rental_eligibility(monkeypatch):
+    # Arrange — over the limit but flag off → shadow only
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", False)
+    incentive = _build_incentive()
+
+    # Act
+    result = await incentive.calculate_executor_score(_make_job(2.3))
+
+    # Assert — still eligible for the unrented rental pool
+    assert result.eligible_for_rental_share is True
+
+
+@pytest.mark.asyncio
+async def test_enforced_drops_rental_eligibility(monkeypatch):
+    # Arrange — over the limit and flag on
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    # Act
+    result = await incentive.calculate_executor_score(_make_job(2.3))
+
+    # Assert — excluded from rental pool, no mining either (active but no incentive)
+    assert result.eligible_for_rental_share is False
+    assert result.mining_score == 0
+
+
+@pytest.mark.asyncio
+async def test_enforced_under_threshold_keeps_eligibility(monkeypatch):
+    # Arrange — flag on but price within the p90 ceiling (2.1 < 2.2)
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    # Act
+    result = await incentive.calculate_executor_score(_make_job(2.1))
+
+    # Assert
+    assert result.eligible_for_rental_share is True
+
+
+@pytest.mark.asyncio
+async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
+    # DAH-2327: the zero-incentive reason must reach the customer-facing incentive
+    # log (JobResult.incentive_logs -> "Incentive Scores Calculation Logs") with the
+    # numbers and the price to set. Threshold = 2.0 * 1.1 = 2.2.
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(2.3))
+
+    log = "\n".join(result.incentive_logs)
+    assert "soft price limit" in log
+    assert "2.3" in log        # miner's price
+    assert "2.2" in log        # ceiling / price to set
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_does_not_append_incentive_log(monkeypatch):
+    # Flag off — payout unchanged, so no zero-incentive reason should be logged.
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", False)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(2.3))
+
+    log = "\n".join(result.incentive_logs)
+    assert "soft price limit" not in log
+
+
+# ── DAH-2327: every zero-incentive exit surfaces its reason to the miner ──────
+
+
+@pytest.mark.parametrize(
+    "job_kwargs, expected_fragments",
+    [
+        ({"is_spot": True}, ["spot", "spot_tier"]),
+        ({"provider_discord_connected": False}, ["Discord", "provider_discord_not_connected"]),
+        ({"is_new_rentals_paused": True}, ["paused", "new_rentals_paused"]),
+        ({"default_job_owner": "miner"}, ["default job", "miner_default_job"]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_hard_exclusion_appends_customer_facing_incentive_log(job_kwargs, expected_fragments):
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(1.0, **job_kwargs))
+
+    assert result.mining_score == 0
+    log = "\n".join(result.incentive_logs).lower()
+    for fragment in expected_fragments:
+        assert fragment.lower() in log
+
+
+@pytest.mark.asyncio
+async def test_eligible_executor_has_no_zero_incentive_reason(monkeypatch):
+    # Healthy unrented eligible executor within price — no zero-incentive reason logged.
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(1.5))
+
+    log = "\n".join(result.incentive_logs)
+    assert "set to 0" not in log
+    assert "No subnet incentive" not in log
+
+
+@pytest.mark.asyncio
+async def test_unrented_non_incentive_model_appends_reason():
+    # RTX 5080 is a valid GPU but not in rental_incentive_gpu_types: an unrented
+    # executor of this model earns nothing while idle and must be told why.
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(
+        _make_job(1.0, gpu_model="NVIDIA GeForce RTX 5080")
+    )
+
+    assert result.mining_score == 0
+    log = "\n".join(result.incentive_logs)
+    assert "gpu_model_not_eligible_for_unrented_incentive" in log
+    assert "RTX 5080" in log
+
+
+@pytest.mark.asyncio
+async def test_eligible_zero_capacity_bucket_appends_reason():
+    # An eligible unrented GPU whose gpu-count bucket has no cap: the cap multiplier and
+    # effective rate collapse to 0, so incentive is 0 despite eligibility. Explain why.
+    incentive = _build_incentive()
+    job = _make_job(1.0)  # H200, unrented, eligible
+    job.eligible_for_rental_share = True
+    job.hourly_rate = 5.0
+    job.sysbox_multiplier = 1.0
+    job.driver_multiplier = 1.0
+    job.count_bucket = 1
+    job.max_cap = 0  # no unrented capacity for this bucket -> cap multiplier 0
+
+    await incentive._post_process_job_result("miner_hotkey", job)
+
+    assert job.incentive == 0
+    log = "\n".join(job.incentive_logs)
+    assert "no_unrented_capacity_for_gpu_count" in log
+    assert "H200" in log
+
+
+@pytest.mark.asyncio
+async def test_eligible_driver_below_minimum_appends_reason():
+    # Live staging case (2026-07-03): driver_multiplier=0 zeroes effective_rate, so an
+    # eligible unrented executor earns 0 with no explanation. Explain why.
+    incentive = _build_incentive()
+    job = _make_job(1.0)
+    job.eligible_for_rental_share = True
+    job.hourly_rate = 5.0
+    job.sysbox_multiplier = 1.0
+    job.driver_multiplier = 0.0  # NVIDIA driver below the network minimum
+    job.nvidia_driver_version = "570.195.03"
+    job.count_bucket = 1
+    job.max_cap = 10
+    incentive.cap_multiplier_by_bucket[("H200", 1)] = 1.0  # bucket has capacity
+
+    await incentive._post_process_job_result("miner_hotkey", job)
+
+    assert job.incentive == 0
+    log = "\n".join(job.incentive_logs)
+    assert "nvidia_driver_below_minimum" in log
+    assert "570.195.03" in log
+    assert "driver" in log.lower()
+
+
+@pytest.mark.asyncio
+async def test_eligible_no_sysbox_appends_reason():
+    # sysbox_multiplier=0 (no sysbox runtime, full unrented penalty) also zeroes the
+    # effective rate -> incentive 0. Explain why.
+    incentive = _build_incentive()
+    job = _make_job(1.0)
+    job.eligible_for_rental_share = True
+    job.hourly_rate = 5.0
+    job.sysbox_multiplier = 0.0
+    job.sysbox_runtime = False
+    job.driver_multiplier = 1.0
+    job.count_bucket = 1
+    job.max_cap = 10
+    incentive.cap_multiplier_by_bucket[("H200", 1)] = 1.0  # bucket has capacity
+
+    await incentive._post_process_job_result("miner_hotkey", job)
+
+    assert job.incentive == 0
+    log = "\n".join(job.incentive_logs)
+    assert "sysbox_not_enabled" in log
+    assert "sysbox" in log.lower()
+
+
+def test_reasons_excluded_from_both_pools_lists_every_match_in_order():
+    # The evaluator is the single source of truth: every matching reason, in catalog order,
+    # and an empty list for a clean executor.
+    incentive = _build_incentive()
+
+    assert incentive._reasons_excluded_from_both_pools(_make_job(1.0)) == []
+    spot = incentive._reasons_excluded_from_both_pools(_make_job(1.0, is_spot=True))
+    assert [line.reason for line in spot] == ["spot_tier"]
+    # spot precedes discord when both apply: both are listed, the old first match first
+    both = _make_job(1.0, is_spot=True, provider_discord_connected=False)
+    assert [line.reason for line in incentive._reasons_excluded_from_both_pools(both)] == [
+        "spot_tier",
+        "provider_discord_not_connected",
+    ]

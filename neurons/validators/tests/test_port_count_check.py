@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.messages import PortCountMessages as Msg
@@ -54,8 +53,7 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
                 miner_hotkey="test-miner",
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="22",
-                pods=[RentedPod(pod_id="pod-1", container_name="container_test")],
-                rented_ports=[8080, 8081],
+                pods=[RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[8080, 8081])],
             )
         },
     )
@@ -66,3 +64,17 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
     assert result.updates["port_count"] == MIN_PORT_COUNT - 1
+
+
+@pytest.mark.asyncio
+async def test_insufficient_ports_names_the_orphaned_container_holding_them(context_factory):
+    """DAH-2991: the shortfall caused by an orphan the cleanup could not remove is named, not a bare count."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ctx = context_factory(state=build_state(verified_port_count=2, orphaned_containers=[name]))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
+    assert result.event.what_we_saw["held_by_orphaned_containers"] == [name]
+    assert name in result.event.remediation

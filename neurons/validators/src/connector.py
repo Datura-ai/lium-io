@@ -4,7 +4,7 @@ import time
 from clients.compute_client import ComputeClient
 
 from core.config import settings
-from core.utils import get_logger, wait_for_services_sync
+from core.utils import get_logger, wait_for_services_sync, widen_default_thread_pool
 from services.ioc import initiate_services, ioc
 
 logger = get_logger(__name__)
@@ -27,6 +27,7 @@ def start_process():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            widen_default_thread_pool(loop)
             loop.run_until_complete(run_forever())
         except Exception as e:
             logger.error(f"Compute app connector crashed: {e}", exc_info=True)

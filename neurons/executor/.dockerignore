@@ -8,3 +8,6 @@ docker_publish.sh
 docker-compose.yml
 .env*
 sysbox-ce_*
+# CVM runtime dir (guest disk images, tens of GB) — never part of the build
+# context, and COPY . . must not bake it into the executor image.
+dstacktee/

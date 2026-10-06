@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/sh -e
 
 # Set mode (default: validator)
 MODE=${1:-validator}
@@ -15,13 +15,13 @@ if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
     echo "Initializing Bittensor wallet..."
 
     pdm run btcli wallet create \
-        --wallet.name $BITTENSOR_WALLET_NAME \
-        --wallet.hotkey $BITTENSOR_WALLET_HOTKEY_NAME \
-        --wallet.path $BITTENSOR_WALLET_DIRECTORY \
+        --wallet.name "$BITTENSOR_WALLET_NAME" \
+        --wallet.hotkey "$BITTENSOR_WALLET_HOTKEY_NAME" \
+        --wallet.path "$BITTENSOR_WALLET_DIRECTORY" \
         --n-words 12 \
         --no-use-password \
         --overwrite \
-        --quiet
+        --quiet > /dev/null
 
     pdm run btcli wallet regen_hotkey \
         --wallet-name "$BITTENSOR_WALLET_NAME" \
@@ -30,7 +30,7 @@ if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
         --mnemonic "$BITTENSOR_HOTKEY_MNEMONIC" \
         --no-use-password \
         --overwrite \
-        --quiet
+        --quiet > /dev/null
 
     echo "Bittensor wallet initialized successfully"
 else
@@ -38,7 +38,6 @@ else
 fi
 
 if [ "$MODE" = "validator" ]; then
-    pdm run alembic upgrade head
     pdm run src/validator.py
 elif [ "$MODE" = "connector" ]; then
     pdm run src/connector.py

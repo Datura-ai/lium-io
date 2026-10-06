@@ -1,6 +1,23 @@
-from typing import Literal
+import logging
+import math
+from datetime import datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel, ValidationError, field_validator
+
+from services.const import FILLER_CONTAINER_PREFIX
+
+logger = logging.getLogger(__name__)
+
+GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
+# The GPU itself is gone until a host reset (post-Xid): "gpu requires reset", "unknown device",
+# "NVML unknown". Same quarantine as the mismatch above — the host cannot serve a rental either way.
+GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
+# DAH-2671: the rental-verification container was created with `--cpus=<advertised>` and the host's
+# Docker daemon rejected the count — the machine has fewer physical cores than the miner reported.
+# Unlike the two GPU faults above this is spec fraud, not a broken runtime, and it is rolled out
+# shadow-first (see RENTAL_CPU_LIMIT_* in core/config.py).
+CPU_QUOTA_EXCEEDS_HOST_REASON = "CPU_QUOTA_EXCEEDS_HOST"
 
 
 class Error(BaseModel, extra="allow"):
@@ -24,6 +41,29 @@ class RentedPod(BaseModel):
     pod_id: str
     container_name: str
     rented_ports: list[int] = []
+    created_at: datetime | None = None
+    # GPUs this pod holds (DAH-2467). None = backend predates the field; the validator then
+    # treats the whole executor as rented (no per-GPU split scoring).
+    gpu_count: int | None = None
+    # DAH-2870: the external port the renter's `ssh -p` uses (container port 22 in the pod's port
+    # map). None = backend predates the field or the pod maps no port 22; the cycle's SSH probe then
+    # skips the pod.
+    ssh_port: int | None = None
+    # DAH-2870: the pod's status as the backend records it (`RUNNING`, `REBOOT_PENDING`, ...). The
+    # rented list carries every status but BROKEN and DELETING; the cycle's SSH probe dials every
+    # pod with an ssh_port whatever its status, and counts only RUNNING (or None = backend predates
+    # the field) pods towards the our-own-outage share.
+    status: str | None = None
+
+    @field_validator("ssh_port")
+    @classmethod
+    def _ssh_port_in_range(cls, value: int | None) -> int | None:
+        # A port outside 1-65535 is not one a renter can `ssh -p` to, and `asyncio.open_connection`
+        # raises OverflowError (not OSError) on it, which would end the executor's whole run with
+        # no verdict. Read as "no mapped port": the probe judges the pod by authorized_keys alone.
+        if value is not None and not 1 <= value <= 65535:
+            return None
+        return value
 
 
 class RentedExecutor(BaseModel):
@@ -33,7 +73,10 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
-    rented_ports: list[int] = []
+
+    def get_rented_ports(self) -> list[int]:
+        """Aggregate rented ports from all pods."""
+        return sorted(port for pod in self.pods for port in pod.rented_ports)
 
 
 class RentedMachine(BaseModel):
@@ -42,7 +85,6 @@ class RentedMachine(BaseModel):
     executor_id: str
     executor_ip_address: str
     executor_ip_port: str
-    container_name: str
     containers: list[RentedContainer]
     owner_flag: bool = False
 
@@ -50,12 +92,277 @@ class RentedMachine(BaseModel):
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
     banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
+
+
+class NetworkEMA(BaseModel):
+    """EMA-smoothed network speed measurements for an executor."""
+
+    ema_download_speed: float | None = None
+    ema_upload_speed: float | None = None
+    ema_verifyx_download_speed: float | None = None
+    ema_verifyx_upload_speed: float | None = None
+
+
+class ManualRentalInfo(BaseModel):
+    """Specs a special manual (bare-metal) rental is force-passed against.
+
+    A manually-rented node is never contacted, so these cannot be scraped — the backend sends
+    what the node was last verified to have, and it is the sole basis for the forced score.
+    Both fields are load-bearing: the incentive layer maps gpu_model to a total-count denominator
+    and multiplies by gpu_count, so a missing model or a zero count means zero emission.
+    """
+    gpu_model: str
+    gpu_count: int
+
+
+class FillerRevenueByGpuConfig(BaseModel):
+    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
+    over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
+    (base model, GPU count)."""
+    base_model: str
+    gpu_count: int
+    usd_per_gpu_hour: float
+    gpu_hours: float  # the filler GPU-hours the average was taken over
 
 
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
+    # Legacy single-filler map (one container per executor), kept for a backend that predates the
+    # list field. Read via get_filler_containers' fallback, never directly.
+    filler_containers_by_executor: dict[str, str] = {}  # executor_id -> filler_<FillerRun.id>
+    # executor_id -> ALL active filler container names. A GPU-split node runs one filler per VRAM
+    # bundle (DAH-2465); every listed container is protected from the stale-reaper and its GPU
+    # processes are tolerated. Additive over the legacy map above so backend/validator deploy in any
+    # order — an older backend leaves this empty and get_filler_containers falls back to the one.
+    all_filler_containers_by_executor: dict[str, list[str]] = {}
+    # executor_id -> external ports its active fillers hold (DAH-2527). A filler creates no pod, so
+    # these ports never show up in executors[].pods and port verification used to probe them and
+    # collide. Empty for a backend that predates the field — the collision simply stays.
+    filler_ports_by_executor: dict[str, list[int]] = {}
     banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
+    gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
+    network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
+    spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
+    # The subset of spot_executor_ids whose provider chose the Spot tier: no demotion, force-spot
+    # hotkey, pin or no-incentive rental put it there. Only these may take spot-node pay. Defaults
+    # to empty so a backend that does not send it pays no spot node.
+    provider_spot_executor_ids: list[str] = []
+    new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
+    # DAH-2703: executor_ids whose Lium filler container is destroyed during create (see
+    # FillerRunDao.CREATE_KILL_*). Such a run never reaches RUNNING, so the ISSUE-050 liveness
+    # probe has nothing to check. Additive with an empty default: an older backend penalizes nobody.
+    filler_create_kill_executor_ids: list[str] = []
+    provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
+    # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
+    # forward-compatibility (a future owner value must not break parsing of the whole response).
+    default_job_owner_by_executor: dict[str, str] = {}
+    # gpu_uuid → "miner" | "lium" for the GPUs an active default job runs on. The same GPUs can be
+    # reported under more than one executor id, and the job runs under only one of them, so the
+    # power-limit exemption reads this map. Empty for a backend that predates the field: the
+    # executor-keyed map above still applies.
+    default_job_owner_by_gpu: dict[str, str] = {}
+    # executor_id → specs to force-pass against. Present only for executors carrying a pod flagged
+    # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
+    # field force-passes nobody (fail-closed) rather than everybody.
+    manual_rental_executors: dict[str, ManualRentalInfo] = {}
+    # Average filler revenue per GPU configuration: what the spot-node pay and the secure floor are
+    # measured against. Defaults to empty so an older backend pays spot nodes nothing, as before.
+    filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+
+    def get_filler_revenue_per_gpu_hour(
+        self, base_model: str | None, gpu_count: int, min_gpu_hours: float
+    ) -> float | None:
+        """The configuration's average filler USD per GPU-hour, or None when there is no usable
+        sample: no entry, a sample under min_gpu_hours, or a value that is not a positive number."""
+        if not base_model:
+            return None
+        for entry in self.filler_revenue_by_gpu_config:
+            if entry.base_model != base_model or entry.gpu_count != gpu_count:
+                continue
+            if not entry.gpu_hours >= min_gpu_hours:
+                return None
+            if not (entry.usd_per_gpu_hour > 0 and math.isfinite(entry.usd_per_gpu_hour)):
+                return None
+            return entry.usd_per_gpu_hour
+        return None
+
+    def is_provider_banned(
+        self,
+        *,
+        miner_hotkey: str,
+        miner_coldkey: str | None = None,
+        gpu_uuids: list[str] | None = None,
+    ) -> bool:
+        if miner_hotkey in self.banned_hotkeys:
+            return True
+        if miner_coldkey and miner_coldkey in self.banned_coldkeys:
+            return True
+        return any(gpu_uuid in self.banned_provider_guids for gpu_uuid in (gpu_uuids or []))
+
+    @field_validator("filler_revenue_by_gpu_config", mode="before")
+    @classmethod
+    def drop_invalid_filler_revenue_entries(cls, value: Any) -> list[FillerRevenueByGpuConfig]:
+        # A malformed average must never fail the whole reply: without the reply a cycle cannot start.
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            logger.warning(
+                "filler_revenue_by_gpu_config is not a list (%s); read as no averages", type(value).__name__
+            )
+            return []
+        entries: list[FillerRevenueByGpuConfig] = []
+        for item in value:
+            try:
+                entries.append(FillerRevenueByGpuConfig.model_validate(item))
+            except ValidationError as e:
+                logger.warning(
+                    "dropped an invalid filler_revenue_by_gpu_config entry: %s",
+                    e.errors(include_url=False, include_input=False),
+                )
+        return entries
+
+    @field_validator("provider_spot_executor_ids", mode="before")
+    @classmethod
+    def read_malformed_provider_spot_as_empty(cls, value: Any) -> list[str]:
+        # Fail closed without failing the reply: a malformed list pays no spot node.
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            logger.warning(
+                "provider_spot_executor_ids is not a list (%s); read as empty", type(value).__name__
+            )
+            return []
+        return [item for item in value if isinstance(item, str)]
+
+    @field_validator("filler_containers_by_executor")
+    @classmethod
+    def keep_only_filler_containers(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            executor_id: container_name
+            for executor_id, container_name in value.items()
+            if container_name.startswith(FILLER_CONTAINER_PREFIX)
+        }
+
+    @field_validator("all_filler_containers_by_executor")
+    @classmethod
+    def keep_only_filler_container_lists(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        # A stray name must never protect a rogue container from cleanup.
+        return {
+            executor_id: filler_names
+            for executor_id, names in value.items()
+            if (filler_names := [name for name in names if name.startswith(FILLER_CONTAINER_PREFIX)])
+        }
+
+    def get_filler_containers(self, executor_uuid: str) -> list[str]:
+        # The full list when the backend sends it; otherwise fall back to the legacy single map, so a
+        # backend that predates the list field still protects its one filler.
+        containers = self.all_filler_containers_by_executor.get(str(executor_uuid))
+        if containers:
+            return containers
+        legacy_single = self.filler_containers_by_executor.get(str(executor_uuid))
+        return [legacy_single] if legacy_single else []
+
+    def get_filler_container(self, executor_uuid: str) -> str | None:
+        # Any one of the node's fillers — enough for callers that only need "does a filler run here"
+        # (skip-checks, logging). Container protection and GPU-usage tolerance use get_filler_containers.
+        containers = self.get_filler_containers(executor_uuid)
+        return containers[0] if containers else None
+
+    def get_filler_ports(self, executor_uuid: str) -> list[int]:
+        return self.filler_ports_by_executor.get(str(executor_uuid), [])
+
+    def get_default_job_owner(self, executor_uuid: str) -> str | None:
+        return self.default_job_owner_by_executor.get(str(executor_uuid))
+
+    def get_gpu_default_job_owner(self, gpu_uuid: str) -> str | None:
+        return self.default_job_owner_by_gpu.get(str(gpu_uuid))
+
+    def get_manual_rental_info(self, executor_uuid: str) -> "ManualRentalInfo | None":
+        """Specs to force-pass this executor against, or None if it is not a manual rental."""
+        return self.manual_rental_executors.get(str(executor_uuid))
+
+
+class PodRentalActiveResponse(BaseModel):
+    active: bool
+    # DAH-2757: the pod's own state. `active` answers "is the rental live", which is a different
+    # question from "is this container ours" — see BROKEN_POD_STATUS below.
+    status: str | None = None
+    # DAH-2757: the executor the pod belongs to. The answer is about the POD, not about where it
+    # runs, so without this a provider can name a squatter container after a live pod of their
+    # second node. Absent means a backend that predates the field — then the fleet snapshot is the
+    # only owner test we have.
+    executor_id: str | None = None
+    rental_closed_at: datetime | None = None
+    # DAH-2545: where an encrypted rental volume is mounted in plaintext inside the container.
+    # Nothing on the host records it, so without this the validator cannot remount gocryptfs when
+    # it revives a pod. Absent — an older backend, or a pod it does not know — means recovery of an
+    # encrypted volume must stand down rather than guess a path.
+    local_volume_path: str | None = None
+
+
+class PodHostRebootRecoveredResponse(BaseModel):
+    recorded: bool
+
+
+class PodSshUnreachableResponse(BaseModel):
+    # DAH-2870: False when the backend already holds an event for this outage of the pod.
+    recorded: bool
+    # lium-platform#429: was the renter told — "notified", "recorded" (nothing was due) or
+    # "notify_failed" (the mail was refused; the outage stays unacknowledged and is reported again
+    # next cycle so the mail is re-sent). None from a backend older than #429: treated as delivered.
+    delivery: str | None = None
+
+
+SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED = "notify_failed"
+
+
+class RentedGpuDropResponse(BaseModel):
+    # False when nothing was written: the backend's flag is off, the pod is not in an open rental,
+    # or a recovery named no open incident.
+    recorded: bool
+    # "notified" (every due notice went out), "recorded" (the incident was already known and told),
+    # "notify_failed" (a notice was refused; report again next cycle), "disabled" (the platform side
+    # has the alert switched off; nothing written), "not_rented" (no open rental).
+    delivery: str | None = None
+
+
+GPU_DROP_DELIVERY_DISABLED = "disabled"
+GPU_DROP_DELIVERY_NOT_RENTED = "not_rented"
+
+
+class VerificationStartedResponse(BaseModel):
+    """Ack for DAH-3019 `verification-started` (one request per miner): how many of the batch's
+    executors the backend stored the run start for, so the provider portal can show which step
+    is running and how long is left. Fewer than sent means nodes this validator does not own."""
+
+    recorded: int
+
+
+class FillerRunActiveResponse(BaseModel):
+    active: bool
+    executor_id: str | None = None  # DAH-2757: the executor the run belongs to, as for the pod above
+    status: str | None = None
+    started_at: datetime | None = None
+
+
+# DAH-2757: the states in which the backend still owns the container. `active` is not enough — the
+# backend sets it for RUNNING alone, and a filler the snapshot missed is usually still STARTING.
+# The terminal states (STOPPED, FAILED, STOP_FAILED, CLEANUP_FAILED) are absent on purpose: a
+# container that outlives its run is an orphan, not a workload we started. Mirrors FillerRunStatus
+# in the backend (models/filler_run.py) — a new transitional state there belongs here too.
+LIVE_FILLER_RUN_STATUSES = frozenset({"STARTING", "RUNNING", "STOPPING"})
+
+# DAH-2757: a pod the backend marked BROKEN has a closed rental, so it reports active=False, but its
+# container stays on the host until the stale-container reaper collects it. That leftover is ours to
+# tolerate, not a foreign workload to score against the provider.
+BROKEN_POD_STATUS = "BROKEN"
 
 
 class ExecutorUptimeResponse(BaseModel):
@@ -66,3 +373,43 @@ class ExecutorUptimeResponse(BaseModel):
 
 class RevenuePerGpuTypeResponse(BaseModel):
     revenues: dict[str, float]
+
+
+class ExecutorHealthCheckResponse(BaseModel):
+    """Response from executor health check endpoint."""
+    success: bool
+    error: str | None = None
+    details: dict | None = None
+    reason_code: str | None = None
+
+
+class DefaultDockerImage(BaseModel, extra="allow"):
+    """One recommended/default template image for a GPU + driver combo.
+
+    Mirrors a single item from the backend `/executors/default-docker-image`
+    response (the same endpoint the executor cache pre-pull consumes). Parsed
+    leniently so new backend fields never break validation.
+    """
+    docker_image: str
+    docker_image_tag: str
+    docker_image_size: int | None = None
+    # Bare manifest-list digest ("sha256:…"). Populated by the backend again as of
+    # DAH-2461 (resolved live from Docker Hub) so executors can pull digest-pinned;
+    # the validator still verifies against its OWN Hub snapshot (DAH-2380), not this field.
+    docker_image_digest: str | None = None
+
+    @property
+    def image_ref(self) -> str:
+        return f"{self.docker_image}:{self.docker_image_tag}"
+
+
+class DefaultDockerImagesResponse(RootModel[list[DefaultDockerImage]]):
+    """The backend returns a bare JSON list; wrap it so `BackendClient.get()`
+    (which validates with a single model) can parse it."""
+
+
+class NvmlReportAckResponse(BaseModel):
+    """Ack for a reported unknown driver (DAH-2451) — the verdict arrives later via
+    shared config, so the body is intentionally empty."""
+
+    status: str | None = None

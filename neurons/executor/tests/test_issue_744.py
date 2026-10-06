@@ -9,7 +9,6 @@ a different public_key while keeping the valid signature for data_to_sign.
 """
 
 import unittest
-from unittest.mock import MagicMock
 import sys
 import os
 
@@ -47,7 +46,8 @@ class TestSSHKeySubstitutionVulnerability(unittest.TestCase):
         payload = UploadSShKeyPayload(
             public_key="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB user@host",
             data_to_sign="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB user@host",
-            signature="valid_signature"
+            signature="valid_signature",
+            validator_signature="validator_signature",
         )
         # Should not raise
         _validate_ssh_key_consistency(payload)
@@ -65,7 +65,8 @@ class TestSSHKeySubstitutionVulnerability(unittest.TestCase):
         payload = UploadSShKeyPayload(
             public_key="ssh-rsa MALICIOUS_ATTACKER_KEY",
             data_to_sign="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB",
-            signature="valid_signature_for_original"
+            signature="valid_signature_for_original",
+            validator_signature="validator_signature",
         )
         
         with self.assertRaises(HTTPException) as cm:
@@ -79,7 +80,8 @@ class TestSSHKeySubstitutionVulnerability(unittest.TestCase):
         payload = UploadSShKeyPayload(
             public_key="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB\n",
             data_to_sign="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB",
-            signature="valid_signature"
+            signature="valid_signature",
+            validator_signature="validator_signature",
         )
         # Should not raise - whitespace is stripped
         _validate_ssh_key_consistency(payload)
@@ -89,7 +91,8 @@ class TestSSHKeySubstitutionVulnerability(unittest.TestCase):
         payload = UploadSShKeyPayload(
             public_key="  ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB",
             data_to_sign="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB  ",
-            signature="valid_signature"
+            signature="valid_signature",
+            validator_signature="validator_signature",
         )
         # Should not raise - whitespace is stripped
         _validate_ssh_key_consistency(payload)
@@ -99,7 +102,8 @@ class TestSSHKeySubstitutionVulnerability(unittest.TestCase):
         payload = UploadSShKeyPayload(
             public_key="   ",
             data_to_sign="\n\t",
-            signature="valid_signature"
+            signature="valid_signature",
+            validator_signature="validator_signature",
         )
         # Should not raise - both are empty after strip
         _validate_ssh_key_consistency(payload)
@@ -109,7 +113,8 @@ class TestSSHKeySubstitutionVulnerability(unittest.TestCase):
         payload = UploadSShKeyPayload(
             public_key="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB",
             data_to_sign="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAC",  # Last char different
-            signature="valid_signature"
+            signature="valid_signature",
+            validator_signature="validator_signature",
         )
         
         with self.assertRaises(HTTPException) as cm:

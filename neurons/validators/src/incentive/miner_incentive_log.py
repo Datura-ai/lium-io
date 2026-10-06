@@ -1,0 +1,756 @@
+"""Everything a miner sees in their "Incentive Scores Calculation Logs" — one catalog.
+
+WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
+  - Mining pool   — for RENTED executors. Paid by a mining score (GPU model/count
+                    times sysbox / driver / uptime multipliers).
+  - Unrented pool — for IDLE executors of an eligible GPU model. Paid as if the GPU
+                    were rented, based on its rental market value (rental-share).
+
+HOW A NODE PICKS A POOL:
+  rented?                                              -> mining pool (always earns)
+  idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND (not flagship-8x OR NCU/split/attested-CVM offered) AND power cap appliable
+                               AND capacity?            -> unrented pool (earns)
+  otherwise                                            -> 0 incentive (reason below)
+
+WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
+(JobResult.incentive_logs, delivered via MACHINE_SPEC_CHANNEL) can contain:
+
+1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
+   because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
+   Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
+     spot tier, Discord not connected, paused for new rentals, running own default job
+   Group B — idle but does not qualify for the unrented pool:
+     GPU model not in the unrented program (earns only when rented),
+     price above the market soft limit (lower the price to earn),
+     total disk below 1.5x total GPU VRAM (add disk to earn),
+     8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
+       attestation (offer any of the three to earn),
+     container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
+     free remainder of a partially rented split node with fewer free ports than the
+       marketplace floor (nobody can rent it; the rented GPUs keep earning),
+     no unrented capacity for that GPU-count tier this cycle,
+     NVIDIA driver below the minimum, sysbox runtime not enabled
+   Spot-node pay (ENABLE_SPOT_NODE_PAY on) — an idle spot node earns only while it runs
+     Lium fillers and its GPU configuration has an average filler revenue:
+     spot node without a Lium filler, no filler revenue average for the GPU configuration,
+     no room left in the incentive pool because the rental share is at the burn cap
+   Group C — a check failed this cycle: the failing check's reason code
+     (`validation_failed`, context.reason_code), so a zero from a failed check is never
+     reported without a reason. A run that passed every check and still scored 0 (the
+     score gate: CPU truth, an outdated image, a rented node's halt) is not a
+     failed check and gets no Group C reason
+   Every reason that applies is recorded, in the order above: a node blocked by Discord
+   still learns that its 8x flagship gate blocks it too. The first entry is the one the
+   old first-match evaluation reported.
+
+2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
+     mining_score_calculated, mining_incentive_calculated,
+     rental_incentive_calculated, spot_pay_incentive_calculated,
+     secure_filler_revenue_floor_applied (the secure floor paid a top-up on the listed or
+       diluted rate), secure_filler_revenue_floor_not_paid (no room at the burn cap),
+     mining_score_missing (internal-error case),
+     unrented_bucket_reassigned (DAH-2528: node rated against its split tier
+     because its own GPU-count tier was over capacity)
+
+The scoring code (rental_price.py / default.py) detects each condition where its
+data naturally lives (some per-executor upfront, some only after cohort aggregation),
+builds the matching line and records it via `result.record_incentive_log(line)` —
+which appends the text to incentive_logs AND, for zero-incentive lines, ships the
+structured reason to the backend (DAH-2340). Never append to incentive_logs directly.
+Open THIS file to see everything a miner can be told and exactly how each message reads.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, Field
+
+from core.config import settings
+from core.utils import _m, _StructuredMessage, get_extra_info
+from services.executor_image_policy import outdated_image_remediation
+
+if TYPE_CHECKING:
+    from incentive.rental_price import (
+        InsufficientDisk,
+        MissingFlagshipCapability,
+        PortLimitedRemainder,
+        PowerCapIncapable,
+    )
+    from services.task_service import JobResult
+
+
+class ZeroIncentiveReason(StrEnum):
+    """Machine-readable codes for every reason a validated executor earns 0.
+
+    APPEND-ONLY contract: Loki dashboards and the backend (DAH-2340 structured
+    payload) key off these exact strings — renaming a value is a breaking change.
+    """
+
+    # Group A: excluded from BOTH pools
+    BANNED_NETWORK_ABUSE = "banned_network_abuse"
+    SPOT_TIER = "spot_tier"
+    PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
+    NEW_RENTALS_PAUSED = "new_rentals_paused"
+    MINER_DEFAULT_JOB = "miner_default_job"
+    # Group B: idle but not qualified for the unrented pool
+    GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE = "gpu_model_not_eligible_for_unrented_incentive"
+    PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
+    NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
+    NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
+    INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
+    SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
+    FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
+    CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
+    OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
+    PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    # Spot-node pay (ENABLE_SPOT_NODE_PAY): an idle spot node that is not paid
+    SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
+    SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
+    SPOT_NO_HEADROOM_AT_BURN_CAP = "spot_no_headroom_at_burn_cap"
+    # Group C: the validation run itself did not pass; context.reason_code names the check
+    VALIDATION_FAILED = "validation_failed"
+
+
+# The reason code a failed run carries when no check produced one (an exception in the pipeline).
+UNCLASSIFIED_VALIDATION_FAILURE = "PIPELINE_VALIDATION_ERROR"
+
+
+class IncentiveReason(BaseModel):
+    """One structured zero-incentive reason as it travels on the wire (DAH-2340).
+
+    Single definition for the whole validator: built here by the catalog
+    (`MinerLogLine.to_incentive_reason`) and reused by `ExecutorSpecRequest`.
+    The contract stays additive by growing `context` keys, never by renaming.
+    """
+
+    reason: str               # stable, APPEND-ONLY machine-readable code the backend keys off
+    message_for_miner: str    # free text, may change any time
+    # per-reason details shown next to the message, e.g. soft_limit_threshold,
+    # gpu_model, gpu_count, executor_id, incentive
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class MinerLogLine(BaseModel):
+    """One line of the miner-facing incentive log.
+
+    Built ONLY via the named constructors below (the catalog). The constructor bakes
+    every field in; recording takes no arguments:
+
+        line: MinerLogLine = MinerLogLine.no_payout_because_spot_tier(result)
+        result.record_incentive_log(line)
+    """
+
+    message: str                                                   # plain-English, shown to the miner
+    fields: dict[str, Any] = Field(default_factory=dict)           # structured payload next to the message
+    reason: ZeroIncentiveReason | None = None                      # machine-readable zero-incentive code; None for reports
+    internal_message: str | None = None                            # separate internal-log wording (both-pools exclusions only)
+    internal_fields: dict[str, Any] = Field(default_factory=dict)  # full extra dict for that internal log
+
+    def to_log_line(self) -> str:
+        """Render as one string; the caller appends it to result.incentive_logs."""
+        return self.as_internal_log().to_full_string()
+
+    def to_incentive_reason(self) -> IncentiveReason:
+        """Typed wire reason for MACHINE_SPEC_CHANNEL (DAH-2340): zero-incentive lines only, never internal_* fields."""
+        # fields carries "reason" for the Loki extra; in the wire model the code already sits top-level.
+        context: dict[str, Any] = {key: value for key, value in self.fields.items() if key != "reason"}
+        return IncentiveReason(reason=self.reason.value, message_for_miner=self.message, context=context)
+
+    def as_internal_log(self) -> _StructuredMessage:
+        """The same line as an `_m` object, for mirroring into the internal logger."""
+        return _m(self.message, extra=get_extra_info(self.fields))
+
+    def to_internal_log(self) -> _StructuredMessage:
+        """The separate internal observability log (both-pools exclusions only).
+
+        Uses `internal_message`/`internal_fields` baked in by `_no_payout`; the caller
+        just does `logger.info(exclusion.to_internal_log())`.
+        """
+        return _m(self.internal_message, extra=self.internal_fields)
+
+    @staticmethod
+    def _no_payout(
+        result: JobResult,
+        reason: ZeroIncentiveReason,
+        message: str,
+        extra_fields: dict[str, Any] | None = None,
+        internal_message: str | None = None,
+        internal_extra_fields: dict[str, Any] | None = None,
+    ) -> MinerLogLine:
+        """Shared shape of every zero-incentive reason: executor identity + reason + incentive 0."""
+        fields: dict[str, Any] = {
+            "executor_id": str(result.executor_info.uuid),
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
+            "reason": reason,
+            "incentive": 0.0,
+            **(extra_fields or {}),
+        }
+        internal_fields: dict[str, Any] = {}
+        if internal_message is not None:
+            internal_fields = {
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "reason": reason,
+                "score": 0,
+                "pool": "none",
+                **(internal_extra_fields or {}),
+            }
+        return MinerLogLine(
+            message=message,
+            fields=fields,
+            reason=reason,
+            internal_message=internal_message,
+            internal_fields=internal_fields,
+        )
+
+    # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─
+
+    @staticmethod
+    def no_payout_because_banned_network_abuse(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.BANNED_NETWORK_ABUSE,
+            message="Banned for network abuse. Ineligible for scoring and rentals",
+            internal_message="Executor excluded from both pools - banned for network abuse",
+        )
+
+    @staticmethod
+    def no_payout_because_spot_tier(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_TIER,
+            # The spot list does not say why, so name every cause.
+            message=(
+                "No subnet incentive: this executor is rated as spot for this cycle (the node "
+                "is set to Spot, its account is demoted for penalties, Lium banned its hotkey by hand, "
+                "Lium pinned the machine as "
+                "spot, or an open rental on it was contracted under the spot tier), and "
+                "spot-rated executors do not earn subnet incentive."
+            ),
+            internal_message="Executor excluded from both pools - spot tier",
+        )
+
+    @staticmethod
+    def no_payout_because_discord_not_connected(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PROVIDER_DISCORD_NOT_CONNECTED,
+            message=(
+                "No subnet incentive: provider Discord is not connected. Connect your "
+                "provider Discord for this executor to start earning incentive."
+            ),
+            internal_message="Executor excluded from both pools - provider Discord not connected",
+            internal_extra_fields={"provider_discord_connected": result.provider_discord_connected},
+        )
+
+    @staticmethod
+    def no_payout_because_paused_for_new_rentals(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.NEW_RENTALS_PAUSED,
+            message=(
+                "No subnet incentive: this executor is paused for new rentals and earns "
+                "nothing while paused. Resume new rentals to start earning again."
+            ),
+            internal_message="Executor excluded from both pools - paused for new rentals",
+        )
+
+    @staticmethod
+    def no_payout_because_running_own_default_job(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.MINER_DEFAULT_JOB,
+            message=(
+                "No subnet incentive: this executor is running your own default job instead "
+                "of a Lium job, and executors on your own job do not earn subnet incentive."
+            ),
+            internal_message="Executor excluded from both pools - running miner's own default job",
+        )
+
+    @staticmethod
+    def no_payout_because_outdated_executor_image(result: JobResult) -> MinerLogLine:
+        report = result.executor_image_report or {}
+        expected_ref = report.get("expected_ref") or settings.EXECUTOR_IMAGE_REF
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
+            message=outdated_image_remediation(str(expected_ref), enforced=True),
+            extra_fields={
+                "executor_image_status": report.get("status"),
+                "observed_digest": report.get("observed_digest"),
+                "expected_digest": report.get("expected_digest"),
+                "expected_ref": expected_ref,
+            },
+            internal_message="Executor excluded from both pools because a required image is outdated",
+        )
+
+    # ── Group B: idle but not qualified for the unrented pool ─────────────────
+
+    @staticmethod
+    def no_payout_because_gpu_model_not_in_unrented_program(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
+            message=(
+                f"No subnet incentive while idle: GPU model {result.gpu_model} is not part of "
+                "the unrented (idle-node) incentive program, so this executor earns nothing "
+                "unless rented. Rent it out to earn."
+            ),
+        )
+
+    @staticmethod
+    def no_payout_because_price_above_market_soft_limit(
+        result: JobResult, market_p90: float, rate: float
+    ) -> MinerLogLine:
+        price_per_gpu: float | None = result.executor_info.price_per_gpu
+        soft_limit: float = round(market_p90 * rate, 4)
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
+            message=(
+                f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the market "
+                f"soft price limit ${soft_limit} (90th-percentile market rate ${market_p90} x "
+                f"{rate}). Lower the price to ${soft_limit} or below to earn the unrented incentive."
+            ),
+            extra_fields={
+                "price_per_gpu": price_per_gpu,
+                "machine_price_p90": market_p90,
+                "soft_limit_rate": rate,
+                "soft_limit_threshold": soft_limit,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_insufficient_disk_for_vram(
+        result: JobResult, measured: InsufficientDisk
+    ) -> MinerLogLine:
+        # takes the measurement whole: the two totals are interchangeable floats, and swapping
+        # them would quietly tell the miner to add disk he already has
+        required_disk_gb: float = round(measured.vram_gb * measured.rate, 1)
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
+            message=(
+                f"No unrented incentive: this executor has {measured.disk_gb} GB of total disk but "
+                f"{measured.vram_gb} GB of GPU VRAM. An idle executor must have at least "
+                f"{measured.rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at "
+                f"least {required_disk_gb} GB of total disk, or rent it out to earn."
+            ),
+            extra_fields={
+                "total_vram_gb": measured.vram_gb,
+                "total_disk_gb": measured.disk_gb,
+                "min_disk_to_vram_rate": measured.rate,
+                "required_disk_gb": required_disk_gb,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_no_unrented_capacity_for_gpu_count(
+        result: JobResult, count_bucket: int | None
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.NO_UNRENTED_CAPACITY_FOR_GPU_COUNT,
+            message=(
+                f"No unrented incentive: there is currently no unrented-incentive capacity for "
+                f"{result.gpu_count}x {result.gpu_model} (its GPU-count tier has no cap this "
+                f"cycle). Rent this executor out to earn."
+            ),
+            extra_fields={
+                "count_bucket": count_bucket,
+                "max_cap": result.max_cap,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
+                "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_nvidia_driver_below_minimum(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM,
+            message=(
+                f"No unrented incentive: NVIDIA driver {result.nvidia_driver_version} is below "
+                "the minimum version required by the network. Upgrade the NVIDIA driver on this "
+                "executor to earn the unrented incentive."
+            ),
+            extra_fields={
+                "nvidia_driver_version": result.nvidia_driver_version,
+                # recorded only at multiplier 0; a node blocked before pricing never gets it set
+                "driver_multiplier": 0.0,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_sysbox_not_enabled(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SYSBOX_NOT_ENABLED,
+            message=(
+                "No unrented incentive: this executor does not run the sysbox runtime, which is "
+                "required for unrented incentive. Enable sysbox on this executor to earn."
+            ),
+            extra_fields={"sysbox_runtime": result.sysbox_runtime},
+        )
+
+    @staticmethod
+    def no_payout_because_flagship_without_ncu_or_split(
+        result: JobResult, missing: MissingFlagshipCapability
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+            message=(
+                f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
+                "NCU profiling, GPU splitting or confidential computing. Either open the host "
+                "profiling counters (NVreg_RestrictProfilingToAdminUsers=0, then reboot), which "
+                "also makes the node rentable only as a whole host, or set a minimum GPU count "
+                "below the full node in the Miner Portal on a host that supports docker storage "
+                "limits, or run the executor inside a confidential VM whose TDX attestation "
+                "passes, or rent it out to earn."
+            ),
+            extra_fields={
+                "ncu_profiling_access": missing.ncu_profiling_access,
+                "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
+                "supports_gpu_splitting": result.supports_gpu_splitting,
+                "gpu_splitting_min_count": result.gpu_splitting_min_count,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_cannot_apply_gpu_power_cap(
+        result: JobResult, incapable: PowerCapIncapable
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
+            message=(
+                "No unrented incentive: this executor's container cannot set a GPU power limit "
+                "(nvidia-smi -pl), which Lium's own idle jobs need. The official executor stack "
+                "already runs privileged, so first update it: 'docker compose pull && docker "
+                "compose up -d' in neurons/executor. If you run a custom compose, give the "
+                "executor container privileged: true (or CAP_SYS_ADMIN) and make sure "
+                "/dev/nvidiactl is owned by root inside it - under sysbox the device is mapped "
+                "to an unprivileged uid, so the executor must run outside the sysbox user "
+                "namespace. Fix it, or rent this executor out to earn."
+            ),
+            extra_fields={
+                "container_cap_eff": incapable.container_cap_eff,
+                "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_port_limited_remainder(
+        result: JobResult, port_limited: PortLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion: gpu_count is the number of free GPUs the message names.
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+            message=(
+                f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
+                f"rented node: it has {port_limited.available_port_count} free port(s) and the "
+                f"marketplace needs at least {port_limited.required_port_count} to list and rent them, so nobody "
+                "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
+                "when the rental ends or the node gets more open ports."
+            ),
+            extra_fields={
+                "available_port_count": port_limited.available_port_count,
+                "required_port_count": port_limited.required_port_count,
+            },
+        )
+
+    # ── Spot-node pay: an idle spot node that is not paid ────────────────────
+
+    @staticmethod
+    def no_payout_because_spot_without_lium_filler(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_WITHOUT_LIUM_FILLER,
+            message=(
+                "No subnet incentive: this spot-tier executor is not running a Lium filler job. "
+                "Spot-tier executors earn only while Lium's filler jobs run on them."
+            ),
+            extra_fields={"has_lium_filler": result.has_lium_filler},
+        )
+
+    @staticmethod
+    def no_payout_because_spot_no_filler_revenue_for_gpu_config(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG,
+            message=(
+                f"No subnet incentive: there is no average filler revenue yet for the "
+                f"{result.gpu_count}x {result.gpu_model} configuration, and spot-tier pay is "
+                "measured against it."
+            ),
+            extra_fields={"filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour},
+        )
+
+    @staticmethod
+    def no_payout_because_spot_no_headroom_at_burn_cap(result: JobResult, paid_fraction: float) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.SPOT_NO_HEADROOM_AT_BURN_CAP,
+            message=(
+                "No subnet incentive this cycle: the unrented pool already takes the whole burn "
+                "emission, so nothing is left for spot-tier pay, which is paid on top of it."
+            ),
+            extra_fields={
+                "effective_rate": result.effective_rate,
+                "unbucketed_share": result.unbucketed_share,
+                "paid_fraction": paid_fraction,
+            },
+        )
+
+    # ── Group C: the validation run did not pass ─────────────────────────────
+
+    @staticmethod
+    def validation_failure_code(result: JobResult) -> str:
+        """The reason code of the event that ended the run; the fallback when there is none."""
+        event = result.validation_event
+        return (
+            result.failure_reason_code
+            or (event.reason_code if event is not None else None)
+            or UNCLASSIFIED_VALIDATION_FAILURE
+        )
+
+    @staticmethod
+    def no_payout_because_validation_failed(result: JobResult) -> MinerLogLine:
+        event = result.validation_event
+        reason_code: str = MinerLogLine.validation_failure_code(result)
+        # the event's check_id/remediation belong to it only when it is the one that ended the run
+        same_event: bool = event is not None and event.reason_code == reason_code
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.VALIDATION_FAILED,
+            message=(
+                f"No subnet incentive: validation did not pass this cycle ({reason_code}). "
+                "Fix the failed check to earn; the node's validation log names it."
+            ),
+            extra_fields={
+                "reason_code": reason_code,
+                "check_id": event.check_id if same_event else None,
+                "remediation": event.remediation if same_event else None,
+            },
+        )
+
+    # ── Calculation reports: the per-cycle lines every scored node gets ───────
+
+    @staticmethod
+    def mining_score_calculated(result: JobResult, is_rented_after_cutoff: bool) -> MinerLogLine:
+        return MinerLogLine(
+            message=(
+                "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count "
+                "/ total_gpu_count * sysbox_multiplier * uptime_multiplier * driver_multiplier"
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "sysbox_multiplier": result.sysbox_multiplier,
+                "driver_multiplier": result.driver_multiplier,
+                "nvidia_driver_version": result.nvidia_driver_version,
+                "uptime_multiplier": result.uptime_multiplier,
+                "mining_score": result.mining_score,
+                "gpu_portion": result.gpu_portion,
+                "total_gpu_count": result.total_gpu_count,
+                "rental_created": result.rental_created_at,
+                "is_rented_after_cutoff": is_rented_after_cutoff,
+            },
+        )
+
+    @staticmethod
+    def mining_incentive_calculated(
+        hotkey: str, result: JobResult, total_mining_score: float, mining_share: float
+    ) -> MinerLogLine:
+        return MinerLogLine(
+            message=(
+                "Incentive score is calculated successfully. Formula: mining_share * mining_score "
+                "/ total_mining_score"
+            ),
+            fields={
+                "hotkey": hotkey,
+                "executor_id": str(result.executor_info.uuid),
+                "mining_score": result.mining_score,
+                "total_mining_score": total_mining_score,
+                "mining_share": mining_share,
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "incentive": result.incentive,
+            },
+        )
+
+    @staticmethod
+    def rental_incentive_calculated(hotkey: str, result: JobResult, count_bucket: int) -> MinerLogLine:
+        return MinerLogLine(
+            message=(
+                "Rental price incentive for executor is calculated successfully. Formula: "
+                "rental_share * gpu_count * effective_rate / total_rental_cost"
+            ),
+            fields={
+                "hotkey": hotkey,
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "hourly_rate": result.hourly_rate,
+                "sysbox_runtime": result.sysbox_runtime,
+                "sysbox_multiplier": result.sysbox_multiplier,
+                "provider_discord_connected": result.provider_discord_connected,
+                "nvidia_driver_version": result.nvidia_driver_version,
+                "driver_multiplier": result.driver_multiplier,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
+                "effective_rate": result.effective_rate,
+                "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
+                "count_bucket": count_bucket,
+                "max_cap": result.max_cap,
+                "cap_dilution_applied": result.cap_dilution_applied,
+                "rental_share": result.rental_share,
+                "burn_share": result.burn_share,
+                "incentive": result.incentive,
+                "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def spot_pay_incentive_calculated(
+        hotkey: str,
+        result: JobResult,
+        secure_rate: float,
+        filler_rate: float,
+        paid_fraction: float,
+        pay_factor: float,
+    ) -> MinerLogLine:
+        return MinerLogLine(
+            message=(
+                "Spot-tier incentive for executor is calculated successfully. Formula: "
+                "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
+                f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate); "
+                "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
+                "that part of spot pay and floor top-ups)"
+            ),
+            fields={
+                "hotkey": hotkey,
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour,
+                "filler_rate": filler_rate,
+                "hourly_rate": result.hourly_rate,
+                "sysbox_multiplier": result.sysbox_multiplier,
+                "driver_multiplier": result.driver_multiplier,
+                "secure_rate": secure_rate,
+                "effective_rate": result.effective_rate,
+                "rental_share": result.rental_share,
+                "burn_share": result.burn_share,
+                "incentive": result.incentive,
+                "unbucketed_share": result.unbucketed_share,
+                "unbucketed_rental_cost": result.unbucketed_rental_cost,
+                "paid_fraction": paid_fraction,
+            },
+        )
+
+    @staticmethod
+    def secure_filler_revenue_floor_applied(
+        result: JobResult,
+        diluted_rate: float,
+        floored_rate: float,
+        top_up_incentive: float,
+        paid_fraction: float,
+        floor_factor: float,
+    ) -> MinerLogLine:
+        # report line, not a zero reason: the node is paid more than its listed or diluted rate
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive: this executor's listed or diluted rate is below {floor_factor:g} x the "
+                "average filler revenue for its GPU configuration, so the difference is paid on top "
+                "of the line above. Formula: unbucketed_share * gpu_count * floor_top_up_rate / "
+                "unbucketed_rental_cost (paid_fraction < 1: the pool had room for only that part of "
+                "spot pay and floor top-ups)."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "secure_filler_revenue_floor_applied",
+                "hourly_rate": result.hourly_rate,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
+                "diluted_rate": diluted_rate,
+                "floored_rate": floored_rate,
+                "filler_revenue_per_gpu_hour": result.filler_revenue_per_gpu_hour,
+                "floor_top_up_rate": result.floor_top_up_rate,
+                "unbucketed_share": result.unbucketed_share,
+                "unbucketed_rental_cost": result.unbucketed_rental_cost,
+                "paid_fraction": paid_fraction,
+                "top_up_incentive": top_up_incentive,
+                "incentive": result.incentive,
+            },
+        )
+
+    @staticmethod
+    def secure_filler_revenue_floor_not_paid(
+        result: JobResult, diluted_rate: float, floored_rate: float, floor_factor: float
+    ) -> MinerLogLine:
+        # report line, not a zero reason: the node keeps the pay in the line above
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive: {floor_factor:g} x the average filler revenue for this GPU configuration is "
+                "above this executor's listed or diluted rate, but no top-up is paid this cycle: the "
+                "unrented pool already takes the whole burn emission, and top-ups are paid on top of it."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "secure_filler_revenue_floor_not_paid",
+                "diluted_rate": diluted_rate,
+                "floored_rate": floored_rate,
+                "floor_top_up_rate": result.floor_top_up_rate,
+                "unbucketed_share": result.unbucketed_share,
+                "incentive": result.incentive,
+            },
+        )
+
+    @staticmethod
+    def unrented_bucket_reassigned(result: JobResult) -> MinerLogLine:
+        # DAH-2528 report line, not a zero reason: the node is paid, in a better bucket.
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive: the {result.bucket_reassigned_from}x "
+                f"{result.gpu_model} tier was over its capacity when this executor "
+                f"was placed, so it is rated against its {result.count_bucket}x "
+                f"split tier, which had free capacity and pays a better rate."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "unrented_bucket_reassigned",
+                "bucket_reassigned_from": result.bucket_reassigned_from,
+                "bucket_reassigned_from_multiplier": result.bucket_reassigned_from_multiplier,
+                "count_bucket": result.count_bucket,
+                "max_cap": result.max_cap,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
+            },
+        )
+
+    @staticmethod
+    def mining_score_missing(hotkey: str, result: JobResult) -> MinerLogLine:
+        # Internal-error case: scoring finished without a mining score. Should not happen.
+        return MinerLogLine(
+            message="Mining score is not set for job result. This should not happen.",
+            fields={
+                "hotkey": hotkey,
+                "executor_id": str(result.executor_info.uuid),
+                "score": result.score,
+                "job_score": result.job_score,
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+            },
+        )

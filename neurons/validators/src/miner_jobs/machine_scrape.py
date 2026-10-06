@@ -1,9 +1,12 @@
 from ctypes import *
 import sys
 import os
+import glob
+import http.client
 import json
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import psutil
@@ -362,7 +365,7 @@ def _LoadNvmlLibrary(nvmlLib_content: bytes):
                         try:
                             # Check for nvml.dll in System32 first for DCH drivers
                             nvmlLib = CDLL(os.path.join(os.getenv("WINDIR", "C:/Windows"), "System32/nvml.dll"))
-                        except OSError as ose:
+                        except OSError:
                             # If nvml.dll is not found in System32, it should be in ProgramFiles
                             # load nvml.dll from %ProgramFiles%/NVIDIA Corporation/NVSMI/nvml.dll
                             nvmlLib = CDLL(os.path.join(os.getenv("ProgramFiles", "C:/Program Files"), "NVIDIA Corporation/NVSMI/nvml.dll"))
@@ -376,7 +379,7 @@ def _LoadNvmlLibrary(nvmlLib_content: bytes):
                             nvmlLib = CDLL(temp_file_path)
                         finally:
                             os.remove(temp_file_path)
-                except OSError as ose:
+                except OSError:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
                 if (nvmlLib == None):
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
@@ -482,6 +485,30 @@ def nvmlDeviceGetPowerManagementLimit(handle):
     ret = fn(handle, byref(c_limit))
     _nvmlCheckReturn(ret)
     return c_limit.value
+
+
+def nvmlDeviceGetPowerManagementDefaultLimit(handle):
+    c_limit = c_uint()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetPowerManagementDefaultLimit")
+    ret = fn(handle, byref(c_limit))
+    _nvmlCheckReturn(ret)
+    return c_limit.value
+
+
+def nvmlDeviceGetPowerManagementLimitConstraints(handle):
+    c_min_limit = c_uint()
+    c_max_limit = c_uint()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetPowerManagementLimitConstraints")
+    ret = fn(handle, byref(c_min_limit), byref(c_max_limit))
+    _nvmlCheckReturn(ret)
+    return c_min_limit.value, c_max_limit.value
+
+
+def safeNvmlValue(get_value):
+    try:
+        return get_value()
+    except Exception:
+        return None
 
 
 def nvmlDeviceGetClockInfo(handle, type_clock):
@@ -604,7 +631,11 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
 
 
 def run_cmd(cmd):
-    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True)
+    # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
+    # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
+    env = {**os.environ}
+    env.pop("LD_LIBRARY_PATH", None)
+    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(
             f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
@@ -612,64 +643,156 @@ def run_cmd(cmd):
     return proc.stdout
 
 
-def get_network_speed():
-    """Get upload and download speed of the machine."""
-    data = {"upload_speed": None, "download_speed": None}
+DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+# /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
+# let a scrape round hang on it.
+DOCKER_API_TIMEOUT_SECONDS = 20
+VLOOPBACK_DRIVER_PREFIX = "vloopback"
+
+
+class UnixSocketHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def docker_api_get(path):
+    # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
+    # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
+    # human strings ("45.08GB"); the API returns exact integers.
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
     try:
-        speedtest_cmd = run_cmd("speedtest-cli --json")
-        speedtest_data = json.loads(speedtest_cmd)
-        data["upload_speed"] = speedtest_data["upload"] / 1_000_000  # Convert to Mbps
-        data["download_speed"] = speedtest_data["download"] / 1_000_000  # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
+        conn.request("GET", path)
+        response = conn.getresponse()
+        body = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"docker api {path} returned HTTP {response.status}")
+        return json.loads(body)
+    finally:
+        conn.close()
 
-def speedcheck_output():
-    data = {"upload_speed": None, "download_speed": None}
+
+def get_vloopback_volume_bytes(docker_root_dir):
+    # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
+    # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
+    volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
+    names = [
+        volume.get("Name")
+        for volume in volumes
+        if (volume.get("Driver") or "").startswith(VLOOPBACK_DRIVER_PREFIX)
+        and volume.get("Name")
+        and "/" not in volume.get("Name")
+    ]
+    if not names:
+        return 0
+
+    # DATA_DIR is set to <DockerRootDir>/loopback at install time, but the plugin writes it inside
+    # its own rootfs; reachable here because the executor container shares the host PID namespace.
+    data_dirs = glob.glob(
+        f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
+    )
+    if not data_dirs:
+        # every volume would be counted as 0 and the breakdown would silently under-report by
+        # terabytes; fail like the rest of the docker half so the miss lands in an error key
+        raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
+
+    total = 0
+    for name in names:
+        for data_dir in data_dirs:
+            try:
+                # st_blocks, not st_size: a preallocated volume takes its whole declared size on
+                # disk while holding nothing, a sparse one takes only what it wrote.
+                total += os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                break
+            except OSError:
+                continue
+    return total
+
+
+def get_container_log_bytes(docker_root_dir: str) -> int:
+    # json logs are NOT in /system/df: `SizeRw` counts the writable layer only, and nothing
+    # rotates the logs on an executor. Left out, a chatty renter pod's log reads as the
+    # provider's own data (review ask, PR #1245). Blocks actually held, like the volume walk.
+    # `*.log*` also catches the rotated `-json.log.1` files a host with log-opts keeps; without
+    # them those bytes would read as the provider's data too.
+    # No match is a normal answer, not a miss: a host on the journald driver writes no json log.
+    total = 0
+    for path in glob.glob(f"/proc/1/root{docker_root_dir}/containers/*/*.log*"):
+        try:
+            total += os.stat(path).st_blocks * 512
+        except OSError:
+            continue
+    return total
+
+
+def get_host_disk_usage():
+    # total/used/free of the filesystem that holds docker's data root — where rented containers,
+    # images and volumes land — read through PID 1's root like the walks above. `/` is this
+    # container's own overlay: on a host with /var/lib/docker on its own partition it reported the
+    # root partition, so a 5 TB docker volume listed as 1.8 TB (ticket-0286, DAH-2771). Without a
+    # docker answer, or outside the executor container, `/` stays the measurement.
     try:
-        speedtest_cmd = run_cmd("/root/app/.venv/bin/speedcheck run --type ookla")
-        json_start = speedtest_cmd.find('{')
-        json_str = speedtest_cmd[json_start:]
-        speedtest_data = json.loads(json_str)
-        data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
-        data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+    host_docker_root = f"/proc/1/root{docker_root_dir}"
+    if os.path.isdir(host_docker_root):
+        return shutil.disk_usage(host_docker_root)
+    return shutil.disk_usage("/")
 
-def netmeasure_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd(f"/root/app/.venv/bin/netmeasure speedtest_dotnet")
-        download_match = re.search(r'Download Rate: ([\d.]+) bit/s', speedtest_cmd)
-        upload_match = re.search(r'Upload Rate: ([\d.]+) bit/s', speedtest_cmd)
 
-        if download_match and upload_match:
-            download_speed = float(download_match.group(1))
-            upload_speed = float(upload_match.group(1))
-            
-            # Convert to Mbps
-            data["download_speed"] = download_speed / 1_000_000 # Convert to Mbps 
-            data["upload_speed"] = upload_speed / 1_000_000 # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
+def get_docker_disk_usage():
+    # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
+    df = docker_api_get("/system/df")
+    containers = sum(
+        max(int(container.get("SizeRw") or 0), 0) for container in df.get("Containers") or []
+    )
+    volumes = sum(
+        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+    )
+    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    volumes += get_vloopback_volume_bytes(docker_root_dir)
+    containers += get_container_log_bytes(docker_root_dir)
 
-def benchmark_network_speed():
-    """Benchmark network speed using different methods"""
-    data = get_network_speed()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    data = speedcheck_output()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    data = netmeasure_output()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    return {"upload_speed": None, "download_speed": None}
+    # BuildCache rides in the same answer and holds image layers a custom build left behind.
+    # Folded into images: unenumerated docker bytes read as the provider's own data downstream.
+    build_cache = sum(
+        max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
+    )
+
+    return {
+        "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
+        "hard_disk_containers": containers // 1024,
+        "hard_disk_volumes": volumes // 1024,
+    }
+
+
+def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float]]:
+    # per-container CPU in core-percent ("897.45%" = ~9 cores). `stats --no-stream` does its own
+    # two-sample delta, one call for all containers. Keyed by the 12-char id stats prints.
+    # The host CPU is sampled over the SAME window (reset counter -> stats -> read), because the
+    # host-minus-containers attribution is only valid when both sides cover the same seconds —
+    # data_cpu's own sample runs ~10s later, after two `docker run` capability tests.
+    # `timeout 30` bounds a wedged docker daemon: the signal degrades instead of hanging the
+    # whole (fatal) machine scrape.
+    psutil.cpu_percent(interval=None)
+    result = run_cmd(f'timeout 30 {docker_path} stats --no-stream --format "{{{{.ID}}}}|{{{{.CPUPerc}}}}"')
+    host_cpu_percent = psutil.cpu_percent(interval=None)
+    # An unparsable row means a container whose CPU the window cannot account for — let the
+    # ValueError escape so the caller voids the whole CPU signal for this cycle (fail-safe)
+    # instead of silently booking that container's load to the provider.
+    cpu_percent_by_short_id = {}
+    for line in result.strip().splitlines():
+        short_id, _, raw_percent = line.partition('|')
+        cpu_percent_by_short_id[short_id.strip()] = float(raw_percent.strip().rstrip('%'))
+    return host_cpu_percent, cpu_percent_by_short_id
+
 
 def get_docker_info(content: bytes):
     data = {
@@ -688,8 +811,25 @@ def get_docker_info(content: bytes):
         result = run_cmd(f'{docker_path} version --format "{{{{.Client.Version}}}}"')
         data["docker_version"] = result.strip()
 
+        # stats runs BEFORE ps on purpose: a container started between the two calls then
+        # appears in ps without a stats row, which voids the CPU attribution for the cycle
+        # (fail-safe) instead of silently counting that container's CPU as provider-side.
+        try:
+            host_cpu_percent, cpu_percents = get_container_cpu_percents(docker_path)
+        except Exception:
+            host_cpu_percent, cpu_percents = None, {}
+
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
+
+        # A stats row whose container is gone from ps burned CPU inside the sampled window but
+        # cannot be listed -- the subtraction would book that CPU to the provider, so the host
+        # sample is dropped and the CPU signal voids for this cycle (fail-safe).
+        stats_rows_without_a_container = set(cpu_percents) - {
+            container_id[:12] for container_id in container_ids
+        }
+        if host_cpu_percent is not None and not stats_rows_without_a_container:
+            data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
 
@@ -712,10 +852,11 @@ def get_docker_info(content: bytes):
                 if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
                     data["docker_container_id"] = container_id
 
-            if digest:
-                containers.append({'each_container_id': container_id, 'each_digest': digest, "each_name": container_name})
-            else:
-                containers.append({'each_container_id': container_id, 'each_digest': '', "each_name": container_name})
+            container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
+            cpu_percent = cpu_percents.get(container_id[:12])
+            if cpu_percent is not None:
+                container_entry['each_cpu_percent'] = cpu_percent
+            containers.append(container_entry)
 
         data["docker_containers"] = containers
 
@@ -750,8 +891,12 @@ def get_sha256_checksum_from_file_content(file_content: bytes):
 def get_libnvidia_ml_path():
     try:
         original_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
-        return original_path.split('\n')[-1]
-    except:
+        paths = [p for p in original_path.split('\n') if p]
+        for p in paths:
+            if 'x86_64' in p or 'lib64' in p:
+                return p
+        return paths[0] if paths else ''
+    except Exception:
         return ''
 
 
@@ -831,6 +976,29 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         return False, f"An unexpected error occurred: {e}"
 
 
+SYSBOX_RUNC_CANDIDATES = ("sysbox-runc", "/usr/bin/sysbox-runc", "/usr/local/bin/sysbox-runc")
+SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*([0-9A-Za-z.+~_-]{1,32})", re.MULTILINE)
+
+
+def get_sysbox_version() -> str | None:
+    """The host's `sysbox-runc --version` (e.g. "0.6.4"), telemetry only. None when Sysbox is absent
+    or the command fails or cannot run. The absolute paths are tried through PID 1's root, since the
+    executor container does not carry the host's binary on its PATH."""
+    for candidate in SYSBOX_RUNC_CANDIDATES:
+        binary = HOST_ROOT_PREFIX + candidate if candidate.startswith("/") else candidate
+        try:
+            result = subprocess.run(
+                [binary, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if result.returncode != 0:
+            continue
+        match = SYSBOX_VERSION_PATTERN.search(result.stdout)
+        if match:
+            return match.group(1)
+    return None
+
 
 def check_storage_limit_ability() -> tuple[bool, str]:
     """
@@ -857,6 +1025,768 @@ def check_storage_limit_ability() -> tuple[bool, str]:
 
     except Exception as e:
         return False, f"An unexpected error occurred: {e}"
+
+
+NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+PROC_SELF_STATUS_PATH = "/proc/self/status"
+NVIDIACTL_PATH = "/dev/nvidiactl"
+INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
+# Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
+# is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
+# IPV4_MAPPED_GID_PREFIX below, never on a position.
+GID_TABLE_ENTRIES_READ = 4
+IPV4_MAPPED_GID_PREFIX = "0000:0000:0000:0000:0000:ffff:"
+
+
+class NcuProfilingObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, access: str, scrape_error: str) -> None:
+        self.access = access
+        self.scrape_error = scrape_error
+
+
+def check_ncu_profiling_access() -> NcuProfilingObservation:
+    # Host driver flag RmProfilingAdminOnly: 0 -> GPU performance counters open to every workload
+    # on the host ("unrestricted"), 1 -> admin-only ("restricted"). Anything unreadable stays
+    # "unknown" - the backend fails closed on it; never guess a value.
+    try:
+        with open(NVIDIA_PARAMS_PATH) as params_file:
+            params_content = params_file.read()
+    except Exception as e:
+        return NcuProfilingObservation("unknown", f"Cannot read {NVIDIA_PARAMS_PATH}: {e}")
+
+    match = re.search(r"^RmProfilingAdminOnly:\s*(\d+)\s*$", params_content, re.M)
+    if match is None:
+        return NcuProfilingObservation(
+            "unknown", "RmProfilingAdminOnly not present in nvidia driver params"
+        )
+
+    flag_value = match.group(1)
+    if flag_value == "0":
+        return NcuProfilingObservation("unrestricted", "")
+    if flag_value == "1":
+        return NcuProfilingObservation("restricted", "")
+    return NcuProfilingObservation(
+        "unknown", f"Unexpected RmProfilingAdminOnly value: {flag_value}"
+    )
+
+
+class GpuPowerCapProbe:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, cap_eff: str, nvidiactl_owner_uid: int | None, scrape_error: str) -> None:
+        self.cap_eff = cap_eff
+        self.nvidiactl_owner_uid = nvidiactl_owner_uid
+        self.scrape_error = scrape_error
+
+
+def probe_gpu_power_cap_ability() -> GpuPowerCapProbe:
+    # DAH-2704: `nvidia-smi -pl` (the PEARL filler's power cap) exits 4 unless the executor container
+    # holds CAP_SYS_ADMIN *and* its root owns /dev/nvidiactl - a sysbox userns maps the device to
+    # nobody while keeping every capability, so neither reading alone tells the two apart. Report both
+    # raw values and let the backend decide; an unreadable one stays empty/None, never a guess.
+    # /proc/self/status is this scrape's own process, which is meaningful only because the scrape and
+    # the validator's `nvidia-smi -pl` run in the same SSH context - keep them together.
+    scrape_errors: list[str] = []
+
+    cap_eff: str = ""
+    try:
+        with open(PROC_SELF_STATUS_PATH) as status_file:
+            status_content = status_file.read()
+        match = re.search(r"^CapEff:\s*([0-9a-fA-F]+)\s*$", status_content, re.M)
+        if match is None:
+            scrape_errors.append(f"CapEff not present in {PROC_SELF_STATUS_PATH}")
+        else:
+            cap_eff = match.group(1)
+    except Exception as e:
+        scrape_errors.append(f"Cannot read {PROC_SELF_STATUS_PATH}: {e}")
+
+    nvidiactl_owner_uid: int | None = None
+    try:
+        nvidiactl_owner_uid = os.stat(NVIDIACTL_PATH).st_uid
+    except Exception as e:
+        scrape_errors.append(f"Cannot stat {NVIDIACTL_PATH}: {e}")
+
+    return GpuPowerCapProbe(cap_eff, nvidiactl_owner_uid, "; ".join(scrape_errors))
+
+
+def get_host_boot_id() -> str:
+    # Reboot marker: the profiling flag only changes on a driver reload/reboot, so a changed
+    # boot_id tells the backend a stale observation may have flipped (DAH-2182).
+    try:
+        with open(BOOT_ID_PATH) as boot_id_file:
+            return boot_id_file.read().strip()
+    except Exception:
+        return ""
+
+
+def read_sysfs_value(path: str) -> str:
+    try:
+        with open(path) as sysfs_file:
+            return sysfs_file.read().strip()
+    except Exception:
+        return ""
+
+
+class InfinibandPort:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(
+        self,
+        device: str,
+        port: str,
+        node_guid: str,
+        sys_image_guid: str,
+        link_layer: str,
+        state: str,
+        phys_state: str,
+        rate: str,
+        lid: str,
+        sm_lid: str,
+        pkey: str,
+        gids: list[str],
+    ) -> None:
+        self.device = device
+        self.port = port
+        self.node_guid = node_guid
+        self.sys_image_guid = sys_image_guid
+        self.link_layer = link_layer
+        self.state = state
+        self.phys_state = phys_state
+        self.rate = rate
+        self.lid = lid
+        self.sm_lid = sm_lid
+        self.pkey = pkey
+        self.gids = gids
+
+    def as_payload(self) -> dict[str, str | list[str]]:
+        return {
+            "ib_device": self.device,
+            "ib_port": self.port,
+            "ib_node_guid": self.node_guid,
+            "ib_sys_image_guid": self.sys_image_guid,
+            "ib_link_layer": self.link_layer,
+            "ib_state": self.state,
+            "ib_phys_state": self.phys_state,
+            "ib_rate": self.rate,
+            "ib_lid": self.lid,
+            "ib_sm_lid": self.sm_lid,
+            "ib_pkey": self.pkey,
+            "ib_gids": self.gids,
+        }
+
+
+def read_infiniband_port(
+    device_path: str, node_guid: str, sys_image_guid: str, port_path: str
+) -> InfinibandPort:
+    # Whole GID table, not just gids/0: every prod port carries the default fe80:: prefix, so the
+    # prefix alone identifies nothing. The IPv4-mapped entry is the one that tells two Ethernet
+    # ports they share a segment - find it by IPV4_MAPPED_GID_PREFIX, its index moves by driver.
+    gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
+    # POSITIONAL ON PURPOSE: obfuscator.py renames __init__ parameters but leaves keyword names at
+    # the call site, so a keyword call raises TypeError in the packaged scrape and nowhere else.
+    # That is what made the first prod rollout return an empty list on every host (DAH-2571).
+    return InfinibandPort(
+        os.path.basename(device_path),
+        os.path.basename(port_path),
+        node_guid,
+        sys_image_guid,
+        read_sysfs_value(f"{port_path}/link_layer"),
+        read_sysfs_value(f"{port_path}/state"),
+        read_sysfs_value(f"{port_path}/phys_state"),
+        read_sysfs_value(f"{port_path}/rate"),
+        read_sysfs_value(f"{port_path}/lid"),
+        read_sysfs_value(f"{port_path}/sm_lid"),
+        read_sysfs_value(f"{port_path}/pkeys/0"),
+        [gid for gid in gids if gid],
+    )
+
+
+class InfinibandObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, ports: list[InfinibandPort], scrape_error: str) -> None:
+        self.ports = ports
+        self.scrape_error = scrape_error
+
+
+def get_infiniband_ports() -> InfinibandObservation:
+    """Every RDMA port the host exposes, as reported by the kernel (DAH-2571).
+
+    Facts only - which ports are usable and which fabric each one sits on. Deciding whether two
+    machines are on the same fabric is the backend's job: it needs both hosts, this sees one.
+
+    An empty port list has three different causes and they must stay distinguishable: the host has
+    no RDMA hardware, the scrape cannot see the sysfs tree from where it runs, or the walk itself
+    failed. Reporting [] for all three is what made the first prod rollout unreadable - every
+    executor came back empty, including hosts known to carry 24 mlx5 devices, with no way to tell
+    which case it was.
+    """
+    if not os.path.isdir(INFINIBAND_SYSFS_PATH):
+        return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} does not exist")
+
+    ports: list[InfinibandPort] = []
+    try:
+        # os.listdir, not glob: glob swallows EACCES/EIO and returns [], which would be reported as
+        # "lists no devices" - the same kind of silent nothing this function exists to stop.
+        device_names = sorted(os.listdir(INFINIBAND_SYSFS_PATH))
+        for device_name in device_names:
+            device_path = f"{INFINIBAND_SYSFS_PATH}/{device_name}"
+            node_guid = read_sysfs_value(f"{device_path}/node_guid")
+            sys_image_guid = read_sysfs_value(f"{device_path}/sys_image_guid")
+            ports_path = f"{device_path}/ports"
+            if not os.path.isdir(ports_path):
+                continue
+            for port_name in sorted(os.listdir(ports_path)):
+                ports.append(
+                    read_infiniband_port(device_path, node_guid, sys_image_guid, f"{ports_path}/{port_name}")
+                )
+    except Exception as e:
+        # An interconnect reading is never worth failing the whole machine scrape over, but the
+        # reason has to travel with the empty result.
+        return InfinibandObservation(ports, f"Error walking {INFINIBAND_SYSFS_PATH}: {e}")
+
+    if not device_names:
+        return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} lists no devices")
+    if not ports:
+        return InfinibandObservation([], f"{len(device_names)} device(s) present, none exposing a port")
+    return InfinibandObservation(ports, "")
+
+
+# GPU-to-GPU interconnect (DAH-2922). Two "8x H200" listings can differ in whether the cards share
+# NVLink and allow peer-to-peer at all; tensor-parallel and FSDP jobs run several times slower on
+# PCIe and NCCL does not start where P2P is off. nvidia-smi is the source because it is what a
+# renter runs first on the pod, so what the listing says and what the renter sees cannot disagree.
+NVIDIA_SMI_TOPO_MATRIX_CMD = "nvidia-smi topo -m"
+NVIDIA_SMI_TOPO_P2P_READ_CMD = "nvidia-smi topo -p2p r"
+NVIDIA_SMI_NVLINK_STATUS_CMD = "nvidia-smi nvlink -s"
+# nvidia-smi's own classes, worst first: SYS crosses the inter-socket link, PIX is one PCIe switch.
+PCIE_LINK_CLASSES_WORST_FIRST = ["SYS", "NODE", "PHB", "PXB", "PIX"]
+TOPO_GPU_LABEL_PATTERN = r"^GPU\d+$"
+TOPO_NVLINK_CELL_PATTERN = r"^NV(\d+)$"
+NVLINK_ACTIVE_LINK_PATTERN = r"Link \d+: [\d.]+ GB/s"
+NVLINK_GPU_HEADER_PATTERN = r"^GPU \d+:"
+
+
+def parse_topology_matrix(output):
+    """The GPU-by-GPU cells of an `nvidia-smi topo -m` or `nvidia-smi topo -p2p r` table.
+
+    Returns (labels, rows): labels in table order ("GPU0", ...), rows[i][j] the cell for
+    (labels[i], labels[j]). NIC columns/rows and the affinity columns are dropped so the matrix is
+    square; the legend is ignored. ([], []) when the output has no GPU header row.
+    """
+    header = None
+    gpu_columns = []
+    labels = []
+    rows = []
+    for line in output.splitlines():
+        cells = [cell.strip() for cell in re.split(r"\t+|\s{2,}", line.rstrip())]
+        if header is None:
+            if len(cells) > 1 and cells[0] == "" and re.match(TOPO_GPU_LABEL_PATTERN, cells[1]):
+                header = cells
+                gpu_columns = [index for index, cell in enumerate(cells) if re.match(TOPO_GPU_LABEL_PATTERN, cell)]
+            continue
+        if not cells or not re.match(TOPO_GPU_LABEL_PATTERN, cells[0]):
+            continue
+        if len(cells) <= max(gpu_columns):
+            continue
+        labels.append(cells[0])
+        rows.append([cells[index] for index in gpu_columns])
+    return labels, rows
+
+
+def count_active_nvlinks_per_gpu(output):
+    """Active NVLink count per GPU block of `nvidia-smi nvlink -s`; [] when no GPU block is listed."""
+    counts = []
+    for line in output.splitlines():
+        if re.match(NVLINK_GPU_HEADER_PATTERN, line.strip()):
+            counts.append(0)
+        elif counts and re.search(NVLINK_ACTIVE_LINK_PATTERN, line):
+            counts[-1] += 1
+    return counts
+
+
+class GpuInterconnectObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, payload, scrape_error):
+        self.payload = payload
+        self.scrape_error = scrape_error
+
+
+def summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output):
+    """Facts a renter needs from the three nvidia-smi tables, in one flat payload.
+
+    nvlink is True only when EVERY GPU pair is joined by NVLink (what an HGX board looks like); a
+    4-GPU box with two NVLink bridges is not "NVLink" for a TP=4 job. p2p is True only when every
+    pair reads OK. Both are None when the table is missing or the host has a single GPU.
+    """
+    labels, rows = parse_topology_matrix(topo_output)
+    gpu_count = len(labels)
+    gpu_pairs = gpu_count * (gpu_count - 1) // 2
+    nvlink_pairs = 0
+    nvlink_link_counts = []
+    pcie_classes_seen = set()
+    for i in range(gpu_count):
+        for j in range(i + 1, gpu_count):
+            cell = rows[i][j]
+            nv_match = re.match(TOPO_NVLINK_CELL_PATTERN, cell)
+            if nv_match:
+                nvlink_pairs += 1
+                nvlink_link_counts.append(int(nv_match.group(1)))
+            elif cell in PCIE_LINK_CLASSES_WORST_FIRST:
+                pcie_classes_seen.add(cell)
+
+    pcie_class = None
+    for candidate in PCIE_LINK_CLASSES_WORST_FIRST:
+        if candidate in pcie_classes_seen:
+            pcie_class = candidate
+            break
+
+    p2p = None
+    p2p_pairs = None
+    p2p_ok_pairs = None
+    if p2p_output is not None:
+        p2p_labels, p2p_rows = parse_topology_matrix(p2p_output)
+        p2p_count = len(p2p_labels)
+        p2p_pairs = p2p_count * (p2p_count - 1) // 2
+        p2p_ok_pairs = 0
+        for i in range(p2p_count):
+            for j in range(i + 1, p2p_count):
+                if p2p_rows[i][j] == "OK":
+                    p2p_ok_pairs += 1
+        if p2p_pairs > 0:
+            p2p = p2p_ok_pairs == p2p_pairs
+
+    nvlink_active_links = None
+    if nvlink_output is not None:
+        active_counts = count_active_nvlinks_per_gpu(nvlink_output)
+        if active_counts:
+            nvlink_active_links = min(active_counts)
+
+    return {
+        "ic_devices": gpu_count,
+        "ic_gpu_pairs": gpu_pairs,
+        "ic_nvlink": (nvlink_pairs == gpu_pairs) if gpu_pairs > 0 else None,
+        "ic_nvlink_pairs": nvlink_pairs,
+        "ic_nvlink_links": min(nvlink_link_counts) if nvlink_link_counts else None,
+        "ic_nvlink_active_links": nvlink_active_links,
+        "ic_pcie_class": pcie_class,
+        "ic_p2p": p2p,
+        "ic_p2p_pairs": p2p_pairs,
+        "ic_p2p_ok_pairs": p2p_ok_pairs,
+        "ic_matrix": rows,
+    }
+
+
+def get_gpu_interconnect():
+    """Run the three nvidia-smi topology tables and summarize them; never fails the scrape.
+
+    `topo -m` is required - without it there is nothing to report and the reason travels in
+    scrape_error. `topo -p2p r` and `nvlink -s` are optional: older drivers and PCIe-only cards exit
+    non-zero on them, which is itself the answer, so their fields are None and the error is kept.
+    """
+    errors = []
+    try:
+        topo_output = run_cmd(NVIDIA_SMI_TOPO_MATRIX_CMD)
+    except Exception as exc:
+        return GpuInterconnectObservation(None, f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: {exc!r}"[:400])
+
+    p2p_output = None
+    try:
+        p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
+    except Exception as exc:
+        errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
+
+    nvlink_output = None
+    try:
+        nvlink_output = run_cmd(NVIDIA_SMI_NVLINK_STATUS_CMD)
+    except Exception as exc:
+        errors.append(f"{NVIDIA_SMI_NVLINK_STATUS_CMD}: {exc!r}"[:200])
+
+    try:
+        payload = summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output)
+    except Exception as exc:
+        return GpuInterconnectObservation(None, f"parse: {exc!r}"[:400])
+    return GpuInterconnectObservation(payload, "; ".join(errors))
+
+
+# DAH-2928: the host's own view of the disk that holds the containers. The scrape shares the host
+# PID namespace (see the /proc/1/root walks above), so /proc/1/mounts is the host mount table.
+HOST_MOUNTS_PATH = "/proc/1/mounts"
+HOST_ROOT_PREFIX = "/proc/1/root"
+# errno values, spelled out because the packaged scrape cannot import errno (obfuscator allowlist)
+ERRNO_EIO = 5
+ERRNO_ENOSPC = 28
+ERRNO_EROFS = 30
+ERRNO_EDQUOT = 122
+# mount options under which a write to the filesystem fails with EROFS: `ro`, and the `emergency_ro`
+# that kernels 6.6+ add (next to a kept `rw`) when ext4 honours errors=remount-ro after an error
+READ_ONLY_MOUNT_OPTIONS = frozenset({"ro", "emergency_ro"})
+
+
+class DiskHealthObservation:
+    def __init__(
+        self,
+        docker_root_dir: str,
+        read_only_mounts: list[str],
+        write_probe: str,
+        write_probe_error: str,
+    ) -> None:
+        self.docker_root_dir = docker_root_dir
+        self.read_only_mounts = read_only_mounts
+        self.write_probe = write_probe
+        self.write_probe_error = write_probe_error
+
+    def as_payload(self) -> dict:
+        return {
+            "dh_docker_root_dir": self.docker_root_dir,
+            "dh_read_only_mounts": self.read_only_mounts,
+            "dh_write_probe_error": self.write_probe_error,
+            "dh_write_probe": self.write_probe,
+        }
+
+
+def mounts_holding(mounts_text: str, path: str) -> list[str]:
+    """The mount point a write to `path` lands on, when that filesystem is mounted read-only.
+
+    `mounts_text` is /proc/<pid>/mounts. Only the covering mount counts - the longest mount point
+    that is `path` or a parent of it, the last line winning when a point is mounted over - because
+    a mount above it says nothing about writes below: `ro /` with `rw /var/lib/docker` is a docker
+    root that takes writes, and returns []. Read-only is the `ro` option, or `emergency_ro`: since
+    kernel 6.6 an ext4 error under errors=remount-ro keeps `rw` in the options and adds
+    `emergency_ro` instead. One element or none; a list so the payload shape holds."""
+    covering = covering_mount(mounts_text, path)
+    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering.options):
+        return []
+    return [covering.mount_point]
+
+
+class MountLine:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, source: str, mount_point: str, options: list[str]) -> None:
+        self.source = source
+        self.mount_point = mount_point
+        self.options = options
+
+
+def covering_mount(mounts_text: str, path: str) -> MountLine | None:
+    """The /proc/<pid>/mounts line whose filesystem a write to `path` lands on; None when no line
+    covers the path.
+
+    The longest mount point that is `path` or a parent of it, the last line winning when a point
+    is mounted over. One rule for both readers of the mount table (`mounts_holding`,
+    `block_device_holding`), so the disk that is judged read-only is the disk that is typed."""
+    covering: MountLine | None = None
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        mount_point = fields[1]
+        if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
+            continue
+        if covering is None or len(mount_point) >= len(covering.mount_point):
+            covering = MountLine(fields[0], mount_point, fields[3].split(","))
+    return covering
+
+
+# DAH-3674: the kind of disk under docker's data root, published as `hard_disk.disk_type` on the
+# public nodes feed (lium-platform). A reading, not a verdict: nothing scores or gates on it.
+SYS_CLASS_BLOCK_PATH = "/sys/class/block"
+SYS_DEV_BLOCK_PATH = "/sys/dev/block"
+SYS_DMI_ID_PATH = "/sys/class/dmi/id"
+SYS_HYPERVISOR_TYPE_PATH = "/sys/hypervisor/type"
+PROC_CPUINFO_PATH = "/proc/cpuinfo"
+# st_mode's file-type bits and the block-device value, spelled out because the packaged scrape cannot
+# import stat (obfuscator allowlist)
+ST_MODE_TYPE_MASK = 0o170000
+ST_MODE_BLOCK_DEVICE = 0o060000
+DISK_TYPE_NVME = "nvme"
+DISK_TYPE_SSD = "ssd"
+DISK_TYPE_HDD = "hdd"
+DISK_TYPE_UNKNOWN = "unknown"
+# Devices with no physical disk of their own and nothing under `slaves/` to follow: a loop file,
+# a network block device. A device-mapper (LVM / dm-crypt) or md RAID device lands here only when
+# sysfs lists no slaves for it; with slaves it is typed by the disks underneath.
+UNTYPED_DEVICE_PREFIXES = ("dm-", "md", "loop", "nbd", "rbd", "drbd")
+# How many layers of `slaves/` to follow (LVM over LUKS over md RAID is three); sysfs is a tree,
+# the cap only bounds a broken one.
+STACKED_DEVICE_MAX_DEPTH = 8
+# DAH-3746: a virtual disk's `rotational` flag describes the hypervisor's emulated controller, not
+# the disk behind it: virtio `vd*` reports 1 whatever backs it (measured on a virtio VM, 19 Sep
+# 2026), and QEMU's emulated SATA/SCSI `sda` reported 1 on 34 of 35 checked VMs (QEMU, DigitalOcean,
+# 21 Sep 2026) whatever the host's storage is. A VM's disk is unknown, never hdd. Three tells, any
+# one enough: the device name (virtio, Xen), the disk's SCSI vendor/model (`QEMU HARDDISK`,
+# DigitalOcean's `DO Volume`, VirtualBox, VMware, Hyper-V, EC2/GCE volumes), and the host's DMI
+# vendor/product, `/sys/hypervisor/type` (what systemd-detect-virt reads), or the `hypervisor`
+# flag in `/proc/cpuinfo` (every x86 hypervisor sets it; a VM whose DMI names no listed vendor
+# still reads unknown without it). A bare-metal EC2
+# `.metal` instance carries `Amazon EC2` in DMI and reads unknown too - the marker list, not the
+# flag, is where that would change.
+VIRTUAL_DISK_PREFIXES = ("vd", "xvd")
+VIRTUAL_DISK_IDENTITY_MARKERS = (
+    "qemu",
+    "virtio",
+    "0x1af4",  # the virtio PCI vendor id, what a virtio-blk disk's device/vendor reads
+    "do volume",
+    "vbox",
+    "vmware",
+    "msft virtual",
+    "google persistentdisk",
+    "amazon elastic block store",
+    "amazon ec2 nvme",
+    "xen",
+)
+VIRTUAL_MACHINE_DMI_MARKERS = (
+    "qemu",
+    "kvm",
+    "bochs",
+    "digitalocean",
+    "droplet",
+    "amazon ec2",
+    "google",
+    "microsoft corporation",
+    "virtual machine",
+    "vmware",
+    "virtualbox",
+    "innotek",
+    "xen",
+    "openstack",
+    "parallels",
+    "bhyve",
+    "standard pc (",
+)
+
+
+def block_device_holding(mounts_text: str, path: str) -> str | None:
+    """The kernel name (`nvme1n1p1`, `sda2`, `dm-0`) of the block device whose filesystem holds
+    `path`; None when nothing covers it or the covering mount is not a /dev node (overlay, tmpfs,
+    a network filesystem).
+
+    The source is stat'ed through PID 1's root and named by its major:minor in /sys/dev/block, so a
+    `/dev/disk/by-uuid/...` or `/dev/mapper/...` link in the mount table reads as the node the kernel
+    names it by. stat follows the /proc/1/root magic link in the kernel; a userspace walk
+    (os.path.realpath) does not - readlink answers `/` and the walk carries on in this container's
+    own /dev, which has the nodes and none of udev's links. When the stat or the sysfs read fails
+    (a scrape run outside the executor container, a node sysfs does not list) the name as mounted is
+    the reading; a by-uuid link then types as unknown downstream."""
+    covering = covering_mount(mounts_text, path)
+    if covering is None or not covering.source.startswith("/dev/"):
+        return None
+    kernel_name = kernel_name_of_device_node(f"{HOST_ROOT_PREFIX}{covering.source}")
+    return kernel_name or os.path.basename(covering.source) or None
+
+
+def kernel_name_of_device_node(node_path: str) -> str | None:
+    """The kernel name (`nvme0n1p2`, `dm-3`) of the block device node at `node_path`, or None when
+    the path is not a block device or sysfs does not list its major:minor.
+
+    /sys/dev/block/<major>:<minor> is a link into the device's sysfs directory, whose last component
+    is the kernel name - the one /sys/class/block indexes by, so `whole_disk_of` can take it from
+    here. No udev needed: the node's st_rdev is the device number whatever name it was mounted by."""
+    try:
+        node_stat = os.stat(node_path)
+        if node_stat.st_mode & ST_MODE_TYPE_MASK != ST_MODE_BLOCK_DEVICE:
+            return None
+        device_number = f"{os.major(node_stat.st_rdev)}:{os.minor(node_stat.st_rdev)}"
+        return os.path.basename(os.readlink(f"{SYS_DEV_BLOCK_PATH}/{device_number}")) or None
+    except OSError:
+        return None
+
+
+def whole_disk_of(device_name: str) -> str:
+    """`nvme0n1p1` -> `nvme0n1`, `sda1` -> `sda`; a whole disk comes back unchanged.
+
+    sysfs says which is which: a partition's `/sys/class/block/<name>` carries a `partition` file
+    and resolves into its disk's directory. Read from the kernel rather than parsed off the name,
+    because the naming differs per driver (`sda1`, `nvme0n1p1`, `mmcblk0p1`)."""
+    device_path = f"{SYS_CLASS_BLOCK_PATH}/{device_name}"
+    if not os.path.exists(f"{device_path}/partition"):
+        return device_name
+    return os.path.basename(os.path.dirname(os.path.realpath(device_path)))
+
+
+def read_sysfs_text(path: str) -> str:
+    """The stripped text of one sysfs attribute, '' when it is missing or unreadable."""
+    try:
+        with open(path) as attribute_file:
+            return attribute_file.read().strip()
+    except Exception:
+        return ""
+
+
+def host_is_a_virtual_machine() -> bool:
+    """True when the host runs under a hypervisor: its DMI vendor or product names one (QEMU/KVM,
+    DigitalOcean, EC2, GCE, Hyper-V, VMware, VirtualBox, Xen, OpenStack, ...), `/sys/hypervisor/type`
+    exists (Xen), or `/proc/cpuinfo` carries the `hypervisor` flag (every x86 hypervisor sets it).
+    Bare metal names its board maker (Supermicro, Dell, ASUS, Gigabyte) and has neither tell."""
+    for attribute in ("sys_vendor", "product_name"):
+        dmi_text = read_sysfs_text(f"{SYS_DMI_ID_PATH}/{attribute}").lower()
+        if dmi_text and any(marker in dmi_text for marker in VIRTUAL_MACHINE_DMI_MARKERS):
+            return True
+    if read_sysfs_text(SYS_HYPERVISOR_TYPE_PATH):
+        return True
+    return _cpuinfo_has_hypervisor_flag()
+
+
+def _cpuinfo_has_hypervisor_flag() -> bool:
+    """True when `/proc/cpuinfo` lists `hypervisor` among the CPU flags."""
+    for line in read_sysfs_text(PROC_CPUINFO_PATH).splitlines():
+        if line.startswith("flags") or line.startswith("Flags"):
+            flags = f" {line.split(':', 1)[-1]} "
+            return " hypervisor " in flags
+    return False
+
+
+def disk_is_virtual(disk: str) -> bool:
+    """True when a whole disk is a hypervisor's emulated one: named by a paravirtual driver
+    (`vd*`, `xvd*`), or its SCSI/ATA `device/vendor` + `device/model` says so (`QEMU HARDDISK`,
+    `DO Volume`, `VBOX HARDDISK`, `VMware Virtual disk`, `Msft Virtual Disk`, ...). A real disk
+    names its maker and model there (`ATA Samsung SSD 870`, `SEAGATE ST16000NM`)."""
+    if disk.startswith(VIRTUAL_DISK_PREFIXES):
+        return True
+    identity = " ".join(
+        read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/device/{attribute}")
+        for attribute in ("vendor", "model")
+    ).lower()
+    return any(marker in identity for marker in VIRTUAL_DISK_IDENTITY_MARKERS)
+
+
+def slaves_of(disk: str) -> list[str]:
+    """The kernel names under `/sys/class/block/<disk>/slaves/` - the devices a stacked one (LVM,
+    dm-crypt, md RAID) is built on; [] for a plain disk or when sysfs has no such directory."""
+    try:
+        return sorted(os.listdir(f"{SYS_CLASS_BLOCK_PATH}/{disk}/slaves"))
+    except Exception:
+        return []
+
+
+def slowest_disk_type(disk_types: list[str]) -> str:
+    """The type of a stacked device. Members that resolve to different kinds (hdd vs ssd vs nvme)
+    read ``unknown`` — a mixed stack has no single kind. Unknown members are skipped, so a stack is
+    unknown when none of its members resolves or when the resolved members differ. One resolved
+    kind, repeated, is that kind."""
+    known = {disk_type for disk_type in disk_types if disk_type != DISK_TYPE_UNKNOWN}
+    if len(known) == 1:
+        return known.pop()
+    return DISK_TYPE_UNKNOWN
+
+
+def disk_type_following_slaves(device_name: str, depth: int) -> str:
+    """`disk_type_of` for one device, recursing through its slaves; `depth` is how deep this call
+    already is in the stack."""
+    disk = whole_disk_of(device_name)
+    slaves = slaves_of(disk)
+    if slaves:
+        if depth >= STACKED_DEVICE_MAX_DEPTH:
+            return DISK_TYPE_UNKNOWN
+        return slowest_disk_type(
+            [disk_type_following_slaves(slave, depth + 1) for slave in slaves]
+        )
+    if disk.startswith(UNTYPED_DEVICE_PREFIXES) or disk_is_virtual(disk):
+        return DISK_TYPE_UNKNOWN
+    if disk.startswith("nvme"):
+        return DISK_TYPE_NVME
+    rotational = read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/queue/rotational")
+    if rotational == "0":
+        return DISK_TYPE_SSD
+    if rotational == "1":
+        return DISK_TYPE_HDD
+    return DISK_TYPE_UNKNOWN
+
+
+def disk_type_of(device_name: str | None) -> str:
+    """nvme | ssd | hdd | unknown for the physical disk(s) behind a block device name.
+
+    A partition is walked up to its whole disk. A stacked device (LVM / dm-crypt `dm-*`, md RAID
+    `md*`) is followed through `slaves/` down to the physical disks: one resolved kind, repeated,
+    is that kind; different resolved kinds, or none, is unknown. `nvme*` is NVMe by name; anything
+    else is what the kernel's `queue/rotational` flag says: 0 is a solid-state disk, 1 a spinning
+    one. A virtual machine's disk, a device with no physical disk behind it (loop, nbd), a missing
+    sysfs entry or any other reading is unknown - never a default of one of the three."""
+    if not device_name or host_is_a_virtual_machine():
+        return DISK_TYPE_UNKNOWN
+    return disk_type_following_slaves(device_name, 0)
+
+
+def get_docker_root_disk_type() -> str:
+    """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+    with open(HOST_MOUNTS_PATH) as mounts_file:
+        mounts_text = mounts_file.read()
+    return disk_type_of(block_device_holding(mounts_text, docker_root_dir))
+
+
+def write_probe_failure_reason(errno_value) -> str:
+    """The reason a write failed because of the disk itself - a container cannot start on any of
+    these - or '' when the errno says where the scrape runs from (EACCES, ENOENT), not what the disk
+    does. A function, not a module-level dict: obfuscator.py renames a name read inside a function,
+    but not one read as a key of a module-level literal."""
+    if errno_value == ERRNO_EROFS:
+        return "read_only"
+    if errno_value == ERRNO_EIO:
+        return "io_error"
+    if errno_value == ERRNO_ENOSPC:
+        return "no_space"
+    if errno_value == ERRNO_EDQUOT:
+        return "quota"
+    return ""
+
+
+def probe_write(directory: str) -> tuple[str, str]:
+    """('ok', '') when a file can be created, written, fsynced and removed under `directory`;
+    ('failed', '<reason>: <error>') when the kernel refused because of the disk - read_only (EROFS),
+    io_error (EIO), no_space (ENOSPC) or quota (EDQUOT); a container cannot start on any of them;
+    ('skipped', error) for anything else (no such directory, no permission from where the scrape runs)."""
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".lium-disk-probe-", dir=directory) as probe:
+            probe.write(b"lium disk probe\n")
+            probe.flush()
+            os.fsync(probe.fileno())
+        return "ok", ""
+    except OSError as e:
+        reason = write_probe_failure_reason(e.errno)
+        if reason:
+            return "failed", f"{reason}: {e.__class__.__name__}: {e}"
+        return "skipped", f"{e.__class__.__name__}: {e}"
+    except Exception as e:
+        return "skipped", f"{e.__class__.__name__}: {e}"
+
+
+def get_disk_health() -> DiskHealthObservation:
+    """Whether the disk that holds the containers is still taking writes (DAH-2928).
+
+    A renter's file on a pod changed on disk after it was written, with no error reaching the
+    container. The scrape reported capacity and usage and nothing about health, so the node kept
+    being listed. Two readings: is the docker root's filesystem mounted read-only, and does a write
+    to it go through. A docker root that refuses writes is a node that cannot start a container;
+    DiskHealthCheck reports it as a warning (no score change) until the reading is proven on live
+    executors.
+    """
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+
+    try:
+        with open(HOST_MOUNTS_PATH) as mounts_file:
+            mounts_text = mounts_file.read()
+    except Exception:
+        mounts_text = ""
+    read_only_mounts = mounts_holding(mounts_text, docker_root_dir)
+
+    host_docker_root = f"{HOST_ROOT_PREFIX}{docker_root_dir}"
+    write_probe, write_probe_error = probe_write(
+        host_docker_root if os.path.isdir(host_docker_root) else docker_root_dir
+    )
+
+    return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
 
 
 def get_machine_specs():
@@ -891,27 +1821,39 @@ def get_machine_specs():
 
         for i in range(device_count):
             handle = nvmlDeviceGetHandleByIndex(i)
-            # graphic_clock = nvmlDeviceGetDefaultApplicationsClock(handle, NVML_CLOCK_GRAPHICS)
-            # memory_clock = nvmlDeviceGetDefaultApplicationsClock(handle, NVML_CLOCK_MEM)
-            # memory_clocks = nvmlDeviceGetSupportedMemoryClocks(handle)
-            # print(graphic_clock)
-            # print(memory_clock)
-            # print(memory_clocks)
-
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
             minor = cuda_compute_capability[1]
 
             # Get GPU utilization rates
             utilization = nvmlDeviceGetUtilizationRates(handle)
+            memory_info = nvmlDeviceGetMemoryInfo(handle)
 
             data["data_gpu"]["gpu_details"].append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
-                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    "gpu.capacity": memory_info.c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    # Not interchangeable with gpu.memory_utilization below: that one is NVML's
+                    # memory-BUS duty cycle, which drops to 0 on a loaded-but-idle GPU.
+                    # Reads a few hundred MB above `nvidia-smi memory.used` because NVML v1 counts the
+                    # driver-reserved block (measured: 386 MB on an A4000, 728 MB on a B200).
+                    "gpu.memory_used_mb": memory_info.c_nvmlMemory_t_used / (1024 ** 2),  # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
+                    "gpu.power_default_limit": safeNvmlValue(
+                        lambda: nvmlDeviceGetPowerManagementDefaultLimit(handle) / 1000
+                    ),
+                    # The lowest cap the host accepts (`nvidia-smi -q -d POWER` "Min Power Limit"). A
+                    # BIOS/driver clamp near the default (measured 409/450 W on 4090s, 518/575 W on
+                    # 5090s) makes `-pl <watts>` settle here instead of at the requested cap, so a
+                    # power-cap guard that only knows the stock default reads a false refusal.
+                    "gpu.power_min_limit": safeNvmlValue(
+                        lambda: nvmlDeviceGetPowerManagementLimitConstraints(handle)[0] / 1000
+                    ),
+                    "gpu.power_max_limit": safeNvmlValue(
+                        lambda: nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] / 1000
+                    ),
                     "gpu.graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
                     "gpu.memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
                     "gpu.pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),
@@ -956,11 +1898,34 @@ def get_machine_specs():
     data["data_sysbox_runtime"] = is_supported
     if not is_supported:
         data["data_sysbox_runtime_scrape_error"] = log_text
+    data["data_sysbox_version"] = get_sysbox_version()
         
     is_supported, log_text = check_storage_limit_ability()
     data["data_storage_limit_supported"] = is_supported
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
+
+    ncu_profiling = check_ncu_profiling_access()
+    data["data_ncu_profiling_access"] = ncu_profiling.access
+    if ncu_profiling.scrape_error:
+        data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
+    data["data_boot_id"] = get_host_boot_id()
+
+    power_cap_probe = probe_gpu_power_cap_ability()
+    data["data_container_cap_eff"] = power_cap_probe.cap_eff
+    data["data_nvidiactl_owner_uid"] = power_cap_probe.nvidiactl_owner_uid
+    if power_cap_probe.scrape_error:
+        data["data_power_cap_probe_error"] = power_cap_probe.scrape_error
+
+    infiniband = get_infiniband_ports()
+    data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]
+    if infiniband.scrape_error:
+        data["data_infiniband_scrape_error"] = infiniband.scrape_error
+
+    interconnect = get_gpu_interconnect()
+    data["data_interconnect"] = interconnect.payload
+    if interconnect.scrape_error:
+        data["data_interconnect_scrape_error"] = interconnect.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")
@@ -999,7 +1964,7 @@ def get_machine_specs():
 
     data["data_hard_disk"] = {}
     try:
-        disk_usage = shutil.disk_usage("/")
+        disk_usage = get_host_disk_usage()
         data["data_hard_disk"] = {
             "hard_disk_total": disk_usage.total // 1024,  # in kB
             "hard_disk_used": disk_usage.used // 1024,
@@ -1010,6 +1975,24 @@ def get_machine_specs():
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
 
+    try:
+        data["data_hard_disk"].update(get_docker_disk_usage())
+    except Exception as exc:
+        # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
+        # node that loses only the breakdown must keep reporting total/used/free.
+        data["hard_disk_docker_scrape_error"] = repr(exc)
+
+    try:
+        data["data_hard_disk"]["hard_disk_disk_type"] = get_docker_root_disk_type()
+    except Exception:
+        # a mount table the scrape cannot read is an unknown disk, not a lost hard_disk block
+        data["data_hard_disk"]["hard_disk_disk_type"] = DISK_TYPE_UNKNOWN
+
+    try:
+        data["data_disk_health"] = get_disk_health().as_payload()
+    except Exception as exc:
+        data["data_disk_health_scrape_error"] = repr(exc)
+
     data["data_os"] = ""
     try:
         data["data_os"] = run_cmd('lsb_release -d | grep -Po "Description:\\s*\\K.*"').strip()
@@ -1017,14 +2000,25 @@ def get_machine_specs():
         # print(f'Error getting os specs: {exc}', flush=True)
         data["os_scrape_error"] = repr(exc)
 
+    # uname reports the host kernel even from inside the container, unlike lsb_release above
+    data["data_kernel"] = ""
+    try:
+        data["data_kernel"] = run_cmd("uname -r").strip()
+    except Exception as exc:
+        data["kernel_scrape_error"] = repr(exc)
+
     
-    data["data_network"] = benchmark_network_speed()
+    data["data_network"] = {}
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",
         "md5_checksums_libnvidia_ml": f"{get_md5_checksum_from_file_content(nvmlLib_content)}:{get_sha256_checksum_from_file_content(nvmlLib_content)}",
         "md5_checksums_docker": f"{get_md5_checksum_from_file_content(docker_content)}:{get_sha256_checksum_from_file_content(docker_content)}",
     }
+
+    if not data.get("data_gpu", {}).get("gpu_details", []):
+        print(json.dumps({"error": "no_gpu_details", "data": data}))
+        sys.exit(1)
 
     return data
 

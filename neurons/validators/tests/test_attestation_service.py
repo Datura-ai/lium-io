@@ -1,0 +1,75 @@
+import json
+import sys
+from pathlib import Path
+from typing import Any
+import asyncssh  # noqa: E402
+import pytest
+from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
+from neurons.validators.src.services.attestation_service import AttestationService  # noqa: E402
+from core.config import settings  # noqa: E402
+
+
+THIS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = THIS_DIR / ".." / ".." / ".."
+VALIDATOR_SRC = REPO_ROOT / "neurons" / "validators" / "src"
+if str(VALIDATOR_SRC) not in sys.path:
+    sys.path.insert(0, str(VALIDATOR_SRC))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+FIXTURE_PATH = THIS_DIR / "fixtures" / "tdx_quote.json"
+VERIFIER_RESPONSE_PATH = THIS_DIR / "fixtures" / "verifier_response.json"
+
+
+def _fixture() -> dict[str, Any]:
+    return json.loads(FIXTURE_PATH.read_text())
+
+
+@pytest.mark.asyncio
+async def test_attestation_service_accepts_fixture_quote(monkeypatch):
+    fixture = _fixture()
+    quote_json = json.dumps(fixture["quote_response"])
+
+    original_call_verifier = AttestationService._call_verifier
+
+    async def fake_call_verifier(self, quote_payload: str, executor: ExecutorSSHInfo) -> dict:
+        if VERIFIER_RESPONSE_PATH.exists():
+            return json.loads(VERIFIER_RESPONSE_PATH.read_text())
+        response = await original_call_verifier(self, quote_payload, executor)
+        VERIFIER_RESPONSE_PATH.write_text(json.dumps(response))
+        return response
+
+    monkeypatch.setattr(AttestationService, "_call_verifier", fake_call_verifier)
+    monkeypatch.setattr(asyncssh, "import_public_key", lambda value: object())
+    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    # This test exercises the verify-and-accept happy path; whitelist gating is a
+    # separate concern. Pin it off so the test is deterministic regardless of a
+    # developer's local .env (which may set ENABLE_ATTESTATION_WHITELIST=True).
+    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
+
+    service = AttestationService()
+    assert service.enabled is True
+
+    executor_info = ExecutorSSHInfo(
+        uuid="test-executor",
+        address="executor.example",
+        port=2222,
+        ssh_username="exec-user",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/opt/executor",
+        port_range=None,
+        port_mappings=None,
+        price=None,
+        ssh_host_key=fixture["host_key"],
+        tdx_quote=quote_json,
+    )
+
+    host_policy = await service.prepare_host_policy(executor_info)
+    assert host_policy.known_hosts is not None
+    assert host_policy.attestation_digest is not None
+    assert host_policy.tee_type == "dstack/tdx"
+    # No GPU evidence supplied and enforcement off → not performed, still passed.
+    assert host_policy.gpu_attestation_passed is None
+    assert host_policy.attestation_passed is True

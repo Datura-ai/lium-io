@@ -1,0 +1,232 @@
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import UUID
+
+import pytest
+
+from services import storage_operations
+
+OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+def _spec() -> dict[str, object]:
+    return {
+        "engine": "restic",
+        "reporter": {
+            "api_url": "https://api.example",
+            "auth_token": "token",
+            "resource": "backup",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_repeated_dispatch_reuses_running_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ssh_client = AsyncMock()
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "_operation_state", AsyncMock(return_value="RUNNING"))
+
+    files = await storage_operations.start_storage_operation(
+        ssh_client,
+        "/usr/bin/python3",
+        OPERATION_ID,
+        _spec(),
+        retain_terminal_artifacts=False,
+    )
+
+    assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert ssh_client.start_sftp_client.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_is_reported_before_the_error_is_reraised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run.side_effect = RuntimeError("ssh failed")
+    report_failure = AsyncMock()
+    monkeypatch.setattr(storage_operations, "_report_launch_failure", report_failure)
+
+    with pytest.raises(RuntimeError, match="ssh failed"):
+        await storage_operations.start_storage_operation(
+            ssh_client,
+            "/usr/bin/python3",
+            OPERATION_ID,
+            _spec(),
+            retain_terminal_artifacts=False,
+        )
+
+    report_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_uses_the_operation_progress_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def read(self) -> bytes:
+            return b"{}"
+
+    class FakeSession:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        def put(self, url: str, **kwargs: object) -> FakeResponse:
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(storage_operations.aiohttp, "ClientSession", FakeSession)
+
+    await storage_operations._report_launch_failure(
+        OPERATION_ID,
+        _spec(),
+        RuntimeError("ssh failed"),
+    )
+
+    assert captured["url"] == f"https://api.example/backup-logs/{OPERATION_ID}/progress"
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["status"] == "FAILED"
+    assert payload["stage"] == "LAUNCH"
+
+
+@pytest.mark.asyncio
+async def test_missing_runner_capability_is_reported_as_launch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run.return_value = SimpleNamespace(exit_status=1, stdout="", stderr="")
+    report_failure = AsyncMock()
+    monkeypatch.setattr(storage_operations, "_report_launch_failure", report_failure)
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError, match="does not support"):
+        await storage_operations.start_storage_operation(
+            ssh_client,
+            "/usr/bin/python3",
+            OPERATION_ID,
+            _spec(),
+            retain_terminal_artifacts=False,
+        )
+
+    report_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_allows_long_running_operation_and_accepts_terminal_status() -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run.side_effect = [
+        SimpleNamespace(exit_status=0, stdout="RUNNING\n", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="STATUS:0\n", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="", stderr=""),
+    ]
+
+    await storage_operations.wait_for_storage_operation(
+        ssh_client,
+        storage_operations.StorageOperationFiles.for_operation(OPERATION_ID),
+        poll_interval_seconds=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_wait_fails_when_seen_runner_disappears_without_status() -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run.side_effect = [
+        SimpleNamespace(exit_status=0, stdout="RUNNING\n", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="EXITED\n", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="runner log", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="", stderr=""),
+    ]
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError, match="disappeared"):
+        await storage_operations.wait_for_storage_operation(
+            ssh_client,
+            storage_operations.StorageOperationFiles.for_operation(OPERATION_ID),
+            poll_interval_seconds=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_waits_for_runner_then_reports_terminal_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run.side_effect = [
+        SimpleNamespace(exit_status=0, stdout='{"reporter":{}}', stderr=""),
+        SimpleNamespace(exit_status=0, stdout="", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="", stderr=""),
+    ]
+    report_cancelled = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", report_cancelled)
+
+    await storage_operations.cancel_storage_operation(ssh_client, OPERATION_ID)
+
+    report_cancelled.assert_awaited_once_with(OPERATION_ID, {"reporter": {}})
+    cancel_command = ssh_client.run.await_args_list[1].args[0]
+    assert f"{OPERATION_ID}.cancel" in cancel_command
+    assert "kill -0" in cancel_command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_status, expected", [(0, True), (3, False)])
+async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field(
+    exit_status, expected
+) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stderr=""))
+
+    supported = await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
+    assert supported is expected
+
+    command = ssh_client.run.await_args.args[0]
+    assert command.startswith("/usr/bin/python3 -c ")
+    assert "WorkspaceSpec.__dataclass_fields__" in command and "'bootstrap'" in command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_status, stderr",
+    [
+        (127, "bash: /usr/bin/python3: No such file or directory"),
+        (1, "ModuleNotFoundError: No module named 'storage'"),
+    ],
+)
+async def test_a_probe_that_cannot_run_is_reported_not_read_as_an_old_image(
+    exit_status, stderr
+) -> None:
+    # review (taiberium): every non-zero exit used to read as "old executor image"; a missing
+    # interpreter (127) or a broken import (1) is a different failure and says so
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stderr=stderr))
+
+    with pytest.raises(RuntimeError, match=rf"exit {exit_status}") as raised:
+        await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
+    assert stderr[-30:] in str(raised.value)
+
+
+def test_bootstrap_probe_finds_the_field_in_this_repo_s_executor_models() -> None:
+    # The probe imports the executor's own storage.models; run it against this checkout's copy
+    # so a renamed field or a wrong sys.path root fails here, not on every encrypted create.
+    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
+    probe = storage_operations._BOOTSTRAP_PROBE.replace("/root/app/src", str(executor_src))
+
+    assert subprocess.run([sys.executable, "-c", probe], check=False).returncode == 0

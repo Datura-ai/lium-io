@@ -1,8 +1,15 @@
 from typing import TYPE_CHECKING
-import argparse
 import pathlib
 
 import bittensor
+from datura.chain import (
+    DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
+    PUBLIC_NODE_SOURCE,
+    ChainEndpoint,
+    chain_endpoint_candidates,
+)
+from core.collateral import DEFAULT_MAX_GAS_PRICE_GWEI, DEFAULT_SENT_RECORD
+from lium_core.shared_config import SharedConfigClient
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,16 +23,14 @@ class DebugSettings(BaseSettings):
     Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
     Use .env for local development (git-ignored).
     """
-    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
-
-    ENABLED: bool = Field(default=False, description="Enable debug mode")
+    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     SKIP_VALIDATOR_REGISTRATION_CHECK: bool = Field(default=False, description="Skip validator registration check")
     SKIP_SYNC_FLOW: bool = Field(default=False, description="Skip sync flow")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     PROJECT_NAME: str = "compute-subnet-miner"
 
     BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
@@ -36,20 +41,33 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID", default=51)
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
+    # Ordered, comma-separated: our proxy first, the public node is always appended last.
+    BITTENSOR_CHAIN_ENDPOINTS: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINTS", default=None)
+    # A failed endpoint is not dialled again for this long; the next ones in the list serve meanwhile.
+    BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS: int = Field(
+        env="BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS", default=DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS
+    )
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
+    COLLATERAL_MAX_GAS_PRICE_GWEI: float = Field(
+        env="COLLATERAL_MAX_GAS_PRICE_GWEI", default=DEFAULT_MAX_GAS_PRICE_GWEI, gt=0
+    )
+    # the collateral client's record of a send whose outcome is not known yet
+    COLLATERAL_SENT_RECORD: str = Field(env="COLLATERAL_SENT_RECORD", default=DEFAULT_SENT_RECORD)
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
 
     EXTERNAL_IP_ADDRESS: str = Field(env="EXTERNAL_IP_ADDRESS")
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     EXTERNAL_PORT: int = Field(env="EXTERNAL_PORT", default=8000)
+    COMPUTE_REST_API_URL: str | None = Field(
+        env="COMPUTE_REST_API_URL", default="https://lium.io/api"
+    )
     ENV: str = Field(env="ENV", default="dev")
 
     MIN_ALPHA_STAKE: int = Field(env="MIN_ALPHA_STAKE", default=10)
     MIN_TOTAL_STAKE: int = Field(env="MIN_TOTAL_STAKE", default=20000)
 
-    REQUIRED_TAO_COLLATERAL: float = 0.01
     RENTAL_REQUEST_HOOK: str | None = Field(env="RENTAL_REQUEST_HOOK", default=None)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
@@ -60,9 +78,11 @@ class Settings(BaseSettings):
             "address": "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6",
             "info": "3rd version: Fixed 'ExecutorNotOwned' error",
         },
+        "1.0.0": {
+            "address": "0x999F9A49A85e9D6E981cad42f197349f50172bEB",
+            "info": "Earlier contract: holds deposits made before 1.0.2 (reclaim only)",
+        },
     }
-
-    COLLATERAL_DAYS: int = 7
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
@@ -75,7 +95,7 @@ class Settings(BaseSettings):
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
-        wallet = bittensor.wallet(
+        wallet = bittensor.Wallet(
             name=self.BITTENSOR_WALLET_NAME,
             hotkey=self.BITTENSOR_WALLET_HOTKEY_NAME,
             path=str(self.BITTENSOR_WALLET_DIRECTORY),
@@ -83,46 +103,33 @@ class Settings(BaseSettings):
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
 
-    def get_bittensor_config(self) -> bittensor.config:
-        parser = argparse.ArgumentParser()
-        # bittensor.wallet.add_args(parser)
-        # bittensor.subtensor.add_args(parser)
-        # bittensor.axon.add_args(parser)
+    def get_bittensor_config(self) -> bittensor.Config:
+        # bittensor >=10.3.2 ignores argparse defaults (BT_NO_PARSE_CLI_ARGS is on by
+        # default), so assign values directly or Subtensor silently falls back to finney
+        config = bittensor.Config()
 
         if self.BITTENSOR_NETWORK:
-            if "--subtensor.network" in parser._option_string_actions:
-                parser._handle_conflict_resolve(
-                    None,
-                    [("--subtensor.network", parser._option_string_actions["--subtensor.network"])],
-                )
+            config.subtensor.network = self.BITTENSOR_NETWORK
 
-            parser.add_argument(
-                "--subtensor.network",
-                type=str,
-                help="network",
-                default=self.BITTENSOR_NETWORK,
-            )
+        first_endpoint = self.get_chain_endpoints()[0]
+        if first_endpoint.source != PUBLIC_NODE_SOURCE:
+            config.subtensor.chain_endpoint = first_endpoint.value
 
-        if self.BITTENSOR_CHAIN_ENDPOINT:
-            if "--subtensor.chain_endpoint" in parser._option_string_actions:
-                parser._handle_conflict_resolve(
-                    None,
-                    [
-                        (
-                            "--subtensor.chain_endpoint",
-                            parser._option_string_actions["--subtensor.chain_endpoint"],
-                        )
-                    ],
-                )
+        return config
 
-            parser.add_argument(
-                "--subtensor.chain_endpoint",
-                type=str,
-                help="chain endpoint",
-                default=self.BITTENSOR_CHAIN_ENDPOINT,
-            )
-
-        return bittensor.config(parser)
+    def get_chain_endpoints(self) -> list[ChainEndpoint]:
+        """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
+        `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or
+        read failure moves the client to the next entry; the failed entry is dialled again only
+        after `BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS`."""
+        return chain_endpoint_candidates(
+            chain_endpoints=self.BITTENSOR_CHAIN_ENDPOINTS,
+            chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
+            network=self.BITTENSOR_NETWORK,
+        )
 
 
 settings = Settings()
+shared_client = SharedConfigClient(
+    api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
+)

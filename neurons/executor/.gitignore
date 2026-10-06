@@ -7,6 +7,7 @@ __pycache__/
 *.so
 !libdmcompverify.so
 !libverifyx.so
+!libinspector.so
 # Distribution / packaging
 .Python
 build/
@@ -163,3 +164,6 @@ cython_debug/
 #.idea/
 
 temp/
+test.db
+
+config_override.py
