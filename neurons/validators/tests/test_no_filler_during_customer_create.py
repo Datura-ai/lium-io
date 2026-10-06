@@ -1,5 +1,5 @@
 """A filler create stands down at `docker run` while this connector creates a customer's container on
-the same executor: the customer's sweep would remove the filler, or, if the executor's create lock
+the same executor, or did since the filler create started: the customer's sweep would remove the filler, or, if the executor's create lock
 lapsed and the sweep already ran, the filler would run beside the renter.
 """
 
@@ -74,18 +74,22 @@ async def test_customer_create_blocks_a_filler_only_on_its_own_executor(
 
 
 @pytest.mark.parametrize(
-    ("registers_during", "docker_calls", "removed_container_id"),
+    ("registers_during", "customer_finishes", "docker_calls", "removed_container_id"),
     [
-        ("stream_log", [], None),
-        ("create_host_config", ["create_host_config"], None),
-        ("create_container", ["create_host_config", "create_container"], "filler-container"),
-        ("start", ["create_host_config", "create_container"], None),
+        ("stream_log", False, [], None),
+        ("create_host_config", False, ["create_host_config"], None),
+        ("create_container", False, ["create_host_config", "create_container"], "filler-container"),
+        ("start", False, ["create_host_config", "create_container"], None),
+        ("create_host_config", True, ["create_host_config"], None),
+        ("create_container", True, ["create_host_config", "create_container"], "filler-container"),
     ],
     ids=[
         "last_await_before_docker_run",
         "docker_thread_before_create",
         "daemon_creating_the_container",
         "customer_sweep_between_create_and_start",
+        "customer_create_started_and_ended_before_create",
+        "customer_create_started_and_ended_while_the_daemon_creates",
     ],
 )
 @pytest.mark.asyncio
@@ -94,6 +98,7 @@ async def test_customer_create_registering_until_the_filler_container_exists_ref
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     registers_during: str,
+    customer_finishes: bool,
     docker_calls: list[str],
     removed_container_id: str | None,
 ) -> None:
@@ -108,7 +113,12 @@ async def test_customer_create_registering_until_the_filler_container_exists_ref
     customer_registration = contextlib.ExitStack()
 
     def register_customer(*_args, **_kwargs) -> dict:
-        customer_registration.enter_context(customer_creates.track(_payload(executor_id=filler.executor_id)))
+        customer = customer_creates.track(_payload(executor_id=filler.executor_id))
+        if customer_finishes:
+            with customer:
+                pass
+        else:
+            customer_registration.enter_context(customer)
         if registers_during == "start":
             raise RuntimeError("No such container: filler-container")
         return {"Id": "filler-container"}
@@ -124,7 +134,7 @@ async def test_customer_create_registering_until_the_filler_container_exists_ref
     if registers_during != "stream_log":
         getattr(docker_api, registers_during).side_effect = register_customer
 
-    with customer_registration:
+    with customer_registration, customer_creates.track(filler):
         filler_create = asyncio.create_task(_run(svc, filler))
         if registers_during == "stream_log":
             await asyncio.wait_for(stream_log_blocked.wait(), timeout=5)
@@ -207,3 +217,28 @@ async def test_filler_create_does_not_count_as_a_customer_create(miner_service: 
 
     assert seen_while_running == [False]
 
+
+
+def test_filler_is_refused_by_a_customer_create_ending_after_its_start_not_by_older_ones() -> None:
+    customer = _payload()
+    filler = _payload(workload_kind=WorkloadKind.FILLER, executor_id=customer.executor_id)
+    with customer_creates.track(customer):
+        pass
+    customer_running = contextlib.ExitStack()
+    customer_running.enter_context(customer_creates.track(customer))
+
+    with customer_creates.track(filler):
+        customer_running.close()
+        refused_after_customer_ended = customer_creates.ran_since_filler_started(filler)
+    with customer_creates.track(filler):
+        refused_after_older_customer_creates = customer_creates.ran_since_filler_started(filler)
+        with customer_creates.track(customer):
+            pass
+        with customer_creates.track(filler.model_copy()):
+            pass
+        refused_beside_a_retry_of_its_pod = customer_creates.ran_since_filler_started(filler)
+
+    assert refused_after_customer_ended is True
+    assert refused_after_older_customer_creates is False
+    assert refused_beside_a_retry_of_its_pod is True
+    assert id(filler) not in customer_creates._ended_seen_by_filler_create

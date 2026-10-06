@@ -1295,27 +1295,44 @@ inflight_creates = _InflightCreateRegistry()
 
 
 class _CustomerCreateRegistry:
-    """Customer creates this connector is running right now, counted per executor.
+    """Customer creates this connector runs per executor, and what each filler create saw of them.
 
     A customer create is counted from before it waits for the executor's create lock, so a filler
     create holding that lock stands down at `docker run` instead of starting a container the
     customer's sweep would remove; if the lock lapsed (its 360 s TTL, Redis unreachable), the filler
-    would start beside the renter after that sweep. Keyed by (miner hotkey, executor id): an executor
-    id is unique only within its miner, and other executors are not affected. Read from the Docker
-    thread too (_refuse_filler_during_customer_create), hence the lock: without it a reader could see
-    an executor whose count just dropped to 0 before its key is deleted.
+    would start beside the renter after that sweep. A customer create can also start and finish
+    between two of the filler's checks (a slow create_container, a queued Docker thread), so the
+    executor also counts the customer creates that ended, and a filler create remembers that count
+    from its own start: one ended since then refuses the filler like one running now. Keyed by (miner
+    hotkey, executor id): an executor id is unique only within its miner, and other executors are not
+    affected. Read from the Docker thread too (_refuse_filler_during_customer_create), hence the lock,
+    held for one update or read, never across an await.
     """
 
     def __init__(self) -> None:
         self._running_by_executor: Counter[tuple[str, str]] = Counter()
+        # ponytail: never shrinks, one int per executor that had a customer create since the connector
+        # started (bounded by the fleet); a filler's snapshot must outlive the customer create it missed.
+        self._ended_by_executor: Counter[tuple[str, str]] = Counter()
+        # keyed by the payload object, not the pod id: two creates of one pod can overlap (a retry)
+        self._ended_seen_by_filler_create: dict[int, int] = {}
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
     def track(self, payload: ContainerCreateRequest) -> Iterator[None]:
+        executor = (payload.miner_hotkey, payload.executor_id)
+        if payload.workload_kind == WorkloadKind.FILLER:
+            with self._lock:
+                self._ended_seen_by_filler_create[id(payload)] = self._ended_by_executor[executor]
+            try:
+                yield
+            finally:
+                with self._lock:
+                    del self._ended_seen_by_filler_create[id(payload)]
+            return
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             yield
             return
-        executor = (payload.miner_hotkey, payload.executor_id)
         with self._lock:
             self._running_by_executor[executor] += 1
         try:
@@ -1323,12 +1340,23 @@ class _CustomerCreateRegistry:
         finally:
             with self._lock:
                 self._running_by_executor[executor] -= 1
+                self._ended_by_executor[executor] += 1
                 if self._running_by_executor[executor] <= 0:
                     del self._running_by_executor[executor]
 
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
             return (miner_hotkey, executor_id) in self._running_by_executor
+
+    def ran_since_filler_started(self, filler: ContainerCreateRequest) -> bool:
+        # a customer create on the filler's executor running now or ended since the filler's track();
+        # one that started after it is running or ended. A filler never tracked: only a running one.
+        executor = (filler.miner_hotkey, filler.executor_id)
+        with self._lock:
+            seen = self._ended_seen_by_filler_create.get(id(filler))
+            return executor in self._running_by_executor or (
+                seen is not None and seen != self._ended_by_executor[executor]
+            )
 
 
 # In-process like inflight_creates: both creates for one executor go through the connector of the
@@ -1337,13 +1365,15 @@ customer_creates = _CustomerCreateRegistry()
 
 
 def _is_filler_create_beside_customer_create(payload: ContainerCreateRequest) -> bool:
-    return payload.workload_kind == WorkloadKind.FILLER and customer_creates.is_running(
-        payload.miner_hotkey, payload.executor_id
+    return (
+        payload.workload_kind == WorkloadKind.FILLER
+        and customer_creates.ran_since_filler_started(payload)
     )
 
 
 def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> None:
-    """Stop a filler create while this connector runs a customer create on the same executor."""
+    """Stop a filler create while this connector runs, or since the filler's start ran, a customer
+    create on the same executor."""
     if _is_filler_create_beside_customer_create(payload):
         raise _FillerRefusedForCustomerCreate(
             f"a customer create is running on executor {payload.executor_id}; filler {payload.pod_id} not started"
@@ -7167,8 +7197,8 @@ class DockerService:
                         spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
                     )
                     edit_swap.replacement_id = container_id
-                    # A customer create that registered while the daemon created this container may
-                    # have swept the host before it was listed: remove it by its ID (handler below).
+                    # A customer create that ran while the daemon created this container may have
+                    # swept the host before it was listed: remove it by its ID (handler below).
                     _refuse_filler_during_customer_create(payload)
                     if jupyter_port_map:
                         # a port collision may have moved the Jupyter mapping: the URL below
