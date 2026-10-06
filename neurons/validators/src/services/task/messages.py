@@ -729,38 +729,27 @@ class DuplicateExecutorMessages:
     )
 
 
-class CollateralMessages:
-    VERIFIED = MessageTemplate(
+class CollateralStatusMessages:
+    DEPOSITED = MessageTemplate(
         event="Collateral verified",
         reason="COLLATERAL_OK",
         severity="info",
         category="policy",
-        impact="Proceed",
+        impact="None; collateral has no score effect",
     )
-    MISSING = MessageTemplate(
+    NOT_DEPOSITED = MessageTemplate(
         event="No collateral deposited",
         reason="COLLATERAL_MISSING",
-        severity="warning",
-        category="policy",
-        impact="Score may be reduced or set to 0 based on policy",
-        remediation="Deposit collateral for this executor.",
-    )
-
-
-class CollateralPrefetchMessages:
-    STARTED = MessageTemplate(
-        event="Collateral read started",
-        reason="COLLATERAL_READ_STARTED",
         severity="info",
         category="policy",
-        impact="Proceed; the collateral check decides when the read answers",
+        impact="None; collateral has no score effect",
     )
-    SKIPPED = MessageTemplate(
-        event="Collateral read not started",
-        reason="COLLATERAL_READ_SKIPPED",
+    READ_FAILED = MessageTemplate(
+        event="Collateral read failed",
+        reason="COLLATERAL_READ_FAILED",
         severity="info",
         category="policy",
-        impact="Proceed; the collateral check reads the contract itself",
+        impact="None; the last known collateral status is reported, or none deposited when there is none",
     )
 
 

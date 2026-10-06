@@ -38,7 +38,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
    Group C — a check failed this cycle: the failing check's reason code
      (`validation_failed`, context.reason_code), so a zero from a failed check is never
      reported without a reason. A run that passed every check and still scored 0 (the
-     score gate: collateral, CPU truth, an outdated image, a rented node's halt) is not a
+     score gate: CPU truth, an outdated image, a rented node's halt) is not a
      failed check and gets no Group C reason
    Every reason that applies is recorded, in the order above: a node blocked by Discord
    still learns that its 8x flagship gate blocks it too. The first entry is the one the
