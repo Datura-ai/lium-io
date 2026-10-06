@@ -2929,8 +2929,8 @@ class DockerService:
         replacements: dict[str, str],
         cleanup_deadline: float,
     ) -> None:
-        """`docker rm -fv` the replacement fillers by their IDs (one attempt, within the cleanup's
-        ``cleanup_deadline``), then confirm again. A timeout fails the create like the first removal's; any other
+        """`docker rm -fv` the replacement fillers by their IDs (one attempt), then confirm again, both within
+        the cleanup's ``cleanup_deadline``. A timeout fails the create like the first removal's; any other
         failure is logged, a filler that still survives is reported by the confirmation, and the
         create goes on."""
         try:
@@ -2957,11 +2957,19 @@ class DockerService:
                     }),
                 )
             )
+        try:
+            async with asyncio.timeout_at(cleanup_deadline):
+                listing_after = await self._list_all_containers(ssh_client)
+        except TimeoutError as exc:
+            raise Exception(
+                "[clean_existing_containers] the listing after a replacement filler's docker rm -fv did not "
+                f"finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from exc
         self._confirm_fillers_removed(
             default_extra=default_extra,
             pod_name=pod_name,
             removed_fillers=list(replacements),
-            listing_after=await self._list_all_containers(ssh_client),
+            listing_after=listing_after,
         )
 
     @staticmethod
