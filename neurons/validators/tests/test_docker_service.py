@@ -131,6 +131,9 @@ class _FakeRentalDockerClient:
         self.inspected_images.append(image)
         return image in self.existing_images
 
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return () if await self.image_exists(image=image) else None
+
     async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
         return True
 
@@ -147,6 +150,12 @@ class _FakeRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
@@ -601,6 +610,35 @@ async def test_enable_jupyter_feature(
         assert len(jupyter_ports) == 0
         # Jupyter port map should be None
         assert jupyter_port_map is None
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_does_not_leak_ports_into_the_next_rent(
+    docker_service, test_executor_id, test_miner_hotkey, monkeypatch
+):
+    # Arrange: a fresh copy of the real list, so a failure here cannot leak into other tests
+    preferred_ports = list(docker_service_module.PREFERRED_POD_PORTS)
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", preferred_ports)
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in range(20000, 20100)
+    ]
+    await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        initial_port_count=None, enable_jupyter=True,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=[],
+    )
+
+    # Act
+    mappings, jupyter_port_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, UUID(test_executor_id),
+        initial_port_count=10, enable_jupyter=False,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=[],
+    )
+
+    # Assert
+    assert [docker_port for docker_port, _, _ in mappings] == [22, *range(20000, 20010)]
+    assert jupyter_port_map is None
+    assert preferred_ports == list(range(20000, 20010))
 
 
 @pytest.mark.asyncio
@@ -5397,15 +5435,15 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
         keypair_mock = MagicMock()
         keypair_mock.ss58_address = "5Test"
 
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=executor_info,
             miner_hotkey="5TestMiner",
             keypair=keypair_mock,
             private_key="encrypted-private-key",
         )
 
-    assert ok is True
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
     # Inspect the docker ps command
     ps_cmd = next((c for c in seen_commands if "docker ps" in c), "")
     assert ps_cmd, f"No docker ps command issued. Commands seen: {seen_commands}"
@@ -5461,15 +5499,15 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
         keypair_mock = MagicMock()
         keypair_mock.ss58_address = "5Test"
 
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=executor_info,
             miner_hotkey="5OurHotkey",
             keypair=keypair_mock,
             private_key="x",
         )
 
-    assert ok is True
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
 
 
 # ---------------------------------------------------------------------------
@@ -5672,7 +5710,7 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
 
     with patch("services.docker_service.asyncssh.connect") as connect_mock, \
          patch("services.docker_service.asyncssh.import_private_key") as pkey_mock:
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=MagicMock(),
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
@@ -5680,8 +5718,8 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
             ssh_client=ssh_client,
         )
 
-    assert ok is True
-    assert msg == "No port check containers found"
+    assert removed is False
+    assert message == "No port check containers found"
     # The reused-session path must skip the connect dance entirely.
     connect_mock.assert_not_called()
     pkey_mock.assert_not_called()
@@ -5717,10 +5755,10 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
                     stdout="health_check_1777635787\n",
                     stderr="", exit_status=0,
                 )
-            # The xargs force-rm command — return success.
-            return MagicMock(stdout="", stderr="", exit_status=0)
+            # The xargs force-rm command — docker rm prints the removed container's ID.
+            return MagicMock(stdout="3f2a9c1d7e4b\n", stderr="", exit_status=0)
 
-    ok, msg = await docker_service.wait_for_port_check_containers(
+    removed, message = await docker_service.wait_for_port_check_containers(
         executor_info=MagicMock(),
         miner_hotkey="5TestMiner",
         keypair=MagicMock(),
@@ -5728,8 +5766,8 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
         ssh_client=FakeSSHClient(),
     )
 
-    assert ok is True
-    assert "forcefully removed" in msg
+    assert removed is True
+    assert "forcefully removed" in message
     # Must have issued the force-rm xargs command targeting both prefixes.
     assert any(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
@@ -5756,7 +5794,7 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
             FakeSSHClient.seen.append(cmd)
             if "docker ps --format" in cmd:
                 return MagicMock(stdout="container_5TestMiner_9101\n", stderr="", exit_status=0)
-            return MagicMock(stdout="", stderr="", exit_status=0)
+            return MagicMock(stdout="3f2a9c1d7e4b\n", stderr="", exit_status=0)
 
     sleep_calls = {"n": 0}
 
@@ -5767,7 +5805,7 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
     real_sleep = svc_mod.asyncio.sleep
     svc_mod.asyncio.sleep = counting_sleep
     try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
+        removed, message = await docker_service.wait_for_port_check_containers(
             executor_info=MagicMock(),
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
@@ -5777,8 +5815,8 @@ async def test_wait_for_port_check_forces_immediately_when_present(docker_servic
     finally:
         svc_mod.asyncio.sleep = real_sleep
 
-    assert ok is True
-    assert "forcefully removed" in msg
+    assert removed is True
+    assert "forcefully removed" in message
     assert sleep_calls["n"] == 0, "the rental path must never sleep waiting on a probe"
     ps_checks = [c for c in FakeSSHClient.seen if "docker ps --format" in c]
     assert len(ps_checks) == 1, f"expected exactly 1 docker ps check, saw: {ps_checks}"
@@ -7853,14 +7891,16 @@ def _state(**overrides) -> ContainerStateSnapshot:
     return ContainerStateSnapshot(**{**base, **overrides})
 
 
-async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, state, exec_error):
+async def _create_failing_at_add_public_keys(
+    docker_service, monkeypatch, *, state, exec_error, failure_step="add_public_keys", container_missing=False
+):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(
         docker_service, "add_ssh_public_keys_with_rental_docker", AsyncMock(side_effect=exec_error)
     )
     inspect = AsyncMock(side_effect=state) if isinstance(state, Exception) else AsyncMock(return_value=state)
     docker_service.rental_docker_client_factory.client.inspect_container_state = inspect
-    cleanup = AsyncMock(return_value=False)
+    cleanup = AsyncMock(return_value=container_missing)
     monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
     payload = _filler_create_payload()
     payload.docker_image = _CUDA_IMAGE
@@ -7872,8 +7912,15 @@ async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, sta
         private_key="encrypted",
     )
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "add_public_keys", "dashboards key on the step"
-    assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
+    assert result.failure_step == failure_step, "dashboards key on the step"
+    if failure_step in ("killed_during_bootstrap", "oom_during_bootstrap"):
+        # a kill's msg is its renter-safe cause sentence; the diagnosis stays in detail
+        assert result.msg.startswith(
+            ("the container was stopped by the node", "the container stopped before", "the container was killed for lack of memory")
+        )
+        assert "cause=" not in result.msg
+    else:
+        assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
     # the container was still there to inspect: the explanation is read before cleanup removes it
     assert inspect.await_args.kwargs == {"container_name": docker_service.get_container_name(payload)}
     cleanup.assert_awaited_once()
@@ -7898,15 +7945,21 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
             "is restarting",
             id="restarting",
         ),
+        # Docker restarts only a command that ended on its own: a SIGTERM-handling CMD's 143 is its own exit
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=143, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-143",
+        ),
+        pytest.param(
+            _state(status="restarting", running=False, restarting=True, exit_code=137, restart_count=1),
+            "status='restarting'",
+            id="restarting-exit-137",
+        ),
         pytest.param(
             _state(status="running", running=True, restart_count=1),
             "is restarting",
             id="running-again-after-a-restart",
-        ),
-        pytest.param(
-            _state(status="dead", running=False, exit_code=1, restart_count=0),
-            "is not running",
-            id="dead",
         ),
     ],
 )
@@ -7942,22 +7995,34 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
 
 
 @pytest.mark.parametrize(
-    "state",
+    "state, failure_step",
     [
-        pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
-        pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+        pytest.param(
+            _state(status="exited", running=False, exit_code=137, oom_killed=True), "oom_during_bootstrap", id="oom-killed"
+        ),
+        pytest.param(_state(status="exited", running=False, exit_code=137), "killed_during_bootstrap", id="sigkill"),
+        # `dead` is a removal the daemon could not finish, not the image's exit, whatever the code
+        pytest.param(
+            _state(status="dead", running=False, exit_code=1, restart_count=0), "killed_during_bootstrap", id="dead"
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_key_injection_that_fails_after_a_host_kill_keeps_the_exec_error(
-    docker_service, monkeypatch, state
+async def test_a_key_injection_that_fails_after_a_host_kill_is_killed_during_bootstrap(
+    docker_service, monkeypatch, state, failure_step
 ):
     """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
     result = await _create_failing_at_add_public_keys(
-        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+        docker_service,
+        monkeypatch,
+        state=state,
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step=failure_step,
     )
 
-    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+    error = _failure_error_field(result)
+    assert "has no long-running command" not in error
+    assert str(_EXEC_KILLED_BY_EXIT) in error
 
 
 @pytest.mark.asyncio
@@ -7973,3 +8038,45 @@ async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
     )
 
     assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+
+
+_OOM_STATES = {
+    "removing": _state(status="removing", running=False, exit_code=137, oom_killed=True),
+    "exited": _state(status="exited", running=False, exit_code=137, oom_killed=True),
+    "restarting": _state(status="restarting", running=True, restarting=True, exit_code=137, oom_killed=True),
+}
+
+
+@pytest.mark.parametrize("swept", [False, True], ids=["unswept", "swept"])
+@pytest.mark.parametrize("container_missing", [False, True], ids=["cleanup-found-it", "cleanup-404"])
+@pytest.mark.parametrize("status", list(_OOM_STATES))
+@pytest.mark.asyncio
+async def test_an_oom_never_goes_out_as_container_vanished(docker_service, monkeypatch, status, container_missing, swept):
+    """The backend's filler streak reads ContainerVanished apart from the failure step: an OOM must not carry it."""
+    monkeypatch.setattr(docker_service_module.own_sweep_removals, "sent_rm_for", lambda _id: swept)
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_OOM_STATES[status],
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        # a container still restarting fails the key injection itself, before any kill is read
+        failure_step="add_public_keys" if status == "restarting" else "oom_during_bootstrap",
+        container_missing=container_missing,
+    )
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+
+
+@pytest.mark.parametrize("container_missing, error_code", [(False, "UnknownError"), (True, "ContainerVanished")])
+@pytest.mark.asyncio
+async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_vanished(
+    docker_service, monkeypatch, container_missing, error_code
+):
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="removing", running=False, exit_code=137),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step="killed_during_bootstrap",
+        container_missing=container_missing,
+    )
+    assert result.error_code == getattr(FailedContainerErrorCodes, error_code)

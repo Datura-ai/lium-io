@@ -381,6 +381,49 @@ class DiskHealthMessages:
     )
 
 
+class RentedGpuDropMessages:
+    DROP = MessageTemplate(
+        event="Rented node lost a GPU",
+        reason="RENTED_GPU_DROP",
+        severity="error",
+        category="env",
+        impact="Proceed; score not changed here. Reported to the backend unless held for a second cycle or a dry "
+        "run (see pods[].posted, held and delivery); provider, support and renter are told once per incident",
+        remediation="A card fell out of NVML on a rented node (see faults, missing_uuids, nvml_error_code). Check "
+        "`nvidia-smi` and `dmesg` for Xid 79 / 'fallen off the bus', then reset or reboot the host; the renter's "
+        "workload on the missing card is already broken.",
+    )
+    RECOVERED = MessageTemplate(
+        event="Rented node shows every GPU again",
+        reason="RENTED_GPU_RECOVERED",
+        severity="info",
+        category="env",
+        impact="Proceed; the end of the incident is reported to the backend (see pods[].delivery; one with no "
+        "answer is sent again next cycle)",
+    )
+    OK = MessageTemplate(
+        event="Rented node shows every rented GPU",
+        reason="RENTED_GPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented GPU drop check skipped: no running rental",
+        reason="RENTED_GPU_DROP_NOT_RENTED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    DISABLED = MessageTemplate(
+        event="Rented GPU drop check disabled",
+        reason="RENTED_GPU_DROP_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",
@@ -686,38 +729,27 @@ class DuplicateExecutorMessages:
     )
 
 
-class CollateralMessages:
-    VERIFIED = MessageTemplate(
+class CollateralStatusMessages:
+    DEPOSITED = MessageTemplate(
         event="Collateral verified",
         reason="COLLATERAL_OK",
         severity="info",
         category="policy",
-        impact="Proceed",
+        impact="None; collateral has no score effect",
     )
-    MISSING = MessageTemplate(
+    NOT_DEPOSITED = MessageTemplate(
         event="No collateral deposited",
         reason="COLLATERAL_MISSING",
-        severity="warning",
-        category="policy",
-        impact="Score may be reduced or set to 0 based on policy",
-        remediation="Deposit collateral for this executor.",
-    )
-
-
-class CollateralPrefetchMessages:
-    STARTED = MessageTemplate(
-        event="Collateral read started",
-        reason="COLLATERAL_READ_STARTED",
         severity="info",
         category="policy",
-        impact="Proceed; the collateral check decides when the read answers",
+        impact="None; collateral has no score effect",
     )
-    SKIPPED = MessageTemplate(
-        event="Collateral read not started",
-        reason="COLLATERAL_READ_SKIPPED",
+    READ_FAILED = MessageTemplate(
+        event="Collateral read failed",
+        reason="COLLATERAL_READ_FAILED",
         severity="info",
         category="policy",
-        impact="Proceed; the collateral check reads the contract itself",
+        impact="None; the last known collateral status is reported, or none deposited when there is none",
     )
 
 

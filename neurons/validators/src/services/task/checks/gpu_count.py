@@ -9,7 +9,7 @@ class GpuCountCheck:
 
     The old task rejected miners reporting more than `MAX_GPU_COUNT`; keeping this early
     avoids downstream scoring on hardware that would be disqualified regardless of
-    collateral or performance.
+    performance.
     """
 
     check_id = "gpu.validate.count"

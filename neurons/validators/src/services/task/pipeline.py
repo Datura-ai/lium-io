@@ -15,7 +15,6 @@ from core.utils import _m
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
 from services.redis_service import RedisService
-from services.collateral_contract_service import CollateralContractService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -27,7 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .models import CollateralPrefetch, ValidationEvent
+from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
 @runtime_checkable
@@ -75,7 +74,6 @@ class PodRecoverer(Protocol):
 class ContextServices:
     ssh: SSHService
     redis: RedisService
-    collateral: CollateralContractService
     validation: ValidationService
     verifyx: VerifyXValidationService
     inspector: InspectorValidationService
@@ -106,7 +104,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    enable_no_collateral: bool = False
     verifyx_enabled: bool = False
     inspector_enabled: bool = False
     port_private_key: Optional[str] = None
@@ -186,10 +183,6 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
-    # Validation fast path: the collateral read CollateralPrefetchCheck started under the GPU
-    # spec checks, for CollateralCheck to await instead of calling the contract itself. None =
-    # no prefetch (the flag is off, or the scrape left no GPU to read for).
-    collateral_prefetch: CollateralPrefetch | None = None
 
 
 class CheckResult(BaseModel):
@@ -197,6 +190,9 @@ class CheckResult(BaseModel):
     event: ValidationEvent
     updates: dict[str, Any] = {}
     halt: bool = False
+    # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
+    # when the node has no live rental). None = fall back to the check's class default.
+    fatal: bool | None = None
 
 
 class Context(BaseModel):
@@ -238,7 +234,6 @@ class Context(BaseModel):
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
     collateral_deposited: bool = False
-    collateral_error_message: str | None = None
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
@@ -276,14 +271,13 @@ class EventSink(Protocol):
 
 
 # DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
-# the validator. They are emitted on every cycle for as long as the state lasts (no collateral,
-# an old image, a banned provider, a host-side workload) and were 135,000 WARNING lines in two
+# the validator. They are emitted on every cycle for as long as the state lasts (an old image,
+# a banned provider, a host-side workload) and were 135,000 WARNING lines in two
 # days. The event keeps its severity for the backend and the portal; when the event is a warning,
 # only the log line is INFO (DEBUG when it repeats the previous cycle, see StatusChangeTracker). An
 # error (an enforced EXECUTOR_IMAGE_OUTDATED, PROVIDER_SIDE_LOAD_ABOVE_LIMIT) stays ERROR every cycle.
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
-        "COLLATERAL_MISSING",
         "EXECUTOR_IMAGE_OUTDATED",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
@@ -485,17 +479,8 @@ def merge_state(current: ContextState, before: ContextState, after: ContextState
 
 
 def _stops_run(chk: Check, res: CheckResult) -> bool:
-    return (not res.passed and getattr(chk, "fatal", False)) or res.halt
-
-
-def cancel_pending_collateral_prefetch(ctx: Context) -> bool:
-    """Cancel a collateral read the fast path started that no check consumed (the run ended
-    before CollateralCheck). Returns whether one was cancelled."""
-    prefetch = ctx.state.collateral_prefetch
-    if prefetch is None or prefetch.task.done():
-        return False
-    prefetch.task.cancel()
-    return True
+    fatal = res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
+    return (not res.passed and fatal) or res.halt
 
 
 class Pipeline:
@@ -578,44 +563,41 @@ class Pipeline:
         steps: list[tuple[str, int]] = []
         last_index = len(self.checks) - 1
 
-        try:
-            for index, step in enumerate(self.checks):
-                parallel = isinstance(step, ParallelStage)
-                ran_checks = await self._run_step(step, current_ctx)
-                for ran in ran_checks:
-                    ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
-                    ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
+        for index, step in enumerate(self.checks):
+            parallel = isinstance(step, ParallelStage)
+            ran_checks = await self._run_step(step, current_ctx)
+            for ran in ran_checks:
+                ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
+                ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
 
-                # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
-                stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
-                for position, ran in enumerate(ran_checks):
-                    chk, res = ran.check, ran.result
-                    # Only emitted checks enter the summary: a sibling lane's checks completed before
-                    # the cancel ran, but the run does not report them.
-                    steps.append((chk.check_id, res.event.context["execution_time_ms"]))
-                    elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
-                    failed = not res.passed and getattr(chk, "fatal", False)
-                    last_of_run = index == last_index and position == len(ran_checks) - 1
-                    if failed or res.halt or last_of_run:
-                        res.event.what_we_saw.update(
-                            summarize_steps(
-                                steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
-                            )
+            # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
+            stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
+            for position, ran in enumerate(ran_checks):
+                chk, res = ran.check, ran.result
+                # Only emitted checks enter the summary: a sibling lane's checks completed before
+                # the cancel ran, but the run does not report them.
+                steps.append((chk.check_id, res.event.context["execution_time_ms"]))
+                elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
+                failed = not res.passed and (
+                    res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
+                )
+                last_of_run = index == last_index and position == len(ran_checks) - 1
+                if failed or res.halt or last_of_run:
+                    res.event.what_we_saw.update(
+                        summarize_steps(
+                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
                         )
+                    )
 
-                    await self.sink.emit(res.event)
-                    events.append(res.event)
+                await self.sink.emit(res.event)
+                events.append(res.event)
 
-                    current_ctx = self._apply(current_ctx, ran, parallel)
+                current_ctx = self._apply(current_ctx, ran, parallel)
 
-                    if failed:
-                        return False, events, current_ctx
+                if failed:
+                    return False, events, current_ctx
 
-                    if res.halt:
-                        return True, events, current_ctx
-        finally:
-            # A run that stops before CollateralCheck (fail, halt or exception) leaves the early
-            # collateral read unconsumed.
-            cancel_pending_collateral_prefetch(current_ctx)
+                if res.halt:
+                    return True, events, current_ctx
 
         return True, events, current_ctx
