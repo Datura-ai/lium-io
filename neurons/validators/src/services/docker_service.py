@@ -838,6 +838,10 @@ class _CreateCancelledByDelete(Exception):
 class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
+    def __init__(self, message: str, *, state: ContainerStateSnapshot | None = None) -> None:
+        super().__init__(message)
+        self.state = state
+
 
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
 # failure_step of an OOM kill during bootstrap: the renter's container ran out of memory, not the host's
@@ -1057,6 +1061,8 @@ async def _explain_add_public_keys_failure(
                 ),
             )
     if not state.exited_since_start or (state.killed_by_host and container_gone_cause(state) != "exited"):
+        # the create path reads it to keep an OOM out of ContainerVanished
+        cause.observed_state = state
         return cause
     if state.running:
         # Docker's restart policy already brought it back; the exec landed in the gap.
@@ -1067,7 +1073,8 @@ async def _explain_add_public_keys_failure(
         f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
         f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
         "SSH keys were being installed; a pod needs a long-running process, for example a start "
-        f"command such as `sleep infinity`. Exec error: {cause}"
+        f"command such as `sleep infinity`. Exec error: {cause}",
+        state=state,
     )
 
 
@@ -7403,6 +7410,10 @@ class DockerService:
                             container_vanished = False
                             current_step = CANCELLED_BY_CREATE_STEP
                             raise
+                        if gone_cause == "oom":
+                            # The filler-streak consumer reads ContainerVanished on its own, so an
+                            # OOM (the renter's own memory limit) must not go out under that code.
+                            container_vanished = False
                         killed = self._explain_container_killed_during_bootstrap(
                             post_run_exc,
                             container_name=container_name,
@@ -7411,6 +7422,10 @@ class DockerService:
                         )
                         current_step = killed.failure_step
                         raise killed from post_run_exc
+                    last_exc = _last_attempt_exception(post_run_exc)
+                    observed = getattr(last_exc, "state", None) or getattr(last_exc, "observed_state", None)
+                    if observed is not None and observed.oom_killed:
+                        container_vanished = False
                     raise
 
                 # DAH-2458: final step. Stamp the subnet's wall-clock finish time onto it (in

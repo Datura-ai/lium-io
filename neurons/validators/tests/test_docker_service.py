@@ -7721,7 +7721,7 @@ def _state(**overrides) -> ContainerStateSnapshot:
 
 
 async def _create_failing_at_add_public_keys(
-    docker_service, monkeypatch, *, state, exec_error, failure_step="add_public_keys"
+    docker_service, monkeypatch, *, state, exec_error, failure_step="add_public_keys", container_missing=False
 ):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(
@@ -7729,7 +7729,7 @@ async def _create_failing_at_add_public_keys(
     )
     inspect = AsyncMock(side_effect=state) if isinstance(state, Exception) else AsyncMock(return_value=state)
     docker_service.rental_docker_client_factory.client.inspect_container_state = inspect
-    cleanup = AsyncMock(return_value=False)
+    cleanup = AsyncMock(return_value=container_missing)
     monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
     payload = _filler_create_payload()
     payload.docker_image = _CUDA_IMAGE
@@ -7867,3 +7867,45 @@ async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
     )
 
     assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+
+
+_OOM_STATES = {
+    "removing": _state(status="removing", running=False, exit_code=137, oom_killed=True),
+    "exited": _state(status="exited", running=False, exit_code=137, oom_killed=True),
+    "restarting": _state(status="restarting", running=True, restarting=True, exit_code=137, oom_killed=True),
+}
+
+
+@pytest.mark.parametrize("swept", [False, True], ids=["unswept", "swept"])
+@pytest.mark.parametrize("container_missing", [False, True], ids=["cleanup-found-it", "cleanup-404"])
+@pytest.mark.parametrize("status", list(_OOM_STATES))
+@pytest.mark.asyncio
+async def test_an_oom_never_goes_out_as_container_vanished(docker_service, monkeypatch, status, container_missing, swept):
+    """The backend's filler streak reads ContainerVanished apart from the failure step: an OOM must not carry it."""
+    monkeypatch.setattr(docker_service_module.own_sweep_removals, "sent_rm_for", lambda _id: swept)
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_OOM_STATES[status],
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        # a container still restarting fails the key injection itself, before any kill is read
+        failure_step="add_public_keys" if status == "restarting" else "oom_during_bootstrap",
+        container_missing=container_missing,
+    )
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+
+
+@pytest.mark.parametrize("container_missing, error_code", [(False, "UnknownError"), (True, "ContainerVanished")])
+@pytest.mark.asyncio
+async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_vanished(
+    docker_service, monkeypatch, container_missing, error_code
+):
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="removing", running=False, exit_code=137),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+        failure_step="killed_during_bootstrap",
+        container_missing=container_missing,
+    )
+    assert result.error_code == getattr(FailedContainerErrorCodes, error_code)
