@@ -1094,10 +1094,11 @@ inflight_creates = _InflightCreateRegistry()
 class _CustomerCreateRegistry:
     """Customer creates this connector is running right now, counted per executor.
 
-    The customer's create lists and removes the node's fillers before its own `docker run`; a filler
-    create for the same executor that reaches `docker run` after that listing would start beside the
-    renter, so it stands down instead. Keyed by (miner hotkey, executor id): an executor id is unique
-    only within its miner, and other executors are not affected.
+    A customer create is counted from before it waits for the executor's create lock, so a filler
+    create holding that lock stands down at `docker run` instead of starting a container the
+    customer's sweep would remove; if the lock lapsed (its 360 s TTL, Redis unreachable), the filler
+    would start beside the renter after that sweep. Keyed by (miner hotkey, executor id): an executor
+    id is unique only within its miner, and other executors are not affected.
     """
 
     def __init__(self) -> None:

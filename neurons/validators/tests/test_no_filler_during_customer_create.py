@@ -1,6 +1,6 @@
 """A filler create stands down at `docker run` while this connector creates a customer's container on
-the same executor: the customer's create has already listed and removed the node's fillers, so a
-filler started now would run beside the renter.
+the same executor: the customer's sweep would remove the filler, or, if the executor's create lock
+lapsed and the sweep already ran, the filler would run beside the renter.
 """
 
 from __future__ import annotations
