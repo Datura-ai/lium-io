@@ -200,31 +200,29 @@ class ContainerDeathDiagnostics:
 ALPINE_HELPER_IMAGE = "docker.io/library/alpine:3.19"
 
 
-async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path: str) -> int:
-    """Free bytes on the filesystem holding `host_path`, measured THROUGH the docker daemon.
+# The helper mounts no host path, only an anonymous volume of its own, which `--rm` removes with it (also when
+# `timeout` kills the client: the daemon removes the container once df exits). Its df is the docker root's `volumes/`.
+# ponytail: a sized customer volume is a loopback file under the root's `plugins/`; the two differ only on a host that
+# mounts one of them apart (the old bind of the whole root missed the other one); exact needs the executor's own read
+DOCKER_VOLUMES_DF_COMMAND = (
+    f"/usr/bin/docker run --rm --mount type=volume,dst=/free {ALPINE_HELPER_IMAGE} df -P -B1 /free"
+)
 
-    Three facts make this non-obvious enough to keep in one place. The validator's SSH session lands
-    inside the miner's executor container, so a host path like the docker data root does not exist
-    there and a plain df would measure the wrong filesystem — hence the bind-mounted helper container.
-    Busybox df has no `--output`, so the request is POSIX `-P`, whose contract is one unwrapped line
-    per filesystem. Available is then column 4 of the data line.
+
+async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection) -> int:
+    """Free bytes on the filesystem docker keeps its local volumes on, measured THROUGH the docker daemon.
+
+    The validator's SSH session lands inside the miner's executor container, where a plain df would
+    measure the wrong filesystem — hence the helper container. Busybox df has no `--output`, so the
+    request is POSIX `-P`, whose contract is one unwrapped line per filesystem. Available is then
+    column 4 of the data line.
 
     Raises on anything unexpected; callers decide whether that is fatal.
     """
-    result = await ssh_client.run(df_command(shlex.quote(host_path)))
+    result = await ssh_client.run(DOCKER_VOLUMES_DF_COMMAND)
     if getattr(result, "exit_status", 0) != 0:
         raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
     return parse_df_available_bytes(result.stdout or "")
-
-
-def df_command(host_path_shell_word: str) -> str:
-    """The helper-container df invocation `df_available_bytes` runs; shared with the volume host
-    probe so both measure free disk the same way. `host_path_shell_word` is already a shell word
-    (a quoted path, or a variable reference such as `"$root"`)."""
-    return (
-        f"/usr/bin/docker run --rm -v {host_path_shell_word}:/hostfs:ro "
-        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
-    )
 
 
 def parse_df_available_bytes(stdout: str) -> int:

@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, Mock
 import asyncssh
 import pytest
 
+from core.docker_utils import DOCKER_VOLUMES_DF_COMMAND
 from payload_models.payloads import ContainerCreated, WorkloadKind
 from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_client
 
@@ -33,6 +34,7 @@ from services.docker_service import (
     ContainerCleanupReport,
     DockerService,
     _remove_and_list_containers_command,
+    own_sweep_removals,
 )
 
 
@@ -61,6 +63,11 @@ def _listing(stdout: str, exit_status: int = 0, stderr: str = ""):
     result.stdout = stdout
     result.stderr = stderr
     return result
+
+
+@pytest.fixture(autouse=True)
+def _no_sweeps_from_other_tests():
+    own_sweep_removals.clear()
 
 
 def _events(caplog) -> list[logging.LogRecord]:
@@ -223,6 +230,23 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
 
 
 @pytest.mark.asyncio
+async def test_a_filler_that_survives_the_removal_is_still_recorded_as_ours(docker_service, retry_ssh_mock):
+    # its `rm` can still finish after the listing in the same command named it, so that listing does not undo it
+    stuck_id, gone_id, target_id = "a" * 64, "b" * 64, "c" * 64
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _listing(f"pod_target {target_id}\nfiller_stuck {stuck_id}\nfiller_gone {gone_id}\n"),
+            _removal(f"filler_stuck {stuck_id}"),
+        ]
+    )
+
+    await _clean_for_customer(docker_service, ssh_client)
+
+    assert all(own_sweep_removals.sent_rm_for(i) for i in (stuck_id, gone_id, target_id))
+
+
+@pytest.mark.asyncio
 async def test_a_confirmed_removal_writes_no_event(docker_service, retry_ssh_mock, caplog):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(side_effect=[_listing("pod_target\nfiller_gone\n"), _removal()])
@@ -353,7 +377,7 @@ async def test_rm_retry_budget_goes_only_to_the_names_still_on_the_host(
     retried_rm = retry_ssh_mock.call_args_list[0]
     assert "filler_busy" in retried_rm[0][1]
     assert "filler_gone" not in retried_rm[0][1]
-    assert "max_attempts" not in retried_rm.kwargs  # the full budget, as before DAH-3706
+    assert retried_rm.kwargs["max_attempts"] == 5  # the full budget, as before DAH-3706
     assert "volume rm" in retry_ssh_mock.call_args_list[1][0][1]
     assert ssh_client.run.await_count == 3
     assert report.removed_cleanly_without_volume_rm is False
@@ -434,8 +458,7 @@ case "$1" in
   rm) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$RM_ARGS"; done; exit "${RM_EXIT:-0}" ;;
   ps) printf 'NAME\\tpod_other\\n' ;;
   volume) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$VOLUME_RM_ARGS"; done ;;
-  info) printf '/var/lib/docker\\n' ;;
-  run) printf '%s\\0' "$@" >> "$RUN_ARGS"; eval "$HELPER_DF"; printf 'Filesystem 1-blocks Used Available Use%% Mounted\\n/dev/vda1 9 2 4242 30%% /hostfs\\n' ;;
+  run) printf '%s\\0' "$@" >> "$RUN_ARGS"; eval "$HELPER_DF"; printf 'Filesystem 1-blocks Used Available Use%% Mounted\\n/dev/vda1 9 2 4242 30%% /free\\n' ;;
 esac
 """
 
@@ -472,7 +495,7 @@ def test_a_hostile_container_name_stays_one_argument_of_the_rm(tmp_path):
         ("", 0, 60, 4242),
         ("sleep 30", 0, 60, None),  # hangs: cut off inside the command, which still answers
         ("printf 'F\\n/dev/vda1 9 2 42'; exit 137", 0, 60, None),  # dies mid-output: not read
-        ("", 0, 8, None),  # the rm left no room for both bounded df calls (1 s each here, 1 s to kill) and a margin
+        ("", 0, 8, None),  # the rm left no room for the bounded df (1 s here, 1 s to kill) and a margin
         ("", 1, 60, None),  # a failed rm: its retry needs the deadline, and the df would go unread
     ],
 )
@@ -500,7 +523,10 @@ def test_the_removal_takes_the_df_after_its_rm_only_when_the_df_ends_in_time(
     stdout = subprocess.run(["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, timeout=10).stdout
 
     assert ds_module._parse_remove_and_list_containers(stdout.decode()) == (rm_exit, (("pod_other",), {}), df_avail_bytes)
-    assert df_avail_bytes is None or "/var/lib/docker:/hostfs:ro" in (tmp_path / "run_args").read_text().split("\0")
+    # the helper the df ran is the shared one, which mounts no host path (test_volume_fast_path)
+    assert df_avail_bytes is None or (tmp_path / "run_args").read_text().split("\0")[:-1] == shlex.split(
+        DOCKER_VOLUMES_DF_COMMAND
+    )[1:]
 
 
 @pytest.mark.asyncio

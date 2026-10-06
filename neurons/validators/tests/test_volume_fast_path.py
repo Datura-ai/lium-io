@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from core.config import settings
-from core.docker_utils import ALPINE_HELPER_IMAGE, df_command
+from core.docker_utils import ALPINE_HELPER_IMAGE, DOCKER_VOLUMES_DF_COMMAND
 from payload_models.payloads import ContainerCreateRequest
 from services.docker_service import (
     DockerService,
@@ -98,8 +99,12 @@ def test_probe_command_is_one_line_with_every_section():
     assert "\n" not in command
     assert "/usr/bin/docker info --format '{{.DockerRootDir}}'" in command
     assert (
-        df_command('"$root"') in command
+        DOCKER_VOLUMES_DF_COMMAND in command
     ), "df must be the same helper-container command df_available_bytes runs"
+    # the helper mounts nothing from the host, only an anonymous volume of its own: any other flag fails here
+    assert shlex.split(DOCKER_VOLUMES_DF_COMMAND) == [
+        "/usr/bin/docker", "run", "--rm", "--mount", "type=volume,dst=/free", ALPINE_HELPER_IMAGE, "df", "-P", "-B1", "/free"
+    ]  # fmt: skip
     assert ALPINE_HELPER_IMAGE in command
     assert (
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; printf 'VOLS\\t%s\\n' \"$?\"; "

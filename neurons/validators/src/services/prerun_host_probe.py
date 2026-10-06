@@ -62,8 +62,8 @@ PROBE_OUTPUT_LOG_CAP = 512
 
 # The docker listings, shared with the per-command path in docker_service.py (imported there, so
 # the two paths run the same text).
-# The stale sweep's listing: the full ID next to each name, so the sweep removes the container
-# instance it listed, not a same-name one created after the listing.
+# The stale sweep's listing: the full ID next to each name, so the sweep removes and records the
+# container instance it listed without another round trip (a retry reuses the name).
 DOCKER_PS_ALL_NAMES_IDS_CMD = '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"'
 
 
