@@ -57,6 +57,7 @@ from protocol.vc_protocol.validator_requests import (
     GpuEstimatesRequest,
     InspectorEventRequest,
     LogStreamRequest,
+    PodStatesReport,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
@@ -78,6 +79,7 @@ from services.redis_service import (
     INSPECTOR_EVENT_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
+    POD_STATES_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
@@ -91,6 +93,17 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
+
+
+class OutgoingMessages(list[DeliveryStamps]):
+    # every append wakes the send loop, so a reply leaves at once instead of on the next 1 s poll
+    def __init__(self) -> None:
+        super().__init__()
+        self.appended = asyncio.Event()
+
+    def append(self, message: DeliveryStamps) -> None:
+        super().append(message)
+        self.appended.set()
 
 
 class AuthenticationError(Exception):
@@ -113,7 +126,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue: list[DeliveryStamps] = []
+        self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -176,7 +189,7 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        self.subtensor_client = await SubtensorClient.initialize()
+        self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
 
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
@@ -282,6 +295,7 @@ class ComputeClient:
                     RESET_VERIFIED_JOB_CHANNEL,
                     NORMALIZED_SCORE_CHANNEL,
                     GPU_ESTIMATES_CHANNEL,
+                    POD_STATES_CHANNEL,
                 )
                 async for message in pubsub.listen():
                     try:
@@ -350,10 +364,27 @@ class ComputeClient:
                             sent_at=data.get("sent_at"),
                             batch_total=data.get("batch_total"),
                             availability_errors=data.get("availability_errors"),
+                            pod_states=data.get("pod_states"),
+                            pod_ssh=data.get("pod_ssh"),
                         )
 
                         async with self.lock:
                             self.message_queue.append(specs)
+                    elif channel == POD_STATES_CHANNEL:
+                        # DAH-3338: one chunk of the cycle's container states, published after the spec
+                        report = PodStatesReport(
+                            validator_hotkey=validator_hotkey,
+                            miner_hotkey=data["miner_hotkey"],
+                            executor_uuid=data["executor_uuid"],
+                            job_batch_id=data["job_batch_id"],
+                            chunk_index=data["chunk_index"],
+                            chunk_total=data["chunk_total"],
+                            pod_states=data["pod_states"],
+                            sent_at=data.get("sent_at"),
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(report)
                     elif channel == STREAMING_LOG_CHANNEL:
                         log_stream = LogStreamRequest(
                             logs=data["logs"],
@@ -480,7 +511,8 @@ class ComputeClient:
                             )
                         )
             else:
-                await asyncio.sleep(1)
+                self.message_queue.appended.clear()
+                await self.message_queue.appended.wait()
 
     async def poll_rented_machines(self):
         while True:

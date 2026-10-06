@@ -19,6 +19,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import HostPolicyResult
 from services.executor_image_policy import ExecutorImageReport, ImageVerdict
 from services.executor_rollout import (
+    ROLLOUT_FAILURE_REASONS,
     ROLLOUT_STATE_KEY,
     ExecutorRolloutTracker,
     RolloutWindow,
@@ -371,6 +372,26 @@ def test_a_failure_on_an_executor_already_running_the_new_image_is_a_real_failur
     assert rollout_grace_reason(still_on_old, window, J1) == reason
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "SCRAPE_FAILED",
+        "SCRAPE_FAILED_NO_GPU",
+        "SCRAPE_FAILED_DRIVER",
+        "SCRAPE_FAILED_ON_HOST",
+        "SCRAPE_TIMEOUT",
+        "SCRAPE_TRANSPORT_FAILED",
+    ],
+)
+def test_every_scrape_failure_code_keeps_the_rollout_grace_scrape_failed_had(reason: str) -> None:
+    """Regression: a code SCRAPE_FAILED split into falling out of the set, so a scrape a watchtower
+    recreate ended inside the window would stand as a verdict."""
+    still_on_old = _failed("node-2", reason, observed_digest=OLD)
+
+    assert reason in ROLLOUT_FAILURE_REASONS
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == reason
+
+
 def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monkeypatch) -> None:
     """The 70 EXECUTOR_IMAGE_OUTDATED rows of 11 Sep, with the image check enforced as it was that
     day. Unrented, the fatal check ends the run with that reason; rented, the run completes with
@@ -505,6 +526,7 @@ async def test_a_refused_connect_records_its_reason_code_for_the_classifier(monk
 
     assert result.score == 0
     assert result.failure_reason_code == "EXECUTOR_SSH_UNREACHABLE"
+    assert result.validation_event.reason_code == "EXECUTOR_SSH_UNREACHABLE"
     assert rollout_grace_reason(result, _open_window(), J0) == "EXECUTOR_SSH_UNREACHABLE"
 
 
@@ -530,6 +552,30 @@ async def test_a_shell_that_dies_under_a_check_records_the_transport_code(monkey
     assert rollout_grace_reason(died, _open_window(), J0) == "EXECUTOR_TRANSPORT_UNREACHABLE"
     assert crashed.failure_reason_code is None
     assert rollout_grace_reason(crashed, _open_window(), J0) is None
+
+
+@pytest.mark.asyncio
+async def test_a_shell_that_dies_under_a_check_sends_the_transport_code_in_the_structured_event(monkeypatch) -> None:
+    """The backend stores the cycle's reason from `validation_event`. Regression: a transport death
+    after the connect sent no event, so the cycle reached the backend with no reason at all; a
+    crash of our own must still send none."""
+    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
+    service = _task_service_that_reaches_the_ssh_connect()
+    service.pipeline_factory = MagicMock()
+    miner, executor = _a_job_for("node-9")
+
+    service.pipeline_factory.build_context = AsyncMock(side_effect=asyncssh.Error(code=1, reason="x" * 2000))
+    died = await _run_cycle(service, miner, executor)
+
+    service.pipeline_factory.build_context = AsyncMock(side_effect=ValueError("a bug of our own"))
+    crashed = await _run_cycle(service, miner, executor)
+
+    event = died.validation_event
+    assert event.reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" == died.failure_reason_code
+    assert event.category == "transport"
+    assert event.what_we_saw["executor_uuid"] == "node-9"
+    assert len(event.what_we_saw["transport_error"]) <= 500
+    assert crashed.validation_event is None
 
 
 @pytest.mark.asyncio

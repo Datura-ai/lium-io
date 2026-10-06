@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import shlex
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-from ..messages import MachineSpecMessages as Msg, render_message
+from core.config import settings
+
+from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
-from .network_ema import compute_ema
+from .rented_gpu_drop import RentedGpuDropCheck
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
+
+logger = logging.getLogger(__name__)
 
 # DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
 # binary. Above a full scrape (~15 s on a real box, so a payload that will not decrypt is only
@@ -104,17 +111,165 @@ def _decrypt_payload(ctx: Context, stdout: str) -> str:
     raise last_exc or ValueError("No scrape payload on stdout")
 
 
+def _scrape_error_report(stdout: str) -> dict[str, Any] | None:
+    # the scrape prints {"error": ...} and exits non-zero when it ran but found nothing to report;
+    # a source the interpreter could not run prints nothing of ours at all. Searched newest-first
+    # like the token, since an atexit handler in the image may print after it.
+    for line in _lines_from_the_end(stdout):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            report = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(report, dict) and "error" in report:
+            return report
+    return None
+
+
 def _scrape_reported_its_own_failure(stdout: str) -> bool:
-    # the scrape prints {"error": ...} as its last line and exits non-zero when it ran but found
-    # nothing to report; a source the interpreter could not run prints nothing of ours at all
-    last_line = next((line for line in _lines_from_the_end(stdout) if line.strip()), None)
-    if last_line is None:
+    return _scrape_error_report(stdout) is not None
+
+
+def _is_no_gpu_details_error(error: Any, obfuscation_keys: dict[str, str] | None) -> bool:
+    # the key substitution that renames `gpu_details` in the shipped scrape (file_encrypt_service)
+    # is a plain text replace, so it renames it inside this string literal too
+    obfuscated_gpu_details_key = (obfuscation_keys or {}).get("gpu_details", "gpu_details")
+    return isinstance(error, str) and error in {"no_gpu_details", f"no_{obfuscated_gpu_details_key}"}
+
+
+@dataclass(frozen=True)
+class ScrapeFailure:
+    """The reason code a failed scrape run gets, plus the cause fields its event carries."""
+
+    template: MessageTemplate
+    error_type: str | None = None
+    scrape_error: str | None = None
+    gpu_scrape_error: str | None = None
+
+    def cause_event_fields(self) -> dict[str, str]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name != "template" and getattr(self, field.name) is not None
+        }
+
+
+def _classify_scrape_failure(
+    scrape_run: SSHCommandResult, obfuscation_keys: dict[str, str] | None
+) -> ScrapeFailure:
+    # which side failed, from what came back: the runner sets error_type exactly when no exit status
+    # came back from the host (timed out, raised, or the channel closed without one). Those stay
+    # undetermined; only an exit status the host sent puts the failure on the host.
+    if scrape_run.error_type == "timeout":
+        return ScrapeFailure(Msg.SCRAPE_TIMEOUT, error_type=scrape_run.error_type)
+    if scrape_run.error_type is not None:
+        return ScrapeFailure(Msg.SCRAPE_TRANSPORT_FAILED, error_type=scrape_run.error_type)
+
+    report = _scrape_error_report(scrape_run.stdout)
+    if report is None or not _is_no_gpu_details_error(report.get("error"), obfuscation_keys):
+        return ScrapeFailure(Msg.SCRAPE_FAILED_ON_HOST)
+
+    report_data = report.get("data")
+    report_data = _deobfuscate(report_data, obfuscation_keys) if isinstance(report_data, dict) else {}
+    gpu_scrape_error = report_data.get("gpu_scrape_error")
+    if gpu_scrape_error:
+        return ScrapeFailure(
+            Msg.SCRAPE_FAILED_DRIVER,
+            scrape_error="no_gpu_details",
+            gpu_scrape_error=str(gpu_scrape_error)[:200],
+        )
+    return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
+
+
+# The scrape's own NVML reading on the host says the node cannot serve a GPU: NVML answered with zero cards
+# (SCRAPE_FAILED_NO_GPU), or raised one of these nvml.h return codes (SCRAPE_FAILED_DRIVER): driver not
+# loaded, GPU lost, GPU requires reset, GPU not found. Anything else stays a plain halt: the library copied
+# to a temp file that a full or read-only disk refuses (LIBRARY_NOT_FOUND), a driver/library mismatch that
+# leaves pods started before the upgrade working, a permission or memory error, UNKNOWN (999, which names
+# no fault), and SCRAPE_FAILED_ON_HOST (a missing interpreter or a traceback says nothing of the GPU).
+HOST_GPU_RUNTIME_DEAD_NVML_CODES = frozenset({9, 15, 16, 28})
+_NVML_ERROR_CODE_RX = re.compile(r"^NVMLError\w*\((\d+)\)")
+HOST_GPU_RUNTIME_FAULT_IMPACT = (
+    "Validation halted — GPU runtime dead on the host of a rented node: verified job cleared, "
+    "executor marked inactive until a clean scrape"
+)
+
+
+def _gpu_runtime_is_dead(failure: ScrapeFailure) -> bool:
+    if failure.template.reason == Msg.SCRAPE_FAILED_NO_GPU.reason:
+        return True
+    if failure.template.reason != Msg.SCRAPE_FAILED_DRIVER.reason:
         return False
+    match = _NVML_ERROR_CODE_RX.match(failure.gpu_scrape_error or "")
+    return match is not None and int(match.group(1)) in HOST_GPU_RUNTIME_DEAD_NVML_CODES
+
+
+def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
+    """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing.
+
+    It clears the verified job as POD_NOT_RUNNING and GPU_MISSING do, so the backend marks the executor inactive
+    and billing stops. It is handled like GPU_MISSING: with the matching backend change the backend proposes
+    EXECUTOR_INACTIVE_MID_RENTAL for it, and the node is listed again only after a full GPU re-verification.
+    A node without a customer pod keeps the plain halt.
+    """
+    if not settings.RENTED_HOST_GPU_FAULT_RESET_ENABLED:
+        return {}
+    if not _gpu_runtime_is_dead(failure):
+        return {}
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    if not rented_executor or not rented_executor.pods:
+        return {}
+    # The executor UUID is the miner's word and the backend resets by UUID alone, so a rental another miner
+    # owns must never be cleared on this miner's report.
+    if rented_executor.miner_hotkey != ctx.miner_hotkey:
+        return {}
+    pod_ids = [pod.pod_id for pod in rented_executor.pods]
+    evidence: dict[str, Any] = {
+        "reason_code": failure.template.reason,
+        "check_id": check_id,
+        "pod_id": pod_ids[0],
+        "rented_pod_ids": pod_ids,
+        "scrape_error": failure.scrape_error,
+    }
+    if failure.gpu_scrape_error is not None:
+        evidence["gpu_scrape_error"] = failure.gpu_scrape_error
+    return {
+        "clear_verified_job_info": True,
+        "clear_verified_job_evidence": evidence,
+    }
+
+
+def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -> dict[str, Any]:
+    """The specs a `no_gpu_details` report carries, in the key shape a successful scrape has."""
+    report = _scrape_error_report(stdout) or {}
+    data = report.get("data")
+    if not isinstance(data, dict):
+        return {"gpu": {}}
+    specs = _update_keys(_deobfuscate(data, obfuscation_keys), ORIGINAL_KEYS)
+    return specs if isinstance(specs.get("gpu"), dict) else {**specs, "gpu": {}}
+
+
+async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
+    # A scrape that lists no GPU (card 0 lost, the only card lost, the driver down) fails here, and
+    # this check is fatal, so RentedGpuDropCheck never runs on that cycle: hand it the empty scrape.
+    gpu = specs["gpu"]
+    count = gpu.get("count")
+    state = replace(
+        ctx.state,
+        specs=specs,
+        gpu_count=count if isinstance(count, int) else 0,
+        gpu_details=[],
+    )
     try:
-        report = json.loads(last_line)
-    except ValueError:
-        return False
-    return isinstance(report, dict) and "error" in report
+        await RentedGpuDropCheck().run(ctx.model_copy(update={"state": state}))
+    except Exception:
+        logger.warning(
+            _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),
+            exc_info=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -200,7 +355,7 @@ class MachineSpecScrapeCheck:
             retryable=False,
             stdin_text=ctx.config.machine_scrape_source,
         )
-        result = self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
+        result = await self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
         if result.passed:
             return result
 
@@ -231,7 +386,7 @@ class MachineSpecScrapeCheck:
             remote_dir = await upload_validation_files_to_fresh_remote_dir(ctx, attempts=FALLBACK_UPLOAD_ATTEMPTS)
         except UploadFailed as exc:
             event = render_message(
-                Msg.SCRAPE_FAILED,
+                Msg.SCRAPE_TRANSPORT_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -247,7 +402,7 @@ class MachineSpecScrapeCheck:
             timeout=timeout,
             retryable=False,
         )
-        return self._check_result_from_scrape_run(
+        return await self._check_result_from_scrape_run(
             ctx, scrape_run, delivery="upload", fallback_from=fallback_from
         )
 
@@ -275,9 +430,9 @@ class MachineSpecScrapeCheck:
         scrape_run = await ctx.runner.run(
             _binary_command(remote_dir, script_filename), timeout=timeout, retryable=False
         )
-        return self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
+        return await self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
 
-    def _check_result_from_scrape_run(
+    async def _check_result_from_scrape_run(
         self,
         ctx: Context,
         scrape_run: SSHCommandResult,
@@ -290,19 +445,28 @@ class MachineSpecScrapeCheck:
             what["fallback_from"] = fallback_from.as_event_field()
 
         if not scrape_run.success or not scrape_run.stdout.strip():
+            failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            if failure.scrape_error == "no_gpu_details":
+                await _report_rented_gpu_loss(
+                    ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)
+                )
+            reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
             event = render_message(
-                Msg.SCRAPE_FAILED,
+                failure.template,
                 ctx=ctx,
                 check_id=self.check_id,
+                impact=HOST_GPU_RUNTIME_FAULT_IMPACT if reset else None,
                 what={
                     **what,
                     "command_id": scrape_run.command_id,
                     "exit_code": scrape_run.exit_code,
                     "duration_ms": scrape_run.duration_ms,
                     "stderr_tail": scrape_run.stderr[-400:],
+                    **failure.cause_event_fields(),
+                    **({"host_gpu_fault_reset": True} if reset else {}),
                 },
             )
-            return CheckResult(passed=False, event=event)
+            return CheckResult(passed=False, event=event, updates=reset)
 
         try:
             decrypted = _decrypt_payload(ctx, scrape_run.stdout)
@@ -327,21 +491,6 @@ class MachineSpecScrapeCheck:
             gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
-
-            prev_ema = (
-                ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
-                if ctx.state.rented_data else None
-            )
-            network = specs.get("network") or {}
-            network["ema_download_speed"] = compute_ema(
-                prev_ema.ema_download_speed if prev_ema else None,
-                network.get("download_speed"),
-            )
-            network["ema_upload_speed"] = compute_ema(
-                prev_ema.ema_upload_speed if prev_ema else None,
-                network.get("upload_speed"),
-            )
-            specs = {**specs, "network": network}
 
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,

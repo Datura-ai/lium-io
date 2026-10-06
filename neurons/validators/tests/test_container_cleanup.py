@@ -6,11 +6,20 @@ DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
 volumes left behind by historical `docker rm` without `-v`.
 """
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.container_cleanup import VOLUME_RM_MAX_PER_PASS, ContainerCleanup
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from services.container_cleanup import (
+    RENTED_LIST_EMPTY,
+    RENTED_LIST_UNAVAILABLE,
+    VOLUME_RM_MAX_PER_PASS,
+    ContainerCleanup,
+    listed_container_names,
+    rented_list_unknown_reason,
+)
 
 
 def _ssh_mock_from_calls(call_handler):
@@ -65,11 +74,19 @@ def _rented_data(executor_uuid: str, pods: list[str]):
     resp = MagicMock()
     resp.executors = {executor_uuid: executor_mock}
     resp.filler_containers_by_executor = {}
-    resp.get_filler_containers.side_effect = lambda key: resp.filler_containers_by_executor.get(str(key), [])
+    resp.all_filler_containers_by_executor = {}
     return resp
 
 
 EXECUTOR_UUID = "00000000-0000-0000-0000-000000000000"
+
+# A rented pod the backend lists but that is not on the host: removal is only allowed against a
+# fetched, non-empty rented list, so tests that exercise a removal carry one.
+LISTED_LIVE_POD = "pod_listed_live"
+
+
+def _listed():
+    return _rented_data(EXECUTOR_UUID, [LISTED_LIVE_POD])
 
 
 @pytest.mark.asyncio
@@ -84,13 +101,86 @@ async def test_cleanup_removes_stale_running_health_check():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
     assert removed_count == 1
     assert removed_names == [name]
     assert any("docker rm -f" in c and name in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_awaits_on_before_remove_before_each_removal():
+    """DAH-3338: the caller queues the reap for the backend BEFORE the container goes, so a crash
+    between the removal and the report cannot lose it. Fails on a cleanup that removes first."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    order: list[str] = []
+
+    async def on_before_remove(container_name: str) -> None:
+        container_removals = [c for c in rm_calls if "docker rm -f" in c]
+        order.append(f"queued {container_name} with {len(container_removals)} removal(s) so far")
+
+    removed_count, removed_names, _ = await cleanup_with_hook(ssh, on_before_remove)
+
+    assert removed_names == [name]
+    assert order == [f"queued {name} with 0 removal(s) so far"]
+    assert any("docker rm -f" in c and name in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_a_volume_rm_error_after_a_successful_rm_still_counts_the_container_as_removed():
+    """Regression (review of DAH-3338): the volume removal ran inside the same try as `docker rm`,
+    so an SSH error on it returned False for a container that was already gone. The caller then
+    named it unremovable and dropped its `reaped` report. Fails on the old shape."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker volume rm" in cmd:
+            raise OSError("ssh transport closed")
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert (removed_count, removed_names, unremovable) == (1, [name], [])
+    assert any("docker rm -f" in c and name in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
+    """Control for the test above: an SSH error on the `docker rm` itself is a failed removal."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, _ = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker rm -f" in cmd:
+            raise OSError("ssh transport closed")
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert (removed_count, removed_names, unremovable) == (0, [], [name])
+
+
+async def cleanup_with_hook(ssh, on_before_remove):
+    return await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh,
+        rented_data=_listed(),
+        executor_uuid=EXECUTOR_UUID,
+        on_before_remove=on_before_remove,
+    )
 
 
 @pytest.mark.asyncio
@@ -110,7 +200,7 @@ async def test_cleanup_removes_stale_exited_health_check():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -130,7 +220,7 @@ async def test_cleanup_preserves_young_health_check():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -180,7 +270,7 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
     ssh.run = AsyncMock(side_effect=handler)
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    await cleanup.cleanup(ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID)
+    await cleanup.cleanup(ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID)
 
     ps_cmd = next((c for c in seen_cmds if "docker ps -a" in c), "")
     assert "pod_*" in ps_cmd
@@ -198,7 +288,7 @@ async def test_cleanup_preserves_active_filler_container():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     rented_data = _rented_data(EXECUTOR_UUID, [])
-    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [name]}
+    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: name}
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
@@ -222,7 +312,7 @@ async def test_cleanup_preserves_young_unknown_filler_container():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -242,7 +332,7 @@ async def test_cleanup_removes_stale_unknown_filler_container():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
@@ -424,13 +514,29 @@ async def test_cleanup_invokes_volume_prune():
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
-        rented_data=None,
+        rented_data=_listed(),
         executor_uuid=EXECUTOR_UUID,
     )
 
     # Container return contract unchanged; the volume was still pruned.
     assert removed_count == 0
     assert removed_names == []
+    assert any("docker volume rm" in c and ANON_VOLUME_A in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data",
+    [pytest.param(None, id="fetch-failed-none"), pytest.param(RentedExecutorsResponse(executors={}), id="empty")],
+)
+async def test_an_empty_or_unknown_rented_list_still_prunes_dangling_volumes(rented_data):
+    ssh, rm_calls = _volume_ssh_mock(dangling=[ANON_VOLUME_A])
+
+    result = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert result == (0, [], [])
     assert any("docker volume rm" in c and ANON_VOLUME_A in c for c in rm_calls)
 
 
@@ -445,7 +551,7 @@ async def test_cleanup_preserves_every_filler_bundle_on_split_node():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     rented_data = _rented_data(EXECUTOR_UUID, [])
-    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [bundle_a, bundle_b]}
+    rented_data.all_filler_containers_by_executor = {EXECUTOR_UUID: [bundle_a, bundle_b]}
 
     removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
@@ -498,7 +604,7 @@ async def test_cleanup_kills_processes_directly_when_docker_rm_cannot_kill():
     ssh, calls = _make_unkillable_ssh_mock(name, rm_failures=1)
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert removed_names == [name] and unremovable == []
@@ -515,9 +621,120 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
     ssh, calls = _make_unkillable_ssh_mock(name, rm_failures=2)
 
     removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
-        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
     )
 
     assert removed_count == 0 and removed_names == []
     assert unremovable == [name]
     assert sum(1 for c in calls if "docker rm -f" in c and name in c) == 2  # one retry, no loop
+
+
+# ---------------------------------------------------------------------------
+# Only an empty or missing fleet snapshot means "don't know"; any listed name is protected on every host
+# ---------------------------------------------------------------------------
+
+LIVE_POD = "pod_live-0000-4000-8000-000000000001"
+LIVE_FILLER = "filler_live_bundle"
+STRAY_POD = "pod_stray-0000-4000-8000-000000000002"
+ELSEWHERE_POD = "pod_elsewhere-0000-4000-8000-000000000003"
+
+
+def _real_rented_data(executor_uuid: str, pods: list[str], fillers: list[str] | None = None, key: str | None = None):
+    return RentedExecutorsResponse(
+        executors={
+            (key or executor_uuid): RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id=name.removeprefix("pod_"), container_name=name) for name in pods],
+            )
+        },
+        all_filler_containers_by_executor={executor_uuid: fillers} if fillers else {},
+    )
+
+
+def _host_with_live_and_stray():
+    return _make_ssh_mock(
+        containers=[LIVE_POD, LIVE_FILLER, STRAY_POD],
+        ages_by_name={LIVE_POD: 28, LIVE_FILLER: 29, STRAY_POD: 60},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data, reason",
+    [
+        pytest.param(None, RENTED_LIST_UNAVAILABLE, id="fetch-failed-none"),
+        pytest.param(RentedExecutorsResponse(executors={}), RENTED_LIST_EMPTY, id="fleet-snapshot-empty"),
+        pytest.param(_real_rented_data(EXECUTOR_UUID, []), RENTED_LIST_EMPTY, id="only-executor-listed-with-no-pods"),
+    ],
+)
+async def test_an_empty_or_unknown_fleet_snapshot_removes_nothing_and_warns(rented_data, reason, caplog):
+    ssh, rm_calls = _host_with_live_and_stray()
+
+    with caplog.at_level(logging.WARNING, logger="services.container_cleanup"):
+        result = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+            ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+        )
+
+    assert result == (0, [], [])
+    assert not any("docker rm -f" in c for c in rm_calls)
+    assert not any("docker ps -a" in c for c in (call.args[0] for call in ssh.run.call_args_list))
+    assert rented_list_unknown_reason(rented_data) == reason
+    assert any("snapshot is empty or unknown" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data, expected_removed",
+    [
+        pytest.param(_real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER]), {STRAY_POD}, id="own-pod-and-filler"),
+        pytest.param(_real_rented_data(EXECUTOR_UUID, [], fillers=[LIVE_FILLER]), {LIVE_POD, STRAY_POD}, id="own-filler-only"),
+        pytest.param(
+            _real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER], key="twin-executor-id"),
+            {STRAY_POD},
+            id="pod-listed-under-twin-id-filler-under-this-id",
+        ),
+        pytest.param(
+            _real_rented_data("another-node", [ELSEWHERE_POD]),
+            {LIVE_POD, LIVE_FILLER, STRAY_POD},
+            id="idle-node-orphans-still-reaped",
+        ),
+    ],
+)
+async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_listed_one(rented_data, expected_removed):
+    ssh, rm_calls = _host_with_live_and_stray()
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert rented_list_unknown_reason(rented_data) is None
+    assert (removed_count, set(removed_names), unremovable) == (len(expected_removed), expected_removed, [])
+
+
+@pytest.mark.asyncio
+async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
+    fleet_pods = [f"pod_fleet-{i:04d}" for i in range(500)]
+    stale = [f"pod_stale-{i:02d}" for i in range(5)]
+    ssh, _ = _make_ssh_mock(containers=stale, ages_by_name={name: 60 for name in stale})
+    rented_data = _real_rented_data("another-node", fleet_pods)
+
+    with caplog.at_level(logging.INFO, logger="services.container_cleanup"):
+        removed_count, _, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+            ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+        )
+
+    cleanup_logs = [r.msg for r in caplog.records if hasattr(r.msg, "to_full_string")]
+    assert removed_count == len(stale) and len(cleanup_logs) == len(stale) + 1
+    for msg in cleanup_logs:
+        assert msg.extra["rented_container_count"] == len(listed_container_names(rented_data))
+        assert "pod_fleet-" not in msg.to_full_string()
+
+
+@pytest.mark.parametrize("rented_data", [None, _listed(), _rented_data("twin-executor-id", ["pod_on_twin"])])
+def test_get_rented_containers_answers_the_dind_volume_sweep_like_listed_container_names(rented_data):
+    # #1448's prune_orphaned_dind_volumes calls it with this signature
+    names = ContainerCleanup()._get_rented_containers(rented_data, EXECUTOR_UUID)
+
+    assert names == listed_container_names(rented_data)

@@ -36,7 +36,7 @@ from payload_models.payloads import (
     now_ms,
 )
 from services.docker_service import DockerService
-from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
+from services.rental_docker_sdk import ContainerExecResult, ContainerStateSnapshot, build_gpu_docker_config
 
 # ------------------------------------------------------------------
 # Fixtures / helpers
@@ -94,6 +94,10 @@ class _FakeRentalDockerClient:
         self.image_exists_result = image_exists_result
         self.image_exists_error = image_exists_error
         self.image_exists_calls = []
+        self.repo_digests = ()
+        self.local_image_current = True
+        self.local_image_current_error = None
+        self.freshness_calls = []
         self.pulled_images = []
         self.run_specs = []
         self.exec_specs = []
@@ -112,6 +116,15 @@ class _FakeRentalDockerClient:
             raise self.image_exists_error
         return self.image_exists_result
 
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return self.repo_digests if await self.image_exists(image=image) else None
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        self.freshness_calls.append({"image": image, "auth_config": auth_config})
+        if self.local_image_current_error is not None:
+            raise self.local_image_current_error
+        return self.local_image_current
+
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
         if self.pull_error is not None:
@@ -123,6 +136,12 @@ class _FakeRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
 
 class _FakeRentalDockerFactory:
@@ -203,8 +222,8 @@ def _patch_happy(svc, monkeypatch, ssh_client):
         svc, "generate_portMappings",
         AsyncMock(return_value=([(22, 20001, 20001)], None)),
     )
-    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock())
-    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         svc, "resolve_volume_sizing",
         AsyncMock(return_value=Mock(volume_limit_gb=10, storage_limit_gb=20)),
@@ -300,6 +319,111 @@ async def test_probe_error_falls_through_to_pull(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     assert _pulled_images(svc) == ["daturaai/pytorch:9.9.9"]
+
+
+@pytest.mark.asyncio
+async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypatch):
+    """DAH-3873: a mutable tag (`:prod`) on the host is stale once the registry tag moves."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).local_image_current = False
+
+    result = await _run(svc, _payload(docker_image="ghcr.io/org/app:prod", **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    assert _pulled_images(svc) == ["ghcr.io/org/app:prod"]
+    assert _docker_client(svc).freshness_calls == [
+        {"image": "ghcr.io/org/app:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
+    ]
+    assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
+
+
+@pytest.mark.asyncio
+async def test_present_image_is_used_when_the_registry_check_fails(svc, monkeypatch):
+    """DAH-3873: fail open. A registry that does not answer must not block the rental."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).local_image_current_error = RuntimeError("registry down")
+
+    result = await _run(svc, _payload())
+
+    assert isinstance(result, ContainerCreated)
+    assert _pulled_images(svc) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("docker_hub_digest", "pulled"),
+    [("sha256:current", []), ("sha256:moved", ["daturaai/pytorch:prod"])],
+)
+async def test_docker_hub_digest_from_the_connector_replaces_the_daemon_registry_check(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path, docker_hub_digest, pulled
+):
+    """DAH-3980: the connector's own Docker Hub answer decides, the daemon is not asked (~2 s)."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
+    no_docker_hub_digest_on_rent_path.return_value = docker_hub_digest
+
+    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
+    assert _docker_client(svc).freshness_calls == []
+    assert _pulled_images(svc) == pulled
+
+
+@pytest.mark.asyncio
+async def test_daemon_checks_the_registry_when_docker_hub_gives_no_digest(svc, monkeypatch):
+    """No connector answer (another registry, a private image, Hub down) keeps the DAH-3873 path."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert [call["image"] for call in _docker_client(svc).freshness_calls] == ["daturaai/pytorch:prod"]
+
+
+@pytest.mark.asyncio
+async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path
+):
+    """The success path the bench measured: one lookup, one inspect, no daemon registry check."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
+    no_docker_hub_digest_on_rent_path.return_value = "sha256:current"
+
+    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
+    assert _docker_client(svc).image_exists_calls == ["daturaai/pytorch:prod"]
+    assert _docker_client(svc).freshness_calls == []
+    assert _docker_client(svc).login_calls == []
+    assert _pulled_images(svc) == []
+    assert _ssh_run_cmds(ssh_client) == [
+        '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the live power floor read twice: beside the volume create, and again right before docker run
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
+        "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+    ]
+    assert _exec_argv_texts(svc) == ["sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"]
+
+
+@pytest.mark.asyncio
+async def test_a_rent_with_registry_credentials_skips_the_anonymous_docker_hub_lookup(
+    svc, monkeypatch, no_docker_hub_digest_on_rent_path
+):
+    """An anonymous lookup of a private image only gets a 401; the daemon asks with the rent's credentials."""
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    result = await _run(svc, _payload(docker_image="private/repo:prod", **_CREDS))
+
+    assert isinstance(result, ContainerCreated)
+    no_docker_hub_digest_on_rent_path.assert_not_called()
+    assert _docker_client(svc).freshness_calls == [
+        {"image": "private/repo:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
+    ]
 
 
 @pytest.mark.asyncio
@@ -954,7 +1078,7 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
     credentials into it is a separate task."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None)))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None, None)))
 
     result = await _run(
         svc,

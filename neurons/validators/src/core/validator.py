@@ -11,7 +11,6 @@ from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
-from services.collateral_contract_service import CollateralContractService
 from services.default_docker_image_digest_service import (
     fetch_default_image_digests,
     fetch_executor_image_digest,
@@ -41,9 +40,11 @@ from services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
 )
+from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
 from core.express_lane import CycleInputs, ExpressLane
@@ -92,7 +93,6 @@ class Validator:
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
-        self.collateral_contract_service = CollateralContractService()
         self.attestation_service = AttestationService(redis_service=self.redis_service)
         # DAH-3405: remembers the authorized executor digest and when it last changed.
         self.rollout_tracker = ExecutorRolloutTracker(redis_service=self.redis_service)
@@ -127,7 +127,6 @@ class Validator:
             redis_service=self.redis_service,
             validation_service=self.validation_service,
             verifyx_validation_service=self.verifyx_validation_service,
-            collateral_contract_service=self.collateral_contract_service,
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
@@ -376,8 +375,14 @@ class Validator:
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
                 )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
+                )
+                # every listed rented pod's SSH (any status), probed once while the miners work
+                pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
                 task_info = {}
 
@@ -414,8 +419,11 @@ class Validator:
                     all_job_results = {}
                     miner_coldkeys = {}
 
-                    # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    # asyncio.wait rejects an empty set.
+                    if jobs:
+                        done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    else:
+                        done, pending = set(), set()
 
                     # Process completed jobs
                     for task in done:
@@ -524,6 +532,10 @@ class Validator:
                                 }
                             ),
                         ),
+                    )
+                    NETWORK_GATE_TALLY.log_and_reset(
+                        MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
                     )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
@@ -637,6 +649,19 @@ class Validator:
                             )
                         )
 
+                    # each node's pod SSH observations ride on its result; a probed rented
+                    # node the cycle has no result for gets one carrying only them. A withheld
+                    # executor has a result this cycle, held back, so it gets none.
+                    pod_ssh = await pod_ssh_probe
+                    reported = attach_pod_ssh(incentive.job_results, pod_ssh) | {
+                        str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results
+                    }
+                    result_missing = (
+                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
+                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
+                        else {}
+                    )
+
                     # Publish machine specs
                     published_executor_ids: list[str] = []
                     for miner_hotkey, results in incentive.job_results.items():
@@ -648,6 +673,10 @@ class Validator:
                                 for result in results
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
+
+                    # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
+                    # the express lane below.
+                    await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -671,7 +700,10 @@ class Validator:
                                 ),
                             )
 
-                    self.completed_cycles_since_start += 1
+                    # A cycle with no miners validated nobody, so it keeps the post-restart
+                    # warm-up closed: set_weights and the express lane wait for a scored cycle.
+                    if jobs:
+                        self.completed_cycles_since_start += 1
 
                     logger.info(
                         _m(
@@ -755,6 +787,63 @@ class Validator:
                         ),
                     ),
                 )
+
+    async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
+        """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
+        if not settings.RENTED_POD_SSH_PROBE_ENABLED:
+            return {}
+        try:
+            return await probe_rented_pods(
+                rented_executors,
+                timeout=settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS,
+                concurrency=settings.RENTED_POD_SSH_PROBE_CONCURRENCY,
+                job_batch_id=job_batch_id,
+            )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] rented pod SSH probe failed; this cycle reports no observations",
+                    extra=get_extra_info(
+                        {**self.default_extra, "job_batch_id": job_batch_id, "error_type": type(exc).__name__}
+                    ),
+                ),
+                exc_info=True,
+            )
+            return {}
+
+    async def publish_result_missing(
+        self, result_missing: dict[str, list[JobResult]], miners, miner_coldkeys: dict, job_batch_id: str
+    ) -> None:
+        """Publish the observations-only results (EXECUTOR_RESULT_MISSING), one miner at a time.
+
+        The coldkey is the miner's answer's when it answered, else the metagraph's; a hotkey that is
+        in neither is not registered any more and its nodes are skipped.
+        """
+        if not result_missing:
+            return
+        metagraph_coldkeys = {miner.hotkey: miner.coldkey for miner in miners}
+        skipped = []
+        for miner_hotkey, results in result_missing.items():
+            miner_coldkey = miner_coldkeys.get(miner_hotkey) or metagraph_coldkeys.get(miner_hotkey)
+            if not miner_coldkey:
+                skipped.extend(result.executor_info.uuid for result in results)
+                continue
+            await self.miner_service.publish_machine_specs(
+                results, miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
+        logger.info(
+            _m(
+                "[sync] rented nodes without a result reported with their pod SSH observations",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "job_batch_id": job_batch_id,
+                        "executors": sum(len(results) for results in result_missing.values()),
+                        "skipped_unregistered": skipped,
+                    }
+                ),
+            )
+        )
 
     async def fetch_executor_digest_or_none(self) -> str | None:
         """The registry digest of EXECUTOR_IMAGE_REF, or None when it cannot be read.

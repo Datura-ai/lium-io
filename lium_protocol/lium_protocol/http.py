@@ -25,6 +25,10 @@ class RentedPod(pydantic.BaseModel):
     # DAH-2467: GPUs this pod holds; None = the backend predates the field, the validator then scores
     # the whole executor as rented
     gpu_count: int | None = None
+    # DAH-2870: the external port of the pod's container port 22; None = none mapped or an older backend
+    ssh_port: int | None = None
+    # DAH-2870: the pod's status (`RUNNING`, `REBOOT_PENDING`, ...); None = an older backend
+    status: str | None = None
 
 
 class RentedExecutor(pydantic.BaseModel):
@@ -51,6 +55,18 @@ class ManualRentalInfo(pydantic.BaseModel):
     gpu_count: int
 
 
+class FillerRevenueByGpuConfig(pydantic.BaseModel):
+    """What Lium's fillers earned per GPU-hour, on average, on one GPU configuration ("8x B200"),
+    over the trailing 24 hours: usd_per_gpu_hour = filler revenue / filler GPU-hours, per
+    (base model, GPU count)."""
+
+    base_model: str
+    gpu_count: int
+    usd_per_gpu_hour: float
+    # the filler GPU-hours the average was taken over; the validator ignores a thin sample
+    gpu_hours: float
+
+
 class RentedExecutorsResponse(pydantic.BaseModel):
     """`GET /internal/executors/rented`: every rented executor, the fillers to protect, the bans."""
 
@@ -68,12 +84,17 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}
     spot_executor_ids: list[str] = []
+    # the subset of spot_executor_ids whose provider chose the Spot tier (not demoted, force-spot,
+    # pinned or in a no-incentive rental); only these may take spot-node pay
+    provider_spot_executor_ids: list[str] = []
     new_rentals_paused_executor_ids: list[str] = []
     # DAH-2703: executor_ids whose filler container was destroyed during create
     filler_create_kill_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None
     default_job_owner_by_executor: dict[str, str] = {}  # executor_id → "miner" | "lium"
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
+    # average filler revenue per GPU configuration, read by the spot-node pay and the secure floor
+    filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
 
 
 class PodRentalActiveResponse(pydantic.BaseModel):
@@ -94,6 +115,14 @@ class PodHostRebootRecoveredRequest(pydantic.BaseModel):
 
 class PodHostRebootRecoveredResponse(pydantic.BaseModel):
     recorded: bool
+
+
+class PodSshUnreachableResponse(pydantic.BaseModel):
+    """`POST …/ssh-unreachable`: ``recorded`` False when the backend already holds this outage."""
+
+    recorded: bool
+    # "notified", "recorded" or "notify_failed"; None = an older backend
+    delivery: str | None = None
 
 
 class FillerRunActiveResponse(pydantic.BaseModel):
@@ -146,6 +175,7 @@ HTTP_MODELS: dict[str, type[pydantic.BaseModel]] = {
         PodRentalActiveResponse,
         PodHostRebootRecoveredRequest,
         PodHostRebootRecoveredResponse,
+        PodSshUnreachableResponse,
         FillerRunActiveResponse,
         ExecutorUptimeResponse,
         ExecutorHealthCheckResponse,

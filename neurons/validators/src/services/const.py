@@ -97,6 +97,8 @@ GPU_MODEL_RATES = {
 }
 # `NVIDIA B300 SXM6 PC` is derived from the AC entry, never a row of its own (incentive/config.py says why).
 GPU_MODEL_RATES["NVIDIA B300 SXM6 PC"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
+# `NVIDIA GB300` is priced like B300 for now; revisit when GB300 market data exists.
+GPU_MODEL_RATES["NVIDIA GB300"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
 
 MAX_UPLOAD_SPEED = 1000
 MAX_DOWNLOAD_SPEED = 1000
@@ -129,6 +131,10 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
+# Declared ports are tallied per bucket of this width (by external port), so a wide range
+# forwarded only in part shows which part answered; at most 14 tallies over 1-65535 per pass
+# (28 per event, both passes).
+PORT_RANGE_BUCKET_WIDTH = 5000
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
@@ -266,6 +272,15 @@ FILLER_CONTAINER_GRACE_MINUTES = 15
 # of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
 # let a provider reuse the name of their own broken pod for a foreign workload.
 BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
+# How long after a rental closes its pod container still counts as the unrent flow's teardown rather
+# than an orphan: with RENTAL_TEARDOWN_DEFERRAL_ENABLED on, the GPU usage check defers instead of
+# scoring 0 until this long after the close, which covers one run and occasionally two. A run is
+# shorter than this, so a rental that ends while the run is inside it always lands here. It must stay
+# short for the same reason as the grace above: the pod's name must not shield a workload for long.
+RENTAL_TEARDOWN_GRACE_MINUTES = 15
+# How far ahead of the validator's clock a rental's close time may sit and still read as a rental
+# that just ended. A close time further ahead is not trusted, so the container stays an orphan.
+RENTAL_CLOSE_CLOCK_SKEW_MINUTES = 5
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
 FILLER_LIVENESS_GRACE_MINUTES = 10
