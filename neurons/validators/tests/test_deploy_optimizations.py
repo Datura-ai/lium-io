@@ -222,8 +222,8 @@ def _patch_happy(svc, monkeypatch, ssh_client):
         svc, "generate_portMappings",
         AsyncMock(return_value=([(22, 20001, 20001)], None)),
     )
-    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock())
-    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         svc, "resolve_volume_sizing",
         AsyncMock(return_value=Mock(volume_limit_gb=10, storage_limit_gb=20)),
@@ -400,6 +400,9 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
         '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the live power floor read twice: beside the volume create, and again right before docker run
+        "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+        " --format=csv,noheader,nounits",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
