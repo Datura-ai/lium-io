@@ -108,6 +108,16 @@ def no_docker_hub_digest_on_rent_path():
         yield lookup
 
 
+@pytest.fixture(autouse=True)
+def no_kept_upload_probes_carried_between_tests():
+    """The VerifyX check counts kept upload probes per (hotkey, uuid) for the process; tests share both."""
+    yield
+    for name in ("services.task.checks.verifyx", "neurons.validators.src.services.task.checks.verifyx"):
+        module = sys.modules.get(name)
+        if module is not None:
+            module._kept_upload_probes.clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_sql_logging():
     """Enable SQL query logging for all tests."""
@@ -123,6 +133,25 @@ def setup_sql_logging():
     pool_logger.setLevel(logging.DEBUG)
 
     print("✅ SQL logging enabled for all tests")
+
+
+@pytest.fixture(autouse=True)
+def _no_collateral_rpc():
+    """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so.
+
+    Not monkeypatch: an autouse fixture that requests it moves its undo after the event loop's teardown,
+    and a test that patched time.monotonic with a finite iterator then fails there."""
+    from services import collateral_status
+
+    async def _refuse(batch):
+        raise AssertionError("collateral RPC called in a unit test")
+
+    saved = collateral_status._reader
+    collateral_status._reader = collateral_status.CollateralStatusReader(
+        rpc=_refuse, evm_address_for_hotkey=lambda _hotkey: None
+    )
+    yield
+    collateral_status._reader = saved
 
 
 @pytest.fixture

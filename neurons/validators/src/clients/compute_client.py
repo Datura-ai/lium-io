@@ -95,6 +95,17 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 
 
+class OutgoingMessages(list[DeliveryStamps]):
+    # every append wakes the send loop, so a reply leaves at once instead of on the next 1 s poll
+    def __init__(self) -> None:
+        super().__init__()
+        self.appended = asyncio.Event()
+
+    def append(self, message: DeliveryStamps) -> None:
+        super().append(message)
+        self.appended.set()
+
+
 class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
         self.reason = reason
@@ -115,7 +126,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue: list[DeliveryStamps] = []
+        self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -178,7 +189,7 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        self.subtensor_client = await SubtensorClient.initialize()
+        self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
 
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
@@ -500,7 +511,8 @@ class ComputeClient:
                             )
                         )
             else:
-                await asyncio.sleep(1)
+                self.message_queue.appended.clear()
+                await self.message_queue.appended.wait()
 
     async def poll_rented_machines(self):
         while True:

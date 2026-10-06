@@ -5,7 +5,8 @@ questions, each its own SSH round trip: the container list (`clean_existing_cont
 volume list and the mounted-volume list (`clean_stale_vloopback_volumes`), the volume names
 again (`reclaim_dphn_cache_for_rental`), the kernel's GPU UUID→minor map and the shared device
 nodes (`build_gpu_docker_config_for_executor`), the nvidia-smi power state
-(`raise_low_power_limits_to_default`) and the image's volume-encryption label. On the far half of
+(`raise_low_power_limits_to_default`) and the image's volume-encryption label; DAH-3980 adds a ninth,
+the lingering port-check / health-check containers (`wait_for_port_check_containers`). On the far half of
 the fleet a round trip is 0.2–0.6 s, so the listings cost more than the work they inform.
 
 With ``RENTAL_PRERUN_HOST_PROBE_ENABLED`` the same listings come back from ONE command, each
@@ -19,7 +20,7 @@ as a whole and every consumer runs as before. The probe reads, never writes.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # The probe reads the same commands the per-command path runs, so the two paths cannot drift.
 from services.gpu_power_limit import POWER_STATE_CMD
@@ -39,6 +40,7 @@ SHARED_TAG = "SHARED"
 SHAREDW_TAG = "SHAREDW"
 POWER_TAG = "POWER"
 LABEL_TAG = "LABEL"
+PORT_CHECK_TAG = "PORTCHECK"
 _ALWAYS_TAGS = (
     PS_TAG,
     VOL_TAG,
@@ -48,6 +50,7 @@ _ALWAYS_TAGS = (
     SHARED_TAG,
     SHAREDW_TAG,
     LABEL_TAG,
+    PORT_CHECK_TAG,
 )
 # The per-command path never looks at these commands' exit status (a `for p in …; [ -e "$p" ] && …`
 # loop exits 1 when the last node is absent; `ls … || true` exits 0), so neither does the parser.
@@ -58,7 +61,23 @@ PROBE_OUTPUT_LOG_CAP = 512
 
 # The docker listings, shared with the per-command path in docker_service.py (imported there, so
 # the two paths run the same text).
-DOCKER_PS_ALL_NAMES_CMD = '/usr/bin/docker ps -a --format "{{.Names}}"'
+# The stale sweep's listing: the full ID next to each name, so the sweep removes and records the
+# container instance it listed without another round trip (a retry reuses the name).
+DOCKER_PS_ALL_NAMES_IDS_CMD = '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"'
+
+
+def parse_container_listing(lines) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Names in listing order, and name -> full ID for the lines that carry a 64-hex ID."""
+    names: list[str] = []
+    ids: dict[str, str] = {}
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        names.append(parts[0])
+        if len(parts) == 2 and len(parts[1]) == 64 and all(c in "0123456789abcdef" for c in parts[1]):
+            ids[parts[0]] = parts[1]
+    return tuple(names), ids
 DOCKER_VOLUME_LS_NAME_DRIVER_CMD = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
 DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
     "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
@@ -67,6 +86,22 @@ DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
 # Printed (untagged) when the awk that prefixes a section's lines fails: an untagged line makes
 # the parser raise, so a prefixing failure is a whole-probe fallback, never an empty listing.
 PREFIX_FAILED_MARKER = "PRERUN_PROBE_PREFIX_FAILED"
+
+
+def port_check_container_filters(miner_hotkey: str) -> str:
+    """`docker ps` filters for validator probes (`container_{hotkey}_*`) and backend `health_check_*`."""
+    # docker ps OR-s multiple --filter name= flags
+    return (
+        f"--filter {shlex.quote(f'name=^container_{miner_hotkey}_')} "
+        f"--filter {shlex.quote('name=^health_check_')}"
+    )
+
+
+def port_check_containers_command(miner_hotkey: str) -> str:
+    """Names of the running port-check / health-check containers — what `wait_for_port_check_containers` lists."""
+    return (
+        f'/usr/bin/docker ps --format "{{{{.Names}}}}" {port_check_container_filters(miner_hotkey)}'
+    )
 
 
 def image_label_command(docker_image: str, label: str) -> str:
@@ -105,6 +140,9 @@ class PrerunHostProbe:
         str | None
     )  # raw nvidia-smi CSV for `_parse_power_state_csv`; None when not asked
     image_label_value: str | None  # the label's value, stripped; None when inspect failed
+    port_check_container_names: tuple[str, ...] | None  # `port_check_containers_command` output
+    # name -> full container ID from the same listing as container_names; {} when none was read
+    container_ids: dict[str, str] = field(default_factory=dict)
 
     @property
     def volume_names(self) -> tuple[str, ...] | None:
@@ -130,7 +168,9 @@ def _section(tag: str, command: str) -> str:
     return f"t {tag} {shlex.quote(command)}"
 
 
-def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power: bool) -> str:
+def prerun_host_probe_command(
+    *, docker_image: str, image_label: str, with_power: bool, miner_hotkey: str
+) -> str:
     """One `sh` command line printing every section; see the module docstring for the format.
 
     ``with_power`` adds the nvidia-smi power-state query (the customer-rental path reads it; a
@@ -143,7 +183,7 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
         'if [ -n "$out" ]; then printf \'%s\\n\' "$out" | awk -v t="$tag" \'{ print t "\\t" $0 }\' '
         f"|| echo {PREFIX_FAILED_MARKER}; fi; "
         f'printf \'%s{_RC_SUFFIX}\\t%s\\n\' "$tag" "$rc"; }}',
-        _section(PS_TAG, DOCKER_PS_ALL_NAMES_CMD),
+        _section(PS_TAG, DOCKER_PS_ALL_NAMES_IDS_CMD),
         _section(VOL_TAG, DOCKER_VOLUME_LS_NAME_DRIVER_CMD),
         _section(MNT_TAG, DOCKER_MOUNTED_VOLUME_NAMES_CMD),
         _section(GPU_MINOR_MAP_TAG, PROC_GPU_INFO_CMD),
@@ -157,6 +197,7 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
     if with_power:
         parts.append(_section(POWER_TAG, POWER_STATE_CMD))
     parts.append(_section(LABEL_TAG, image_label_command(docker_image, image_label)))
+    parts.append(_section(PORT_CHECK_TAG, port_check_containers_command(miner_hotkey)))
     return "; ".join(parts)
 
 
@@ -228,8 +269,10 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
         # arrives as several LABEL lines and is joined back before the strip.
         label_value = "\n".join(lines.get(LABEL_TAG, ())).strip()
 
+    container_names, container_ids = parse_container_listing(stripped_lines(PS_TAG))
     return PrerunHostProbe(
-        container_names=stripped_lines(PS_TAG) if ok(PS_TAG) else None,
+        container_names=container_names if ok(PS_TAG) else None,
+        container_ids=container_ids if ok(PS_TAG) else {},
         volumes=volumes,
         mounted_volume_names=stripped_lines(MNT_TAG) if ok(MNT_TAG) else None,
         gpu_minor_map_stdout="\n".join(lines.get(GPU_MINOR_MAP_TAG, ()))
@@ -242,4 +285,5 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
             "\n".join(lines.get(POWER_TAG, ())) if with_power and ok(POWER_TAG) else None
         ),
         image_label_value=label_value,
+        port_check_container_names=stripped_lines(PORT_CHECK_TAG) if ok(PORT_CHECK_TAG) else None,
     )
