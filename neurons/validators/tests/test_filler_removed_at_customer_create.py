@@ -431,11 +431,11 @@ async def test_a_removal_that_times_out_still_logs_its_duration(docker_service, 
 
 _DOCKER_STUB = """#!/bin/sh
 case "$1" in
-  rm) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$RM_ARGS"; done ;;
+  rm) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$RM_ARGS"; done; exit "${RM_EXIT:-0}" ;;
   ps) printf 'NAME\\tpod_other\\n' ;;
   volume) shift 2; for arg in "$@"; do printf '%s\\0' "$arg" >> "$VOLUME_RM_ARGS"; done ;;
   info) printf '/var/lib/docker\\n' ;;
-  run) printf '%s\\0' "$@" >> "$RUN_ARGS"; printf 'Filesystem 1-blocks Used Available Use%% Mounted\\n/dev/vda1 9 2 4242 30%% /hostfs\\n' ;;
+  run) printf '%s\\0' "$@" >> "$RUN_ARGS"; eval "$HELPER_DF"; printf 'Filesystem 1-blocks Used Available Use%% Mounted\\n/dev/vda1 9 2 4242 30%% /hostfs\\n' ;;
 esac
 """
 
@@ -466,7 +466,21 @@ def test_a_hostile_container_name_stays_one_argument_of_the_rm(tmp_path):
     assert ds_module._parse_remove_and_list_containers(stdout) == (0, (("pod_other",), {}), None)
 
 
-def test_the_removal_reads_df_of_the_docker_root_after_the_rm(tmp_path):
+@pytest.mark.parametrize(
+    ("helper_df", "rm_exit", "removal_timeout_s", "df_avail_bytes"),
+    [
+        ("", 0, 60, 4242),
+        ("sleep 30", 0, 60, None),  # hangs: cut off inside the command, which still answers
+        ("printf 'F\\n/dev/vda1 9 2 42'; exit 137", 0, 60, None),  # dies mid-output: not read
+        ("", 0, 8, None),  # the rm left no room for both bounded df calls (1 s each here, 1 s to kill) and a margin
+        ("", 1, 60, None),  # a failed rm: its retry needs the deadline, and the df would go unread
+    ],
+)
+def test_the_removal_takes_the_df_after_its_rm_only_when_the_df_ends_in_time(
+    tmp_path, monkeypatch, helper_df, rm_exit, removal_timeout_s, df_avail_bytes
+):
+    monkeypatch.setattr(ds_module, "_DF_AFTER_REMOVAL_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", removal_timeout_s)
     stub = tmp_path / "docker"
     stub.write_text(_DOCKER_STUB)
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
@@ -478,13 +492,15 @@ def test_the_removal_reads_df_of_the_docker_root_after_the_rm(tmp_path):
         "RM_ARGS": str(tmp_path / "rm_args"),
         "VOLUME_RM_ARGS": str(tmp_path / "volume_rm_args"),
         "RUN_ARGS": str(tmp_path / "run_args"),
+        "HELPER_DF": helper_df,
+        "RM_EXIT": str(rm_exit),
     }
 
     # bytes: text mode would turn the DF record's "\r" into "\n"
-    stdout = subprocess.run(["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, check=False).stdout
+    stdout = subprocess.run(["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, timeout=10).stdout
 
-    assert "/var/lib/docker:/hostfs:ro" in (tmp_path / "run_args").read_text().split("\0")
-    assert ds_module._parse_remove_and_list_containers(stdout.decode()) == (0, (("pod_other",), {}), 4242)
+    assert ds_module._parse_remove_and_list_containers(stdout.decode()) == (rm_exit, (("pod_other",), {}), df_avail_bytes)
+    assert df_avail_bytes is None or "/var/lib/docker:/hostfs:ro" in (tmp_path / "run_args").read_text().split("\0")
 
 
 @pytest.mark.asyncio

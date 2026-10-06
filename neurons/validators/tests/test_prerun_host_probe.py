@@ -1231,7 +1231,7 @@ def _wire_customer_create_over_the_host(
     ssh_client = _deploy_ssh_client()
 
     def answer(cmd, *args, **kwargs):
-        if cmd.startswith("/usr/bin/docker rm -fv"):
+        if "/usr/bin/docker rm -fv" in cmd:
             if docker_rm_raises is not None:
                 raise docker_rm_raises
             # the removal command reports the rm's status and the names left after it
@@ -1353,7 +1353,7 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
 
 def _df_record(avail_bytes: int) -> str:
     # `df -P -B1` output with "\r" in place of "\n", as the removal command's DF line carries it
-    return f"Filesystem 1-blocks Used Available Capacity Mounted on\r/dev/vda1 0 0 {avail_bytes} 50% /hostfs\r"
+    return f"0\tFilesystem 1-blocks Used Available Capacity Mounted on\r/dev/vda1 0 0 {avail_bytes} 50% /hostfs\r"
 
 
 def _fresh_sizing_payload(**over):
@@ -1389,15 +1389,24 @@ async def test_a_filler_removal_sizes_the_volume_on_the_df_read_after_its_rm(svc
 
 
 @pytest.mark.asyncio
-async def test_a_filler_removal_without_its_df_measures_the_volume_facts_again(svc_fixture, monkeypatch):
-    """The removal's df was not read (the helper failed): the early df is not used in its place."""
+@pytest.mark.parametrize(
+    "df_after_rm", [None, "137\tFilesystem\r/dev/vda1 9 2 42"], ids=["not_read", "died_mid_output"]
+)
+async def test_a_filler_removal_without_its_df_measures_the_volume_facts_again(svc_fixture, monkeypatch, df_after_rm):
+    """The removal's df was not read, or not to its end: the early df is not used in its place."""
     svc = svc_fixture
-    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    gb = ds_module._FRESH_SIZING_GB_BYTES
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"), df_after_rm=df_after_rm)
+    svc.probe_volume_host = AsyncMock(
+        side_effect=[VolumeHostProbe("/var/lib/docker", size * gb, [], True) for size in (100, 140)]
+    )
+    monkeypatch.delattr(svc, "resolve_volume_sizing")
 
     result = await _run_create_container(svc, _fresh_sizing_payload(active_volume_names=["volume_x"]))
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert svc.probe_volume_host.await_count == 2
+    # sized on the live probe's 140 GB, not on the early 100 GB
+    assert svc.create_local_volume.await_args.kwargs["limit"] == 40
 
 
 @pytest.mark.asyncio

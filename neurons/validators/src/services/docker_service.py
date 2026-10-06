@@ -437,6 +437,8 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
+# the df that removal reads after its rm is optional: each of its two docker calls gets this bound
+_DF_AFTER_REMOVAL_TIMEOUT_SECONDS = 5
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -604,11 +606,13 @@ def _remove_and_list_containers_command(
     (a listed ID, or the name when no ID was listed), its exit status, the `docker ps -a` names and
     full IDs left after it, that listing's exit status, then `docker volume rm` of the unprotected
     volumes, if any, and ``with_df`` the volume probe's df of the docker root, read after all of
-    them. Every output line is tagged so the parser never guesses."""
+    them when the rm and the listing exited 0 early enough, with the exit status of that step (0
+    only for a df read to its end). Every output line is tagged so the parser never guesses."""
     names = " ".join(shlex.quote(target) for target in targets)
     command = (
-        f"/usr/bin/docker rm -fv {names} >/dev/null; printf 'RM\\t%s\\n' \"$?\"; "
-        "/usr/bin/docker ps -a --no-trunc --format 'NAME\\t{{.Names}} {{.ID}}'; printf 'PS\\t%s\\n' \"$?\""
+        f"/usr/bin/docker rm -fv {names} >/dev/null; rm_rc=$?; printf 'RM\\t%s\\n' \"$rm_rc\"; "
+        "/usr/bin/docker ps -a --no-trunc --format 'NAME\\t{{.Names}} {{.ID}}'; ps_rc=$?; "
+        "printf 'PS\\t%s\\n' \"$ps_rc\""
     )
     if volume_names:
         volumes = " ".join(shlex.quote(volume) for volume in volume_names)
@@ -617,9 +621,17 @@ def _remove_and_list_containers_command(
         # ponytail: +1 `docker info` and +1 helper `docker run` (~0.4 s on the lab box) on every such
         # removal; skip it when the early df already sizes the volume at the request cap, if it matters
         df_cmd = df_command('"$root"')
-        command += (
-            "; root=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\"; "
-            f"printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\""
+        bound = f"timeout -k 1 {_DF_AFTER_REMOVAL_TIMEOUT_SECONDS}"
+        # the df never fails the removal: it starts only after a clean rm and listing (any other
+        # removal drops it and needs what is left of the deadline) and while both bounded calls
+        # still end well inside the removal's timeout; a hung or failed one only leaves a non-zero status
+        latest_start = _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS - 4 * (_DF_AFTER_REMOVAL_TIMEOUT_SECONDS + 1)
+        command = (
+            f"t0=$(date +%s); {command}; [ \"$rm_rc\" = 0 ] && [ \"$ps_rc\" = 0 ] && [ -n \"$t0\" ] && "
+            f"[ $(($(date +%s) - t0)) -lt {latest_start} ] && "
+            f"root=\"$({bound} /usr/bin/docker info --format '{{{{.DockerRootDir}}}}')\" && "
+            f"df_out=\"$({bound} {df_cmd})\"; "
+            "printf 'DF\\t%s\\t%s\\n' \"$?\" \"$(printf '%s' \"$df_out\" | tr '\\n' '\\r')\""
         )
     return command
 
@@ -647,8 +659,8 @@ class RemoveAndListContainersOutput(NamedTuple):
 def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOutput:
     """(rm exit status, the listing after the rm, the df after it). The status is None when its line
     is missing, repeated or not a number; the listing is None unless it exited 0; the df is None
-    unless one DF line parses -- an untagged line makes all None, so an ambiguous output never reads
-    as a clean removal."""
+    unless one DF line carries exit status 0 and parses -- an untagged line makes all None, so an
+    ambiguous output never reads as a clean removal."""
     rm_statuses: list[str] = []
     ps_statuses: list[str] = []
     names: list[str] = []
@@ -669,9 +681,10 @@ def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOut
             return RemoveAndListContainersOutput(None, None)
     rm_exit_status = int(rm_statuses[0]) if len(rm_statuses) == 1 and rm_statuses[0].isdigit() else None
     df_avail_bytes = None
-    if len(df_outputs) == 1:
+    df_exit_status, _, df_record = df_outputs[0].partition("\t") if len(df_outputs) == 1 else ("", "", "")
+    if df_exit_status == "0":
         with contextlib.suppress(Exception):
-            df_avail_bytes = parse_df_available_bytes(df_outputs[0].replace("\r", "\n"))
+            df_avail_bytes = parse_df_available_bytes(df_record.replace("\r", "\n"))
     return RemoveAndListContainersOutput(
         rm_exit_status, parse_container_listing(names) if ps_statuses == ["0"] else None, df_avail_bytes
     )
