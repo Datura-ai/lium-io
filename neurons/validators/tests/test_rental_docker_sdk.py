@@ -512,6 +512,19 @@ async def test_image_exists_returns_false_for_missing_image():
 
 
 @pytest.mark.asyncio
+async def test_local_image_repo_digests_reads_one_inspect_and_none_for_a_missing_image():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["daturaai/pytorch@sha256:abc"]
+    api_client.missing_images.add("daturaai/missing:tag")
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_repo_digests(image="daturaai/pytorch:prod") == ("daturaai/pytorch@sha256:abc",)
+    assert await client.local_image_repo_digests(image="daturaai/missing:tag") is None
+    assert api_client.inspected_images == ["daturaai/pytorch:prod", "daturaai/missing:tag"]
+    assert api_client.distribution_calls == []
+
+
+@pytest.mark.asyncio
 async def test_local_image_is_current_when_a_repo_digest_matches_the_registry():
     api_client = FakeApiClient()
     api_client.repo_digests = ["ghcr.io/org/app@sha256:old", "ghcr.io/org/app@sha256:remote"]

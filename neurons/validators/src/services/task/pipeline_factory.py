@@ -15,7 +15,6 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from clients.backend_client import BackendClient
 from core.config import settings, shared_client
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -32,7 +31,7 @@ from .checks import (
     BannedProviderCheck,
     CachedTemplateVerificationCheck,
     CapabilityCheck,
-    CollateralCheck,
+    CollateralStatusCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -53,8 +52,10 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     ProviderSideLoadCheck,
+    RegistryPullCheck,
     RentalProbeCheck,
     RentalVerificationCheck,
+    RentedGpuDropCheck,
     ScoreCheck,
     SpecChangeCheck,
     StaleContainerCleanupCheck,
@@ -72,8 +73,10 @@ from .pipeline import (
     ContextServices,
     ContextState,
     LoggerSink,
+    ParallelStage,
     Pipeline,
     PodRecoverer,
+    StatusChangeTracker,
 )
 from .runner import SSHCommandRunner
 from .score_calculator import calculate_scores
@@ -102,7 +105,6 @@ class PipelineFactory:
         redis_service: RedisService,
         validation_service: ValidationService,
         verifyx_validation_service: VerifyXValidationService,
-        collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
         backend_client: BackendClient,
         pod_recovery: PodRecoverer,
@@ -114,7 +116,6 @@ class PipelineFactory:
             redis_service: Redis service for state management
             validation_service: Matrix validation service
             verifyx_validation_service: VerifyX validation service
-            collateral_contract_service: Collateral contract service
             executor_connectivity_service: Executor connectivity service
             backend_client: Backend API client
             pod_recovery: Docker service, for checks that repair container state
@@ -124,7 +125,6 @@ class PipelineFactory:
         self.validation_service = validation_service
         self.verifyx_validation_service = verifyx_validation_service
         self.inspector_validation_service = InspectorValidationService()
-        self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
         self.pod_recovery = pod_recovery
@@ -132,6 +132,8 @@ class PipelineFactory:
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
         self.container_cleanup = ContainerCleanup(dry_run=dry_run)
+        # One tracker for the factory's lifetime: build_pipeline() makes a new sink every cycle.
+        self.status_tracker = StatusChangeTracker()
 
     async def build_context(
         self,
@@ -212,7 +214,6 @@ class PipelineFactory:
             services=ContextServices(
                 ssh=self.ssh_service,
                 redis=self.redis_service,
-                collateral=self.collateral_contract_service,
                 validation=self.validation_service,
                 verifyx=self.verifyx_validation_service,
                 inspector=self.inspector_validation_service,
@@ -248,7 +249,6 @@ class PipelineFactory:
                 # constant when the backend is unreachable (shared config empty).
                 nvml_digest_map=shared_client.config.nvml_ml_digests or LIB_NVIDIA_ML_DIGESTS,
                 nvml_invalid_drivers=shared_client.config.nvml_invalid_drivers,
-                enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
                 verifyx_enabled=settings.ENABLE_VERIFYX,
                 inspector_enabled=settings.ENABLE_INSPECTOR,
                 port_private_key=private_key,
@@ -266,18 +266,28 @@ class PipelineFactory:
         )
 
     @staticmethod
-    def build_checks() -> list[Check]:
+    def build_checks(fast_path: bool = False) -> list[Check]:
         """Build the standard validation check pipeline.
+
+        fast_path (validation fast path): the same checks with the same verdicts, arranged so a
+        new node's first verification waits less — see build_fast_path_checks. The wave never
+        asks for it.
 
         Returns:
             Ordered list of validation checks to execute
         """
+        if fast_path:
+            return PipelineFactory.build_fast_path_checks()
         return cast(
             list[Check],
             [
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
+                # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
+                # TenantEnforcementCheck; this reports it to the backend on that same cycle.
+                RentedGpuDropCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -308,7 +318,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
-                CollateralCheck(),
+                CollateralStatusCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.
@@ -330,6 +340,9 @@ class PipelineFactory:
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
+                # renter's pod).
+                RegistryPullCheck(),
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
@@ -364,6 +377,100 @@ class PipelineFactory:
         )
 
     @staticmethod
+    def takes_fast_path(
+        first_pass: bool, executor_uuid: str, rented_data: RentedExecutorsResponse | None
+    ) -> bool:
+        """Whether this run gets build_fast_path_checks: the flag is on, it is a never-validated
+        node's first pass (the express lane's; the wave passes first_pass=False), and the backend
+        lists no pod and no filler on it — a node someone is using takes the serial list, so the
+        rented halt and the filler skips happen before any GPU work exactly as today."""
+        if not (first_pass and settings.VALIDATION_FAST_PATH_ENABLED):
+            return False
+        if rented_data is None:
+            return False
+        rented_executor = rented_data.executors.get(executor_uuid)
+        if rented_executor is not None and rented_executor.pods:
+            return False
+        if rented_data.get_filler_containers(executor_uuid):
+            return False
+        return True
+
+    @staticmethod
+    def build_fast_path_checks() -> list[Check]:
+        """The first-pass pipeline with the validation fast path on: every check of build_checks,
+        each deciding exactly as there, in an order that waits less.
+
+        - VerifyX runs alone first: it measures the node's network, and nothing else of ours may
+          be pulling an image or copying a challenge while it does.
+        - Then one `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
+          fault probe, cached template — the challenge lives on the card) and the host lane
+          (port connectivity, port count, registry pull, sysbox, rental check — containers, ports and the
+          backend's probe). The executor's own one-call verification already runs its facts
+          steps (docker, ports, inspector) beside its GPU group, and runs VerifyX before the
+          matmul unless asked otherwise (`LocalVerifyService`, `parallel_gpu`) — the same split
+          and the same order kept here. `StaleContainerCleanupCheck` still precedes the port
+          checks, and `TenantEnforcementCheck` still halts a rented node before either lane
+          starts.
+        - The rental probe, score and finalize follow as today.
+        The list differs from build_checks only in where these checks sit; a node that would fail
+        there fails here too. A node that would fail two checks can report the other one first:
+        the port checks now run after VerifyX, and a lane that stops first wins. One read is not
+        shared: when the matmul fails and CapabilityCheck finds a Lium workload started during the
+        run, RentalVerificationCheck in the host lane still sees the cycle-start rented_data.
+        """
+        return cast(
+            list[Check],
+            [
+                StartGPUMonitorCheck(),
+                UploadFilesCheck(),
+                MachineSpecScrapeCheck(),
+                RentedGpuDropCheck(),
+                TdxHostCheck(),
+                GpuCountCheck(),
+                GpuModelValidCheck(),
+                GpuVramPrecheck(),
+                DiskHealthCheck(),
+                CpuTruthCheck(),
+                GpuPowerLimitCheck(),
+                NvmlDigestCheck(),
+                GpuFingerprintCheck(),
+                SpecChangeCheck(),
+                BannedProviderCheck(),
+                BannedGpuCheck(),
+                DuplicateExecutorCheck(),
+                CollateralStatusCheck(),
+                _STALE_CONTAINER_CLEANUP_SINGLETON,
+                ProviderSideLoadCheck(),
+                _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                ExecutorImageCheck(),
+                InspectorRentedCheck(),
+                TenantEnforcementCheck(),
+                GpuUsageCheck(),
+                LocalVerifyCheck(),
+                VerifyXCheck(),
+                ParallelStage(
+                    [
+                        [
+                            PortConnectivityCheck(),
+                            PortCountCheck(),
+                            RegistryPullCheck(),
+                            SysboxRequiredCheck(),
+                            RentalVerificationCheck(),
+                        ],
+                        [
+                            CapabilityCheck(),
+                            GpuFaultProbeCheck(),
+                            CachedTemplateVerificationCheck(),
+                        ],
+                    ]
+                ),
+                RentalProbeCheck(),
+                ScoreCheck(),
+                FinalizeCheck(),
+            ],
+        )
+
+    @staticmethod
     def build_dry_run_checks() -> list[Check]:
         """Build a dry run validation pipeline that excludes state-changing checks.
 
@@ -382,6 +489,8 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
+                RentedGpuDropCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),
@@ -404,10 +513,11 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
-                CollateralCheck(),
+                CollateralStatusCheck(),
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # RegistryPullCheck left out: it removes and pulls an image on the executor.
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
@@ -438,4 +548,4 @@ class PipelineFactory:
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger))
+        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker))
