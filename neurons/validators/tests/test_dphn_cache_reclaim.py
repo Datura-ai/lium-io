@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.docker_utils import DOCKER_VOLUMES_DF_COMMAND
 from services.container_cleanup import DPHN_CACHE_RECLAIM_FREE_FLOOR_GB, ContainerCleanup
 
 GB = 1024**3
@@ -25,23 +26,19 @@ class FakeSshClient:
         volumes: list[str],
         free_gb: float,
         refuses: set[str] | None = None,
-        docker_root: str = "/var/lib/docker",
     ):
         self._containers = "\n".join(containers)
         self._volumes = list(volumes)
         self._refuses = refuses or set()
         self._free_bytes = str(int(free_gb * GB))
-        self.docker_root = docker_root
         self.commands: list[str] = []
 
     async def run(self, command: str, *args, **kwargs):
         self.commands.append(command)
-        if "docker info" in command:
-            stdout = self.docker_root
-        elif "df -P -B1" in command:
-            # Only answer for the real data root: a node with docker on a dedicated disk would
-            # otherwise be judged by the root filesystem, which says nothing about docker's space.
-            avail = self._free_bytes if self.docker_root.strip() in command else "999999999999"
+        if "df -P -B1" in command:
+            # Only a df on a docker volume reads docker's disk: a node with docker on a dedicated disk
+            # would otherwise be judged by the root filesystem, which says nothing about docker's space.
+            avail = self._free_bytes if command == DOCKER_VOLUMES_DF_COMMAND else "999999999999"
             stdout = f"Filesystem 1B-blocks Used Available Capacity\n/dev/sda1 1 1 {avail} 1% /hostfs"
         elif "volume rm" in command:
             # dockerd refuses a volume referenced by any container, in any state.
@@ -127,13 +124,11 @@ async def test_the_disk_is_measured_on_the_real_docker_data_root(cleanup):
     # Nodes can move docker's data-root to a dedicated disk. Measuring /var/lib/docker there reads the
     # root filesystem instead: the reclaim then never fires while docker's disk is full, or fires and
     # deletes a healthy cache the node had room for. The rest of the codebase already discovers the
-    # root dynamically.
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=10, docker_root="/mnt/docker-data"
-    )
+    # root dynamically; the df runs on a volume of docker's own, which lives on that root wherever it is.
+    ssh_client = FakeSshClient(containers=[], volumes=["dphn_cache_hf_x"], free_gb=10)
 
     assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-    assert any("/mnt/docker-data" in command for command in ssh_client.commands), (
+    assert DOCKER_VOLUMES_DF_COMMAND in ssh_client.commands, (
         "the reclaim measured a filesystem that is not docker's data root"
     )
 
