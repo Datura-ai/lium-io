@@ -45,7 +45,11 @@ from payload_models.payloads import (
     PayloadPortMapping,
 )
 from services.docker_service import DIND_DNS_RULE_TAG, DockerService
-from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
+from services.rental_docker_sdk import (
+    ContainerExecResult,
+    ContainerStateSnapshot,
+    build_gpu_docker_config,
+)
 
 # ------------------------------------------------------------------
 # Shared fixtures / helpers
@@ -103,6 +107,12 @@ class _FakeRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
     async def create_volume(
         self,
