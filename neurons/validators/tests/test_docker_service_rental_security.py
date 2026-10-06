@@ -24,6 +24,7 @@ from payload_models.payloads import (
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerStateSnapshot,
     RentalDockerOperationError,
     build_gpu_docker_config,
 )
@@ -86,12 +87,18 @@ class RecordingRentalDockerClient:
         self.pruned_images = 0
         self.run_container_error = None
 
-    async def login(self, *, username: str, password: str) -> None:
-        self.login_calls.append({"username": username, "password": password})
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        self.login_calls.append({"username": username, "password": password, "image": image})
 
     async def image_exists(self, *, image: str) -> bool:
         self.inspected_images.append(image)
         return image in self.existing_images
+
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return () if await self.image_exists(image=image) else None
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        return True
 
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
@@ -104,6 +111,12 @@ class RecordingRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
@@ -410,7 +423,7 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
         ],
     )
     assert docker_client.login_calls == [
-        {"username": HOSTILE_USERNAME, "password": HOSTILE_PASSWORD}
+        {"username": HOSTILE_USERNAME, "password": HOSTILE_PASSWORD, "image": HOSTILE_IMAGE}
     ]
     assert docker_client.pulled_images == [HOSTILE_IMAGE]
     assert run_spec.image == HOSTILE_IMAGE
@@ -824,7 +837,7 @@ async def test_sdk_exec_logs_exit_status_stdout_and_stderr_lengths(
     caplog,
 ):
     with caplog.at_level(logging.WARNING, logger="services.rental_docker_observability"):
-        ok = await docker_service.add_environment_variables_with_rental_docker(
+        error = await docker_service.add_environment_variables_with_rental_docker(
             docker_client=NonZeroExecRentalDockerClient(),
             container_name="pod_logs",
             environment={"APP_MODE": "prod"},
@@ -832,7 +845,7 @@ async def test_sdk_exec_logs_exit_status_stdout_and_stderr_lengths(
             log_extra={"pod_id": "pod-id", "miner_hotkey": "miner-hotkey"},
         )
 
-    assert ok is False
+    assert error == "exit_status=7; stderr=stderr details; stdout=stdout details"
     failed_extra = _sdk_log_extra(
         caplog,
         operation="exec_append_environment",
@@ -1059,7 +1072,7 @@ async def test_port_check_filters_quote_hostile_miner_hotkey(
         ssh_client=ssh_client,
     )
 
-    assert result == (True, "No port check containers found")
+    assert result == (False, "No port check containers found")
     assert len(ssh_client.commands) == 1
     _assert_shell_arg_is_single_token(
         ssh_client.commands[0],

@@ -3,8 +3,8 @@ import logging
 import json
 import time
 from datetime import datetime
-from core.db import get_session
-from daos.pod_log import PodLog, PodLogDao
+from models.pod_log import PodLog
+from services.pod_log_store import append_pod_log
 
 # Set up logging to a file in JSON format (one JSON object per line)
 logging.basicConfig(filename="container_monitor.log", level=logging.INFO,
@@ -60,12 +60,10 @@ def classify_stop(exit_code):
     return reason
 
 
-def log_event(log: PodLog):
+def log_event(log: PodLog) -> None:
     try:
-        with get_session() as session:
-            pod_log_dao = PodLogDao()
-            pod_log_dao.save(session, log)
-            logging.info(json.dumps(log.model_dump(), default=str))
+        append_pod_log(log)
+        logging.info(json.dumps(log.model_dump(), default=str))
     except:
         pass
 

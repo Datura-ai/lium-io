@@ -5,15 +5,25 @@ import time
 from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient
-from clients.subtensor_client import SubtensorClient
+from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
 from incentive.eligibility import is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
-from services.collateral_contract_service import CollateralContractService
-from services.default_docker_image_digest_service import fetch_default_image_digests
+from services.default_docker_image_digest_service import (
+    fetch_default_image_digests,
+    fetch_executor_image_digest,
+)
 from services.docker_service import DockerService
+from services.executor_image_policy import build_expected_image_snapshot
+from services.executor_rollout import (
+    ROLLOUT_GRACE,
+    ExecutorRolloutTracker,
+    RolloutWindow,
+    WithheldVerdict,
+    withhold_rollout_verdicts,
+)
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
@@ -25,11 +35,19 @@ from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
-from services.redis_service import GPU_ESTIMATES_CHANNEL, PENDING_PODS_PREFIX, RedisService
+from services.redis_service import (
+    GPU_ESTIMATES_CHANNEL,
+    PENDING_PODS_PREFIX,
+    RedisService,
+)
+from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
+from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
+from core.express_lane import CycleInputs, ExpressLane
 from core.utils import _m, get_extra_info, get_logger
 from services.ssh_service import SSHService
 
@@ -38,6 +56,8 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
+# Executor uuid request_job_to_miner reports a miner-level failure under (no real executor).
+FAILED_MINER_EXECUTOR_UUID = "11111111-1111-1111-1111-111111111111"
 
 
 class Validator:
@@ -46,8 +66,16 @@ class Validator:
         self.should_exit = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
+        # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
+        # express lane so its verifications are the cycle's pipeline. None before the first cycle.
+        self.cycle_inputs: CycleInputs | None = None
+        # When the first cycle since start began (CycleInputs.fleet_known_since).
+        self.first_cycle_started_at: datetime | None = None
 
         self.miner_scores = {}
+        # Hotkeys with at least one live executor in the last completed cycle. Rebuilt
+        # every cycle, never persisted — set_weights floors them to u16=1.
+        self.active_hotkeys: set[str] = set()
         # Number of fully-completed sync cycles since this process started.
         # Used to skip the first post-restart set_weights when the in-memory
         # accumulator may have been re-built from a partial cycle.
@@ -65,8 +93,9 @@ class Validator:
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
-        self.collateral_contract_service = CollateralContractService()
         self.attestation_service = AttestationService(redis_service=self.redis_service)
+        # DAH-3405: remembers the authorized executor digest and when it last changed.
+        self.rollout_tracker = ExecutorRolloutTracker(redis_service=self.redis_service)
 
         # Backend client for API requests
         keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -98,7 +127,6 @@ class Validator:
             redis_service=self.redis_service,
             validation_service=self.validation_service,
             verifyx_validation_service=self.verifyx_validation_service,
-            collateral_contract_service=self.collateral_contract_service,
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
@@ -109,6 +137,13 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+        )
+        self.express_lane = ExpressLane(
+            miner_service=self.miner_service,
+            redis_service=self.redis_service,
+            backend_client=self.backend_client,
+            subtensor_client=self.subtensor_client,
+            cycle_inputs=self.express_lane_cycle_inputs,
         )
 
         # init miner_scores: always load from Redis if present so accumulated
@@ -149,6 +184,41 @@ class Validator:
             ),
         )
 
+    def express_lane_cycle_inputs(self) -> CycleInputs | None:
+        """DAH-2958: the express lane runs only once a full cycle has completed since start.
+        That cycle marks validated every executor of every miner that answered it; an executor
+        registered before it began whose miner failed or was offline is not in that set, so the
+        lane also skips everything registered before `fleet_known_since` (the inputs carry it)."""
+        if self.completed_cycles_since_start < 1:
+            return None
+        return self.cycle_inputs
+
+    async def an_operator_asked_for_a_cycle_now(self) -> bool:
+        """Whether an operator asked for a cycle. Reads only -- the request stays pending.
+
+        DAH-2090, staging only. The connector process writes the request; it runs beside this
+        one and shares no memory with it, so Redis carries it across. The request is cleared
+        only once a cycle actually starts, so a tick that gives up early tries again instead
+        of swallowing it.
+        """
+        # A production validator ignores the key entirely, so a stray one cannot start a cycle
+        # there even if something wrote it.
+        if settings.DEPLOY_ENV == "PROD":
+            return False
+
+        # This runs on every tick, before the cycle branch. Without the guard a Redis blip
+        # would end the whole tick as a generic "[sync] Unknown error".
+        try:
+            return await self.redis_service.is_forced_validation_cycle_requested()
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not read the forced validation cycle request",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            return False
+
     async def sync(self):
         try:
             logger.info(
@@ -158,8 +228,18 @@ class Validator:
                 ),
             )
 
-            # fetch miners
-            miners = await self.subtensor_client.get_miners()
+            try:
+                miners = await self.subtensor_client.get_miners()
+            except ProviderPortalDataUnavailable as exc:
+                logger.error(
+                    _m(
+                        "[sync] No reliable provider snapshot, skipping iteration",
+                        extra=get_extra_info(
+                            {**self.default_extra, "error": str(exc)}
+                        ),
+                    )
+                )
+                return
 
             try:
                 if await self.subtensor_client.should_set_weights():
@@ -185,7 +265,10 @@ class Validator:
                                 )
                             )
                         else:
-                            await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
+                            await self.subtensor_client.set_weights(
+                                miner_scores=self.miner_scores,
+                                active_hotkeys=self.active_hotkeys,
+                            )
                         self.miner_scores = {}
             except Exception as e:
                 logger.error(
@@ -213,7 +296,15 @@ class Validator:
                 ),
             )
 
-            if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
+            # Kept out of last_job_run_blocks on purpose: that field is the throttle's memory of
+            # the previous cycle, and sync() can still return early below. Zeroing it would leave
+            # the gate open on every following tick instead of running one cycle.
+            cycle_asked_for_now = await self.an_operator_asked_for_a_cycle_now()
+
+            if (
+                cycle_asked_for_now
+                or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
+            ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
@@ -232,6 +323,9 @@ class Validator:
                         ),
                     )
 
+                executor_digest = await self.fetch_executor_digest_or_none()
+                executor_image_snapshot = build_expected_image_snapshot(executor_digest)
+
                 # Fetch all rented executors from backend API
                 rented_executors = await self.backend_client.get_all_rented_executors()
                 if rented_executors is None:
@@ -242,6 +336,11 @@ class Validator:
                         ),
                     )
                     return
+
+                # DAH-3405: a push between two cycles opens the grace window here, after the last
+                # early return and before the first job of this cycle runs against the new digest,
+                # so an aborted iteration does not count as a cycle of the window.
+                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
 
                 logger.info(
                     _m(
@@ -258,8 +357,32 @@ class Validator:
                 )
 
                 self.last_job_run_blocks = current_block
+                if cycle_asked_for_now:
+                    # Cleared here and not at the read: every return above this line means no
+                    # cycle started, and the operator's request must survive to the next tick.
+                    await self.redis_service.clear_forced_validation_cycle_request()
 
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
+                if self.first_cycle_started_at is None:
+                    self.first_cycle_started_at = datetime.now(UTC)
+                # A fresh job-files directory for this cycle; the ones an express verification
+                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
+                    keep_directories=(
+                        self.express_lane.directories_in_use() if settings.EXPRESS_LANE_ENABLED else ()
+                    )
+                )
+                self.cycle_inputs = CycleInputs(
+                    encrypted_files=encrypted_files,
+                    default_image_digests=default_image_digests,
+                    executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
+                    fleet_known_since=self.first_cycle_started_at,
+                )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
+                )
+                # every listed rented pod's SSH (any status), probed once while the miners work
+                pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
                 task_info = {}
 
@@ -277,6 +400,7 @@ class Validator:
                             encrypted_files=encrypted_files,
                             rented_data=rented_executors,
                             default_docker_image_digests=default_image_digests,
+                            executor_image_snapshot=executor_image_snapshot,
                         )
                     )
                     for miner in miners
@@ -295,8 +419,11 @@ class Validator:
                     all_job_results = {}
                     miner_coldkeys = {}
 
-                    # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    # asyncio.wait rejects an empty set.
+                    if jobs:
+                        done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    else:
+                        done, pending = set(), set()
 
                     # Process completed jobs
                     for task in done:
@@ -406,6 +533,24 @@ class Validator:
                             ),
                         ),
                     )
+                    NETWORK_GATE_TALLY.log_and_reset(
+                        MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
+                    )
+
+                    all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
+                        all_job_results, job_block, job_batch_id, rollout_window
+                    )
+
+                    # DAH-2622: a miner whose machine passed validation must keep its UID even
+                    # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
+                    # withheld result (DAH-3405) got no verdict on that executor this cycle, so it
+                    # is treated as active as well.
+                    self.active_hotkeys = {
+                        miner_hotkey
+                        for miner_hotkey, results in all_job_results.items()
+                        if any(result.is_successful for result in results)
+                    } | {withheld.miner_hotkey for withheld in withheld_results}
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
@@ -492,13 +637,73 @@ class Validator:
                     for miner_hotkey, score in cycle_scores.items():
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
+                    # DAH-2748: a cycle where most nodes failed at the connect is our own
+                    # outage, not theirs; reporting it would empty the market in one cycle.
+                    cycle_results = [result for results in incentive.job_results.values() for result in results]
+                    silenced_count = silence_availability_errors_on_our_own_outage(cycle_results)
+                    if silenced_count:
+                        logger.error(
+                            _m(
+                                "[sync] Most of the cycle could not be reached; reporting no availability errors",
+                                extra={"silenced_results": silenced_count},
+                            )
+                        )
+
+                    # each node's pod SSH observations ride on its result; a probed rented
+                    # node the cycle has no result for gets one carrying only them. A withheld
+                    # executor has a result this cycle, held back, so it gets none.
+                    pod_ssh = await pod_ssh_probe
+                    reported = attach_pod_ssh(incentive.job_results, pod_ssh) | {
+                        str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results
+                    }
+                    result_missing = (
+                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
+                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
+                        else {}
+                    )
+
                     # Publish machine specs
+                    published_executor_ids: list[str] = []
                     for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
+                            published_executor_ids.extend(
+                                result.executor_info.uuid
+                                for result in results
+                                if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
+                            )
 
-                    self.completed_cycles_since_start += 1
+                    # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
+                    # the express lane below.
+                    await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
+
+                    # DAH-3405: a withheld executor was handled by this cycle too — the express
+                    # lane must not treat it as never validated and run a first pass on it.
+                    published_executor_ids.extend(
+                        withheld.result.executor_info.uuid for withheld in withheld_results
+                    )
+
+                    if settings.EXPRESS_LANE_ENABLED:
+                        # DAH-2958: everything published by a cycle is "validated" for the
+                        # express lane; only what the portal lists beyond this set is new.
+                        # Never lets a Redis blip end the cycle: the next cycle seeds again, and
+                        # the wave's CYCLE_DONE claims keep the lane off those executors until then.
+                        try:
+                            await self.redis_service.mark_executors_validated(published_executor_ids)
+                            self.miner_service.forget_cycle_done()
+                        except Exception as exc:
+                            logger.error(
+                                _m(
+                                    "[sync] Failed to record validated executors for the express lane",
+                                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                                ),
+                            )
+
+                    # A cycle with no miners validated nobody, so it keeps the post-restart
+                    # warm-up closed: set_weights and the express lane wait for a scored cycle.
+                    if jobs:
+                        self.completed_cycles_since_start += 1
 
                     logger.info(
                         _m(
@@ -513,6 +718,7 @@ class Validator:
                                     "total_executors": incentive.total_executors,
                                     "successful_executors": incentive.successful_executors,
                                     "failed_executors": incentive.failed_executors,
+                                    "withheld_executors": len(withheld_results),
                                     "completed_cycles_since_start": self.completed_cycles_since_start,
                                 }
                             ),
@@ -582,6 +788,172 @@ class Validator:
                     ),
                 )
 
+    async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
+        """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
+        if not settings.RENTED_POD_SSH_PROBE_ENABLED:
+            return {}
+        try:
+            return await probe_rented_pods(
+                rented_executors,
+                timeout=settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS,
+                concurrency=settings.RENTED_POD_SSH_PROBE_CONCURRENCY,
+                job_batch_id=job_batch_id,
+            )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] rented pod SSH probe failed; this cycle reports no observations",
+                    extra=get_extra_info(
+                        {**self.default_extra, "job_batch_id": job_batch_id, "error_type": type(exc).__name__}
+                    ),
+                ),
+                exc_info=True,
+            )
+            return {}
+
+    async def publish_result_missing(
+        self, result_missing: dict[str, list[JobResult]], miners, miner_coldkeys: dict, job_batch_id: str
+    ) -> None:
+        """Publish the observations-only results (EXECUTOR_RESULT_MISSING), one miner at a time.
+
+        The coldkey is the miner's answer's when it answered, else the metagraph's; a hotkey that is
+        in neither is not registered any more and its nodes are skipped.
+        """
+        if not result_missing:
+            return
+        metagraph_coldkeys = {miner.hotkey: miner.coldkey for miner in miners}
+        skipped = []
+        for miner_hotkey, results in result_missing.items():
+            miner_coldkey = miner_coldkeys.get(miner_hotkey) or metagraph_coldkeys.get(miner_hotkey)
+            if not miner_coldkey:
+                skipped.extend(result.executor_info.uuid for result in results)
+                continue
+            await self.miner_service.publish_machine_specs(
+                results, miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
+        logger.info(
+            _m(
+                "[sync] rented nodes without a result reported with their pod SSH observations",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "job_batch_id": job_batch_id,
+                        "executors": sum(len(results) for results in result_missing.values()),
+                        "skipped_unregistered": skipped,
+                    }
+                ),
+            )
+        )
+
+    async def fetch_executor_digest_or_none(self) -> str | None:
+        """The registry digest of EXECUTOR_IMAGE_REF, or None when it cannot be read.
+
+        None makes the image check skip this cycle and (DAH-3405) leaves the rollout window as it
+        was. Called at cycle start and, since DAH-3405, once more at cycle end; each call is a
+        token GET and a manifest HEAD against Docker Hub, each with a 30-s timeout.
+        """
+        try:
+            return await fetch_executor_image_digest()
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] executor image digest fetch failed; image check skips this cycle and "
+                    "the rollout window is left as it was",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            return None
+
+    async def observe_executor_rollout(
+        self,
+        executor_digest: str | None,
+        job_block: int,
+        fallback: RolloutWindow | None = None,
+    ) -> RolloutWindow:
+        """DAH-3405: tell the tracker what the registry says now, in cycle `job_block`.
+
+        Called at cycle start (a push between cycles) and again at cycle end (a push during the
+        cycle — the 11 Sep case) with the start's window as `fallback`. When Redis fails the
+        cycle keeps what it already knew; without that, it behaves as before this change: every
+        failure is a verdict.
+        """
+        try:
+            return await self.rollout_tracker.observe(executor_digest, job_block)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[rollout-grace] rollout state unreadable; "
+                    + ("the window seen at cycle start stands" if fallback else "every verdict stands this cycle"),
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            if fallback is not None:
+                return fallback
+            return RolloutWindow(
+                digest=executor_digest,
+                previous_digest=None,
+                started_at=None,
+                opened_job_block=None,
+                cycles_seen=0,
+                grace_cycles=0,
+            )
+
+    async def withhold_verdicts_for_rollout(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        job_block: int,
+        job_batch_id: str,
+        window_at_cycle_start: RolloutWindow,
+    ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
+        """DAH-3405: at cycle end, take the results the rollout explains out of the cycle.
+
+        The push that recreates the fleet's containers can land in the middle of a cycle (11 Sep
+        07:50Z did), so the registry is read once more here and the window opens on THIS cycle's
+        results, before scoring and publishing see them.
+        """
+        window = await self.observe_executor_rollout(
+            await self.fetch_executor_digest_or_none(), job_block, fallback=window_at_cycle_start
+        )
+        standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
+        await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
+        return standing, withheld_results
+
+    async def record_withheld_verdicts(
+        self,
+        window: RolloutWindow,
+        withheld_results: list[WithheldVerdict],
+        job_batch_id: str,
+        job_block: int,
+    ) -> None:
+        """DAH-3405: one line per cycle inside the window, and the window's running total."""
+        if not window.covers(job_block):
+            return
+        withheld_count = len(withheld_results)
+        logger.warning(
+            _m(
+                "[rollout-grace] cycle inside the executor image rollout window",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "outcome": ROLLOUT_GRACE,
+                        "job_batch_id": job_batch_id,
+                        "job_block": job_block,
+                        "withheld_executors": withheld_count,
+                        **window.as_extra(),
+                    }
+                ),
+            ),
+        )
+        try:
+            await self.rollout_tracker.record_withheld(withheld_count)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[rollout-grace] could not record the withheld count",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+
     async def start(self):
         logger.info(
             _m(
@@ -592,6 +964,13 @@ class Validator:
         try:
             await self.initiate_services()
             self.should_exit = False
+
+            if settings.EXPRESS_LANE_ENABLED and not settings.DRY_RUN:
+                # DAH-2958: ticks beside the cycle on this loop; coordination through
+                # MinerService.in_flight. Flag off: the task is never created.
+                self.express_lane_task = asyncio.create_task(
+                    self.express_lane.run(lambda: self.should_exit)
+                )
 
             while not self.should_exit:
                 await self.sync()

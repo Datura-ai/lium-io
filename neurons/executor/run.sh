@@ -23,8 +23,5 @@ fi
 ssh-keygen -A
 service ssh start
 
-# db migrate
-pdm run alembic upgrade head
-
 # run fastapi app
 pdm run python src/executor.py

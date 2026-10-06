@@ -51,6 +51,45 @@ async def supports_storage_operation(
     return result.exit_status == 0
 
 
+# Asks the executor's own storage models whether `workspace.bootstrap` exists (DAH-3274). An
+# executor image from before it drops the unknown key and refuses the non-empty target the
+# pod's entrypoint has already written to, so the create must stop before `docker run`.
+# Exit 0 = the field exists, exit 3 = the models import but have no such field (an old image);
+# any other status is the probe itself failing (no python at that path = 127, an import error =
+# 1, …) and is reported as such, not read as an old image (review, taiberium).
+_BOOTSTRAP_PROBE = (
+    "import sys; sys.path.insert(0, '/root/app/src'); "
+    "from storage.models import WorkspaceSpec; "
+    "sys.exit(0 if 'bootstrap' in WorkspaceSpec.__dataclass_fields__ else 3)"
+)
+_BOOTSTRAP_PROBE_FIELD_MISSING = 3
+
+
+async def supports_bootstrap_restore(
+    ssh_client: asyncssh.SSHClientConnection,
+    python_path: str,
+) -> bool:
+    """True when the executor's models know `workspace.bootstrap`, False when they do not.
+
+    Raises RuntimeError, with the exit status and the tail of stderr, when the probe could not
+    answer — the caller must not take that for an old executor image.
+    """
+    result = await ssh_client.run(
+        f"{shlex.quote(python_path)} -c {shlex.quote(_BOOTSTRAP_PROBE)}",
+        check=False,
+    )
+    if result.exit_status == 0:
+        return True
+    if result.exit_status == _BOOTSTRAP_PROBE_FIELD_MISSING:
+        return False
+    stderr = result.stderr if isinstance(result.stderr, str) else ""
+    tail = " ".join(stderr.strip().splitlines()[-3:])[-400:]
+    raise RuntimeError(
+        f"bootstrap-restore probe could not run on the executor (exit {result.exit_status}"
+        f"{': ' + tail if tail else ''})"
+    )
+
+
 async def start_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     python_path: str,
@@ -70,6 +109,23 @@ async def start_storage_operation(
             f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
+        existing_state = await _operation_state(ssh_client, files)
+        if existing_state == "STARTING" and await _remote_file_exists(ssh_client, files.spec):
+            # A repeated backend dispatch can arrive while the first wrapper is between
+            # writing its spec and PID. Give that deterministic operation a chance to appear.
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                existing_state = await _operation_state(ssh_client, files)
+                if existing_state != "STARTING":
+                    break
+        if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
+            return files
+        if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
+            ssh_client, files.spec
+        ):
+            await _remove_operation_artifacts(ssh_client, files)
+        await _remove_stale_helper_container(ssh_client, operation_id)
+
         async with ssh_client.start_sftp_client() as sftp:
             async with sftp.open(str(files.spec), "w") as remote_spec:
                 await remote_spec.write(
@@ -235,6 +291,25 @@ async def _read_operation_spec(
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, Mapping) else None
+
+
+async def _remote_file_exists(
+    ssh_client: asyncssh.SSHClientConnection,
+    path: PurePosixPath,
+) -> bool:
+    result = await ssh_client.run(f"test -e {shlex.quote(str(path))}", check=False)
+    return result.exit_status == 0
+
+
+async def _remove_stale_helper_container(
+    ssh_client: asyncssh.SSHClientConnection,
+    operation_id: UUID,
+) -> None:
+    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    await ssh_client.run(
+        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true",
+        check=False,
+    )
 
 
 async def _tail_operation_log(

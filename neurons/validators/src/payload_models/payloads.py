@@ -1,5 +1,6 @@
 import enum
 from datetime import datetime
+from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
@@ -156,6 +157,9 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
+    # DAH-2794: the same obfuscated source the binary was frozen from, so a pipeline that can
+    # deliver it over stdin needs no upload and one that cannot still has the binary.
+    machine_scrape_source: str
     # score_file_name: str
 
 
@@ -195,6 +199,16 @@ class ContainerRequestType(enum.Enum):
     InstallJupyterServer = "InstallJupyterServer"
 
 
+class ForcedValidationCycleRequest(BaseModel):
+    """Ask the validator to start its validation cycle now, not at the next block window.
+
+    A staging development tool: it removes the wait for the next cycle. It carries no executor
+    -- the cycle validates the whole fleet, exactly as the scheduled one does.
+    """
+
+    message_type: Literal["ForcedValidationCycleRequest"]
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
@@ -232,7 +246,6 @@ class BootstrapRestoreSpec(BaseModel):
     legacy_object_size_bytes: int | None = None
     auth_token: str = Field(repr=False)
     restore_path: str
-    s3_connections: int = Field(default=64, ge=1, le=128)
     failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
@@ -270,7 +283,13 @@ class ClusterMembership(BaseModel):
     node_index: int
     # This node's fully-rendered wg-quick config, minted by the backend for the whole group so every
     # node's keys and peer list agree. The validator only injects it; it generates nothing itself.
-    wireguard_conf: str
+    # `repr=False` because every container create logs the whole request as `str(payload)` and this
+    # holds the node's WireGuard PrivateKey; the wire format still carries it.
+    wireguard_conf: str = Field(repr=False)
+    # DAH-2664: one SSH login shared by the whole group, so a pod can start a process on its peers —
+    # which is how mpirun, pdsh and every nccl-tests recipe launch. Empty from an older backend.
+    ssh_private_key: str = Field(default="", repr=False)
+    ssh_authorized_key: str = ""
 
 
 class ContainerCreateRequest(ContainerBaseRequest):
@@ -431,7 +450,6 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_engine: str = "tar_aws_cli"
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
-    s3_connections: int = Field(default=64, ge=1, le=128)
     failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
@@ -451,7 +469,6 @@ class RestoreContainerRequest(ContainerBaseRequest):
     repository_password: str | None = Field(default=None, repr=False)
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
-    s3_connections: int = Field(default=64, ge=1, le=128)
     failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
@@ -480,7 +497,15 @@ class ContainerResponseType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
-class BaseValidatorResponse(BaseRequest):
+class DeliveryStamps(BaseModel):
+    # DAH-2792: epoch seconds; sent_at by the producer, forwarded_at/queue_depth by the connector
+    # before ws.send(). Mixed into every model the connector queues, since its send loop stamps them all.
+    sent_at: float | None = None
+    forwarded_at: float | None = None
+    queue_depth: int | None = None
+
+
+class BaseValidatorResponse(BaseRequest, DeliveryStamps):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str
@@ -514,6 +539,9 @@ class ProfilerStepName(str, enum.Enum):
     PORT_MAPPINGS_GENERATED = "Port mappings generated"
     SSH_CONNECTION_ESTABLISHED = "SSH connection established"
     DOCKER_LOGIN = "Docker login step finished"
+    # DAH-3246: the image-presence probe, once folded into DOCKER_PULL (whose value was ~0.4 s
+    # of probe on a rental whose pull was skipped). Its own step from here on.
+    DOCKER_IMAGE_INSPECT = "Docker image inspect step finished"
     CUSTOM_DOCKER_BUILD = "Custom docker build step finished"
     DOCKER_PULL = "Docker pull step finished"
     CONTAINER_CLEANING = "Container cleaning step finished"
@@ -528,6 +556,12 @@ class ProfilerStepName(str, enum.Enum):
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
     FINISHED_IN_SUBNET = "Finished in subnet."
+    # DAH-3980: host work started early that runs beside the steps above; each row is that
+    # work's own start->end, overlapping the step rows (which keep only the residual wait),
+    # so it is never part of a sum of the profile.
+    PRERUN_HOST_PROBE_PARALLEL = "Prerun host probe (parallel)"
+    VOLUME_HOST_PROBE_PARALLEL = "Volume host probe (parallel)"
+    GPU_POWER_RESTORE_PARALLEL = "GPU power restore (parallel)"
     # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
     # appends these to its own profiler and passes the pre-dispatch ones in
     # ContainerCreateRequest.pre_dispatch_profilers; the subnet seeds its profile from them so the
@@ -537,6 +571,13 @@ class ProfilerStepName(str, enum.Enum):
     FILLER_PREEMPTION = "Filler preemption"
     BACKEND_PREP = "Backend rent prep"
     BACKEND_FINALIZE = "Backend finalize"
+
+
+PARALLEL_PROFILER_STEP_NAMES = frozenset({
+    ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+    ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+    ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
+})
 
 
 def now_ms() -> int:
@@ -665,11 +706,17 @@ class FailedContainerErrorCodes(enum.Enum):
     DeletionInProgress = "DeletionInProgress"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
+    # DAH-3338: the miner lists the executor but the node did not accept the validator's key. Was
+    # reported as InvalidExecutorId, which the backend cannot tell from an id nobody knows.
+    ExecutorUnreachable = "ExecutorUnreachable"
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
     NoJupyterPortMapping = "NoJupyterPortMapping"
     AttestationError = "AttestationError"
+    # DAH-2703: the container we created was gone from the host before creation finished — a
+    # host-side reaper, not a container that failed on its own.
+    ContainerVanished = "ContainerVanished"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -693,6 +740,14 @@ class FailedContainerRequest(ContainerBaseResponse):
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-2211 follow-up: for a custom-Dockerfile build that failed, the last lines the build printed
+    # (docker_build), the timeout (build_timeout) or a fixed one-line reason for build_export and the
+    # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
+    # host data. None for every other failure and from old validators.
+    build_log_tail: str | None = Field(default=None, repr=False)
+    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
+    # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
+    step_detail: str | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):

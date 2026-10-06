@@ -11,8 +11,6 @@ from workspace_mount import VolumeAccess, detect_volume_access
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backup_storage")
 
-plugin_name = "s3fs-backup"
-
 # AWS CLI only needs --expected-size for very large stdin uploads. Passing a
 # large guessed value for small gzip streams can make aws-cli use multipart
 # behavior and return without a usable object, so keep small backups simple.
@@ -107,84 +105,6 @@ def run_command_args(command: list[str], input_stream=None, stdout=None, input_d
         )
     logger.info(f"Command succeeded: {command_label}")
     return result
-
-
-def create_backup_container(args):
-    # install docker volume plugin
-    command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias {plugin_name} --grant-all-permissions --disable"
-    run_command(command, command_label="docker plugin install mochoa/s3fs-volume-plugin")
-
-    # disable volume plugin and set credential
-    command = f"/usr/bin/docker plugin disable {plugin_name} -f"
-    run_command(command, command_label="docker plugin disable s3fs-backup")
-    command = f"/usr/bin/docker plugin set {plugin_name} AWSACCESSKEYID={args.backup_volume_iam_user_access_key} AWSSECRETACCESSKEY={args.backup_volume_iam_user_secret_key}"
-    run_command(command, command_label="docker plugin set s3fs-backup credentials")
-    command = f'/usr/bin/docker plugin set s3fs-backup DEFAULT_S3FSOPTS="url=https://s3-accelerate.amazonaws.com"'
-    run_command(command, command_label="docker plugin set s3fs-backup options")
-    command = f"/usr/bin/docker plugin enable {plugin_name}"
-    run_command(command, command_label="docker plugin enable s3fs-backup")
-
-    # clean up all existing volumes and containers for s3 backup 
-    # Find and remove all containers whose names start with s3fs-backup
-    list_cmd = "/usr/bin/docker ps -a --filter 'name=^/s3fs-backup' --format '{{.Names}}'"
-    result = run_command(list_cmd, command_label="docker ps s3fs-backup containers")
-    container_names = [name for name in result.stdout.strip().split('\n') if name]
-    if container_names:
-        names_str = " ".join(container_names)
-        rm_cmd = f"/usr/bin/docker rm -f {names_str}"
-        run_command(rm_cmd, command_label="docker rm stale s3fs-backup containers")
-
-    # Find and remove all Docker volumes whose names start with "celium-backup-volume"
-    list_volumes_cmd = "/usr/bin/docker volume ls --format '{{.Name}}'"
-    result = run_command(list_volumes_cmd, command_label="docker volume ls")
-    volume_names = [name for name in result.stdout.strip().split('\n') if name.startswith("celium-backup-volume")]
-    if volume_names:
-        names_str = " ".join(volume_names)
-        rm_volumes_cmd = f"/usr/bin/docker volume rm {names_str}"
-        run_command(rm_volumes_cmd, command_label="docker volume rm stale backup volumes")
-    
-    # create volume
-    volume_name = args.backup_volume_name
-    command = " ".join([
-        "/usr/bin/docker", "volume", "create", "-d", plugin_name, volume_name,
-    ])
-    run_command(command, command_label="docker volume create s3fs-backup")
-
-    # create s3fs backup container
-    container_name = f"s3fs-backup-{args.backup_log_id}"
-    command = (
-        "/usr/bin/docker run -d "
-        f"--name {container_name} "
-        f"-v {volume_name}:/mnt "
-        f"-v {args.source_volume}:{args.source_volume_path} "
-        f"--entrypoint bash "
-        f'ubuntu -c "tail -f /dev/null"'
-    )
-    run_command(command, command_label="docker run s3fs-backup container")
-    return container_name
-
-
-def start_backup(args, container_name):
-    # Run cp command inside the container to copy from source_volume_path to /mnt
-    run_command(
-        f"/usr/bin/docker exec {container_name} sh -lc 'mkdir -p /mnt/{args.backup_target_path}'",
-        command_label="docker exec mkdir backup target",
-    )
-    command = f"/usr/bin/docker exec {container_name} sh -lc 'cp -a {args.backup_path} /mnt/{args.backup_target_path}'"
-    run_command(command, command_label="docker exec cp backup path")
-
-
-def clean_backup_container(container_name):
-    command = f"/usr/bin/docker rm -f {container_name}"
-    run_command(command, command_label="docker rm backup container")
-
-def clean_backup_volume(volume_name):
-    command = f"/usr/bin/docker volume rm {volume_name}"
-    run_command(command, command_label="docker volume rm backup volume")
-
-def disable_backup_volume_plugin():
-    command = f"/usr/bin/docker plugin disable {plugin_name} -f"
-    run_command(command, command_label="docker plugin disable s3fs-backup")
 
 
 def update_backup_log(
@@ -411,44 +331,6 @@ def backup_storage(args):
         logger.info("=" * 70)
         logger.info("Environment variables:")
         logger.info("=" * 70)
-
-        # logger.info(f"SOURCE_VOLUME: {args.source_volume}")
-        # logger.info(f"BACKUP_VOLUME_NAME: {args.backup_volume_name}")
-        # logger.info(f"BACKUP_VOLUME_IAM_USER_ACCESS_KEY: {args.backup_volume_iam_user_access_key}")
-        # logger.info(f"BACKUP_VOLUME_IAM_USER_SECRET_KEY: {args.backup_volume_iam_user_secret_key}")
-        # logger.info(f"BACKUP_PATH: {args.backup_path}")
-        # logger.info(f"AUTH_TOKEN: {args.auth_token}")
-        # logger.info(f"BACKUP_LOG_ID: {args.backup_log_id}")
-
-        # logger.info("Step 1: Creating backup container...")
-        # container_name = create_backup_container(args)
-        # logger.info(f"Backup container created: {container_name}")
-        # progress += 10 # 10
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container created"], "", progress, args.auth_token)
-
-        # logger.info("Step 2: Starting backup...")
-        # start_backup(args, container_name)
-        # logger.info("Backup started")
-        # progress += 20 # 30
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup started"], "", progress, args.auth_token)
-
-        # logger.info("Step 3: Cleanup backup container...")
-        # clean_backup_container(container_name)
-        # logger.info("Backup container cleaned")
-        # progress += 50 # 80
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container cleaned"], "", progress, args.auth_token)
-
-        # logger.info("Step 4: Cleanup backup volume...")
-        # clean_backup_volume(args.backup_volume_name)
-        # logger.info("Backup volume cleaned")
-        # progress += 10 # 90
-        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup volume cleaned"], "", progress, args.auth_token)
-
-        # logger.info("Step 5: Disable backup volume plugin...")
-        # disable_backup_volume_plugin()
-        # logger.info("Backup volume plugin disabled")
-        # progress += 10 # 100
-        # update_backup_log(args.api_url, "COMPLETED", [], "", progress, args.auth_token)
 
         logger.info("Step 1: Preparing workspace and pulling aws cli...")
         pull_aws_cli()

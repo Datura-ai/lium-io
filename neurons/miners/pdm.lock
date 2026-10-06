@@ -4,8 +4,8 @@
 [metadata]
 groups = ["default"]
 strategy = ["inherit_metadata"]
-lock_version = "4.5.0"
-content_hash = "sha256:9c50a49970ee0ec28236b9abeefa80ffd3ef7597a565da6c2c1f092e0e747872"
+lock_version = "4.5.1"
+content_hash = "sha256:b889954bcb60bddca63d2f1b9042df472189067ba1aa37e227ae1e4e47c6a1c6"
 
 [[metadata.targets]]
 requires_python = ">=3.11,<3.13"
@@ -232,17 +232,6 @@ files = [
 ]
 
 [[package]]
-name = "base58"
-version = "2.1.1"
-requires_python = ">=3.5"
-summary = "Base58 and Base58Check implementation."
-groups = ["default"]
-files = [
-    {file = "base58-2.1.1-py3-none-any.whl", hash = "sha256:11a36f4d3ce51dfc1043f3218591ac4eb1ceb172919cebe05b52a5bcc8d245c2"},
-    {file = "base58-2.1.1.tar.gz", hash = "sha256:c5d0cb3f5b6e81e8e35da5754388ddcc6d0d14b6c6a132cb93d69ed580a7278c"},
-]
-
-[[package]]
 name = "bitarray"
 version = "3.9.0"
 requires_python = ">=3.7"
@@ -393,23 +382,6 @@ files = [
     {file = "bittensor_wallet-4.1.0-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:22b91e4c8b336ec5739c3c6262ea21cbff5e005d4e38963097f0ed0fed2bf80b"},
     {file = "bittensor_wallet-4.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:796b924712e5306bd93bcf17483012a01fae8ba526d55d2424933ffb70a462a7"},
     {file = "bittensor_wallet-4.1.0.tar.gz", hash = "sha256:f0f34641a4b9110def9e35fe22498195fcb31d143dc4f76dd9022db374ccd484"},
-]
-
-[[package]]
-name = "celium-collateral"
-version = "1.2.0"
-requires_python = "<3.13,>=3.11"
-summary = "Collateral Smart Contract for Lium"
-groups = ["default"]
-dependencies = [
-    "base58>=2.1.1",
-    "eth-utils==2.2.2",
-    "requests>=2.32.3",
-    "web3>=6.0.0",
-]
-files = [
-    {file = "celium_collateral-1.2.0-py3-none-any.whl", hash = "sha256:e022e886b488333f3b3cf7ec6ce61b20c920bc96822db635358a5d8733017c8b"},
-    {file = "celium_collateral-1.2.0.tar.gz", hash = "sha256:36aa7c4e2daea340cc86c416907e4b5f131718bb6c3da3e5ad56c49ae0f269fc"},
 ]
 
 [[package]]

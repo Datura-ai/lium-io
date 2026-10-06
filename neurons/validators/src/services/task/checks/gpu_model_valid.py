@@ -10,6 +10,13 @@ class GpuModelValidCheck:
     This mirrors the legacy guard that rejected unknown models, zero counts, or mismatched
     detail lists. It prevents us from handing out scores when the scrape clearly failed or
     when a miner advertises off-policy hardware.
+
+    A detail list whose length differs from the count (GPU_DETAILS_MISMATCH) also clears the
+    verified job (DAH-3519): in production this is a scrape that enumerated fewer cards than the
+    node reports, which is what a card that fell off the bus looks like. The check is fatal and
+    runs before SpecChangeCheck, so the reset has to happen here; the node then leaves the market
+    through the same path banned_gpu, gpu_fingerprint, duplicate_executor and spec_change use,
+    rented or idle, and is verified again on the first cycle whose scrape lists every card.
     """
 
     check_id = "gpu.validate.model"
@@ -72,7 +79,7 @@ class GpuModelValidCheck:
                 check_id=self.check_id,
                 what={"gpu_count": gpu_count, "details_len": len(gpu_details)},
             )
-            return CheckResult(passed=False, event=event)
+            return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
 
         event = render_message(
             Msg.MODEL_OK,

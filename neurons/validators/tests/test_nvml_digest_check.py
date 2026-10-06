@@ -43,7 +43,7 @@ from tests.helpers import build_context_config, build_services, build_state
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
             Msg.DRIVER_UNKNOWN.reason,
-            True,
+            False,  # DAH-2742: unknown driver is not tampering
         ),
         # Real-world unknown driver case - 535.274.02
         (
@@ -52,7 +52,7 @@ from tests.helpers import build_context_config, build_services, build_state
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
             Msg.DRIVER_UNKNOWN.reason,
-            True,
+            False,  # DAH-2742: unknown driver is not tampering
         ),
         # Empty digest - should fail if driver version is known
         (
@@ -139,6 +139,9 @@ async def test_known_spoof_driver_is_not_reported(context_factory):
 
     assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
     services.backend.report_unknown_driver.assert_not_awaited()
+    # DAH-2742: a confirmed spoof keeps the instant reset that an unrecognized-but-innocent
+    # driver no longer gets.
+    assert result.updates["clear_verified_job_info"] is True
 
 
 @pytest.mark.asyncio
@@ -147,6 +150,24 @@ async def test_nvml_digest_check_allows_driver_580_167_08(context_factory):
         "gpu": {"driver": "580.167.08"},
         "md5_checksums": {
             "libnvidia_ml": "fa0c084327835d0369e5307a1ba3a882:c7eac74626efce631035360d6a5d1f9d72b02d81739ab0adbf0521f6c6a0f10a",
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs))
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.DIGEST_OK.reason
+    assert "clear_verified_job_info" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_nvml_digest_check_allows_driver_595_91_07(context_factory):
+    # The Deep Learning Base OSS NVIDIA Driver AMI (AWS g5/g6) ships this driver (DAH-3339).
+    specs = {
+        "gpu": {"driver": "595.91.07"},
+        "md5_checksums": {
+            "libnvidia_ml": "815eeecaf87fd8f947c66b2ef1ca7525:7515da5b856b805fc07811dfd72a37545c1bd9e78f4d8c16421e155ac8f4aec4",
         },
     }
     ctx = context_factory(state=build_state(specs=specs))

@@ -30,12 +30,24 @@ class ClusterPodNetworking:
     published_udp_ports: tuple[int, ...]
 
 
-def cluster_pod_networking(wireguard_conf: str) -> ClusterPodNetworking:
+def cluster_pod_networking(
+    wireguard_conf: str,
+    ssh_private_key: str,
+    ssh_authorized_key: str,
+) -> ClusterPodNetworking:
     """The config in env for the template's entrypoint, and the UDP port to publish.
 
-    Base64 because the config is multi-line and travels as an environment variable.
+    Base64 because the config and the private key are multi-line and travel as environment
+    variables. DAH-2664: the SSH pair is the group's shared login, so `mpirun` and pdsh can start
+    ranks on the peers; an older backend sends neither and the entrypoint then installs nothing.
     """
+    environment: dict[str, str] = {
+        "LIUM_WIREGUARD_CONF_B64": base64.b64encode(wireguard_conf.encode()).decode()
+    }
+    if ssh_private_key and ssh_authorized_key:
+        environment["LIUM_CLUSTER_SSH_KEY_B64"] = base64.b64encode(ssh_private_key.encode()).decode()
+        environment["LIUM_CLUSTER_SSH_PUBKEY"] = ssh_authorized_key
     return ClusterPodNetworking(
-        environment={"LIUM_WIREGUARD_CONF_B64": base64.b64encode(wireguard_conf.encode()).decode()},
+        environment=environment,
         published_udp_ports=(WIREGUARD_LISTEN_PORT,),
     )

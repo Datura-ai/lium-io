@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from core.config import settings
+from services.executor_connectivity.models import PortVerificationResult, SecondPass
 from services.port_utils import get_all_ports
 
 from ..messages import PortConnectivityMessages as Msg
@@ -57,10 +59,28 @@ class PortConnectivityCheck:
             },
         )
         verified_port_count = len(result.successful_ports)
-        extra_info = {
+        probed_port_count = len(result.selected_ports)
+        declared_port_count = result.declared_port_count
+        extra_info: dict[str, object] = {
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
+            "probed_port_count": probed_port_count,
+            "declared_port_count": declared_port_count,
+            "probe_tier": result.probe_tier,
+            "dind_ok": result.dind_ok,
         }
+        if result.dind_error:
+            extra_info["dind_error"] = result.dind_error.text
+        # event-only: kept out of default_extra so later checks' log lines stay small
+        event_extra: dict[str, object] = {
+            "port_ranges": [r.as_dict() for r in result.port_ranges],
+            "second_pass": result.second_pass,
+        }
+        if result.second_pass == SecondPass.SKIPPED_BATCH_FAILED:
+            event_extra["second_pass_note"] = (
+                "second port pass skipped: the first pass's batch container didn't complete "
+                "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
+            )
         # DAH-2647: no_ports carries two different facts. When the executor declares ports and
         # a rental or filler holds all of them, the selector had nothing LEFT to offer — no
         # verdict, and during a teardown that snapshot is a moment stale. When the executor
@@ -81,19 +101,13 @@ class PortConnectivityCheck:
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count_or_none,
+            probed_port_count=probed_port_count,
+            declared_port_count=declared_port_count,
+            verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
+            dind_probe_error=result.dind_error,
         )
 
-        # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD
-        # probe containers the instant a ContainerCreateRequest lands (see
-        # DockerService.wait_for_port_check_containers). That race can flip
-        # sysbox_runtime to False for this cycle even though the executor is
-        # fine. Don't record a rental-induced sysbox downgrade — keep the last
-        # known value and let the next verification cycle re-measure. Mirrors
-        # the rented-executor sysbox fallback in ExecutorConnectivityService.
-        sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
-        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
-            ctx.miner_hotkey, ctx.executor.uuid
-        ):
+        if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
             extra_info["sysbox_downgrade_tolerated"] = True
             updated_state = replace(
                 updated_state,
@@ -169,9 +183,10 @@ class PortConnectivityCheck:
                     "total_ports_tested": len(result.successful_ports) + len(result.failed_ports),
                     "successful_ports": len(result.successful_ports),
                     "failed_ports": len(result.failed_ports),
+                    **event_extra,
                     **rental_info,
                 },
-                extra=extra_info,
+                extra={**extra_info, **event_extra},
             )
             return CheckResult(
                 passed=False,
@@ -184,7 +199,7 @@ class PortConnectivityCheck:
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
-            extra=extra_info,
+            extra={**extra_info, **event_extra},
         )
         return CheckResult(
             passed=True,
@@ -209,3 +224,40 @@ class PortConnectivityCheck:
             )
         except Exception:
             return True
+
+    @staticmethod
+    async def _should_keep_last_known_sysbox(
+        ctx: Context, result: PortVerificationResult, extra_info: dict[str, object]
+    ) -> bool:
+        # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD
+        # probe containers the instant a ContainerCreateRequest lands (see
+        # DockerService.wait_for_port_check_containers). That race can flip
+        # sysbox_runtime to False for this cycle even though the executor is
+        # fine. Don't record a rental-induced sysbox downgrade — keep the last
+        # known value and let the next verification cycle re-measure. Mirrors
+        # the rented-executor sysbox fallback in ExecutorConnectivityService.
+        sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
+        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
+            ctx.miner_hotkey, ctx.executor.uuid
+        ):
+            return True
+        if not settings.DIND_PROBE_FIRST_MISS_GRACE:
+            return False
+        # DAH-3597: a probe that never reached its container (dind_ok False: docker run
+        # refused, sshd not up in 30 s, SSH reset) measured nothing about sysbox, so the first
+        # such miss inside the TTL window keeps the last known value and the next cycle
+        # re-measures. A second miss inside the window is recorded as before. A probe that
+        # reached its container and still says no sysbox is a verdict, never tolerated.
+        if sysbox_downgraded and not result.dind_ok:
+            first_miss = await ctx.services.redis.record_dind_probe_miss(
+                ctx.miner_hotkey,
+                ctx.executor.uuid,
+                settings.DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS,
+            )
+            if first_miss:
+                extra_info["sysbox_downgrade_tolerated_reason"] = "first_dind_probe_miss"
+                return True
+            extra_info["dind_probe_miss_repeated"] = True
+        elif result.dind_ok:
+            await ctx.services.redis.clear_dind_probe_miss(ctx.miner_hotkey, ctx.executor.uuid)
+        return False

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neurons.validators.tests.helpers import build_scrape_namespace
+from neurons.validators.tests.helpers import build_scrape_namespace, dict_literal_keys
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -92,18 +92,6 @@ def test_boot_id_is_empty_when_unreadable(scrape: dict[str, Any], tmp_path: Path
     assert scrape["get_host_boot_id"]() == ""
 
 
-def _dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
-    """Keys of the single dict literal assigned to `dict_name`, in source order."""
-    for node in ast.walk(module):
-        if (
-            isinstance(node, ast.Assign)
-            and getattr(node.targets[0], "id", "") == dict_name
-            and isinstance(node.value, ast.Dict)
-        ):
-            return [key.value for key in node.value.keys]
-    raise AssertionError(f"{dict_name} dict literal not found")
-
-
 def test_new_keys_are_wired_through_both_obfuscation_tables() -> None:
     """A key missing from either table ships un-renamed/un-mapped — keep all three in both."""
     # Arrange
@@ -112,8 +100,8 @@ def test_new_keys_are_wired_through_both_obfuscation_tables() -> None:
     new_keys = ["data_ncu_profiling_access", "data_ncu_profiling_scrape_error", "data_boot_id"]
 
     # Act
-    original_keys = _dict_literal_keys(service_module, "ORIGINAL_KEYS")
-    all_keys = _dict_literal_keys(service_module, "all_keys")
+    original_keys = dict_literal_keys(service_module, "ORIGINAL_KEYS")
+    all_keys = dict_literal_keys(service_module, "all_keys")
 
     # Assert - the scrape emits each key and both tables carry it
     for key in new_keys:
@@ -129,7 +117,7 @@ def test_no_obfuscation_key_is_a_prefix_of_a_later_one() -> None:
     service_module = ast.parse((SRC / "services" / "file_encrypt_service.py").read_text())
 
     # Act
-    all_keys = _dict_literal_keys(service_module, "all_keys")
+    all_keys = dict_literal_keys(service_module, "all_keys")
 
     # Assert
     prefixed_pairs = [

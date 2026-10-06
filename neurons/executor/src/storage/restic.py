@@ -20,7 +20,6 @@ from storage.models import (
 )
 from storage.reporting import StorageEventReporter
 from storage.workspace import (
-    DockerEncryptedVolumeWorkspace,
     DockerUserNamespaceWorkspace,
     LocalWorkspace,
     ResolvedWorkspace,
@@ -30,28 +29,8 @@ RESTORE_CHECKPOINT_PREFIX = "LIUM_RESTORE_CHECKPOINT_"
 TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
-RESTIC_PACK_SIZE_BYTES = 16 * MEBIBYTE
-RESTIC_OPEN_PACKER_COUNT = 4
-RESTIC_TEMP_PACK_HEADROOM = 2
-RESTIC_MINIMUM_TMPFS_BYTES = 256 * MEBIBYTE
+RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
-ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
-set -eu
-passfile=/tmp/.lium-volume-passphrase
-umask 077
-printf '%s' "$LIUM_VOLUME_PASSPHRASE" > "$passfile"
-if [ ! -f /lium-cipher/gocryptfs.conf ]; then
-  /usr/local/bin/gocryptfs -init /lium-cipher -passfile "$passfile"
-fi
-/usr/local/bin/gocryptfs /lium-cipher /workspace -passfile "$passfile" -o allow_other -nonempty
-cleanup() {
-  /bin/fusermount3 -u /workspace >/dev/null 2>&1 || true
-  rm -f "$passfile"
-}
-trap cleanup EXIT INT TERM
-"$@"
-"""
-
 
 class ResticOperationError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
@@ -109,6 +88,9 @@ class JsonEventWriter:
 
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
+
+    def stage(self, stage: str) -> None:
+        self._write({"event": "stage", "operation_id": self._operation_id, "stage": stage})
 
     def heartbeat_if_due(self) -> None:
         now = self._clock()
@@ -192,38 +174,131 @@ class ResticStorageRunner:
         return result
 
     def _ensure_repository_for_backup(self) -> None:
-        probe = subprocess.run(
-            self._restic_command(["snapshots", "--json"]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
+        # A newly attached IAM policy can briefly return Access Denied while AWS
+        # propagates it. Share one three-minute readiness window across setup.
+        repository_readiness_deadline = time.monotonic() + 180.0
+        repository_probe = self._run_repository_command_with_retry(
+            ["snapshots", "--json"],
+            repository_command_name="probe",
+            retry_deadline=repository_readiness_deadline,
+            accepted_exit_codes=(0, 10),
         )
-        if probe.returncode == 0:
+        if repository_probe.returncode == 0:
             return
-        if probe.returncode != 10:
-            detail = _redact(probe.stderr or probe.stdout, self._secret_values())
+        if repository_probe.returncode != 10:
+            failure_detail = self._redacted_repository_failure_detail(repository_probe)
             raise ResticOperationError(
-                f"restic repository probe failed with exit {probe.returncode}: {detail}"
+                "restic repository probe failed with exit "
+                f"{repository_probe.returncode}: {failure_detail}"
             )
 
-        initialized = subprocess.run(
-            self._restic_command(["init", "--json"]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
+        repository_initialization = self._run_repository_command_with_retry(
+            ["init", "--json"],
+            repository_command_name="initialization",
+            retry_deadline=repository_readiness_deadline,
         )
-        if initialized.returncode == 0:
+        if repository_initialization.returncode == 0:
             return
 
-        retry_probe = subprocess.run(
-            self._restic_command(["snapshots", "--json"]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
+        # Initialization may have succeeded even if its response was lost. Probe
+        # again before retrying so we never initialize an existing repository.
+        repository_confirmation = self._run_repository_command_with_retry(
+            ["snapshots", "--json"],
+            repository_command_name="post-initialization probe",
+            retry_deadline=repository_readiness_deadline,
+            accepted_exit_codes=(0, 10),
         )
-        if retry_probe.returncode != 0:
-            detail = _redact(initialized.stderr or initialized.stdout, self._secret_values())
-            raise ResticOperationError(f"restic repository initialization failed: {detail}")
+        if repository_confirmation.returncode != 0:
+            failure_detail = self._redacted_repository_failure_detail(repository_initialization)
+            raise ResticOperationError(
+                f"restic repository initialization failed: {failure_detail}"
+            )
+
+    def _run_repository_command_with_retry(
+        self,
+        restic_arguments: list[str],
+        *,
+        repository_command_name: str,
+        retry_deadline: float,
+        accepted_exit_codes: tuple[int, ...] = (0,),
+    ) -> subprocess.CompletedProcess[str]:
+        # Start with a short delay so newly propagated permissions recover quickly.
+        retry_delay_seconds = 2.0
+        while True:
+            self._raise_if_cancellation_requested()
+            repository_command_result = subprocess.run(
+                self._restic_command(restic_arguments),
+                env=self._environment,
+                capture_output=True,
+                text=True,
+            )
+            if repository_command_result.returncode in accepted_exit_codes:
+                return repository_command_result
+
+            failure_detail = self._redacted_repository_failure_detail(repository_command_result)
+            if not _is_retryable_repository_failure(failure_detail):
+                return repository_command_result
+            remaining_retry_seconds = retry_deadline - time.monotonic()
+            if remaining_retry_seconds <= 0:
+                self._log_transient_repository_failure(
+                    repository_command_name,
+                    failure_detail,
+                    retry_delay_seconds=None,
+                )
+                raise ResticOperationError(
+                    "Backup storage was not ready after retrying: "
+                    f"{failure_detail}"
+                ) from None
+            wait_seconds = min(retry_delay_seconds, remaining_retry_seconds)
+            self._log_transient_repository_failure(
+                repository_command_name,
+                failure_detail,
+                retry_delay_seconds=wait_seconds,
+            )
+            self._wait_before_repository_retry(wait_seconds)
+            # Avoid hammering S3 while still checking readiness at least every 30 seconds.
+            retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
+
+    def _redacted_repository_failure_detail(
+        self,
+        repository_command_result: subprocess.CompletedProcess[str],
+    ) -> str:
+        command_output = repository_command_result.stderr or repository_command_result.stdout
+        return _redact(command_output, self._secret_values())
+
+    def _wait_before_repository_retry(self, delay_seconds: float) -> None:
+        deadline = time.monotonic() + delay_seconds
+        while True:
+            self._raise_if_cancellation_requested()
+            self._events.heartbeat_if_due()
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return
+            # Wake every second so cancellation and heartbeats remain responsive.
+            time.sleep(min(1.0, remaining_seconds))
+
+    def _raise_if_cancellation_requested(self) -> None:
+        if self._events.cancellation_requested:
+            raise StorageOperationCancelled("storage operation cancellation requested")
+
+    def _log_transient_repository_failure(
+        self,
+        repository_command_name: str,
+        failure_detail: str,
+        *,
+        retry_delay_seconds: float | None,
+    ) -> None:
+        retry_status = (
+            f"; retrying in {retry_delay_seconds:g}s"
+            if retry_delay_seconds is not None
+            else "; retries exhausted"
+        )
+        print(
+            "Transient repository "
+            f"{repository_command_name} failure{retry_status}: {failure_detail}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _require_repository_for_restore(self) -> None:
         # Restore is read-only: a missing source must fail instead of creating an
@@ -232,7 +307,7 @@ class ResticStorageRunner:
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
         probe = subprocess.run(
-            self._restic_command(["snapshots", "--json", snapshot_id]),
+            self._restic_command(["snapshots", "--json", "--", snapshot_id]),
             env=self._environment,
             capture_output=True,
             text=True,
@@ -295,6 +370,7 @@ class ResticStorageRunner:
         exit_code, _ = self._stream_command(command, cwd)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
+        self._events.stage("FINALIZING")
         return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
 
     def _restore_legacy_archive(self) -> ResticResult:
@@ -319,6 +395,7 @@ class ResticStorageRunner:
                 "bytes_restored": restore_stats.total_size,
             }
         )
+        self._events.stage("FINALIZING")
         return ResticResult("COMPLETED", OperationResultQuality.FULL, None, exit_code)
 
     def _stream(
@@ -459,9 +536,6 @@ class ResticStorageRunner:
                 namespace_command = restic_command
             return self._encrypted_helper_command(namespace_command), None
 
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            return self._encrypted_volume_helper_command(restic_command, working_directory), None
-
         volume_mode = "ro" if self._workspace.read_only else "rw"
         command = [
             *self._docker_helper_base(),
@@ -494,7 +568,7 @@ class ResticStorageRunner:
             # User xattrs belong to customer data; only host-managed namespaces
             # that cannot be written from the rental user namespace are skipped.
             arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
-        arguments.append(snapshot_id)
+        arguments.extend(["--", snapshot_id])
         return self._execution_command(arguments, working_directory=False)
 
     def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
@@ -522,8 +596,6 @@ class ResticStorageRunner:
             return pipeline_command, None
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
             return self._encrypted_helper_command(pipeline_command), None
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            return self._encrypted_volume_helper_command(pipeline_command, False), None
         return [
             *self._docker_helper_base(),
             "--security-opt",
@@ -556,52 +628,7 @@ class ResticStorageRunner:
             *namespace_command,
         ]
 
-    def _encrypted_volume_helper_command(
-        self,
-        command: list[str],
-        working_directory: bool,
-    ) -> list[str]:
-        if not isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            raise ResticOperationError(
-                "encrypted volume helper requested for a different workspace"
-            )
-        wrapped_command = command
-        if working_directory:
-            wrapped_command = [
-                "/bin/sh",
-                "-c",
-                ENCRYPTED_BACKUP_SCRIPT,
-                "sh",
-                str(self._workspace.path),
-                *command,
-            ]
-        return [
-            *self._docker_helper_base(),
-            "--privileged",
-            "--security-opt",
-            "label=disable",
-            "--device",
-            "/dev/fuse:/dev/fuse",
-            "--tmpfs",
-            "/workspace:rw,nosuid,nodev,size=67108864",
-            "-v",
-            f"{self._workspace.volume_name}:/lium-cipher:rw",
-            "--entrypoint",
-            "/bin/bash",
-            self._workspace.image,
-            "-c",
-            ENCRYPTED_BOOTSTRAP_SCRIPT,
-            "bash",
-            *wrapped_command,
-        ]
-
     def _docker_helper_base(self) -> list[str]:
-        tmpfs_size_bytes = max(
-            RESTIC_MINIMUM_TMPFS_BYTES,
-            (self._operation.repository.s3_connections + RESTIC_OPEN_PACKER_COUNT)
-            * RESTIC_PACK_SIZE_BYTES
-            * RESTIC_TEMP_PACK_HEADROOM,
-        )
         return [
             self._docker_binary,
             "run",
@@ -612,7 +639,7 @@ class ResticStorageRunner:
             "none",
             "--read-only",
             "--tmpfs",
-            f"/tmp:rw,nosuid,nodev,size={tmpfs_size_bytes}",
+            f"/tmp:rw,nosuid,nodev,size={RESTIC_TMPFS_BYTES}",
             "-e",
             "AWS_ACCESS_KEY_ID",
             "-e",
@@ -625,24 +652,19 @@ class ResticStorageRunner:
             "RESTIC_REPOSITORY",
             "-e",
             "RESTIC_PASSWORD",
-            "-e",
-            "LIUM_VOLUME_PASSPHRASE",
         ]
 
     def _helper_container_name(self) -> str:
         return f"lium-storage-{str(self._operation.operation_id)[:12]}"
 
     def _restic_command(self, arguments: list[str]) -> list[str]:
+        # Restic's native concurrency avoided the intermittent S3 transfer tails
+        # observed when Lium forced 64 connections.
         return [
             self._restic_binary,
             "--no-cache",
-            "-o",
-            self._s3_connection_option(),
             *arguments,
         ]
-
-    def _s3_connection_option(self) -> str:
-        return f"s3.connections={self._operation.repository.s3_connections}"
 
     def _workspace_path(self) -> str:
         return str(self._workspace.path)
@@ -662,10 +684,6 @@ class ResticStorageRunner:
             environment["RESTIC_PASSWORD"] = repository.password
         else:
             environment.pop("RESTIC_PASSWORD", None)
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            environment["LIUM_VOLUME_PASSPHRASE"] = self._workspace.volume_passphrase
-        else:
-            environment.pop("LIUM_VOLUME_PASSPHRASE", None)
         if repository.session_token:
             environment["AWS_SESSION_TOKEN"] = repository.session_token
         else:
@@ -679,10 +697,16 @@ class ResticStorageRunner:
             repository.secret_access_key,
             repository.session_token or "",
             repository.password or "",
-            self._workspace.volume_passphrase
-            if isinstance(self._workspace, DockerEncryptedVolumeWorkspace)
-            else "",
         )
+
+
+def _is_retryable_repository_failure(failure_detail: str) -> bool:
+    # Restic treats AccessDenied as permanent and does not retry it, but AWS can
+    # return it temporarily while a newly attached IAM policy is propagating.
+    retryable_failure_markers = ("accessdenied",)
+    # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
+    normalized_detail = "".join(failure_detail.casefold().split())
+    return any(marker in normalized_detail for marker in retryable_failure_markers)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:

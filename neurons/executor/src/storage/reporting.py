@@ -40,7 +40,8 @@ class StorageEventReporter:
         self._clock = clock
         self._sleeper = sleeper
         self._last_success_at = self._clock()
-        self._state = ProgressState(stage=action.value.upper())
+        initial_stage = "PREPARING" if action is StorageAction.RESTORE else action.value.upper()
+        self._state = ProgressState(stage=initial_stage)
         self._cancel_requested = False
         self._restic_failure_detail: str | None = None
         self._diagnostic_detail: str | None = None
@@ -51,11 +52,19 @@ class StorageEventReporter:
 
     def send(self, event: Mapping[str, object]) -> None:
         event_type = event.get("event")
+        if event_type == "stage":
+            stage = event.get("stage")
+            if isinstance(stage, str) and stage:
+                self._state.stage = stage
+                self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
         if event_type == "restic":
             payload = event.get("payload")
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
+            if self._state.stage == "PREPARING" and self._restore_has_started():
+                self._state.stage = "RESTORING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
@@ -145,6 +154,13 @@ class StorageEventReporter:
         if message:
             self._restic_failure_detail = message[:2000]
 
+    def _restore_has_started(self) -> bool:
+        return bool(
+            self._state.progress > 0
+            or (self._state.processed_files or 0) > 0
+            or (self._state.processed_bytes or 0) > 0
+        )
+
     def _progress_payload(
         self,
         *,
@@ -183,6 +199,8 @@ class StorageEventReporter:
                     headers={"Authorization": f"Bearer {self._spec.auth_token}"},
                     timeout=10,
                 )
+                if getattr(response, "status_code", None) in (404, 410):
+                    raise ReportingLeaseExpired("storage operation is no longer active")
                 response.raise_for_status()
                 body = response.json()
                 self._last_success_at = self._clock()
