@@ -1231,6 +1231,7 @@ def _wire_customer_create_over_the_host(
     containers_on_host: tuple[str, ...] | None = None,
     container_ids: dict[str, str] | None = None,
     listings_that_answer: int | None = None,
+    df_after_rm: str | None = None,
 ) -> AsyncMock:
     """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it. The host lists the
@@ -1250,7 +1251,10 @@ def _wire_customer_create_over_the_host(
             names_on_host = ps_after_rm.split()
             # the removal command reports the rm's status and the names left after it
             names_after = "".join(f"NAME\t{name}\n" for name in names_on_host)
-            return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t{listing_after_rm_exit}\n")
+            df_line = f"DF\t{df_after_rm}\n" if df_after_rm is not None else ""
+            return _ssh_result(
+                stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t{listing_after_rm_exit}\n{df_line}"
+            )
         if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
             listings += 1
             if listings_that_answer is not None and listings > listings_that_answer:
@@ -1394,7 +1398,10 @@ async def test_a_filler_removal_sizes_the_volume_on_the_df_read_after_its_rm(svc
     result = await _run_create_container(svc, _fresh_sizing_payload(active_volume_names=["volume_x"]))
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _cmds(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [], with_df=True)]
+    assert _cmds(ssh_client) == [
+        DOCKER_PS_ALL_NAMES_IDS_CMD,
+        _remove_and_list_containers_command(["filler_x"], [], with_df=True),
+    ]
     svc.probe_volume_host.assert_awaited_once()
     # 0.5 x (df - 20 GB overhead), two thirds of it the volume: 100 GB -> 26 GB, 140 GB -> 40 GB
     assert svc.create_local_volume.await_args.kwargs["limit"] == 40

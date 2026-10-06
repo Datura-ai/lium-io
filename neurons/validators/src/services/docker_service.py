@@ -654,6 +654,8 @@ class FillerRemovalAtSshConnect(NamedTuple):
     # every filler it removed (or tried to); "" when the listing carried no ID
     listed_id_by_filler_name: dict[str, str]
     removed_cleanly_without_volume_rm: bool
+    # df of the docker root its removal command read after the rm; None when not asked or not read
+    df_avail_bytes_after_removal: int | None = None
 
 
 class RemoveAndListContainersOutput(NamedTuple):
@@ -2923,6 +2925,7 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         active_volume_names: list[str] | None,
+        with_df: bool = False,
     ) -> FillerRemovalAtSshConnect:
         """DAH-3980: a customer create's `filler_*` removal, started as soon as the SSH session is up
         so the kill overlaps the image inspect and the host probes. The same removal and confirmation
@@ -2946,7 +2949,7 @@ class DockerService:
             for name in filler_names_on_host
             if (volume_name := f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}") not in protected_volumes
         ]
-        removed_cleanly = await self._remove_stale_containers(
+        removed_cleanly, df_avail_bytes_after_removal = await self._remove_stale_containers(
             ssh_client,
             default_extra,
             pod_name,
@@ -2954,10 +2957,12 @@ class DockerService:
             True,
             volumes_to_remove,
             {name: listed_ids[name] for name in filler_names_on_host if name in listed_ids},
+            with_df and not volumes_to_remove,
         )
         return FillerRemovalAtSshConnect(
             listed_id_by_filler_name={name: listed_ids.get(name, "") for name in filler_names_on_host},
             removed_cleanly_without_volume_rm=removed_cleanly and not volumes_to_remove,
+            df_avail_bytes_after_removal=df_avail_bytes_after_removal,
         )
 
     async def clean_existing_containers(
@@ -2973,6 +2978,7 @@ class DockerService:
         remove_every_filler: bool = False,
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
+        with_df_after_removal: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
@@ -6469,6 +6475,8 @@ class DockerService:
                             default_extra,
                             self.get_container_name(payload),
                             payload.active_volume_names,
+                            # the early volume probe may read df before this rm frees the disk
+                            with_df=measures_host and wants_volume_probe,
                         )
                     )
                     connections.push_async_callback(settle_filler_removal_at_ssh_connect)
@@ -6922,6 +6930,14 @@ class DockerService:
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
+                    # the early volume probe's df predates the rm, which frees disk
+                    with_df_after_removal=measures_host and early_volume_probe is not None and image_present,
+                )
+                # the df read after the last removal: the cleanup's, or the SSH-connect one's if it removed nothing
+                df_after_removal = (
+                    cleanup_report.df_avail_bytes_after_removal
+                    if removed_containers
+                    else fillers_removed_at_ssh_connect.df_avail_bytes_after_removal
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, and frees
@@ -7103,7 +7119,6 @@ class DockerService:
                     # passthrough contract needs neither, so it pays for no command
                     if wants_volume_probe:
                         current_step = "volume_host_probe"
-                        df_after_removal = cleanup_report.df_avail_bytes_after_removal
                         # a removal frees disk: the early df stands only with the df read after the rm
                         early_df_stands = not (removed_containers and measures_host) or df_after_removal is not None
                         if (
