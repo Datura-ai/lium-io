@@ -84,7 +84,13 @@ async def _run_set_weights_and_capture(
 
 
 async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_batch_id="2024-01-01 00:00:00"):
-    async def request_job_side_effect(payload, encrypted_files, rented_data, default_docker_image_digests):
+    async def request_job_side_effect(
+        payload,
+        encrypted_files,
+        rented_data,
+        default_docker_image_digests,
+        executor_image_snapshot,
+    ):
         hotkey = payload.miner_hotkey
         results = job_results_by_hotkey.get(hotkey, [])
         return {
@@ -101,9 +107,15 @@ async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_b
     # DAH-2380: sync() fetches default docker image digests from Docker Hub at job-cycle
     # start. Stub it here so these unit tests never hit the network (the real fetch would
     # open aiohttp connections to auth.docker.io / registry-1.docker.io per cycle).
-    with patch(
-        "core.validator.fetch_default_image_digests",
-        new=AsyncMock(return_value={}),
+    with (
+        patch(
+            "core.validator.fetch_default_image_digests",
+            new=AsyncMock(return_value={}),
+        ),
+        patch(
+            "core.validator.fetch_executor_image_digest",
+            new=AsyncMock(return_value=None),
+        ),
     ):
         await validator.sync()
 
@@ -520,7 +532,6 @@ async def test_scenario_multiple_executors_per_miner(
         assert_incentive_log_present,
         assert_executor_has_log,
         assert_log_contains_keys,
-        count_incentive_log_entries,
     )
 
     for hotkey, results in all_job_results.items():
@@ -666,11 +677,6 @@ async def test_scenario_single_miner_monopoly(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    monopoly_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=4,
-        total_gpu_count=4,
-    )
     failed_score = 0.0
 
     assert validator.miner_scores["monopoly_miner"] == pytest.approx(MINING_ALLOCATION)

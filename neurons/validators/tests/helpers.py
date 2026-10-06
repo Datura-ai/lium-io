@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
@@ -54,9 +56,171 @@ def dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
     raise AssertionError(f"{dict_name} dict literal not found")
 
 
+# Every Fernet token is base64url of a 0x80 version byte, so all of them start with "gAAAAA" —
+# and MachineSpecScrapeCheck only tries to decrypt the stdout lines shaped like that.
+FERNET_TOKEN = "gAAAAABscrape-payload"
+
+
+@dataclass(frozen=True)
+class SFTPPutCall:
+    local_path: str
+    remote_path: str
+    recurse: bool
+
+
+class DummySFTPClient:
+    """Mock SFTP client that simulates file upload."""
+
+    def __init__(self, *, should_raise: bool = False, error_message: str = ""):
+        self.should_raise = should_raise
+        self.error_message = error_message
+        self.put_called_with: SFTPPutCall | None = None
+        self.put_call_count = 0
+
+    async def put(self, local_path: str, remote_path: str, recurse: bool = False) -> None:
+        self.put_call_count += 1
+        self.put_called_with = SFTPPutCall(local_path, remote_path, recurse)
+        if self.should_raise:
+            raise RuntimeError(self.error_message)
+
+
+class DummySSHClient:
+    """Mock SSH client that provides SFTP access."""
+
+    def __init__(self, *, sftp_should_raise: bool = False, sftp_error: str = ""):
+        self.sftp_client = DummySFTPClient(
+            should_raise=sftp_should_raise,
+            error_message=sftp_error,
+        )
+
+    def start_sftp_client(self):
+        return self
+
+    async def __aenter__(self):
+        return self.sftp_client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 class DummyScoreCalc:
     def __call__(self, *args, **kwargs):  # pragma: no cover
         return 0.0, 0.0, ""
+
+
+class FakeRedis:
+    """Dict-backed stand-in for RedisService's get/set/delete and the hash calls (hset/hgetall/hdel/expire).
+
+    `ttl` records the `ex` of the last set per key (None when set without one), so a
+    test can assert that a mark carries an expiry. `failing` makes every call raise the client's
+    ConnectionError, the shape of a Redis outage seen through RedisService; `fail_next_set_of`
+    makes only the next `set` of those keys raise (one shot each; `fail_set_of_after[key] = n` skips n sets first), the shape of a blip that hits
+    one write in the middle of a cycle.
+    """
+
+    def __init__(self, *, failing: bool = False):
+        self.store: dict[str, str] = {}
+        # hset/hgetall/hdel: the per-cycle fleet and due hashes (DAH-2870), kept apart from the
+        # string keys so `store` still reads as the per-pod marks alone.
+        self.hashes: dict[str, dict[str, str]] = {}
+        self.ttl: dict[str, int | None] = {}
+        self.failing = failing
+        self.fail_next_set_of: set[str] = set()
+        # key -> how many `set`s of it to let through before the one that raises (one shot each)
+        self.fail_set_of_after: dict[str, int] = {}
+        # keys whose next DELETE fails (one shot each): a plain `delete`, or the whole batch when
+        # it sits inside write_atomically
+        self.fail_delete_of: set[str] = set()
+        self.calls = 0
+
+    def _touch(self):
+        self.calls += 1
+        if self.failing:
+            raise redis.exceptions.ConnectionError("Error 111 connecting to redis:6379")
+
+    async def get(self, key: str):
+        self._touch()
+        return self.store.get(key)
+
+    def _set_hook(self, key: str):
+        if key in self.fail_next_set_of:
+            self.fail_next_set_of.discard(key)
+            raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
+        if key in self.fail_set_of_after:
+            if self.fail_set_of_after[key] == 0:
+                del self.fail_set_of_after[key]
+                raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
+            self.fail_set_of_after[key] -= 1
+
+    async def set(self, key: str, value: str, ex: int | None = None):
+        self._touch()
+        self._set_hook(key)
+        self.store[key] = value
+        self.ttl[key] = ex
+
+    async def write_atomically(self, writes):
+        """`RedisService.write_atomically`: all of `writes` or none. `fail_delete_of` names keys whose
+        DELETE fails the whole batch (the shape of a connection lost mid-transaction); the set hooks
+        above apply to every SET in the batch. A failing batch applies nothing."""
+        self._touch()
+        for name, args, _kwargs in writes.ops:
+            if name == "set":
+                self._set_hook(args[0])
+            if name == "delete" and args[0] in self.fail_delete_of:
+                self.fail_delete_of.discard(args[0])
+                raise redis.exceptions.ConnectionError(f"Connection lost deleting {args[0]}")
+        # EXEC: applied without the hooks (they were consumed above) and as one round trip
+        for name, args, kwargs in writes.ops:
+            if name == "set":
+                key, value = args
+                self.store[key] = value
+                self.ttl[key] = kwargs.get("ex")
+            elif name == "delete":
+                (key,) = args
+                self.store.pop(key, None)
+                self.hashes.pop(key, None)
+                self.ttl.pop(key, None)
+            elif name == "hset":
+                key, field, value = args
+                self.hashes.setdefault(key, {})[field] = value
+            elif name == "expire":
+                key, seconds = args
+                if key in self.store or key in self.hashes:
+                    self.ttl[key] = seconds
+            else:
+                raise AssertionError(f"FakeRedis.write_atomically: unknown write {name}")
+
+    async def delete(self, key: str):
+        self._touch()
+        if key in self.fail_delete_of:
+            self.fail_delete_of.discard(key)
+            raise redis.exceptions.ConnectionError(f"Connection lost deleting {key}")
+        self.store.pop(key, None)
+        self.hashes.pop(key, None)
+        self.ttl.pop(key, None)
+
+    async def hset(self, key: str, field: str, value: str):
+        self._touch()
+        self.hashes.setdefault(key, {})[field] = value
+
+    async def hget(self, key: str, field: str):
+        self._touch()
+        return self.hashes.get(key, {}).get(field)
+
+    async def hgetall(self, key: str):
+        self._touch()
+        # redis-py returns bytes for both sides; the module must decode them
+        return {k.encode(): v.encode() for k, v in self.hashes.get(key, {}).items()}
+
+    async def hdel(self, key: str, *fields: str):
+        self._touch()
+        for field in fields:
+            self.hashes.get(key, {}).pop(field, None)
+
+    async def expire(self, key: str, seconds: int):
+        self._touch()
+        if key in self.store or key in self.hashes:
+            self.ttl[key] = seconds
 
 
 def default_executor() -> ExecutorSSHInfo:
@@ -85,7 +249,6 @@ def build_context_config(**overrides) -> ContextConfig:
         max_gpu_count=None,
         gpu_model_rates={},
         nvml_digest_map={},
-        enable_no_collateral=False,
         verifyx_enabled=False,
         inspector_enabled=False,
         port_private_key=None,
@@ -104,10 +267,12 @@ def build_services(**overrides) -> ContextServices:
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)
     backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
+    # A bare AsyncMock would report a live Lium workload on every node (DAH-3480); opt in per test.
+    backend.get_rented_executors_now.return_value = None
     base = dict(
         ssh=None,
-        redis=None,
-        collateral=None,
+        # DAH-2870: the rented check keeps per-pod marks in Redis on every rented cycle.
+        redis=FakeRedis(),
         validation=None,
         verifyx=None,
         inspector=None,

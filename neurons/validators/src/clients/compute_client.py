@@ -9,9 +9,9 @@ import bittensor
 import pydantic
 import tenacity
 import websockets
-from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    DeliveryStamps,
     CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
@@ -30,6 +30,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
+    ForcedValidationCycleRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -56,13 +57,13 @@ from protocol.vc_protocol.validator_requests import (
     GpuEstimatesRequest,
     InspectorEventRequest,
     LogStreamRequest,
+    PodStatesReport,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
 )
-from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
@@ -78,6 +79,7 @@ from services.redis_service import (
     INSPECTOR_EVENT_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
+    POD_STATES_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
@@ -86,6 +88,22 @@ from services.redis_service import (
 from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
+
+# DAH-2792: the keepalive pong queues behind a scoring-cycle burst and missed the 20 s default;
+# mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT = 40
+
+
+class OutgoingMessages(list[DeliveryStamps]):
+    # every append wakes the send loop, so a reply leaves at once instead of on the next 1 s poll
+    def __init__(self) -> None:
+        super().__init__()
+        self.appended = asyncio.Event()
+
+    def append(self, message: DeliveryStamps) -> None:
+        super().append(message)
+        self.appended.set()
 
 
 class AuthenticationError(Exception):
@@ -108,7 +126,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue = []
+        self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -130,7 +148,11 @@ class ComputeClient:
                 extra=get_extra_info(self.logging_extra)
             )
         )
-        return websockets.connect(self.compute_app_uri)
+        return websockets.connect(
+            self.compute_app_uri,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        )
 
     async def miner_driver_awaiter(self):
         """avoid memory leak by awaiting miner driver tasks"""
@@ -167,7 +189,7 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        self.subtensor_client = await SubtensorClient.initialize()
+        self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
 
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
@@ -229,7 +251,7 @@ class ComputeClient:
                         )
                         await asyncio.sleep(reconnect_delay)
                         reconnect_delay = min(reconnect_delay * 2, max_delay)
-            except Exception as exc:
+            except Exception:
                 logger.error(
                     _m(
                         "Error connecting to compute app, retrying...",
@@ -273,12 +295,13 @@ class ComputeClient:
                     RESET_VERIFIED_JOB_CHANNEL,
                     NORMALIZED_SCORE_CHANNEL,
                     GPU_ESTIMATES_CHANNEL,
+                    POD_STATES_CHANNEL,
                 )
                 async for message in pubsub.listen():
                     try:
                         channel = message['channel'].decode('utf-8')
                         data = json.loads(message['data'])
-                    except Exception as exc:
+                    except Exception:
                         continue
 
                     logger.info(
@@ -321,6 +344,7 @@ class ComputeClient:
                             incentive_formula_version=data.get("incentive_formula_version"),
                             incentive_formula_inputs=data.get("incentive_formula_inputs"),
                             log_text=data["log_text"],
+                            validation_event=data.get("validation_event"),
                             incentive_reasons=data.get("incentive_reasons"),
                             miner_hotkey=data["miner_hotkey"],
                             miner_coldkey=data["miner_coldkey"],
@@ -336,10 +360,31 @@ class ComputeClient:
                             attestation_digest=data.get("attestation_digest"),
                             tdx_attestation_passed=data.get("tdx_attestation_passed"),
                             gpu_attestation_passed=data.get("gpu_attestation_passed"),
+                            executor_image=data.get("executor_image"),
+                            sent_at=data.get("sent_at"),
+                            batch_total=data.get("batch_total"),
+                            availability_errors=data.get("availability_errors"),
+                            pod_states=data.get("pod_states"),
+                            pod_ssh=data.get("pod_ssh"),
                         )
 
                         async with self.lock:
                             self.message_queue.append(specs)
+                    elif channel == POD_STATES_CHANNEL:
+                        # DAH-3338: one chunk of the cycle's container states, published after the spec
+                        report = PodStatesReport(
+                            validator_hotkey=validator_hotkey,
+                            miner_hotkey=data["miner_hotkey"],
+                            executor_uuid=data["executor_uuid"],
+                            job_batch_id=data["job_batch_id"],
+                            chunk_index=data["chunk_index"],
+                            chunk_total=data["chunk_total"],
+                            pod_states=data["pod_states"],
+                            sent_at=data.get("sent_at"),
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(report)
                     elif channel == STREAMING_LOG_CHANNEL:
                         log_stream = LogStreamRequest(
                             logs=data["logs"],
@@ -375,7 +420,10 @@ class ComputeClient:
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
-                            reason=data["reason"]
+                            reason=data["reason"],
+                            reason_code=data.get("reason_code"),
+                            check_id=data.get("check_id"),
+                            evidence=data.get("evidence"),
                         )
 
                         async with self.lock:
@@ -431,7 +479,10 @@ class ComputeClient:
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
-    async def send_model(self, msg: BaseModel):
+    async def send_model(self, msg: DeliveryStamps):
+        # stamped inside the retry so a message resent after a reconnect reports its own delay
+        msg.forwarded_at = time.time()
+        msg.queue_depth = len(self.message_queue)
         await self.ws.send(msg.model_dump_json())
 
     async def handle_send_messages(self):
@@ -460,7 +511,8 @@ class ComputeClient:
                             )
                         )
             else:
-                await asyncio.sleep(1)
+                self.message_queue.appended.clear()
+                await self.message_queue.appended.wait()
 
     async def poll_rented_machines(self):
         while True:
@@ -662,6 +714,14 @@ class ComputeClient:
             return
 
         try:
+            pydantic.TypeAdapter(ForcedValidationCycleRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_forced_validation_cycle()
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = "Invalid message received from backend"
@@ -743,6 +803,23 @@ class ComputeClient:
                 ),
             )
         )
+
+    async def handle_forced_validation_cycle(self) -> None:
+        """Start a validation cycle now instead of waiting for the next block window.
+
+        Staging only. The backend gates the request too; this is the second gate, so a message
+        that reaches a production validator does nothing.
+        """
+        if settings.DEPLOY_ENV == "PROD":
+            logger.warning(
+                _m(
+                    "Forced validation cycle is disabled in production",
+                    extra=get_extra_info(self.logging_extra),
+                ),
+            )
+            return
+
+        await self.miner_service.request_validation_cycle_now()
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

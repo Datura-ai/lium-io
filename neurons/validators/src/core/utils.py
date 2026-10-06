@@ -8,7 +8,6 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 import asyncssh
 
 from core.config import settings
-from celium_collateral_contracts import CollateralContract
 
 # Create a ContextVar to hold the context information
 context = contextvars.ContextVar("context", default="TaskService")
@@ -156,10 +155,35 @@ def _apply_asyncssh_log_level(asyncssh_logger: logging.Logger | None = None) -> 
     return level
 
 
+_warned_log_levels: set[str] = set()
+
+
+def root_log_level() -> int:
+    """``settings.LOG_LEVEL`` as a logging level; an unknown name falls back to INFO, with one warning."""
+    value = str(settings.LOG_LEVEL)
+    level = logging.getLevelName(value.strip().upper())
+    if isinstance(level, int):
+        return level
+    if value not in _warned_log_levels:
+        _warned_log_levels.add(value)
+        logging.getLogger(__name__).warning("LOG_LEVEL=%r is not a level name; logging at INFO", value)
+    return logging.INFO
+
+
+# Third-party protocol loggers that write frames, headers or bodies at DEBUG. A websocket frame to a miner
+# can carry an SSH private key, a registry password or a token (ComputeClient.send_model), so LOG_LEVEL=DEBUG
+# stops at the validator's own loggers.
+PROTOCOL_LOGGERS = ("websockets", "aiohttp", "httpx", "httpcore", "urllib3")
+
+
+def protocol_log_level() -> int:
+    return max(root_log_level(), logging.INFO)
+
+
 def configure_logs_of_other_modules():
     # Configure root logger with JSON formatter
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(root_log_level())
 
     # Remove existing handlers
     for handler in root_logger.handlers[:]:
@@ -172,6 +196,9 @@ def configure_logs_of_other_modules():
 
     sqlalchemy_logger = logging.getLogger("sqlalchemy")
     sqlalchemy_logger.setLevel(logging.WARNING)
+
+    for name in PROTOCOL_LOGGERS:
+        logging.getLogger(name).setLevel(protocol_log_level())
 
     class ContextFilter(logging.Filter):
         """
@@ -205,7 +232,7 @@ def get_logger(name: str):
             },
         },
         "root": {
-            "level": "INFO",
+            "level": root_log_level(),
             "handlers": ["console"],
         },
         "loggers": {
@@ -219,6 +246,7 @@ def get_logger(name: str):
                 "level": "DEBUG" if settings.SSH_DEBUG_LOGGING else "WARNING",
                 "propagate": True,
             },
+            **{name: {"level": protocol_log_level(), "propagate": True} for name in PROTOCOL_LOGGERS},
         },
     }
 
@@ -254,7 +282,8 @@ async def retry_ssh_command(
     max_attempts: int = 5,
     wait_seconds: int = 10,
 ):
-    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds))
+    # reraise: the caller gets the last attempt's error (exit code, stderr), not RetryError[<Future>]
+    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds), reraise=True)
     async def execute_command():
         result = await ssh_client.run(command)
         if result.exit_status != 0:
@@ -262,29 +291,3 @@ async def retry_ssh_command(
 
     await execute_command()
 
-
-def get_collateral_contract(version: str = "1.0.2") -> CollateralContract:
-    """
-    Initializes and returns a CollateralContract instance.
-
-    Args:
-        network (str): The blockchain network to use ('local', 'test', 'finney', etc.).
-        contract_address (str): Address of the collateral contract.
-        owner_key (str): Ethereum owner key.
-        miner_key (str): Optional miner key required for contract operations.
-
-    Returns:
-        CollateralContract: The initialized contract instance.
-    """
-    network = settings.BITTENSOR_NETWORK
-    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
-    if version and settings.CONTRACT_VERSIONS.get(version):
-        contract_address = settings.CONTRACT_VERSIONS.get(version)["address"]
-
-    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
-
-    return CollateralContract(
-        network=network,
-        contract_address=contract_address,
-        rpc_url=rpc_url,
-    )
