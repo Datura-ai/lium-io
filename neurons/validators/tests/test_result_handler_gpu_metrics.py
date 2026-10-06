@@ -147,24 +147,30 @@ async def test_handle_result_defaults_inspector_outcome_to_skipped(context_facto
     assert result.inspector_outcome == "SKIPPED"
 
 
+@pytest.mark.parametrize(
+    "outcome, reason_code",
+    [("CLEAN", "INSPECTOR_CLEAN"), ("MALICIOUS", "INSPECTOR_MALICIOUS_FINDINGS")],
+)
 @pytest.mark.asyncio
-async def test_handle_result_publishes_inspector_event(context_factory):
+async def test_handle_result_publishes_inspector_event(context_factory, outcome, reason_code):
+    """The Inspector outcome is reported only: the job result carries the context's scores unchanged."""
     from unittest.mock import AsyncMock
 
     from services.redis_service import INSPECTOR_EVENT_CHANNEL
 
     inspector_event = {
         "executor_id": "executor-123",
-        "outcome": "CLEAN",
-        "reason_code": "INSPECTOR_CLEAN",
+        "outcome": outcome,
+        "reason_code": reason_code,
         "report": {"canary_ok": True, "findings": []},
         "when": "2026-06-17T12:00:00+00:00",
     }
     state = build_state(inspector_event=inspector_event)
     ctx = context_factory(
         state=state,
-        score=1.0,
-        job_score=1.0,
+        # distinct non-trivial values, so a zeroing or swapped score cannot pass unnoticed
+        score=0.7,
+        job_score=0.4,
         collateral_deposited=False,
         ssh_pub_keys=[],
         rented=True,
@@ -181,7 +187,8 @@ async def test_handle_result_publishes_inspector_event(context_factory):
         success=True,
     )
 
-    assert result.inspector_outcome == "CLEAN"
+    assert result.inspector_outcome == outcome
+    assert (result.score, result.job_score) == (ctx.score, ctx.job_score) == (0.7, 0.4)
     redis.publish.assert_awaited_once_with(
         INSPECTOR_EVENT_CHANNEL,
         {**inspector_event, "miner_hotkey": "miner-hotkey"},

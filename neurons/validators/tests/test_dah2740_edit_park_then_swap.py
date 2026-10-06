@@ -222,18 +222,16 @@ async def test_a_leftover_parked_container_next_to_the_pod_is_removed_before_par
 
 
 def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():
-    from services.container_cleanup import ContainerCleanup
+    from services.container_cleanup import listed_container_names
     from types import SimpleNamespace
 
     rented = SimpleNamespace(
         executors={"exec-1": SimpleNamespace(pods=[SimpleNamespace(container_name="pod_aaaa"), SimpleNamespace(container_name="pod_bbbb")])},
-        get_filler_containers=lambda uuid: set(),
+        all_filler_containers_by_executor={},
+        filler_containers_by_executor={},
     )
 
-    protected = ContainerCleanup()._get_rented_containers(rented, "exec-1")
-
-    assert protected == {"pod_aaaa", "pod_aaaa" + EDIT_PARKED_SUFFIX, "pod_bbbb", "pod_bbbb" + EDIT_PARKED_SUFFIX}
-    assert ContainerCleanup()._get_rented_containers(rented, "exec-2") == set()  # another host's pods are not this host's
+    assert listed_container_names(rented) == {"pod_aaaa", "pod_aaaa" + EDIT_PARKED_SUFFIX, "pod_bbbb", "pod_bbbb" + EDIT_PARKED_SUFFIX}
 
 
 @pytest.mark.asyncio
@@ -274,3 +272,18 @@ async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, m
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_run" and "gocryptfs: EPERM" in result.detail
     assert "Connection lost" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_undo_removes_the_replacement_by_its_id_so_a_sibling_retry_under_the_pod_name_survives():
+    from services.docker_service import _EditSwap
+
+    ssh = _ssh_recording()
+    swap = _EditSwap(ssh, "pod_abc", {})
+    swap.parked_name = "pod_abc" + EDIT_PARKED_SUFFIX
+    swap.replacement_id = "a" * 64
+
+    await swap.restore()
+
+    assert _docker(ssh.commands, "rm -fv") == [f"/usr/bin/docker rm -fv {'a' * 64} 2>/dev/null || true"]
+    assert "/usr/bin/docker rm -fv pod_abc 2>/dev/null || true" not in ssh.commands

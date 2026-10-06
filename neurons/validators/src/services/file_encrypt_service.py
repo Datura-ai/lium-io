@@ -141,6 +141,7 @@ ORIGINAL_KEYS = {
     'each_cpu_percent': "cpu_percent",
     'data_sysbox_runtime': "sysbox_runtime",
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
+    'data_sysbox_version': "sysbox_version",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
     # ticket-0331: the vloopback mount test. Prefixed so no existing key is a substring of them
@@ -349,6 +350,7 @@ class FileEncryptService:
             'machine_specs': "",
             'data_sysbox_runtime_scrape_error': "",
             'data_sysbox_runtime': "",
+            'data_sysbox_version': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
             'data_vloopback_check': "",
@@ -400,9 +402,15 @@ class FileEncryptService:
             'dh_write_probe': "",
         }
 
-        # Generate dictionary key mapping on validator side
-        for key, value in all_keys.items():
-            all_keys[key] = self.generate_random_name()
+        # Names must be unique: the validator reverses this map, so a shared name loses a key.
+        # No key fits "_" + letters (tested), so a later str.replace never matches inside a name.
+        used_names: set[str] = set()
+        for key in all_keys:
+            name = self.generate_random_name()
+            while name in used_names:
+                name = self.generate_random_name()
+            used_names.add(name)
+            all_keys[key] = name
 
         encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
