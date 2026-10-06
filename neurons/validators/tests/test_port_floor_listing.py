@@ -7,6 +7,7 @@ probe cascade and checks to show where the 2 comes from and what each run now re
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,7 +16,10 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.checks.finalize import FinalizeCheck
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
-from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+from neurons.validators.src.services.task.checks.port_count import (
+    PortCountCheck,
+    port_floor_what,
+)
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import (
     FinalizeMessages,
@@ -25,7 +29,7 @@ from neurons.validators.src.services.task.messages import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
-from services.executor_connectivity.models import DindProbeResult, PortPair
+from services.executor_connectivity.models import BatchResult, DindProbeResult, PortPair
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
@@ -58,9 +62,9 @@ class HostNetworkBatch:
         self.reachable = reachable
         self.calls: list[list[PortPair]] = []
 
-    async def verify(self, ports, *, ssh_client, host, log_ctx=None):
+    async def verify(self, ports, *, ssh_client, host, log_ctx=None, max_attempts=2):
         self.calls.append(list(ports))
-        return list(ports[: self.reachable]), list(ports[self.reachable :])
+        return BatchResult(list(ports[: self.reachable]), list(ports[self.reachable :]), completed=True)
 
 
 class PublishedPorts:
@@ -216,8 +220,12 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     assert ctx.state.specs["available_port_count"] == 2
     assert count_result.passed is False
     assert count_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
-    assert count_result.event.what_we_saw["probed_port_count"] == BATCH_PORT_VERIFICATION_SIZE
-    assert count_result.event.what_we_saw["declared_port_count"] == 25536
+    what = count_result.event.what_we_saw
+    assert (what["probed_port_count"], what["declared_port_count"]) == (
+        BATCH_PORT_VERIFICATION_SIZE,
+        25536,
+    )
+    assert (what["listing_check"], what["port_range"]) == ("INSUFFICIENT_PORTS", DECLARED_RANGE)
 
 
 @pytest.mark.asyncio
@@ -241,7 +249,10 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
     # exempt at the port check because the list still named the pod
     assert count_result.passed is True
     assert count_result.event.severity == "warning"
-    assert count_result.event.what_we_saw["listing_hidden"] is True
+    assert count_result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
+    what = count_result.event.what_we_saw
+    assert what["listing_hidden"] is True and what["exempt_because_rented"] is True
+    assert what["port_range"] == DECLARED_RANGE
     assert "Hidden from renters: only 2 verified ports, need 3" in count_result.event.impact
     # the pod is gone, the run goes on as unrented and completes
     assert tenant_result.passed is True
@@ -253,6 +264,8 @@ async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_comple
         "available_port_count": 2,
         "required": MIN_PORT_COUNT,
         "listing_hidden": True,
+        "listing_check": "INSUFFICIENT_PORTS",
+        "port_range": "40000-65535",
         "probed_port_count": BATCH_PORT_VERIFICATION_SIZE,
         "declared_port_count": 25536,
     }
@@ -324,16 +337,20 @@ async def test_topup_flag_reprobes_the_failed_ports_through_published_ports(cont
 
 
 @pytest.mark.asyncio
-async def test_topup_leaves_a_batch_at_the_floor_alone(context_factory, monkeypatch):
+@pytest.mark.parametrize("reachable", [MIN_PORT_COUNT, MIN_PORT_COUNT + 1])
+async def test_topup_leaves_a_batch_at_the_floor_alone(context_factory, monkeypatch, reachable):
     monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
-    batch, semi = HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts()
+    batch, semi = HostNetworkBatch(reachable=reachable), PublishedPorts()
     ctx = run_context(context_factory, connectivity(batch, semi, PublishedPorts()))
 
     _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
 
     assert semi.calls == []
-    assert ctx.state.verified_port_count == MIN_PORT_COUNT
+    assert ctx.state.verified_port_count == reachable
     assert ctx.default_extra["probe_tier"] == "batch"
+    assert count_result.passed is True
+    assert "listing_check" not in count_result.event.what_we_saw
 
 
 @pytest.mark.asyncio
@@ -567,3 +584,50 @@ async def test_finalize_keeps_the_score_warning_and_adds_the_port_floor_fix(cont
     assert remediation.startswith("No action needed.GPU runtime NVML driver/library mismatch ")
     assert f"lowest {BATCH_PORT_VERIFICATION_SIZE} free ports of the declared range" in remediation
     assert f"allow at least {MIN_PORT_COUNT} of them through the host firewall" in remediation
+
+
+MAPPINGS = "[[40000, 50000], [40001, 50001]]"
+UNPARSED = ([], "[]", "{}", "not json", "[[40000]]")
+
+
+@pytest.mark.parametrize(
+    ("port_range", "port_mappings", "named_range"),
+    [
+        (None, MAPPINGS, None),
+        (DECLARED_RANGE, MAPPINGS, None),  # mappings are what the node forwards
+        ("", None, "20000-65535"),
+        # same parse as the platform check: no [internal, external] pair means no mappings
+        *[(DECLARED_RANGE, m, DECLARED_RANGE) for m in UNPARSED],
+    ],
+)
+def test_port_floor_what_names_the_range_or_the_mappings(port_range, port_mappings, named_range):
+    specs = {"port_range": port_range, "port_mappings": port_mappings}
+    state = SimpleNamespace(specs=specs, probed_port_count=0, declared_port_count=2)
+
+    what = port_floor_what(state, 1)
+
+    assert what["port_range"] == named_range
+    assert "port_mappings" not in what
+
+
+@pytest.mark.asyncio
+async def test_a_range_next_to_empty_mappings_is_named_while_the_event_says_no_ports_were_probed(
+    context_factory,
+):
+    batch = HostNetworkBatch(reachable=2)
+    ctx = run_context(
+        context_factory,
+        connectivity(batch, PublishedPorts(), PublishedPorts()),
+        backend=RentalsBackendClient(None),
+    )
+    executor = ctx.executor.model_copy(update={"port_mappings": "[]"})
+    ctx = ctx.model_copy(update={"executor": executor})
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, _ = await apply(ctx, PortCountCheck())
+
+    assert batch.calls == []  # the selector reads the empty mappings, not the range
+    assert count_result.passed is False
+    what = count_result.event.what_we_saw
+    assert what["port_range"] == DECLARED_RANGE
+    assert (what["probed_port_count"], what["declared_port_count"]) == (0, 0)
