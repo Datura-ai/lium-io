@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, Mock
 import asyncssh
 import pytest
 from core.config import settings
+from payload_models.payloads import WorkloadKind
 from services import nvidia_devices as nd
 from services.docker_service import (
     DockerService,
@@ -1229,6 +1230,7 @@ def _wire_customer_create_over_the_host(
     docker_rm_seconds: float = 0,
     containers_on_host: tuple[str, ...] | None = None,
     container_ids: dict[str, str] | None = None,
+    listings_that_answer: int | None = None,
 ) -> AsyncMock:
     """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it. The host lists the
@@ -1237,9 +1239,10 @@ def _wire_customer_create_over_the_host(
     monkeypatch.setattr(settings, "RENTAL_VOLUME_FAST_PATH_ENABLED", True)
     ssh_client = _deploy_ssh_client()
     names_on_host = list(probe.container_names or () if containers_on_host is None else containers_on_host)
+    listings = 0
 
     async def answer(cmd, *args, **kwargs):
-        nonlocal names_on_host
+        nonlocal names_on_host, listings
         if "/usr/bin/docker rm -fv" in cmd:
             await asyncio.sleep(docker_rm_seconds)
             if docker_rm_raises is not None:
@@ -1247,10 +1250,11 @@ def _wire_customer_create_over_the_host(
             names_on_host = ps_after_rm.split()
             # the removal command reports the rm's status and the names left after it
             names_after = "".join(f"NAME\t{name}\n" for name in names_on_host)
-            return _ssh_result(
-                stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t{listing_after_rm_exit}\n"
-            )
+            return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t{listing_after_rm_exit}\n")
         if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
+            listings += 1
+            if listings_that_answer is not None and listings > listings_that_answer:
+                return _ssh_result(exit_status=1)
             ids = container_ids or {}
             return _ssh_result(stdout="".join(f"{name} {ids.get(name, '')}\n" for name in names_on_host))
         return _ssh_result()
@@ -1289,87 +1293,30 @@ def _relisting_commands(ssh_client) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc_fixture, monkeypatch):
-    """The filler's removal is the only host change; nothing is listed or probed again."""
+@pytest.mark.parametrize("probe_saw_the_filler", [True, False], ids=["probe_listed_the_filler", "probe_listed_after_the_removal"])
+async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(
+    svc_fixture, monkeypatch, probe_saw_the_filler
+):
+    """The filler's removal is the only host change; nothing is listed or probed again. Whether the probe listed
+    the host before or after it, it hands on a listing without the filler and keeps its early df."""
     svc = svc_fixture
+    probe = _probe_with_containers(*(["filler_x"] if probe_saw_the_filler else []), "pod_keep")
     ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=_probe_with_containers("filler_x")
+        svc, monkeypatch, probe=probe, containers_on_host=("filler_x", "pod_keep")
     )
     # the backend protects a preempted filler's volume until its own filler delete
-    payload = _deploy_payload(active_volume_names=["volume_x"])
+    payload = _deploy_payload(active_container_names=["pod_keep"], active_volume_names=["volume_keep", "volume_x"])
 
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the rm and its confirming listing are one host command; the listing that finds the filler
-    # at SSH connect is the other
-    assert _cmds(ssh_client) == [
-        DOCKER_PS_ALL_NAMES_IDS_CMD,
-        _remove_and_list_containers_command(["filler_x"], []),
-    ]
+    # the listing that finds the filler at SSH connect, then the rm and its confirming listing in one command
+    assert _cmds(ssh_client) == [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL]
     assert _relisting_commands(ssh_client) == []
+    handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
+    assert (handed_on.container_names, handed_on.mounted_volume_names) == (("pod_keep",), ("volume_keep",))
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_customer_create_removes_the_filler_at_ssh_connect_by_the_id_it_was_listed_under(
-    svc_fixture, monkeypatch
-):
-    """A same-name filler created after the listing is not the instance the removal targets."""
-    svc = svc_fixture
-    filler_id = "f" * 64
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=_probe_with_containers("filler_x"), container_ids={"filler_x": filler_id}
-    )
-
-    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _removal_commands(ssh_client) == [_remove_and_list_containers_command([filler_id], [])]
-
-
-_REMOVED_AT_SSH_CONNECT_ID = "a" * 64
-_RECREATED_ID = "b" * 64
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("id_in_cleanup_listing", "removals"),
-    [
-        # the instance removed at SSH connect, in a listing read before that removal: not removed twice
-        (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID]),
-        # a filler created again under the same name since: it goes too, by its own ID
-        (_RECREATED_ID, [_REMOVED_AT_SSH_CONNECT_ID, _RECREATED_ID]),
-    ],
-    ids=["same_instance", "recreated_filler"],
-)
-async def test_the_cleanup_skips_only_the_filler_instance_removed_at_ssh_connect(
-    svc_fixture, monkeypatch, id_in_cleanup_listing, removals
-):
-    svc = svc_fixture
-    probe = _probe_with_containers("filler_x")
-    probe.container_ids["filler_x"] = id_in_cleanup_listing
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=probe, container_ids={"filler_x": _REMOVED_AT_SSH_CONNECT_ID}
-    )
-    events: list[str] = []
-    host = ssh_client.run.side_effect
-
-    async def recording_host(cmd, *args, **kwargs):
-        if cmd.startswith("/usr/bin/docker rm -fv"):
-            events.append(cmd)
-        return await host(cmd, *args, **kwargs)
-
-    ssh_client.run.side_effect = recording_host
-    svc._run_rental_docker_create_with_port_retry = AsyncMock(
-        side_effect=lambda *args, **kwargs: events.append("docker run")
-    )
-
-    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert events == [_remove_and_list_containers_command([target], []) for target in removals] + ["docker run"]
 
 
 _FILLER_X_REMOVAL = _remove_and_list_containers_command(["filler_x"], [])
@@ -1380,10 +1327,8 @@ _POD_OLD_REMOVAL = _remove_and_list_containers_command(["pod_old"], ["volume_old
 @pytest.mark.parametrize(
     ("containers", "active_volume_names", "docker_rm_exit", "ps_after_rm", "listing_after_rm_exit", "removals"),
     [
-        # a pod removed beside the filler: the filler at SSH connect, the pod at the cleanup step
-        (("filler_x", "pod_old"), ["volume_x"], 0, "", 0, [_FILLER_X_REMOVAL, _POD_OLD_REMOVAL]),
-        # the filler's volume removed by the create
-        (("filler_x",), [], 0, "", 0, [_remove_and_list_containers_command(["filler_x"], ["volume_x"])]),
+        (("filler_x", "pod_old"), ["volume_x"], 0, "", 0, [_FILLER_X_REMOVAL, _POD_OLD_REMOVAL]),  # a pod beside the filler
+        (("filler_x",), [], 0, "", 0, [_remove_and_list_containers_command(["filler_x"], ["volume_x"])]),  # the filler's volume
         (("filler_x",), ["volume_x"], 0, "filler_x\n", 0, [_FILLER_X_REMOVAL]),  # the filler survived the rm
         (("filler_x",), ["volume_x"], 1, "", 0, [_FILLER_X_REMOVAL]),  # the rm failed although the filler is gone
         (("filler_x",), ["volume_x"], 0, "", 1, [_FILLER_X_REMOVAL]),  # the confirming listing failed
@@ -1416,27 +1361,6 @@ async def test_customer_create_relists_after_any_other_removal(
         port_check_containers_command("miner"),
     ]
     assert svc.probe_volume_host.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_customer_create_without_a_filler_runs_the_same_commands_as_before(
-    svc_fixture, monkeypatch
-):
-    """Keeping the probes changes nothing when the cleanup removes nothing (the list is the one before it).
-    Removing fillers at SSH connect adds one read-only listing, run beside the probes."""
-    svc = svc_fixture
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=_probe_with_containers("pod_keep")
-    )
-
-    result = await _run_create_container(
-        svc, _deploy_payload(active_container_names=["pod_keep"], active_volume_names=["volume_keep"])
-    )
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _cmds(ssh_client) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
-    svc.probe_prerun_host.assert_awaited_once()
-    svc.probe_volume_host.assert_awaited_once()
 
 
 def _df_record(avail_bytes: int) -> str:
@@ -1522,171 +1446,106 @@ def _removal_commands(ssh_client) -> list[str]:
     return [cmd for cmd in _cmds(ssh_client) if cmd.startswith("/usr/bin/docker rm -fv")]
 
 
-def _record_removal(ssh_client, events: list[str]) -> None:
-    host = ssh_client.run.side_effect
-
-    async def run(cmd, *args, **kwargs):
-        if cmd.startswith("/usr/bin/docker rm -fv"):
-            events.append("removal issued")
-            answer = await host(cmd, *args, **kwargs)
-            events.append("removal confirmed")
-            return answer
-        return await host(cmd, *args, **kwargs)
-
-    ssh_client.run.side_effect = run
-
-
-@pytest.mark.asyncio
-async def test_customer_create_removes_the_filler_before_the_image_inspect_and_the_probes_finish(
-    svc_fixture, monkeypatch
-):
-    """The kill is issued at SSH connect and the cleanup step does not issue it again."""
-    svc = svc_fixture
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=_probe_with_containers("filler_x")
-    )
-    events: list[str] = []
-    _record_removal(ssh_client, events)
-    docker_client = _docker_client(svc)
-    inspect_image = docker_client.local_image_repo_digests
-    probe = svc.probe_prerun_host.return_value
-
-    async def slow_inspect(*, image):
-        await asyncio.sleep(0.05)
-        events.append("image inspected")
-        return await inspect_image(image=image)
-
-    async def slow_probe(*args, **kwargs):
-        await asyncio.sleep(0.05)
-        events.append("host probed")
-        return probe
-
-    docker_client.local_image_repo_digests = slow_inspect
-    svc.probe_prerun_host = AsyncMock(side_effect=slow_probe)
-
-    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert events[:2] == ["removal issued", "removal confirmed"]
-    assert sorted(events[2:]) == ["host probed", "image inspected"]
-    assert _removal_commands(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("probe_saw_the_filler", [True, False])
-async def test_customer_create_hands_on_a_listing_without_the_filler_whichever_side_won_the_race(
-    svc_fixture, monkeypatch, probe_saw_the_filler
-):
-    """The probe lists the host before or after the removal; both end without the filler, and the
-    early df stays (read beside the removal it can only read less free space)."""
-    svc = svc_fixture
-    probe = (
-        _probe_with_containers("filler_x", "pod_keep")
-        if probe_saw_the_filler
-        else _probe_with_containers("pod_keep")
-    )
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=probe, containers_on_host=("filler_x", "pod_keep")
-    )
-
-    result = await _run_create_container(
-        svc,
-        _deploy_payload(
-            active_container_names=["pod_keep"], active_volume_names=["volume_keep", "volume_x"]
-        ),
-    )
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _removal_commands(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
-    assert _relisting_commands(ssh_client) == []
-    handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
-    assert handed_on.container_names == ("pod_keep",)
-    assert handed_on.mounted_volume_names == ("volume_keep",)
-    svc.probe_volume_host.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_power_restore_cache_reclaim_and_docker_run_wait_for_the_early_removal(
-    svc_fixture, monkeypatch
-):
-    """Safety order: a PEARL filler is gone before its cap is lifted, and the Dolphin cache
-    is reclaimed only once the filler that mounts it is gone."""
-    svc = svc_fixture
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=_probe_with_containers("filler_x"), docker_rm_seconds=0.05
-    )
-    events: list[str] = []
-    _record_removal(ssh_client, events)
-
-    def recorder(event: str, returns=None) -> AsyncMock:
-        return AsyncMock(side_effect=lambda *args, **kwargs: events.append(event) or returns)
-
-    svc._restore_gpu_power_for_uncapped_pod = recorder("power restore")
-    svc.reclaim_dphn_cache_for_rental = recorder("cache reclaim", returns=False)
-    svc._run_rental_docker_create_with_port_retry = recorder("docker run")
-
-    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert events[:2] == ["removal issued", "removal confirmed"]
-    # power restore twice: beside the volume create, and again right before docker run
-    assert sorted(events[2:]) == ["cache reclaim", "docker run", "power restore", "power restore"]
-
-
-def _removals_at_ssh_connect_left_running() -> list[asyncio.Task]:
-    return [
-        task
-        for task in asyncio.all_tasks()
-        if "remove_fillers_at_ssh_connect" in repr(task.get_coro()) and not task.done()
-    ]
-
-
-_HOSTILE_HOST_TEXT = "HOSTILE-BANNER-6f1c\nforged log line"
-
-
-def _relisting_fails_after_the_first(ssh_client) -> None:
-    # the listing that finds the filler works; the one after the failed rm does not, so the rm's error is raised
-    host = ssh_client.run.side_effect
-    listings = 0
-
-    async def run(cmd, *args, **kwargs):
-        nonlocal listings
-        if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
-            listings += 1
-            if listings > 1:
-                return _ssh_result(exit_status=1)
-        return await host(cmd, *args, **kwargs)
-
-    ssh_client.run.side_effect = run
+_REMOVED_AT_SSH_CONNECT_ID = "a" * 64
+_RECREATED_ID = "b" * 64
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("docker_rm_seconds", "docker_rm_raises", "failed_before_the_create", "logged_error_type"),
+    ("id_in_cleanup_listing", "removed_ids", "docker_rm_seconds", "probes_seconds", "after_the_first_removal"),
+    [
+        # the instance removed at SSH connect, in a listing read before that removal: not removed twice
+        (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
+        # a listing without IDs: the removal at SSH connect still targets the ID it listed, not the name
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
+        # a filler created again under the same name since: it goes too, by its own ID
+        (_RECREATED_ID, [_REMOVED_AT_SSH_CONNECT_ID, _RECREATED_ID], 0, 0, []),
+        # the kill is issued at SSH connect: confirmed before the image inspect and the probes finish
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["host probed", "image inspected"]),
+        # safety order: a PEARL filler is gone before its cap is lifted (beside the volume create, and again
+        # right before docker run), and the Dolphin cache is reclaimed only once the filler that mounts it is gone
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["cache reclaim", "docker run", "power restore", "power restore"]),
+    ],
+    ids=["same_instance", "cleanup_listing_without_ids", "recreated_filler", "before_the_image_inspect_and_the_probes_finish",
+         "before_power_restore_cache_reclaim_and_docker_run"],
+)
+async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
+    svc_fixture, monkeypatch, id_in_cleanup_listing, removed_ids, docker_rm_seconds, probes_seconds, after_the_first_removal
+):
+    svc = svc_fixture
+    probe = _probe_with_containers("filler_x")
+    if id_in_cleanup_listing:
+        probe.container_ids["filler_x"] = id_in_cleanup_listing
+    ssh_client = _wire_customer_create_over_the_host(
+        svc,
+        monkeypatch,
+        probe=probe,
+        container_ids={"filler_x": _REMOVED_AT_SSH_CONNECT_ID},
+        docker_rm_seconds=docker_rm_seconds,
+    )
+    events: list[str] = []  # each removal command and step, once it answered
+    host = ssh_client.run.side_effect
+
+    async def run(cmd, *args, **kwargs):
+        answer = await host(cmd, *args, **kwargs)
+        events.extend([cmd] if cmd.startswith("/usr/bin/docker rm -fv") else [])
+        return answer
+
+    def recorded(event: str, call, seconds: float = 0):
+        async def record(*args, **kwargs):
+            await asyncio.sleep(seconds)
+            answer = await call(*args, **kwargs)
+            events.append(event)
+            return answer
+
+        return record
+
+    ssh_client.run.side_effect = run
+    docker_client = _docker_client(svc)
+    docker_client.local_image_repo_digests = recorded(
+        "image inspected", docker_client.local_image_repo_digests, probes_seconds
+    )
+    svc.probe_prerun_host = AsyncMock(side_effect=recorded("host probed", svc.probe_prerun_host, probes_seconds))
+    svc._restore_gpu_power_for_uncapped_pod = recorded("power restore", AsyncMock())
+    svc.reclaim_dphn_cache_for_rental = recorded("cache reclaim", AsyncMock(return_value=False))
+    svc._run_rental_docker_create_with_port_retry = recorded("docker run", AsyncMock())
+
+    result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    removals = [_remove_and_list_containers_command([removed_id], []) for removed_id in removed_ids]
+    assert [event for event in events if event.startswith("/usr/bin/docker rm -fv")] == removals
+    assert events.index("docker run") > events.index(removals[-1])
+    after = events[events.index(removals[0]) + 1 :]
+    assert sorted(event for event in after if event in after_the_first_removal) == after_the_first_removal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("docker_rm_seconds", "docker_rm_raises", "delete_seconds", "logged_error_types"),
     [
         # the create fails while the removal is in flight: the removal is cancelled, nothing logged
-        (5, None, False, None),
+        (5, None, 0, []),
         # the removal failed first on a host's crafted text: only the error's type reaches the log
-        (0, asyncssh.ConnectionLost(_HOSTILE_HOST_TEXT), True, "ConnectionLost"),
+        (0, asyncssh.ConnectionLost("HOSTILE-BANNER-6f1c\nforged log line"), 0.05, ["ConnectionLost"]),
     ],
     ids=["removal_in_flight", "removal_failed"],
 )
 async def test_create_failing_before_the_cleanup_settles_the_removal_at_ssh_connect(
-    svc_fixture, monkeypatch, caplog, docker_rm_seconds, docker_rm_raises, failed_before_the_create, logged_error_type
+    svc_fixture, monkeypatch, caplog, docker_rm_seconds, docker_rm_raises, delete_seconds, logged_error_types
 ):
     svc = svc_fixture
-    ssh_client = _wire_customer_create_over_the_host(
+    _wire_customer_create_over_the_host(
         svc,
         monkeypatch,
         probe=_probe_with_containers("filler_x"),
         docker_rm_seconds=docker_rm_seconds,
         docker_rm_raises=docker_rm_raises,
+        listings_that_answer=1,  # the listing after a failed rm fails too, so the rm's error is raised
     )
-    _relisting_fails_after_the_first(ssh_client)
 
     async def deleted(*args, **kwargs):
-        if failed_before_the_create:
-            await asyncio.sleep(0.05)
+        await asyncio.sleep(delete_seconds)
         raise RuntimeError("deleted")
 
     monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock(side_effect=deleted))
@@ -1697,13 +1556,13 @@ async def test_create_failing_before_the_cleanup_settles_the_removal_at_ssh_conn
 
     assert type(result).__name__ == "FailedContainerRequest"
     assert result.failure_step == "ssh_connect"
-    assert _removals_at_ssh_connect_left_running() == []
-    settled = [
-        record.msg.extra
-        for record in caplog.records
+    assert not [
+        task for task in asyncio.all_tasks() if "remove_fillers_at_ssh_connect" in repr(task.get_coro()) and not task.done()
+    ]
+    assert logged_error_types == [
+        record.msg.extra["error_type"] for record in caplog.records
         if getattr(record.msg, "message", None) == "Filler removal at SSH connect failed before the cleanup step"
     ]
-    assert [extra["error_type"] for extra in settled] == ([logged_error_type] if logged_error_type else [])
     logged = "".join(
         record.msg.to_full_string() if hasattr(record.msg, "to_full_string") else record.getMessage()
         for record in caplog.records
@@ -1713,38 +1572,32 @@ async def test_create_failing_before_the_cleanup_settles_the_removal_at_ssh_conn
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("filler_create", "commands"),
+    ("container", "payload_fields", "bootstrap_restore", "commands"),
     [
+        # nothing to remove: the commands of before, plus the removal's one read-only listing beside the probes
+        ("pod_keep", {"active_container_names": ["pod_keep"], "active_volume_names": ["volume_keep"]}, False, [DOCKER_PS_ALL_NAMES_IDS_CMD]),
         # a filler create keeps protecting its sibling bundle (DAH-2465) and lists nothing at SSH connect
-        (True, []),
+        ("filler_sibling", {"workload_kind": WorkloadKind.FILLER, "active_container_names": ["filler_sibling"], "active_volume_names": ["volume_sibling"]}, False, []),
         # a bootstrap restore removes the filler at the cleanup step
-        (False, [_FILLER_X_REMOVAL]),
+        ("filler_x", {"active_volume_names": ["volume_x"]}, True, [_FILLER_X_REMOVAL]),
     ],
-    ids=["filler_create", "bootstrap_restore"],
+    ids=["customer_without_a_filler", "filler_create", "bootstrap_restore"],
 )
 async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
-    svc_fixture, monkeypatch, filler_create, commands
+    svc_fixture, monkeypatch, container, payload_fields, bootstrap_restore, commands
 ):
-    from payload_models.payloads import WorkloadKind
-
     svc = svc_fixture
-    filler = "filler_sibling" if filler_create else "filler_x"
-    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers(filler))
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers(container))
     monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
-    if filler_create:
-        payload = _deploy_payload(
-            workload_kind=WorkloadKind.FILLER,
-            active_container_names=["filler_sibling"],
-            active_volume_names=["volume_sibling"],
-        )
-    else:
-        payload = _deploy_payload(active_volume_names=["volume_x"])
-        payload.bootstrap_restore = Mock(restore_log_id="restore-log")
+    payload = _deploy_payload(**payload_fields)
+    payload.bootstrap_restore = Mock(restore_log_id="restore-log") if bootstrap_restore else None
 
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert _cmds(ssh_client) == commands
+    svc.probe_prerun_host.assert_awaited_once()
+    svc.probe_volume_host.assert_awaited_once()
 
 
 def test_probe_without_containers_drops_them_and_their_mounts_only():
