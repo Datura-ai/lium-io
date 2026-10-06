@@ -34,6 +34,7 @@ from services.docker_service import (
     ContainerCleanupReport,
     DockerService,
     _remove_and_list_containers_command,
+    own_sweep_removals,
 )
 
 
@@ -62,6 +63,11 @@ def _listing(stdout: str, exit_status: int = 0, stderr: str = ""):
     result.stdout = stdout
     result.stderr = stderr
     return result
+
+
+@pytest.fixture(autouse=True)
+def _no_sweeps_from_other_tests():
+    own_sweep_removals.clear()
 
 
 def _events(caplog) -> list[logging.LogRecord]:
@@ -224,6 +230,23 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
 
 
 @pytest.mark.asyncio
+async def test_a_filler_that_survives_the_removal_is_still_recorded_as_ours(docker_service, retry_ssh_mock):
+    # its `rm` can still finish after the listing in the same command named it, so that listing does not undo it
+    stuck_id, gone_id, target_id = "a" * 64, "b" * 64, "c" * 64
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _listing(f"pod_target {target_id}\nfiller_stuck {stuck_id}\nfiller_gone {gone_id}\n"),
+            _removal(f"filler_stuck {stuck_id}"),
+        ]
+    )
+
+    await _clean_for_customer(docker_service, ssh_client)
+
+    assert all(own_sweep_removals.sent_rm_for(i) for i in (stuck_id, gone_id, target_id))
+
+
+@pytest.mark.asyncio
 async def test_a_confirmed_removal_writes_no_event(docker_service, retry_ssh_mock, caplog):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(side_effect=[_listing("pod_target\nfiller_gone\n"), _removal()])
@@ -354,7 +377,7 @@ async def test_rm_retry_budget_goes_only_to_the_names_still_on_the_host(
     retried_rm = retry_ssh_mock.call_args_list[0]
     assert "filler_busy" in retried_rm[0][1]
     assert "filler_gone" not in retried_rm[0][1]
-    assert "max_attempts" not in retried_rm.kwargs  # the full budget, as before DAH-3706
+    assert retried_rm.kwargs["max_attempts"] == 5  # the full budget, as before DAH-3706
     assert "volume rm" in retry_ssh_mock.call_args_list[1][0][1]
     assert ssh_client.run.await_count == 3
     assert report.removed_cleanly_without_volume_rm is False

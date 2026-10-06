@@ -84,7 +84,9 @@ fi
 log_success "All required environment variables are set"
 log_kv "TAG:" "${TAG}"
 
-IMAGE_NAME="daturaai/compute-subnet-executor:${TAG}"
+# IMAGE_REPO_SUFFIX=-dev (executor_cd_dev from a branch other than main) pushes to
+# daturaai/compute-subnet-executor-dev; unset, the release repository.
+IMAGE_NAME="daturaai/compute-subnet-executor${IMAGE_REPO_SUFFIX:-}:${TAG}"
 
 # ── Optionally generate config_override.py ────────────────────────────────────
 log_step "Validator hotkey configuration"
