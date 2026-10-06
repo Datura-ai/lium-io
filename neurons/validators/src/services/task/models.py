@@ -1,10 +1,33 @@
 import uuid
 from datetime import UTC, datetime
-from typing import Any
-
-from pydantic import BaseModel, Field
+from typing import TYPE_CHECKING, Any
 
 from datura.requests.miner_requests import ExecutorSSHInfo
+from incentive.miner_incentive_log import IncentiveReason
+from protocol.vc_protocol.validator_requests import (
+    AVAILABILITY_CATEGORY as AVAILABILITY_CATEGORY,
+    PodContainerState,
+    PodSshObservation,
+    ValidationEvent,
+)
+from pydantic import BaseModel, Field, PrivateAttr
+
+if TYPE_CHECKING:
+    from incentive.miner_incentive_log import MinerLogLine
+
+
+class MixedFormulaInputs(BaseModel):
+    """DAH-2467: what a partially rented split node's incentive was computed from.
+
+    The two blocks are whole `JobResult.incentive_formula_inputs` payloads — the mining
+    one for the rented GPUs, the unrented one for the free GPUs — so the stored numbers
+    reproduce the paid incentive, which one flattened block cannot do.
+    """
+
+    rented_gpu_count: int
+    free_gpu_count: int
+    mining: dict[str, Any]
+    unrented: dict[str, Any]
 
 
 class JobResult(BaseModel):
@@ -16,6 +39,7 @@ class JobResult(BaseModel):
     job_batch_id: str
     log_status: str
     log_text: str
+    validation_event: ValidationEvent | None = None
     # One timestamp shared by every executor finalized in this validator cycle.
     # It is assigned after final weights are calculated and is the accounting/day key.
     scored_at: datetime | None = None
@@ -27,11 +51,25 @@ class JobResult(BaseModel):
     gpu_splitting_min_count: int | None = None
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+    # GPUs held by rented pods (DAH-2467). None = unknown (old backend or not rented) — the
+    # executor is then scored whole-box; set and below gpu_count on a split node, the incentive
+    # engine scores the free GPUs in the unrented pool.
+    rented_gpu_count: int | None = None
+    # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
+    # minimum-split tier and rate, never as a bundle of its own size.
+    is_split_remainder: bool = False
     is_spot: bool = False
+    # in the backend's provider_spot_executor_ids: the provider chose Spot, rather than a demotion,
+    # force-spot hotkey, pin or no-incentive rental putting the node there. Gates spot-node pay.
+    is_provider_chosen_spot: bool = False
     is_new_rentals_paused: bool = False
+    is_provider_banned: bool = False
     provider_discord_connected: bool = True
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive
+    has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
+    # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
+    filler_revenue_per_gpu_hour: float | None = None
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -39,8 +77,27 @@ class JobResult(BaseModel):
     tdx_attestation_passed: bool = False
     # G1 — NVIDIA CC GPU attestation outcome (None = not performed)
     gpu_attestation_passed: bool | None = None
+    executor_image_report: dict[str, Any] | None = None
+    # DAH-3338: container state per rented pod plus reaped orphans; None = the cycle never
+    # observed any (not reached the rented-state check, nothing reaped).
+    pod_states: list[PodContainerState] | None = None
+    # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
+    # None when the node has no rented pod with an ssh_port or the probe did not run.
+    pod_ssh: list[PodSshObservation] | None = None
 
     inspector_outcome: str = "SKIPPED"
+
+    # DAH-2748: every reachability check this cycle failed, with what we saw when we tried.
+    # The backend hides such a node from the market until a cycle reports none. None means this
+    # cycle never got to check — a failure before the connect leaves the stored errors alone
+    # rather than re-listing a node nobody tested.
+    availability_errors: list[dict[str, Any]] | None = None
+
+    # DAH-3405: the reason code of the event that ended a run without a score (the failed
+    # check's, the finalize or rented halt event's, or EXECUTOR_SSH_UNREACHABLE when the connect
+    # itself failed). None on a scored run and on an error no check produced. Read by the
+    # rollout-grace classifier at the end of the cycle.
+    failure_reason_code: str | None = None
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
@@ -50,6 +107,9 @@ class JobResult(BaseModel):
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
     incentive: float | None = None                      # Incentive score for the executor in this cycle
+    # DAH-2467: how `incentive` splits across the two pools. Always sums to `incentive`.
+    incentive_rented: float | None = None
+    incentive_idle: float | None = None
     mining_share: float | None = None
     total_mining_score: float | None = None
 
@@ -58,9 +118,21 @@ class JobResult(BaseModel):
     hourly_rate: float | None = None                  # Hourly rate for the executor in this cycle for scoring logic
     max_cap: int | None = None                        # Max cap for GPU counts in this cycle for scoring logic
     count_bucket: int | None = None                    # gpu_count_bucket the executor is accounted against; 0 = aggregate-cap path
+    bucket_reassigned_from: int | None = None          # DAH-2528: gpu_count bucket the executor left because it was over cap
+    bucket_reassigned_from_multiplier: float | None = None  # source bucket's cap multiplier at reassignment time
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
+    # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
+    spot_pay_candidate: bool = False
+    # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
+    # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
+    # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),
+    # on top of its effective_rate, which stays the listed or diluted rate.
+    # Set only on a node paid from that share, so every other node's output is unchanged.
+    unbucketed_share: float | None = None
+    unbucketed_rental_cost: float | None = None
+    floor_top_up_rate: float | None = None
     unrented_cap_multiplier: float | None = None          # Cap dilution multiplier: min(count, cap) / count
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
@@ -74,8 +146,31 @@ class JobResult(BaseModel):
     seconds_per_block: int | None = None
     fixed_ratio: float | None = None
 
-    
-    incentive_logs: list[str] = []
+
+    # Delivery buffers with dedicated export paths (full_log_text, direct publish);
+    # excluded so no model_dump ever serializes them raw.
+    incentive_logs: list[str] = Field(default_factory=list, exclude=True)
+    # DAH-2340 wire reasons for the backend; [] when no catalogued reason was recorded.
+    zero_incentive_reasons: list[IncentiveReason] = Field(default_factory=list, exclude=True)
+
+    _mixed_formula_inputs: "MixedFormulaInputs | None" = PrivateAttr(default=None)
+
+    def set_incentive_split(self, rented: float, idle: float) -> None:
+        """Record the two-pool breakdown and keep `incentive` equal to their sum."""
+        self.incentive_rented = rented
+        self.incentive_idle = idle
+        self.incentive = rented + idle
+
+    def record_mixed_formula_inputs(self, inputs: "MixedFormulaInputs") -> None:
+        """Take both portions' formula snapshots — call it while each portion still holds
+        the GPU count its own formula ran on, before the merge restores the whole box."""
+        self._mixed_formula_inputs = inputs
+
+    def record_incentive_log(self, line: "MinerLogLine") -> None:
+        """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
+        self.incentive_logs.append(line.to_log_line())
+        if line.reason is not None:
+            self.zero_incentive_reasons.append(line.to_incentive_reason())
 
     @property
     def incentive_source(self) -> str:
@@ -84,21 +179,44 @@ class JobResult(BaseModel):
             return "unknown"
         if self.incentive <= 0:
             return "zero_incentive"
+        if self._is_mixed:
+            return "mixed"
         return "rented_emission" if self.is_rented else "idle_incentive"
 
     @property
+    def _is_mixed(self) -> bool:
+        """True when the merge produced this row from a rented and a free portion (DAH-2467).
+
+        Keyed on the snapshot, not on the two amounts: a free portion that scored 0 still
+        went through the mixed formula, and every label must agree on one answer.
+        """
+        return self._mixed_formula_inputs is not None
+
+    @property
     def node_state_at_cycle(self) -> str:
+        if self._is_mixed:
+            return "mixed"
         return "rented" if self.is_rented else "idle"
 
     @property
     def incentive_formula_version(self) -> str:
-        return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
+        if self._is_mixed:
+            return "mixed_v1"
+        return "rental_price_v2" if self._paid_from_rental_share else "mining_v1"
+
+    @property
+    def _paid_from_rental_share(self) -> bool:
+        return self.eligible_for_rental_share or self.spot_pay_candidate
 
     @property
     def incentive_formula_inputs(self) -> dict[str, Any]:
         """Snapshot the exact scalar inputs needed to explain this cycle's incentive."""
-        if self.eligible_for_rental_share:
-            return {
+        if self._mixed_formula_inputs is not None:
+            # The property's contract is a plain JSON-ready dict, and the payload is
+            # published straight into a JSON message.
+            return self._mixed_formula_inputs.model_dump()
+        if self._paid_from_rental_share:
+            inputs: dict[str, Any] = {
                 "rental_share": self.rental_share,
                 "rental_share_raw": self.rental_share_raw,
                 "total_burn_emission": self.total_burn_emission,
@@ -112,6 +230,8 @@ class JobResult(BaseModel):
                 "effective_rate": self.effective_rate,
                 "total_rental_cost": self.total_rental_cost,
                 "count_bucket": self.count_bucket,
+                "bucket_reassigned_from": self.bucket_reassigned_from,
+                "bucket_reassigned_from_multiplier": self.bucket_reassigned_from_multiplier,
                 "max_cap": self.max_cap,
                 "total_unrented_by_gpu_type": self.total_unrented_by_gpu_type,
                 "cap_dilution_applied": self.cap_dilution_applied,
@@ -122,6 +242,19 @@ class JobResult(BaseModel):
                 "seconds_per_block": self.seconds_per_block,
                 "fixed_ratio": self.fixed_ratio,
             }
+            if self.unbucketed_share is not None:
+                # rental_price_v2 has two terms once these keys are present (documented in the
+                # lium_protocol README, 1.5.0):
+                #   rental term:     rental_share * gpu_count * effective_rate / total_rental_cost
+                #   unbucketed term: unbucketed_share * gpu_count * floor_top_up_rate / unbucketed_rental_cost
+                # A floored secure node is paid both. A spot node (spot_pay: true) is paid only the
+                # unbucketed term, with floor_top_up_rate = effective_rate.
+                inputs["unbucketed_share"] = self.unbucketed_share
+                inputs["unbucketed_rental_cost"] = self.unbucketed_rental_cost
+                inputs["floor_top_up_rate"] = self.floor_top_up_rate
+                if self.spot_pay_candidate:
+                    inputs["spot_pay"] = True
+            return inputs
         return {
             "score": self.score,
             "mining_share": self.mining_share,
@@ -147,36 +280,21 @@ class JobResult(BaseModel):
         }
 
     @property
-    def full_log_text(self):
+    def full_log_text(self) -> str:
         """Return the full log text including the incentive logs."""
         if not self.log_text or not self.incentive_logs:
             return self.log_text
-        return self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+        text: str = self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+        if self._is_mixed:
+            text += (
+                f"\n\nPartially rented split node total: rented {self.incentive_rented} "
+                f"+ idle {self.incentive_idle} = {self.incentive}"
+            )
+        return text
 
     @property
     def is_successful(self):
         return (self.score > 0 or self.job_score > 0) and self.gpu_model and self.gpu_count > 0
-
-
-class ValidationEvent(BaseModel):
-    event: str
-    reason_code: str
-    severity: str
-    category: str = "runtime"
-    impact: str
-    remediation: str | None = None
-    what_we_saw: dict[str, Any] = Field(default_factory=dict)
-    warnings: list[str] = Field(default_factory=list)
-    help_uri: str | None = None
-    check_id: str | None = None
-    pipeline_id: str | None = None
-    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    when: datetime
-    context: dict[str, Any] = Field(default_factory=dict)
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-        extra = "allow"
 
 
 def build_msg(

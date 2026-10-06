@@ -39,7 +39,7 @@ async def test_orchestrator_success(sample_executor_info, mock_ssh_client, mocke
         executor_info=sample_executor_info,
         miner_hotkey="miner",
         sysbox_runtime=False,
-        rented_ports=[],
+        unavailable_ports=[],
         ssh_client=mock_ssh_client,
     )
 
@@ -74,7 +74,7 @@ async def test_orchestrator_no_ports(sample_executor_info, mock_ssh_client, mock
         executor_info=sample_executor_info,
         miner_hotkey="miner",
         sysbox_runtime=False,
-        rented_ports=[],
+        unavailable_ports=[],
         ssh_client=mock_ssh_client,
     )
 
@@ -121,7 +121,7 @@ async def test_orchestrator_probe_fails_dind_ok(sample_executor_info, mock_ssh_c
         executor_info=sample_executor_info,
         miner_hotkey="miner",
         sysbox_runtime=False,
-        rented_ports=[],
+        unavailable_ports=[],
         ssh_client=mock_ssh_client,
     )
 
@@ -167,7 +167,7 @@ async def test_orchestrator_probe_ok_dind_fails(sample_executor_info, mock_ssh_c
         executor_info=sample_executor_info,
         miner_hotkey="miner",
         sysbox_runtime=True,
-        rented_ports=[],
+        unavailable_ports=[],
         ssh_client=mock_ssh_client,
     )
 

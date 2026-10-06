@@ -1,4 +1,7 @@
-FROM python:3.11-slim
+# python:3.11-slim as published on 8 Sep 2026 (= 3.11-slim-trixie: Debian 13, OpenSSH 10.0), pinned by
+# digest. The bare tag moved from Debian 12 to Debian 13 on its own and changed sshd's defaults under
+# every executor (DAH-3236); a base bump is now a deliberate edit of this line, checked by sshd_setup.sh.
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ENV=prod
@@ -9,8 +12,11 @@ WORKDIR /root/app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
      build-essential \
+     bzip2 \
      ca-certificates \
      curl \
+     e2fsprogs \
+     fuse3 \
      git \
      gnupg \
      libffi-dev \
@@ -19,8 +25,10 @@ RUN apt-get update \
      openssh-client \
      openssh-server \
      pkg-config \
-     speedtest-cli \
      ssh \
+     awscli \
+     tar \
+     util-linux \
   && install -m 0755 -d /etc/apt/keyrings \
   && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
   && chmod a+r /etc/apt/keyrings/docker.gpg \
@@ -29,6 +37,26 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends docker-ce-cli \
   && rm -rf /var/lib/apt/lists/* \
   && docker --version
+
+ARG RESTIC_VERSION=0.19.1
+ARG RESTIC_LINUX_AMD64_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+RUN curl -fsSLo /tmp/restic.bz2 \
+      "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2" \
+  && echo "${RESTIC_LINUX_AMD64_SHA256}  /tmp/restic.bz2" | sha256sum -c - \
+  && bunzip2 /tmp/restic.bz2 \
+  && install -m 0755 /tmp/restic /usr/local/bin/restic \
+  && rm -f /tmp/restic \
+  && test "$(restic version | awk '{print $2}')" = "${RESTIC_VERSION}"
+
+ARG GOCRYPTFS_VERSION=2.6.1
+ARG GOCRYPTFS_LINUX_AMD64_SHA256=49b8c0eb0f6373b6ac99c394a52909d8478e74c08d0961527c1162967cc28c44
+RUN curl -fsSLo /tmp/gocryptfs.tgz \
+      "https://github.com/rfjakob/gocryptfs/releases/download/v${GOCRYPTFS_VERSION}/gocryptfs_v${GOCRYPTFS_VERSION}_linux-static_amd64.tar.gz" \
+  && echo "${GOCRYPTFS_LINUX_AMD64_SHA256}  /tmp/gocryptfs.tgz" | sha256sum -c - \
+  && tar -xzf /tmp/gocryptfs.tgz -C /usr/local/bin gocryptfs \
+  && chmod 0755 /usr/local/bin/gocryptfs \
+  && rm -f /tmp/gocryptfs.tgz \
+  && gocryptfs --version
 
 RUN pip install -U pdm
 ENV PDM_CHECK_UPDATE=false
@@ -74,5 +102,9 @@ RUN useradd -m -s /bin/bash liumuser && \
 
 RUN echo 'AcceptEnv CONTAINER_NAME' >>/etc/ssh/sshd_config && \
     printf 'Match User liumuser\n    ForceCommand bash -c '"'"'[ -n "$CONTAINER_NAME" ] && exec docker exec -it "$CONTAINER_NAME" bash || { echo "CONTAINER_NAME not set"; exit 1; }'"'"'\n' >>/etc/ssh/sshd_config
+
+# PerSourcePenalties off via /etc/ssh/sshd_config.d/lium.conf when this sshd knows the directive,
+# then `sshd -T` must accept the whole rendered config or the build fails (sshd_setup.sh says why).
+RUN sh sshd_setup.sh
 
 CMD ["bash", "run.sh"]

@@ -47,7 +47,6 @@ Pre-check policy:
     - Models in neither -> raises UnsupportedGpuModelError.
 """
 from __future__ import annotations
-from typing import Dict, List, Optional, Set, Tuple
 
 # Per-window bounds are nominal × [VRAM_FLOOR_RATIO, VRAM_CEIL_RATIO].
 # See the module docstring for why 0.90 / 1.05 (NVML under-reporting + vendor drift).
@@ -60,7 +59,7 @@ VRAM_CEIL_RATIO = 1.05
 #   `observed: X` notes the prod NVML-reported value(s) we've seen for that
 #   model (most-common first). Used to verify the computed window covers reality.
 #   Multi-variant cards list one nominal size per real SKU (flagged `# multi-variant`).
-GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
+GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Blackwell data-center
     "NVIDIA B300 SXM6 AC":                                [294912],        # 288 GB; observed: 275040
     "NVIDIA B200":                                        [196608],        # 192 GB; observed: 183359 (49140 ~48GB outlier rejected)
@@ -92,10 +91,16 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     "NVIDIA GeForce RTX 4060 Ti":                         [8192, 16384],   # 8/16 GB multi-variant
     "NVIDIA GeForce RTX 4060":                            [8192],          # 8 GB
     # Blackwell pro / Ada pro / Quadro-class
+    "NVIDIA RTX PRO 2000 Blackwell":                      [16384],         # 16 GB; observed: 16311
     "NVIDIA RTX PRO 4000 Blackwell":                      [24576],         # 24 GB
+    "NVIDIA RTX PRO 4500 Blackwell":                      [32768],         # 32 GB
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition":       [32768],         # 32 GB
     "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
     "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],         # 84 GB; China SKU, 448-bit bus
+    "NVIDIA RTX 6000D":                                   [86016],         # 84 GB; China SKU, 448-bit bus
+    "NVIDIA RTX 4500 Ada Generation":                     [24576],         # 24 GB; observed: 23034
     "NVIDIA RTX 5000 Ada Generation":                     [32768],         # 32 GB
     "NVIDIA RTX 5880 Ada Generation":                     [49152],         # 48 GB
     "NVIDIA RTX 6000 Ada Generation":                     [49152],         # 48 GB; observed: 49140 (92%), 46068 (8%)
@@ -106,7 +111,10 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     # Ampere data-center
     "NVIDIA A100 80GB PCIe":                              [81920],         # 80 GB; observed: 81920
     "NVIDIA A100-SXM4-80GB":                              [81920],         # 80 GB; observed: 81920
+    "NVIDIA A800 80GB PCIe":                              [81920],         # 80 GB
     "NVIDIA A10 Tensor Core GPU":                         [24576],         # 24 GB
+    # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
+    "NVIDIA CMP 170HX":                                   [8192, 40960, 65536], # 8/40/64 GB multi-variant
     # Ampere pro
     "NVIDIA RTX A6000":                                   [49152],         # 48 GB; observed: 49140
     "NVIDIA RTX A5000":                                   [24576],         # 24 GB; observed: 24564
@@ -154,12 +162,19 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     # Maxwell
     "NVIDIA Tesla M40":                                   [12288, 24576],  # 12/24 GB multi-variant
 }
+# `NVIDIA B300 SXM6 PC` (provider-observed on real hardware, 21 Sep 2026: memory.total 275040 MiB on all
+# 8 GPUs — the AC row's observed total, inside the [0.90, 1.05] band for both names; not in NVIDIA's
+# public chip list) takes the AC card's sizes. Derived, never a row of its own: a corrected AC size moves
+# both names. The precheck fails closed on a reading outside the window.
+GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
+# `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300, so the same nominal size; no GB300 reading observed yet.
+GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
 # enforce a VRAM range (e.g., legacy data, awaiting spec confirmation).
 # Pre-check returns None for these.
-KNOWN_UNRANGED: Set[str] = set()
+KNOWN_UNRANGED: set[str] = set()
 
 
 # --- Normalization (CUDA deviceProp.name -> canonical key) -------------------
@@ -168,7 +183,7 @@ KNOWN_UNRANGED: Set[str] = set()
 # keys directly. Add entries as new mismatches are observed in production
 # logs. Unmapped names pass through unchanged (and will likely produce
 # UnsupportedGpuModelError until added here).
-NORMALIZATION_MAP: Dict[str, str] = {
+NORMALIZATION_MAP: dict[str, str] = {
     # Tesla V100 family — CUDA reports "Tesla V100-..." in some driver versions
     "Tesla V100-SXM2-16GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
     "Tesla V100-SXM2-32GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
@@ -180,11 +195,14 @@ NORMALIZATION_MAP: Dict[str, str] = {
     "Tesla T4":                             "NVIDIA T4 Tensor Core GPU",
     "NVIDIA T4":                            "NVIDIA T4 Tensor Core GPU",
     "NVIDIA A10":                           "NVIDIA A10 Tensor Core GPU",
+    # A10G is the AWS-only SKU of the A10 (GA102, 24 GB GDDR6; g5 instances report it as
+    # "NVIDIA A10G"). Rentable as an A10; A10's rate is 0.0, so no incentive either way.
+    "NVIDIA A10G":                          "NVIDIA A10 Tensor Core GPU",
     # Add observed CUDA names here as production logs surface them.
 }
 
 
-def normalize_gpu_model(name: Optional[str]) -> str:
+def normalize_gpu_model(name: str | None) -> str:
     """Map a CUDA-reported GPU name to a canonical GPU_MODEL_RATES key.
 
     Returns:
@@ -198,7 +216,7 @@ def normalize_gpu_model(name: Optional[str]) -> str:
     return NORMALIZATION_MAP.get(stripped, stripped)
 
 
-def vram_window_for_size(nominal_mb: int) -> Tuple[int, int]:
+def vram_window_for_size(nominal_mb: int) -> tuple[int, int]:
     """Compute the (vram_mb_min, vram_mb_max) acceptance window for one nominal size.
 
     Bounds are nominal × [VRAM_FLOOR_RATIO, VRAM_CEIL_RATIO], rounded to int. This
@@ -207,7 +225,26 @@ def vram_window_for_size(nominal_mb: int) -> Tuple[int, int]:
     return (round(nominal_mb * VRAM_FLOOR_RATIO), round(nominal_mb * VRAM_CEIL_RATIO))
 
 
-def get_expected_vram_windows(canonical_model: str) -> Optional[List[Tuple[int, int]]]:
+def matmul_probe_vram_mb(model: str | None) -> int | None:
+    """VRAM (MB) to size the all-cards work-proof from — registry-derived and floored to usable.
+
+    Normalizes the CUDA-reported name, takes the SMALLEST nominal size for a multi-variant model
+    (e.g. RTX 3060 8/12 GB -> 8192), then applies VRAM_FLOOR_RATIO (0.90) — the same floor
+    GpuVramPrecheck uses. NVML `.total` is physical VRAM minus vendor/ECC/driver-reserved regions,
+    observed up to ~6.7% below the marketing nominal (e.g. B200 reports 183359 on a 192 GB card,
+    L40S 46068 on 48 GB); sizing the matmul from the raw nominal would ask an honest B200/B300/L40S
+    to allocate past its usable VRAM and OOM (DAH-2671). The floor is registry-derived, NOT host
+    self-report, so a spoofing host still cannot shrink its own challenge. Returns None for unknown
+    models — the caller then skips rather than guessing. Keeps registry sizing in this one module.
+    """
+    canonical = normalize_gpu_model(model)
+    sizes = GPU_VRAM_SIZES_MB.get(canonical)
+    if not sizes:
+        return None
+    return round(min(sizes) * VRAM_FLOOR_RATIO)
+
+
+def get_expected_vram_windows(canonical_model: str) -> list[tuple[int, int]] | None:
     """Return the list of (vram_mb_min, vram_mb_max) windows for `canonical_model`.
 
     Windows are computed from the model's nominal VRAM size(s) via

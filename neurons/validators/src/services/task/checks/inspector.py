@@ -9,6 +9,7 @@ from services.inspector_validation_service import InspectorValidationResponse
 
 from core.config import settings
 
+from ..inspector_verdict import InspectorVerdict, build_verdict
 from ..messages import InspectorMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -50,11 +51,13 @@ class InspectorRentedCheck:
             "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
 
+        sensor_attested = _sensor_attested(ctx)
         result = await ctx.services.inspector.validate_rented_executor(
             ctx.services.shell,
             ctx.ssh,
             ctx.executor,
             ctx.default_extra,
+            sensor_attested=sensor_attested,
         )
 
         if result.error:
@@ -83,38 +86,56 @@ class InspectorRentedCheck:
 
         report = dict(result.report or {})
         findings = _findings(report)
-        warnings = _collector_start_warnings(report)
-        if findings:
-            what: dict[str, Any] = {
-                "findings": findings,
-                "summary": report.get("summary", {}),
-                "canary_ok": report.get("canary_ok"),
-            }
-            if warnings:
-                what["warnings"] = warnings
+        if findings is None:
+            # a report whose findings are not a list of objects is a broken sensor, not a
+            # provider caught in the act — it must not be recorded as a MALICIOUS finding
             event = render_message(
-                Msg.MALICIOUS_FINDINGS,
+                Msg.VALIDATION_ERROR,
                 ctx=ctx,
                 check_id=self.check_id,
-                what=what,
+                what={
+                    "error": "inspector report findings are not a list of objects",
+                    "findings_type": type(report.get("findings")).__name__,
+                    "findings_preview": repr(report.get("findings"))[:200],
+                },
                 extra=extra,
             )
             inspector_event = _build_inspector_event(
-                ctx, event, rented_pods, result, outcome="MALICIOUS", report=report
+                ctx, event, rented_pods, result, outcome="ERROR", report=report
             )
             return CheckResult(
                 passed=True,
                 event=event,
-                updates={
-                    "default_extra": extra,
-                    "state": replace(ctx.state, inspector_event=inspector_event),
-                },
+                updates={"default_extra": extra, "state": replace(ctx.state, inspector_event=inspector_event)},
+            )
+        warnings = _collector_start_warnings(report)
+        verdict = build_verdict(
+            report,
+            findings,
+            rented_pod_ids=[p.pod_id for p in rented_pods],
+            sensor_attested=sensor_attested,
+        )
+        if verdict.provider_origin:
+            return self._record_provider_origin(
+                ctx,
+                verdict=verdict,
+                report=report,
+                warnings=warnings,
+                rented_pods=rented_pods,
+                result=result,
+                extra=extra,
             )
 
         clean_what: dict[str, Any] = {
             "summary": report.get("summary", {}),
             "canary_ok": report.get("canary_ok"),
+            "verdict": verdict.as_payload().model_dump(),
         }
+        if verdict.platform_findings:
+            # every finding was one of our own execs seen from a host whose Tetragon lost the
+            # sshd ancestry — recorded, not malicious (the 8 Sep false positives); the findings
+            # themselves are in the inspector event's report
+            clean_what["platform_findings"] = len(verdict.platform_findings)
         if _canary_failed(report):
             outcome = "CANARY_FAILED"
             event = render_message(
@@ -148,6 +169,15 @@ class InspectorRentedCheck:
                 },
                 extra=extra,
             )
+        elif verdict.platform_findings:
+            outcome = "CLEAN"
+            event = render_message(
+                Msg.PLATFORM_ORIGIN_ONLY,
+                ctx=ctx,
+                check_id=self.check_id,
+                what=clean_what,
+                extra=extra,
+            )
         else:
             outcome = "CLEAN"
             event = render_message(
@@ -158,7 +188,54 @@ class InspectorRentedCheck:
                 extra=extra,
             )
         inspector_event = _build_inspector_event(
-            ctx, event, rented_pods, result, outcome=outcome, report=report
+            ctx, event, rented_pods, result, outcome=outcome, report=report, verdict=verdict
+        )
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={
+                "default_extra": extra,
+                "state": replace(ctx.state, inspector_event=inspector_event),
+            },
+        )
+
+    def _record_provider_origin(
+        self,
+        ctx: Context,
+        *,
+        verdict: InspectorVerdict,
+        report: dict[str, Any],
+        warnings: list[dict[str, Any]],
+        rented_pods: list[RentedPod],
+        result: InspectorValidationResponse,
+        extra: dict[str, Any],
+    ) -> CheckResult:
+        """A provider-origin verdict becomes the MALICIOUS event and the inspector event that
+        carries its evidence. It is a record only: the check passes, nothing reaches the score
+        and no renter or backend is asked to act."""
+        if verdict.affected_pod_ids:
+            impact = "Provider-origin access to a rented pod recorded; score unchanged"
+        else:
+            impact = "Provider-origin finding on a container that is not a rented pod recorded; score unchanged"
+        what: dict[str, Any] = {
+            "findings": verdict.provider_findings,
+            "platform_findings": len(verdict.platform_findings),
+            "verdict": verdict.as_payload().model_dump(),
+            "summary": report.get("summary", {}),
+            "canary_ok": report.get("canary_ok"),
+        }
+        if warnings:
+            what["warnings"] = warnings
+        event = render_message(
+            Msg.MALICIOUS_FINDINGS,
+            ctx=ctx,
+            check_id=self.check_id,
+            impact=impact,
+            what=what,
+            extra=extra,
+        )
+        inspector_event = _build_inspector_event(
+            ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
         )
         return CheckResult(
             passed=True,
@@ -178,6 +255,7 @@ def _build_inspector_event(
     *,
     outcome: str,
     report: dict[str, Any] | None = None,
+    verdict: InspectorVerdict | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "executor_id": ctx.executor.uuid,
@@ -197,8 +275,26 @@ def _build_inspector_event(
     else:
         payload["report"] = report
         payload["error"] = None
-        payload["context"] = result.diagnostics or {}
+        # `context` is the one free-form field InspectorEventRequest carries to the backend;
+        # the verdict rides there (evidence hashes, sensor state, affected pods) so a reader
+        # does not have to re-derive the classification.
+        payload["context"] = {
+            **(result.diagnostics or {}),
+            **({"verdict": verdict.as_payload().model_dump()} if verdict is not None else {}),
+        }
     return payload
+
+
+def _sensor_attested(ctx: Context) -> bool:
+    # The sensor (libinspector.so + Tetragon) ships inside the executor image. On a dstack CVM
+    # the image is part of the measured stack — but only when ENABLE_ATTESTATION_WHITELIST is on
+    # does the validator compare that stack against TDX_WHITELIST (attestation_service._verify_tdx);
+    # with the flag off (prod today) a passed attestation says the quote is genuine, not that the
+    # image is ours, so the report is not from a measured binary and the shell checksum stays.
+    # Elsewhere the checksum was read through the provider's own shell and proves nothing — say
+    # so in the verdict.
+    return bool(ctx.tdx_attestation_passed) and settings.ENABLE_ATTESTATION_WHITELIST
+
 
 def _canary_failed(report: dict[str, Any]) -> bool:
     return report.get("canary_ok") is False
@@ -229,8 +325,11 @@ def _collector_start_warnings(report: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _findings(report: dict[str, Any]) -> list[dict[str, Any]]:
-    findings = report.get("findings") or []
-    if not isinstance(findings, list):
-        return [{"value": findings}]
-    return [item if isinstance(item, dict) else {"value": item} for item in findings]
+def _findings(report: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The report's findings as a list of objects, or None when the report is malformed."""
+    findings = report.get("findings")
+    if findings is None:
+        findings = []
+    if not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings):
+        return None
+    return findings

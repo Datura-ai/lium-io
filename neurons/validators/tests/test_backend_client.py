@@ -8,7 +8,11 @@ import pytest
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
 
-from protocol.vc_protocol.compute_requests import PodRentalActiveResponse, RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+    RentedExecutorsResponse,
+)
 
 
 class SampleResponse(BaseModel):
@@ -84,6 +88,35 @@ async def test_get_pod_rental_active_uses_internal_endpoint(client):
     mock_get.assert_awaited_once_with(
         "/internal/pods/pod-1/rental-active",
         PodRentalActiveResponse,
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_filler_run_active_flags_missing_container(client):
+    # container_missing=True must ride on the query string — the backend's zombie-run
+    # reconciliation (DAH-2471) is fed by exactly this flag; a plain re-check sends none.
+    expected = MagicMock()
+
+    with patch.object(client, "get", AsyncMock(return_value=expected)) as mock_get:
+        result = await client.get_filler_run_active("run-1", container_missing=True)
+
+    assert result is expected
+    mock_get.assert_awaited_once_with(
+        "/internal/filler-runs/run-1/active?container_missing=true",
+        FillerRunActiveResponse,
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_filler_run_active_without_flag_keeps_plain_path(client):
+    with patch.object(client, "get", AsyncMock(return_value=None)) as mock_get:
+        await client.get_filler_run_active("run-1")
+
+    mock_get.assert_awaited_once_with(
+        "/internal/filler-runs/run-1/active",
+        FillerRunActiveResponse,
         timeout=10,
     )
 
@@ -419,3 +452,22 @@ async def test_post_generic_client_error_is_not_retried(reset_session, client):
 
     assert result is None
     assert mock_session.request.call_count == 1
+
+
+def test_get_filler_containers_prefers_list_field_and_falls_back_to_legacy():
+    # DAH-2465 additive protocol: the list field wins when present; an older backend that only sends
+    # the single legacy map still yields its one filler (so deploy order never breaks protection).
+    new_backend = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"exec-legacy-too": "filler_ignored"},
+        all_filler_containers_by_executor={"exec-split": ["filler_a", "filler_b"]},
+    )
+    assert new_backend.get_filler_containers("exec-split") == ["filler_a", "filler_b"]
+
+    old_backend = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"exec-single": "filler_only"},
+    )
+    assert old_backend.get_filler_containers("exec-single") == ["filler_only"]
+    assert old_backend.get_filler_container("exec-single") == "filler_only"
+    assert old_backend.get_filler_containers("exec-unknown") == []

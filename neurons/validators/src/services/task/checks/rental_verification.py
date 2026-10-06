@@ -1,29 +1,96 @@
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from core.docker_utils import (
-    ContainerDeathKind,
+    ContainerDeathDiagnostics,
     DockerCommand,
-    classify_container_death,
     collect_container_death_diagnostics,
-    container_uptime_seconds,
 )
 from protocol.vc_protocol.compute_requests import (
+    CPU_QUOTA_EXCEEDS_HOST_REASON,
+    GPU_RUNTIME_DEVICE_FAULT_REASON,
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     FillerRunActiveResponse,
 )
 
-from ...const import (
-    FILLER_CONTAINER_PREFIX,
-    FILLER_KILL_STRIKE_TTL_SECONDS,
-    FILLER_LIVENESS_GRACE_MINUTES,
-)
-from ..messages import MessageTemplate, RentalVerificationMessages as Msg, render_message
+from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
+from ..messages import MessageTemplate, render_message
+from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
+from .cpu_truth import advertised_cpu_count
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GpuRuntimeQuarantine:
+    message: MessageTemplate
+    score_warning: str
+
+
+# Backend verdicts that quarantine the host: the GPU runtime is broken in a way no rental survives,
+# so the score is zeroed and the verified job cleared. The host returns on the next clean check.
+_GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
+    GPU_RUNTIME_NVML_MISMATCH_REASON: GpuRuntimeQuarantine(
+        message=Msg.GPU_RUNTIME_NVML_MISMATCH,
+        score_warning="GPU runtime NVML driver/library mismatch",
+    ),
+    GPU_RUNTIME_DEVICE_FAULT_REASON: GpuRuntimeQuarantine(
+        message=Msg.GPU_RUNTIME_DEVICE_FAULT,
+        score_warning="GPU is not addressable and needs a host reset",
+    ),
+}
+
+# How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
+# bundle but the pipeline emits a single event, so the node must be judged by its worst container:
+# a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
+# unlisted sorts as healthy.
+# Every state `docker inspect --format '{{json .State}}'` can report, mapped to what it proves about
+# the filler. Listed exhaustively on purpose: a state that fell through to a default is how this
+# check mislabeled deaths before (DAH-2730).
+# "removing" is the offence itself caught a moment early — a removal already in flight (observed in
+# prod on the ISSUE-050 class). "dead" means docker failed to remove the container, so it is not
+# proof the host succeeded either — it stays unproven rather than punished.
+_DOCKER_STATUS_REMOVING = "removing"
+_DOCKER_STATUS_EXITED = "exited"
+_DOCKER_STATES_PROVING_NO_DEATH = frozenset({"running", "created", "restarting", "paused", "dead"})
+
+# Docker reports 128 + signal number when something outside the container terminated its PID 1:
+# `docker stop` sends SIGTERM (143), `docker kill` sends SIGKILL (137). A job that died on its own
+# exits with the code its own process chose, never with these.
+_EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL = frozenset({137, 143})
+
+
+def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics) -> bool:
+    """Whether someone on the host terminated the filler rather than the job dying by itself.
+
+    Fillers run with `restart: unless-stopped`, so anything that merely killed the process would be
+    back up by the next probe; a container still sitting in `exited` after an external signal was
+    stopped on purpose. An out-of-memory kill carries the same exit code but is the kernel
+    reclaiming memory, not a choice the host made, so it is excluded.
+    """
+    if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL:
+        return False
+    return not diagnostics.oom_killed
+
+_FILLER_VERDICT_SEVERITY: dict[str, int] = {
+    Msg.FILLER_KILLED.reason: 3,
+    # Removed or stopped, the node took the job down either way — same rank, same penalty.
+    Msg.FILLER_STOPPED_BY_HOST.reason: 3,
+    Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
+    Msg.FILLER_STATE_UNKNOWN.reason: 1,
+    # DAH-2730: ranks with STATE_UNKNOWN — the node lost its job either way, and neither outcome
+    # is an offence.
+    Msg.FILLER_CONTAINER_EXITED.reason: 1,
+    Msg.FILLER_VERIFIED.reason: 0,
+}
 
 
 class RentalVerificationCheck:
@@ -63,8 +130,46 @@ class RentalVerificationCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         has_customer_rental = bool(rented_executor and rented_executor.pods)
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
-        if filler_container and not has_customer_rental:
+        # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
+        # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
+        # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
+        filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
+        # `docker run` leaves no RUNNING run and no container, so the liveness probe below never
+        # sees it and the node collects unrented incentive while never running a default job. The
+        # backend counts those create-time kills per executor and lists the ones past the streak
+        # threshold. Judged BEFORE the liveness probe on purpose: a GPU-split node runs one filler
+        # per bundle, and one surviving bundle would otherwise return a clean verdict for a host
+        # that destroys every other bundle it is given.
+        create_killed: bool = bool(
+            rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids
+        )
+        if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
+            if settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED:
+                event = render_message(
+                    Msg.FILLER_KILLED_AT_CREATE,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"verified": False, "executor_uuid": ctx.executor.uuid, "enforced": True},
+                )
+                return CheckResult(passed=False, event=event, updates={})
+            # Shadow: observe and fall through to the normal verification. Returning a pass here
+            # would hand the node a free pass — it skips the backend health check the node would
+            # otherwise have to survive, so shadow mode would be an upgrade, not an observation.
+            # A check owns one event and the fall-through path writes it, so the shadow verdict
+            # rides a log line carrying the same reason code the enforced event uses.
+            logger.warning(
+                _m(
+                    "Lium default job is destroyed during create (shadow)",
+                    extra=get_extra_info({
+                        "reason_code": Msg.FILLER_KILLED_AT_CREATE.reason,
+                        "executor_uuid": ctx.executor.uuid,
+                        "enforced": False,
+                    }),
+                )
+            )
+
+        if filler_containers and not has_customer_rental:
             # ISSUE-050: the backend's word alone is not proof the filler is alive — some hosts
             # remove Lium filler containers while the run stays RUNNING and keep earning
             # unrented incentive. Verify the container on the host, mirroring the customer-pod
@@ -79,13 +184,13 @@ class RentalVerificationCheck:
                     what={
                         "skipped": True,
                         "reason": "active filler runtime",
-                        "filler_container": filler_container,
+                        "filler_containers": filler_containers,
                     },
                 )
                 return CheckResult(passed=True, event=event, updates={})
 
-            return await self._verify_filler_alive(
-                ctx, filler_container, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
+            return await self._verify_every_filler_alive(
+                ctx, filler_containers, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
             )
 
         # Get required info from context
@@ -118,6 +223,24 @@ class RentalVerificationCheck:
         # Use the first verified port
         container_port = verified_ports[0]
 
+        # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
+        # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
+        # customer's rental (DAH-2614). Sent from the scrape, not read from the backend's stored
+        # specs: those lag a cycle and do not exist at all on an executor's first pass.
+        gpu_details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
+        gpu_uuids = [detail["uuid"] for detail in gpu_details if isinstance(detail, dict) and detail.get("uuid")]
+
+        # DAH-2671 item 2b: hand the backend the advertised core count AS-IS so the probe is created
+        # with `--cpus=<advertised>`. The backend classifier compares it against the daemon's own N
+        # from the refusal message and only classifies CPU_QUOTA_EXCEEDS_HOST when
+        # advertised > 2*N + 4 (honest max divergence is 2x — SMT off; observed spoofs 4-8x), so an
+        # honest SMT-off host falls into the backend's retry-without-flag path. No host-read capping:
+        # any source read from the judged host (sysfs/procfs) is spoofable, and a cap computed from
+        # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
+        # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
+        # rent skips `--cpus` there too) and when the count is unreadable.
+        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
@@ -129,6 +252,8 @@ class RentalVerificationCheck:
                 container_port=container_port,
                 executor_id=executor.uuid,
                 rental_in_progress=has_customer_rental,
+                gpu_uuids=gpu_uuids,
+                cpu_count=cpu_count,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -165,11 +290,14 @@ class RentalVerificationCheck:
                     event=event,
                     updates={},
                 )
-            elif response.reason_code == GPU_RUNTIME_NVML_MISMATCH_REASON:
+            elif response.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON:
+                return self._cpu_quota_verdict(ctx, response)
+            elif response.reason_code in _GPU_RUNTIME_QUARANTINE:
+                quarantine = _GPU_RUNTIME_QUARANTINE[response.reason_code]
                 details = response.details or {}
                 stderr = details.get("docker_stderr") or response.error
                 event = render_message(
-                    Msg.GPU_RUNTIME_NVML_MISMATCH,
+                    quarantine.message,
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
@@ -188,7 +316,7 @@ class RentalVerificationCheck:
                     updates={
                         "score": 0.0,
                         "job_score": 0.0,
-                        "score_warning": "GPU runtime NVML driver/library mismatch",
+                        "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
                     },
                 )
@@ -235,6 +363,72 @@ class RentalVerificationCheck:
                 ctx.ssh, ctx.executor.uuid
             )
 
+    def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
+        """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
+
+        Shadow (enforcement off) logs the verdict as a warning and keeps passed=True so scoring is
+        unchanged; enforcement zeroes the score. DAH-2742: unlike the GPU runtime quarantine, the
+        previous verification is kept — a host that really overstates its cores fails every cycle
+        and the stale-executor sweep deactivates it without an instant flip.
+        """
+        enforce = settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED
+        details = response.details or {}
+        stderr = details.get("docker_stderr") or response.error
+        event = render_message(
+            Msg.CPU_QUOTA_EXCEEDS_HOST,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=None if enforce else "warning",
+            impact=None if enforce else "Shadow observation only: score was NOT changed",
+            what={
+                "verified": False,
+                "executor_uuid": ctx.executor.uuid,
+                "source": "rental_verification",
+                "reason_code": response.reason_code,
+                "advertised_cpu_count": advertised_cpu_count(ctx),
+                "stderr": stderr,
+                "enforced": enforce,
+                "details": details,
+            },
+        )
+        updates = (
+            {
+                "score": 0.0,
+                "job_score": 0.0,
+                "score_warning": "Advertised CPU cores exceed the host's physical cores",
+            }
+            if enforce
+            else {}
+        )
+        return CheckResult(passed=not enforce, event=event, updates=updates)
+
+    async def _verify_every_filler_alive(
+        self, ctx: Context, filler_containers: list[str], *, enforce: bool
+    ) -> CheckResult:
+        """Verify each of the node's filler containers, one per GPU bundle (DAH-2465).
+
+        Every container is probed independently, so a removed bundle is reported to the backend
+        (container_missing=true, feeding the DAH-2471 reconciliation) even while its siblings run
+        fine. A check may return only one result, so the node's verdict is its WORST container by
+        _FILLER_VERDICT_SEVERITY. Picking positionally would let a healthy or unreachable sibling
+        hide a kill: in shadow every verdict passes, so a killed non-last bundle would emit no
+        FILLER_KILLED at all, and under enforcement an early SSH failure would decide the node
+        while a real kill behind it went unlogged. Each container's reason code is also listed on
+        the returned event, so one log line still covers the whole node.
+        """
+        verdicts: list[tuple[str, CheckResult]] = [
+            (filler_container, await self._verify_filler_alive(ctx, filler_container, enforce=enforce))
+            for filler_container in filler_containers
+        ]
+        decisive: CheckResult = max(
+            verdicts, key=lambda verdict: _FILLER_VERDICT_SEVERITY.get(verdict[1].event.reason_code, 0)
+        )[1]
+        decisive.event.what_we_saw["checked_containers"] = [
+            {"filler_container": filler_container, "reason_code": verdict.event.reason_code}
+            for filler_container, verdict in verdicts
+        ]
+        return decisive
+
     async def _verify_filler_alive(
         self, ctx: Context, filler_container: str, *, enforce: bool
     ) -> CheckResult:
@@ -249,24 +443,25 @@ class RentalVerificationCheck:
                 DockerCommand.ps_running(filler_container)
             )
         except (asyncssh.Error, OSError) as exc:
-            # SSH transport died mid-cycle: a lost connection is not evidence the owner killed the
-            # filler, so never penalize it even under enforcement — fail open. A real kill still
-            # surfaces as REMOVED/STOPPED on a later cycle once the connection is back.
-            return self._filler_state_unknown_result(
-                ctx,
-                filler_container,
-                enforce=enforce,
-                reason="ssh transport unreachable",
-                details={"transport_error": repr(exc)},
-                template=Msg.FILLER_TRANSPORT_UNREACHABLE,
+            # SSH transport died mid-cycle: filler state is unknown, do not re-check.
+            event = render_message(
+                Msg.FILLER_TRANSPORT_UNREACHABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "filler_container": filler_container,
+                    "executor_uuid": ctx.executor.uuid,
+                    "transport_error": repr(exc),
+                    "enforced": enforce,
+                },
             )
+            return CheckResult(passed=not enforce, event=event, updates={})
 
         if ps_result.exit_status != 0:
             # docker daemon error (e.g. restarting) — indistinguishable from a kill, so fail open.
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
-                enforce=enforce,
                 reason="docker ps failed on host",
                 details={"exit_status": ps_result.exit_status},
             )
@@ -289,13 +484,17 @@ class RentalVerificationCheck:
         # still starting mid-cycle) — re-check the live run state before penalizing, like the pod
         # flow does with get_pod_rental_active.
         filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
+        # container_missing carries the probe's observation — no RUNNING container by that name —
+        # which is what the backend needs to close zombie RUNNING runs (DAH-2471). It is NOT the
+        # removal verdict: whether the host removed it or it exited on its own is decided below,
+        # from the death diagnostics (DAH-2730).
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
-            filler_run_id
+            filler_run_id, container_missing=True
         )
 
         if filler_run is None:
             return self._filler_state_unknown_result(
-                ctx, filler_container, enforce=enforce, reason="filler-run re-check API unavailable"
+                ctx, filler_container, reason="filler-run re-check API unavailable"
             )
 
         if not filler_run.active:
@@ -305,7 +504,6 @@ class RentalVerificationCheck:
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
-                enforce=enforce,
                 reason="filler run is not in RUNNING state",
                 details={"filler_run_status": filler_run.status},
             )
@@ -317,7 +515,6 @@ class RentalVerificationCheck:
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
-                enforce=enforce,
                 reason="filler run within startup grace window",
                 details={"run_age_seconds": run_age.total_seconds() if run_age else None},
             )
@@ -339,113 +536,69 @@ class RentalVerificationCheck:
         run_age: timedelta,
         enforce: bool,
     ) -> CheckResult:
-        """Classify WHY the container is dead; only a repeated targeted kill may cost incentive.
+        """Judge why the container is not running, and emit FILLER_KILLED only for a removal.
 
-        REMOVED (container gone) and STOPPED (SIGTERM/SIGKILL) are both "container missing"
-        with no reliable one-shot kill signal, so both are strike-gated: the first incident
-        per executor is a logged strike and only repeat incidents within the strike window are
-        punished. Prod shadow proved this necessary — every removed case was a single
-        unreconciled zombie run (backend filler_run stuck RUNNING after a host reboot or a
-        watchtower executor recreation), not a fresh kill; punishing REMOVED outright would
-        have hit honest providers. Strikes are only counted under enforcement, so an executor
-        always gets its grace incident once enforcement begins, never a strike carried over
-        from the shadow period. HOST_REBOOT and every self-death kind (self-crash, OOM, never
-        started, clean exit, unknown) are self-heal territory and never punished.
+        DAH-2730: `docker ps` lists RUNNING containers only, so a filler that exited on its own
+        looks exactly like one the host removed. The death diagnostics already know the difference
+        — a removed container has no state at all — and only a removal is the offence this check
+        withholds incentive for. An unprovable state (SSH lost, diagnostics failed) is never a
+        penalty.
         """
-        try:
-            diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
-            death_fields: dict[str, object] = diagnostics.to_log_fields()
-            death_kind = classify_container_death(diagnostics)
-            uptime_seconds = container_uptime_seconds(diagnostics.started_at, diagnostics.finished_at)
-        except Exception as exc:
-            death_fields = {"diagnostics_capture_error": repr(exc)}
-            death_kind = ContainerDeathKind.UNKNOWN
-            uptime_seconds = None
-
-        kill_timing: str | None = None
-        if uptime_seconds is not None:
-            grace_seconds = FILLER_LIVENESS_GRACE_MINUTES * 60
-            kill_timing = "at_start" if uptime_seconds < grace_seconds else "after_running"
-
-        common_what: dict[str, object] = {
+        # collect_container_death_diagnostics folds every failure into capture_error and never
+        # raises (cancellation excepted), so an unreadable state arrives as empty fields below.
+        diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
+        what_we_saw: dict[str, object] = {
+            "verified": False,
             "filler_container": filler_container,
             "executor_uuid": ctx.executor.uuid,
             "filler_run_status": filler_run_status,
             "run_age_seconds": run_age.total_seconds(),
-            "death_kind": death_kind.value,
-            "container_uptime_seconds": uptime_seconds,
-            "kill_timing": kill_timing,
-            "enforced": enforce,
-            **death_fields,
+            **diagnostics.to_log_fields(),
         }
 
-        if death_kind in (ContainerDeathKind.REMOVED, ContainerDeathKind.STOPPED):
-            return await self._ambiguous_stop_result(
-                ctx, filler_container, enforce=enforce, what=common_what
+        container_was_removed = (
+            diagnostics.container_missing or diagnostics.status == _DOCKER_STATUS_REMOVING
+        )
+        if not container_was_removed:
+            if diagnostics.status != _DOCKER_STATUS_EXITED:
+                # Anything but a recorded exit is unproven: the container may be running again
+                # (fillers carry `restart: unless-stopped`, so docker can bring one back between
+                # the ps probe and this inspect), mid-transition, or unreadable.
+                return self._filler_state_unknown_result(
+                    ctx,
+                    filler_container,
+                    reason=(
+                        f"container state {diagnostics.status} is not a death"
+                        if diagnostics.status in _DOCKER_STATES_PROVING_NO_DEATH
+                        else "container state could not be read"
+                    ),
+                    details=diagnostics.to_log_fields(),
+                )
+            if _was_deliberately_stopped_on_the_host(diagnostics):
+                event = render_message(
+                    Msg.FILLER_STOPPED_BY_HOST,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    severity=None if enforce else "warning",
+                    impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
+                    what={**what_we_saw, "enforced": enforce},
+                )
+                return CheckResult(passed=not enforce, event=event, updates={})
+            event = render_message(
+                Msg.FILLER_CONTAINER_EXITED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what_we_saw, "enforced": False},
             )
+            return CheckResult(passed=True, event=event, updates={})
 
-        # HOST_REBOOT / SELF_CRASHED / OOM_KILLED / NEVER_STARTED / CLEAN_EXIT / UNKNOWN:
-        # not the owner targeting the filler.
-        return self._passthrough_result(ctx, Msg.FILLER_CRASHED, common_what)
-
-    def _passthrough_result(
-        self, ctx: Context, template: MessageTemplate, what: dict[str, object]
-    ) -> CheckResult:
-        """Emit a non-penalizing verdict: the event is logged, incentive is untouched."""
-        event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
-        return CheckResult(passed=True, event=event, updates={})
-
-    async def _ambiguous_stop_result(
-        self, ctx: Context, filler_container: str, *, enforce: bool, what: dict[str, object]
-    ) -> CheckResult:
-        """A SIGTERM/SIGKILL stop: count a strike (enforcement only) and punish past threshold.
-
-        Strikes are never counted in shadow — otherwise the first ENFORCED incident could inherit
-        a shadow-period strike and skip the grace incident. In shadow this is always a no-penalty
-        suspected event.
-        """
-        if not enforce:
-            what["kill_strikes"] = None
-            return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
-
-        strikes = await self._register_kill_strike(ctx, filler_container)
-        what["kill_strikes"] = strikes
-        # strikes is None => the strike store is unreachable (Redis down). A lost store is not
-        # evidence of a repeat kill, so fail open like every other unknown in this check rather
-        # than punish a provider for our own outage — a real repeat killer resurfaces as REMOVED
-        # or another stop once Redis is back.
-        if strikes is not None and strikes >= settings.FILLER_KILL_STRIKE_THRESHOLD:
-            return self._external_kill_result(ctx, enforce=enforce, what=what)
-        return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
-
-    async def _register_kill_strike(self, ctx: Context, filler_container: str) -> int | None:
-        """One strike per filler run (deduped in Redis); None when Redis is unavailable.
-
-        None means the strike store is unreachable, and the caller fails open (no penalty) —
-        a provider is never punished because our own Redis was down.
-        """
-        filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
-        redis_service = ctx.services.redis
-        if redis_service is None:
-            return None
-        try:
-            return await redis_service.register_filler_kill_strike(
-                ctx.executor.uuid, filler_run_id, FILLER_KILL_STRIKE_TTL_SECONDS
-            )
-        except Exception:
-            return None
-
-    def _external_kill_result(
-        self, ctx: Context, *, enforce: bool, what: dict[str, object]
-    ) -> CheckResult:
-        # `enforced` already rides in via `what` (common_what); only `verified` is added here.
         event = render_message(
             Msg.FILLER_KILLED,
             ctx=ctx,
             check_id=self.check_id,
             severity=None if enforce else "warning",
             impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
-            what={"verified": False, **what},
+            what={**what_we_saw, "enforced": enforce},
         )
         return CheckResult(passed=not enforce, event=event, updates={})
 
@@ -454,20 +607,17 @@ class RentalVerificationCheck:
         ctx: Context,
         filler_container: str,
         *,
-        enforce: bool,
         reason: str,
         details: dict[str, object] | None = None,
-        template: MessageTemplate = Msg.FILLER_STATE_UNKNOWN,
     ) -> CheckResult:
         event = render_message(
-            template,
+            Msg.FILLER_STATE_UNKNOWN,
             ctx=ctx,
             check_id=self.check_id,
             what={
                 "filler_container": filler_container,
                 "executor_uuid": ctx.executor.uuid,
                 "reason": reason,
-                "enforced": enforce,
                 **(details or {}),
             },
         )

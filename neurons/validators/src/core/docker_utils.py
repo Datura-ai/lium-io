@@ -2,8 +2,6 @@ import asyncio
 import json
 import shlex
 from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
 
 import asyncssh
 
@@ -50,6 +48,42 @@ class DockerCommand:
         return f"/usr/bin/docker rm -fv {name}"
 
     @staticmethod
+    def dind_diagnostics(name: str, lines: int = 40) -> str:
+        """What a DinD container whose sshd never answered has to say (DAH-2856).
+
+        The image's entrypoint waits for the inner dockerd before it runs the validator's
+        `service ssh start`; when that dockerd cannot start, sshd never does. supervisord in the
+        image writes dockerd's stderr to /var/log/dockerd.err.log, not to the container log, so
+        both are read: the container log first, then that file. Exit 0 always; the text is data.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"/usr/bin/docker logs --tail {lines} {quoted} 2>&1; "
+            f"/usr/bin/docker exec {quoted} tail -n {lines} /var/log/dockerd.err.log 2>&1; true"
+        )
+
+    @staticmethod
+    def kill_container_processes(name: str) -> str:
+        """SIGKILL a container's init and its containerd shim directly (DAH-2991).
+
+        For a container dockerd cannot kill ("tried to kill container, but did not receive an exit
+        event": the process is wedged, typically in uninterruptible I/O on a dead mount), `docker rm -f`
+        fails forever and the container keeps its published ports. The executor runs `pid: host` and
+        privileged, so the host pids are visible: killing the shim makes containerd report the task
+        as exited and dockerd then lets `docker rm -f` through. Prints what was killed; exit 0 always.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"pid=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {quoted} 2>/dev/null); "
+            "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ]; then "
+            "shim=$(awk '/^PPid:/{print $2}' /proc/$pid/status 2>/dev/null); "
+            "kill -9 $pid 2>/dev/null; "
+            "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
+            "then kill -9 $shim 2>/dev/null; else shim=; fi; "
+            "sleep 3; echo \"killed pid=$pid shim=${shim:-none}\"; fi; true"
+        )
+
+    @staticmethod
     def ps_filter(*name_patterns: str) -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
@@ -77,6 +111,15 @@ class DockerCommand:
         return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
 
     @staticmethod
+    def volume_remove_strict(volume_name: str) -> str:
+        """Build docker volume rm for ONE volume that reports its own exit status and stderr.
+
+        DAH-3436 (review): `volume_remove` masks every failure with `|| true`; the rental probe's
+        teardown has to know whether its volume is gone ("No such volume" counts as gone).
+        """
+        return f"/usr/bin/docker volume rm {shlex.quote(volume_name)}"
+
+    @staticmethod
     def volume_ls_dangling() -> str:
         """Build docker volume ls command listing dangling volume names."""
         return "/usr/bin/docker volume ls -qf dangling=true"
@@ -97,8 +140,21 @@ class DockerCommand:
 
     @staticmethod
     def exec_command(container_name: str, command: str) -> str:
-        """Build docker exec command."""
-        return f"/usr/bin/docker exec -i {container_name} sh -c '{command}'"
+        """Build docker exec command.
+
+        `-u 0` because the exec would otherwise inherit the image's USER and lose
+        access to the root-owned paths we write to. Numeric, so it does not need a
+        root entry in the image's /etc/passwd (DAH-2534).
+
+        The result runs through the executor host's root shell over SSH, so both
+        values are quoted: the container name stays one argv token and the command
+        reaches the container's `sh -c` verbatim (a single quote inside it cannot
+        end the quoting and continue on the host).
+        """
+        return (
+            f"/usr/bin/docker exec -u 0 -i {shlex.quote(container_name)} "
+            f"sh -c {shlex.quote(command)}"
+        )
 
 
 @dataclass
@@ -121,6 +177,9 @@ class ContainerDeathDiagnostics:
     logs_tail: str | None = None
     host_context: dict[str, str] | None = None
     capture_error: str | None = None
+    # DAH-2703: the container is not on the host at all any more. Distinguishes a container that
+    # something removed from one that merely died — only the former accuses the host.
+    container_missing: bool = False
 
     def to_log_fields(self) -> dict[str, object]:
         """Flatten into the shared Loki field shape used at both call sites."""
@@ -134,106 +193,60 @@ class ContainerDeathDiagnostics:
             "container_logs_tail": self.logs_tail,
             "container_host_context": self.host_context,
             "diagnostics_capture_error": self.capture_error,
+            "container_missing": self.container_missing,
         }
 
 
-class ContainerDeathKind(str, Enum):
-    """Why a dead filler container died — decides whether the provider is punishable.
+ALPINE_HELPER_IMAGE = "docker.io/library/alpine:3.19"
 
-    Only REMOVED and STOPPED are external kills (a container cannot rm or SIGTERM itself
-    from outside its own process tree); everything else is the filler's or the host's own
-    failure and belongs to self-heal (DAH-2419), never to incentive withholding.
+
+async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path: str) -> int:
+    """Free bytes on the filesystem holding `host_path`, measured THROUGH the docker daemon.
+
+    Three facts make this non-obvious enough to keep in one place. The validator's SSH session lands
+    inside the miner's executor container, so a host path like the docker data root does not exist
+    there and a plain df would measure the wrong filesystem — hence the bind-mounted helper container.
+    Busybox df has no `--output`, so the request is POSIX `-P`, whose contract is one unwrapped line
+    per filesystem. Available is then column 4 of the data line.
+
+    Raises on anything unexpected; callers decide whether that is fatal.
     """
-
-    REMOVED = "removed"  # container gone entirely — external `docker rm`
-    STOPPED = "stopped"  # exited by SIGKILL/SIGTERM (137/143), not OOM — external stop
-    HOST_REBOOT = "host_reboot"  # SIGTERM that coincided with a host reboot / executor restart
-    SELF_CRASHED = "self_crashed"  # nonzero exit other than the kill signals
-    OOM_KILLED = "oom_killed"  # kernel OOM kill (reports 137 + OOMKilled=true)
-    NEVER_STARTED = "never_started"  # created but never ran, or start failed
-    CLEAN_EXIT = "clean_exit"  # exit 0
-    UNKNOWN = "unknown"  # diagnostics incomplete — fail open
+    result = await ssh_client.run(df_command(shlex.quote(host_path)))
+    if getattr(result, "exit_status", 0) != 0:
+        raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
+    return parse_df_available_bytes(result.stdout or "")
 
 
-_ZERO_DOCKER_TIMESTAMP_PREFIX = "0001-01-01"
-_KILL_SIGNAL_EXIT_CODES = (137, 143)  # 128+SIGKILL, 128+SIGTERM
-_REMOVED_MARKERS = ("no such object", "no such container")  # docker casing varies; match lowercased
-# A reboot SIGTERMs every container at shutdown and brings the executor stack back up on boot, so
-# the executor's StartedAt lands at or shortly AFTER the filler's death. The restart must bracket
-# the death to count as collateral: up to this long after (slow boot), with only a small skew
-# tolerance before (clocks). A filler-targeted `docker stop` leaves the executor started hours/days
-# earlier (far-negative delta); an executor that restarts long after the kill (far-positive delta)
-# does not excuse a kill that already happened.
-_HOST_RESTART_WINDOW_SECONDS = 600
-_HOST_RESTART_CLOCK_SKEW_SECONDS = 120
+def df_command(host_path_shell_word: str) -> str:
+    """The helper-container df invocation `df_available_bytes` runs; shared with the volume host
+    probe so both measure free disk the same way. `host_path_shell_word` is already a shell word
+    (a quoted path, or a variable reference such as `"$root"`)."""
+    return (
+        f"/usr/bin/docker run --rm -v {host_path_shell_word}:/hostfs:ro "
+        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
+    )
 
 
-def _never_started(diagnostics: ContainerDeathDiagnostics) -> bool:
-    if diagnostics.status == "created":
-        return True
-    started = diagnostics.started_at or ""
-    return started.startswith(_ZERO_DOCKER_TIMESTAMP_PREFIX) if started else False
+def parse_df_available_bytes(stdout: str) -> int:
+    """Column 4 of the data line of a POSIX `df -P -B1` output; raises when the shape is off."""
+    lines = stdout.strip().splitlines()
+    if len(lines) < 2:
+        raise Exception(f"Unexpected df output: {stdout!r}")
+    columns = lines[1].split()
+    if len(columns) < 4 or not columns[3].isdigit():
+        raise Exception(f"Unexpected df output: {stdout!r}")
+    return int(columns[3])
 
 
-def _stop_coincided_with_host_restart(diagnostics: ContainerDeathDiagnostics) -> bool:
-    """True when the executor stack restarted around the filler's death (reboot/compose restart).
-
-    Uses the executor container's start time (a UTC docker timestamp, same clock as FinishedAt) to
-    avoid the timezone ambiguity of `uptime -s`. A filler-targeted `docker stop` leaves the executor
-    stack untouched, so its start time stays hours/days before the death.
-    """
-    context = diagnostics.host_context or {}
-    executor_started = _parse_docker_timestamp(context.get("executor_container_started_at"))
-    finished = _parse_docker_timestamp(diagnostics.finished_at)
-    if executor_started is None or finished is None:
-        return False
-    delta_seconds = (executor_started - finished).total_seconds()
-    return -_HOST_RESTART_CLOCK_SKEW_SECONDS <= delta_seconds <= _HOST_RESTART_WINDOW_SECONDS
+# Docker's two ways of saying the container is not on this host any more. Kept separate from
+# services.docker_service._is_missing_docker_container_error, which reads an exception and matches
+# case-sensitively; this one reads `docker inspect` stderr, which says "No such object".
+_MISSING_CONTAINER_MARKERS = ("no such object", "no such container")
 
 
-def classify_container_death(diagnostics: ContainerDeathDiagnostics) -> ContainerDeathKind:
-    # Match the "no such object/container" marker only in OUR inspect error, never in the
-    # container's own logs_tail: a genuinely removed container fails inspect and lands the
-    # marker in capture_error, while a still-existing stopped container whose workload merely
-    # printed that string would otherwise be misread as removed and punished outright.
-    capture_error = (diagnostics.capture_error or "").lower()
-    if any(marker in capture_error for marker in _REMOVED_MARKERS):
-        return ContainerDeathKind.REMOVED
-    if diagnostics.oom_killed:
-        return ContainerDeathKind.OOM_KILLED
-    if _never_started(diagnostics):
-        return ContainerDeathKind.NEVER_STARTED
-    if diagnostics.exit_code in _KILL_SIGNAL_EXIT_CODES:
-        if _stop_coincided_with_host_restart(diagnostics):
-            return ContainerDeathKind.HOST_REBOOT
-        return ContainerDeathKind.STOPPED
-    if diagnostics.exit_code == 0 and diagnostics.status is not None:
-        return ContainerDeathKind.CLEAN_EXIT
-    if isinstance(diagnostics.exit_code, int) and diagnostics.exit_code != 0:
-        return ContainerDeathKind.SELF_CRASHED
-    return ContainerDeathKind.UNKNOWN
-
-
-def _parse_docker_timestamp(value: str | None) -> datetime | None:
-    if not value or value.startswith(_ZERO_DOCKER_TIMESTAMP_PREFIX):
-        return None
-    # Docker prints RFC3339 with nanoseconds; fromisoformat takes at most microseconds.
-    trimmed = value.rstrip("Z")
-    if "." in trimmed:
-        seconds_part, fraction = trimmed.split(".", 1)
-        trimmed = f"{seconds_part}.{fraction[:6]}"
-    try:
-        return datetime.fromisoformat(trimmed)
-    except ValueError:
-        return None
-
-
-def container_uptime_seconds(started_at: str | None, finished_at: str | None) -> float | None:
-    started = _parse_docker_timestamp(started_at)
-    finished = _parse_docker_timestamp(finished_at)
-    if started is None or finished is None:
-        return None
-    return (finished - started).total_seconds()
+def _reports_missing_container(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _MISSING_CONTAINER_MARKERS)
 
 
 async def collect_container_death_diagnostics(
@@ -270,6 +283,7 @@ async def collect_container_death_diagnostics(
                 capture_errors.append(f"inspect: non-object state JSON: {parsed_state!r}")
         else:
             stderr = (getattr(inspect_result, "stderr", "") or "").strip()
+            diagnostics.container_missing = _reports_missing_container(stderr)
             capture_errors.append(f"inspect: {stderr or 'empty stdout'}")
     except asyncio.CancelledError:
         raise
