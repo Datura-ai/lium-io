@@ -4,16 +4,26 @@ pong timeout long enough for the keepalive to survive a scoring-cycle burst.
 """
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import websockets
+from clients.compute_client import (
+    WS_PING_INTERVAL,
+    WS_PING_TIMEOUT,
+    ComputeClient,
+    OutgoingMessages,
+)
 from payload_models.payloads import ContainerCreated, DeliveryStamps
-
-from clients.compute_client import WS_PING_INTERVAL, WS_PING_TIMEOUT, ComputeClient
-from protocol.vc_protocol.validator_requests import ExecutorSpecRequest, RentedMachineRequest
+from protocol.vc_protocol.validator_requests import (
+    ExecutorSpecRequest,
+    RentedMachineRequest,
+    ValidationEvent,
+)
 from services.miner_service import MinerService
 from services.redis_service import MACHINE_SPEC_CHANNEL
 
@@ -44,7 +54,7 @@ async def _bridge_machine_spec(payload: dict[str, Any]) -> ExecutorSpecRequest:
     return client.message_queue[0]
 
 
-async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
+async def _published_payloads(jobs: list[Any], **kwargs: Any) -> list[dict[str, Any]]:
     redis_service = MagicMock()
     redis_service.publish = AsyncMock()
     service = MinerService(
@@ -53,7 +63,7 @@ async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
         redis_service=redis_service,
         attestation_service=MagicMock(),
     )
-    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck")
+    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck", **kwargs)
     return [call.args[1] for call in redis_service.publish.await_args_list]
 
 
@@ -68,6 +78,17 @@ async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_
     # Assert
     assert [payload["batch_total"] for payload in payloads] == [2, 2]
     assert all(isinstance(payload["sent_at"], float) for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_a_spec_that_is_not_the_miners_batch_sets_no_batch_total(
+    create_job_result, mock_settings
+) -> None:
+    # The backend takes the expected count once per (validator, job_batch_id, miner), from the
+    # first spec: an express spec under the cycle's id arrives before the wave's.
+    payloads = await _published_payloads([create_job_result()], is_whole_miner_batch=False)
+
+    assert [payload["batch_total"] for payload in payloads] == [None]
 
 
 @pytest.mark.asyncio
@@ -96,6 +117,39 @@ async def test_bridge_tolerates_payload_without_stamps(create_job_result, mock_s
     # Assert
     assert spec.sent_at is None
     assert spec.batch_total is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_carries_structured_validation_event(create_job_result, mock_settings) -> None:
+    job = create_job_result(log_text="GPU mismatch >>> legacy JSON")
+    job.validation_event = ValidationEvent(
+        event="GPU mismatch",
+        reason_code="GPU_MISMATCH",
+        severity="critical",
+        impact="Node cannot be listed",
+        remediation="Check the installed GPU",
+        what_we_saw={"expected": "A100", "actual": "T4"},
+        check_id="executor.validate.gpu",
+        when=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    [payload] = await _published_payloads([job])
+    spec = await _bridge_machine_spec(payload)
+
+    assert payload["validation_event"]["reason_code"] == "GPU_MISMATCH"
+    assert isinstance(spec.validation_event, ValidationEvent)
+    assert spec.validation_event.what_we_saw == {"expected": "A100", "actual": "T4"}
+    assert spec.validation_event.when == datetime(2026, 9, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_bridge_tolerates_payload_without_validation_event(create_job_result, mock_settings) -> None:
+    [payload] = await _published_payloads([create_job_result()])
+    del payload["validation_event"]
+
+    spec = await _bridge_machine_spec(payload)
+
+    assert spec.validation_event is None
 
 
 async def _drain_send_loop(client: ComputeClient, expected_sends: int) -> list[dict[str, Any]]:
@@ -140,6 +194,27 @@ async def test_send_loop_stamps_container_responses_too() -> None:
     # Assert
     assert [message["message_type"] for message in sent] == ["ContainerCreated", "RentedMachineRequest"]
     assert [message["queue_depth"] for message in sent] == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_send_loop_waiting_on_an_empty_queue_sends_an_appended_reply_at_once() -> None:
+    # Arrange: the loop is already idle on an empty queue when the create's reply is appended
+    client = _client()
+    client.message_queue = OutgoingMessages()
+    sent_at: list[float] = []
+    client.ws = MagicMock(send=AsyncMock(side_effect=lambda raw_message: sent_at.append(time.monotonic())))
+    send_loop = asyncio.create_task(client.handle_send_messages())
+    await asyncio.sleep(0.05)
+
+    # Act
+    appended_at = time.monotonic()
+    client.message_queue.append(RentedMachineRequest())
+    await asyncio.sleep(0.05)
+    send_loop.cancel()
+
+    # Assert: sent within the wait above, not on a 1 s poll
+    assert len(sent_at) == 1
+    assert sent_at[0] - appended_at < 0.05
 
 
 @pytest.mark.asyncio
