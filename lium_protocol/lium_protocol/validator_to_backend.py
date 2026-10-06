@@ -292,7 +292,7 @@ class ExecutorSpecRequest(ValidatorMessage):
     # The event behind `log_text`, structured; its `reason_code` is what the backend stores for the cycle.
     # None from a publisher that sends the event only inside `log_text`.
     validation_event: ValidationEvent | None = None
-    # This cycle's SSH probe of each RUNNING pod rented on the node, successes included. None = the
+    # This cycle's SSH probe of each pod with an ssh_port rented on the node, successes included. None = the
     # publisher does not probe; [] = it probed and the node has no pod to probe.
     pod_ssh: list[PodSshObservation] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
 

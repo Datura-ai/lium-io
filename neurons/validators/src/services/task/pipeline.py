@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -13,7 +15,6 @@ from core.utils import _m
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
 from services.redis_service import RedisService
-from services.collateral_contract_service import CollateralContractService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -25,7 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .models import CollateralPrefetch, ValidationEvent
+from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
 @runtime_checkable
@@ -73,7 +74,6 @@ class PodRecoverer(Protocol):
 class ContextServices:
     ssh: SSHService
     redis: RedisService
-    collateral: CollateralContractService
     validation: ValidationService
     verifyx: VerifyXValidationService
     inspector: InspectorValidationService
@@ -104,7 +104,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    enable_no_collateral: bool = False
     verifyx_enabled: bool = False
     inspector_enabled: bool = False
     port_private_key: Optional[str] = None
@@ -184,10 +183,6 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
-    # Validation fast path: the collateral read CollateralPrefetchCheck started under the GPU
-    # spec checks, for CollateralCheck to await instead of calling the contract itself. None =
-    # no prefetch (the flag is off, or the scrape left no GPU to read for).
-    collateral_prefetch: CollateralPrefetch | None = None
 
 
 class CheckResult(BaseModel):
@@ -195,6 +190,9 @@ class CheckResult(BaseModel):
     event: ValidationEvent
     updates: dict[str, Any] = {}
     halt: bool = False
+    # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
+    # when the node has no live rental). None = fall back to the check's class default.
+    fatal: bool | None = None
 
 
 class Context(BaseModel):
@@ -236,7 +234,6 @@ class Context(BaseModel):
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
     collateral_deposited: bool = False
-    collateral_error_message: str | None = None
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
@@ -257,9 +254,6 @@ class Context(BaseModel):
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
-    # False only once InspectorRentedCheck sees a provider-origin finding on a rented pod under
-    # INSPECTOR_ENFORCE_ENABLED (DAH-3275); the score gate lives in calculate_scores.
-    inspector_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -277,12 +271,13 @@ class EventSink(Protocol):
 
 
 # DAH-3593: verdicts that describe the provider's state, not a fault of the node under test or of
-# the validator. They are emitted on every cycle for as long as the state lasts (no collateral,
-# an old image, a banned provider, a host-side workload) and were 135,000 WARNING lines in two
-# days. The event keeps its severity for the backend and the portal; only the log line is INFO.
+# the validator. They are emitted on every cycle for as long as the state lasts (an old image,
+# a banned provider, a host-side workload) and were 135,000 WARNING lines in two
+# days. The event keeps its severity for the backend and the portal; when the event is a warning,
+# only the log line is INFO (DEBUG when it repeats the previous cycle, see StatusChangeTracker). An
+# error (an enforced EXECUTOR_IMAGE_OUTDATED, PROVIDER_SIDE_LOAD_ABOVE_LIMIT) stays ERROR every cycle.
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
-        "COLLATERAL_MISSING",
         "EXECUTOR_IMAGE_OUTDATED",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
@@ -290,9 +285,46 @@ PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
 )
 
 
+class StatusChangeTracker:
+    """The last outcome each executor had on each check, kept across pipeline runs.
+
+    Every check emits one event per executor per cycle, and most of them repeat the previous cycle
+    word for word. The sink logs a repeat at DEBUG and a change at INFO. The outcome is the event
+    name, reason code and severity; `what_we_saw` and timings vary every cycle and are not part of it.
+    """
+
+    def __init__(self, max_entries: int = 200_000):
+        self.max_entries = max_entries
+        self._last: OrderedDict[tuple[str, str, str], tuple[str, str, str]] = OrderedDict()
+
+    def changed(
+        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]
+    ) -> bool:
+        # the miner reports its executor UUIDs: keyed without the hotkey, one miner could replay another
+        # provider's UUID and move that provider's lines between INFO and DEBUG
+        key = (miner_hotkey, executor_uuid, check_id)
+        previous = self._last.pop(key, None)
+        self._last[key] = outcome
+        if len(self._last) > self.max_entries:
+            self._last.popitem(last=False)
+        return previous != outcome
+
+
+STEP_DURATION_LOGGER = "services.task.step_duration"
+
+
 class LoggerSink:
-    def __init__(self, logger_: logging.Logger):
+    def __init__(self, logger_: logging.Logger, tracker: StatusChangeTracker | None = None):
         self.logger = logger_
+        self.tracker = tracker
+        # writes its message as the whole line: the shared JSON formatter adds ~280 bytes of fixed
+        # fields, more than the step duration it carries on each repeated outcome
+        self.duration_logger = logging.getLogger(STEP_DURATION_LOGGER)
+        if not self.duration_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self.duration_logger.addHandler(handler)
+            self.duration_logger.propagate = False
 
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
@@ -300,7 +332,37 @@ class LoggerSink:
         if level == "warning" and event.reason_code in PROVIDER_STATE_REASON_CODES:
             level = "info"
             extra["reason"] = "provider_state"
+        if self._is_repeat(event) and level == "info":
+            level = "debug"
+            self._log_step_duration(event)
         getattr(self.logger, level)(_m(event.event, extra=extra))
+
+    def _log_step_duration(self, event: ValidationEvent) -> None:
+        # The step-duration panels unwrap extra.context.execution_time_ms per extra.check_id from
+        # every validator line, so a repeat keeps those two fields at INFO in the same shape.
+        execution_time_ms = event.context.get("execution_time_ms")
+        if execution_time_ms is None or self.logger.isEnabledFor(logging.DEBUG):
+            return
+        line = {
+            "level": "INFO",
+            "logger": STEP_DURATION_LOGGER,
+            "message": "Check step duration",
+            "extra": {"check_id": event.check_id, "context": {"execution_time_ms": execution_time_ms}},
+        }
+        self.duration_logger.info(json.dumps(line, separators=(",", ":")))
+
+    def _is_repeat(self, event: ValidationEvent) -> bool:
+        executor_uuid = event.context.get("executor_uuid")
+        if self.tracker is None or not executor_uuid or not event.check_id:
+            return False
+        changed = self.tracker.changed(
+            str(event.context.get("miner_hotkey") or ""),
+            executor_uuid,
+            event.check_id,
+            (event.event, event.reason_code, event.severity),
+        )
+        # The run's last event carries the per-step summary; it stays at INFO as one line per run.
+        return not changed and "steps_total_s" not in event.what_we_saw
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
@@ -417,17 +479,8 @@ def merge_state(current: ContextState, before: ContextState, after: ContextState
 
 
 def _stops_run(chk: Check, res: CheckResult) -> bool:
-    return (not res.passed and getattr(chk, "fatal", False)) or res.halt
-
-
-def cancel_pending_collateral_prefetch(ctx: Context) -> bool:
-    """Cancel a collateral read the fast path started that no check consumed (the run ended
-    before CollateralCheck). Returns whether one was cancelled."""
-    prefetch = ctx.state.collateral_prefetch
-    if prefetch is None or prefetch.task.done():
-        return False
-    prefetch.task.cancel()
-    return True
+    fatal = res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
+    return (not res.passed and fatal) or res.halt
 
 
 class Pipeline:
@@ -510,44 +563,41 @@ class Pipeline:
         steps: list[tuple[str, int]] = []
         last_index = len(self.checks) - 1
 
-        try:
-            for index, step in enumerate(self.checks):
-                parallel = isinstance(step, ParallelStage)
-                ran_checks = await self._run_step(step, current_ctx)
-                for ran in ran_checks:
-                    ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
-                    ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
+        for index, step in enumerate(self.checks):
+            parallel = isinstance(step, ParallelStage)
+            ran_checks = await self._run_step(step, current_ctx)
+            for ran in ran_checks:
+                ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
+                ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
 
-                # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
-                stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
-                for position, ran in enumerate(ran_checks):
-                    chk, res = ran.check, ran.result
-                    # Only emitted checks enter the summary: a sibling lane's checks completed before
-                    # the cancel ran, but the run does not report them.
-                    steps.append((chk.check_id, res.event.context["execution_time_ms"]))
-                    elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
-                    failed = not res.passed and getattr(chk, "fatal", False)
-                    last_of_run = index == last_index and position == len(ran_checks) - 1
-                    if failed or res.halt or last_of_run:
-                        res.event.what_we_saw.update(
-                            summarize_steps(
-                                steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
-                            )
+            # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
+            stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
+            for position, ran in enumerate(ran_checks):
+                chk, res = ran.check, ran.result
+                # Only emitted checks enter the summary: a sibling lane's checks completed before
+                # the cancel ran, but the run does not report them.
+                steps.append((chk.check_id, res.event.context["execution_time_ms"]))
+                elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
+                failed = not res.passed and (
+                    res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
+                )
+                last_of_run = index == last_index and position == len(ran_checks) - 1
+                if failed or res.halt or last_of_run:
+                    res.event.what_we_saw.update(
+                        summarize_steps(
+                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
                         )
+                    )
 
-                    await self.sink.emit(res.event)
-                    events.append(res.event)
+                await self.sink.emit(res.event)
+                events.append(res.event)
 
-                    current_ctx = self._apply(current_ctx, ran, parallel)
+                current_ctx = self._apply(current_ctx, ran, parallel)
 
-                    if failed:
-                        return False, events, current_ctx
+                if failed:
+                    return False, events, current_ctx
 
-                    if res.halt:
-                        return True, events, current_ctx
-        finally:
-            # A run that stops before CollateralCheck (fail, halt or exception) leaves the early
-            # collateral read unconsumed.
-            cancel_pending_collateral_prefetch(current_ctx)
+                if res.halt:
+                    return True, events, current_ctx
 
         return True, events, current_ctx

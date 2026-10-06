@@ -381,6 +381,49 @@ class DiskHealthMessages:
     )
 
 
+class RentedGpuDropMessages:
+    DROP = MessageTemplate(
+        event="Rented node lost a GPU",
+        reason="RENTED_GPU_DROP",
+        severity="error",
+        category="env",
+        impact="Proceed; score not changed here. Reported to the backend unless held for a second cycle or a dry "
+        "run (see pods[].posted, held and delivery); provider, support and renter are told once per incident",
+        remediation="A card fell out of NVML on a rented node (see faults, missing_uuids, nvml_error_code). Check "
+        "`nvidia-smi` and `dmesg` for Xid 79 / 'fallen off the bus', then reset or reboot the host; the renter's "
+        "workload on the missing card is already broken.",
+    )
+    RECOVERED = MessageTemplate(
+        event="Rented node shows every GPU again",
+        reason="RENTED_GPU_RECOVERED",
+        severity="info",
+        category="env",
+        impact="Proceed; the end of the incident is reported to the backend (see pods[].delivery; one with no "
+        "answer is sent again next cycle)",
+    )
+    OK = MessageTemplate(
+        event="Rented node shows every rented GPU",
+        reason="RENTED_GPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented GPU drop check skipped: no running rental",
+        reason="RENTED_GPU_DROP_NOT_RENTED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    DISABLED = MessageTemplate(
+        event="Rented GPU drop check disabled",
+        reason="RENTED_GPU_DROP_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",
@@ -686,38 +729,27 @@ class DuplicateExecutorMessages:
     )
 
 
-class CollateralMessages:
-    VERIFIED = MessageTemplate(
+class CollateralStatusMessages:
+    DEPOSITED = MessageTemplate(
         event="Collateral verified",
         reason="COLLATERAL_OK",
         severity="info",
         category="policy",
-        impact="Proceed",
+        impact="None; collateral has no score effect",
     )
-    MISSING = MessageTemplate(
+    NOT_DEPOSITED = MessageTemplate(
         event="No collateral deposited",
         reason="COLLATERAL_MISSING",
-        severity="warning",
-        category="policy",
-        impact="Score may be reduced or set to 0 based on policy",
-        remediation="Deposit collateral for this executor.",
-    )
-
-
-class CollateralPrefetchMessages:
-    STARTED = MessageTemplate(
-        event="Collateral read started",
-        reason="COLLATERAL_READ_STARTED",
         severity="info",
         category="policy",
-        impact="Proceed; the collateral check decides when the read answers",
+        impact="None; collateral has no score effect",
     )
-    SKIPPED = MessageTemplate(
-        event="Collateral read not started",
-        reason="COLLATERAL_READ_SKIPPED",
+    READ_FAILED = MessageTemplate(
+        event="Collateral read failed",
+        reason="COLLATERAL_READ_FAILED",
         severity="info",
         category="policy",
-        impact="Proceed; the collateral check reads the contract itself",
+        impact="None; the last known collateral status is reported, or none deposited when there is none",
     )
 
 
@@ -728,6 +760,13 @@ class StaleContainerCleanupMessages:
         severity="info",
         category="prep",
         impact="Proceed",
+    )
+    RENTED_LIST_UNKNOWN = MessageTemplate(
+        event="Stale container removal skipped: rented list empty or unknown",
+        reason="STALE_CLEANUP_RENTED_LIST_UNKNOWN",
+        severity="warning",
+        category="prep",
+        impact="No rental container removed this cycle; live pods and fillers are left alone",
     )
 
 
@@ -805,7 +844,7 @@ class InspectorMessages:
         severity="warning",
         category="runtime",
         impact="Provider-origin findings recorded; score unchanged",
-        remediation="Review the verdict's evidence; when the verdict's action is quarantine (INSPECTOR_ENFORCE_ENABLED and a rented pod affected) the renters were told and the backend acts on it.",
+        remediation="Review the verdict's evidence; findings are recorded only, no score or marketplace effect.",
     )
     PLATFORM_ORIGIN_ONLY = MessageTemplate(
         event="Inspector findings were the platform's own execs",
@@ -957,39 +996,6 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
-    # DAH-2870: the container runs but the renter cannot get in (SSH port refuses, or
-    # authorized_keys is unreadable because the volume is not mounted). Detected here, not scored;
-    # the notice to the backend and the renter is the cycle-end flush's, so the impact says
-    # "queued", never "told": this renders before the flush, which can still get no answer or be
-    # suppressed. The check renders the NOT_QUEUED impact instead when
-    # no pod of the event queued one this cycle.
-    RENTED_POD_SSH_UNREACHABLE = MessageTemplate(
-        event="Rented pod refuses its renter over SSH",
-        reason="RENTED_POD_SSH_UNREACHABLE",
-        severity="error",
-        category="runtime",
-        impact=(
-            "Outage detected; the notice to the backend and the renter is queued for the "
-            "cycle-end fleet gate, not yet sent; score unchanged"
-        ),
-        remediation=(
-            "The pod container is running but its SSH port refuses or has no authorized_keys, "
-            "usually after a host reboot restarted the container without its volume. "
-            "The renter can reboot the pod from the pod page; check the host for unplanned reboots."
-        ),
-    )
-    # The same event when this cycle queued no notice for the pods it names: DRY_RUN, a streak the
-    # backend already acknowledged, or (after the fleet gate) only such pods left in the event.
-    RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT = (
-        "Outage detected; no notice queued this cycle (DRY_RUN, or the backend already "
-        "acknowledged this outage); score unchanged"
-    )
-    # DAH-2255: the same event when ``is_enforced`` holds (flag on, streak at the enforce threshold,
-    # outage accepted by the backend) — the check fails the cycle instead of halting on it.
-    RENTED_POD_SSH_UNREACHABLE_ENFORCED_IMPACT = (
-        "Outage past the enforcement threshold: the rented-state check fails this cycle, "
-        "score 0 and the verified job cleared, until a cycle finds the pod reachable again"
-    )
 
 
 class GpuUsageMessages:
@@ -1008,13 +1014,53 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
+        "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
+        "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "
+        "starts it itself."
+    )
     ORPHANED_CONTAINER = MessageTemplate(
         event="Orphaned rental container detected",
         reason="ORPHANED_RENTAL_CONTAINER",
         severity="error",
         category="runtime",
         impact="Validation skipped; score set to 0",
-        remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
+        remediation=(
+            "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+            "node uses it: {rental_status}. Lium stops a pod's container when its rental ends and the "
+            "validator removes leftovers, so this one should not be holding the GPU. Before you touch "
+            "it, confirm it is not a live rental: the node's page in the Provider Portal must show no "
+            "active rental. Only then remove it: docker rm -f {orphaned_container}. If the portal "
+            "still shows a rental on the node, leave the container running and contact Lium support."
+        ),
+    )
+    ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
+        "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+        "node uses it: {rental_status}. Do not stop or remove it: contact Lium support with the "
+        "container name."
+    )
+    ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION = (
+        "{orphaned_container} is a Lium pod container{pod} of a rental on this node that is ending "
+        "or starting: {rental_status}. Lium stops or starts it itself, so do not stop or remove it; "
+        "the next cycle checks the node again."
+    )
+    TEARDOWN_IN_PROGRESS = MessageTemplate(
+        event="Rental teardown in progress",
+        reason="TEARDOWN_IN_PROGRESS",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle",
+        remediation=(
+            "A rental on this node has just ended and Lium is stopping its container; do not stop it yourself."
+        ),
+    )
+    RENTAL_STARTED_DURING_RUN = MessageTemplate(
+        event="Rental started during validation",
+        reason="RENTAL_STARTED_DURING_RUN",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle",
+        remediation="The GPU is held by a rental that started while this run was in progress.",
     )
     FOREIGN_PROCESS = MessageTemplate(
         event="Foreign GPU process on idle executor",
