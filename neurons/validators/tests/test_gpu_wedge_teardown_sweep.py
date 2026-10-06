@@ -45,7 +45,7 @@ async def test_sweep_cures_wedged_gpu(monkeypatch):
         "CUDA_VISIBLE_DEVICES=": _ssh_result("ctx open/close OK"),
     }
 
-    async def fake_run(cmd: str):
+    async def fake_run(cmd: str, **kwargs):
         for prefix, result in responses.items():
             if cmd.startswith(prefix):
                 return result
@@ -69,7 +69,7 @@ async def test_sweep_is_a_noop_on_healthy_gpus(monkeypatch):
         "neurons.validators.src.services.docker_service.GPU_WEDGE_SWEEP_SETTLE_SECONDS", 0
     )
 
-    async def fake_run(cmd: str):
+    async def fake_run(cmd: str, **kwargs):
         if cmd.startswith("nvidia-smi --query-gpu"):
             return _ssh_result(f"{HEALTHY_UUID}, 0, 0\n")
         if cmd.startswith("nvidia-smi --query-compute-apps"):
@@ -93,7 +93,7 @@ async def test_sweep_skips_the_settle_wait_when_nothing_looks_wedged():
     async def fake_sleep(seconds: float) -> None:
         slept.append(seconds)
 
-    async def fake_run(cmd: str):
+    async def fake_run(cmd: str, **kwargs):
         if cmd.startswith("nvidia-smi --query-gpu"):
             return _ssh_result(f"{HEALTHY_UUID}, 0, 0\n")
         if cmd.startswith("nvidia-smi --query-compute-apps"):
@@ -123,7 +123,7 @@ async def test_sweep_does_not_reset_a_card_that_settles_by_itself(monkeypatch):
         ]
     )
 
-    async def fake_run(cmd: str):
+    async def fake_run(cmd: str, **kwargs):
         if cmd.startswith("nvidia-smi --query-gpu"):
             return next(gpu_query_results)
         if cmd.startswith("nvidia-smi --query-compute-apps"):

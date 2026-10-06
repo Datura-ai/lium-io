@@ -12,6 +12,7 @@ from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
+from services.ssh_service import run_uploaded_key_purge
 from vast_api.wiring import attach_vast_api
 
 # Set up logging
@@ -39,26 +40,26 @@ async def lifespan(app: FastAPI):
     # Start pulling this host's cache template image as soon as the executor
     # boots, and keep it fresh in the background, without blocking startup.
     prefetch_task = asyncio.create_task(run_cache_template_prefetch())
+    # DAH-3394: ssh keys the validator uploaded and never removed expire (EXECUTOR_UPLOADED_KEY_TTL_S)
+    key_purge_task = asyncio.create_task(run_uploaded_key_purge())
     # Watch the nested dockerd for Vast contract start/end edges and report
     # them to the backend (no-op until the machine is enrolled and configured).
     events_task = asyncio.create_task(app.state.vast_events_poller.run_forever())
     try:
         yield
     finally:
-        prefetch_task.cancel()
-        try:
-            await prefetch_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"cache template pre-pull task ended with error: {e}")
-        events_task.cancel()
-        try:
-            await events_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"vast contract events task ended with error: {e}")
+        for name, task in (
+            ("cache template pre-pull", prefetch_task),
+            ("uploaded ssh key purge", key_purge_task),
+            ("vast contract events", events_task),
+        ):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"{name} task ended with error: {e}")
 
 
 app = FastAPI(
@@ -77,4 +78,13 @@ attach_vast_api(app)
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":
-    uvicorn.run("executor:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)
+    # No proxy sits between a client and this process, so no X-Forwarded-* header may rewrite the
+    # peer address: routes/apis.py's `/verify` admits loopback peers only (the validator's SSH
+    # tunnel) and reads `request.client` for that.
+    uvicorn.run(
+        "executor:app",
+        host="0.0.0.0",
+        port=settings.INTERNAL_PORT,
+        reload=reload,
+        proxy_headers=False,
+    )

@@ -1,15 +1,28 @@
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from uuid import UUID
 
 from core.config import settings
+from protocol.vc_protocol.compute_requests import (
+    BROKEN_POD_STATUS,
+    LIVE_FILLER_RUN_STATUSES,
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+)
 from services.const import (
+    BROKEN_POD_CONTAINER_GRACE_MINUTES,
+    EDIT_PARKED_SUFFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
     POD_CONTAINER_PREFIX,
+    RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
+    RENTAL_TEARDOWN_GRACE_MINUTES,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -23,7 +36,8 @@ from services.gpu_wedge import (
 
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
+from .verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS, specs_with_last_known_verifyx_ema
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +60,27 @@ class WedgedGpu:
     gpu_uuid: str
     gpu_utilization: float | None
     memory_utilization: float | None
+
+
+class PodRentalState(str, Enum):
+    ENDED_DURING_RUN = "ended_during_run"
+    ENDED_RECENTLY = "ended_recently"
+    LIVE = "live"
+    LIVE_ON_ANOTHER_NODE = "live_on_another_node"
+    ORPHAN = "orphan"
+
+
+_ORPHAN_STATES = frozenset({PodRentalState.ORPHAN, PodRentalState.LIVE_ON_ANOTHER_NODE})
+
+
+@dataclass(frozen=True)
+class PodContainerRental:
+    container_name: str
+    pod_id: str | None
+    state: PodRentalState
+    # Completes "no live rental on this node uses it: ..." in the remediation.
+    provider_facing_rental_status: str
+    rental_closed_at: datetime | None = None
 
 
 class GpuUsageCheck:
@@ -76,7 +111,9 @@ class GpuUsageCheck:
         Competitor marketplaces (Nodexo/SN106) idle below the percentage limits on purpose: a
         rental holding 22.4 GB at 0% load passes every utilization gate. The expected holders
         come from the backend (`rented_data`), never from a container-name prefix — the whole
-        point of the ticket is a verdict `docker rename` cannot defeat. Shadow by default like
+        point of the ticket is a verdict `docker rename` cannot defeat. A container named like
+        ours but missing from the snapshot is asked about directly (DAH-2757); the prefix only
+        decides whom to ask, the backend still gives the answer. Shadow by default like
         every other money-withholding gate: without FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
         the verdict is logged, not scored. Returns None when the card is clean, leaving the
         legacy verdict to the caller.
@@ -90,7 +127,7 @@ class GpuUsageCheck:
             return None
 
         enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
-        workload_containers: set[str] = _lium_workload_containers(ctx)
+        workload_containers: set[str] = lium_workload_containers(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
                 pid=process.get("pid"),
@@ -101,15 +138,15 @@ class GpuUsageCheck:
             if process.get("container_name") not in workload_containers
             and not _runs_in_the_executors_own_cgroup(process)
         ]
+        foreign_processes = await _drop_containers_the_backend_still_owns(ctx, foreign_processes)
 
         if foreign_processes:
             what = {
                 "foreign_processes": foreign_processes,
                 "process_count": len(gpu_processes),
-                # Review ask (PR #1242): the backend can start a filler AFTER this cycle's
-                # rented_data snapshot. Such a container carries our own prefix but is absent
-                # from the allowlist, so it reads as foreign. Count it separately, so the
-                # shadow week measures how often that race happens before enforcement goes on.
+                # Our own name on a container the backend disowns — the id inside it belongs
+                # to no run it ever issued. Counted separately, because that is the shape a
+                # forged name takes once the late-start race (DAH-2757) is out of the way.
                 "lium_named_outside_snapshot": [
                     process for process in foreign_processes if _carries_a_lium_prefix(process)
                 ],
@@ -208,24 +245,17 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        # Check for orphaned rental containers
-        for process in gpu_processes:
-            container_name = process.get("container_name")
-            if container_name and container_name.startswith(POD_CONTAINER_PREFIX) and not ctx.rented:
-                # Found orphaned rental container - rental ended but container still running
-                event = render_message(
-                    Msg.ORPHANED_CONTAINER,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    remediation=Msg.ORPHANED_CONTAINER.remediation.format(orphaned_container=container_name),
-                    what={
-                        **violation,
-                        "orphaned_container": container_name,
-                        "rental_status": "ended",
-                        "container_status": "still running",
-                    },
-                )
-                return CheckResult(passed=False, event=event)
+        pod_containers: list[str] = sorted(
+            {
+                name
+                for process in gpu_processes
+                if (name := process.get("container_name")) and name.startswith(POD_CONTAINER_PREFIX)
+            }
+        )
+        if pod_containers and not ctx.rented:
+            return await self._judge_pod_containers_outside_a_rental(
+                ctx, violation, gpu_processes, pod_containers, filler_containers
+            )
 
         event = render_message(
             Msg.USAGE_HIGH,
@@ -234,6 +264,157 @@ class GpuUsageCheck:
             what=violation,
         )
         return CheckResult(passed=False, event=event)
+
+    async def _judge_pod_containers_outside_a_rental(
+        self,
+        ctx: Context,
+        violation: dict,
+        gpu_processes: list[dict],
+        pod_containers: list[str],
+        filler_containers: set[str],
+    ) -> CheckResult:
+        """A pod container on the GPU of a node this run judges as not rented.
+
+        The GPU processes are read at the start of the run and `ctx.rented` is settled later, from
+        the cycle's snapshot and the backend's answer about the pods in it. A renter who ends the
+        rental in between leaves the scrape holding a pod container that the unrent flow is still
+        stopping. That container, and one whose rental closed within RENTAL_TEARDOWN_GRACE_MINUTES,
+        is teardown: the run ends without a GPU verdict and the next cycle looks again. Only a
+        container with no rental, or whose rental closed longer ago, is an orphan. A process outside
+        those containers and the node's fillers still fails the usage check, with advice that names
+        only the outside processes: the pod container belongs to a renter.
+
+        With RENTAL_TEARDOWN_DEFERRAL_ENABLED off, every pod container here is scored as an orphan,
+        as before; the rental read still picks the remediation, so a provider is never told to
+        remove the container of a rental that is ending or starting.
+        """
+        rentals: list[PodContainerRental] = list(
+            await asyncio.gather(*(_pod_container_rental(ctx, name) for name in pod_containers))
+        )
+        orphans = [rental for rental in rentals if rental.state in _ORPHAN_STATES]
+        if orphans or not settings.RENTAL_TEARDOWN_DEFERRAL_ENABLED:
+            return self._orphaned_container_failure(ctx, violation, rentals, orphans[0] if orphans else rentals[0])
+
+        expected_containers: set[str] = {rental.container_name for rental in rentals} | filler_containers
+        outside_processes: list[dict] = [
+            process for process in gpu_processes if process.get("container_name") not in expected_containers
+        ]
+        if outside_processes:
+            return self._usage_high_beside_a_rental_failure(ctx, violation, rentals, outside_processes)
+
+        return self._halt_scored_as_idle_while_the_rental_changes(ctx, violation, rentals)
+
+    def _orphaned_container_failure(
+        self, ctx: Context, violation: dict, rentals: list[PodContainerRental], orphan: PodContainerRental
+    ) -> CheckResult:
+        remediation_template: str
+        if orphan.state is PodRentalState.ORPHAN:
+            remediation_template = Msg.ORPHANED_CONTAINER.remediation
+        elif orphan.state is PodRentalState.LIVE_ON_ANOTHER_NODE:
+            # This node's portal page shows no rental for a pod registered elsewhere, so the usual
+            # "confirm, then remove" advice would clear the removal of a live rental's container.
+            remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+        else:
+            remediation_template = Msg.ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION
+        event = render_message(
+            Msg.ORPHANED_CONTAINER,
+            ctx=ctx,
+            check_id=self.check_id,
+            remediation=remediation_template.format(
+                orphaned_container=orphan.container_name,
+                pod=f" (pod {orphan.pod_id})" if orphan.pod_id else "",
+                rental_status=orphan.provider_facing_rental_status,
+            ),
+            what={
+                **violation,
+                "orphaned_container": orphan.container_name,
+                "rental_status": orphan.provider_facing_rental_status,
+                "container_status": "still running",
+                "pod_containers": rentals,
+            },
+        )
+        return CheckResult(passed=False, event=event)
+
+    def _usage_high_beside_a_rental_failure(
+        self,
+        ctx: Context,
+        violation: dict,
+        rentals: list[PodContainerRental],
+        outside_processes: list[dict],
+    ) -> CheckResult:
+        event = render_message(
+            Msg.USAGE_HIGH,
+            ctx=ctx,
+            check_id=self.check_id,
+            remediation=Msg.USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION.format(
+                outside_processes=", ".join(_describe_process(process) for process in outside_processes),
+                pod_containers=", ".join(rental.container_name for rental in rentals),
+            ),
+            what={
+                **violation,
+                "process_count": len(outside_processes),
+                "gpu_processes": outside_processes,
+                "pod_containers": rentals,
+            },
+        )
+        return CheckResult(passed=False, event=event)
+
+    def _halt_scored_as_idle_while_the_rental_changes(
+        self, ctx: Context, violation: dict, rentals: list[PodContainerRental]
+    ) -> CheckResult:
+        any_rental_ended: bool = any(rental.state is not PodRentalState.LIVE for rental in rentals)
+        template = Msg.TEARDOWN_IN_PROGRESS if any_rental_ended else Msg.RENTAL_STARTED_DURING_RUN
+        # VerifyXCheck writes the download-speed EMA an idle score needs, and it runs after this
+        # halt: without the last known value the calculator scores every deferred node 0.
+        state: ContextState = replace(ctx.state, specs=specs_with_last_known_verifyx_ema(ctx))
+        actual_score, job_score, warning_message = ctx.services.score_calculator(
+            ctx.model_copy(update={"state": state}), ctx.rented
+        )
+        last_download_speed: float | None = (state.specs.get("network") or {}).get("ema_verifyx_download_speed")
+        if last_download_speed is not None and last_download_speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+            # VerifyXCheck fails a node under its download-speed floor; the halt skips it, so apply it here.
+            actual_score, job_score = 0.0, 0.0
+            too_slow = (
+                f"Last VerifyX download speed {last_download_speed} Mbps is under the "
+                f"{MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS} Mbps minimum"
+            )
+            warning_message = f"{warning_message} | {too_slow}" if warning_message else f" WARNING: {too_slow}"
+        success: bool = actual_score > 0
+        # The halt skips FinalizeCheck, which would word the outcome from the score the same way.
+        severity: str = "info" if success else "warning"
+        if warning_message:
+            outcome: str = ("No action needed." if success else "Address issues:") + warning_message
+        else:
+            outcome = "No action needed." if success else "Address issues."
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=severity,
+            impact=f"{template.impact}; job score={job_score}, actual score={actual_score}",
+            remediation=f"{outcome} {template.remediation}",
+            what={
+                **violation,
+                "pod_containers": rentals,
+                "actual_score": actual_score,
+                "job_score": job_score,
+            },
+        )
+        # A halt, not a pass: the checks after this one load the GPU the pod still holds.
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={
+                "state": state,
+                "score": actual_score,
+                "job_score": job_score,
+                "score_warning": warning_message or None,
+                "success": success,
+                "log_status": severity,
+                "log_text": event.event,
+            },
+            halt=True,
+        )
 
     async def _detect_and_cure_ghost_gpus(
         self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
@@ -302,11 +483,14 @@ class GpuUsageCheck:
             return None
 
 
-def _lium_workload_containers(ctx: Context) -> set[str]:
+def lium_workload_containers(ctx: Context) -> set[str]:
     """This node's fillers and pods, as the BACKEND knows them — not as the node names them.
 
     A container-name prefix would hand a pass to anything the provider renames `filler_*`,
     and the ticket's whole requirement is a verdict `docker rename` cannot defeat.
+
+    Public because both gates that judge a foreign workload share it: this one for the card,
+    the provider-side load one for CPU. They must never disagree about whose container it is.
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
@@ -332,10 +516,243 @@ def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
     return memory_by_uuid
 
 
+def carries_a_rental_prefix(container_name: str) -> bool:
+    """Named like a rental of ours. Says nothing about who really started it: `docker rename`
+    forges the name, which is why every caller confirms it against the backend."""
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
 def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
     """The container is named like one of ours, but the backend did not report it this cycle."""
-    container_name: str = process.container_name or ""
-    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+    return carries_a_rental_prefix(process.container_name or "")
+
+
+async def _drop_containers_the_backend_still_owns(
+    ctx: Context, foreign_processes: list[ForeignGpuProcess]
+) -> list[ForeignGpuProcess]:
+    """Ask the backend about a Lium-named container that this cycle's snapshot does not hold.
+
+    DAH-2757: `rented_data` is read once, at cycle start. A filler or pod the backend starts
+    later in the same cycle carries our own name and is absent from the allowlist, so it reads
+    as foreign at 0% load — 7 honest nodes hit this in the first prod shadow day. The name on
+    its own still proves nothing, because `docker rename` forges it, so the id inside the name
+    is confirmed against the backend, which disowns an id it never issued.
+
+    One question per container, not per process: a single container holds as many GPU processes
+    as it has workers (8 in one prod pod), and this check sits on the healthy path of every
+    executor in every cycle.
+    """
+    claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
+    lium_named_containers: list[str] = sorted(
+        {
+            process.container_name
+            for process in foreign_processes
+            if _carries_a_lium_prefix(process) and process.container_name not in claimed_elsewhere
+        }
+    )
+    if not lium_named_containers:
+        return foreign_processes
+
+    ownership_verdicts: list[bool] = await asyncio.gather(
+        *(the_backend_still_owns(ctx, name) for name in lium_named_containers)
+    )
+    still_ours: set[str] = {
+        name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
+    }
+    return [process for process in foreign_processes if process.container_name not in still_ours]
+
+
+async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
+    """True when the backend confirms the id inside the container name as a live run of ours.
+
+    Public because the provider-side load gate asks the same question about the same race.
+
+    Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
+    (a None response): an inability to measure never withholds money here.
+    """
+    is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
+    prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
+    backend_issued_id: str | None = _uuid_after_prefix(container_name, prefix)
+    if backend_issued_id is None:
+        return False
+
+    if is_filler:
+        filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
+            backend_issued_id
+        )
+        if filler_run is None:
+            return True
+        if not _the_answer_is_about_this_node(ctx, filler_run.executor_id):
+            return False
+        # `active` alone means RUNNING. The status carries the two transitional states, which is
+        # where a filler the snapshot missed usually sits — but a backend that sends no status
+        # must not turn a run it calls active into a foreign workload.
+        return filler_run.active or filler_run.status in LIVE_FILLER_RUN_STATUSES
+
+    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(
+        backend_issued_id
+    )
+    if pod_rental is None:
+        return True
+    if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
+        return False
+    return pod_rental.active or _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental)
+
+
+def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
+    """Whether a BROKEN pod's container is still the leftover our own reaper owes us.
+
+    The exemption is deliberately time-boxed. The pod ROW survives 24 hours, but the container it
+    left behind is gone within the stale-container grace, so an exemption that followed the row
+    would hand a provider a whole day in which the name of their own broken pod launders a foreign
+    workload.
+    """
+    if pod_rental.status != BROKEN_POD_STATUS or pod_rental.rental_closed_at is None:
+        return False
+    return _time_since_the_rental_closed(pod_rental.rental_closed_at) < timedelta(
+        minutes=BROKEN_POD_CONTAINER_GRACE_MINUTES
+    )
+
+
+def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
+    # The backend closes a rental with a naive UTC timestamp, but the field is a datetime parsed off
+    # the wire: an offset in the JSON would make it aware, and mixing the two raises inside a fatal
+    # check. Read a naive value as the UTC it is and compare in one frame.
+    closed_at: datetime = rental_closed_at
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - closed_at
+
+
+def _describe_process(process: dict) -> str:
+    owner: str = process.get("container_name") or process.get("name") or "a host process"
+    return f"{owner} (pid {process.get('pid')})"
+
+
+def _in_minutes(elapsed: timedelta) -> str:
+    minutes: int = round(elapsed.total_seconds() / 60)
+    return "1 minute" if minutes == 1 else f"{minutes} minutes"
+
+
+async def _pod_container_rental(ctx: Context, container_name: str) -> PodContainerRental:
+    """Where the rental behind a pod container stands now, re-read from the backend.
+
+    The cycle's snapshot says which pods were rented on this node when the run started; the
+    backend's close time says when the rental ended. A pod the snapshot listed ended during this
+    run, even when the backend cannot be reached now. A name the backend does not confirm stays an
+    orphan, as it always was: a container called pod_<any uuid> must not buy a deferral.
+    """
+    pod_id: str | None = _uuid_after_prefix(
+        container_name.removesuffix(EDIT_PARKED_SUFFIX), POD_CONTAINER_PREFIX
+    )
+    if pod_id is None:
+        return PodContainerRental(
+            container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
+        )
+
+    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
+    rented_at_run_start: bool = rented_executor is not None and any(
+        pod.pod_id == pod_id for pod in rented_executor.pods
+    )
+    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
+
+    if pod_rental is not None and not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
+        if pod_rental.active:
+            return PodContainerRental(
+                container_name,
+                pod_id,
+                PodRentalState.LIVE_ON_ANOTHER_NODE,
+                "its rental is live but registered to another node",
+            )
+        return PodContainerRental(
+            container_name, pod_id, PodRentalState.ORPHAN, "its rental belongs to another node"
+        )
+    if pod_rental is not None and pod_rental.active:
+        return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its rental is live")
+
+    closed_at: datetime | None = pod_rental.rental_closed_at if pod_rental else None
+    if closed_at is not None:
+        since_closed: timedelta = _time_since_the_rental_closed(closed_at)
+        if since_closed < -timedelta(minutes=RENTAL_CLOSE_CLOCK_SKEW_MINUTES):
+            status = (
+                f"its rental's close time is {_in_minutes(-since_closed)} ahead of the validator's clock"
+            )
+            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+        # A close time slightly ahead of this clock is backend-validator skew on a rental that just ended.
+        status = (
+            f"its rental ended {_in_minutes(since_closed)} ago"
+            if since_closed >= timedelta(minutes=1)
+            else "its rental ended just now"
+        )
+        if since_closed >= timedelta(minutes=RENTAL_TEARDOWN_GRACE_MINUTES):
+            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+        if rented_at_run_start:
+            return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_DURING_RUN, status, closed_at)
+        # The backend deletes the pod row as it closes the rental, so a closed rental usually comes
+        # without an executor_id: then nothing proves it ran on this node.
+        if pod_rental.executor_id is None:
+            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+        return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_RECENTLY, status, closed_at)
+
+    if rented_at_run_start:
+        return PodContainerRental(
+            container_name, pod_id, PodRentalState.ENDED_DURING_RUN, "its rental ended during this run"
+        )
+    status = "Lium could not confirm a rental for it this cycle" if pod_rental is None else "Lium has no rental for it"
+    return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status)
+
+
+def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:
+    """The uuid the backend issued, or None when the name carries something else.
+
+    Only the canonical spelling counts. `UUID()` also reads an upper-case or dash-less form of
+    the same id, and both are legal docker names — without this test a provider could point a
+    second container at a live run of their own node and have the re-check clear it.
+    """
+    suffix: str = container_name.removeprefix(prefix)
+    try:
+        canonical_uuid: str = str(UUID(suffix))
+    except ValueError:
+        return None
+    return canonical_uuid if canonical_uuid == suffix else None
+
+
+def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None) -> bool:
+    """Whether the run the backend described lives on the node the check is looking at.
+
+    The endpoints answer about a run id, which is public on its own host, so a provider with two
+    nodes could name a squatter container after a live run of their honest one. A backend that
+    predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
+    """
+    if owning_executor_id is None:
+        return True
+    return str(owning_executor_id) == str(ctx.executor.uuid)
+
+
+def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:
+    """Container names this cycle's snapshot gives to a DIFFERENT node of the fleet.
+
+    A run id is public on its own host (`docker ps`), and the backend answers about the RUN, not
+    about where it runs. So a provider with two nodes could name a foreign container after a live
+    filler of their honest node and have the re-check clear it. The snapshot is what separates
+    them: a name another executor already holds is never ours to clear.
+    """
+    rented_data = ctx.state.rented_data
+    our_executor_uuid: str = str(ctx.executor.uuid)
+    claimed: set[str] = set()
+
+    filler_executor_uuids: set[str] = set(rented_data.all_filler_containers_by_executor) | set(
+        rented_data.filler_containers_by_executor
+    )
+    for executor_uuid in filler_executor_uuids - {our_executor_uuid}:
+        claimed.update(rented_data.get_filler_containers(executor_uuid))
+
+    for executor_uuid, rented_executor in rented_data.executors.items():
+        if executor_uuid != our_executor_uuid:
+            claimed.update(pod.container_name for pod in rented_executor.pods)
+
+    claimed.discard("")
+    return claimed
 
 
 def _runs_in_the_executors_own_cgroup(process: dict) -> bool:

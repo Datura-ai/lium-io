@@ -146,7 +146,7 @@ async def test_unreadable_proc_recorded_distinctly(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_silently_empty_proc_still_records_unreadable(monkeypatch, caplog):
-    # The usual shape of the honest casualty: _PROC_GPU_INFO_CMD exits 0 with no rows (unexpanded
+    # The usual shape of the honest casualty: PROC_GPU_INFO_CMD exits 0 with no rows (unexpanded
     # glob, `|| continue`, stderr discarded), so no RuntimeError is raised. The map is still empty,
     # and without proc_unreadable=True this host would log identically to a real spoof.
     monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", True, raising=False)

@@ -46,6 +46,7 @@ def _operation_payload(
     action: str = "backup",
     mode: str = "plain_volume",
     requested_path: str = "/root/checkpoints",
+    bootstrap: bool | None = None,
 ) -> dict[str, object]:
     workspace: dict[str, object] = {
         "mode": mode,
@@ -55,6 +56,8 @@ def _operation_payload(
     }
     if mode == "encrypted_running":
         workspace["container_name"] = "rental-pod"
+    if bootstrap is not None:
+        workspace["bootstrap"] = bootstrap
     return {
         "operation_id": str(OPERATION_ID),
         "pod_id": str(POD_ID),
@@ -443,6 +446,96 @@ def test_encrypted_workspace_resolves_verified_plaintext_view(
     assert "-m" not in preflight
 
 
+def _running_encrypted_pod(tmp_path: Path, plaintext_relative: str = "root/root") -> str:
+    process_root = tmp_path / "4321"
+    (process_root / plaintext_relative).mkdir(parents=True)
+    (process_root / "cgroup").write_text(f"0::/docker/{CONTAINER_ID}\n")
+    (process_root / "mountinfo").write_text(
+        "36 25 0:32 / /root rw,nosuid,nodev - fuse.gocryptfs gocryptfs rw,user_id=0\n"
+    )
+    return json.dumps(
+        [
+            {
+                "Id": CONTAINER_ID,
+                "State": {"Running": True, "Pid": 4321},
+                "Mounts": [{"Name": "customer-volume", "Destination": "/lium-cipher"}],
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize("bootstrap", (None, False))
+def test_online_encrypted_restore_still_refuses_a_nonempty_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bootstrap: bool | None,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(
+        _operation_payload(action="restore", mode="encrypted_running", requested_path="/root", bootstrap=bootstrap)
+    )
+    inspection = _running_encrypted_pod(tmp_path)
+
+    def run_docker(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout=inspection, stderr="")
+        return SimpleNamespace(returncode=21, stdout="", stderr="")   # the target has entries
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
+
+    with pytest.raises(WorkspaceResolutionError, match="new or empty"):
+        WorkspaceResolver(
+            docker_binary="docker", proc_root=tmp_path, environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}
+        ).resolve(operation)
+
+
+def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # DAH-3274: at create time the pod has been running since `docker run`, so `.jupyter` or
+    # `.bashrc` may already sit in the fresh mount. Nothing there is the customer's; the
+    # preflight only checks the target is a directory and the restore writes over it.
+    operation = StorageOperationSpec.from_mapping(
+        _operation_payload(action="restore", mode="encrypted_running", requested_path="/root", bootstrap=True)
+    )
+    inspection = _running_encrypted_pod(tmp_path)
+    scripts: list[str] = []
+
+    def run_docker(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout=inspection, stderr="")
+        scripts.append(command[command.index("-c") + 1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
+
+    workspace = WorkspaceResolver(
+        docker_binary="docker", proc_root=tmp_path, environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}
+    ).resolve(operation)
+
+    assert workspace.read_only is False
+    (preflight,) = scripts
+    assert "exit 20" in preflight          # a file where the directory should be still fails
+    assert "find" not in preflight         # emptiness is not required
+    assert "-mindepth" not in preflight
+
+
+def test_bootstrap_flag_is_refused_outside_encrypted_running() -> None:
+    with pytest.raises(
+        OperationSpecError, match="bootstrap is only meaningful for encrypted_running"
+    ):
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore", bootstrap=True))
+    # a backup carrying the flag would parse and silently ignore it (review, taiberium)
+    with pytest.raises(OperationSpecError, match="bootstrap is only meaningful for restore"):
+        StorageOperationSpec.from_mapping(
+            _operation_payload(action="backup", mode="encrypted_running", bootstrap=True)
+        )
+    with pytest.raises(OperationSpecError, match="must be a boolean"):
+        StorageOperationSpec.from_mapping(
+            _operation_payload(action="restore", mode="encrypted_running", bootstrap="yes")  # type: ignore[arg-type]
+        )
+
+
 def test_encrypted_workspace_fails_closed_without_gocryptfs_mount(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -677,6 +770,75 @@ def test_encrypted_restore_preserves_user_xattrs() -> None:
     ]
     assert excluded_xattrs == ["security.*", "trusted.*"]
     assert "user.*" not in excluded_xattrs
+
+
+def test_spec_refuses_a_volume_passphrase() -> None:
+    # DAH-3274: the spec file lands on the provider's disk; a validator that still puts the
+    # gocryptfs passphrase in it is refused before anything is built from it.
+    payload = _operation_payload(action="restore", mode="encrypted_running")
+    payload["workspace"]["volume_passphrase"] = "gocryptfs-secret"
+
+    with pytest.raises(OperationSpecError, match="must not carry volume_passphrase"):
+        StorageOperationSpec.from_mapping(payload)
+
+
+def test_encrypted_bootstrap_mode_no_longer_exists() -> None:
+    payload = _operation_payload(action="restore", mode="encrypted_bootstrap")
+
+    with pytest.raises(OperationSpecError, match="workspace.mode must be one of"):
+        StorageOperationSpec.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        DockerVolumeWorkspace(
+            image="executor:test",
+            volume_name="customer-volume",
+            path=PurePosixPath("/workspace"),
+            read_only=False,
+        ),
+        DockerUserNamespaceWorkspace(
+            image="executor:test",
+            container_name="rental-pod",
+            container_id=CONTAINER_ID,
+            pid=4321,
+            path=PurePosixPath("/proc/4321/root/root"),
+            read_only=False,
+        ),
+    ],
+    ids=["plain_volume", "encrypted_running"],
+)
+def test_no_rendered_helper_spec_carries_a_volume_passphrase(
+    workspace: DockerVolumeWorkspace | DockerUserNamespaceWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The rendered `docker run` argv plus the environment handed to it IS the helper's
+    # container spec — what `docker inspect` and config.v2.json show the provider. Grep it.
+    monkeypatch.setenv("LIUM_VOLUME_PASSPHRASE", "leaked-from-the-executor-environment")
+    mode = "encrypted_running" if isinstance(workspace, DockerUserNamespaceWorkspace) else "plain_volume"
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore", mode=mode)),
+        workspace,
+    )
+
+    rendered: list[str] = []
+    forwarded_env: set[str] = set()
+    for command, _ in (
+        runner._restore_execution_command(SNAPSHOT_ID),
+        runner._legacy_restore_execution_command("legacy/object.tgz"),
+        runner._execution_command(["backup", "--json", "."], working_directory=True),
+    ):
+        rendered.extend(command)
+        forwarded_env.update(
+            command[index + 1] for index, argument in enumerate(command) if argument == "-e"
+        )
+
+    # only `-e NAME` entries cross from the executor's environment into the container
+    assert "LIUM_VOLUME_PASSPHRASE" not in forwarded_env, forwarded_env
+    assert not any("passphrase" in item.lower() for item in rendered), rendered
+    assert not any("gocryptfs" in item for item in rendered), rendered
+    assert "leaked-from-the-executor-environment" not in " ".join(rendered)
 
 
 def test_local_cancellation_marker_is_observed() -> None:
