@@ -126,7 +126,6 @@ class Settings(BaseSettings):
         env="BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS", default=DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS
     )
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
-    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
@@ -156,7 +155,6 @@ class Settings(BaseSettings):
         env="MINER_PORTAL_REST_API_URL", default="https://provider-api.lium.io/"
     )
     TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
-    COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
 
     PORTION_FOR_UPTIME: float = 1
@@ -246,7 +244,6 @@ class Settings(BaseSettings):
         env="REFERRAL_FEED_MAX_STALENESS_EPOCHS", default=3
     )
 
-    ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
     # DAH-2959: a never-measured executor whose first VerifyX download sample is below the 100 Mbps
     # EMA gate gets one more sample inside the same task, and the better one seeds the EMA. 11 of
@@ -617,24 +614,24 @@ class Settings(BaseSettings):
     # turns it on.
     ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
 
+    # collateral_deposited keeps its meaning for the backend's provider statistics and the support board:
+    # the miner's associated EVM address owns the executor on this contract and its collateral covers
+    # required_deposit_amount × gpu_count × COLLATERAL_DAYS. It has no score effect. The read is the contract's
+    # storage at the finalized block through the Substrate JSON-RPC (state_getStorage), so the URL must be a
+    # Subtensor node; it is cached per executor for COLLATERAL_STATUS_CACHE_SECONDS.
+    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
+        env="COLLATERAL_CONTRACT_ADDRESS", default="0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"
     )
-    CONTRACT_VERSIONS: dict = {
-        "1.0.2": {
-            "address": "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6",
-            "info": "3rd version: Fixed 'ExecutorNotOwned' error",
-        },
-    }
+    COLLATERAL_CONTRACT_VERSION: str = "1.0.2"
+    COLLATERAL_DAYS: int = 7
+    COLLATERAL_STATUS_TIMEOUT_SECONDS: float = Field(env="COLLATERAL_STATUS_TIMEOUT_SECONDS", default=5.0, gt=0)
+    COLLATERAL_STATUS_CACHE_SECONDS: int = Field(env="COLLATERAL_STATUS_CACHE_SECONDS", default=1800, ge=0)
+
     FEATURE_FLAGS: dict[str, bool] = {
         FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,  # If it's True - then bad internet connection will raise error on synthetic job
     }
 
-    # GPU types that will be excluded in collateral checks
-    COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
-        "NVIDIA B200"
-    ]
-    
     # TDX Attestation settings
     ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
@@ -728,8 +725,6 @@ class Settings(BaseSettings):
     # - the checks with no data dependency run at once (`PipelineFactory.build_checks(fast_path=True)`:
     #   the matmul chain beside the port/sysbox/rental-check chain, after VerifyX has measured the
     #   network alone — the split and the order the executor's own one-call verification uses);
-    # - the collateral read starts under the pure-data GPU checks and is awaited where it is today
-    #   (`CollateralPrefetchCheck`); the fatal collateral gate and the score gate are unchanged;
     # - the express lane ticks every EXPRESS_LANE_FAST_TICK_SECONDS and, when the miner's portal
     #   snapshot does not list the node yet, asks again after EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
     #   (the central miner refreshes that snapshot every 30 s); the 120-s retry stays for every other reason.
@@ -850,9 +845,6 @@ class Settings(BaseSettings):
         if self.REDIS_USERNAME and self.REDIS_PASSWORD:
             return f"redis://{self.REDIS_USERNAME}:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{int(self.REDIS_PORT)}"
         return f"redis://{self.REDIS_HOST}:{int(self.REDIS_PORT)}"
-
-    def get_latest_contract_version(self) -> str:
-        return max(self.CONTRACT_VERSIONS.keys())
 
     def get_referral_feed_url(self) -> str:
         """Referral-weights feed URL, derived from COMPUTE_REST_API_URL unless overridden.

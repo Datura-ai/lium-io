@@ -15,7 +15,6 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from clients.backend_client import BackendClient
 from core.config import settings, shared_client
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -32,8 +31,7 @@ from .checks import (
     BannedProviderCheck,
     CachedTemplateVerificationCheck,
     CapabilityCheck,
-    CollateralCheck,
-    CollateralPrefetchCheck,
+    CollateralStatusCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -107,7 +105,6 @@ class PipelineFactory:
         redis_service: RedisService,
         validation_service: ValidationService,
         verifyx_validation_service: VerifyXValidationService,
-        collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
         backend_client: BackendClient,
         pod_recovery: PodRecoverer,
@@ -119,7 +116,6 @@ class PipelineFactory:
             redis_service: Redis service for state management
             validation_service: Matrix validation service
             verifyx_validation_service: VerifyX validation service
-            collateral_contract_service: Collateral contract service
             executor_connectivity_service: Executor connectivity service
             backend_client: Backend API client
             pod_recovery: Docker service, for checks that repair container state
@@ -129,7 +125,6 @@ class PipelineFactory:
         self.validation_service = validation_service
         self.verifyx_validation_service = verifyx_validation_service
         self.inspector_validation_service = InspectorValidationService()
-        self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
         self.pod_recovery = pod_recovery
@@ -219,7 +214,6 @@ class PipelineFactory:
             services=ContextServices(
                 ssh=self.ssh_service,
                 redis=self.redis_service,
-                collateral=self.collateral_contract_service,
                 validation=self.validation_service,
                 verifyx=self.verifyx_validation_service,
                 inspector=self.inspector_validation_service,
@@ -255,7 +249,6 @@ class PipelineFactory:
                 # constant when the backend is unreachable (shared config empty).
                 nvml_digest_map=shared_client.config.nvml_ml_digests or LIB_NVIDIA_ML_DIGESTS,
                 nvml_invalid_drivers=shared_client.config.nvml_invalid_drivers,
-                enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
                 verifyx_enabled=settings.ENABLE_VERIFYX,
                 inspector_enabled=settings.ENABLE_INSPECTOR,
                 port_private_key=private_key,
@@ -325,7 +318,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
-                CollateralCheck(),
+                CollateralStatusCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.
@@ -407,8 +400,6 @@ class PipelineFactory:
         """The first-pass pipeline with the validation fast path on: every check of build_checks,
         each deciding exactly as there, in an order that waits less.
 
-        - `CollateralPrefetchCheck` right after the scrape starts the contract read that
-          `CollateralCheck` (kept at its place, fatal as today) awaits instead of starting.
         - VerifyX runs alone first: it measures the node's network, and nothing else of ours may
           be pulling an image or copying a challenge while it does.
         - Then one `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
@@ -434,7 +425,6 @@ class PipelineFactory:
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
                 RentedGpuDropCheck(),
-                CollateralPrefetchCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
@@ -448,7 +438,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
-                CollateralCheck(),
+                CollateralStatusCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
@@ -523,7 +513,7 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
-                CollateralCheck(),
+                CollateralStatusCheck(),
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),

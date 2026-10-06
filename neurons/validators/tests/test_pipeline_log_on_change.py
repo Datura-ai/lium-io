@@ -60,7 +60,7 @@ def _event(
 OK, SKIPPED = _event, partial(_event, "SYSBOX_REQUIRED_SKIPPED_RENTED")
 MISSING = partial(_event, "SYSBOX_REQUIRED_MISSING", "warning")
 PORT_FAILED = partial(_event, "PORT_VERIFICATION_FAILED", "error", check_id=PORTS)
-COLLATERAL = partial(_event, "COLLATERAL_MISSING", "warning")
+PROVIDER_STATE = partial(_event, "EXECUTOR_IMAGE_OUTDATED", "warning")
 DONE = partial(_event, "VALIDATION_COMPLETED", check_id="x.finalize", what_we_saw=FINAL)
 
 
@@ -95,7 +95,7 @@ async def _levels(caplog, sink: LoggerSink, events) -> list[int]:
             True, id="warn-error",
         ),
         pytest.param([OK(), MISSING(), OK()], [INFO, WARNING, INFO], True, id="recovery"),
-        pytest.param([COLLATERAL(), COLLATERAL()], [INFO, DEBUG], True, id="provider-state"),
+        pytest.param([PROVIDER_STATE(), PROVIDER_STATE()], [INFO, DEBUG], True, id="provider-state"),
         pytest.param(
             [OK(), OK(executor_uuid="exec-2"), OK(check_id="gpu"), OK(executor_uuid="exec-2")],
             [INFO, INFO, INFO, DEBUG],
@@ -121,7 +121,7 @@ async def test_sink_levels(caplog, durations, events, expected, tracked):
     sink = LoggerSink(logging.getLogger(LOGGER), tracker=StatusChangeTracker() if tracked else None)
 
     assert await _levels(caplog, sink, events) == expected
-    if events[-1].reason_code == "COLLATERAL_MISSING":
+    if events[-1].reason_code == "EXECUTOR_IMAGE_OUTDATED":
         assert caplog.records[-1].msg.extra["reason"] == "provider_state"
 
 
@@ -160,7 +160,7 @@ async def test_repeat_keeps_its_step_duration_at_info(
 
 def test_pipelines_from_one_factory_share_the_tracker(monkeypatch):
     monkeypatch.setattr(pipeline_factory_module, "InspectorValidationService", MagicMock)
-    factory = PipelineFactory(*(MagicMock() for _ in range(8)))
+    factory = PipelineFactory(*(MagicMock() for _ in range(7)))
     first, second = factory.build_pipeline([]), factory.build_pipeline([])
 
     assert isinstance(factory.status_tracker, StatusChangeTracker)

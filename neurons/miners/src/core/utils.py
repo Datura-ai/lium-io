@@ -4,7 +4,7 @@ import json
 import logging
 
 from core.config import settings
-from celium_collateral_contracts import CollateralContract
+from core.collateral import CollateralClient
 
 logger = logging.getLogger(__name__)
 
@@ -91,29 +91,66 @@ _m = StructuredMessage
 def get_collateral_contract(
     miner_key: str = None,
     version: str = "1.0.2",
-) -> CollateralContract:
+) -> CollateralClient:
     """
-    Initializes and returns a CollateralContract instance.
+    Returns a client for the collateral contract of the given version.
 
     Args:
-        version (str): Contract version to use (defaults to 1.0.1).
-        miner_key (str): Optional miner key required for contract operations.
-
-    Returns:
-        CollateralContract: The initialized contract instance.
+        version (str): Contract version to use (defaults to 1.0.2).
+        miner_key (str): Optional miner key, required to send reclaim transactions.
     """
-    network = settings.BITTENSOR_NETWORK
-    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS  # Default address
-    
-    # Use version-specific address if available
+    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
     if version and settings.CONTRACT_VERSIONS.get(version):
         contract_address = settings.CONTRACT_VERSIONS.get(version)["address"]
-    
-    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
 
-    return CollateralContract(
-        network=network,
+    return CollateralClient(
+        network=settings.BITTENSOR_NETWORK,
         contract_address=contract_address,
-        rpc_url=rpc_url,
+        rpc_url=settings.SUBTENSOR_EVM_RPC_URL,
         miner_key=miner_key,
+        max_gas_price_gwei=settings.COLLATERAL_MAX_GAS_PRICE_GWEI,
+        sent_record_path=settings.COLLATERAL_SENT_RECORD,
+        other_contract_addresses=tuple(entry["address"] for entry in settings.CONTRACT_VERSIONS.values()),
     )
+
+
+async def versions_holding_collateral(executor_uuid: str) -> list[str]:
+    """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor.
+
+    Every contract is read three times: at the head and at its parent, both named by hash and taken from one head
+    response (`_storage_at_block_hash`: the contract's storage at the Substrate block that built it, so a backend
+    without that block fails the read instead of answering from another state), and at `latest`. Both pinned reads
+    must succeed: a deposit in the head is seen there even when `latest` reaches a backend still at the parent.
+    A version counts when any read sees collateral, so the answer errs towards "still held": reads at `latest`
+    alone, one after another, can straddle a deposit landing on one contract and a reclaim finalizing on the other and report
+    neither, and removing the executor then drops the record of collateral that is still held. Near the head, not
+    finalized: a deposit that is mined but not yet final must still count, and the `latest` read sees one mined in
+    the head block itself."""
+    head_hash, parent_hash = await get_collateral_contract().head_block_hashes()
+    versions = []
+    for version in settings.CONTRACT_VERSIONS:
+        contract = get_collateral_contract(version=version)
+        at_parent = await contract.get_executor_collateral(executor_uuid, block_hash=parent_hash)
+        at_head = await contract.get_executor_collateral(executor_uuid, block_hash=head_hash)
+        latest = await contract.get_executor_collateral(executor_uuid)
+        if at_parent > 0 or at_head > 0 or latest > 0:
+            versions.append(version)
+    return versions
+
+
+async def versions_with_open_reclaim(reclaim_request_id: int, miner_address: str) -> list[str]:
+    """The CONTRACT_VERSIONS keys whose contract holds an open reclaim request with this id for this miner.
+
+    Reclaim request ids are counted per contract, so the same id can exist on several contracts. Every contract is
+    read at one finalized block named by its hash: reads at `latest` one after another can straddle a request
+    opening on one contract and report only the other, and the CLI then picks it without asking.
+    """
+    block_hash = await get_collateral_contract().finalized_block_hash()
+    versions = []
+    for version in settings.CONTRACT_VERSIONS:
+        _, miner, amount, _ = await get_collateral_contract(version=version).get_reclaim_request(
+            reclaim_request_id, block_hash=block_hash
+        )
+        if amount > 0 and miner.lower() == miner_address.lower():
+            versions.append(version)
+    return versions
