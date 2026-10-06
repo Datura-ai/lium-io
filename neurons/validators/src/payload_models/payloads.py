@@ -336,6 +336,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     active_container_names: list[str] | None = None
     cluster_membership: ClusterMembership | None = None
     active_volume_names: list[str] | None = None
+    # DAH-1482: renter secrets (name -> value); never logged (every create logs str(payload)) or re-serialized
+    secrets: dict[str, str] | None = Field(default=None, repr=False, exclude=True)
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.

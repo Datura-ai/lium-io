@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import socket as socket_module
 import tempfile
 import threading
@@ -42,6 +43,11 @@ RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+# DAH-1482: renter secrets live on a tmpfs, so a value never reaches the container's disk, env or
+# `docker inspect`. mode=1777: files are written as the image's USER, which may be non-root.
+POD_SECRETS_DIR = "/run/lium/secrets"
+POD_SECRETS_TMPFS = {POD_SECRETS_DIR: "rw,noexec,nosuid,nodev,size=1m,mode=1777"}
+_POD_SECRET_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 logger = logging.getLogger(__name__)
 
 
@@ -195,6 +201,7 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    tmpfs: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -203,6 +210,8 @@ class ContainerExecSpec:
     argv: tuple[str, ...]
     stdin: str | bytes | None = None
     environment: dict[str, str] = field(default_factory=dict)
+    # "" runs as the image's USER; the default pins rental bootstrap to root
+    user: str = "0"
 
 
 @dataclass(slots=True)
@@ -812,8 +821,8 @@ class RentalDockerSdkClient:
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
-        # Every spec routed here is rental bootstrap writing to /root or /etc, so
-        # it must not inherit a non-root image USER (DAH-2534). Numeric uid, so no
+        # Rental bootstrap writes to /root or /etc, so by default a spec must not
+        # inherit a non-root image USER (DAH-2534). Numeric uid, so no
         # root entry in the image's /etc/passwd is required. The renter's own
         # workload still runs as the image's USER — only these execs are pinned.
         exec_create_result = self._api_client.exec_create(
@@ -821,7 +830,7 @@ class RentalDockerSdkClient:
             cmd=list(spec.argv),
             stdin=stdin_data is not None,
             environment=spec.environment or None,
-            user="0",
+            user=spec.user,
         )
         exec_id = exec_create_result["Id"]
 
@@ -1026,6 +1035,32 @@ def build_environment_exec_spec(
     )
 
 
+def build_pod_secret_exec_specs(*, container_name: str, secrets: dict[str, str]) -> list[ContainerExecSpec]:
+    # one exec per secret as the image's USER, the value on stdin only; `.ready` is written last.
+    # Refuses to write unless the directory is the tmpfs mount, so a value never lands on the disk layer.
+    guard = (
+        f"grep -qs ' {POD_SECRETS_DIR} tmpfs ' /proc/mounts "
+        f"|| {{ echo {POD_SECRETS_DIR} is not a tmpfs >&2; exit 1; }}; umask 077; "
+    )
+    specs = []
+    for name, value in secrets.items():
+        if not _POD_SECRET_NAME_PATTERN.fullmatch(name):
+            # not echoed: a refused name may be a pasted value
+            raise ValueError("invalid secret name: letters, digits and _ only, not starting with a digit")
+        specs.append(ContainerExecSpec(
+            container_name=container_name,
+            argv=("sh", "-c", guard + f"cat > {POD_SECRETS_DIR}/{name}"),
+            stdin=value,
+            user="",
+        ))
+    specs.append(ContainerExecSpec(
+        container_name=container_name,
+        argv=("sh", "-c", guard + f"date -u > {POD_SECRETS_DIR}/.ready"),
+        user="",
+    ))
+    return specs
+
+
 def _default_docker_api_client_factory(**kwargs):
     import docker
 
@@ -1127,6 +1162,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         ),
         "shm_size": spec.shm_size,
         "network_mode": spec.network,
+        "tmpfs": spec.tmpfs,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
 

@@ -120,6 +120,7 @@ from services.rental_docker_sdk import (
     ContainerStateSnapshot,
     ContainerUlimit,
     DeviceMount,
+    POD_SECRETS_TMPFS,
     PortBinding,
     RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
@@ -133,6 +134,7 @@ from services.rental_docker_sdk import (
     is_docker_container_not_running_error,
     is_docker_not_found_error,
     build_environment_exec_spec,
+    build_pod_secret_exec_specs,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
 )
@@ -2224,6 +2226,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            tmpfs=POD_SECRETS_TMPFS if settings.POD_SECRETS_TMPFS_ENABLED and payload.secrets else None,
         )
 
     async def _ensure_pod_quote_socket(
@@ -7536,6 +7539,20 @@ class DockerService:
                     )
                     if environment_error:
                         raise RuntimeError(f"Failed to set environment variables: {environment_error}")
+
+                    if settings.POD_SECRETS_TMPFS_ENABLED and payload.secrets:
+                        current_step = "write_pod_secrets"
+                        for secret_exec_spec in build_pod_secret_exec_specs(
+                            container_name=container_name, secrets=payload.secrets
+                        ):
+                            secret_write_result = await exec_logged_rental_docker_sdk_operation(
+                                docker_client=docker_client,
+                                operation="exec_write_pod_secret",
+                                exec_spec=secret_exec_spec,
+                                log_extra=default_extra,
+                            )
+                            if secret_write_result.exit_status != 0:
+                                raise RuntimeError(f"Failed to write pod secrets: {secret_write_result.stderr}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
