@@ -491,3 +491,49 @@ async def test_filler_create_never_triggers_the_rental_reclaim(docker_service):
     await docker_service.reclaim_dphn_cache_for_rental(ssh_client, payload, {})
 
     assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
+async def test_an_engy_launch_never_sweeps_the_dolphin_cache(docker_service):
+    # DAH-2805: the sweep used to look at `dphn_cache_` only, so an ENGY launch — whose kept names are
+    # all `engy_cache_` — read every Dolphin volume as stale and deleted it. The node then re-downloaded
+    # ~37 GB the next time it ran Dolphin, which is exactly what these volumes exist to avoid.
+    ssh_client = FakeSshClient(["dphn_cache_hf_v1", "engy_cache_ckpt_old", "engy_cache_ckpt_new"])
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="engy_cache_ckpt_new", target="/opt/engy/models")],
+    )
+
+    await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
+
+    assert _removed_volumes(ssh_client) == ["engy_cache_ckpt_old"]
+
+
+@pytest.mark.asyncio
+async def test_an_engy_launch_sweeps_its_own_stale_checkpoint(docker_service):
+    # The other half: a checkpoint or image bump renames the volume, and nothing swept the old one, so
+    # every bump left ~35 GB on the host forever.
+    ssh_client = FakeSshClient(["engy_cache_ckpt_old", "engy_cache_jit_old", "engy_cache_jit_new"])
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="engy_cache_jit_new", target="/opt/engy/deepgemm-cache")],
+    )
+
+    await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
+
+    assert _removed_volumes(ssh_client) == ["engy_cache_ckpt_old", "engy_cache_jit_old"]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_engy_cache_is_mounted_without_charging_for_it_again(docker_service):
+    # Same bug as the DPHN case above, which the prefix filter hid for ENGY: its volumes were never
+    # seen as present, so every ENGY launch was measured as if the checkpoint still had to be pulled.
+    ssh_client = HostSshClient(["engy_cache_ckpt_v1"], free_gb=170)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="engy_cache_ckpt_v1", target="/opt/engy/models")],
+    )
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
+
+    assert [volume.name for volume in affordable] == ["engy_cache_ckpt_v1"]

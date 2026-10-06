@@ -5,6 +5,7 @@ import string
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated
 
@@ -13,6 +14,9 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
 from services.ssh_service import SSHService
+
+# Where each cycle's job files (the frozen scrape) are written: one `cycle-*` directory per cycle.
+JOB_FILES_ROOT = Path(__file__).parent / "temp"
 
 # ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
 # gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
@@ -24,6 +28,7 @@ KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
     "gpu.cuda",
     "gpu.power_limit",
     "gpu.power_default_limit",
+    "gpu.power_min_limit",
     "gpu.power_max_limit",
     "gpu.graphics_speed",
     "gpu.memory_speed",
@@ -40,6 +45,7 @@ ORIGINAL_KEYS = {
     "gpu.cuda": "cuda",
     "gpu.power_limit": "power_limit",
     "gpu.power_default_limit": "power_default_limit",
+    "gpu.power_min_limit": "power_min_limit",
     "gpu.power_max_limit": "power_max_limit",
     "gpu.graphics_speed": "graphics_speed",
     "gpu.memory_speed": "memory_speed",
@@ -59,10 +65,6 @@ ORIGINAL_KEYS = {
     'c_nvmlMemory_v2_t_used': "used",
     'c_nvmlUtilization_t_gpu': "gpu",
     'c_nvmlUtilization_t_memory': "memory",
-    'upload_speed': "upload_speed",
-    'download_speed': "download_speed",
-    'network_speed_error': "network_speed_error",
-    'net_speed_error': "net_speed_error",
     'gpu_count': "count",
     'gpu_driver': "driver",
     'gpu_cuda_driver': "cuda_driver",
@@ -96,6 +98,8 @@ ORIGINAL_KEYS = {
     'hard_disk_volumes': "volumes",
     'hard_disk_scrape_error': "hard_disk_scrape_error",
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
+    # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
+    'hard_disk_disk_type': "disk_type",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -117,12 +121,15 @@ ORIGINAL_KEYS = {
     'docker_version': "version",
     'docker_container_id': "container_id",
     'docker_containers': "containers",
+    'docker_host_cpu_percent': "host_cpu_percent",
     'data_docker': "docker",
     'each_container_id': "container_id",
     'each_digest': "digest",
     'each_name': "name",
+    'each_cpu_percent': "cpu_percent",
     'data_sysbox_runtime': "sysbox_runtime",
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
+    'data_sysbox_version': "sysbox_version",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
     'data_ncu_profiling_access': "ncu_profiling_access",
@@ -145,6 +152,30 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
+    # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
+    # keys are prefixed so no existing key is a substring of them (ecrypt_miner_job_files renames by
+    # sequential str.replace); the backend names are what MachineSpecs declares.
+    'data_interconnect_scrape_error': "interconnect_scrape_error",
+    'data_interconnect': "interconnect",
+    'ic_devices': "gpu_count",
+    'ic_gpu_pairs': "gpu_pairs",
+    'ic_nvlink_active_links': "nvlink_active_links",
+    'ic_nvlink_links': "nvlink_links",
+    'ic_nvlink_pairs': "nvlink_pairs",
+    'ic_nvlink': "nvlink",
+    'ic_pcie_class': "pcie_class",
+    'ic_p2p_ok_pairs': "p2p_ok_pairs",
+    'ic_p2p_pairs': "p2p_pairs",
+    'ic_p2p': "p2p",
+    'ic_matrix': "matrix",
+    # DAH-2928: disk health. Prefixed so no existing key is a substring (ecrypt_miner_job_files
+    # renames by sequential str.replace); the longer of two keys sharing a prefix comes first.
+    'data_disk_health_scrape_error': "disk_health_scrape_error",
+    'data_disk_health': "disk_health",
+    'dh_docker_root_dir': "docker_root_dir",
+    'dh_read_only_mounts': "read_only_mounts",
+    'dh_write_probe_error': "write_probe_error",
+    'dh_write_probe': "write_probe",
 }
 
 
@@ -215,6 +246,7 @@ class FileEncryptService:
             "gpu.cuda": "",
             "gpu.power_limit": "",
             "gpu.power_default_limit": "",
+            "gpu.power_min_limit": "",
             "gpu.power_max_limit": "",
             "gpu.graphics_speed": "",
             "gpu.memory_speed": "",
@@ -254,10 +286,6 @@ class FileEncryptService:
             'c_nvmlMemory_v2_t_used': "",
             'c_nvmlUtilization_t_gpu': "",
             'c_nvmlUtilization_t_memory': "",
-            'upload_speed': "",
-            'download_speed': "",
-            'network_speed_error': "",
-            'net_speed_error': "",
             'hard_disk_total': "",
             'hard_disk_used': "",
             'hard_disk_free': "",
@@ -267,6 +295,7 @@ class FileEncryptService:
             'hard_disk_volumes': "",
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
+            'hard_disk_disk_type': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",
@@ -291,14 +320,17 @@ class FileEncryptService:
             'docker_version': "",
             'docker_container_id': "",
             'docker_containers': "",
+            'docker_host_cpu_percent': "",
             'data_docker': "",
             'data_ram': "",
             'each_container_id': "",
             'each_digest': "",
             'each_name': "",
+            'each_cpu_percent': "",
             'machine_specs': "",
             'data_sysbox_runtime_scrape_error': "",
             'data_sysbox_runtime': "",
+            'data_sysbox_version': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
             'data_ncu_profiling_scrape_error': "",
@@ -321,32 +353,79 @@ class FileEncryptService:
             'data_container_cap_eff': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
+            # DAH-2922 - longer keys before the key they extend (prefix rule above)
+            'data_interconnect_scrape_error': "",
+            'data_interconnect': "",
+            'ic_devices': "",
+            'ic_gpu_pairs': "",
+            'ic_nvlink_active_links': "",
+            'ic_nvlink_links': "",
+            'ic_nvlink_pairs': "",
+            'ic_nvlink': "",
+            'ic_pcie_class': "",
+            'ic_p2p_ok_pairs': "",
+            'ic_p2p_pairs': "",
+            'ic_p2p': "",
+            'ic_matrix': "",
+            # DAH-2928 - longer keys before the key they extend (prefix rule above)
+            'data_disk_health_scrape_error': "",
+            'data_disk_health': "",
+            'dh_docker_root_dir': "",
+            'dh_read_only_mounts': "",
+            'dh_write_probe_error': "",
+            'dh_write_probe': "",
         }
 
-        # Generate dictionary key mapping on validator side
-        for key, value in all_keys.items():
-            all_keys[key] = self.generate_random_name()
+        # Names must be unique: the validator reverses this map, so a shared name loses a key.
+        # No key fits "_" + letters (tested), so a later str.replace never matches inside a name.
+        used_names: set[str] = set()
+        for key in all_keys:
+            name = self.generate_random_name()
+            while name in used_names:
+                name = self.generate_random_name()
+            used_names.add(name)
+            all_keys[key] = name
 
         encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
 
-    def ecrypt_miner_job_files(self):
+    @staticmethod
+    def fresh_job_files_directory(keep: Iterable[str] = ()) -> Path:
+        """A new, empty directory for this cycle's job files under JOB_FILES_ROOT; every earlier
+        cycle's directory is removed unless its path is in `keep`.
+
+        DAH-2958: an express verification reads the job files of the cycle that prepared them
+        (UploadFilesCheck, the scrape's binary fallback) and may still be running when the next
+        cycle starts, so the validator passes the lane's directories in use and they survive
+        until the first cycle that starts after those verifications ended.
+        """
+        root = JOB_FILES_ROOT
+        root.mkdir(exist_ok=True)
+        kept = {Path(path).resolve() for path in keep}
+        for entry in root.iterdir():
+            if entry.resolve() in kept:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        return Path(tempfile.mkdtemp(prefix="cycle-", dir=root))
+
+    def ecrypt_miner_job_files(self, keep_directories: Iterable[str] = ()):
         """
         Encrypts and obfuscates miner job files for secure execution.
 
         This function performs the following steps:
-        1. Clears any existing temporary directory used for storing encrypted files.
+        1. Makes a fresh directory for this cycle's files and removes the earlier cycles' directories
+           (except `keep_directories`, still read by an express verification — DAH-2958).
         2. Defines file paths for the machine scrape script and its obfuscator.
         3. Runs the obfuscator script to generate an obfuscated version of the machine scrape script.
         4. Replaces dictionary keys in the obfuscated script with randomly generated names.
         5. Compiles the obfuscated script into a binary using Nuitka or another method.
-        6. Generates a score script file and obfuscates it for secure execution.
 
         Returns: MinerJobEnryptedFiles
         """
-        tmp_directory = Path(__file__).parent / "temp"
-        if tmp_directory.exists() and tmp_directory.is_dir():
-            shutil.rmtree(tmp_directory)
+        tmp_directory = self.fresh_job_files_directory(keep_directories)
 
         # file pathes
         machine_scrape_file_path = str(
@@ -390,21 +469,10 @@ class FileEncryptService:
             #         str(tmp_directory), machine_scrape_file.name
             #     )
 
-        # # generate score_script file
-        # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
-        # with open(score_script_file_path) as file:
-        #     content = file.read()
-        # modified_content = content
-
-        # with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
-        #     score_file.write(modified_content.encode("utf-8"))
-        #     score_file.flush()
-        #     os.fsync(score_file.fileno())
-        #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
-
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
+            machine_scrape_source=obfuscated_content,
         )

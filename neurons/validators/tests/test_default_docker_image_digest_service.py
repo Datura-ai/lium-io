@@ -1,5 +1,6 @@
 """Tests for the default docker image digest snapshot (DAH-2380)."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -7,6 +8,8 @@ import pytest
 from neurons.validators.src.services.default_docker_image_digest_service import (
     _shared_config_image_refs,
     fetch_default_image_digests,
+    fetch_docker_hub_digest,
+    fetch_executor_image_digest,
     fetch_registry_digest,
 )
 
@@ -118,3 +121,57 @@ async def test_fetch_default_image_digests_reads_refs_from_shared_config():
         digests = await fetch_default_image_digests()
 
     assert digests == {"daturaai/pytorch:shared": "sha256:shared"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_executor_image_digest_uses_executor_image_ref():
+    with patch(
+        f"{_MODULE}.fetch_registry_digest",
+        new=AsyncMock(return_value=f"sha256:{'a' * 64}"),
+    ) as fetch_registry:
+        digest = await fetch_executor_image_digest()
+
+    assert digest == f"sha256:{'a' * 64}"
+    fetch_registry.assert_awaited_once()
+    assert fetch_registry.await_args.args[1] == "daturaai/compute-subnet-executor:latest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("image", "looked_up"),
+    [
+        ("daturaai/pytorch:2.11.0-dind-lium1", "daturaai/pytorch:2.11.0-dind-lium1"),
+        ("docker.io/daturaai/pytorch:prod", "daturaai/pytorch:prod"),
+        ("ubuntu:24.04", "library/ubuntu:24.04"),
+        ("ghcr.io/org/app:prod", None),
+        ("ghcr.io/app:prod", None),
+        ("localhost:5000/app:prod", None),
+        ("localhost/app:prod", None),
+        ("daturaai/pytorch@sha256:abc", None),
+        ("daturaai/pytorch", None),
+        ("daturaai/../v2/x:tag", None),
+        ("daturaai/pytorch:tag?x=1", None),
+    ],
+)
+async def test_fetch_docker_hub_digest_asks_docker_hub_only_for_a_plain_hub_tag(image, looked_up):
+    with patch(f"{_MODULE}.fetch_registry_digest", AsyncMock(return_value="sha256:d")) as fetch:
+        digest = await fetch_docker_hub_digest(image)
+
+    if looked_up is None:
+        assert digest is None
+        fetch.assert_not_awaited()
+    else:
+        assert digest == "sha256:d"
+        assert fetch.await_args.args[1] == looked_up
+
+
+@pytest.mark.asyncio
+async def test_fetch_docker_hub_digest_gives_up_at_its_bound_when_docker_hub_hangs(monkeypatch):
+    monkeypatch.setattr(f"{_MODULE}._RENT_PATH_DIGEST_TIMEOUT_SECONDS", 0.05)
+    async def docker_hub_hangs(*args: object) -> str | None:
+        await asyncio.Event().wait()
+
+    with patch(f"{_MODULE}.fetch_registry_digest", docker_hub_hangs):
+        digest = await asyncio.wait_for(fetch_docker_hub_digest("daturaai/pytorch:prod"), timeout=2)
+
+    assert digest is None

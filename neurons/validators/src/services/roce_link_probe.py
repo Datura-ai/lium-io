@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import PROBE_CONTAINER_NAME
 from services.task.models import JobResult
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,6 @@ logger = logging.getLogger(__name__)
 PROBE_IMAGE = "daturaai/lium-rdma-probe:0.0.1"
 # The image's own entrypoint, named again because the server run replaces it with `timeout`.
 PROBE_ENTRYPOINT = "/usr/local/bin/lium-roce-probe"
-PROBE_CONTAINER_NAME = "lium_roce_probe"
 # Both sides open this for the out-of-band handshake; the data path is card to card and never
 # touches it. Well above the ephemeral range so it cannot collide with a renter's published port.
 PROBE_HANDSHAKE_PORT = 18515

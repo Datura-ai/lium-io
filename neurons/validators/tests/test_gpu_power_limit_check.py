@@ -64,6 +64,8 @@ def _state(
     count: int = 1,
     default_job_owner: str | None = None,
     rented_data_known: bool = True,
+    min_limit: float | None = None,
+    gpu_owner_map: dict[str, str] | None = None,
 ) -> ContextState:
     details = [
         {
@@ -73,6 +75,7 @@ def _state(
             "power_default_limit": default_limit,
             "power_max_limit": max_limit,
         }
+        | ({"power_min_limit": min_limit} if min_limit is not None else {})
         for index in range(count)
     ]
     rented_data = None
@@ -81,6 +84,7 @@ def _state(
         rented_data = RentedExecutorsResponse(
             executors={},
             default_job_owner_by_executor=owner_map,
+            default_job_owner_by_gpu=gpu_owner_map or {},
         )
     return build_state(
         gpu_model="NVIDIA L40S",
@@ -97,6 +101,21 @@ async def test_power_limit_passes_when_current_is_close_to_default(context_facto
     assert result.passed is True
     assert result.event.reason_code == "GPU_POWER_LIMIT_OK"
     read_records_mock.assert_not_awaited()  # healthy nodes cost zero Redis traffic
+
+
+@pytest.mark.asyncio
+async def test_power_limit_evidence_carries_the_host_floor(context_factory, read_records_mock) -> None:
+    """B-113: the scrape's power_min_limit (the lowest cap the host accepts) travels into the
+    check's measurements so a power-cap guard can tell a BIOS clamp from a refused cap; a scrape
+    without the field yields None, never a failure."""
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, min_limit=100))
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.event.what_we_saw["rejected_gpus"][0]["power_min_limit"] == 100
+
+    ctx = context_factory(state=_state(current_limit=320, default_limit=350))
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.what_we_saw["measurements"][0]["power_min_limit"] is None
 
 
 @pytest.mark.asyncio
@@ -156,6 +175,78 @@ async def test_power_limit_still_rejects_under_miner_default_job(context_factory
     assert result.passed is False
     assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
     assert result.updates["score"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_power_limit_skipped_for_twin_executor_id_of_lium_filler_gpus(
+    context_factory, read_records_mock
+) -> None:
+    # The same GPUs are reported under a second executor id; the filler runs under the other one,
+    # so only the GPU-keyed map names this executor's GPUs as Lium's.
+    ctx = context_factory(
+        state=_state(
+            current_limit=105,
+            default_limit=350,
+            count=2,
+            gpu_owner_map={"GPU-abc": "lium", "GPU-abc-1": "lium"},
+        )
+    )
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+    assert result.event.what_we_saw["gpu_uuids"] == ["GPU-abc", "GPU-abc-1"]
+    read_records_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_power_limit_exemption_follows_gpu_when_executor_id_changes(
+    context_factory, read_records_mock
+) -> None:
+    # The executor-keyed map still names the old id; the GPU-keyed map follows the cards.
+    state = _state(current_limit=105, default_limit=350, gpu_owner_map={"GPU-abc": "lium"})
+    state.rented_data.default_job_owner_by_executor = {"executor-old-id": "lium"}
+    ctx = context_factory(state=state)
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+
+
+@pytest.mark.asyncio
+async def test_power_limit_rejects_capped_gpu_outside_the_lium_gpu_map(
+    context_factory, read_records_mock
+) -> None:
+    # A capped GPU that no Lium filler runs on fails, whatever other GPUs the map lists.
+    ctx = context_factory(
+        state=_state(current_limit=105, default_limit=350, gpu_owner_map={"GPU-other": "lium"})
+    )
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
+    assert result.updates["score"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_power_limit_rejects_when_only_some_capped_gpus_are_lium_filler_gpus(
+    context_factory, read_records_mock
+) -> None:
+    ctx = context_factory(
+        state=_state(current_limit=105, default_limit=350, count=2, gpu_owner_map={"GPU-abc": "lium"})
+    )
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
+
+
+@pytest.mark.asyncio
+async def test_power_limit_rejects_capped_gpu_under_miner_default_job_by_gpu(
+    context_factory, read_records_mock
+) -> None:
+    ctx = context_factory(
+        state=_state(current_limit=105, default_limit=350, gpu_owner_map={"GPU-abc": "miner"})
+    )
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
 
 
 @pytest.mark.asyncio
