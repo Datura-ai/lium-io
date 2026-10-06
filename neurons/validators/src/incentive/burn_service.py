@@ -5,14 +5,38 @@ supporting both the old burner selection algorithm and the new equal distributio
 """
 
 import random
+from collections import Counter
 
 import bittensor
 
-from core.config import settings
+from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_logger
-from services.const import BURNER_EMISSION, TOTAL_BURN_EMISSION
+from services.const import BURNER_EMISSION
 
 logger = get_logger(__name__)
+
+
+def _burner_coldkey_matches(miner: bittensor.NeuronInfo) -> bool:
+    """Return True when the miner UID has no configured coldkey or coldkey matches."""
+    expected_coldkey = settings.BURNER_COLDKEYS.get(miner.uid)
+    if expected_coldkey is None:
+        return True
+
+    if miner.coldkey == expected_coldkey:
+        return True
+
+    logger.error(
+        _m(
+            "Burner coldkey mismatch — withholding burn weight",
+            extra={
+                "miner_uid": miner.uid,
+                "miner_hotkey": miner.hotkey,
+                "expected_coldkey": expected_coldkey,
+                "actual_coldkey": miner.coldkey,
+            },
+        )
+    )
+    return False
 
 
 class BurnService:
@@ -36,8 +60,8 @@ class BurnService:
 
         Args:
             miners: List of all miner neuron information
-            burn_share: Dynamic burn emission share to distribute (e.g., 0.91 for default,
-                       or TOTAL_BURN_EMISSION - rental_share for rental price incentive)
+            burn_share: Dynamic burn emission share to distribute (e.g., 0.87 for default,
+                       or total burn emission - rental_share for rental price incentive)
             last_mechanism_step_block: Block number for randomization (old logic only)
 
         Returns:
@@ -65,7 +89,7 @@ class BurnService:
                     "burn_logic": "new" if settings.ENABLE_NEW_BURN_LOGIC else "old",
                     "num_burners": num_burners,
                     "burn_share": burn_share,
-                    "total_burn_emission_const": TOTAL_BURN_EMISSION,
+                    "total_burn_emission": get_total_burn_emission(),
                     "total_distributed": total_distributed,
                     "burner_hotkeys": list(burn_scores.keys()),
                     "validation": f"distributed={total_distributed:.6f}, expected={burn_share:.6f}",
@@ -80,47 +104,59 @@ class BurnService:
         miners: list[bittensor.NeuronInfo],
         burn_share: float,
     ) -> dict[str, float]:
-        """Calculate burn scores using new logic (equal distribution).
+        """Calculate burn scores using new logic (slot-weighted distribution).
 
-        All burners in NEW_BURNERS receive equal share of burn_share.
+        Burners in NEW_BURNERS share burn_share by slot count. A UID listed
+        multiple times receives a proportionally larger share — this lets a
+        single UID absorb the emission of retired burners.
 
         Args:
             miners: List of all miner neuron information
             burn_share: Dynamic burn emission share to distribute
 
         Returns:
-            dict[str, float]: Burner hotkeys to equal burn scores
+            dict[str, float]: Burner hotkeys to weighted burn scores
         """
         burn_scores = {}
-        burners = settings.NEW_BURNERS
-        burn_score_per_burner = burn_share / len(burners)
+        burner_slots = settings.NEW_BURNERS
+        slot_weights = Counter(burner_slots)
+        total_slots = len(burner_slots)
+        burn_score_per_slot = burn_share / total_slots
 
         for miner in miners:
-            if miner.uid in burners:
-                burn_scores[miner.hotkey] = burn_score_per_burner
+            slots = slot_weights.get(miner.uid, 0)
+            if slots == 0:
+                continue
+            if not _burner_coldkey_matches(miner):
+                continue
 
-                logger.debug(
-                    _m(
-                        "Miner assigned to burn pool (new logic)",
-                        extra={
-                            "miner_uid": miner.uid,
-                            "miner_hotkey": miner.hotkey,
-                            "burn_share": burn_share,
-                            "num_burners": len(burners),
-                            "score": burn_score_per_burner,
-                            "pool": "burn",
-                            "logic": "new_equal_distribution",
-                        },
-                    )
+            score = burn_score_per_slot * slots
+            burn_scores[miner.hotkey] = score
+
+            logger.debug(
+                _m(
+                    "Miner assigned to burn pool (new logic)",
+                    extra={
+                        "miner_uid": miner.uid,
+                        "miner_hotkey": miner.hotkey,
+                        "burn_share": burn_share,
+                        "total_slots": total_slots,
+                        "miner_slots": slots,
+                        "score": score,
+                        "pool": "burn",
+                        "logic": "new_slot_weighted_distribution",
+                    },
                 )
+            )
 
         logger.info(
             _m(
-                "New burn logic applied - equal distribution",
+                "New burn logic applied - slot-weighted distribution",
                 extra={
-                    "total_burners": len(burners),
-                    "burner_uids": list(burners),
-                    "score_per_burner": burn_score_per_burner,
+                    "total_slots": total_slots,
+                    "unique_burners": len(slot_weights),
+                    "slot_weights": dict(slot_weights),
+                    "score_per_slot": burn_score_per_slot,
                     "burn_share": burn_share,
                 },
             )
@@ -155,9 +191,10 @@ class BurnService:
         other_burners = [uid for uid in burners if uid != main_burner]
 
         # Calculate scores proportional to burn_share
-        # Scale the original BURNER_EMISSION by the ratio of burn_share to TOTAL_BURN_EMISSION
-        # This maintains the same distribution pattern but with dynamic burn_share
-        burn_ratio = burn_share / TOTAL_BURN_EMISSION if TOTAL_BURN_EMISSION > 0 else 1
+        # Scale the original BURNER_EMISSION by the ratio of burn_share to the total burn
+        # emission. This maintains the same distribution pattern but with dynamic burn_share.
+        total_burn_emission = get_total_burn_emission()
+        burn_ratio = burn_share / total_burn_emission if total_burn_emission > 0 else 1
         scaled_burner_emission = BURNER_EMISSION * burn_ratio
 
         # Main burner gets: burn_share - (num_other_burners * scaled_burner_emission)
@@ -167,6 +204,8 @@ class BurnService:
 
         for miner in miners:
             if miner.uid == main_burner:
+                if not _burner_coldkey_matches(miner):
+                    continue
                 burn_scores[miner.hotkey] = main_burner_score
 
                 logger.debug(
@@ -186,6 +225,8 @@ class BurnService:
                     )
                 )
             elif miner.uid in other_burners:
+                if not _burner_coldkey_matches(miner):
+                    continue
                 burn_scores[miner.hotkey] = other_burner_score
 
                 logger.debug(
@@ -239,14 +280,14 @@ class BurnService:
         """Get the total burn emission share.
 
         Returns:
-            float: Total portion of emission allocated to burning (0.91)
+            float: Total portion of emission allocated to burning (from shared config)
         """
-        return TOTAL_BURN_EMISSION
+        return get_total_burn_emission()
 
     def get_mining_share(self) -> float:
         """Get the total mining emission share.
 
         Returns:
-            float: Total portion of emission allocated to mining (0.09)
+            float: Total portion of emission allocated to mining (from shared config)
         """
-        return 1 - TOTAL_BURN_EMISSION
+        return 1 - get_total_burn_emission()

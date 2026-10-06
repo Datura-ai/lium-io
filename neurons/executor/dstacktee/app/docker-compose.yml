@@ -1,14 +1,23 @@
 version: '3.7'
 
+# G2 (CVM attestation): the executor-runner is pinned BY DIGEST inside this
+# measured compose so the runner release is covered by compose_hash / RTMR3 —
+# the quote the validator verifies and whitelists (with a monotonic version
+# floor). ${EXECUTOR_RUNNER_IMAGE_DIGEST} ("sha256:<64-hex>") is stamped from
+# .env by lium-cvm.sh BEFORE `dstack.py new` measures this file; rotating the
+# runner therefore changes the measurement and requires a new whitelisted
+# compose release version.
+#
+# The lium-watchtower auto-updater is retired from the measured topology: an
+# in-place runner rotation would reintroduce measured ≠ running. Runner updates
+# now ship as a CVM redeploy with a new stamped digest (zero-touch updates are
+# traded for verifiability — see the DAH-2338 remediation plan, G2/G9).
+
 services:
-  lium-watchtower:
-    image: daturaai/lium-watchtower@sha256:4c26288f06261eb33f41793a39e3364017a6b1f30c3e852770c0dd3e72595bed
+  executor-runner:
+    image: daturaai/compute-subnet-executor-runner@${EXECUTOR_RUNNER_IMAGE_DIGEST}
+    container_name: executor-runner
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./.env:/app/.env
-    environment:
-      - WATCHTOWER_ENABLED=true
-      - WATCHTOWER_IMAGE=daturaai/compute-subnet-executor-runner
-      - WATCHTOWER_INTERVAL=300
-      - WATCHTOWER_ENV_FILE_PATH=${PWD}/.env
+      - ./.env:/root/executor/.env

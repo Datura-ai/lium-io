@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -9,6 +11,8 @@ from core.config import settings
 from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
+from services.cache_template_service import run_cache_template_prefetch
+from services.ssh_service import run_uploaded_key_purge
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,11 +34,32 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start pulling this host's cache template image as soon as the executor
+    # boots, and keep it fresh in the background, without blocking startup.
+    prefetch_task = asyncio.create_task(run_cache_template_prefetch())
+    # DAH-3394: ssh keys the validator uploaded and never removed expire (EXECUTOR_UPLOADED_KEY_TTL_S)
+    key_purge_task = asyncio.create_task(run_uploaded_key_purge())
+    try:
+        yield
+    finally:
+        for name, task in (("cache template pre-pull", prefetch_task), ("uploaded ssh key purge", key_purge_task)):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"{name} task ended with error: {e}")
+
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     docs_url=None,  # Disable /docs
     redoc_url=None,  # Disable /redoc
     openapi_url=None,  # Disable /openapi.json
+    lifespan=lifespan,
 )
 
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
@@ -44,4 +69,13 @@ app.include_router(apis_router)
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":
-    uvicorn.run("executor:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)
+    # No proxy sits between a client and this process, so no X-Forwarded-* header may rewrite the
+    # peer address: routes/apis.py's `/verify` admits loopback peers only (the validator's SSH
+    # tunnel) and reads `request.client` for that.
+    uvicorn.run(
+        "executor:app",
+        host="0.0.0.0",
+        port=settings.INTERNAL_PORT,
+        reload=reload,
+        proxy_headers=False,
+    )

@@ -5,7 +5,11 @@ import uvicorn
 from fastapi import FastAPI
 
 from core.config import settings
-from core.utils import configure_logs_of_other_modules, wait_for_services_sync
+from core.utils import (
+    configure_logs_of_other_modules,
+    wait_for_services_sync,
+    widen_default_thread_pool,
+)
 from core.validator import Validator
 
 configure_logs_of_other_modules()
@@ -13,6 +17,7 @@ wait_for_services_sync()
 
 
 async def app_lifespan(app: FastAPI):
+    widen_default_thread_pool(asyncio.get_running_loop())
     validator = Validator()
     # Run the miner in the background
     task = asyncio.create_task(validator.start())

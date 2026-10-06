@@ -1,13 +1,12 @@
 import json
-import os
 import sys
-import types
 from pathlib import Path
 from typing import Any
 import asyncssh  # noqa: E402
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
 from neurons.validators.src.services.attestation_service import AttestationService  # noqa: E402
+from core.config import settings  # noqa: E402
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -17,15 +16,6 @@ if str(VALIDATOR_SRC) not in sys.path:
     sys.path.insert(0, str(VALIDATOR_SRC))
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-
-if "celium_collateral_contracts" not in sys.modules:
-    module = types.ModuleType("celium_collateral_contracts")
-
-    class CollateralContract:  # type: ignore
-        ...
-
-    module.CollateralContract = CollateralContract
-    sys.modules["celium_collateral_contracts"] = module
 
 FIXTURE_PATH = THIS_DIR / "fixtures" / "tdx_quote.json"
 VERIFIER_RESPONSE_PATH = THIS_DIR / "fixtures" / "verifier_response.json"
@@ -51,6 +41,12 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
 
     monkeypatch.setattr(AttestationService, "_call_verifier", fake_call_verifier)
     monkeypatch.setattr(asyncssh, "import_public_key", lambda value: object())
+    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    # This test exercises the verify-and-accept happy path; whitelist gating is a
+    # separate concern. Pin it off so the test is deterministic regardless of a
+    # developer's local .env (which may set ENABLE_ATTESTATION_WHITELIST=True).
+    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
 
     service = AttestationService()
     assert service.enabled is True
@@ -70,5 +66,10 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
         tdx_quote=quote_json,
     )
 
-    policy, digest, _ = await service.prepare_host_policy(executor_info)
-    assert policy is not None
+    host_policy = await service.prepare_host_policy(executor_info)
+    assert host_policy.known_hosts is not None
+    assert host_policy.attestation_digest is not None
+    assert host_policy.tee_type == "dstack/tdx"
+    # No GPU evidence supplied and enforcement off → not performed, still passed.
+    assert host_policy.gpu_attestation_passed is None
+    assert host_policy.attestation_passed is True

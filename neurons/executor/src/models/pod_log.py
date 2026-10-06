@@ -1,13 +1,14 @@
 import uuid
-from uuid import UUID
 from datetime import datetime
-from sqlmodel import Field, SQLModel
+from uuid import UUID
+
+from pydantic import BaseModel, Field
 
 
-class PodLog(SQLModel, table=True):
-    """Task model."""
+class PodLog(BaseModel):
+    """One container lifecycle event, stored as a JSON line in the pod-log file."""
 
-    uuid: UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    uuid: UUID = Field(default_factory=uuid.uuid4)
     container_name: str | None = None
     container_id: str | None = None
     event: str | None = None
@@ -15,4 +16,3 @@ class PodLog(SQLModel, table=True):
     reason: str | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
-

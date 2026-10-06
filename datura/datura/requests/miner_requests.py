@@ -52,11 +52,21 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     price_per_gpu: float | None = None
     ssh_host_key: str | None = None
     tdx_quote: str | None = None
+    # NVIDIA confidential-compute GPU evidence, JSON-encoded
+    # {"nonce": <hex>, "arch": <str>, "evidence_list": [...]} — collected in-CVM
+    # only and bound to the same nonce as the TDX quote when one was issued.
+    nvidia_payload: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptSSHKeyRequest
+    # The executors that accepted the validator's key.
     executors: list[ExecutorSSHInfo]
+    # DAH-3338: every executor the miner lists for this validator (and executor_id filter), whether
+    # or not it accepted the key. An id here but not in `executors` is a node the miner knows and
+    # could not reach — ExecutorUnreachable on the validator, not InvalidExecutorId. None from a
+    # miner that predates the field: the validator then keeps reading a missing executor as invalid.
+    known_executor_ids: list[str] | None = None
 
 
 class SSHKeyRemoved(BaseMinerRequest):

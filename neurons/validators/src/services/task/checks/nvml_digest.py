@@ -29,6 +29,13 @@ class NvmlDigestCheck:
         if driver_version and expected_digest != lib_digest:
             # Check if driver version is unknown (not in our map)
             if expected_digest is None:
+                # Reactive verification (DAH-2451): ask the backend to resolve a driver we
+                # have never seen against NVIDIA's official installer. Skip versions already
+                # confirmed as spoofs so we don't re-report a known-invalid driver.
+                invalid_drivers = ctx.config.nvml_invalid_drivers or []
+                is_confirmed_spoof = driver_version in invalid_drivers
+                if not is_confirmed_spoof:
+                    await ctx.services.backend.report_unknown_driver(driver_version)
                 event = render_message(
                     Msg.DRIVER_UNKNOWN,
                     ctx=ctx,
@@ -38,6 +45,11 @@ class NvmlDigestCheck:
                         "actual_md5": lib_digest,
                     },
                 )
+                # DAH-2742: an unrecognized driver only means the digest map has not caught up
+                # with a newer NVIDIA release, so it keeps its verification and waits for the
+                # stale-executor sweep. A confirmed spoof is a hard fact — instant reset, like
+                # DIGEST_MISMATCH.
+                updates = {"clear_verified_job_info": True} if is_confirmed_spoof else {}
             else:
                 # Driver is known but digest doesn't match - possible tampering
                 event = render_message(
@@ -50,10 +62,11 @@ class NvmlDigestCheck:
                         "actual_md5": lib_digest,
                     },
                 )
+                updates = {"clear_verified_job_info": True}
             return CheckResult(
                 passed=False,
                 event=event,
-                updates={"clear_verified_job_info": True},
+                updates=updates,
             )
 
         event = render_message(

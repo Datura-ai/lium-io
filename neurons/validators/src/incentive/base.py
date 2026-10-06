@@ -5,14 +5,12 @@ from abc import ABC, abstractmethod
 
 import bittensor
 from pydantic import BaseModel
+from services.redis_service import RedisService
+from services.task_service import JobResult
 
 from incentive.burn_service import BurnService
 from incentive.config import IncentiveConfig
 from incentive.utils import log_for_monitoring
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.redis_service import RedisService
-from services.task_service import JobResult
-from services.const import TOTAL_BURN_EMISSION
 
 
 class BaseIncentive(ABC):
@@ -62,8 +60,28 @@ class BaseIncentive(ABC):
         for hotkey, results in self.job_results.items():
             for result in results:
                 await self._post_process_job_result(hotkey, result)
+                self._split_incentive_across_pools(result)
 
-        log_for_monitoring(self.job_results, t1, getattr(self, "unrented_count_by_bucket", None))
+        log_for_monitoring(
+            self.job_results,
+            t1,
+            getattr(self, "unrented_count_by_bucket", None),
+            unbucketed_share=getattr(self, "unbucketed_share", 0.0),
+            unbucketed_rental_cost=getattr(self, "_unbucketed_rental_cost", 0.0),
+        )
+
+    @staticmethod
+    def _split_incentive_across_pools(result: JobResult) -> None:
+        """DAH-2467: the single place a scored result gets its rented/idle breakdown.
+
+        A whole node earns from one pool only, so the pair is just its incentive on the
+        side it was scored on. A partially rented split node is merged from two portions
+        afterwards, which overwrites the pair with the real two-pool split.
+        """
+        if result.incentive is None:
+            return
+        rented: float = result.incentive if result.is_rented else 0.0
+        result.set_incentive_split(rented, result.incentive - rented)
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Callback before post-processing a job result.
@@ -122,6 +140,7 @@ class BaseIncentive(ABC):
         self,
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int | None,
+        current_epoch: int | None = None,
     ) -> dict[str, float]:
         """Calculate final weights with burning logic applied for this cycle.
 
@@ -135,8 +154,8 @@ class BaseIncentive(ABC):
 
         Returns:
             dict[str, float]: Weights with burning applied for each miner.
-                - Burners receive high scores (proportional to TOTAL_BURN_EMISSION)
-                - Regular miners receive low scores (proportional to 1 - TOTAL_BURN_EMISSION)
+                - Burners receive high scores (proportional to the burn emission share)
+                - Regular miners receive low scores (proportional to 1 - burn emission share)
                 These weights are accumulated across cycles in validator.miner_scores
         """
         pass

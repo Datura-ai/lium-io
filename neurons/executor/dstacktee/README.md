@@ -5,10 +5,12 @@ Run compute subnet executors inside Intel TDX confidential VMs with hardware att
 ## Prerequisites
 
 - Intel CPU with TDX and SGX support
-- Ubuntu 22.04+ with KVM enabled
+- Kernel with KVM TDX (Canonical intel kernel or mainline ≥ 6.16) and the boot parameters from [docs/host-setup.md](docs/host-setup.md)
 - Docker and Docker Compose
-- QEMU with TDX support
+- The dstack QEMU 9.2.1 build — **required for attestation to pass**; one-time install, see [docs/host-setup.md](docs/host-setup.md)
 - SGX devices: `/dev/sgx_enclave` and `/dev/sgx_provision`
+
+First-time host? Follow [docs/host-setup.md](docs/host-setup.md) end to end — it covers BIOS, kernel parameters, the QEMU build, and the key provider; the steps below assume a prepared host.
 
 ## Quick Start
 
@@ -48,6 +50,10 @@ cp .env.example .env
 ./lium-cvm.sh run my-executor
 ```
 
+`lium-cvm.sh` subcommands: `check`, `download`, `new <name> [--env local|staging|prod] [--enable-logs] [--enable-sysinfo]`
+(`--env` picks `app/docker-compose.local.yml`, `app/docker-compose.staging.yml` or `app/docker-compose.yml`; default `prod`),
+`run <name> [--dry-run]`, `stop <name> [--timeout N] [--force]`, `list`, `lsgpu`, `help`.
+
 ## Architecture
 
 ```mermaid
@@ -79,6 +85,7 @@ sequenceDiagram
 | Component | Purpose |
 |-----------|---------|
 | `lium-cvm.sh` | CLI for creating and running CVMs |
+| `cvm_upgrade_guard.sh` | Host-wide CVM disk inventory, pinned key-provider image, host lock; refuses a key-provider rebuild while any CVM disk exists |
 | `scripts/dstack.py` | VM manifest generator and QEMU orchestrator |
 | `scripts/host_api.py` | HTTP API bridge between VM and key provider |
 | `key-provider/` | SGX enclave containers for sealing key derivation |
@@ -95,8 +102,14 @@ SSH_PORT=2200
 RENTING_PORT_RANGE="19001,19002,19003"
 
 # Identity
-MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here
+MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here   # your provider hotkey (SS58)
+VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed per image: docker_build.sh writes src/core/config_override.py from VALIDATOR_HOTKEY_SS58 at build time (src/core/config.py holds the default)
 ENABLE_TDX_ATTESTATION=true
+ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
+# EXECUTOR_LOCAL_VERIFY_ENABLED=false        # optional; the validator's one-call POST /verify over its SSH tunnel (LOCAL_VERIFY_MAX_DEADLINE_SECONDS, LOCAL_VERIFY_INTENT_WINDOW_SECONDS tune it)
+
+# Measured executor-runner release (release notes, section "CVM attestation") — required
+EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
 
 # Resources
 CVM_VCPUS=16
@@ -118,6 +131,13 @@ CVM_GPUS=all  # or "19:00.0,3b:00.0"
 **Check key provider status:**
 ```bash
 cd key-provider && docker compose logs -f
+```
+
+**Start or upgrade the key provider** (`docker compose build` in `key-provider/` builds nothing: the compose file has no `build:` section, the guard builds through `docker-compose.build.yaml`; a rebuild changes MRENCLAVE and locks every CVM out of its data disk):
+```bash
+sudo ./cvm_upgrade_guard.sh start      # pinned image; builds only on a host with no CVM disk
+sudo ./lium-cvm.sh inventory           # every CVM disk on the host
+sudo ./cvm_upgrade_guard.sh upgrade    # refused while any CVM disk exists; see docs/host-setup.md §6.1
 ```
 
 **List running VMs:**

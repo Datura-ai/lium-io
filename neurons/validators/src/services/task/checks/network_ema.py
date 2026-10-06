@@ -1,4 +1,4 @@
-NETWORK_EMA_ALPHA = 0.3
+NETWORK_EMA_ALPHA = 0.5
 
 
 def compute_ema(prev: float | None, current: float | None, alpha: float = NETWORK_EMA_ALPHA) -> float | None:

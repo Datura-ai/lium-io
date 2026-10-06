@@ -9,9 +9,10 @@ import bittensor
 import pydantic
 import tenacity
 import websockets
-from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    DeliveryStamps,
+    CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
     ContainerCreateRequest,
@@ -29,6 +30,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
+    ForcedValidationCycleRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -53,27 +55,31 @@ from protocol.vc_protocol.validator_requests import (
     EstimateResponse,
     ExecutorSpecRequest,
     GpuEstimatesRequest,
+    InspectorEventRequest,
     LogStreamRequest,
+    PodStatesReport,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
 )
-from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
+from services.docker_service import inflight_creates
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
     GPU_ESTIMATES_CHANNEL,
+    INSPECTOR_EVENT_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
+    POD_STATES_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
@@ -82,6 +88,22 @@ from services.redis_service import (
 from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
+
+# DAH-2792: the keepalive pong queues behind a scoring-cycle burst and missed the 20 s default;
+# mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT = 40
+
+
+class OutgoingMessages(list[DeliveryStamps]):
+    # every append wakes the send loop, so a reply leaves at once instead of on the next 1 s poll
+    def __init__(self) -> None:
+        super().__init__()
+        self.appended = asyncio.Event()
+
+    def append(self, message: DeliveryStamps) -> None:
+        super().append(message)
+        self.appended.set()
 
 
 class AuthenticationError(Exception):
@@ -104,7 +126,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue = []
+        self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -126,7 +148,11 @@ class ComputeClient:
                 extra=get_extra_info(self.logging_extra)
             )
         )
-        return websockets.connect(self.compute_app_uri)
+        return websockets.connect(
+            self.compute_app_uri,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        )
 
     async def miner_driver_awaiter(self):
         """avoid memory leak by awaiting miner driver tasks"""
@@ -163,7 +189,7 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        self.subtensor_client = await SubtensorClient.initialize()
+        self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
 
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
@@ -225,7 +251,7 @@ class ComputeClient:
                         )
                         await asyncio.sleep(reconnect_delay)
                         reconnect_delay = min(reconnect_delay * 2, max_delay)
-            except Exception as exc:
+            except Exception:
                 logger.error(
                     _m(
                         "Error connecting to compute app, retrying...",
@@ -260,19 +286,22 @@ class ComputeClient:
         validator_hotkey = self.my_hotkey()
 
         while True:
+            pubsub = None
             try:
                 pubsub = await self.miner_service.redis_service.subscribe(
                     MACHINE_SPEC_CHANNEL,
                     STREAMING_LOG_CHANNEL,
+                    INSPECTOR_EVENT_CHANNEL,
                     RESET_VERIFIED_JOB_CHANNEL,
                     NORMALIZED_SCORE_CHANNEL,
                     GPU_ESTIMATES_CHANNEL,
+                    POD_STATES_CHANNEL,
                 )
                 async for message in pubsub.listen():
                     try:
                         channel = message['channel'].decode('utf-8')
                         data = json.loads(message['data'])
-                    except Exception as exc:
+                    except Exception:
                         continue
 
                     logger.info(
@@ -305,7 +334,18 @@ class ComputeClient:
                             synthetic_job_score=data["synthetic_job_score"],
                             log_status=data["log_status"],
                             job_batch_id=data['job_batch_id'],
+                            netuid=data.get("netuid"),
+                            scored_at=data.get("scored_at"),
+                            incentive=data.get("incentive"),
+                            incentive_rented=data.get("incentive_rented"),
+                            incentive_idle=data.get("incentive_idle"),
+                            incentive_source=data.get("incentive_source"),
+                            node_state_at_cycle=data.get("node_state_at_cycle"),
+                            incentive_formula_version=data.get("incentive_formula_version"),
+                            incentive_formula_inputs=data.get("incentive_formula_inputs"),
                             log_text=data["log_text"],
+                            validation_event=data.get("validation_event"),
+                            incentive_reasons=data.get("incentive_reasons"),
                             miner_hotkey=data["miner_hotkey"],
                             miner_coldkey=data["miner_coldkey"],
                             validator_hotkey=validator_hotkey,
@@ -316,10 +356,35 @@ class ComputeClient:
                             price_per_gpu=data["price_per_gpu"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
+                            tee_type=data.get("tee_type"),
+                            attestation_digest=data.get("attestation_digest"),
+                            tdx_attestation_passed=data.get("tdx_attestation_passed"),
+                            gpu_attestation_passed=data.get("gpu_attestation_passed"),
+                            executor_image=data.get("executor_image"),
+                            sent_at=data.get("sent_at"),
+                            batch_total=data.get("batch_total"),
+                            availability_errors=data.get("availability_errors"),
+                            pod_states=data.get("pod_states"),
+                            pod_ssh=data.get("pod_ssh"),
                         )
 
                         async with self.lock:
                             self.message_queue.append(specs)
+                    elif channel == POD_STATES_CHANNEL:
+                        # DAH-3338: one chunk of the cycle's container states, published after the spec
+                        report = PodStatesReport(
+                            validator_hotkey=validator_hotkey,
+                            miner_hotkey=data["miner_hotkey"],
+                            executor_uuid=data["executor_uuid"],
+                            job_batch_id=data["job_batch_id"],
+                            chunk_index=data["chunk_index"],
+                            chunk_total=data["chunk_total"],
+                            pod_states=data["pod_states"],
+                            sent_at=data.get("sent_at"),
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(report)
                     elif channel == STREAMING_LOG_CHANNEL:
                         log_stream = LogStreamRequest(
                             logs=data["logs"],
@@ -331,12 +396,34 @@ class ComputeClient:
 
                         async with self.lock:
                             self.message_queue.append(log_stream)
+                    elif channel == INSPECTOR_EVENT_CHANNEL:
+                        inspector_event = InspectorEventRequest(
+                            validator_hotkey=validator_hotkey,
+                            miner_hotkey=data["miner_hotkey"],
+                            executor_id=data["executor_id"],
+                            job_batch_id=data["job_batch_id"],
+                            pod_ids=data["pod_ids"],
+                            outcome=data["outcome"],
+                            reason_code=data["reason_code"],
+                            report=data.get("report"),
+                            error=data.get("error"),
+                            context=data.get("context") or {},
+                            pipeline_id=data.get("pipeline_id"),
+                            trace_id=data.get("trace_id"),
+                            when=data["when"],
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(inspector_event)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         reset_request = ResetVerifiedJobRequest(
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
-                            reason=data["reason"]
+                            reason=data["reason"],
+                            reason_code=data.get("reason_code"),
+                            check_id=data.get("check_id"),
+                            evidence=data.get("evidence"),
                         )
 
                         async with self.lock:
@@ -365,6 +452,14 @@ class ComputeClient:
                         }),
                     )
                 )
+            finally:
+                # The connection goes back to the (bounded) pubsub pool only on aclose(); without
+                # this every reconnect round leaked one, and the pool would drain within the hour.
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
 
             await asyncio.sleep(1)
 
@@ -384,7 +479,10 @@ class ComputeClient:
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
-    async def send_model(self, msg: BaseModel):
+    async def send_model(self, msg: DeliveryStamps):
+        # stamped inside the retry so a message resent after a reconnect reports its own delay
+        msg.forwarded_at = time.time()
+        msg.queue_depth = len(self.message_queue)
         await self.ws.send(msg.model_dump_json())
 
     async def handle_send_messages(self):
@@ -413,7 +511,8 @@ class ComputeClient:
                             )
                         )
             else:
-                await asyncio.sleep(1)
+                self.message_queue.appended.clear()
+                await self.message_queue.appended.wait()
 
     async def poll_rented_machines(self):
         while True:
@@ -615,13 +714,27 @@ class ComputeClient:
             return
 
         try:
+            pydantic.TypeAdapter(ForcedValidationCycleRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_forced_validation_cycle()
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
-            error_msg = f"Invalid message received from backend: {str(ex)}"
+            error_msg = "Invalid message received from backend"
             logger.error(
                 _m(
                     error_msg,
-                    extra=get_extra_info({**self.logging_extra, "error": str(ex), "raw_msg": raw_msg}),
+                    extra=get_extra_info(
+                        {
+                            **self.logging_extra,
+                            "error_type": type(ex).__name__,
+                            "raw_message_length": len(raw_msg),
+                        }
+                    ),
                 )
             )
             pass
@@ -691,11 +804,51 @@ class ComputeClient:
             )
         )
 
+    async def handle_forced_validation_cycle(self) -> None:
+        """Start a validation cycle now instead of waiting for the next block window.
+
+        Staging only. The backend gates the request too; this is the second gate, so a message
+        that reaches a production validator does nothing.
+        """
+        if settings.DEPLOY_ENV == "PROD":
+            logger.warning(
+                _m(
+                    "Forced validation cycle is disabled in production",
+                    extra=get_extra_info(self.logging_extra),
+                ),
+            )
+            return
+
+        await self.miner_service.request_validation_cycle_now()
+
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)
         return miner.axon_info
 
     async def miner_driver(
+        self,
+        job_request: ContainerCreateRequest
+        | ContainerDeleteRequest
+        | ContainerStopRequest
+        | ContainerStartRequest
+        | AddSshPublicKeyRequest
+        | RemoveSshPublicKeysRequest
+        | ExecutorRentFinishedRequest
+        | GetPodLogsRequestFromServer
+        | AddDebugSshKeyRequest
+        | BackupContainerRequest
+        | RestoreContainerRequest
+        | InstallJupyterServerRequest
+    ):
+        # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
+        # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
+        # past it and find nothing to cancel — and the create it raced then orphans its container.
+        if not isinstance(job_request, ContainerCreateRequest):
+            return await self._drive_miner_job(job_request)
+        with inflight_creates.track(job_request.pod_id):
+            return await self._drive_miner_job(job_request)
+
+    async def _drive_miner_job(
         self,
         job_request: ContainerCreateRequest
         | ContainerDeleteRequest
@@ -723,7 +876,7 @@ class ComputeClient:
             "miner_hotkey": job_request.miner_hotkey,
             "miner_ip": miner_axon_info.ip,
             "miner_port": miner_axon_info.port,
-            "job_request": str(job_request),
+            "request_type": job_request.message_type.value,
             "executor_id": str(job_request.executor_id),
         }
         logger.info(
@@ -878,3 +1031,5 @@ class ComputeClient:
             await self.backup_handler.handle_backup_container_req(job_request)
         elif isinstance(job_request, RestoreContainerRequest):
             await self.backup_handler.handle_restore_container_req(job_request)
+        elif isinstance(job_request, CancelStorageOperationRequest):
+            await self.backup_handler.handle_cancel_storage_operation_req(job_request)

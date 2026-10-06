@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,7 +8,8 @@ from incentive import rental_price as rental_price_module
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.factory import IncentiveFactory
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
+from constants import TOTAL_BURN_EMISSION
+from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO
 from tests.helpers import (
     assert_executor_has_log,
     assert_incentive_log_present,
@@ -138,6 +140,10 @@ def validator_with_rental_price(
 def _make_rented_data(
     rented_executor_ids: list[str] | None = None,
     gpu_splitting_config: dict[str, int] | None = None,
+    spot_executor_ids: list[str] | None = None,
+    new_rentals_paused_executor_ids: list[str] | None = None,
+    provider_discord_connected_executor_ids: list[str] | None = None,
+    default_job_owner_by_executor: dict[str, str] | None = None,
 ) -> RentedExecutorsResponse:
     executors = {}
     for executor_id in rented_executor_ids or []:
@@ -151,6 +157,10 @@ def _make_rented_data(
         executors=executors,
         banned_guids=[],
         gpu_splitting_config=gpu_splitting_config or {},
+        spot_executor_ids=spot_executor_ids or [],
+        new_rentals_paused_executor_ids=new_rentals_paused_executor_ids or [],
+        provider_discord_connected_executor_ids=provider_discord_connected_executor_ids,
+        default_job_owner_by_executor=default_job_owner_by_executor or {},
     )
 
 
@@ -171,6 +181,28 @@ def _total_gpu_counts(all_job_results: dict[str, list]) -> dict[str, int]:
         for result in results:
             counts[result.gpu_model] = counts.get(result.gpu_model, 0) + result.gpu_count
     return counts
+
+
+@pytest.mark.asyncio
+async def test_cycle_with_no_miners_still_writes_snapshot_and_gpu_estimates(
+    validator_with_rental_price,
+    incentive_redis_service,
+):
+    """A network with no reachable miner still answers estimate requests, and the empty
+    cycle neither scores anyone nor ends the post-restart set_weights warm-up."""
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    await _run_sync_with_jobs(validator, [], {})
+
+    incentive_redis_service.set_incentive_snapshot.assert_awaited_once()
+    snapshot = incentive_redis_service.set_incentive_snapshot.await_args.args[0]
+    assert snapshot.mining.total_gpu_count == 0
+    incentive_redis_service.set_gpu_estimates.assert_awaited_once()
+    estimates = incentive_redis_service.set_gpu_estimates.await_args.args[0]
+    assert set(estimates) == set(BASE_GPU_MAP)
+    assert validator.miner_scores == {}
+    assert validator.completed_cycles_since_start == 0
 
 
 @pytest.mark.asyncio
@@ -208,6 +240,18 @@ async def test_rental_price_scenario_basic_mixed(
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data(["exec-a"]))
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    rented_result = all_job_results["miner_a"][0]
+    idle_result = all_job_results["miner_b"][0]
+    assert rented_result.incentive_formula_version == "mining_v1"
+    assert rented_result.incentive_formula_inputs["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION)
+    assert rented_result.incentive_formula_inputs["total_mining_score"] == pytest.approx(
+        rented_result.mining_score
+    )
+    assert idle_result.incentive_formula_version == "rental_price_v2"
+    assert idle_result.incentive_formula_inputs["validator_tao_price_usd"] == TAO_PRICE
+    assert idle_result.incentive_formula_inputs["validator_alpha_rate_tao_per_block"] == ALPHA_RATE
+    assert idle_result.incentive_formula_inputs["max_cap"] == MAX_UNRENTED_GPUS_AGGREGATE["H100"]
 
     # Verify rental-specific logging for rented vs unrented executors
     from tests.helpers import (
@@ -492,7 +536,7 @@ async def test_rental_price_scenario_all_unrented(
         alpha_rate=ALPHA_RATE,
     )
 
-    assert splits["mining_share"] == pytest.approx(0.09)
+    assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION)
     assert sum(validator.miner_scores.values()) == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
 
     for hotkey in ["miner_a", "miner_b", "miner_c"]:
@@ -545,7 +589,7 @@ async def test_rental_price_scenario_zero_unrented(
 
     assert splits["rental_share"] == 0.0
     assert splits["burn_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
-    assert splits["mining_share"] == pytest.approx(0.09, abs=0.0001)
+    assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION, abs=0.0001)
     mock_price_provider.get_tao_price.assert_not_called()
     mock_price_provider.get_alpha_rate.assert_not_called()
 
@@ -1116,7 +1160,6 @@ async def test_rental_price_failed_executors_rented_do_not_score(
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
     # --- Assert ---
-    from tests.helpers import extract_incentive_section
 
     for hotkey, results in all_job_results.items():
         for result in results:
@@ -1185,7 +1228,6 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
         assert_executor_has_log,
         assert_incentive_log_present,
         assert_log_contains_keys,
-        extract_incentive_section,
     )
 
     for hotkey, results in all_job_results.items():
@@ -1324,7 +1366,12 @@ async def test_rental_price_edge_single_miner_dominance(
                     # Default algorithm logs for rented executors
                     assert_log_contains_keys(result.full_log_text, ["mining_score", "total_mining_score"])
 
-    assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_b"] + validator.miner_scores["miner_c"]
+    # The single miner controlling vast unrented capacity dominates each rented
+    # peer individually. (It no longer necessarily out-earns the rented miners
+    # combined: DAH-2273 raised the rented mining pool from 0.09 to 0.13, so two
+    # rented peers can now sum above one capped unrented miner.)
+    assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_b"]
+    assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_c"]
     assert validator.miner_scores["miner_b"] == pytest.approx(
         validator.miner_scores["miner_c"], abs=0.0001
     )
@@ -1704,22 +1751,7 @@ async def test_rental_price_multi_variant_mixed_rental_status(
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
     # Assert
-    # Verify miner A has mining score (rented → uses default algorithm)
-    total_gpu_counts = _total_gpu_counts(all_job_results)
-    expected_a_mining = expected_executor_score(
-        gpu_model="H200",
-        gpu_count=5,
-        total_gpu_count=total_gpu_counts["H200"],
-        portion=GPU_PORTION["H200"],
-        is_rented=True,
-        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
-        sysbox_runtime=True,
-        collateral_deposited=True,
-        uptime_minutes=120,
-    )
-
     # Verify miners B and C have rental values
-    unrented_counts = {"H200 NVL": 3, "H200": 2}
     total_unrented_counts = {"H200": 2, "H200 NVL": 3}  # For expected_miner_rental_value
 
     expected_b_rental = expected_miner_rental_value(
@@ -1854,13 +1886,6 @@ async def test_rental_price_multiple_base_models_with_variants(
     assert h200_dilution_factor == pytest.approx(0.8, abs=0.01), "H200 should have dilution factor 0.8"
     assert h200_nvl_dilution_factor == pytest.approx(0.8, abs=0.01), "H200 NVL should have same dilution factor as H200"
 
-    # Verify total rental cost: H100 undiluted + H200 variants diluted
-    expected_total_rental_cost = (
-        4 * H100_HOURLY_RATE +  # H100: no dilution
-        3 * expected_h200_effective_rate +  # H200: diluted
-        2 * expected_h200_nvl_effective_rate  # H200 NVL: diluted
-    )
-
     # All three miners receive positive rental share weights
     assert validator.miner_scores["miner_a"] > 0, "Miner A should get rental share"
     assert validator.miner_scores["miner_b"] > 0, "Miner B should get rental share"
@@ -1912,19 +1937,6 @@ async def test_rental_price_single_miner_multiple_variants(
             assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
 
     # Calculate expected values
-    total_gpu_counts = _total_gpu_counts(all_job_results)
-    expected_mining = expected_executor_score(
-        gpu_model="H100",
-        gpu_count=4,
-        total_gpu_count=total_gpu_counts["H100"],
-        portion=GPU_PORTION["H100"],
-        is_rented=True,
-        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
-        sysbox_runtime=True,
-        collateral_deposited=True,
-        uptime_minutes=120,
-    )
-
     total_unrented_counts = {"H200": 3, "H200 NVL": 2}
     expected_rental = expected_miner_rental_value(
         miner_results=all_job_results["miner_a"],
@@ -2430,8 +2442,12 @@ async def test_pcc_case5_single_8xB200_full_payout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pcc_8xB200_split_prefers_8_bucket(monkeypatch):
-    """8×B200 splitting + min_count=1 should land in the 8× bucket (configured)
-    instead of being forced into the 1× bucket and diluting its subsidy.
+    """8×B200 splitting + min_count=1 lands in the 8× bucket when it has a cap.
+
+    With the default caps the solo node fills the 8× bucket exactly to cap
+    (multiplier 1.0), so the DAH-2528 occupancy-aware fallback must NOT move it
+    either — reassignment only triggers when the source bucket is strictly over
+    cap (see the test_pcc_2528_* cases).
     """
     config = _make_pcc_config()
     jobs = {
@@ -2579,3 +2595,541 @@ async def test_pcc_snapshot_exposes_by_bucket(monkeypatch):
 
     # Legacy aggregate field no longer exposed on RentalShareState.
     assert not hasattr(snapshot.rental, "by_gpu_type")
+
+
+@pytest.mark.asyncio
+async def test_rental_price_spot_excluded_from_both_pools(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """A spot executor must produce zero mining and rental incentive, and must
+    not affect the share earned by secure executors sharing the same GPU model:
+    - secure unrented in the same bucket: per-bucket cap multiplier stays 1.0
+    - secure rented: mining_score denominator (total_gpu_count) excludes spot
+    """
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_secure_unrented"),
+        create_neuron_info(uid=3, hotkey="miner_secure_rented"),
+        create_neuron_info(uid=4, hotkey="miner_spot"),
+    ]
+
+    secure_unrented = _job(
+        create_job_result, executor_id="exec-secure-unrented",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    secure_rented = _job(
+        create_job_result, executor_id="exec-secure-rented",
+        gpu_model="H100", gpu_count=8, is_rented=True,
+    )
+    spot = _job(
+        create_job_result, executor_id="exec-spot",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    spot.is_spot = True
+
+    all_job_results = {
+        "miner_secure_unrented": [secure_unrented],
+        "miner_secure_rented": [secure_rented],
+        "miner_spot": [spot],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            rented_executor_ids=["exec-secure-rented"],
+            spot_executor_ids=["exec-spot"],
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Spot is zeroed on both axes
+    assert spot.mining_score == 0
+    assert spot.eligible_for_rental_share is False
+    assert (spot.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_spot", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    # Secure unrented stays in rental pool and is NOT diluted by spot
+    # in the per-bucket cap. If spot leaked into the bucket,
+    # total_unrented_by_gpu_type would be 16, not 8.
+    assert secure_unrented.eligible_for_rental_share is True
+    assert secure_unrented.total_unrented_by_gpu_type == 8
+    assert secure_unrented.unrented_cap_multiplier == pytest.approx(1.0)
+    assert (secure_unrented.incentive or 0.0) > 0.0
+    assert validator.miner_scores["miner_secure_unrented"] > 0
+
+    # Secure rented mining denominator excludes spot. The map includes the two
+    # secure H100 executors (8+8=16) but must NOT include the spot's 8 GPUs;
+    # an inflated denominator (24) would silently reduce the rented executor's
+    # mining incentive by 1/3 (formula: score * gpu_portion * gpu_count / total).
+    assert secure_rented.is_rented is True
+    assert secure_rented.total_gpu_count == 16
+    assert validator.miner_scores["miner_secure_rented"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rental_price_missing_discord_excluded_like_spot(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+    monkeypatch,
+):
+    """A no-Discord executor after cutoff is treated like spot for incentives:
+    - it earns zero
+    - it does not dilute secure unrented bucket caps
+    - it does not inflate rented mining denominators
+    """
+    monkeypatch.setattr(settings, "DISCORD_INCENTIVE_CUTOFF", datetime.utcnow() - timedelta(days=1))
+
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_secure_unrented"),
+        create_neuron_info(uid=3, hotkey="miner_secure_rented"),
+        create_neuron_info(uid=4, hotkey="miner_no_discord"),
+    ]
+
+    secure_unrented = _job(
+        create_job_result, executor_id="exec-secure-unrented",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    secure_rented = _job(
+        create_job_result, executor_id="exec-secure-rented",
+        gpu_model="H100", gpu_count=8, is_rented=True,
+    )
+    no_discord = _job(
+        create_job_result, executor_id="exec-no-discord",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    no_discord.provider_discord_connected = False
+
+    all_job_results = {
+        "miner_secure_unrented": [secure_unrented],
+        "miner_secure_rented": [secure_rented],
+        "miner_no_discord": [no_discord],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            rented_executor_ids=["exec-secure-rented"],
+            provider_discord_connected_executor_ids=[
+                "exec-secure-unrented",
+                "exec-secure-rented",
+            ],
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    assert no_discord.mining_score == 0
+    assert no_discord.eligible_for_rental_share is False
+    assert (no_discord.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_no_discord", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    assert secure_unrented.eligible_for_rental_share is True
+    assert secure_unrented.total_unrented_by_gpu_type == 8
+    assert secure_unrented.unrented_cap_multiplier == pytest.approx(1.0)
+    assert (secure_unrented.incentive or 0.0) > 0.0
+
+    assert secure_rented.is_rented is True
+    assert secure_rented.total_gpu_count == 16
+    assert validator.miner_scores["miner_secure_rented"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rental_price_paused_unrented_excluded_from_incentives_but_still_validated(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """A paused unrented executor is validated but does not enter either
+    incentive pool:
+    - it earns zero
+    - it does not dilute secure unrented bucket caps
+    - it does not inflate rented mining denominators
+    """
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_secure_unrented"),
+        create_neuron_info(uid=3, hotkey="miner_secure_rented"),
+        create_neuron_info(uid=4, hotkey="miner_paused"),
+    ]
+
+    secure_unrented = _job(
+        create_job_result, executor_id="exec-secure-unrented",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    secure_rented = _job(
+        create_job_result, executor_id="exec-secure-rented",
+        gpu_model="H100", gpu_count=8, is_rented=True,
+    )
+    paused = _job(
+        create_job_result, executor_id="exec-paused",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    paused.is_new_rentals_paused = True
+
+    all_job_results = {
+        "miner_secure_unrented": [secure_unrented],
+        "miner_secure_rented": [secure_rented],
+        "miner_paused": [paused],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            rented_executor_ids=["exec-secure-rented"],
+            new_rentals_paused_executor_ids=["exec-paused"],
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    assert paused.mining_score == 0
+    assert paused.eligible_for_rental_share is False
+    assert (paused.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_paused", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    assert secure_unrented.eligible_for_rental_share is True
+    assert secure_unrented.total_unrented_by_gpu_type == 8
+    assert secure_unrented.unrented_cap_multiplier == pytest.approx(1.0)
+    assert (secure_unrented.incentive or 0.0) > 0.0
+
+    assert secure_rented.is_rented is True
+    assert secure_rented.total_gpu_count == 16
+    assert validator.miner_scores["miner_secure_rented"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rental_price_miner_default_job_unrented_earns_nothing(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """An unrented executor running the MINER'S OWN default job earns nothing:
+    - it is excluded from both pools (mining + rental)
+    - it does not dilute the unrented bucket caps of legitimate executors
+    A Lium-owned default job (or no default job) keeps the unrented incentive.
+    """
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_plain"),
+        create_neuron_info(uid=3, hotkey="miner_lium_job"),
+        create_neuron_info(uid=4, hotkey="miner_own_job"),
+    ]
+
+    plain = _job(
+        create_job_result, executor_id="exec-plain",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    lium_job = _job(
+        create_job_result, executor_id="exec-lium-job",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    own_job = _job(
+        create_job_result, executor_id="exec-own-job",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    lium_job.default_job_owner = "lium"
+    own_job.default_job_owner = "miner"
+
+    all_job_results = {
+        "miner_plain": [plain],
+        "miner_lium_job": [lium_job],
+        "miner_own_job": [own_job],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            default_job_owner_by_executor={
+                "exec-lium-job": "lium",
+                "exec-own-job": "miner",
+            },
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Miner's own default job -> excluded from both pools, earns nothing
+    assert own_job.default_job_owner == "miner"
+    assert own_job.mining_score == 0
+    assert own_job.eligible_for_rental_share is False
+    assert (own_job.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_own_job", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    # Lium-owned default job -> still earns the unrented incentive
+    assert lium_job.default_job_owner == "lium"
+    assert lium_job.eligible_for_rental_share is True
+    assert (lium_job.incentive or 0.0) > 0.0
+
+    # No default job -> still earns the unrented incentive
+    assert plain.default_job_owner is None
+    assert plain.eligible_for_rental_share is True
+    assert (plain.incentive or 0.0) > 0.0
+
+    # The miner's own job must not dilute the legitimate unrented bucket (only plain + lium_job count)
+    assert lium_job.total_unrented_by_gpu_type == 16
+    assert plain.total_unrented_by_gpu_type == 16
+
+
+# ── DAH-2528: occupancy-aware bucket fallback for split-capable idle nodes ────
+
+PCC_2528_CAPS = {**PCC_PER_COUNT_CAPS, "B200": {1: 10, 8: 8}}
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_split_node_falls_back_when_8_bucket_over_cap(monkeypatch):
+    """The 8× bucket is over cap and the 1× tier is empty: the split-capable node
+    moves whole into the 1× tier at full multiplier; non-splitting siblings stay
+    diluted, and the source bucket's multiplier improves by the freed GPUs.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [_make_pcc_job("exec-c", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    # Mover: whole node (8 GPUs) rated against the 1× tier at full weight.
+    mover = jobs["miner_a"][0]
+    assert mover.count_bucket == 1
+    assert mover.max_cap == 10
+    assert mover.bucket_reassigned_from == 8
+    assert mover.bucket_reassigned_from_multiplier == pytest.approx(8 / 24)
+    assert mover.unrented_cap_multiplier == pytest.approx(1.0)
+    assert mover.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+    assert mover.cap_dilution_applied is False
+    assert any("unrented_bucket_reassigned" in line for line in mover.incentive_logs)
+
+    # Bucket fills after the move: 1× holds the mover, 8× keeps the two others.
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 8
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 16
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(0.5)
+
+    # Non-splitting siblings stay in the 8× bucket, diluted, and are never reassigned.
+    for hk in ("miner_b", "miner_c"):
+        stayer = jobs[hk][0]
+        assert stayer.count_bucket == 8
+        assert stayer.bucket_reassigned_from is None
+        assert stayer.effective_rate == pytest.approx(0.5 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+        assert not any("unrented_bucket_reassigned" in line for line in stayer.incentive_logs)
+
+    # Snapshot persists the post-move fills, so estimates see the same state.
+    by_bucket = incentive.get_snapshot().rental.by_bucket
+    assert by_bucket["B200·1"].unrented_count == 8
+    assert by_bucket["B200·1"].cap_multiplier == pytest.approx(1.0)
+    assert by_bucket["B200·8"].unrented_count == 16
+    assert by_bucket["B200·8"].cap_multiplier == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_no_move_when_whole_node_does_not_fit_target(monkeypatch):
+    """Strict admission: the whole node must fit under the target cap. With 3 native
+    1× nodes already in the tier (cap 10), an 8-GPU candidate would make 11 — it
+    stays in its over-cap 8× bucket and the 1× incumbents keep full weight.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [
+            _make_pcc_job("exec-c1", "NVIDIA B200", 1),
+            _make_pcc_job("exec-c2", "NVIDIA B200", 1),
+            _make_pcc_job("exec-c3", "NVIDIA B200", 1),
+        ],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    candidate = jobs["miner_a"][0]
+    assert candidate.count_bucket == 8
+    assert candidate.bucket_reassigned_from is None
+    assert candidate.effective_rate == pytest.approx(0.5 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+    assert not any("unrented_bucket_reassigned" in line for line in candidate.incentive_logs)
+
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 3
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 16
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_greedy_stops_when_source_no_longer_over_cap(monkeypatch):
+    """Two split-capable 8× nodes over an 8-GPU cap: the lowest-uuid one moves,
+    which brings the source back to cap, so the second stays — and both end at
+    full multiplier. Rerunning an identical fleet reproduces the same assignment.
+    """
+    def make_jobs():
+        return {
+            "miner_a": [_make_pcc_job(
+                "exec-a", "NVIDIA B200", 8,
+                supports_gpu_splitting=True, gpu_splitting_min_count=1,
+            )],
+            "miner_b": [_make_pcc_job(
+                "exec-b", "NVIDIA B200", 8,
+                supports_gpu_splitting=True, gpu_splitting_min_count=1,
+            )],
+        }
+
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = make_jobs()
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    mover, stayer = jobs["miner_a"][0], jobs["miner_b"][0]
+    assert mover.count_bucket == 1
+    assert mover.bucket_reassigned_from == 8
+    assert stayer.count_bucket == 8
+    assert stayer.bucket_reassigned_from is None
+    # After the move both buckets sit exactly at (or under) cap: nobody is diluted.
+    assert mover.unrented_cap_multiplier == pytest.approx(1.0)
+    assert stayer.unrented_cap_multiplier == pytest.approx(1.0)
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 8
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 8
+
+    # Determinism: an identical fleet produces identical bucket assignments.
+    jobs_rerun = make_jobs()
+    await _run_pcc_incentive(config, jobs_rerun, monkeypatch)
+    for hk in jobs:
+        assert jobs_rerun[hk][0].count_bucket == jobs[hk][0].count_bucket
+        assert jobs_rerun[hk][0].bucket_reassigned_from == jobs[hk][0].bucket_reassigned_from
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_no_move_when_source_at_cap(monkeypatch):
+    """Reassignment needs a strictly over-cap source: a bucket exactly at cap pays
+    full weight already, so the split-capable node stays put.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    result = jobs["miner_a"][0]
+    assert result.count_bucket == 8
+    assert result.bucket_reassigned_from is None
+    assert result.unrented_cap_multiplier == pytest.approx(1.0)
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_move_lands_exactly_at_target_cap_with_incumbents(monkeypatch):
+    """A move that fills the target exactly to cap is admitted, and the native 1×
+    incumbents keep full weight — the newcomer never dilutes them.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [
+            _make_pcc_job("exec-c1", "NVIDIA B200", 1),
+            _make_pcc_job("exec-c2", "NVIDIA B200", 1),
+        ],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    mover = jobs["miner_a"][0]
+    assert mover.count_bucket == 1
+    assert mover.bucket_reassigned_from == 8
+    # 2 incumbents + 8 = 10 == cap: admitted, everyone in the tier at full weight.
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 10
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    for native in jobs["miner_c"]:
+        assert native.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_source_bucket_emptied_by_move(monkeypatch):
+    """With cap 8×=4, a single split-capable 8× node over-fills its own bucket and
+    moves out entirely, leaving the source at 0 GPUs — no division error, and the
+    snapshot and total_rental_cost stay consistent.
+    """
+    config = _make_pcc_config(caps={**PCC_PER_COUNT_CAPS, "B200": {1: 10, 8: 4}})
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    mover = jobs["miner_a"][0]
+    assert mover.count_bucket == 1
+    assert mover.bucket_reassigned_from == 8
+    assert mover.bucket_reassigned_from_multiplier == pytest.approx(4 / 8)
+    assert mover.unrented_cap_multiplier == pytest.approx(1.0)
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 0
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 8
+    # The emptied source contributes nothing; the whole cost is the mover at full rate.
+    assert incentive.total_rental_cost == pytest.approx(8 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+    by_bucket = incentive.get_snapshot().rental.by_bucket
+    assert by_bucket["B200·8"].unrented_count == 0
+    assert by_bucket["B200·1"].unrented_count == 8
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_no_move_when_split_tier_has_no_cap(monkeypatch):
+    """A min-count tier with no configured cap can never receive a fallback move:
+    the candidate stays in its over-cap gpu_count bucket, diluted.
+    """
+    config = _make_pcc_config(caps={**PCC_PER_COUNT_CAPS, "B200": {8: 8}})
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    candidate = jobs["miner_a"][0]
+    assert candidate.count_bucket == 8
+    assert candidate.bucket_reassigned_from is None
+    assert candidate.unrented_cap_multiplier == pytest.approx(0.5)
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket

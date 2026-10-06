@@ -1,17 +1,14 @@
 """Score calculation logic for executor validation.
 
 This module contains the business logic for calculating actual and job scores
-based on collateral status, rental state, and contract versions.
+based on executor checks and rental state.
 """
 
 from typing import Tuple
 
-from core.config import settings
-from services.const import MACHINE_PRICES
+from core.config import settings, shared_client
+from services.executor_image_policy import ImageVerdict
 from services.task.pipeline import Context
-
-
-SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 
 def calculate_scores(
@@ -31,21 +28,63 @@ def calculate_scores(
         - warning_message: Empty string or warning message with leading " WARNING: "
     """
     gpu_model = ctx.state.gpu_model or ""
-    collateral_deposited = ctx.collateral_deposited
-    contract_version = ctx.contract_version or ""
     price_per_gpu = ctx.executor.price_per_gpu
 
     warning_messages = []
     job_score = 1.0
     actual_score = 1.0
 
+    # Outdated executor image (DAH-2701). Enforcement is off by default until nodes
+    # auto-update again (DAH-3419); off, ExecutorImageCheck logs the verdict as a warning.
+    image_report = getattr(ctx.state, "executor_image_report", None)
+    if (
+        settings.EXECUTOR_IMAGE_CHECK_ENFORCE
+        and image_report
+        and image_report.status is ImageVerdict.OUTDATED
+    ):
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Required executor image is outdated")
+
     # Machine price check
-    base_price = MACHINE_PRICES.get(gpu_model, 0)
-    if price_per_gpu and price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
+    base_price = shared_client.config.machine_prices.get(gpu_model, 0)
+    max_price_rate = shared_client.config.machine_max_price_rate
+    if price_per_gpu and price_per_gpu > base_price * max_price_rate:
         actual_score = 0.0
         warning_messages.append(
-            f"GPU price exceeds the limit. limit: {base_price * settings.MACHINE_MAX_PRICE_RATE}, actual: {price_per_gpu}"
+            f"GPU price exceeds the limit. limit: {base_price * max_price_rate}, actual: {price_per_gpu}"
         )
+
+    # Minimal-G5 CVM attestation gate: a CVM-flagged executor (it presented a TDX
+    # quote) whose attestation did not pass earns nothing while TCB enforcement is
+    # on. Non-CVM executors (no quote) are untouched — omitted-quote bypass by a
+    # known CVM is rejected upstream by the attestation ratchet.
+    if (
+        settings.ENABLE_TDX_ATTESTATION
+        and settings.ENABLE_TCB_ENFORCEMENT
+        and ctx.executor.tdx_quote
+        and not ctx.tdx_attestation_passed
+    ):
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("CVM attestation not passed (TDX/GPU attestation required)")
+
+    # CPU-truth gate: the advertised CPU(s) count is contradicted by the kernel-present
+    # population. CpuTruthCheck is non-fatal and runs before this, so passed=False alone would
+    # not survive — only this gate actually zeroes the score. Shadow leaves the flag True.
+    if not ctx.cpu_truth_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Advertised CPU cores exceed the host's physical cores")
+
+    # Provider-side load gate (DAH-2734): the host burns CPU or disk outside Lium's containers
+    # while it sells that capacity — the CPU/disk twin of the foreign-GPU gate. Same mechanics
+    # as the CPU-truth gate above: the check is non-fatal, so only this line zeroes the score,
+    # and shadow leaves the flag True.
+    if not ctx.provider_side_load_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Provider-side workload consumes the machine's CPU or disk")
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
@@ -56,31 +95,6 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append(
             "EMA verifyx download speed unavailable (probe failed or never measured)"
-        )
-
-    # Early return for collateral-excluded GPU types
-    if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
-        return _format_return(actual_score, job_score, warning_messages, rented)
-
-    # Collateral checks
-    if not collateral_deposited:
-        collateral_error = ctx.collateral_error_message
-        if settings.ENABLE_NO_COLLATERAL:
-            warning_messages.append(collateral_error or "No collateral deposited")
-        else:
-            actual_score = 0.0
-            job_score = 0.0
-            warning_messages.append(collateral_error or "Collateral required but not deposited")
-    elif (
-        contract_version
-        and contract_version != settings.get_latest_contract_version()
-        and not settings.ENABLE_NO_COLLATERAL
-    ):
-        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-        warning_messages.append(
-            f"Outdated contract version (current: {contract_version}, "
-            f"latest: {settings.get_latest_contract_version()})"
         )
 
     return _format_return(actual_score, job_score, warning_messages, rented)
