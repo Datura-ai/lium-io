@@ -62,7 +62,13 @@ class BaseIncentive(ABC):
                 await self._post_process_job_result(hotkey, result)
                 self._split_incentive_across_pools(result)
 
-        log_for_monitoring(self.job_results, t1, getattr(self, "unrented_count_by_bucket", None))
+        log_for_monitoring(
+            self.job_results,
+            t1,
+            getattr(self, "unrented_count_by_bucket", None),
+            unbucketed_share=getattr(self, "unbucketed_share", 0.0),
+            unbucketed_rental_cost=getattr(self, "_unbucketed_rental_cost", 0.0),
+        )
 
     @staticmethod
     def _split_incentive_across_pools(result: JobResult) -> None:

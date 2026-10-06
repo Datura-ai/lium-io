@@ -87,13 +87,11 @@ ROLLOUT_FAILURE_REASONS = frozenset(
 _OUTDATED = ExecutorImageMessages.OUTDATED.reason
 # The ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
-# (RENTED, or RENTED_POD_SSH_UNREACHABLE when the renter's SSH is being reported — DAH-2870, the
-# same halt with a different reason); a run that reaches finalize ends on VALIDATION_COMPLETED.
+# (RENTED); a run that reaches finalize ends on VALIDATION_COMPLETED.
 RUN_ENDED_WITHOUT_FAILING = frozenset(
     {
         FinalizeMessages.COMPLETED.reason,
         TenantEnforcementMessages.ALREADY_RENTED.reason,
-        TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason,
     }
 )
 
@@ -384,8 +382,7 @@ def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: in
     failing), and, for every reason but OUTDATED, the executor's observed image is not the new
     digest. The OUTDATED-without-failing case counts only while `EXECUTOR_IMAGE_CHECK_ENFORCE` is
     on: off (the default since DAH-3439), the image check passes an OUTDATED node and leaves its
-    score alone, so a score of 0 under an OUTDATED report came from another gate (price cap, TDX,
-    collateral) and stands. An executor that already runs
+    score alone, so a score of 0 under an OUTDATED report came from another gate (price cap, TDX) and stands. An executor that already runs
     the new image failed for a reason of its own; a rented executor that failed a later check of
     its own (pod not running, filler killed) failed for that reason, OUTDATED or not; and a result
     with a score is never touched.

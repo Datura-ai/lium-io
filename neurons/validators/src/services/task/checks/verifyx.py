@@ -5,9 +5,15 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
 
+from protocol.vc_protocol.compute_requests import NetworkEMA
+
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.verifyx_validation_service import NETWORK_GATE_TALLY, _is_speed_reading
+from services.verifyx_validation_service import (
+    NETWORK_GATE_TALLY,
+    _is_positive_number,
+    _is_speed_reading,
+)
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -16,6 +22,15 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+_EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
+
+# A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
+# before each probe. So a 429 keeps the upload EMA for at most this many probes in a row; after
+# that the probe's 0.0 is fed. One probe per job cycle (BLOCKS_FOR_JOB, ~15 min): 8 is ~2 h,
+# well past Cloudflare's Retry-After. Per process, so a validator restart starts the count again.
+# Keyed by (miner hotkey, executor uuid): two miners can list the same executor uuid.
+MAX_KEPT_UPLOAD_PROBES = 8
+_kept_upload_probes: dict[tuple[str, str], int] = {}
 
 
 @dataclass(frozen=True)
@@ -67,7 +82,7 @@ class VerifyXCheck:
 
         filler_container = _get_filler_only_container(ctx)
         if filler_container:
-            updated_specs = _with_last_known_verifyx_ema(ctx)
+            updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -173,12 +188,15 @@ class VerifyXCheck:
                 }
             )
 
-            # Always compute verifyx network EMA. A Cloudflare probe failure that fell back to
-            # the package download feeds that number, never 0. A malformed reading never reaches
-            # compute_ema: the previous EMA stands.
+            # Each direction keeps its previous EMA when Cloudflare, not the host, failed it (see
+            # _fallback_upload_reading); a download fallback feeds the package reading, never 0.
             if "network" not in updated_specs:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
+            cloudflare_fallback = bool(verifyx_network.get("cloudflare_fallback"))
+            upload_blocked = _upload_kept_within_cap(
+                ctx, bool(verifyx_network.get("cloudflare_upload_fallback"))
+            )
             unavailable_readings: list[str] = []
             ema_download = _feed_ema(
                 ctx,
@@ -187,15 +205,16 @@ class VerifyXCheck:
                 download_speed,
                 prev_ema.ema_verifyx_download_speed if prev_ema else None,
                 unavailable_readings,
-                keep_previous_on_none=bool(verifyx_network.get("cloudflare_fallback")),
+                keep_previous_on_none=cloudflare_fallback,
             )
             _feed_ema(
                 ctx,
                 updated_specs["network"],
                 "upload",
-                verifyx_network.get("upload_speed"),
+                _fallback_upload_reading(verifyx_network.get("upload_speed"), upload_blocked),
                 prev_ema.ema_verifyx_upload_speed if prev_ema else None,
                 unavailable_readings,
+                keep_previous_on_none=upload_blocked,
             )
 
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
@@ -236,7 +255,7 @@ class VerifyXCheck:
                 NETWORK_GATE_TALLY.record(
                     ema_download,
                     MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
-                    fallback=bool(verifyx_network.get("cloudflare_fallback")),
+                    fallback=cloudflare_fallback,
                 )
 
             updated_state = replace(ctx.state, specs=updated_specs)
@@ -258,7 +277,7 @@ class VerifyXCheck:
                 deferred_network = {
                     key: value
                     for key, value in updated_specs["network"].items()
-                    if key not in ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
+                    if key not in _EMA_KEYS
                 }
                 updated_state = replace(
                     ctx.state, specs={**updated_specs, "network": deferred_network}
@@ -380,6 +399,37 @@ def _feed_ema(
     return ema
 
 
+def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:
+    """`upload_blocked`, until this host's upload EMA has been kept MAX_KEPT_UPLOAD_PROBES probes
+    in a row; a probe that does not keep it starts the count again."""
+    key = (ctx.miner_hotkey, ctx.executor.uuid)
+    if not upload_blocked:
+        _kept_upload_probes.pop(key, None)
+        return False
+    kept = _kept_upload_probes.get(key, 0) + 1
+    _kept_upload_probes[key] = kept
+    if kept <= MAX_KEPT_UPLOAD_PROBES:
+        return True
+    logger.warning(
+        _m(
+            "VerifyX upload EMA kept too many probes in a row on Cloudflare's 429, feeding the 0",
+            extra=get_extra_info({**ctx.default_extra, "kept_upload_probes": kept}),
+        )
+    )
+    return False
+
+
+def _fallback_upload_reading(reading: object, upload_blocked: bool) -> object:
+    """The upload reading `_feed_ema` gets. When Cloudflare failed the upload, or failed the
+    download so the upload never ran (`cloudflare_upload_fallback`: Cloudflare's 429),
+    the 0.0 (or missing value) the probe reports is no measurement: None, and the previous upload
+    EMA stands. Otherwise a 0.0, a direction timeout included, still lowers the EMA; a positive
+    upload is always a measurement."""
+    if upload_blocked and not _is_positive_number(reading):
+        return None
+    return reading
+
+
 def _ema_if_gated(prev: float | None, reading: object) -> float | None:
     """The download EMA `_feed_ema` would store if `reading` were the gated one."""
     if reading is not None and not _is_speed_reading(reading):
@@ -421,6 +471,53 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
+def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
+    """Why this cycle's VerifyX sample must not move the published EMA, or None.
+
+    Held: a cycle another check failed, and a passing cycle without the image cached on a
+    never-measured node, since the image pre-pull shares the link. Not held: a cycle VerifyX itself
+    failed (the gate working), and anything without the backend's answer, as for the cold retry.
+    """
+    if ctx.state.rented_data is None:
+        return None
+    if failed_check_id:
+        if failed_check_id != VerifyXCheck.check_id:
+            return f"cycle failed {failed_check_id}"
+        return None
+    if ctx.state.recommended_image_cached is False:
+        prev_ema = _stored_network_ema(ctx)
+        if prev_ema is None or prev_ema.ema_verifyx_download_speed is None:
+            return "never-measured node, image not cached yet"
+    return None
+
+
+def _stored_network_ema(ctx: Context) -> NetworkEMA | None:
+    rented_data = ctx.state.rented_data
+    return rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+
+
+def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
+    """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
+
+    Only keys this cycle wrote are touched. A never-measured node publishes none, which the backend
+    already reads as unseeded (the backend's first-pass deferral relies on it). The raw samples stay.
+    """
+    network = specs.get("network")
+    if not isinstance(network, dict) or not any(key in network for key in _EMA_KEYS):
+        return specs
+    prev_ema = _stored_network_ema(ctx)
+    held = dict(network)
+    for key in _EMA_KEYS:
+        if key not in held:
+            continue
+        previous = getattr(prev_ema, key, None)
+        if previous is None:
+            del held[key]
+        else:
+            held[key] = previous
+    return {**specs, "network": held}
+
+
 def _get_filler_only_container(ctx: Context) -> str | None:
     rented_data = ctx.state.rented_data
     if not rented_data:
@@ -432,7 +529,7 @@ def _get_filler_only_container(ctx: Context) -> str | None:
     return filler_container if filler_container and not has_customer_rental else None
 
 
-def _with_last_known_verifyx_ema(ctx: Context) -> dict:
+def specs_with_last_known_verifyx_ema(ctx: Context) -> dict:
     specs = dict(ctx.state.specs or {})
     rented_data = ctx.state.rented_data
     network_ema = rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
