@@ -53,6 +53,16 @@ class ProviderPortalDataUnavailable(RuntimeError):
     """No live or Redis-cached provider snapshot is available."""
 
 
+def scored_registered_neurons(
+    miners: Sequence[bittensor.NeuronInfo],
+    registered: Sequence[bittensor.NeuronInfo],
+    miner_scores: dict[str, float],
+) -> list[bittensor.NeuronInfo]:
+    """Registered neurons with a score that the served-miner list does not carry."""
+    selected = {miner.hotkey for miner in miners}
+    return [neuron for neuron in registered if neuron.hotkey in miner_scores and neuron.hotkey not in selected]
+
+
 @contextlib.contextmanager
 def _log_sync_block(name: str, *, extra: dict | None = None):
     """Time a synchronous call that runs inside the asyncio event loop. Emits a single
@@ -766,6 +776,7 @@ class SubtensorClient:
         miner_scores: dict[str, float],
         active_hotkeys: set[str] | None = None,
         wait_for_inclusion: bool = False,
+        include_registered_scored: bool = False,
     ) -> bool:
         """Set weights using accumulated scores with burning already applied.
 
@@ -798,6 +809,10 @@ class SubtensorClient:
             return False
 
         metagraph = self.get_metagraph()
+        if include_registered_scored:
+            # DAH-4001: a settled batch is a day old. A provider that removed its last node since then is no longer
+            # in the served-miner list, but its hotkey is still registered and the pay the backend approved is its.
+            miners = list(miners) + scored_registered_neurons(miners, metagraph.neurons, miner_scores)
         self._log_scored_hotkeys_missing_from_selected_miners(
             miner_scores=miner_scores,
             selected_miners=miners,

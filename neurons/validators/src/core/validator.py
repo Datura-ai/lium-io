@@ -1021,6 +1021,7 @@ class Validator:
                 miner_scores=batch.hotkey_scores,
                 active_hotkeys=self.active_hotkeys,
                 wait_for_inclusion=True,
+                include_registered_scored=True,
             )
         except Exception as exc:
             # a timeout here is ambiguous: the commit may have landed. The batch is immutable, so the retry

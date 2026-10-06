@@ -60,7 +60,10 @@ async def test_matured_batch_is_submitted_cached_and_reported():
     await validator.submit_settled_batch()
 
     validator.subtensor_client.set_weights.assert_awaited_once_with(
-        miner_scores=BATCH.hotkey_scores, active_hotkeys=set(), wait_for_inclusion=True
+        miner_scores=BATCH.hotkey_scores,
+        active_hotkeys=set(),
+        wait_for_inclusion=True,
+        include_registered_scored=True,
     )
     validator.redis_service.set.assert_awaited_once()
     assert json.loads(validator.redis_service.set.await_args.args[1])["batch_id"] == "b1"
@@ -217,3 +220,20 @@ async def test_resubmitting_the_cached_batch_keeps_its_first_acceptance_block():
     await validator.submit_settled_batch()
 
     assert json.loads(validator.redis_service.set.await_args.args[1])["submitted_block"] == 100
+
+
+def test_a_registered_hotkey_with_a_settled_score_is_paid_even_when_it_serves_no_node():
+    from clients.subtensor_client import scored_registered_neurons
+
+    serving = [MagicMock(uid=1, hotkey="still-here")]
+    registered = [
+        MagicMock(uid=1, hotkey="still-here"),
+        MagicMock(uid=2, hotkey="left-yesterday"),
+        MagicMock(uid=3, hotkey="never-scored"),
+    ]
+
+    extra = scored_registered_neurons(
+        serving, registered, {"still-here": 0.5, "left-yesterday": 0.3}
+    )
+
+    assert [neuron.uid for neuron in extra] == [2]
