@@ -7286,8 +7286,10 @@ class DockerService:
                         await restore_filler_pod_gpu_power_limits(
                             ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
                         )
-                        # A run that failed because the customer's sweep removed the container between
-                        # its create and start (create lock lapsed) is that refusal, not a filler fault.
+                        # A run that failed because the customer's sweep removed the container (create
+                        # lock lapsed), before its start or before the running-state check, is that
+                        # refusal, not a filler fault: not ContainerVanished, counted against the host.
+                        container_vanished = False
                         _refuse_filler_during_customer_create(payload)
                     raise
 
