@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Annotated
 
 import asyncssh
@@ -10,7 +11,6 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationError, AttestationNonce, AttestationService
-from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.interactive_shell_service import InteractiveShellService
@@ -22,8 +22,9 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import build_ssh_unreachable_event, first_availability_error_code
-from .models import JobResult
+from .availability import MAX_PEER_TEXT_LENGTH, availability_errors, build_ssh_unreachable_event
+from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
+from .models import JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
@@ -31,13 +32,34 @@ from .result_handler import ResultHandler
 logger = logging.getLogger(__name__)
 
 def _is_ssh_transport_failure(error: BaseException) -> bool:
-    """True when we never got a usable SSH session, so nothing about the node was measured.
+    """The pair the rented-machine check uses; OSError also covers a hung handshake since 3.11.
 
-    asyncssh raises its own errors for a refused or reset connection and for a rejected
-    handshake; the socket layer raises OSError; a hung handshake raises TimeoutError. A
-    failure inside the pipeline is a real verdict and never lands here.
+    Only the KIND of error. The caller must also confirm WHERE it came from: the attestation
+    verifier's HTTP call raises the same types and says nothing about the node's own SSH.
     """
-    return isinstance(error, (asyncssh.Error, OSError, asyncio.TimeoutError))
+    return isinstance(error, (asyncssh.Error, OSError))
+
+
+def _transport_unreachable_event(*, executor_uuid: str, error: BaseException) -> ValidationEvent:
+    """The structured event of a run whose shell died after the connect.
+
+    The rented-machine check's template; no check_id, since the error does not say which check
+    was running when the shell died.
+    """
+    template = TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE
+    return build_msg(
+        event=template.event,
+        reason=template.reason,
+        severity=template.severity,
+        category=template.category,
+        impact=template.impact,
+        remediation=template.remediation,
+        help_uri=template.help_uri or REASON_CODE_DOCS_URL,
+        what={
+            "executor_uuid": executor_uuid,
+            "transport_error": repr(error)[:MAX_PEER_TEXT_LENGTH],
+        },
+    )
 
 
 class TaskService:
@@ -47,7 +69,6 @@ class TaskService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
-        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
@@ -56,7 +77,10 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        self.backend_client = backend_client
         self.wallet = settings.get_bittensor_wallet()
+        # DAH-3019: the start reports run in the background; the set keeps them referenced until done.
+        self._start_reports: set[asyncio.Task] = set()
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -64,11 +88,33 @@ class TaskService:
             redis_service=redis_service,
             validation_service=validation_service,
             verifyx_validation_service=verifyx_validation_service,
-            collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             backend_client=backend_client,
             pod_recovery=pod_recovery,
         )
+
+    def report_verification_started(
+        self,
+        miner_info: MinerJobRequestPayload,
+        executors: list[ExecutorSSHInfo],
+    ) -> None:
+        """Tell the backend this miner's executors are starting their pipelines (DAH-3019), off the hot path.
+
+        Called once per miner by MinerService, right where it launches one `create_task` per executor,
+        so the whole batch shares one start time and one request. Scheduled, not awaited: the report
+        must not add its round trip (or a slow backend's 10-s timeout) to the miner's pipelines. The
+        client method swallows every error.
+        """
+        task = asyncio.create_task(
+            self.backend_client.report_verification_started(
+                job_batch_id=miner_info.job_batch_id,
+                miner_hotkey=miner_info.miner_hotkey,
+                executor_uuids=[executor.uuid for executor in executors],
+                started_at=datetime.now(UTC),
+            )
+        )
+        self._start_reports.add(task)
+        task.add_done_callback(self._start_reports.discard)
 
     async def create_task(
         self,
@@ -82,15 +128,27 @@ class TaskService:
         default_docker_image_digests: dict[str, str],
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
+        first_pass: bool = False,
     ):
-        """New pipeline-based validation task implementation."""
+        """New pipeline-based validation task implementation.
+
+        `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
+        (the express lane, DAH-2958). The wave never sets it.
+        """
         attestation_digest = None
         tee_type = None
         attestation_passed = False
         gpu_attestation_passed = None
+        # DAH-2748: true only while the SSH connection is being opened, so a network error from
+        # the attestation verifier or from a pipeline check is never blamed on the node's sshd.
+        is_opening_ssh_connection = False
+        # Once the shell is open the node is proven reachable, whatever fails afterwards.
+        has_reached_the_node = False
 
         try:
-            # Decrypt private key
+            # Decrypt private key. The encrypted form is kept for the rental probe (DAH-3436), whose
+            # create_container / delete_container calls decrypt it themselves like a backend request.
+            encrypted_private_key = private_key
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
             # Prepare attestation host policy before SSH connection
@@ -119,6 +177,7 @@ class TaskService:
                 logger.error(log_text)
                 raise
 
+            is_opening_ssh_connection = True
             async with InteractiveShellService(
                 host=executor_info.address,
                 username=executor_info.ssh_username,
@@ -126,6 +185,8 @@ class TaskService:
                 port=executor_info.ssh_port,
                 known_hosts=known_hosts_policy,
             ) as shell:
+                is_opening_ssh_connection = False
+                has_reached_the_node = True
                 # Build validation context
                 base_ctx = await self.pipeline_factory.build_context(
                     shell=shell,
@@ -140,6 +201,8 @@ class TaskService:
                     executor_image_snapshot=executor_image_snapshot,
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
+                    first_pass=first_pass,
+                    encrypted_private_key=encrypted_private_key,
                 )
 
                 # Build and run validation pipeline
@@ -147,7 +210,12 @@ class TaskService:
                 if settings.DRY_RUN:
                     checks = self.pipeline_factory.build_dry_run_checks()
                 else:
-                    checks = self.pipeline_factory.build_checks()
+                    # Validation fast path: a never-validated idle node's first pass runs the
+                    # same checks arranged to wait less (flag-gated); the wave never does.
+                    if PipelineFactory.takes_fast_path(first_pass, executor_info.uuid, rented_data):
+                        checks = self.pipeline_factory.build_checks(fast_path=True)
+                    else:
+                        checks = self.pipeline_factory.build_checks()
                 pipeline = self.pipeline_factory.build_pipeline(checks)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
@@ -166,19 +234,29 @@ class TaskService:
                     verified_job_info=base_ctx.verified,  # From original context
                     log_text=log_text.to_full_string(),
                     success=success,
+                    validation_event=last_event,
                 )
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
-                result.availability_error_code = first_availability_error_code(events)
+                result.availability_errors = [
+                    error.model_dump(mode="json") for error in availability_errors(events)
+                ]
+                # DAH-3405: the last event is the one that ended the run — the failed fatal check,
+                # the finalize event of a run that completed without a score, or the rented halt
+                # (success=True, score 0 when the image is OUTDATED).
+                if not success or result.score <= 0:
+                    result.failure_reason_code = last_event.reason_code
                 return result
 
         except Exception as e:
+            failure_reason_code = None
+            event = None
             # DAH-2748: SSH we could not open is an availability error, not a verdict on the
             # machine. One is enough to hide the node until a cycle succeeds.
-            if _is_ssh_transport_failure(e):
+            if is_opening_ssh_connection and _is_ssh_transport_failure(e):
                 event = build_ssh_unreachable_event(
                     executor_uuid=executor_info.uuid,
                     host=executor_info.address,
@@ -186,38 +264,36 @@ class TaskService:
                     error=str(e),
                 )
                 log_text = _m(event.event, extra=event.model_dump())
-                logger.error(log_text, exc_info=True)
-                return JobResult(
-                    spec=None,
-                    executor_info=executor_info,
-                    score=0,
-                    job_score=0,
-                    collateral_deposited=False,
-                    job_batch_id=miner_info.job_batch_id,
-                    log_status="error",
-                    log_text=log_text.to_full_string(),
-                    gpu_model=None,
-                    gpu_count=0,
-                    sysbox_runtime=False,
-                    attestation_digest=attestation_digest,
-                    tee_type=tee_type,
-                    gpu_attestation_passed=gpu_attestation_passed,
-                    availability_error_code=event.reason_code,
+                availability_problems = [error.model_dump(mode="json") for error in availability_errors([event])]
+                failure_reason_code = event.reason_code
+            else:
+                # DAH-3405: a shell that died under a check that lets asyncssh raise (a watchtower
+                # recreate mid-run) ends here; name it the way the rented-machine check names the
+                # same death so the rollout classifier sees it. Not an availability error: the
+                # connect succeeded, and the code says nothing about the machine's own sshd. Any
+                # OSError after the connect takes the name too (an aiohttp connection error from a
+                # backend call included): inside a rollout window that withholds a verdict for two
+                # cycles at most, outside it the name changes nothing.
+                if has_reached_the_node and _is_ssh_transport_failure(e):
+                    event = _transport_unreachable_event(executor_uuid=executor_info.uuid, error=e)
+                    failure_reason_code = event.reason_code
+                log_text = _m(
+                    "Pipeline validation error",
+                    extra=get_extra_info({
+                        "job_batch_id": miner_info.job_batch_id,
+                        "miner_hotkey": miner_info.miner_hotkey,
+                        "executor_uuid": executor_info.uuid,
+                        "executor_ip_address": executor_info.address,
+                        "executor_port": executor_info.port,
+                        "ssh_user": executor_info.ssh_username,
+                        "ssh_port": executor_info.ssh_port,
+                        "error": str(e),
+                    })
                 )
-
-            log_text = _m(
-                "Pipeline validation error",
-                extra=get_extra_info({
-                    "job_batch_id": miner_info.job_batch_id,
-                    "miner_hotkey": miner_info.miner_hotkey,
-                    "executor_uuid": executor_info.uuid,
-                    "executor_ip_address": executor_info.address,
-                    "executor_port": executor_info.port,
-                    "ssh_user": executor_info.ssh_username,
-                    "ssh_port": executor_info.ssh_port,
-                    "error": str(e),
-                })
-            )
+                # A cycle that opened the shell proves the node is reachable, so it reports an
+                # empty list and re-lists a node an earlier cycle hid. A cycle that never got
+                # there says nothing, and must not clear what the cycle before it found.
+                availability_problems = [] if has_reached_the_node else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,
@@ -234,6 +310,9 @@ class TaskService:
                 attestation_digest=attestation_digest,
                 tee_type=tee_type,
                 gpu_attestation_passed=gpu_attestation_passed,
+                availability_errors=availability_problems,
+                failure_reason_code=failure_reason_code,
+                validation_event=event,
             )
 
 

@@ -1,0 +1,1082 @@
+"""GPU kernel-fault probe, run on the executor by GpuFaultProbeCheck (`python -I -`, this file on stdin).
+
+Standard library only. The CUDA driver API is reached through ctypes (`libcuda.so.1` is in every
+container the NVIDIA runtime prepares), the kernels are PTX the driver JIT-compiles, NVML is read
+through nvidia-ml-py when it is importable. One forked worker per GPU runs, for a few seconds, the
+access patterns a cuBLAS matmul never exercises: a random permutation built on the device, a gather
+through it, a scatter back (plain stores and atomics), a dependent pointer chase, and a pinned-memory
+async H2D/D2H round-trip. Every result is verified on the device (mismatch counters) and a sample of
+the chase on the host. A fault is any non-zero CUDA return code once the kernels run
+(CUDA_ERROR_ILLEGAL_ADDRESS is what Blender prints as "Illegal address in CUDA queue"), a data
+mismatch, a worker that crashes or hangs once its kernels run, or an uncorrected-ECC / remapped-row /
+recovery-action change in NVML across the run. A probe that cannot start (no libcuda, cuInit, PTX JIT,
+context creation, an allocation the card or the container's limits refuse, a worker that never gets past
+setup) is an error, not a fault: the validator does not penalise what it could not measure.
+
+Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import multiprocessing
+import multiprocessing.connection
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+MB = 1024 * 1024
+JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
+BLOCK = 256
+CHASE_STEPS = 32
+CHASE_SAMPLES = 64
+MIN_LOG2_N = 20  # 1 Mi elements = 4 MB per buffer
+MAX_LOG2_N = 28  # 256 Mi elements = 1 GB per buffer
+BUFFERS = 4  # in, idx, out, aux
+VRAM_RESERVE_MB = (
+    1024  # left free on the card: the runtime's own context and whatever else idles there
+)
+WORKER_GRACE_SECONDS = 30  # on top of --seconds: JIT, allocations, copies, host verification
+WORKER_GRACE_PER_GPU_SECONDS = (
+    5  # more of it per extra worker: they fork, JIT and allocate at the same time
+)
+NVML_GRACE_SECONDS = 10  # an NVML snapshot runs in its own fork: nvmlInit hangs on a wedged card
+WORKER_REAP_AFTER_KILL_SECONDS = (
+    5  # one shared wait, after the kill, for the workers to be reaped, whatever their number
+)
+DMESG_TIMEOUT_SECONDS = 5
+# Xid types an application raises on a healthy card (graphics exception, MMU fault, channel reset, preemptive
+# cleanup): a rented pod's own bug, not the hardware. The probe's own kernels report those through CUresult.
+SOFTWARE_XIDS = {13, 31, 43, 45}
+
+# fmix32-style mixer whose every step is a bijection on [0, 2**k): (x + seed) mod 2**k, odd multiplier
+# mod 2**k, xorshift within k bits. Mirrored in PTX by k_perm; the host replays it to check the chase.
+PERM_MUL = (0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35)
+PERM_SHIFT = (15, 13, 16)
+
+PTX = r"""
+.version 6.0
+.target sm_50
+.address_size 64
+
+// idx[i] = perm(i): the permutation every other kernel gathers and scatters through
+.visible .entry k_perm(.param .u64 p_idx, .param .u32 p_n, .param .u32 p_seed, .param .u32 p_mask)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [p_idx];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_seed];
+    ld.param.u32 %r3, [p_mask];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;
+    setp.ge.u32 %p1, %r7, %r1;
+    @%p1 bra L_end;
+    add.u32 %r8, %r7, %r2;
+    and.b32 %r8, %r8, %r3;
+    mov.u32 %r10, 0x9E3779B1;
+    mul.lo.u32 %r8, %r8, %r10;
+    and.b32 %r8, %r8, %r3;
+    shr.u32 %r9, %r8, 15;
+    xor.b32 %r8, %r8, %r9;
+    mov.u32 %r10, 0x85EBCA6B;
+    mul.lo.u32 %r8, %r8, %r10;
+    and.b32 %r8, %r8, %r3;
+    shr.u32 %r9, %r8, 13;
+    xor.b32 %r8, %r8, %r9;
+    mov.u32 %r10, 0xC2B2AE35;
+    mul.lo.u32 %r8, %r8, %r10;
+    and.b32 %r8, %r8, %r3;
+    shr.u32 %r9, %r8, 16;
+    xor.b32 %r8, %r8, %r9;
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.u32 %rd3, %r7, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r8;
+L_end:
+    ret;
+}
+
+// out[i] = i
+.visible .entry k_iota(.param .u64 p_out, .param .u32 p_n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [p_out];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r5;
+L_end:
+    ret;
+}
+
+// out[i] = in[idx[i]]  (random reads)
+.visible .entry k_gather(.param .u64 p_out, .param .u64 p_in, .param .u64 p_idx, .param .u32 p_n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_out];
+    ld.param.u64 %rd2, [p_in];
+    ld.param.u64 %rd3, [p_idx];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r5, 4;
+    add.s64 %rd8, %rd6, %rd7;
+    ld.global.u32 %r6, [%rd8];
+    mul.wide.u32 %rd9, %r6, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.u32 %r7, [%rd10];
+    add.s64 %rd11, %rd4, %rd7;
+    st.global.u32 [%rd11], %r7;
+L_end:
+    ret;
+}
+
+// out[idx[i]] = i  (random writes; out becomes the inverse permutation)
+.visible .entry k_scatter(.param .u64 p_out, .param .u64 p_idx, .param .u32 p_n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_out];
+    ld.param.u64 %rd3, [p_idx];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r5, 4;
+    add.s64 %rd8, %rd6, %rd7;
+    ld.global.u32 %r6, [%rd8];
+    mul.wide.u32 %rd9, %r6, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.u32 [%rd10], %r5;
+L_end:
+    ret;
+}
+
+// cnt[idx[i]] += 1  (random atomics; every slot ends at exactly 1)
+.visible .entry k_scatter_add(.param .u64 p_cnt, .param .u64 p_idx, .param .u32 p_n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_cnt];
+    ld.param.u64 %rd3, [p_idx];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r5, 4;
+    add.s64 %rd8, %rd6, %rd7;
+    ld.global.u32 %r6, [%rd8];
+    mul.wide.u32 %rd9, %r6, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    red.global.add.u32 [%rd10], 1;
+L_end:
+    ret;
+}
+
+// j = i; steps times: j = idx[j]; out[i] = j  (dependent random reads)
+.visible .entry k_chase(.param .u64 p_out, .param .u64 p_idx, .param .u32 p_n, .param .u32 p_steps)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_out];
+    ld.param.u64 %rd3, [p_idx];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r10, [p_steps];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd6, %rd3;
+    mov.u32 %r8, %r5;
+    mov.u32 %r9, 0;
+    setp.ge.u32 %p2, %r9, %r10;
+    @%p2 bra L_store;
+L_loop:
+    mul.wide.u32 %rd7, %r8, 4;
+    add.s64 %rd8, %rd6, %rd7;
+    ld.global.u32 %r8, [%rd8];
+    add.u32 %r9, %r9, 1;
+    setp.lt.u32 %p2, %r9, %r10;
+    @%p2 bra L_loop;
+L_store:
+    mul.wide.u32 %rd9, %r5, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.u32 [%rd10], %r8;
+L_end:
+    ret;
+}
+
+// ctr += (a[i] != b[i])
+.visible .entry k_count_neq(.param .u64 p_a, .param .u64 p_b, .param .u32 p_n, .param .u64 p_ctr)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u64 %rd2, [p_b];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u64 %rd3, [p_ctr];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    mul.wide.u32 %rd7, %r5, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.u32 %r6, [%rd8];
+    add.s64 %rd9, %rd5, %rd7;
+    ld.global.u32 %r7, [%rd9];
+    setp.eq.u32 %p2, %r6, %r7;
+    @%p2 bra L_end;
+    cvta.to.global.u64 %rd10, %rd3;
+    red.global.add.u32 [%rd10], 1;
+L_end:
+    ret;
+}
+
+// ctr += (a[i] != v)
+.visible .entry k_count_neq_const(.param .u64 p_a, .param .u32 p_n, .param .u32 p_v, .param .u64 p_ctr)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r7, [p_v];
+    ld.param.u64 %rd3, [p_ctr];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    mul.wide.u32 %rd7, %r5, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.u32 %r6, [%rd8];
+    setp.eq.u32 %p2, %r6, %r7;
+    @%p2 bra L_end;
+    cvta.to.global.u64 %rd10, %rd3;
+    red.global.add.u32 [%rd10], 1;
+L_end:
+    ret;
+}
+
+// ctr += (inv[idx[i]] != i)
+.visible .entry k_check_inverse(.param .u64 p_inv, .param .u64 p_idx, .param .u32 p_n, .param .u64 p_ctr)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [p_inv];
+    ld.param.u64 %rd2, [p_idx];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u64 %rd3, [p_ctr];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    mul.wide.u32 %rd7, %r5, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    ld.global.u32 %r6, [%rd8];
+    mul.wide.u32 %rd9, %r6, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    ld.global.u32 %r7, [%rd10];
+    setp.eq.u32 %p2, %r7, %r5;
+    @%p2 bra L_end;
+    cvta.to.global.u64 %rd11, %rd3;
+    red.global.add.u32 [%rd11], 1;
+L_end:
+    ret;
+}
+"""
+
+KERNELS = (
+    "k_perm",
+    "k_iota",
+    "k_gather",
+    "k_scatter",
+    "k_scatter_add",
+    "k_chase",
+    "k_count_neq",
+    "k_count_neq_const",
+    "k_check_inverse",
+)
+
+
+def perm(i: int, seed: int, mask: int) -> int:
+    x = (i + seed) & mask
+    for mul, shift in zip(PERM_MUL, PERM_SHIFT):
+        x = (x * mul) & mask
+        x ^= x >> shift
+    return x
+
+
+class ProbeError(Exception):
+    """The probe could not start on this device (library, cuInit, JIT): reported as an error, not a fault."""
+
+
+class CudaFault(Exception):
+    """A CUDA call failed once the context existed, or a result did not verify: the device is faulty."""
+
+
+class Cuda:
+    """The slice of the driver API the probe uses, through ctypes."""
+
+    def __init__(self) -> None:
+        self.lib = None
+        for name in ("libcuda.so.1", "libcuda.so"):
+            try:
+                self.lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if self.lib is None:
+            raise ProbeError("libcuda.so.1 not found")
+        self.lib.cuGetErrorName.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+        self.lib.cuGetErrorName.restype = ctypes.c_int
+
+    def error_name(self, code: int) -> str:
+        name = ctypes.c_char_p()
+        if self.lib.cuGetErrorName(code, ctypes.byref(name)) == 0 and name.value:
+            return name.value.decode()
+        return f"CUDA_ERROR_{code}"
+
+    def call(self, fn: str, *args, raise_as_fault: bool = True) -> None:
+        code = getattr(self.lib, fn)(*args)
+        if code != 0:
+            message = f"{fn} -> {self.error_name(code)} ({code})"
+            raise CudaFault(message) if raise_as_fault else ProbeError(message)
+
+
+class DevPtr(int):
+    """A CUdeviceptr; distinguishes 64-bit pointer arguments from 32-bit scalars in _launch."""
+
+
+def _launch(cuda: Cuda, func, stream, n: int, *args) -> None:
+    # kernel arguments travel as an array of pointers to their ctypes values, which must outlive the call
+    values = [ctypes.c_uint64(a) if isinstance(a, DevPtr) else ctypes.c_uint32(a) for a in args]
+    params = (ctypes.c_void_p * len(values))(*[ctypes.addressof(v) for v in values])
+    grid = (n + BLOCK - 1) // BLOCK
+    cuda.call("cuLaunchKernel", func, grid, 1, 1, BLOCK, 1, 1, 0, stream, params, None)
+
+
+def _read_counter(cuda: Cuda, d_ctr: int, h_ctr, stream) -> int:
+    cuda.call("cuMemcpyDtoHAsync_v2", h_ctr, ctypes.c_uint64(d_ctr), ctypes.c_size_t(4), stream)
+    cuda.call("cuStreamSynchronize", stream)
+    return ctypes.c_uint32.from_address(h_ctr.value).value
+
+
+def _declare_driver_signatures(lib) -> None:
+    # ctypes defaults every argument to a C int: 64-bit device pointers and size_t lengths must be declared
+    # or they are truncated on the way into the driver
+    lib.cuLaunchKernel.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.cuMemcpyHtoDAsync_v2.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    lib.cuMemcpyDtoHAsync_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    lib.cuMemsetD32Async.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    lib.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+    lib.cuMemFree_v2.argtypes = [ctypes.c_uint64]
+    lib.cuMemAllocHost_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+    lib.cuMemFreeHost.argtypes = [ctypes.c_void_p]
+    lib.cuMemGetInfo_v2.argtypes = [
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.cuCtxCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
+    lib.cuCtxDestroy_v2.argtypes = [ctypes.c_void_p]
+    lib.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+    lib.cuStreamSynchronize.argtypes = [ctypes.c_void_p]
+    lib.cuModuleLoadDataEx.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.cuModuleGetFunction.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    lib.cuDeviceGetName.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+
+
+@dataclass
+class ProbeSetup:
+    """What the allocation phase hands the kernel phase: the context, the JIT'd kernels, the stream and
+    the device and pinned host buffers, sized to the card. Built by ``_setup_device``, freed at the end
+    of ``probe_device``."""
+
+    report: dict
+    cuda: Cuda
+    context: ctypes.c_void_p
+    n: int
+    mask: int
+    funcs: dict
+    stream: ctypes.c_void_p
+    device_buffers: list
+    d_ctr: DevPtr
+    h_ctr: ctypes.c_void_p
+    copy_bytes: int
+    h_src: ctypes.c_void_p
+    h_dst: ctypes.c_void_p
+    pattern: bytes
+    h_sample: ctypes.c_void_p
+
+
+def _setup_device(index: int, vram_mb: int) -> ProbeSetup:
+    """The allocation phase: everything up to the first kernel launch is "could the probe start", not "is
+    the card faulty" — every CUDA call here is ``raise_as_fault=False`` (a ProbeError), never a CudaFault."""
+    report: dict = {"index": index}
+    cuda = Cuda()
+    lib = cuda.lib
+    _declare_driver_signatures(lib)
+
+    cuda.call("cuInit", 0, raise_as_fault=False)
+    device = ctypes.c_int()
+    cuda.call("cuDeviceGet", ctypes.byref(device), index, raise_as_fault=False)
+    name = ctypes.create_string_buffer(256)
+    lib.cuDeviceGetName(name, 256, device)
+    report["name"] = name.value.decode(errors="replace")
+    bus_id = ctypes.create_string_buffer(64)
+    if lib.cuDeviceGetPCIBusId(bus_id, 64, device) == 0:
+        report["pci_bus_id"] = bus_id.value.decode(errors="replace")
+
+    # setup: everything up to the first kernel launch is "could the probe start", not "is the card faulty" —
+    # a context the driver refuses, a busy or full card, a memlock cap on pinned memory all raise ProbeError
+    context = ctypes.c_void_p()
+    cuda.call("cuCtxCreate_v2", ctypes.byref(context), 0, device, raise_as_fault=False)
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+    cuda.call("cuMemGetInfo_v2", ctypes.byref(free), ctypes.byref(total), raise_as_fault=False)
+    report["vram_free_mb"] = free.value // MB
+
+    budget = min(vram_mb * MB, max(free.value - VRAM_RESERVE_MB * MB, 0))
+    smallest = BUFFERS * 4 * (1 << MIN_LOG2_N)
+    if budget < smallest:
+        raise ProbeError(
+            f"not enough free VRAM: {free.value // MB} MB free, {VRAM_RESERVE_MB} MB reserved, "
+            f"the smallest working set is {smallest // MB} MB"
+        )
+    log2_n = MIN_LOG2_N
+    while log2_n < MAX_LOG2_N and BUFFERS * 4 * (1 << (log2_n + 1)) <= budget:
+        log2_n += 1
+    n = 1 << log2_n
+    mask = n - 1
+    report["elements"] = n
+    report["working_set_mb"] = BUFFERS * 4 * n // MB
+
+    t_jit = time.perf_counter()
+    module = ctypes.c_void_p()
+    error_log = ctypes.create_string_buffer(8192)
+    options = (ctypes.c_int * 2)(
+        5, 6
+    )  # CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
+    option_values = (ctypes.c_void_p * 2)(ctypes.addressof(error_log), 8192)
+    code = lib.cuModuleLoadDataEx(ctypes.byref(module), PTX.encode(), 2, options, option_values)
+    if code != 0:
+        raise ProbeError(
+            f"PTX JIT failed: {cuda.error_name(code)}: {error_log.value.decode(errors='replace')}"
+        )
+    funcs = {}
+    for kernel in KERNELS:
+        func = ctypes.c_void_p()
+        cuda.call(
+            "cuModuleGetFunction", ctypes.byref(func), module, kernel.encode(), raise_as_fault=False
+        )
+        funcs[kernel] = func
+    report["jit_ms"] = int((time.perf_counter() - t_jit) * 1000)
+
+    stream = ctypes.c_void_p()
+    cuda.call(
+        "cuStreamCreate", ctypes.byref(stream), 1, raise_as_fault=False
+    )  # CU_STREAM_NON_BLOCKING
+    device_buffers = []
+    for _ in range(BUFFERS):
+        ptr = ctypes.c_uint64()
+        cuda.call("cuMemAlloc_v2", ctypes.byref(ptr), n * 4, raise_as_fault=False)
+        device_buffers.append(DevPtr(ptr.value))
+    d_ctr = ctypes.c_uint64()
+    cuda.call("cuMemAlloc_v2", ctypes.byref(d_ctr), 16, raise_as_fault=False)
+    d_ctr = DevPtr(d_ctr.value)
+    h_ctr = ctypes.c_void_p()
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_ctr), 16, raise_as_fault=False)
+    copy_bytes = min(32 * MB, n * 4)
+    h_src, h_dst = ctypes.c_void_p(), ctypes.c_void_p()
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_src), copy_bytes, raise_as_fault=False)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_dst), copy_bytes, raise_as_fault=False)
+    pattern = os.urandom(copy_bytes)
+    ctypes.memmove(h_src, pattern, copy_bytes)
+    h_sample = ctypes.c_void_p()
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_sample), CHASE_SAMPLES * 4, raise_as_fault=False)
+    report["copy_mb"] = copy_bytes // MB
+    return ProbeSetup(
+        report=report,
+        cuda=cuda,
+        context=context,
+        n=n,
+        mask=mask,
+        funcs=funcs,
+        stream=stream,
+        device_buffers=device_buffers,
+        d_ctr=d_ctr,
+        h_ctr=h_ctr,
+        copy_bytes=copy_bytes,
+        h_src=h_src,
+        h_dst=h_dst,
+        pattern=pattern,
+        h_sample=h_sample,
+    )
+
+
+def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
+    setup = _setup_device(index, vram_mb)
+    report, cuda, context = setup.report, setup.cuda, setup.context
+    n, mask, funcs, stream = setup.n, setup.mask, setup.funcs, setup.stream
+    device_buffers, d_ctr, h_ctr = setup.device_buffers, setup.d_ctr, setup.h_ctr
+    copy_bytes, h_src, h_dst, pattern, h_sample = (
+        setup.copy_bytes,
+        setup.h_src,
+        setup.h_dst,
+        setup.pattern,
+        setup.h_sample,
+    )
+    d_in, d_idx, d_out, d_aux = device_buffers
+    if on_phase is not None:
+        on_phase("kernels")  # from here on a hang or a crash is the card's
+
+    def launch(kernel: str, *args) -> None:
+        _launch(cuda, funcs[kernel], stream, n, *args)
+
+    def counter_check(what: str, kernel: str, *args) -> None:
+        cuda.call("cuMemsetD32Async", d_ctr, 0, 4, stream)
+        launch(kernel, *args)
+        mismatches = _read_counter(cuda, d_ctr, h_ctr, stream)
+        if mismatches:
+            raise CudaFault(f"{what}: {mismatches} of {n} elements wrong")
+
+    launch("k_iota", d_in, n)
+    rounds = 0
+    t_work = time.perf_counter()
+    while rounds < 2 or (time.perf_counter() - t_work < seconds and rounds < 64):
+        seed = (rounds * 0x9E37 + 12345) & mask
+        launch("k_perm", d_idx, n, seed, mask)
+        launch("k_gather", d_out, d_in, d_idx, n)
+        counter_check("gather", "k_count_neq", d_out, d_idx, n, d_ctr)
+        cuda.call("cuMemsetD32Async", d_aux, 0, n, stream)
+        launch("k_scatter_add", d_aux, d_idx, n)
+        counter_check("scatter_add", "k_count_neq_const", d_aux, n, 1, d_ctr)
+        launch("k_scatter", d_aux, d_idx, n)
+        counter_check("scatter", "k_check_inverse", d_aux, d_idx, n, d_ctr)
+        launch("k_chase", d_out, d_idx, n, CHASE_STEPS)
+        # pinned-memory round trip through the copy engines, both directions, verified on the host
+        cuda.call("cuMemcpyHtoDAsync_v2", d_aux, h_src, copy_bytes, stream)
+        cuda.call("cuMemcpyDtoHAsync_v2", h_dst, d_aux, copy_bytes, stream)
+        # a host sample of the chase: 64 dependent-load chains replayed in Python
+        starts = [(perm(k, seed ^ 0x5BD1, mask)) for k in range(CHASE_SAMPLES)]
+        for k, start in enumerate(starts):
+            cuda.call(
+                "cuMemcpyDtoHAsync_v2",
+                ctypes.c_void_p(h_sample.value + 4 * k),
+                ctypes.c_uint64(d_out + 4 * start),
+                ctypes.c_size_t(4),
+                stream,
+            )
+        cuda.call("cuStreamSynchronize", stream)
+        cuda.call("cuCtxSynchronize")
+        if ctypes.string_at(h_dst, copy_bytes) != pattern:
+            raise CudaFault("async memcpy round trip: data differs")
+        sample = (ctypes.c_uint32 * CHASE_SAMPLES).from_address(h_sample.value)
+        for k, start in enumerate(starts):
+            j = start
+            for _ in range(CHASE_STEPS):
+                j = perm(j, seed, mask)
+            if sample[k] != j:
+                raise CudaFault(f"chase: start {start} reached {sample[k]}, expected {j}")
+        rounds += 1
+    report["rounds"] = rounds
+    report["work_s"] = round(time.perf_counter() - t_work, 2)
+
+    for ptr in device_buffers + [d_ctr]:
+        cuda.call("cuMemFree_v2", ptr)
+    for ptr in (h_ctr, h_src, h_dst, h_sample):
+        cuda.call("cuMemFreeHost", ptr)
+    cuda.call("cuCtxSynchronize")
+    cuda.call("cuCtxDestroy_v2", context)
+    return report
+
+
+def _quiet_child() -> None:
+    # a forked worker inherits the SSH session's stdout/stderr; one the driver holds unreaped would keep the
+    # channel open after the parent has printed its verdict. Children talk to the parent over their pipe only.
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+
+def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
+    _quiet_child()
+    started = time.perf_counter()
+
+    def on_phase(phase: str) -> None:
+        # the parent classifies a worker that never answers by the phase it reached: setup -> error, kernels -> fault
+        conn.send({"phase": phase})
+
+    try:
+        report = probe_device(index, seconds, vram_mb, on_phase)
+        report["status"] = "ok"
+    except CudaFault as exc:
+        report = {"index": index, "status": "fault", "error": str(exc)}
+    except ProbeError as exc:
+        report = {"index": index, "status": "error", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - the parent must always get a verdict
+        report = {"index": index, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    report["elapsed_s"] = round(time.perf_counter() - started, 2)
+    conn.send(report)
+    conn.close()
+
+
+def _count_worker(conn) -> None:
+    _quiet_child()
+    try:
+        cuda = Cuda()
+        cuda.call("cuInit", 0, raise_as_fault=False)
+        count = ctypes.c_int()
+        cuda.call("cuDeviceGetCount", ctypes.byref(count), raise_as_fault=False)
+        conn.send({"count": count.value})
+    except Exception as exc:  # noqa: BLE001
+        conn.send({"error": str(exc)})
+    conn.close()
+
+
+def _device_count(mp) -> int:
+    # in its own fork: a process that has called cuInit cannot fork CUDA-capable children
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    process = mp.Process(target=_count_worker, args=(child_conn,))
+    process.start()
+    child_conn.close()
+    try:
+        reply = (
+            parent_conn.recv()
+            if parent_conn.poll(WORKER_GRACE_SECONDS)
+            else {"error": "device enumeration hung"}
+        )
+    except EOFError:  # the pipe closed without a reply: the enumeration child died
+        reply = {"error": f"device enumeration worker died with exit code {_exit_code(process)}"}
+    process.join(5)
+    if process.is_alive():
+        # multiprocessing joins live children at interpreter exit without a timeout: a hung enumeration
+        # would keep this process alive past the check's deadline and turn "could not count" into a fault
+        process.kill()
+        process.join(5)
+    if "error" in reply:
+        raise ProbeError(reply["error"])
+    return reply["count"]
+
+
+def nvml_snapshot() -> dict:
+    """Per-GPU counters that move when hardware faults: uncorrected ECC, remapped rows, recovery action."""
+    try:
+        import pynvml
+    except ImportError:
+        return {"available": False}
+    try:
+        pynvml.nvmlInit()
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": str(exc)}
+    gpus = []
+    try:
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            gpu: dict = {"index": i}
+            for key, read in (
+                ("uuid", lambda h: pynvml.nvmlDeviceGetUUID(h)),
+                ("pci_bus_id", lambda h: pynvml.nvmlDeviceGetPciInfo(h).busId),
+                (
+                    "ecc_uncorrected",
+                    lambda h: pynvml.nvmlDeviceGetTotalEccErrors(
+                        h, pynvml.NVML_MEMORY_ERROR_TYPE_UNCORRECTED, pynvml.NVML_VOLATILE_ECC
+                    ),
+                ),
+                ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
+                ("recovery_action", lambda h: pynvml.nvmlDeviceGetGpuRecoveryAction(h)),
+            ):
+                try:
+                    value = read(handle)
+                    gpu[key] = value.decode() if isinstance(value, bytes) else value
+                except Exception:  # noqa: BLE001 - NotSupported on consumer cards, missing on old bindings
+                    gpu[key] = None
+            gpus.append(gpu)
+    finally:
+        pynvml.nvmlShutdown()
+    return {"available": True, "gpus": gpus}
+
+
+def _nvml_worker(conn) -> None:
+    _quiet_child()
+    try:
+        conn.send(nvml_snapshot())
+    except Exception as exc:  # noqa: BLE001
+        conn.send({"available": False, "error": f"{type(exc).__name__}: {exc}"})
+    conn.close()
+
+
+def nvml_snapshot_forked(mp) -> dict:
+    # in its own fork with a deadline: nvmlInit and the per-GPU reads block on a card that has wedged the
+    # driver, and this parent must always print its verdict
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    process = mp.Process(target=_nvml_worker, args=(child_conn,))
+    process.start()
+    child_conn.close()
+    try:
+        snapshot = (
+            parent_conn.recv()
+            if parent_conn.poll(NVML_GRACE_SECONDS)
+            else {"available": False, "error": f"NVML snapshot hung for {NVML_GRACE_SECONDS}s"}
+        )
+    except (
+        EOFError
+    ):  # the pipe closed without a snapshot: the NVML child died (a driver call that aborted)
+        snapshot = {
+            "available": False,
+            "error": f"NVML snapshot worker died with exit code {_exit_code(process)}",
+        }
+    process.join(1)
+    if process.is_alive():
+        process.kill()
+        process.join(5)
+    return snapshot
+
+
+def nvml_faults(before: dict, after: dict) -> list[str]:
+    faults = []
+    before_gpus, after_gpus = before.get("gpus", []), after.get("gpus", [])
+    # the UUID names the card; when any read of it failed (an old binding, one card) both snapshots fall
+    # back to the position, so the two sides are always keyed the same way
+    by_uuid = all(gpu.get("uuid") for gpu in before_gpus + after_gpus)
+
+    def key(gpu: dict):
+        return gpu["uuid"] if by_uuid else gpu.get("index")
+
+    after_by_key = {key(a): a for a in after_gpus}
+    for b in before_gpus:
+        a = after_by_key.get(key(b))
+        if a is None:
+            # matched by UUID, not by position: a card that fell off the bus mid-run must not be read
+            # as the card that took its index
+            faults.append(
+                f"gpu {b['index']} ({b.get('uuid') or b.get('pci_bus_id')}): missing from the NVML snapshot after the run"
+            )
+            continue
+        if a.get("ecc_uncorrected") is not None and b.get("ecc_uncorrected") is not None:
+            if a["ecc_uncorrected"] > b["ecc_uncorrected"]:
+                faults.append(
+                    f"gpu {a['index']}: uncorrected ECC errors {b['ecc_uncorrected']} -> {a['ecc_uncorrected']}"
+                )
+        rows, rows_before = a.get("remapped_rows"), b.get("remapped_rows")
+        if rows and len(rows) >= 4:
+            # (corrected, uncorrected, isPending, failureOccurred): a row remapped during the run is a fault
+            # whether or not the remap is still pending or has failed
+            if (
+                rows_before
+                and len(rows_before) >= 2
+                and (rows[0] > rows_before[0] or rows[1] > rows_before[1])
+            ):
+                faults.append(
+                    f"gpu {a['index']}: remapped rows corrected {rows_before[0]} -> {rows[0]}, "
+                    f"uncorrected {rows_before[1]} -> {rows[1]}"
+                )
+            # isPending stays set until the GPU is reset, so a card already pending a remap before the run
+            # must not fault on every cycle: only a flag that came up during the run counts
+            if (
+                rows_before
+                and len(rows_before) >= 4
+                and ((rows[2] and not rows_before[2]) or (rows[3] and not rows_before[3]))
+            ):
+                faults.append(
+                    f"gpu {a['index']}: remapped rows pending={rows_before[2]} -> {rows[2]}, "
+                    f"failure={rows_before[3]} -> {rows[3]}"
+                )
+        if a.get("recovery_action"):
+            faults.append(f"gpu {a['index']}: NVML recovery action {a['recovery_action']} required")
+    return faults
+
+
+def xid_lines() -> dict:
+    """The kernel log's NVRM Xid lines when the container may read it; most cannot, and that is fine."""
+    try:
+        out = subprocess.run(
+            ["dmesg"], capture_output=True, text=True, timeout=DMESG_TIMEOUT_SECONDS
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "error": str(exc)}
+    if out.returncode != 0:
+        return {"available": False, "error": (out.stderr or "").strip()[:200]}
+    lines = [line.strip() for line in out.stdout.splitlines() if "NVRM: Xid" in line]
+    return {"available": True, "count": len(lines), "last": lines[-5:], "lines": lines}
+
+
+def pci_key(bus_id) -> str | None:
+    """`0000:81:00.0`, `00000000:81:00.0` and dmesg's `PCI:0000:81:00` all become `0000:81:00`."""
+    if not isinstance(bus_id, str):
+        return None
+    parts = bus_id.strip().lower().split(".")[0].split(":")
+    if len(parts) == 2:
+        parts = ["0000", *parts]
+    if len(parts) != 3:
+        return None
+    return f"{parts[0][-4:].rjust(4, '0')}:{parts[1]}:{parts[2]}"
+
+
+def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list[str]]:
+    """New Xid lines split into this executor's hardware faults and evidence about other cards.
+
+    dmesg is host-wide: a rented pod's illegal address on another card, or a sibling executor's fault, must
+    not be scored against this one. A new line counts as a fault only when its PCI id is one of the probed
+    devices and its Xid type is not an application error (SOFTWARE_XIDS); everything else is kept as evidence.
+    """
+    if not (before.get("available") and after.get("available")):
+        return [], []
+    new_lines = (after.get("lines") or [])[len(before.get("lines") or []) :]
+    faults, other = [], []
+    for line in new_lines:
+        pci = re.search(r"Xid \(PCI:([0-9a-fA-F:.]+)\)", line)
+        code = re.search(r"Xid \([^)]*\): (\d+)", line)
+        xid = int(code.group(1)) if code else None
+        # a line whose Xid number the regex misses is kept as "other", not scored as hardware (review)
+        if (
+            pci
+            and pci_key(pci.group(1)) in bus_ids
+            and xid is not None
+            and xid not in SOFTWARE_XIDS
+        ):
+            faults.append(f"new NVRM Xid on a probed GPU: {line[:200]}")
+        else:
+            other.append(line[:200])
+    return faults, other
+
+
+def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]:
+    """One report per worker, every pipe polled together until the deadline.
+
+    Every worker gets the whole budget: a card that hangs does not eat the time of the ones after it, and a
+    report a worker has already sent (a fault on GPU 3 while GPU 0 hangs) is read, not discarded. A worker
+    still in setup at the deadline did not get to measure anything: the host, the driver or the container's
+    limits kept it from starting, which is an error; once its kernels run, a hang or a crash is the card's.
+    """
+    pending = {
+        index: {"process": process, "conn": conn, "phase": "setup"}
+        for index, process, conn in workers
+    }
+    reports: dict[int, dict] = {}
+
+    def no_verdict(index: int, describe) -> None:
+        worker = pending.pop(index)
+        reports[index] = {
+            "index": index,
+            "status": "fault" if worker["phase"] == "kernels" else "error",
+            "error": describe(worker["phase"]),
+        }
+
+    def died(index: int) -> None:
+        code = _exit_code(pending[index]["process"])
+        no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}")
+
+    def poll_worker_pipes(timeout: float) -> None:
+        by_conn = {worker["conn"]: index for index, worker in pending.items()}
+        for conn in multiprocessing.connection.wait(list(by_conn), timeout=timeout):
+            index = by_conn[conn]
+            try:
+                message = conn.recv()
+            except EOFError:  # the pipe closed without a report: the worker is gone
+                died(index)
+                continue
+            if "phase" in message:
+                pending[index]["phase"] = message["phase"]
+            else:
+                reports[index] = message
+                del pending[index]
+        for index, worker in list(pending.items()):
+            if not worker["process"].is_alive() and not worker["conn"].poll(0):
+                died(index)
+
+    while pending and time.perf_counter() < deadline:
+        poll_worker_pipes(0.2)
+    if pending:
+        poll_worker_pipes(0)  # a message that landed as the deadline passed
+    for index in list(pending):
+        pending[index]["process"].kill()
+        no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
+    # one reap grace for all of them, not 5 s each: a killed worker the driver still holds must not push
+    # the verdict past the validator's SSH cap on an 8-GPU host
+    reap_by = time.perf_counter() + WORKER_REAP_AFTER_KILL_SECONDS
+    for _, process, _ in workers:
+        process.join(max(0.0, reap_by - time.perf_counter()))
+    return [reports[index] for index, _, _ in workers]
+
+
+def _exit_code(process):
+    process.join(1)
+    return process.exitcode
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--seconds", type=float, default=4.0, help="kernel work per GPU (default 4)"
+    )
+    parser.add_argument(
+        "--vram-mb", type=int, default=2048, help="working set cap per GPU (default 2048)"
+    )
+    parser.add_argument(
+        "--device", type=int, action="append", help="probe only this index (repeatable)"
+    )
+    args = parser.parse_args(argv)
+
+    started = time.perf_counter()
+    result: dict = {"status": "ok", "devices": [], "faults": []}
+    # every CUDA call happens in a forked worker (one per GPU, plus one to count them): a crash or hang
+    # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself
+    mp = multiprocessing.get_context("fork")
+    try:
+        indices = args.device if args.device else list(range(_device_count(mp)))
+        if not indices:
+            raise ProbeError("no CUDA devices")
+    except ProbeError as exc:
+        result.update(
+            status="error", error=str(exc), elapsed_s=round(time.perf_counter() - started, 2)
+        )
+        print(JSON_MARKER, json.dumps(result, sort_keys=True))
+        return 2
+
+    result["nvml_before"] = nvml_snapshot_forked(mp)
+    xid_before = xid_lines()
+
+    workers = []
+    for index in indices:
+        parent_conn, child_conn = mp.Pipe(duplex=False)
+        process = mp.Process(target=_worker, args=(index, args.seconds, args.vram_mb, child_conn))
+        process.start()
+        child_conn.close()
+        workers.append((index, process, parent_conn))
+
+    # one wall-clock budget for the concurrent workers, with grace that grows with their number: eight
+    # interpreters forking, JIT-compiling and allocating at once on a loaded host take longer than one
+    grace = WORKER_GRACE_SECONDS + WORKER_GRACE_PER_GPU_SECONDS * (len(workers) - 1)
+    budget = args.seconds + grace
+    result["devices"] = drain_workers(workers, time.perf_counter() + budget, budget)
+
+    result["nvml_after"] = nvml_snapshot_forked(mp)
+    xid_after = xid_lines()
+    # the cards this run speaks for: the workers' own PCI ids, plus NVML's when every device was probed
+    bus_ids = {pci_key(r.get("pci_bus_id")) for r in result["devices"]} - {None}
+    if not args.device:
+        bus_ids |= {
+            pci_key(g.get("pci_bus_id")) for g in result["nvml_before"].get("gpus") or []
+        } - {None}
+    xid_new, xid_other = xid_faults(xid_before, xid_after, bus_ids)
+    result["faults"].extend(xid_new)
+    result["xid"] = {k: v for k, v in xid_after.items() if k != "lines"}
+    if xid_other:
+        result["xid"]["other_new"] = xid_other[-5:]
+    result["faults"].extend(nvml_faults(result["nvml_before"], result["nvml_after"]))
+    for report in result["devices"]:
+        if report["status"] == "fault":
+            result["faults"].append(f"gpu {report['index']}: {report['error']}")
+    errors = [r for r in result["devices"] if r["status"] == "error"]
+    if result["faults"]:
+        result["status"] = "fault"
+    elif errors:
+        result["status"] = "error"
+        result["error"] = "; ".join(f"gpu {r['index']}: {r['error']}" for r in errors)
+    result["elapsed_s"] = round(time.perf_counter() - started, 2)
+    print(JSON_MARKER, json.dumps(result, sort_keys=True))
+    return {"ok": 0, "fault": 1, "error": 2}[result["status"]]
+
+
+if __name__ == "__main__":
+    code = main(sys.argv[1:])
+    # the verdict is printed into a pipe (block-buffered) and multiprocessing joins live children at exit
+    # without a timeout: flush, then leave without the exit handlers so a child the driver still holds
+    # cannot keep the verdict from the validator
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

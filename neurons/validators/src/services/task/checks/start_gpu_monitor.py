@@ -83,6 +83,10 @@ class StartGPUMonitorCheck:
             Msg.START_FAILED,
             ctx=ctx,
             check_id=self.check_id,
-            what={"exit_code": start_res.exit_code, "stderr": start_res.stderr[-400:]},
+            what={
+                "exit_code": start_res.exit_code,
+                "error_type": start_res.error_type,
+                "stderr": start_res.stderr[-400:],
+            },
         )
         return CheckResult(passed=False, event=event)

@@ -75,12 +75,18 @@ def build_expected_image_snapshot(digest: str | None) -> ExpectedImageSnapshot:
     return ExpectedImageSnapshot(executor=executor, executor_ref=ref)
 
 
-def outdated_image_remediation(expected_ref: str) -> str:
+def outdated_image_remediation(expected_ref: str, *, enforced: bool) -> str:
+    consequence = (
+        "The node earns no incentive until the executor image matches the current release."
+        if enforced
+        else "Incentive is unchanged for now: the image check is a warning until "
+        "EXECUTOR_IMAGE_CHECK_ENFORCE is on."
+    )
     return (
         f"This node is not running the current {expected_ref} image. "
         "On a standard stack, confirm executor-executor-runner-1 and executor-watchtower-1 "
         "are running so Watchtower can pull and redeploy the latest executor automatically. "
         "If auto-update stopped, follow "
         "https://docs.lium.io/providers/nodes/gpu-power-cap#the-standard-stack-which-stopped-updating. "
-        "The node earns no incentive until the executor image matches the current release."
+        f"{consequence}"
     )

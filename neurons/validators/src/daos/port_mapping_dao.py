@@ -1,5 +1,4 @@
 import logging
-import time
 from asyncio import Semaphore
 from uuid import UUID
 from core.db import POOL_SIZE

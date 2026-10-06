@@ -532,7 +532,6 @@ async def test_scenario_multiple_executors_per_miner(
         assert_incentive_log_present,
         assert_executor_has_log,
         assert_log_contains_keys,
-        count_incentive_log_entries,
     )
 
     for hotkey, results in all_job_results.items():
@@ -678,11 +677,6 @@ async def test_scenario_single_miner_monopoly(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    monopoly_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=4,
-        total_gpu_count=4,
-    )
     failed_score = 0.0
 
     assert validator.miner_scores["monopoly_miner"] == pytest.approx(MINING_ALLOCATION)
