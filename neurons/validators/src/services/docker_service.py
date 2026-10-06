@@ -6440,8 +6440,8 @@ class DockerService:
             early_host_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
             early_volume_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
             # DAH-3980: a customer's create removes every filler (DAH-3706); started with the probes,
-            # the kill runs beside the image inspect instead of after it. An edit, a restore and a
-            # filler create keep the removal at the cleanup step.
+            # the kill runs beside the image inspect instead of after it. Any other create (a filler
+            # create, a restore, a custom build, a local volume) keeps the removal at the cleanup step.
             removes_fillers_at_ssh_connect = (
                 early_probes_allowed
                 and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
@@ -6908,7 +6908,7 @@ class DockerService:
                 # 90s _run_docker_create_with_port_retry budget), so we no longer
                 # block the critical path for ~10s. (sleep defaults to 0.)
                 # DAH-3980: everything after the cleanup (power restore, cache reclaim, docker run) still
-                # waits for the fillers to be removed and confirmed; an error fails the create here.
+                # waits for the fillers' removal and its confirming listing; an error fails the create here.
                 fillers_removed_at_ssh_connect = FillerRemovalAtSshConnect(
                     listed_id_by_filler_name={}, removed_cleanly_without_volume_rm=False
                 )
