@@ -7742,7 +7742,7 @@ async def _create_failing_at_add_public_keys(
     )
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == failure_step, "dashboards key on the step"
-    if failure_step == "killed_during_bootstrap":
+    if failure_step in ("killed_during_bootstrap", "oom_during_bootstrap"):
         # a kill's msg is its renter-safe cause sentence; the diagnosis stays in detail
         assert result.msg.startswith(
             ("the container was stopped by the node", "the container stopped before", "the container was killed for lack of memory")
@@ -7824,17 +7824,21 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
 
 
 @pytest.mark.parametrize(
-    "state",
+    "state, failure_step",
     [
-        pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
-        pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+        pytest.param(
+            _state(status="exited", running=False, exit_code=137, oom_killed=True), "oom_during_bootstrap", id="oom-killed"
+        ),
+        pytest.param(_state(status="exited", running=False, exit_code=137), "killed_during_bootstrap", id="sigkill"),
         # `dead` is a removal the daemon could not finish, not the image's exit, whatever the code
-        pytest.param(_state(status="dead", running=False, exit_code=1, restart_count=0), id="dead"),
+        pytest.param(
+            _state(status="dead", running=False, exit_code=1, restart_count=0), "killed_during_bootstrap", id="dead"
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_a_key_injection_that_fails_after_a_host_kill_is_killed_during_bootstrap(
-    docker_service, monkeypatch, state
+    docker_service, monkeypatch, state, failure_step
 ):
     """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
     result = await _create_failing_at_add_public_keys(
@@ -7842,7 +7846,7 @@ async def test_a_key_injection_that_fails_after_a_host_kill_is_killed_during_boo
         monkeypatch,
         state=state,
         exec_error=_EXEC_KILLED_BY_EXIT,
-        failure_step="killed_during_bootstrap",
+        failure_step=failure_step,
     )
 
     error = _failure_error_field(result)

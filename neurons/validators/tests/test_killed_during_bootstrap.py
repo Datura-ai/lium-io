@@ -27,6 +27,7 @@ from services.docker_service import (
     CANCELLED_BY_CREATE_STEP,
     KILLED_DURING_BOOTSTRAP_EVENT,
     KILLED_DURING_BOOTSTRAP_STEP,
+    OOM_DURING_BOOTSTRAP_STEP,
     ContainerKilledDuringBootstrap,
     DockerService,
     container_gone_cause,
@@ -364,7 +365,10 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     result = await _create(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP == "killed_during_bootstrap"
+    # an OOM is the renter's container running out of memory: its own step, which no host step set holds
+    expected_step = "oom_during_bootstrap" if event["cause"] == "oom" else "killed_during_bootstrap"
+    assert result.failure_step == expected_step
+    assert result.detail.startswith(f"{expected_step}: ") or f"{expected_step}: " in result.detail
     assert sentence in result.detail
     # the backend builds the renter's error from msg: the cause sentence, without the diagnosis
     assert sentence in result.msg and "cause=" not in result.msg and "Failed create_container" not in result.msg
@@ -372,7 +376,7 @@ async def test_a_kill_during_a_bootstrap_step_is_killed_during_bootstrap(
     assert f"(cause={event['cause']} oom_killed=" in result.detail
     # the backend reads Docker's "is not running" as the renter's image exiting, not a kill on the node
     assert "is not running" not in result.detail
-    assert _failure_extra(caplog)["failure_step"] == "killed_during_bootstrap"
+    assert _failure_extra(caplog)["failure_step"] == expected_step
     failure = next(r for r in caplog.records if str(r.msg) == "Failed create_container")
     assert failure.levelno == logging.ERROR and failure.exc_info is None
     assert failure.msg.extra["reason"] == "killed_during_bootstrap"
@@ -440,7 +444,7 @@ async def test_a_container_another_create_swept_is_not_a_node_kill(svc, monkeypa
 
     assert isinstance(result, FailedContainerRequest)
     if swept.startswith("older-") or swept.endswith("-oom"):
-        assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+        assert result.failure_step == ("oom_during_bootstrap" if swept.endswith("-oom") else KILLED_DURING_BOOTSTRAP_STEP)
         (logged,) = _events(caplog)
         assert logged["container_name"] == name
         assert logged["cause"] == ("oom" if swept.endswith("-oom") else "killed")
@@ -1066,7 +1070,7 @@ async def test_a_kill_after_the_last_bootstrap_exec_is_not_a_created_container(s
         else:
             assert "status='exited'" in result.detail
         return
-    assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+    assert result.failure_step == ("oom_during_bootstrap" if outcome == "oom" else KILLED_DURING_BOOTSTRAP_STEP)
     (logged,) = _events(caplog)
     assert logged["bootstrap_step"] == "finalize" and logged["cause"] == outcome
     assert "is not running" not in result.detail
@@ -1174,3 +1178,34 @@ async def test_a_failed_ssh_bootstrap_on_a_running_container_still_creates(svc, 
     result = await _create(svc, _payload())
 
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+
+
+# lium-platform #976 `IMAGE_DEPENDENT_STEPS` and `IMAGE_INDEPENDENT_HOST_STEPS` name the steps an official image's
+# failure counts against the host on; an OOM's step must be in neither
+_BACKEND_HOST_STEPS = {"killed_during_bootstrap", "finalize", "docker_run", "container_health_check", "ssh_ready"}
+
+
+@pytest.mark.parametrize(
+    "status, running, restarting, exit_code, oom, cause, step",
+    [
+        ("removing", False, False, 137, True, "oom", "oom_during_bootstrap"),
+        ("exited", False, False, 137, True, "oom", "oom_during_bootstrap"),
+        ("restarting", True, True, 137, True, "oom", "oom_during_bootstrap"),
+        ("removing", False, False, 137, False, "killed", "killed_during_bootstrap"),
+        ("exited", False, False, 143, False, "signaled", "killed_during_bootstrap"),
+    ],
+    ids=["oom-removing", "oom-exited", "oom-restarting", "sigkill-control", "signaled-control"],
+)  # fmt: skip
+def test_an_oom_goes_out_under_its_own_step_in_every_state(status, running, restarting, exit_code, oom, cause, step):
+    """The accepted policy: an OOM is the renter's container hitting its memory, never the host's failure,
+    whatever State it is read in; the kills the node did keep killed_during_bootstrap."""
+    state = ContainerStateSnapshot(
+        status=status, running=running, restarting=restarting, exit_code=exit_code,
+        restart_count=0, error=None, oom_killed=oom,
+    )  # fmt: skip
+    killed = ContainerKilledDuringBootstrap(
+        container_name="pod_x", bootstrap_step="ssh_bootstrap", state=state, detail=""
+    )
+    assert killed.cause == cause and killed.failure_step == step
+    assert str(killed).startswith(f"{step}: ") and OOM_DURING_BOOTSTRAP_STEP == "oom_during_bootstrap"
+    assert (step in _BACKEND_HOST_STEPS) is (cause != "oom")

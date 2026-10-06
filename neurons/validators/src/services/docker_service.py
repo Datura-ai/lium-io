@@ -840,6 +840,9 @@ class ImageExitedDuringKeyInjection(Exception):
 
 
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
+# failure_step of an OOM kill during bootstrap: the renter's container ran out of memory, not the host's
+# failure, so it stays out of killed_during_bootstrap (lium-platform counts that step's OOM against the host)
+OOM_DURING_BOOTSTRAP_STEP = "oom_during_bootstrap"
 # failure_step of a create whose container another create on this node swept: not the host's failure
 CANCELLED_BY_CREATE_STEP = "cancelled_by_create"
 KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
@@ -964,8 +967,9 @@ class ContainerKilledDuringBootstrap(Exception):
         self.cause = container_gone_cause(state)
         # the wire `msg`: the backend builds the renter-facing error from it, so it carries no diagnosis
         self.renter_sentence = self._sentence()
+        self.failure_step = OOM_DURING_BOOTSTRAP_STEP if self.cause == "oom" else KILLED_DURING_BOOTSTRAP_STEP
         super().__init__(
-            f"{KILLED_DURING_BOOTSTRAP_STEP}: {self.renter_sentence} during {bootstrap_step} "
+            f"{self.failure_step}: {self.renter_sentence} during {bootstrap_step} "
             f"(cause={self.cause} oom_killed={str(self.oom_killed).lower()} exit_code={self.exit_code!r} "
             f"signal={self.signal!r} status={self.status!r}). {detail}"
         )
@@ -7405,7 +7409,7 @@ class DockerService:
                             bootstrap_step=current_step,
                             default_extra=default_extra,
                         )
-                        current_step = KILLED_DURING_BOOTSTRAP_STEP
+                        current_step = killed.failure_step
                         raise killed from post_run_exc
                     raise
 
