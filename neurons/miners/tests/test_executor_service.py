@@ -12,7 +12,17 @@ import bittensor
 import pytest
 
 from models.executor import Executor
-from protocol.miner_portal_request import AddExecutorFailed, ExecutorAdded
+from protocol.miner_portal_request import (
+    AddExecutorFailed,
+    DeleteExecutorRequest,
+    ExecutorAdded,
+    ExecutorDeleteFailed,
+    ExecutorUpdateFailed,
+    SyncExecutorMinerPortalFailed,
+    SyncExecutorMinerPortalRequest,
+    SyncExecutorPayload,
+    UpdateExecutorRequest,
+)
 from services.executor_service import ExecutorService
 
 
@@ -219,3 +229,40 @@ async def test_register_pubkey_knows_nothing_for_an_id_the_miner_does_not_list(
 
     assert registration.known_executor_ids == []
     assert registration.accepted == []
+
+
+# ---------------------------------------------------------------------------
+# A failed write rolls the shared session back
+# ---------------------------------------------------------------------------
+
+
+def _payload(test_executor):
+    return SyncExecutorPayload(
+        uuid=test_executor.uuid,
+        validator=test_executor.validator,
+        address=test_executor.address,
+        port=test_executor.port,
+        price_per_gpu=0.5,
+    )
+
+
+@pytest.mark.parametrize(
+    "call, failed_type",
+    [
+        (lambda s, p: s.update(UpdateExecutorRequest(executor=p)), ExecutorUpdateFailed),
+        (lambda s, p: s.delete(DeleteExecutorRequest(executor=p)), ExecutorDeleteFailed),
+        (lambda s, p: s.sync_executor_miner_portal(SyncExecutorMinerPortalRequest(payload=[p])), SyncExecutorMinerPortalFailed),
+    ],
+    ids=["update", "delete", "sync_executor_miner_portal"],
+)
+def test_a_failed_write_rolls_the_shared_session_back(executor_service, test_executor, call, failed_type):
+    """ioc builds one ExecutorService on one session for the process: a failed flush left in it fails every later
+    request with 'transaction has been rolled back due to a previous exception during flush'."""
+    dao = executor_service.executor_dao
+    for method in (dao.update_by_uuid, dao.delete_by_address_port, dao.find_by_uuid):
+        method.side_effect = Exception("flush failed")
+
+    result = call(executor_service, _payload(test_executor))
+
+    assert isinstance(result, failed_type)
+    dao.session.rollback.assert_called_once()
