@@ -14,7 +14,7 @@ class _ScriptedSshClient:
         self._results: list[tuple[int, str]] = results
         self.commands_called: list[str] = []
 
-    async def run(self, command: str, check: bool = True):
+    async def run(self, command: str, check: bool = True, input: str | None = None):
         self.commands_called.append(command)
         exit_status, stdout = self._results.pop(0) if self._results else (0, "")
 

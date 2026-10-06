@@ -10,6 +10,7 @@ from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
     MissingFlagshipCapability,
+    PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
 )
@@ -37,6 +38,11 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "filler_container_entered",
         "outdated_executor_image",
+        "port_limited_remainder",
+        "spot_without_lium_filler",
+        "spot_no_filler_revenue_for_gpu_config",
+        "spot_no_headroom_at_burn_cap",
+        "validation_failed",
     }
 
 
@@ -145,6 +151,13 @@ def _job(**overrides) -> JobResult:
             "cannot_apply_gpu_power_cap",
             "CAP_SYS_ADMIN",
         ),
+        (
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(available_port_count=2, required_port_count=3)
+            ),
+            "port_limited_remainder",
+            "2 free port",
+        ),
     ],
 )
 def test_zero_reason_constructor_code_and_message(build, expected_code, message_fragment):
@@ -167,15 +180,32 @@ def test_banned_network_abuse_message():
 def test_provider_ban_is_excluded_from_both_pools():
     incentive = object.__new__(RentalPriceIncentive)
 
-    line = incentive._reason_excluded_from_both_pools(_job(is_provider_banned=True))
+    lines = incentive._reasons_excluded_from_both_pools(_job(is_provider_banned=True))
 
-    assert line is not None
-    assert line.reason is ZeroIncentiveReason.BANNED_NETWORK_ABUSE
+    assert [line.reason for line in lines] == [ZeroIncentiveReason.BANNED_NETWORK_ABUSE]
 
 
 def test_spot_tier_carries_internal_log_message():
     line = MinerLogLine.no_payout_because_spot_tier(_job())
     assert line.internal_message == "Executor excluded from both pools - spot tier"
+
+
+def test_spot_tier_message_lists_every_cause_of_spot_rating():
+    message = MinerLogLine.no_payout_because_spot_tier(_job()).message
+    assert "this executor is on the spot tier" not in message
+    assert message.startswith("No subnet incentive: this executor is rated as spot for this cycle")
+    for cause in (
+        "set to Spot",
+        "demoted for penalties",
+        "Lium banned its hotkey by hand",
+        "Lium pinned the machine as spot",
+        "open rental",
+        "contracted under the spot tier",
+    ):
+        assert cause in message
+    assert "by Lium by hand" not in message
+    assert "network abuse" not in message
+    assert message.endswith("spot-rated executors do not earn subnet incentive.")
 
 
 def test_discord_reason_carries_connected_flag_for_internal_log():

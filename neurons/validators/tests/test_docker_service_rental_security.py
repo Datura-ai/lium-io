@@ -24,6 +24,7 @@ from payload_models.payloads import (
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerStateSnapshot,
     RentalDockerOperationError,
     build_gpu_docker_config,
 )
@@ -93,6 +94,12 @@ class RecordingRentalDockerClient:
         self.inspected_images.append(image)
         return image in self.existing_images
 
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
+        return () if await self.image_exists(image=image) else None
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        return True
+
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)
 
@@ -104,6 +111,12 @@ class RecordingRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
 
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
@@ -1059,7 +1072,7 @@ async def test_port_check_filters_quote_hostile_miner_hotkey(
         ssh_client=ssh_client,
     )
 
-    assert result == (True, "No port check containers found")
+    assert result == (False, "No port check containers found")
     assert len(ssh_client.commands) == 1
     _assert_shell_arg_is_single_token(
         ssh_client.commands[0],
