@@ -740,6 +740,12 @@ class Settings(BaseSettings):
         env="EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS", default=8, gt=0
     )
 
+    # A new node whose first pass failed is run again by the lane (up to 3 runs, 60 s
+    # apart) instead of waiting for the next cycle; off = the failed result waits for the cycle.
+    EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED: bool = Field(
+        env="EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", default=True
+    )
+
     def express_lane_tick_seconds(self) -> int:
         """How often the express lane reads the portal snapshot: the fast tick with the fast path on."""
         if self.VALIDATION_FAST_PATH_ENABLED:

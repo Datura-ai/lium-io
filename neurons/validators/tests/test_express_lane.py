@@ -9,8 +9,8 @@ verified is not run again before the cycle records it; the next cycle keeps the 
 running express verification reads, and a cycle that starts during a tick moves the launch to
 its files; a verification without its job files is never published as the node's verdict; a
 published result is never run again when recording it fails; the in-flight caps bound a
-registration flood; an executor the miner does not return is retried a bounded number of times
-and then left to the cycle; an express publish carries the job_batch_id of the cycle whose job
+registration flood; an executor the miner does not return, or whose first pass failed, is
+retried a bounded number of times and then left to the cycle; an express publish carries the job_batch_id of the cycle whose job
 files it ran on, so its prod_executors row lands on that cycle's time.
 """
 
@@ -28,7 +28,13 @@ import bittensor
 import pytest
 import services.file_encrypt_service as file_encrypt_service
 from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, portal_miner_auth_blob
-from core.express_lane import EXPRESS_PUBLISHED_EVENT, MAX_ATTEMPTS, CycleInputs, ExpressLane
+from core.express_lane import (
+    EXPRESS_PUBLISHED_EVENT,
+    FIRST_PASS_MAX_RUNS,
+    MAX_ATTEMPTS,
+    CycleInputs,
+    ExpressLane,
+)
 from fakeredis.aioredis import FakeRedis
 from fixtures.rest_miner_fixtures import VALIDATOR_HOTKEY
 from fixtures.rest_miner_fixtures import executor_info as _executor_info
@@ -779,7 +785,7 @@ async def test_a_result_produced_after_the_job_files_vanished_is_not_the_nodes_v
     pending.not_before = 0.0
     assert await harness.tick_and_settle() == 1
     harness.miner_service.publish_machine_specs.assert_awaited_once()
-    assert await harness.redis_service.get_validated_executors() == {new_node}
+    assert harness.lane._pending[new_node].failed_runs == 1
 
 
 @pytest.mark.asyncio
@@ -894,9 +900,69 @@ async def test_a_failed_verification_is_published_so_the_provider_sees_why(monke
         assert await harness.tick_and_settle() == 1
 
     harness.miner_service.publish_machine_specs.assert_awaited_once()
-    assert await harness.redis_service.get_validated_executors() == {new_node}
     published = [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
     assert published[0].msg.extra["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_pass_is_run_again_and_a_pass_is_recorded(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    scores = iter([0.0, 1.0])
+    harness.job_for = lambda payload, executor_id: {
+        "miner_hotkey": "miner-a",
+        "miner_coldkey": "c",
+        "results": [_job_result(executor_id, score=next(scores))],
+    }
+
+    assert await harness.tick_and_settle() == 1
+    assert await harness.redis_service.get_validated_executors() == set()
+    assert await harness.tick_and_settle() == 0  # inside the retry backoff
+    harness.lane._pending[new_node].not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+
+    assert harness.miner_service.publish_machine_specs.await_count == 2
+    assert await harness.redis_service.get_validated_executors() == {new_node}
+    assert new_node not in harness.lane._pending
+    assert harness.miner_service.in_flight == {}
+
+
+@pytest.mark.asyncio
+async def test_a_first_pass_that_keeps_failing_is_left_to_the_cycle_after_max_runs(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.job_for = lambda payload, executor_id: {
+        "miner_hotkey": "miner-a",
+        "miner_coldkey": "c",
+        "results": [_job_result(executor_id, score=0.0)],
+    }
+
+    assert await harness.tick_and_settle() == 1
+    for _ in range(FIRST_PASS_MAX_RUNS - 1):
+        harness.lane._pending[new_node].not_before = 0.0
+        assert await harness.tick_and_settle() == 1
+    assert await harness.tick_and_settle() == 0
+
+    assert harness.miner_service.request_job_to_miner.await_count == FIRST_PASS_MAX_RUNS
+    assert harness.miner_service.publish_machine_specs.await_count == FIRST_PASS_MAX_RUNS
+    assert await harness.redis_service.get_validated_executors() == {new_node}
+
+
+@pytest.mark.asyncio
+async def test_retry_off_a_failed_first_pass_is_recorded_and_left_to_the_cycle(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", False)
+    harness.job_for = lambda payload, executor_id: {
+        "miner_hotkey": "miner-a",
+        "miner_coldkey": "c",
+        "results": [_job_result(executor_id, score=0.0)],
+    }
+
+    assert await harness.tick_and_settle() == 1
+    assert await harness.redis_service.get_validated_executors() == {new_node}
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.request_job_to_miner.assert_awaited_once()
 
 
 # --- Redis seed and portal auth -------------------------------------------------------------
