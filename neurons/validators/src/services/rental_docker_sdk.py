@@ -85,6 +85,10 @@ class RentalDockerConnectionError(RuntimeError):
     """Raised when Docker SDK over SSH cannot be constructed safely."""
 
 
+class ContainerCreateRefused(Exception):
+    """Raised by a run spec's `before_create` check; nothing was created."""
+
+
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
@@ -291,6 +295,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
+    before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -481,7 +487,10 @@ class RentalDockerSdkClient:
         )
 
     async def run_container(self, spec: ContainerRunSpec) -> str | None:
-        """Creates and starts the container; returns its ID (None if Docker gave none)."""
+        """Creates and starts the container; returns its ID (None if Docker gave none).
+
+        The ContainerCreateRefused of ``spec.before_create`` reaches the caller unwrapped.
+        """
         # The retry adopts a container of this name and image if the first attempt's
         # `containers/create` reached the daemon before the channel dropped: `create` is the one
         # call here that must not run twice, `start` on a running container is a no-op.
@@ -494,7 +503,7 @@ class RentalDockerSdkClient:
     async def _run_container_once(self, spec: ContainerRunSpec, *, adopt_existing: bool) -> str | None:
         try:
             return await _in_docker_thread(self._run_container_sync, spec, adopt_existing=adopt_existing)
-        except RentalDockerOperationError:
+        except (RentalDockerOperationError, ContainerCreateRefused):
             raise
         except Exception as exc:
             raise RentalDockerOperationError(
@@ -958,6 +967,8 @@ class RentalDockerSdkClient:
             host_config = self._api_client.create_host_config(
                 **_build_host_config_kwargs(spec)
             )
+            if spec.before_create is not None:
+                spec.before_create()
             created = self._api_client.create_container(
                 image=spec.image,
                 command=list(spec.command) or None,
