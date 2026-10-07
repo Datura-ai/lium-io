@@ -804,8 +804,8 @@ class Settings(BaseSettings):
     RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX: int = Field(
         env="RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX", default=32768, ge=0,
         description=(
-            "kernel.pid_max to assume when the executor's real value cannot be read (SSH timeout, "
-            "`timeout` missing, parse failure). The container is clamped to this minus "
+            "kernel.pid_max to assume when the executor's real value cannot be read (SSH failure or "
+            "timeout, parse failure). The container is clamped to this minus "
             "RENTAL_PIDS_LIMIT_HOST_MARGIN, so an unreadable host fails safe to a low-pid_max box "
             "(32768 - 4096 = 28672) instead of keeping the full cap and reopening the fork-bomb "
             "vector. 0 restores the old behaviour (keep the scaled cap when pid_max is unreadable)."

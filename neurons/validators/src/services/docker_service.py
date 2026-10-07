@@ -2427,11 +2427,13 @@ class DockerService:
         Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
         ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Best-effort
         and bounded: on any miss the helper fails safe to RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX rather
-        than keeping the full cap.
+        than keeping the full cap. The read is a bare `cat` of a /proc file bounded by asyncssh's own
+        `timeout`; it deliberately does not shell out to `timeout`, whose absence would otherwise
+        turn into a miss and over-provision the fallback on a host below it.
         """
         try:
             res = await ssh_client.run(
-                "timeout -k 2 10 cat /proc/sys/kernel/pid_max", check=False, timeout=15
+                "cat /proc/sys/kernel/pid_max", check=False, timeout=15
             )
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
