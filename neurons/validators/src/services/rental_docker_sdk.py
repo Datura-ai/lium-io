@@ -195,6 +195,11 @@ class ContainerRunSpec:
     cpu_count: int | None = None
     memory_gb: int | None = None
     storage_limit_gb: int | None = None
+    # cgroup pids.max for the container. Caps total tasks (processes + threads) so a tenant fork
+    # bomb cannot exhaust the host's global PID space and starve the executor/sshd of forks. None
+    # keeps the daemon default (unlimited); the memory cgroup is no ceiling here because on a
+    # whole-host rental mem_limit is host-sized.
+    pids_limit: int | None = None
     shm_size: str | None = None
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
@@ -1167,6 +1172,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "device_requests": _device_requests(spec.device_requests),
         "nano_cpus": spec.cpu_count * 1_000_000_000 if spec.cpu_count else None,
         "mem_limit": f"{spec.memory_gb}g" if spec.memory_gb else None,
+        "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
             {"size": f"{spec.storage_limit_gb}g"}
             if spec.storage_limit_gb

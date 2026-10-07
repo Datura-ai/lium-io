@@ -194,6 +194,7 @@ class ExecutorService:
                 executor_id=executor.uuid,
             )
         except Exception as e:
+            self.executor_dao.session.rollback()
             return ExecutorUpdateFailed(
                 executor_id=executor.uuid,
                 error=str(e),
@@ -209,6 +210,8 @@ class ExecutorService:
                 executor_id=executor_uuid,
             )
         except Exception as e:
+            # the session is shared by every later request: left in a failed flush, each of them fails too
+            self.executor_dao.session.rollback()
             return ExecutorDeleteFailed(
                 executor_id=executor_uuid,
                 error=str(e),
@@ -239,6 +242,7 @@ class ExecutorService:
 
             return SyncExecutorMinerPortalSuccess()
         except Exception as e:
+            self.executor_dao.session.rollback()
             log_text = _m(
                 "Failed to sync executor miner portal",
                 extra={
