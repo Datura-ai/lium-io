@@ -68,6 +68,10 @@ class RentalDockerConnectionError(RuntimeError):
     """Raised when Docker SDK over SSH cannot be constructed safely."""
 
 
+class ContainerCreateRefused(Exception):
+    """Raised by a run spec's `before_create` check; nothing was created."""
+
+
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
@@ -210,6 +214,8 @@ class ContainerRunSpec:
     network: str | None = None
     # Docker-in-Docker address pools, merged into the container's /etc/docker/daemon.json between create and start
     inner_daemon_address_pools: tuple[AddressPool, ...] = ()
+    # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
+    before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -388,9 +394,14 @@ class RentalDockerSdkClient:
         )
 
     async def run_container(self, spec: ContainerRunSpec) -> str | None:
-        """Creates and starts the container; returns its ID (None if Docker gave none)."""
+        """Creates and starts the container; returns its ID (None if Docker gave none).
+
+        The ContainerCreateRefused of ``spec.before_create`` reaches the caller unwrapped.
+        """
         try:
             return await _in_docker_thread(self._run_container_sync, spec)
+        except ContainerCreateRefused:
+            raise
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK run container failed", exc)
@@ -718,6 +729,8 @@ class RentalDockerSdkClient:
         host_config = self._api_client.create_host_config(
             **_build_host_config_kwargs(spec)
         )
+        if spec.before_create is not None:
+            spec.before_create()
         created = self._api_client.create_container(
             image=spec.image,
             command=list(spec.command) or None,
