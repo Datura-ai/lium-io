@@ -4514,6 +4514,8 @@ def test_local_volume_timeout_preserves_larger_explicit_timeout():
 def test_rental_pids_limit_scales_per_cpu_and_clamps_to_cap(monkeypatch):
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    # isolate the per-CPU scaling from the unreadable-host fallback clamp
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX", 0)
     # a per-pod CPU cap gives a proportionate ceiling
     assert DockerService._rental_pids_limit(1) == 4096
     assert DockerService._rental_pids_limit(8) == 32768
@@ -4524,6 +4526,7 @@ def test_rental_pids_limit_scales_per_cpu_and_clamps_to_cap(monkeypatch):
 def test_rental_pids_limit_uses_cap_for_whole_host_rentals(monkeypatch):
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX", 0)
     # no per-pod CPU cap (whole host) still gets a finite ceiling
     assert DockerService._rental_pids_limit(None) == 1_048_576
     assert DockerService._rental_pids_limit(0) == 1_048_576
@@ -4560,10 +4563,27 @@ def test_rental_pids_limit_never_emits_zero_or_negative(monkeypatch):
     assert DockerService._rental_pids_limit(8, 2048) == docker_service_module._MIN_RENTAL_PIDS_LIMIT
 
 
-def test_rental_pids_limit_unreadable_host_pid_max_keeps_scaled_cap(monkeypatch):
+def test_rental_pids_limit_unreadable_host_pid_max_fails_safe_to_fallback(monkeypatch):
+    # Review finding on #1531: when the real pid_max cannot be read the limit must NOT keep the
+    # full cap (that reopens the fork-bomb vector on a low-pid_max host); it fails safe to
+    # RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX minus the host margin.
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
-    # None (could not read pid_max) → no host clamp, scaled cap stands
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_HOST_MARGIN", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX", 32768)
+    # None (could not read pid_max) → clamp to the conservative fallback, not the configured cap
+    assert DockerService._rental_pids_limit(8, None) == 28672
+    assert DockerService._rental_pids_limit(None, None) == 28672
+    # a small per-CPU share still sits below the fallback, so it is unaffected
+    assert DockerService._rental_pids_limit(1, None) == 4096
+
+
+def test_rental_pids_limit_fallback_disabled_keeps_scaled_cap(monkeypatch):
+    # RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX=0 restores the old behaviour for operators who know all
+    # their hosts have a high kernel.pid_max and do not want an unreadable read to shrink the cap.
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX", 0)
     assert DockerService._rental_pids_limit(8, None) == 32768
     assert DockerService._rental_pids_limit(None, None) == 1_048_576
 
