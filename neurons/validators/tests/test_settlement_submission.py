@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from clients.backend_client import BackendClient, BackendRejected, SettledWeights
+from clients.backend_client import (
+    DEFINITIVE_REJECTIONS,
+    BackendClient,
+    BackendRejected,
+    SettledWeights,
+)
 from clients.subtensor_client import fold_unregistered_into_burner, scored_registered_neurons
 from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
 from core.validator import PENDING_INCLUSION_KEY, UNACKED_CYCLE_REPORTS_KEY, Validator
@@ -414,3 +419,19 @@ async def test_a_later_confirmation_does_not_clear_an_earlier_pending_one():
     validator.redis_service.set.assert_awaited_with(
         PENDING_INCLUSION_KEY, json.dumps({"342": 123456})
     )
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_is_kept_after_a_rejected_fallback_submission():
+    validator = _validator(window=None, accepted=False, fallback={"burn": 1.0})
+
+    settled = await validator.submit_settled_window()
+
+    assert settled is False  # the sync loop keeps fallback_scores for the next tick on False
+    validator = _validator(window=WINDOW, accepted=True)
+    assert await validator.submit_settled_window() is True
+
+
+def test_only_a_wrong_request_is_dropped_a_bad_moment_is_retried():
+    assert DEFINITIVE_REJECTIONS == (400, 404, 422)
+    assert 403 not in DEFINITIVE_REJECTIONS and 429 not in DEFINITIVE_REJECTIONS

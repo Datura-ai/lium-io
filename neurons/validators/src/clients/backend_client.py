@@ -71,8 +71,13 @@ class SettledWeightsResult(BaseModel):
     inclusion_block: int | None = None
 
 
+# the 4xx answers that mean the request itself is wrong; a 401/403 (a clock past the signature window) or a 429
+# is the moment, not the request, and the report is kept for the next replay
+DEFINITIVE_REJECTIONS = (400, 404, 422)
+
+
 class BackendRejected(Exception):
-    """The backend answered 4xx: the request is wrong, and sending it again would be wrong again."""
+    """The backend answered that the request itself is wrong, so sending it again would be wrong again."""
 
     def __init__(self, status: int):
         super().__init__(f"backend answered {status}")
@@ -267,7 +272,7 @@ class BackendClient:
                                     extra=get_extra_info({**context, "status": resp.status}),
                                 ),
                             )
-                            if raise_on_4xx and 400 <= resp.status < 500:
+                            if raise_on_4xx and resp.status in DEFINITIVE_REJECTIONS:
                                 raise BackendRejected(resp.status)
                             return None
 

@@ -292,10 +292,11 @@ class Validator:
                         self.miner_scores = {}
                         self.fallback_scores = {}
                     elif settings.SETTLEMENT_MODE == SETTLEMENT_ENFORCE:
-                        # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is
-                        await self.submit_settled_window()
+                        # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is.
+                        # The fallback stays until a tempo is accepted, so a rejected fallback can be retried
+                        if await self.submit_settled_window():
+                            self.fallback_scores = {}
                         self.miner_scores = {}
-                        self.fallback_scores = {}
                     else:
                         if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
                             await self.shadow_settled_window()
@@ -982,18 +983,17 @@ class Validator:
             )
             return False
 
-    async def submit_settled_window(self) -> None:
+    async def submit_settled_window(self) -> bool:
         """DAH-4001 enforce: submit the backend's settled vector for this tempo. When the backend cannot serve one
         (unreachable, or nothing scored in its window) submit the fallback instead: this tempo's rental and
         referral as scored, its idle to the verified burner. Never an older vector: weights are a state, and a
-        stale one pays nodes that may have left since."""
+        stale one pays nodes that may have left since. Returns whether this tempo is settled on chain."""
         index, tempo = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
-            return
+            return True
         window = await self._fetch_settled_window(index, tempo)
         if window is None or not window.hotkey_scores:
-            await self._submit_fallback(index, "backend unreachable" if window is None else "empty window")
-            return
+            return await self._submit_fallback(index, "backend unreachable" if window is None else "empty window")
         accepted = await self._submit_vector(window.hotkey_scores)
         if accepted:
             self._settled_tempo_done = index
@@ -1020,6 +1020,7 @@ class Validator:
                 ),
             )
         )
+        return accepted
 
     async def _pending_inclusions(self) -> dict[str, int]:
         try:
@@ -1029,8 +1030,9 @@ class Validator:
         return json.loads(kept) if kept else {}
 
     async def _confirm_inclusion(self, index: int, block: int) -> None:
-        """Tell the backend where the tempo's vector went in; kept and retried every cycle until it answers.
-        Each tempo's confirmation stays until its own acknowledgement: a later one never clears an earlier one."""
+        """Tell the backend the block read right after the chain accepted the tempo's vector (the extrinsic landed
+        at or just before it); kept and retried every cycle until the backend answers. Each tempo's confirmation
+        stays until its own acknowledgement: a later one never clears an earlier one."""
         try:
             confirmed = await self.backend_client.report_settled_weights_result(index, block)
         except Exception as exc:
@@ -1057,7 +1059,7 @@ class Validator:
         for index, block in sorted((await self._pending_inclusions()).items()):
             await self._confirm_inclusion(int(index), int(block))
 
-    async def _submit_fallback(self, index: int, reason: str) -> None:
+    async def _submit_fallback(self, index: int, reason: str) -> bool:
         vector = dict(self.fallback_scores)
         if not vector:
             logger.error(
@@ -1067,7 +1069,7 @@ class Validator:
                 )
             )
             self._alert_if_near_activity_cutoff()
-            return
+            return False
         accepted = await self._submit_vector(vector)
         if accepted:
             self._settled_tempo_done = index
@@ -1082,6 +1084,7 @@ class Validator:
                 ),
             )
         )
+        return accepted
 
     def _alert_if_near_activity_cutoff(self) -> None:
         """Error-log when no weights of ours were accepted for more than half the subnet's activity cutoff."""
