@@ -1412,7 +1412,17 @@ class _CreateStepsAfterReplyRegistry:
     async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
         """Wait for this pod's steps; cancel what is left after the timeout and wait for it once more
         as long. False on a cancel."""
-        tasks = set(self._tasks_by_pod_id.get(pod_id, ()))
+        return await self._wait_or_cancel(set(self._tasks_by_pod_id.get(pod_id, ())), timeout)
+
+    async def wait_until_all_done(self) -> bool:
+        """The same for every pod's steps, bounded as a delete's wait: the connector's shutdown, so it does
+        not cut a key removal."""
+        return await self._wait_or_cancel(
+            set().union(*self._tasks_by_pod_id.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+        )
+
+    @staticmethod
+    async def _wait_or_cancel(tasks: set[asyncio.Task], timeout: float) -> bool:
         if not tasks:
             return True
         _, pending = await asyncio.wait(tasks, timeout=timeout)

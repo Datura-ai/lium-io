@@ -17,6 +17,7 @@ from uuid import uuid4
 
 import pytest
 
+from clients.compute_client import ComputeClient
 from core.config import settings
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
 from datura.requests.validator_requests import SSHPubKeyRemoveRequest
@@ -155,7 +156,8 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
 @pytest.mark.asyncio
 async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, miner_service, caplog, use_rest_api):
     """A miner holding or failing the key removal cannot hold or fail the created pod's reply, on either route; the
-    customer create counts against fillers on its executor while it runs and until its reply."""
+    customer create counts against fillers on its executor while it runs and until its reply; the connector's shutdown
+    waits for the removal."""
     executor_id = str(uuid4())
     payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
@@ -191,8 +193,11 @@ async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, 
         result = await asyncio.wait_for(miner_service.handle_container(payload), 5)
         counted_after_the_reply = customer_creates.is_running(payload.miner_hotkey, executor_id)
         socket_closes_before_the_removal = miner_client.__aexit__.await_count
-        removal_released.set()
-        assert await docker_service_module.create_steps_after_reply.wait_until_done(payload.pod_id, 5)
+        connector = ComputeClient.__new__(ComputeClient)
+        connector.miner_drivers = asyncio.Queue()
+        connector.miner_driver_awaiter_task = asyncio.create_task(connector.miner_driver_awaiter())
+        asyncio.get_running_loop().call_later(0.05, removal_released.set)
+        await asyncio.wait_for(connector.__aexit__(None, None, None), 5)
 
     assert result is created
     assert (customer_create_counted_while_it_ran, counted_after_the_reply) == ([True], False)
