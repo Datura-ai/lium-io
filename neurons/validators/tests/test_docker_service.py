@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -7220,25 +7221,46 @@ async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
 
 
 @pytest.mark.asyncio
-async def test_a_refused_inspect_channel_leaves_no_volume_setup_running(docker_service):
-    # the setup exec and `docker inspect` run side by side; the inspect's channel is refused
-    setup_states: list[str] = []
+@pytest.mark.parametrize(
+    ("setup_opens_second", "inspect_error", "raised", "commands_run"),
+    [
+        # an sshd with MaxSessions=1 refuses whichever channel opens second: it runs again alone
+        (False, None, contextlib.nullcontext(), ["setup", "inspect"]),
+        (True, None, contextlib.nullcontext(), ["inspect", "setup"]),
+        (False, asyncssh.ConnectionLost("lost"), pytest.raises(asyncssh.ConnectionLost), ["setup"]),
+        # the inspect failed: the create fails, the refused setup never runs
+        (True, 1, pytest.raises(asyncssh.ChannelOpenError), ["inspect"]),
+    ],
+    ids=["one_session_host_inspect_refused", "one_session_host_setup_refused", "inspect_failed", "inspect_exited_1"],
+)
+async def test_the_volume_setup_and_the_inspect_settle_together(
+    docker_service, setup_opens_second, inspect_error, raised, commands_run
+):
+    # the setup exec and `docker inspect` run side by side on a host that opens one channel at a time;
+    # the create's failure cleanup may start only after the setup has settled
+    session_in_use, setup_states, commands = False, [], []
 
-    async def host(cmd, *args, **kwargs):
-        if kwargs.get("input") is not None:
-            setup_states.append("started")
-            await asyncio.sleep(0.2)
-            setup_states.append("completed")
-            return _make_ssh_command_result()
-        raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+    async def one_session_host(cmd, *args, **kwargs):
+        nonlocal session_in_use
+        command = "setup" if kwargs.get("input") is not None else "inspect"
+        if command == "setup" and setup_opens_second and not commands:
+            await asyncio.sleep(0)
+        if command == "inspect" and isinstance(inspect_error, Exception):
+            raise inspect_error
+        if session_in_use:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+        session_in_use = True
+        setup_states.extend(["started"] if command == "setup" else [])
+        await asyncio.sleep(0.05)
+        setup_states.extend(["completed"] if command == "setup" else [])
+        commands.append(command)
+        session_in_use = False
+        return _make_ssh_command_result(exit_status=inspect_error if command == "inspect" and inspect_error else 0)
 
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=host)
+    ssh_client.run = AsyncMock(side_effect=one_session_host)
 
-    with (
-        patch.object(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"),
-        pytest.raises(asyncssh.ChannelOpenError),
-    ):
+    with patch.object(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"), raised:
         await docker_service.setup_encrypted_local_volume(
             ssh_client=ssh_client,
             container_name="pod_test",
@@ -7250,8 +7272,8 @@ async def test_a_refused_inspect_channel_leaves_no_volume_setup_running(docker_s
             authorized_keys=["ssh-ed25519 AAAA renter"],
         )
 
-    # the create's failure cleanup starts only after the setup has settled
-    assert setup_states == ["started", "completed"]
+    assert setup_states == ["started", "completed"] * ("setup" in commands_run)
+    assert commands == commands_run
 
 
 @pytest.mark.asyncio

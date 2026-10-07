@@ -4382,14 +4382,21 @@ class DockerService:
         )
         # `docker inspect` on the host, not `id` in the container: a renter image is not
         # guaranteed to ship coreutils. Read beside the exec, it costs no round trip of its own.
+        def run_setup():
+            return ssh_client.run(setup_command, input=setup_script + key_data, check=False)
+
+        def run_user_inspect():
+            return ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}", check=False)
+
         setup_result, user_inspect_result = await asyncio.gather(
-            ssh_client.run(setup_command, input=setup_script + key_data, check=False),
-            ssh_client.run(
-                f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
-                check=False,
-            ),
-            return_exceptions=True,
+            run_setup(), run_user_inspect(), return_exceptions=True
         )
+        # an sshd with MaxSessions=1 refuses whichever channel opens second; nothing ran on it, so it runs
+        # again alone once the other one succeeded (after a failure the create fails anyway)
+        if isinstance(setup_result, asyncssh.ChannelOpenError) and getattr(user_inspect_result, "exit_status", None) == 0:
+            setup_result = await run_setup()
+        if isinstance(user_inspect_result, asyncssh.ChannelOpenError) and getattr(setup_result, "exit_status", None) == 0:
+            user_inspect_result = await run_user_inspect()
         # both settled: a failed inspect must not leave the setup running beside the failure cleanup
         for outcome in (setup_result, user_inspect_result):
             if isinstance(outcome, BaseException):
