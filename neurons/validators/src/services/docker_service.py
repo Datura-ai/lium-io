@@ -7197,8 +7197,8 @@ class DockerService:
                         default_extra=default_extra,
                     )
                     current_step = "park_current_container"
-                    # DAH-3980: an earlier edit's steps after its reply remove `<name>_parked`; parked
-                    # before they ran, this edit's parked container would be the one removed
+                    # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
+                    # its removal of the container it parked, by that one's ID (never the one this edit parks)
                     if not await create_steps_after_reply.wait_until_done(
                         payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
                     ):
