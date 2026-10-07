@@ -2401,23 +2401,17 @@ class DockerService:
         low pid_max (e.g. 32768) the fork bomb exhausts the global PID space before the container
         reaches its cgroup wall and the executor is starved anyway. The cap is clamped to
         ``kernel.pid_max - RENTAL_PIDS_LIMIT_HOST_MARGIN``, never below ``_MIN_RENTAL_PIDS_LIMIT``
-        (0 or a negative would read as "unlimited" to Docker). When ``host_pid_max`` could not be
-        read it fails safe: it falls back to ``RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX`` (a conservatively
-        low assumed pid_max) rather than keeping the full cap, which would reopen the fork-bomb
-        vector on a low-pid_max host. RENTAL_PIDS_LIMIT_PER_CPU=0 disables the limit for rollback;
-        RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX=0 restores the old keep-the-cap-when-unreadable behaviour.
+        (0 or a negative would read as "unlimited" to Docker). When ``host_pid_max`` is None (it could
+        not be read) the scaled cap is returned unclamped; the caller refuses the rental before that
+        happens. RENTAL_PIDS_LIMIT_PER_CPU=0 disables the limit for rollback.
         """
         per_cpu = settings.RENTAL_PIDS_LIMIT_PER_CPU
         if per_cpu <= 0:
             return None
         cap = settings.RENTAL_PIDS_LIMIT_CAP
         want = min(per_cpu * cpu_count, cap) if cpu_count and cpu_count > 0 else cap
-        effective_pid_max = (
-            host_pid_max if host_pid_max and host_pid_max > 0
-            else settings.RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX
-        )
-        if effective_pid_max and effective_pid_max > 0:
-            host_room = max(effective_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN, _MIN_RENTAL_PIDS_LIMIT)
+        if host_pid_max and host_pid_max > 0:
+            host_room = max(host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN, _MIN_RENTAL_PIDS_LIMIT)
             want = min(want, host_room)
         return want
 
@@ -2425,11 +2419,10 @@ class DockerService:
         """The executor host's kernel.pid_max, read before `docker run`, or None when unreadable.
 
         Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
-        ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Best-effort
-        and bounded: on any miss the helper fails safe to RENTAL_PIDS_LIMIT_FALLBACK_PID_MAX rather
-        than keeping the full cap. The read is a bare `cat` of a /proc file bounded by asyncssh's own
+        ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Bounded:
+        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded by asyncssh's own
         `timeout`; it deliberately does not shell out to `timeout`, whose absence would otherwise
-        turn into a miss and over-provision the fallback on a host below it.
+        turn into a miss and fail the read.
         """
         try:
             res = await ssh_client.run(
@@ -7354,8 +7347,13 @@ class DockerService:
                     prev_timestamp = now_ms()
                 # Clamp the container's pids.max below the host's real kernel.pid_max so a tenant
                 # fork bomb cannot exhaust the global PID space on a low-pid_max host (review finding
-                # on PR #1531). Bounded, best-effort; a miss leaves the scaled cgroup cap in place.
+                # on PR #1531). Bounded; an unreadable value refuses the create (fail closed), since no
+                # fixed assumption is safe on a host whose real pid_max is lower.
                 host_pid_max = await self._read_host_pid_max(ssh_client)
+                if host_pid_max is None and settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
+                    raise RuntimeError(
+                        "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
+                    )
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,

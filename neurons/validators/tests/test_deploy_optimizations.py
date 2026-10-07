@@ -83,6 +83,8 @@ def _ssh_client(*, inspect_exit: int = 0, inspect_raises: bool = False):
     client.image_exists_error = RuntimeError("probe boom") if inspect_raises else None
 
     def _side(cmd, *args, **kwargs):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
         return _ssh_result(exit_status=0)
 
     client.run = AsyncMock(side_effect=_side)
@@ -335,6 +337,20 @@ async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypa
         {"image": "ghcr.io/org/app:prod", "auth_config": {"username": "renter", "password": "renter-secret"}}
     ]
     assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
+
+
+@pytest.mark.asyncio
+async def test_rental_is_refused_when_the_host_pid_max_cannot_be_read(svc, monkeypatch):
+    """An unreadable kernel.pid_max fails closed: no fixed pids limit is safe on an unknown host."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
+
+    result = await _run(svc, _payload())
+
+    assert not isinstance(result, ContainerCreated)
+    assert _docker_client(svc).run_specs == []
 
 
 @pytest.mark.asyncio
