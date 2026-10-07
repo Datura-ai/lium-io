@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1469,7 +1470,8 @@ class MinerService:
                 miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
-            async with miner_client:
+            async with contextlib.AsyncExitStack() as miner_connection:
+                await miner_connection.enter_async_context(miner_client)
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
@@ -1581,15 +1583,22 @@ class MinerService:
                                 private_key.decode("utf-8"),
                             )
 
-                        await miner_client.send_model(
+                        # DAH-3980: a create's reply does not wait for the miner; the steps after it own
+                        # the miner's socket and close it once the removal is sent
+                        remove_ssh_key = self._remove_ssh_key_via_websocket(
+                            miner_client,
+                            miner_connection.pop_all(),
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
-                            )
+                            ),
+                            log_extra=default_extra,
                         )
-
+                        create_steps_after_reply.start(
+                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                        )
                         return result
 
                     elif isinstance(payload, ContainerDeleteRequest):
@@ -2378,6 +2387,27 @@ class MinerService:
                 ),
             )
             return False
+
+    async def _remove_ssh_key_via_websocket(
+        self,
+        miner_client: MinerClient,
+        miner_connection: contextlib.AsyncExitStack,
+        remove_request: SSHPubKeyRemoveRequest,
+        log_extra: dict,
+    ) -> bool:
+        # the WebSocket twin of _remove_ssh_key_via_rest: logs a failure instead of raising it, then closes the socket
+        async with miner_connection:
+            try:
+                await miner_client.send_model(remove_request)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to remove SSH key via WebSocket. Validator key may still be present on miner",
+                        extra=get_extra_info({**log_extra, "error_type": type(exc).__name__}),
+                    )
+                )
+                return False
+        return True
 
     async def _log_ssh_key_removal_after_reply(self, remove_ssh_key: Awaitable[bool], log_extra: dict) -> None:
         # the removal logs its own failure; this line puts it after the reply in the log
