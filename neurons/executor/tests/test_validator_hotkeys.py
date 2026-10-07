@@ -189,7 +189,7 @@ def test_without_an_override_the_built_in_pair_is_configured_current_first(monke
 
     assert list(config.VALIDATOR_HOTKEYS_SS58.items()) == [
         ("current", "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"),
-        ("next", "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK"),
+        ("next", "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"),
     ]
 
 

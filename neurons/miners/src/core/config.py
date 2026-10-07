@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 # the one the owner swaps to. Same pair as the executor's core/config.py and the platform's
 # ACCEPTED_VALIDATOR_HOTKEYS — the swap is a config flip in each, not a code change.
 LIUM_VALIDATOR_HOTKEY_CURRENT = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
-LIUM_VALIDATOR_HOTKEY_NEXT = "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK"
+LIUM_VALIDATOR_HOTKEY_NEXT = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
 
 
 class DebugSettings(BaseSettings):

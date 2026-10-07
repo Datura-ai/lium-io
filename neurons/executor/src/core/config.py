@@ -19,7 +19,7 @@ _BUILTIN_VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb1
 # on, so the fleet is ready before the chain swap; the swap release makes it `current` and drops the
 # address above. Applies to the built-in anchor only: a build with core/config_override.py names
 # its own `next` (or none) — a staging executor keeps trusting staging's validator alone.
-_BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58 = "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK"
+_BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58 = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
 
 
 def _resolve_validator_hotkey() -> str:

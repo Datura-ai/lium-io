@@ -283,7 +283,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-cont
 
 `show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses.
 
-`migrate-validator-hotkey` is the data step of a validator hotkey rotation, run once per miner after the config pair swap (`DEFAULT_VALIDATOR_HOTKEY=<new>`, `VALIDATOR_NEXT_HOTKEY=<old>`): it re-keys this miner's executor rows from the previous validator hotkey to the active one. The defaults read those two settings; `--from-hotkey` / `--to-hotkey` name them explicitly and `--dry-run` prints the row count without changing anything. Lium announces the rotation date; the current swap (to `5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK`) is pending.
+`migrate-validator-hotkey` is the data step of a validator hotkey rotation, run once per miner after the config pair swap (`DEFAULT_VALIDATOR_HOTKEY=<new>`, `VALIDATOR_NEXT_HOTKEY=<old>`): it re-keys this miner's executor rows from the previous validator hotkey to the active one. The defaults read those two settings; `--from-hotkey` / `--to-hotkey` name them explicitly and `--dry-run` prints the row count without changing anything. Lium announces the rotation date; the current swap (to `5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9`) is pending.
 
 ```shell
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey --dry-run
