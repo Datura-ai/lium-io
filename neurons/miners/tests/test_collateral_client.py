@@ -698,3 +698,63 @@ def test_collateral_command_logs_leave_out_a_keyed_rpc_url(
         assert result.exit_code == 1
 
 
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("orphaned", "not the finalized block at that number"),
+        ("final", None),
+        # read a of a5079c9: the default finney RPC keeps about 256 blocks and answers HTTP 429 after about 100 reads
+        ("pruned", "no longer keeps.*SUBTENSOR_EVM_RPC_URL"),
+        ("rate-limited", "could not be read \\(HTTP 429.*SUBTENSOR_EVM_RPC_URL"),
+        # review of 7a226f9: a gateway answers the finalized block from fork A and the receipt's block from fork B
+        ("split-batch", "from more than one chain"),
+        # reads of a7a2820: a receipt 120 blocks below the finalized block is read in batches the RPC accepts
+        ("deep", None),
+    ],
+)
+async def test_a_fresh_send_record_clears_only_on_a_receipt_on_the_finalized_chain(monkeypatch, case, error):
+    monkeypatch.setattr(collateral_module, "RATE_LIMIT_RETRY_SEC", (0, 0, 0))
+    provider = FakeProvider(calls={selector("reclaims(uint256)"): open_reclaim()}, logs=[reclaimed_log()])
+    if case == "deep":
+        provider.block_number = provider.finalized_number = 16 + 120
+    elif case != "orphaned":
+        provider.block_number = provider.finalized_number = 20
+    if case == "orphaned":
+        provider.canonical_hashes[16] = "0x" + "bb" * 32
+    elif case == "pruned":
+        provider.oldest_kept = 17
+    elif case == "rate-limited":
+        provider.batch_backends = ["429"] * 4
+    elif case == "split-batch":
+        provider.canonical_hashes[16] = "0x" + "bb" * 32
+        provider.batch_backends, provider.fork_b_hash = ["b", "b"], BLOCK_HASH
+    client = client_with(provider)
+
+    if error is None:
+        await client.finalize_reclaim(5)
+        assert client._read_sent_record(CHAIN_ID) is None
+        return
+    with pytest.raises(CollateralOutcomeUnknownError, match=error):
+        await client.finalize_reclaim(5)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+
+
+async def test_a_mined_reclaim_whose_receipt_lacks_its_event_keeps_the_record_until_a_receipt_has_it(monkeypatch):
+    """Review of e02f9ff: a status=1 receipt with no ReclaimProcessStarted cleared the record, and a retry reverts
+    AmountZero, so the request ID was lost."""
+    provider = FakeProvider(logs=[])
+    client = client_with(provider)
+    with pytest.raises(CollateralOutcomeUnknownError, match="no ReclaimProcessStarted event"):
+        await client.reclaim_collateral(EXECUTOR)
+    assert client._read_sent_record(CHAIN_ID)["hash"] == sent_hash(provider)
+
+    provider.nonce = provider.pending_nonce = NONCE + 1
+    with pytest.raises(CollateralOutcomeUnknownError, match="no ReclaimProcessStarted event"):
+        await client.settle_earlier_send()
+    assert client._read_sent_record(CHAIN_ID) is not None
+
+    provider.logs = [started_log(reclaim_request_id=12)]
+    with pytest.raises(CollateralTransactionError, match="it started reclaim request 12;"):
+        await client.settle_earlier_send()
+    assert client._read_sent_record(CHAIN_ID) is None
+    assert len(provider.sent) == 1
