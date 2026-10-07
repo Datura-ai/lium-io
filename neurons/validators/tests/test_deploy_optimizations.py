@@ -405,6 +405,9 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
         " --format=csv,noheader,nounits",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # the host's kernel.pid_max, read right before docker run so the rental's pids.max can be
+        # clamped below it (a tenant fork bomb otherwise starves the executor on a low-pid_max host)
+        "timeout -k 2 10 cat /proc/sys/kernel/pid_max",
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
     ]
     assert _exec_argv_texts(svc) == ["sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"]
