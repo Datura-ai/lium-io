@@ -1238,6 +1238,7 @@ def _wire_customer_create_over_the_host(
     monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
     monkeypatch.setattr(settings, "RENTAL_VOLUME_FAST_PATH_ENABLED", True)
     ssh_client = _deploy_ssh_client()
+    answer_as_the_deploy_host = ssh_client.run.side_effect
 
     def answer(cmd, *args, **kwargs):
         if "/usr/bin/docker rm -fv" in cmd:
@@ -1248,7 +1249,7 @@ def _wire_customer_create_over_the_host(
             return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t0\n")
         if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
             return _ssh_result(stdout=ps_after_rm)
-        return _ssh_result()
+        return answer_as_the_deploy_host(cmd, *args, **kwargs)
 
     ssh_client.run.side_effect = answer
     _wire(svc, monkeypatch, ssh_client, probe_result=probe)
@@ -1309,7 +1310,11 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     # the rm and its confirming listing are the one host command of the create besides the probes
-    assert _cmds(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
+    # and the pid_max read every rental makes
+    assert _cmds(ssh_client) == [
+        _remove_and_list_containers_command(["filler_x"], []),
+        "cat /proc/sys/kernel/pid_max",
+    ]
     assert _relisting_commands(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
     # 0.5 x (free - 20 GB overhead), two thirds of it the volume: the early 100 GB -> 26, the live 140 GB -> 40
@@ -1367,7 +1372,7 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
     )
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _cmds(ssh_client) == []
+    assert _cmds(ssh_client) == ["cat /proc/sys/kernel/pid_max"]
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
 

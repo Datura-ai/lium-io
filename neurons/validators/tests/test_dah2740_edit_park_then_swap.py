@@ -24,7 +24,10 @@ from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_st
 def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
-    return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    return service
 
 
 def _edit_payload(**over):
