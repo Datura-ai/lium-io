@@ -392,6 +392,7 @@ RENTAL_DISK_HEADROOM_GB = 20
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
+_KIB_PER_GIB = 1024 * 1024
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -2329,8 +2330,10 @@ class DockerService:
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
         host_pid_max: int | None = None,
+        host_ram_kib: int | None = None,
         quote_socket: bool = False,
     ) -> ContainerRunSpec:
+        memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib)
         environment = {
             key: str(value)
             for key, value in (custom_options.environment or {}).items()
@@ -2381,11 +2384,11 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
-            ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
+            ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
-            memory_gb=payload.memory_gb,
+            memory_gb=memory_gb,
             storage_limit_gb=effective_storage_limit_gb,
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
@@ -2503,6 +2506,39 @@ class DockerService:
         except (TypeError, ValueError):
             return None
         return value if value > 0 else None
+
+    async def _read_host_ram_kib(self, ssh_client) -> int | None:
+        """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
+        try:
+            res = await ssh_client.run("cat /proc/meminfo", check=False, timeout=15)
+        except (asyncssh.Error, asyncio.TimeoutError, OSError):
+            return None
+        if getattr(res, "exit_status", 1) != 0:
+            return None
+        for line in (res.stdout or "").splitlines():
+            if line.startswith("MemTotal:"):
+                try:
+                    value = int(line.split()[1])
+                except (IndexError, ValueError):
+                    return None
+                return value if value > 0 else None
+        return None
+
+    @staticmethod
+    def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None) -> int | None:
+        """The rental's memory limit: the backend's, or host RAM less the host reserve when it sent none.
+
+        A pod row saved before the backend sized RAM carries ram_total 0, which arrives as memory_gb 0 and
+        used to mean no mem_limit: the renter could take every byte and the kernel OOM killer would pick
+        sshd or the executor, taking the node offline mid-rental on the provider's account.
+        """
+        if memory_gb or not host_ram_kib:
+            return memory_gb
+        reserve_kib = max(
+            settings.RENTAL_HOST_RAM_RESERVE_GB * _KIB_PER_GIB,
+            host_ram_kib * settings.RENTAL_HOST_RAM_RESERVE_PERCENT / 100,
+        )
+        return max(int((host_ram_kib - reserve_kib) // _KIB_PER_GIB), 1)
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -7274,6 +7310,9 @@ class DockerService:
                             "margin; refusing to start a rental"
                         )
 
+                # Only a rental sent without a memory limit needs the host's RAM, to size one.
+                host_ram_kib = None if payload.memory_gb else await self._read_host_ram_kib(ssh_client)
+
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
                 effective_volume_limit_gb = payload.volume_limit_gb
@@ -7541,6 +7580,7 @@ class DockerService:
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
                     host_pid_max=host_pid_max,
+                    host_ram_kib=host_ram_kib,
                     quote_socket=quote_socket,
                 )
 
