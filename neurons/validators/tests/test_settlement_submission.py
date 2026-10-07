@@ -113,6 +113,16 @@ async def test_an_empty_window_submits_the_fallback():
 
 
 @pytest.mark.asyncio
+async def test_a_window_whose_scores_are_all_zero_submits_the_fallback():
+    zeros = WINDOW.model_copy(update={"hotkey_scores": {"hk": 0.0, "burn": 0.0}})
+    validator = _validator(window=zeros, accepted=True)
+
+    await validator.submit_settled_window()
+
+    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {"burn": 1.0}
+
+
+@pytest.mark.asyncio
 async def test_no_window_and_no_burner_skips_the_tempo():
     validator = _validator(window=None, accepted=True, burner=None)
 

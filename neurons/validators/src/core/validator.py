@@ -986,7 +986,7 @@ class Validator:
         if index == getattr(self, "_settled_tempo_done", None):
             return True
         window = await self._fetch_settled_window(index, tempo)
-        if window is None or not window.hotkey_scores:
+        if window is None or not any(window.hotkey_scores.values()):  # all zero would land as uniform weights
             return await self._submit_fallback(index, "backend unreachable" if window is None else "empty window")
         accepted = await self._submit_vector(window.hotkey_scores)
         if accepted:
