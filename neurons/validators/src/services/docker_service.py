@@ -2331,9 +2331,10 @@ class DockerService:
         cpu_count: int | None,
         host_pid_max: int | None = None,
         host_ram_kib: int | None = None,
+        gpu_share: float = 1.0,
         quote_socket: bool = False,
     ) -> ContainerRunSpec:
-        memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib)
+        memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
         environment = {
             key: str(value)
             for key, value in (custom_options.environment or {}).items()
@@ -2524,13 +2525,39 @@ class DockerService:
                 return value if value > 0 else None
         return None
 
+    async def _read_host_gpu_count(self, ssh_client) -> int | None:
+        """The executor host's GPU count, or None when unreadable. Same bounded read as RAM.
+
+        Counts /dev/nvidiaN device nodes, the same host-GPU enumeration the --device flag path uses
+        (nvidia_devices.GPU_DEVICE_NODES_CMD). Lets a legacy zero-RAM split rental be sized to its GPU
+        share of host RAM; the caller refuses the rental on a miss so the fallback is never larger than
+        the renter's share of the host."""
+        try:
+            res = await ssh_client.run(
+                "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", check=False, timeout=15
+            )
+        except (asyncssh.Error, asyncio.TimeoutError, OSError):
+            return None
+        if getattr(res, "exit_status", 1) != 0:
+            return None
+        try:
+            value = int((res.stdout or "").strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     @staticmethod
-    def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None) -> int | None:
+    def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None, gpu_share: float = 1.0) -> int | None:
         """The rental's memory limit: the backend's, or host RAM less the host reserve when it sent none.
 
         A pod row saved before the backend sized RAM carries ram_total 0, which arrives as memory_gb 0 and
         used to mean no mem_limit: the renter could take every byte and the kernel OOM killer would pick
         sshd or the executor, taking the node offline mid-rental on the provider's account.
+
+        On a split host the fallback follows the backend's own rule (models.executor.pod_ram_total_kib):
+        the renter gets (host - reserve) times its GPU share, not the whole host less the reserve. Without
+        the share, two legacy zero-RAM pods on different GPUs of one host would each be capped near the
+        full host RAM and could together exceed it, re-opening the OOM path this limit exists to close.
         """
         if memory_gb or not host_ram_kib:
             return memory_gb
@@ -2538,7 +2565,8 @@ class DockerService:
             settings.RENTAL_HOST_RAM_RESERVE_GB * _KIB_PER_GIB,
             host_ram_kib * settings.RENTAL_HOST_RAM_RESERVE_PERCENT / 100,
         )
-        return max(int((host_ram_kib - reserve_kib) // _KIB_PER_GIB), 1)
+        share = min(max(gpu_share, 0.0), 1.0)
+        return max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -7310,8 +7338,32 @@ class DockerService:
                             "margin; refusing to start a rental"
                         )
 
-                # Only a rental sent without a memory limit needs the host's RAM, to size one.
-                host_ram_kib = None if payload.memory_gb else await self._read_host_ram_kib(ssh_client)
+                # Only a rental sent without a memory limit (legacy ram_total 0 rows) needs the host's
+                # RAM, to size one. Decide fail-closed BEFORE any host side-effect, like host_pid_max
+                # above (review finding on PR #1534): under host contention — the exact condition that
+                # delays this SSH probe — an unlimited rental lets the renter exhaust host RAM and OOM
+                # the executor/sshd. Refuse rather than fall through to no mem_limit.
+                host_ram_kib: int | None = None
+                rental_gpu_share = 1.0
+                if not payload.memory_gb:
+                    current_step = "host_ram_kib"
+                    host_ram_kib = await self._read_host_ram_kib(ssh_client)
+                    if host_ram_kib is None:
+                        raise RuntimeError(
+                            "host MemTotal could not be read; refusing to start a legacy rental without a safe memory limit"
+                        )
+                    # A split-host rental gets its GPU share of host RAM, matching the backend's own
+                    # sizing (models.executor.pod_ram_total_kib). Two legacy zero-RAM pods on one host
+                    # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
+                    if payload.gpu_uuids:
+                        current_step = "host_gpu_count"
+                        host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                        if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
+                            raise RuntimeError(
+                                "host GPU count could not be read or is below the rented GPU count; "
+                                "refusing to start a legacy split rental without a safe memory limit"
+                            )
+                        rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
 
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
@@ -7581,6 +7633,7 @@ class DockerService:
                     cpu_count=cpu_count,
                     host_pid_max=host_pid_max,
                     host_ram_kib=host_ram_kib,
+                    gpu_share=rental_gpu_share,
                     quote_socket=quote_socket,
                 )
 
