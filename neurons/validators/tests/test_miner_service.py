@@ -25,6 +25,7 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     CustomOptions,
     PayloadPortMapping,
+    WorkloadKind,
 )
 from services import docker_service as docker_service_module
 from services.docker_service import customer_creates
@@ -152,15 +153,20 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
     wait_mock.assert_not_awaited()
 
 
+@pytest.mark.parametrize("miner_lists_the_executor", [True, False], ids=["reached_create_container", "executor_left_out"])
 @pytest.mark.parametrize("use_rest_api", [True, False], ids=["rest", "websocket"])
 @pytest.mark.asyncio
-async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, miner_service, caplog, use_rest_api):
+async def test_create_reply_does_not_wait_for_the_validator_key_removal(
+    mocker, miner_service, caplog, use_rest_api, miner_lists_the_executor
+):
     """A miner holding or failing the key removal cannot hold or fail the created pod's reply, on either route; the
-    customer create counts against fillers on its executor while it runs and until its reply; the connector's shutdown
-    waits for the removal."""
+    customer create counts against fillers on its executor while it runs and until its reply, and refuses a filler that
+    started before it only once it reached create_container; the connector's shutdown waits for the removal."""
     executor_id = str(uuid4())
     payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
+    accept = AcceptSSHKeyRequest(executors=[_make_executor_info(executor_id)] if miner_lists_the_executor else [])
+    mocker.patch("services.miner_service._parse_miner_response", return_value=accept)
     mocker.patch.object(settings, "USE_REST_API", use_rest_api)
     created = Mock()
     customer_create_counted_while_it_ran: list[bool] = []
@@ -171,6 +177,8 @@ async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, 
 
     mocker.patch("services.miner_service.DockerService.create_container", create_container)
     removal_released = asyncio.Event()
+    if not miner_lists_the_executor:
+        removal_released.set()  # an early exit removes the key before its reply, as on main
 
     async def rest_removal_held_by_the_miner(**kwargs) -> bool:
         await removal_released.wait()
@@ -184,14 +192,14 @@ async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, 
     mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", rest_removal_held_by_the_miner)
     miner_client = MagicMock(send_model=send_model)
     miner_client.job_state.miner_accepted_ssh_key_or_failed_future = asyncio.get_running_loop().create_future()
-    miner_client.job_state.miner_accepted_ssh_key_or_failed_future.set_result(
-        AcceptSSHKeyRequest(executors=[_make_executor_info(executor_id)])
-    )
+    miner_client.job_state.miner_accepted_ssh_key_or_failed_future.set_result(accept)
     mocker.patch("services.miner_service.MinerClient", return_value=miner_client)
+    filler = payload.model_copy(update={"workload_kind": WorkloadKind.FILLER})
 
-    with caplog.at_level("INFO"):
+    with caplog.at_level("INFO"), customer_creates.track(filler):
         result = await asyncio.wait_for(miner_service.handle_container(payload), 5)
         counted_after_the_reply = customer_creates.is_running(payload.miner_hotkey, executor_id)
+        filler_refused_after_the_reply = customer_creates.ran_since_filler_started(filler)
         socket_closes_before_the_removal = miner_client.__aexit__.await_count
         connector = ComputeClient.__new__(ComputeClient)
         connector.miner_drivers = asyncio.Queue()
@@ -199,8 +207,10 @@ async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, 
         asyncio.get_running_loop().call_later(0.05, removal_released.set)
         await asyncio.wait_for(connector.__aexit__(None, None, None), 5)
 
-    assert result is created
-    assert (customer_create_counted_while_it_ran, counted_after_the_reply) == ([True], False)
+    assert (result is created, filler_refused_after_the_reply) == (miner_lists_the_executor, miner_lists_the_executor)
+    assert (customer_create_counted_while_it_ran, counted_after_the_reply) == ([True] * miner_lists_the_executor, False)
+    if not miner_lists_the_executor:
+        return
     assert (socket_closes_before_the_removal, miner_client.__aexit__.await_count) == (0, 0 if use_rest_api else 1)
     assert any("Validator SSH key removal after reply finished" in r.getMessage() for r in caplog.records)
 

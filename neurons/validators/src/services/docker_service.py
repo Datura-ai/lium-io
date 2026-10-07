@@ -1448,7 +1448,7 @@ class _CustomerCreateRegistry:
     customer's sweep would remove; if the lock lapsed (its 360 s TTL, Redis unreachable), the filler
     would start beside the renter after that sweep. A customer create can also start and finish
     between two of the filler's checks (a slow create_container, a queued Docker thread), so the
-    executor also counts the customer creates that ended, and a filler create remembers that count
+    executor also counts the customer creates that ended after reaching create_container, and a filler create remembers that count
     from its own start: one ended since then refuses the filler like one running now. Keyed by (miner
     hotkey, executor id): an executor id is unique only within its miner, and other executors are not
     affected. Read from the Docker thread too (_refuse_filler_during_customer_create), hence the lock,
@@ -1462,6 +1462,9 @@ class _CustomerCreateRegistry:
         self._ended_by_executor: Counter[tuple[str, str]] = Counter()
         # keyed by the payload object, not the pod id: two creates of one pod can overlap (a retry)
         self._ended_seen_by_filler_create: dict[int, int] = {}
+        # a customer request that failed before create_container (the miner left the executor out) touched
+        # no host: it ends as no create, so a filler that started before it is not refused
+        self._customer_create_reached_create_container: dict[int, bool] = {}
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
@@ -1481,14 +1484,21 @@ class _CustomerCreateRegistry:
             return
         with self._lock:
             self._running_by_executor[executor] += 1
+            self._customer_create_reached_create_container[id(payload)] = False
         try:
             yield
         finally:
             with self._lock:
                 self._running_by_executor[executor] -= 1
-                self._ended_by_executor[executor] += 1
+                if self._customer_create_reached_create_container.pop(id(payload)):
+                    self._ended_by_executor[executor] += 1
                 if self._running_by_executor[executor] <= 0:
                     del self._running_by_executor[executor]
+
+    def reached_create_container(self, payload: ContainerCreateRequest) -> None:
+        with self._lock:
+            if id(payload) in self._customer_create_reached_create_container:
+                self._customer_create_reached_create_container[id(payload)] = True
 
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
