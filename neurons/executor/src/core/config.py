@@ -15,6 +15,8 @@ logger = get_logger(__name__)
 # at another validator at runtime. Non-prod images bake a different anchor in at
 # build time — docker_build.sh writes core/config_override.py.
 _BUILTIN_VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
+# The hotkey the built-in anchor rotates to (see VALIDATOR_NEXT_HOTKEY_SS58 below).
+_BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58 = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
 
 
 def _resolve_validator_hotkey() -> str:
@@ -40,11 +42,14 @@ VALIDATOR_HOTKEY_SS58 = _resolve_validator_hotkey()
 
 # DAH-3394: the validator hotkey is being rotated. A release that trusts only the new hotkey
 # would be refused by every executor that has not restarted onto it yet, so this release accepts
-# two: `current` (above) and `next`, the hotkey the validator swaps to. `next` is empty until the
-# new hotkey exists; it is then set here or in config_override at build time — like `current`,
+# two: `current` (above) and `next`, the hotkey the validator swaps to. The prod image (no
+# override) trusts the built-in `next`; a build with an override trusts only the `next` that the
+# override names, so a dev image never trusts the prod validator's next hotkey. Like `current`,
 # never from the environment: the set of signers an executor trusts is fixed by the image, not by
 # whoever writes its .env. With `next` empty the executor behaves exactly as before.
-VALIDATOR_NEXT_HOTKEY_SS58 = ""
+VALIDATOR_NEXT_HOTKEY_SS58 = (
+    _BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58 if importlib.util.find_spec("core.config_override") is None else ""
+)
 try:
     from core.config_override import _VALIDATOR_NEXT_HOTKEY_SS58
     VALIDATOR_NEXT_HOTKEY_SS58 = _VALIDATOR_NEXT_HOTKEY_SS58
