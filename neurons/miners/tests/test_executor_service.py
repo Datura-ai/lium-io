@@ -6,10 +6,12 @@ body sent to the executor when registering or removing SSH public keys.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import bittensor
 import pytest
 
+from models.executor import Executor
 from services.executor_service import ExecutorService
 
 
@@ -50,6 +52,16 @@ def executor_service(miner_keypair, monkeypatch):
     monkeypatch.setattr(es_module, "settings", mock_settings)
 
     return service
+
+
+@pytest.fixture
+def test_executor():
+    return Executor(
+        uuid=uuid4(),
+        validator="//TestValidator",
+        address="127.0.0.1",
+        port=8001,
+    )
 
 
 def _make_mock_session(response_status: int = 500):
