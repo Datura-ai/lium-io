@@ -453,15 +453,15 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
         '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the host's kernel.pid_max, read before any host side-effect so a rental whose pids.max
+        # can't be clamped below it is refused with nothing to undo; a bare cat bounded by
+        # asyncssh's timeout, no `timeout` binary to be absent
+        "cat /proc/sys/kernel/pid_max",
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
-        # the host's kernel.pid_max, read right before docker run so the rental's pids.max can be
-        # clamped below it (a tenant fork bomb otherwise starves the executor on a low-pid_max host);
-        # a bare cat bounded by asyncssh's timeout, no `timeout` binary to be absent
-        "cat /proc/sys/kernel/pid_max",
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
     ]
     assert _exec_argv_texts(svc) == ["sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"]
