@@ -11,17 +11,24 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import pytest
 
+from clients.compute_client import ComputeClient
+from core.config import settings
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
+from datura.requests.validator_requests import SSHPubKeyRemoveRequest
 from payload_models.payloads import (
     ContainerCreateRequest,
     CustomOptions,
     PayloadPortMapping,
+    WorkloadKind,
 )
+from services import docker_service as docker_service_module
+from services.docker_service import customer_creates
 from services.miner_service import MinerService
 
 
@@ -144,6 +151,116 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
     assert order == ["lock", "create", "unlock"]
     # No pre-flag port-check removal in miner_service anymore.
     wait_mock.assert_not_awaited()
+
+
+@pytest.mark.parametrize("miner_lists_the_executor", [True, False], ids=["reached_create_container", "executor_left_out"])
+@pytest.mark.parametrize("use_rest_api", [True, False], ids=["rest", "websocket"])
+@pytest.mark.asyncio
+async def test_create_reply_does_not_wait_for_the_validator_key_removal(
+    mocker, miner_service, caplog, use_rest_api, miner_lists_the_executor
+):
+    """A miner holding or failing the key removal cannot hold or fail the created pod's reply, on either route; the
+    customer create counts against fillers on its executor while it runs and until its reply, and refuses a filler that
+    started before it only once it reached create_container; the connector's shutdown waits for the removal."""
+    executor_id = str(uuid4())
+    payload = _make_create_payload(executor_id)
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    accept = AcceptSSHKeyRequest(executors=[_make_executor_info(executor_id)] if miner_lists_the_executor else [])
+    mocker.patch("services.miner_service._parse_miner_response", return_value=accept)
+    mocker.patch.object(settings, "USE_REST_API", use_rest_api)
+    created = Mock()
+    customer_create_counted_while_it_ran: list[bool] = []
+
+    async def create_container(*args) -> Mock:
+        customer_create_counted_while_it_ran.append(customer_creates.is_running(payload.miner_hotkey, executor_id))
+        return created
+
+    mocker.patch("services.miner_service.DockerService.create_container", create_container)
+    removal_released = asyncio.Event()
+    if not miner_lists_the_executor:
+        removal_released.set()  # an early exit removes the key before its reply, as on main
+
+    async def rest_removal_held_by_the_miner(**kwargs) -> bool:
+        await removal_released.wait()
+        return False
+
+    async def send_model(model) -> None:
+        if isinstance(model, SSHPubKeyRemoveRequest):
+            await removal_released.wait()
+            raise OSError("the miner closed its socket")
+
+    mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", rest_removal_held_by_the_miner)
+    miner_client = MagicMock(send_model=send_model)
+    miner_client.job_state.miner_accepted_ssh_key_or_failed_future = asyncio.get_running_loop().create_future()
+    miner_client.job_state.miner_accepted_ssh_key_or_failed_future.set_result(accept)
+    mocker.patch("services.miner_service.MinerClient", return_value=miner_client)
+    filler = payload.model_copy(update={"workload_kind": WorkloadKind.FILLER})
+
+    with caplog.at_level("INFO"), customer_creates.track(filler):
+        result = await asyncio.wait_for(miner_service.handle_container(payload), 5)
+        counted_after_the_reply = customer_creates.is_running(payload.miner_hotkey, executor_id)
+        filler_refused_after_the_reply = customer_creates.ran_since_filler_started(filler)
+        socket_closes_before_the_removal = miner_client.__aexit__.await_count
+        connector = ComputeClient.__new__(ComputeClient)
+        connector.miner_drivers = asyncio.Queue()
+        connector.miner_driver_awaiter_task = asyncio.create_task(connector.miner_driver_awaiter())
+        asyncio.get_running_loop().call_later(0.05, removal_released.set)
+        await asyncio.wait_for(connector.__aexit__(None, None, None), 5)
+
+    assert (result is created, filler_refused_after_the_reply) == (miner_lists_the_executor, miner_lists_the_executor)
+    assert (customer_create_counted_while_it_ran, counted_after_the_reply) == ([True] * miner_lists_the_executor, False)
+    if not miner_lists_the_executor:
+        return
+    assert (socket_closes_before_the_removal, miner_client.__aexit__.await_count) == (0, 0 if use_rest_api else 1)
+    assert any("Validator SSH key removal after reply finished" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_key_removal_after_the_reply_is_logged(mocker, miner_service, caplog):
+    """A delete's wait timing out, or a shutdown, can leave the validator's key at the miner: say so."""
+    executor_id = str(uuid4())
+    payload = _make_create_payload(executor_id)
+    my_key = _wire_common_mocks(mocker, miner_service, executor_id)
+    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    async def removal_that_hangs(**kwargs) -> bool:
+        await asyncio.Event().wait()
+        return True
+
+    mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", removal_that_hangs)
+
+    with caplog.at_level("INFO"):
+        await miner_service._handle_container(payload)
+        await asyncio.sleep(0)
+        steps_finished = await docker_service_module.create_steps_after_reply.wait_until_done(payload.pod_id, 0.01)
+
+    assert steps_finished is False
+    [cancelled] = [r for r in caplog.records if "Validator SSH key removal after reply cancelled" in r.getMessage()]
+    assert cancelled.levelname == "WARNING"
+    assert str(my_key) not in cancelled.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_step_stuck_after_its_cancel_does_not_hold_the_wait_past_its_bound():
+    """A cancelled step stuck in its own cleanup (a `docker rm` on a hung dockerd) must not hold a delete or an edit."""
+    registry = docker_service_module._CreateStepsAfterReplyRegistry()
+
+    async def step_stuck_in_its_cleanup() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()
+
+    registry.start("pod-1", step_stuck_in_its_cleanup())
+    [stuck_step] = registry._tasks_by_pod_id["pod-1"]
+    await asyncio.sleep(0)
+
+    try:
+        steps_finished = await asyncio.wait_for(registry.wait_until_done("pod-1", 0.05), 1)
+    finally:
+        stuck_step.cancel()
+
+    assert steps_finished is False
 
 
 # ---------------------------------------------------------------------------

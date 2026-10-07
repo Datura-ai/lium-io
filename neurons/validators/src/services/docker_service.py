@@ -12,7 +12,7 @@ import shlex
 import threading
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1089,6 +1089,10 @@ def _refused_exec_kill_detail(cause: Exception, state_after: str) -> str | None:
     return f"Docker refused the exec; {state_after}"
 
 
+class AuthorizedKeysWriteFailed(RuntimeError):
+    """The volume setup exec mounted the encrypted volume but could not write the renter's keys."""
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -1181,12 +1185,18 @@ class _EditSwap:
         self.ssh_client = ssh_client
         self.container_name = container_name
         self.parked_name: str | None = None
+        # the parked container's own Docker ID: its removal after the reply can land after a later edit
+        # of the pod parked another container under the same name, and removing by name would delete that one
+        self.parked_id: str | None = None
         self.default_extra = default_extra
         # How restore() brings the parked container back up. Set by the create path once it knows
         # the pod's volume path: a bare `docker start` drops the gocryptfs plaintext mount and the
         # sshd, so the restore goes through the same steps as start_existing_container
         # (start, remount with allow_init=False, sshd bootstrap). None falls back to `docker start`.
         self.bring_up: Callable[[str], Awaitable[None]] | None = None
+        # set once the reply went to the backend: from then on the edit stands, whatever ends the
+        # steps after the reply (a delete's wait timing out cancels them)
+        self.replacement_is_up = False
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
         self.replacement_id: str | None = None
@@ -1198,10 +1208,17 @@ class _EditSwap:
         """Rename the running container aside and stop it. None when there is nothing to park."""
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
         listed = await self.ssh_client.run(
-            f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" '
+            f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
         )
-        names = set((listed.stdout or "").split())
+        listing = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
+        names = {fields[0] for fields in listing}
+        ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
+        # the container this edit parks: the pod's, or the one recovered from a crashed edit below
+        container_id = ids_by_name.get(self.container_name if self.container_name in names else parked)
+        if names and container_id is None:
+            # its removal after the reply could only go by name, and a later edit may park another container under it
+            raise Exception("[park_current_container] docker ps listed the pod without its container ID; the pod was left as it was")
         if self.container_name not in names:
             if parked in names:
                 # An earlier edit crashed between park and restore: the parked container is the
@@ -1229,6 +1246,7 @@ class _EditSwap:
         if renamed.exit_status != 0:
             raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
         self.parked_name = parked
+        self.parked_id = container_id
         stopped = await self.ssh_client.run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
         if stopped.exit_status != 0:
             # The container cannot be stopped: give it its name back and fail the edit with the
@@ -1254,10 +1272,10 @@ class _EditSwap:
         if self.parked_name is None:
             return False
         try:
-            if exc is None or isinstance(exc, _CreateCancelledByDelete):
+            if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_name)}")
+                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
@@ -1372,6 +1390,60 @@ class _InflightCreateRegistry:
 inflight_creates = _InflightCreateRegistry()
 
 
+class _CreateStepsAfterReplyRegistry:
+    """Create steps the backend's reply does not wait for, by pod.
+
+    DAH-3980: the inspector start, the create's session close and the validator key removal run
+    after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
+    them first: an inspector start landing after the delete's stop would leave the collector running.
+    Each step logs its own failure.
+    """
+
+    def __init__(self) -> None:
+        self._tasks_by_pod_id: dict[str, set[asyncio.Task]] = {}
+
+    def start(self, pod_id: str, steps: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(steps)
+        self._tasks_by_pod_id.setdefault(pod_id, set()).add(task)
+        task.add_done_callback(lambda done: self._forget(pod_id, done))
+
+    def _forget(self, pod_id: str, task: asyncio.Task) -> None:
+        tasks = self._tasks_by_pod_id.get(pod_id, set())
+        tasks.discard(task)
+        if not tasks:
+            self._tasks_by_pod_id.pop(pod_id, None)
+
+    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
+        """Wait for this pod's steps; cancel what is left after the timeout and wait for it once more
+        as long. False on a cancel."""
+        return await self._wait_or_cancel(set(self._tasks_by_pod_id.get(pod_id, ())), timeout)
+
+    async def wait_until_all_done(self) -> bool:
+        """The same for every pod's steps, bounded as a delete's wait: the connector's shutdown, so it does
+        not cut a key removal."""
+        return await self._wait_or_cancel(
+            set().union(*self._tasks_by_pod_id.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+        )
+
+    @staticmethod
+    async def _wait_or_cancel(tasks: set[asyncio.Task], timeout: float) -> bool:
+        if not tasks:
+            return True
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if not pending:
+            return True
+        for task in pending:
+            task.cancel()
+        # a cancelled step still closes its sessions before the delete opens its own; bounded, since its
+        # cleanup (the parked container's `docker rm`) can hang on a wedged dockerd
+        await asyncio.wait(pending, timeout=timeout)
+        return False
+
+
+# In-process like inflight_creates.
+create_steps_after_reply = _CreateStepsAfterReplyRegistry()
+
+
 class _CustomerCreateRegistry:
     """Customer creates this connector runs per executor, and what each filler create saw of them.
 
@@ -1380,7 +1452,7 @@ class _CustomerCreateRegistry:
     customer's sweep would remove; if the lock lapsed (its 360 s TTL, Redis unreachable), the filler
     would start beside the renter after that sweep. A customer create can also start and finish
     between two of the filler's checks (a slow create_container, a queued Docker thread), so the
-    executor also counts the customer creates that ended, and a filler create remembers that count
+    executor also counts the customer creates that ended after reaching create_container, and a filler create remembers that count
     from its own start: one ended since then refuses the filler like one running now. Keyed by (miner
     hotkey, executor id): an executor id is unique only within its miner, and other executors are not
     affected. Read from the Docker thread too (_refuse_filler_during_customer_create), hence the lock,
@@ -1394,6 +1466,9 @@ class _CustomerCreateRegistry:
         self._ended_by_executor: Counter[tuple[str, str]] = Counter()
         # keyed by the payload object, not the pod id: two creates of one pod can overlap (a retry)
         self._ended_seen_by_filler_create: dict[int, int] = {}
+        # a customer request that failed before create_container (the miner left the executor out) touched
+        # no host: it ends as no create, so a filler that started before it is not refused
+        self._customer_create_reached_create_container: dict[int, bool] = {}
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
@@ -1413,14 +1488,21 @@ class _CustomerCreateRegistry:
             return
         with self._lock:
             self._running_by_executor[executor] += 1
+            self._customer_create_reached_create_container[id(payload)] = False
         try:
             yield
         finally:
             with self._lock:
                 self._running_by_executor[executor] -= 1
-                self._ended_by_executor[executor] += 1
+                if self._customer_create_reached_create_container.pop(id(payload)):
+                    self._ended_by_executor[executor] += 1
                 if self._running_by_executor[executor] <= 0:
                     del self._running_by_executor[executor]
+
+    def reached_create_container(self, payload: ContainerCreateRequest) -> None:
+        with self._lock:
+            if id(payload) in self._customer_create_reached_create_container:
+                self._customer_create_reached_create_container[id(payload)] = True
 
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
@@ -1781,7 +1863,10 @@ def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
 
 def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
     if allow_init:
-        return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"'
+        # scrypt N=2^10, not the default 2^16 (0.44 s less per create). The passphrase is HKDF of
+        # VOLUME_MASTER_SECRET, so N only slows guessing that secret (2^16 is 64x slower); a random
+        # secret of 128 bits or more needs no stretching. A volume keeps the N it was made with.
+        return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -scryptn 10 -passfile "$_pf"'
     return (
         f'  echo "gocryptfs.conf missing under {_LIUM_CIPHER_MOUNT};'
         ' refusing to re-initialise an existing rental volume" >&2\n'
@@ -1841,6 +1926,53 @@ fi
 """
 
 
+# exit status of the volume setup exec -> the step that failed and its log message; any other
+# status is `docker exec` itself failing, which used to surface at the upload
+_VOLUME_SETUP_EXEC_FAILURES: dict[int, tuple[str, str]] = {
+    90: ("upload_setup_script", "Failed to upload gocryptfs setup script into container"),
+    91: ("setup_or_mount", "Failed to initialize or mount gocryptfs inside container"),
+    92: ("verify_mount", "gocryptfs mount did not become visible inside container"),
+    93: ("add_public_keys", "Failed to add SSH public keys inside container"),
+}
+_VOLUME_SETUP_UPLOAD_FAILURE = _VOLUME_SETUP_EXEC_FAILURES[90]
+
+
+def _build_volume_setup_exec_script(
+    plaintext_path: str,
+    *,
+    setup_script_path: str,
+    passfile_path: str,
+    setup_script_size: int,
+    with_authorized_keys: bool,
+) -> str:
+    # The fixed program of the one volume setup exec; its stdin is the setup script, exactly
+    # setup_script_size bytes, then the renter's public keys. `dd bs=1` takes only the script onto
+    # tmpfs and leaves the keys to the final `cat`: they stay data, never shell text. Not `head -c`:
+    # busybox's reads a whole buffer from the pipe and swallows the keys.
+    script = shlex.quote(setup_script_path)
+    passfile = shlex.quote(passfile_path)
+    mount_check = (
+        f"awk -v target={shlex.quote(plaintext_path)} "
+        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
+    )
+    lines = [
+        f'trap "rm -f {script} {passfile}" EXIT',
+        # 0600 from the first byte, and only for the upload: the script's mkdir -p of a volume
+        # path's missing parents keeps the exec's default umask, as in separate execs
+        f"(umask 077 && dd bs=1 count={setup_script_size} of={script} 2>/dev/null)"
+        f" && [ $(wc -c < {script}) -eq {setup_script_size} ] || exit 90",
+        f"sh {script} || exit 91",
+        f"{mount_check} || {{ echo '--- /proc/mounts ---'; cat /proc/mounts;"
+        " echo '--- gocryptfs ps ---'; ps aux | grep '[g]ocryptfs'; exit 92; }",
+    ]
+    if with_authorized_keys:
+        # chmod up front: sshd may already be up and must find the directory private
+        lines.append(
+            "{ mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys; } || exit 93"
+        )
+    return "\n".join(lines)
+
+
 class DockerService:
     def __init__(
         self,
@@ -1861,7 +1993,7 @@ class DockerService:
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
-        self.is_realtime_logging = False
+        self.log_stream_finish_requested = asyncio.Event()
 
     @staticmethod
     def get_container_name(payload: ContainerBaseRequest) -> str:
@@ -2120,6 +2252,7 @@ class DockerService:
                     and port_maps is not None
                     and spare_port_pairs
                 ):
+                    ssh_port_map_before = self._find_mapping_by_docker_port(port_maps, 22)
                     remapped_spec = await self._remap_colliding_port(
                         exc=exc,
                         ssh_client=ssh_client,
@@ -2129,6 +2262,10 @@ class DockerService:
                         default_extra=default_extra,
                     )
                     if remapped_spec is not None:
+                        ssh_port_map = self._find_mapping_by_docker_port(port_maps, 22)
+                        if ssh_port_map and ssh_port_map != ssh_port_map_before:
+                            # the UI's SSH command still names the port dockerd just refused
+                            await self.stream_log(f"Port mappings ready: 22->{ssh_port_map[2]}", "success", log_tag)
                         run_spec = remapped_spec
                         remapped = True
                         attempt += 1
@@ -3068,11 +3205,8 @@ class DockerService:
             "pod_id": pod_id,
         }
 
-        self.is_realtime_logging = True
-
         while True:
-            await asyncio.sleep(LOG_STREAM_INTERVAL)
-
+            finish_requested = self.log_stream_finish_requested.is_set()
             async with self.lock:
                 logs_to_process = self.logs_queue[:]
                 self.logs_queue.clear()
@@ -3105,8 +3239,12 @@ class DockerService:
                         exc_info=True,
                     )
 
-            if not self.is_realtime_logging:
+            if finish_requested:
                 break
+            # publish first, then wait: the first line (the UI's SSH port) goes out at once, and
+            # finish_stream_logs cuts the wait short so the last batch does too
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.log_stream_finish_requested.wait(), LOG_STREAM_INTERVAL)
 
         logger.info(
             _m(
@@ -3116,7 +3254,7 @@ class DockerService:
         )
 
     async def finish_stream_logs(self):
-        self.is_realtime_logging = False
+        self.log_stream_finish_requested.set()
         if self.log_task:
             await self.log_task
 
@@ -4268,7 +4406,9 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
         allow_init: bool = True,
+        authorized_keys: Sequence[str] = (),
     ) -> None:
+        # authorized_keys: the renter's public keys, appended to /root/.ssh once the mount is up
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
 
         container_q = shlex.quote(container_name)
@@ -4279,13 +4419,6 @@ class DockerService:
         wrapped_var = _opaque_shell_name()
         while wrapped_var == pad_var:
             wrapped_var = _opaque_shell_name()
-
-        async def wipe_tmp_files() -> None:
-            await ssh_client.run(
-                f"/usr/bin/docker exec -u 0 {container_q} rm -f "
-                f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
-                check=False,
-            )
 
         async def fail_step(step: str, message: str, result: Any | None = None) -> None:
             exit_status = getattr(result, "exit_status", None)
@@ -4313,7 +4446,8 @@ class DockerService:
                     }),
                 )
             )
-            raise RuntimeError(
+            error_class = AuthorizedKeysWriteFailed if step == "add_public_keys" else RuntimeError
+            raise error_class(
                 f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})"
             )
 
@@ -4341,82 +4475,62 @@ class DockerService:
             passfile_path=passfile_path,
             allow_init=allow_init,
         )
+        key_data = "".join(f"{public_key}\n" for public_key in authorized_keys)
         # The script goes over the SSH channel's stdin, never in the command string: sshd hands
         # the command string to `sh -c`, so a heredoc there is the remote shell's argv, readable
         # by anyone on the host (`/proc/<pid>/cmdline`, execsnoop, auditd) for as long as the
-        # exec runs — pad and wrapped passphrase side by side. `umask 077` makes the file 0600
-        # from its first byte: it carries the same material as the passfile the script chmods 600.
-        upload_cmd = (
+        # exec runs — pad and wrapped passphrase side by side. The keys follow it on the same
+        # stdin, so upload, mount, check and keys cost one round trip instead of five.
+        setup_command = (
             f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
-            f"{shlex.quote(f'umask 077 && cat > {setup_script_path}')}"
-        )
-        logger.info(
-            _m(
-                "Uploading encrypted-volume setup script",
-                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
+            + shlex.quote(
+                _build_volume_setup_exec_script(
+                    plaintext_path,
+                    setup_script_path=setup_script_path,
+                    passfile_path=passfile_path,
+                    # asyncssh sends a str input as UTF-8; a template path may be non-ASCII
+                    setup_script_size=len(setup_script.encode("utf-8")),
+                    with_authorized_keys=bool(authorized_keys),
+                )
             )
         )
-        upload_result = await ssh_client.run(upload_cmd, input=setup_script)
-        if upload_result.exit_status != 0:
-            await wipe_tmp_files()
-            await fail_step(
-                "upload_setup_script",
-                "Failed to upload gocryptfs setup script into container",
-                upload_result,
-            )
-
         logger.info(
             _m(
                 "Running gocryptfs init/mount",
-                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
-            )
-        )
-        mount_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u 0 {container_q} sh {shlex.quote(setup_script_path)}",
-        )
-        await wipe_tmp_files()
-        if mount_result.exit_status != 0:
-            await fail_step(
-                "setup_or_mount",
-                "Failed to initialize or mount gocryptfs inside container",
-                mount_result,
-            )
-
-        verify_mount_script = (
-            f"awk -v target={shlex.quote(plaintext_path)} "
-            "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
-        )
-        logger.info(
-            _m(
-                "Verifying gocryptfs mount",
                 extra=get_extra_info({
                     **log_extra,
                     "container_name": container_name,
-                    "plaintext_path": plaintext_path,
                     "pod_id": pod_id,
+                    "with_authorized_keys": bool(authorized_keys),
                 }),
             )
         )
-        verify_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u 0 {container_q} sh -lc {shlex.quote(verify_mount_script)}"
+        # `docker inspect` on the host, not `id` in the container: a renter image is not
+        # guaranteed to ship coreutils. Read beside the exec, it costs no round trip of its own.
+        def run_setup():
+            return ssh_client.run(setup_command, input=setup_script + key_data, check=False)
+
+        def run_user_inspect():
+            return ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}", check=False)
+
+        setup_result, user_inspect_result = await asyncio.gather(
+            run_setup(), run_user_inspect(), return_exceptions=True
         )
-        if verify_result.exit_status != 0:
-            diagnostic_script = (
-                'printf "%s\\n" "--- /proc/mounts ---"; '
-                'cat /proc/mounts; '
-                'printf "%s\\n" "--- gocryptfs ps ---"; '
-                'ps aux | grep [g]ocryptfs || true'
+        # an sshd with MaxSessions=1 refuses whichever channel opens second; nothing ran on it, so it runs
+        # again alone once the other one succeeded (after a failure the create fails anyway)
+        if isinstance(setup_result, asyncssh.ChannelOpenError) and getattr(user_inspect_result, "exit_status", None) == 0:
+            setup_result = await run_setup()
+        if isinstance(user_inspect_result, asyncssh.ChannelOpenError) and getattr(setup_result, "exit_status", None) == 0:
+            user_inspect_result = await run_user_inspect()
+        # both settled: a failed inspect must not leave the setup running beside the failure cleanup
+        for outcome in (setup_result, user_inspect_result):
+            if isinstance(outcome, BaseException):
+                raise outcome
+        if setup_result.exit_status != 0:
+            step, message = _VOLUME_SETUP_EXEC_FAILURES.get(
+                setup_result.exit_status, _VOLUME_SETUP_UPLOAD_FAILURE
             )
-            diagnostic_result = await ssh_client.run(
-                f"/usr/bin/docker exec -u 0 {container_q} sh -lc "
-                f"{shlex.quote(diagnostic_script)}",
-                check=False,
-            )
-            await fail_step(
-                "verify_mount",
-                "gocryptfs mount did not become visible inside container",
-                diagnostic_result,
-            )
+            await fail_step(step, message, setup_result)
 
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
@@ -4425,6 +4539,7 @@ class DockerService:
             ssh_client=ssh_client,
             container_q=container_q,
             plaintext_path=plaintext_path,
+            user_inspect_result=user_inspect_result,
             log_extra={**log_extra, "container_name": container_name, "pod_id": pod_id},
         )
         if unwritable_workspace_error:
@@ -4452,6 +4567,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         container_q: str,
         plaintext_path: str,
+        user_inspect_result: asyncssh.SSHCompletedProcess,
         log_extra: dict,
     ) -> str | None:
         """Hand the freshly mounted workspace to the image's own user.
@@ -4468,21 +4584,15 @@ class DockerService:
         at ``/root/workspace`` under a 0700 ``/root`` is chown-ed and still
         unreachable).
         """
-        # `docker inspect` on the host, not `id` in the container: a renter image
-        # is not guaranteed to ship coreutils, and a probe we cannot run must not
-        # be mistaken for a probe that passed.
-        inspect_result = await ssh_client.run(
-            f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
-            check=False,
-        )
-        if inspect_result.exit_status != 0:
+        # a probe we cannot run must not be mistaken for a probe that passed
+        if user_inspect_result.exit_status != 0:
             return (
                 f"could not read the image USER of the rental container "
-                f"(docker inspect exit={inspect_result.exit_status}, "
-                f"stderr={(inspect_result.stderr or '')[-300:]!r})"
+                f"(docker inspect exit={user_inspect_result.exit_status}, "
+                f"stderr={(user_inspect_result.stderr or '')[-300:]!r})"
             )
 
-        image_user: str = (inspect_result.stdout or "").strip()
+        image_user: str = (user_inspect_result.stdout or "").strip()
         if image_user in ("", "0", "root", "0:0", "root:root"):
             return None
 
@@ -6557,6 +6667,45 @@ class DockerService:
             concurrency=concurrency,
         )
 
+    async def _run_create_steps_after_reply(
+        self,
+        connections: AsyncExitStack,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        log_extra: dict,
+    ) -> None:
+        # the create's steps a renter's first login does not need; closes the create's sessions
+        try:
+            async with connections:
+                if settings.ENABLE_INSPECTOR:
+                    started_ms = now_ms()
+                    # logs its own failure as "Inspector collector start failed"
+                    await self._run_inspector_collector_lifecycle(
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        action="start",
+                        default_extra=log_extra,
+                    )
+                    logger.info(
+                        _m(
+                            "Create step after reply finished",
+                            extra=get_extra_info({
+                                **log_extra,
+                                "step": ProfilerStepName.INSPECTOR_START.value,
+                                "duration_ms": now_ms() - started_ms,
+                            }),
+                        )
+                    )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Create steps after reply failed",
+                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -6666,6 +6815,10 @@ class DockerService:
                 payload.pod_mapping,
                 payload.workload_kind,
             )
+            # the UI shows the SSH command from this line while the pod is still being built
+            ssh_port_map = self._find_mapping_by_docker_port(port_maps, 22)
+            if ssh_port_map:
+                await self.stream_log(f"Port mappings ready: 22->{ssh_port_map[2]}", "success", log_tag)
 
             # Add profiler for port mappings generation
             profilers.append(ProfilerStep.since(ProfilerStepName.PORT_MAPPINGS_GENERATED, prev_timestamp))
@@ -6735,6 +6888,18 @@ class DockerService:
                     failure_step=current_step,
                 )
 
+            # DAH-3980: started before the host connection, the port line above reaches the backend
+            # ~1.5 s earlier; every return from here on calls finish_stream_logs. Cleared here, not
+            # in the task: a create failing before the task first runs must keep its finish request.
+            self.log_stream_finish_requested.clear()
+            self.log_task = asyncio.create_task(
+                self.handle_stream_logs(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                )
+            )
+
             # add executor in pending status dict
             current_step = "pending_pod"
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -6757,6 +6922,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 )
                 logger.error(log_text)
+                await self.finish_stream_logs()
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
@@ -6920,14 +7086,6 @@ class DockerService:
                             )
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
 
-                # set real-time logging
-                self.log_task = asyncio.create_task(
-                    self.handle_stream_logs(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        pod_id=payload.pod_id,
-                    )
-                )
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
                 # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
@@ -7223,6 +7381,19 @@ class DockerService:
                         default_extra=default_extra,
                     )
                     current_step = "park_current_container"
+                    # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
+                    # its removal of the container it parked, by that one's ID (never the one this edit parks)
+                    if not await create_steps_after_reply.wait_until_done(
+                        payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+                    ):
+                        logger.warning(
+                            _m(
+                                "The earlier create's steps after its reply ran out of time and were cancelled; parking now",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+                    # a delete that landed during the wait must find the pod as it was, not parked
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     parked_name = await edit_swap.park()
                     if parked_name:
                         protected_container_names.append(parked_name)
@@ -7826,18 +7997,27 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
+                # the keys ride in the encrypted volume setup exec, unless a restore must write
+                # /root between the mount and the keys
+                keys_in_volume_setup = use_encrypted_volume and not payload.bootstrap_restore
+                keys_write_failure: AuthorizedKeysWriteFailed | None = None
                 try:
                     if use_encrypted_volume:
                         current_step = "encrypted_volume_setup"
-                        await self.setup_encrypted_local_volume(
-                            ssh_client=ssh_client,
-                            container_name=container_name,
-                            plaintext_path=local_volume_path,
-                            volume_name=local_volume,
-                            pod_id=payload.pod_id,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                        )
+                        try:
+                            await self.setup_encrypted_local_volume(
+                                ssh_client=ssh_client,
+                                container_name=container_name,
+                                plaintext_path=local_volume_path,
+                                volume_name=local_volume,
+                                pod_id=payload.pod_id,
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                                authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
+                            )
+                        except AuthorizedKeysWriteFailed as exc:
+                            # the mount is up: fail at add_public_keys below, as a separate keys exec did
+                            keys_write_failure = exc
                         volume_encryption_status = VolumeEncryptionStatus.ENABLED
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
@@ -7871,13 +8051,16 @@ class DockerService:
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
                     try:
-                        await self.add_ssh_public_keys_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            public_keys=payload.user_public_keys,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                        )
+                        if keys_write_failure:
+                            raise keys_write_failure
+                        if not keys_in_volume_setup:
+                            await self.add_ssh_public_keys_with_rental_docker(
+                                docker_client=docker_client,
+                                container_name=container_name,
+                                public_keys=payload.user_public_keys,
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                            )
                     except Exception as keys_exc:
                         # DAH-3678: name the exiting image (DAH-2624) whatever form the exec
                         # failure took; the step and the cleanup below stay as they are.
@@ -8018,24 +8201,13 @@ class DockerService:
                         container_name=container_name,
                         default_extra=default_extra,
                     )
-                    if settings.ENABLE_INSPECTOR:
-                        await self._run_inspector_collector_lifecycle(
-                            ssh_client=ssh_client,
-                            executor_info=executor_info,
-                            action="start",
-                            default_extra={
-                                **default_extra,
-                                "container_name": container_name,
-                            },
-                        )
+                    # no duration: the collector starts after the reply, its time is logged there
                     profilers.append(
-                        ProfilerStep.since(
-                            ProfilerStepName.INSPECTOR_START,
-                            prev_timestamp,
+                        ProfilerStep(
+                            name=ProfilerStepName.INSPECTOR_START_AFTER_REPLY,
                             skipped=not settings.ENABLE_INSPECTOR,
                         )
                     )
-                    prev_timestamp = now_ms()
                 except Exception as post_run_exc:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
@@ -8154,7 +8326,7 @@ class DockerService:
                     )
                 )
 
-                return ContainerCreated(
+                container_created_reply = ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
@@ -8175,6 +8347,19 @@ class DockerService:
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
                 )
+                # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
+                # the steps after it take over this create's sessions and close them.
+                edit_swap.replacement_is_up = True
+                create_steps_after_reply.start(
+                    payload.pod_id,
+                    self._run_create_steps_after_reply(
+                        connections.pop_all(),
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        log_extra={**default_extra, "container_name": container_name},
+                    ),
+                )
+                return container_created_reply
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
@@ -9309,6 +9494,12 @@ class DockerService:
             )
             if not create_aborted:
                 log.warning("The cancelled create is still running; deleting without it")
+        # DAH-3980: the create's steps after its reply (inspector start, session close) end before
+        # this teardown, so its inspector stop is the last word on the host.
+        if not await create_steps_after_reply.wait_until_done(
+            payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+        ):
+            log.warning("Cancelled the create's steps after its reply; deleting without them")
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
