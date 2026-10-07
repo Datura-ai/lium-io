@@ -1241,10 +1241,14 @@ class _EditSwap:
             f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
         )
-        ids_by_name = dict(line.split()[:2] for line in (listed.stdout or "").splitlines() if len(line.split()) >= 2)
-        names = set(ids_by_name)
+        listing = [line.split() for line in (listed.stdout or "").splitlines() if line.strip()]
+        names = {fields[0] for fields in listing}
+        ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
         # the container this edit parks: the pod's, or the one recovered from a crashed edit below
-        container_id = ids_by_name.get(self.container_name) or ids_by_name.get(parked)
+        container_id = ids_by_name.get(self.container_name if self.container_name in names else parked)
+        if names and container_id is None:
+            # its removal after the reply could only go by name, and a later edit may park another container under it
+            raise Exception("[park_current_container] docker ps listed the pod without its container ID; the pod was left as it was")
         if self.container_name not in names:
             if parked in names:
                 # An earlier edit crashed between park and restore: the parked container is the
@@ -1301,9 +1305,7 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-                removed = await self.ssh_client.run(
-                    f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id or self.parked_name)}"
-                )
+                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id)}")
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(

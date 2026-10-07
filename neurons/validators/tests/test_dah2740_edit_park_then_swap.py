@@ -35,7 +35,7 @@ def _pod_name(payload) -> str:
     return DockerService.get_container_name(payload)
 
 
-def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename_back_exit: int = 0):
+def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename_back_exit: int = 0, listed_with_ids: bool = True):
     """An ssh mock that answers docker like a host with (or without) the pod's container, recording every command."""
     client = AsyncMock()
     client.image_exists_result = True
@@ -49,7 +49,7 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
         if "docker ps -a" in cmd and "--filter name=" in cmd:
             names = [part.split()[0].rstrip("$").strip("'") for part in cmd.split("--filter name=^")[1:]]
             present = [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
-            return _ssh_result(stdout="".join(f"{n} id-{n}\n" for n in present))
+            return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
         if "docker stop" in cmd:
             return _ssh_result(exit_status=stop_exit, stderr="tried to kill container, but did not receive an exit event")
         if "docker rename" in cmd and cmd.split()[-2].endswith(EDIT_PARKED_SUFFIX):  # parked -> original name
@@ -258,10 +258,15 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
     assert kwargs["local_volume_path"] == "/root" and kwargs["ssh_client"] is ssh
 
 
+@pytest.mark.parametrize(
+    ("stop_exit", "listed_with_ids", "details", "renamed"),
+    [(1, True, ("could not be stopped", "did not receive an exit event"), True), (0, False, ("without its container ID",), False)],
+    ids=["unstoppable", "listed_without_its_id"],  # the removal after the reply could only go by name, which a later edit reuses
+)
 @pytest.mark.asyncio
-async def test_an_unstoppable_container_fails_the_edit_before_anything_is_destroyed(svc, monkeypatch):
+async def test_an_unstoppable_container_fails_the_edit_before_anything_is_destroyed(svc, monkeypatch, stop_exit, listed_with_ids, details, renamed):
     payload = _edit_payload()
-    ssh = _ssh_recording(stop_exit=1)
+    ssh = _ssh_recording(stop_exit=stop_exit, listed_with_ids=listed_with_ids)
     _patch_happy(svc, monkeypatch, ssh)
     name, parked = _pod_name(payload), _pod_name(payload) + EDIT_PARKED_SUFFIX
 
@@ -269,11 +274,11 @@ async def test_an_unstoppable_container_fails_the_edit_before_anything_is_destro
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "park_current_container"
-    assert "could not be stopped" in result.detail and "did not receive an exit event" in result.detail
+    assert all(detail in result.detail for detail in details)
     assert _docker(ssh.commands, "rename") == [
         f"/usr/bin/docker rename {name} {parked}",
         f"/usr/bin/docker rename {parked} {name}",
-    ]
+    ] * renamed
     # the only rm is the best-effort sweep of a leftover parked name from an earlier edit
     destructive = [c for c in _docker(ssh.commands, "rm -fv") if not c.endswith("2>/dev/null || true")]
     assert destructive == []
