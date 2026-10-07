@@ -1151,6 +1151,7 @@ def test_docker_rm_exit_one_means_gone_only_with_no_such_container():
         ctx.ssh.run.side_effect = [
             MagicMock(exit_status=exit_status, stdout="", stderr=stderr),
             MagicMock(exit_status=0, stdout="volume_x\n", stderr=""),
+            MagicMock(exit_status=0, stdout="", stderr=""),
         ]
         return await module._remove_over_shell(
             ctx, container_name="pod_x", volume_name="volume_x"
@@ -1175,6 +1176,7 @@ def test_a_volume_rm_that_fails_is_a_leftover_not_a_clean_teardown():
         ctx.ssh.run.side_effect = [
             MagicMock(exit_status=0, stdout="pod_x\n", stderr=""),
             MagicMock(exit_status=exit_status, stdout="", stderr=stderr),
+            MagicMock(exit_status=0, stdout="", stderr=""),
         ]
         error = await module._remove_over_shell(ctx, container_name="pod_x", volume_name="volume_x")
         return error, [call.args[0] for call in ctx.ssh.run.call_args_list][1]
@@ -1193,6 +1195,22 @@ def test_a_volume_rm_that_fails_is_a_leftover_not_a_clean_teardown():
     assert error is None
     error, _ = asyncio.run(run_case(0, ""))
     assert error is None
+
+
+def test_shell_removal_also_drops_the_dind_volumes_without_judging_them():
+    """A probe created with the DinD volume flags on owns `volume_<id>_docker` (and on an encrypted
+    pod `_workspace`); the fallback removes them too, and their absence is not a leftover."""
+    ctx, _, _ = make_probe_context()
+    ctx.ssh.run.side_effect = [
+        MagicMock(exit_status=0, stdout="pod_x\n", stderr=""),
+        MagicMock(exit_status=0, stdout="volume_x\n", stderr=""),
+        MagicMock(exit_status=0, stdout="", stderr=""),
+    ]
+    error = asyncio.run(module._remove_over_shell(ctx, container_name="pod_x", volume_name="volume_x"))
+    assert error is None
+    assert [call.args[0] for call in ctx.ssh.run.call_args_list][2] == (
+        "/usr/bin/docker volume rm volume_x_docker volume_x_workspace 2>/dev/null || true"
+    )
 
 
 @pytest.mark.asyncio
