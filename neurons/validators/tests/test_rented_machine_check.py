@@ -1220,23 +1220,33 @@ async def test_pod_states_reports_exited_when_inspect_shows_a_stopped_container(
 class RestartingContainerSSHClient(DummySSHClient):
     """`docker ps` lists nothing and `docker inspect` shows dockerd between restarts of the pod."""
 
-    def __init__(self, *, error: str = ""):
+    def __init__(self, *, error: str = "", exit_code: int = 1, oom_killed: bool = False):
         super().__init__(pod_running=False)
         self.error = error
+        self.exit_code = exit_code
+        self.oom_killed = oom_killed
 
     async def run(self, command: str):
         if "docker inspect" in command:
             self.commands_called.append(command)
-            state = {"Status": "restarting", "ExitCode": 1, "Error": self.error, "FinishedAt": self.container_finished_at}
+            state = {
+                "Status": "restarting",
+                "ExitCode": self.exit_code,
+                "OOMKilled": self.oom_killed,
+                "Error": self.error,
+                "FinishedAt": self.container_finished_at,
+            }
             return Mock(stdout=json.dumps(state), stderr="")
         return await super().run(command)
 
 
 @pytest.mark.asyncio
 async def test_a_pod_crash_looping_on_its_own_keeps_the_verification(context_factory):
+    # The renter's PID 1 ran and exited with its own code (1): affirmative renter-fault evidence, so the
+    # provider is shielded (POD_RESTARTING, verification kept).
     ctx = _tenant_ctx(
         context_factory,
-        RestartingContainerSSHClient(),
+        RestartingContainerSSHClient(exit_code=1),
         {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
     )
 
@@ -1258,6 +1268,34 @@ async def test_a_pod_whose_restart_fails_to_start_is_still_not_running(context_f
     result = await TenantEnforcementCheck().run(ctx)
 
     assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "oom_killed", "case"),
+    [
+        (143, False, "daemon restart (SIGTERM) with empty error"),
+        (137, False, "host SIGKILL with empty error"),
+        (137, True, "host OOM-kill with empty error"),
+    ],
+)
+async def test_a_restarting_pod_without_renter_fault_evidence_is_not_shielded(
+    context_factory, exit_code, oom_killed, case
+):
+    """Review finding (Serhii, #1534): a provider Docker-daemon restart or a host SIGKILL/OOM can leave an
+    unless-stopped container `restarting` with an empty State.Error. Without affirmative renter-fault
+    evidence the cycle must fall through to POD_NOT_RUNNING (clears the verified job, provider-fault path),
+    not label the provider outage as a renter crash-loop and keep verification."""
+    ctx = _tenant_ctx(
+        context_factory,
+        RestartingContainerSSHClient(exit_code=exit_code, oom_killed=oom_killed),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason, case
     assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
 
 

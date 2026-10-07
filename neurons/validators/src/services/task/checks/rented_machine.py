@@ -405,8 +405,10 @@ class TenantEnforcementCheck:
 
         if _restarting_on_its_own(diagnostics):
             # A renter can make their own pod crash-loop (kill PID 1, break the entrypoint, hit its own memory
-            # limit); dockerd then restarts it under the pod's policy, which only works on a healthy host. No
-            # clear_verified_job: that would penalise the provider for the renter's workload.
+            # limit); dockerd then restarts it under the pod's policy, which only works on a healthy host. We
+            # reach here only with affirmative renter-fault evidence (see `_restarting_on_its_own`); without it
+            # the code below treats the pod as POD_NOT_RUNNING. No clear_verified_job: that would penalise the
+            # provider for the renter's workload.
             event = render_message(
                 Msg.POD_RESTARTING,
                 ctx=ctx,
@@ -462,10 +464,27 @@ class TenantEnforcementCheck:
         )
 
 
+# 128 + SIGKILL(9) and 128 + SIGTERM(15): an external kill, not the renter's own process exiting. A
+# provider Docker-daemon restart (unless-stopped → SIGTERM/SIGKILL) and a host SIGKILL/OOM-kill all land
+# here, and all can leave an `unless-stopped` container `restarting` with an empty State.Error.
+_EXTERNAL_KILL_EXIT_CODES = frozenset({137, 143})
+
+
 def _restarting_on_its_own(diagnostics: dict[str, object]) -> bool:
     # `restarting` is dockerd between a process exit and the policy's next start; an error is a start that
-    # failed (runtime, devices, mounts), which is the host's.
-    return diagnostics.get("container_status") == "restarting" and not diagnostics.get("container_error")
+    # failed (runtime, devices, mounts), which is the host's. But `restarting` + empty error does NOT prove
+    # the renter caused it: a provider daemon restart or a host SIGKILL/OOM leaves the same shape (review
+    # finding, Serhii, #1534). Shield the provider ONLY with affirmative renter-fault evidence — the renter's
+    # PID 1 ran and exited with its own code — and never on an external kill or an OOM we cannot attribute to
+    # the renter. Absent that, the caller falls through to POD_NOT_RUNNING (clears the verified job, provider
+    # path). An unattributable OOM is deliberately not shielded: Docker's OOMKilled cannot separate the
+    # renter's own cgroup limit from a host OOM, so it is treated as the provider's.
+    if diagnostics.get("container_status") != "restarting" or diagnostics.get("container_error"):
+        return False
+    if diagnostics.get("container_oom_killed"):
+        return False
+    exit_code = diagnostics.get("container_exit_code")
+    return isinstance(exit_code, int) and exit_code not in _EXTERNAL_KILL_EXIT_CODES
 
 
 def _container_state_from_diagnostics(diagnostics: dict[str, object]) -> ContainerState:
