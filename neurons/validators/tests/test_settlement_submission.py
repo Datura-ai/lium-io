@@ -380,13 +380,9 @@ async def test_an_unacknowledged_inclusion_is_kept_and_retried_next_cycle():
 
     await validator.submit_settled_window()
 
-    validator.redis_service.set.assert_any_await(
-        PENDING_INCLUSION_KEY, json.dumps({"tempo_index": 342, "block": 123456})
-    )
+    validator.redis_service.set.assert_any_await(PENDING_INCLUSION_KEY, json.dumps({"342": 123456}))
 
-    validator.redis_service.get = AsyncMock(
-        return_value=json.dumps({"tempo_index": 342, "block": 123456})
-    )
+    validator.redis_service.get = AsyncMock(return_value=json.dumps({"342": 123456}))
     validator.backend_client.report_settled_weights_result = AsyncMock(
         return_value=MagicMock(inclusion_block=123456)
     )
@@ -400,4 +396,21 @@ async def test_an_unacknowledged_inclusion_is_kept_and_retried_next_cycle():
     )
 
     validator.backend_client.report_settled_weights_result.assert_awaited_once_with(342, 123456)
-    validator.redis_service.set.assert_any_await(PENDING_INCLUSION_KEY, "")
+    validator.redis_service.set.assert_any_await(PENDING_INCLUSION_KEY, json.dumps({}))
+
+
+@pytest.mark.asyncio
+async def test_a_later_confirmation_does_not_clear_an_earlier_pending_one():
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.redis_service.get = AsyncMock(return_value=json.dumps({"342": 123456}))
+
+    async def answer(index, block):
+        return MagicMock(inclusion_block=block) if index == 343 else None
+
+    validator.backend_client.report_settled_weights_result = AsyncMock(side_effect=answer)
+
+    await validator._confirm_inclusion(343, 123800)
+
+    validator.redis_service.set.assert_awaited_with(
+        PENDING_INCLUSION_KEY, json.dumps({"342": 123456})
+    )

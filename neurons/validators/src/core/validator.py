@@ -61,8 +61,8 @@ MINER_SCORES_KEY = "miner_scores"
 # DAH-4001: this tempo's vector with every idle share moved to the verified burner, submitted when the backend
 # cannot serve the settled one; persisted like the accumulator so a restart does not lose it
 FALLBACK_SCORES_KEY = "settlement_fallback_scores"
-# an accepted submission whose inclusion the backend has not acknowledged yet: {"tempo_index", "block"}, retried
-# every cycle until it does, so the attribution has the block the vector went in at
+# accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
+# every cycle until its own acknowledgement, so the attribution has the block every vector went in at
 PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
 # cycle reports the backend has not acknowledged yet, replayed every cycle until it does
 UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
@@ -1021,8 +1021,16 @@ class Validator:
             )
         )
 
+    async def _pending_inclusions(self) -> dict[str, int]:
+        try:
+            kept = await self.redis_service.get(PENDING_INCLUSION_KEY)
+        except Exception:
+            return {}
+        return json.loads(kept) if kept else {}
+
     async def _confirm_inclusion(self, index: int, block: int) -> None:
-        """Tell the backend where the tempo's vector went in; kept and retried every cycle until it answers."""
+        """Tell the backend where the tempo's vector went in; kept and retried every cycle until it answers.
+        Each tempo's confirmation stays until its own acknowledgement: a later one never clears an earlier one."""
         try:
             confirmed = await self.backend_client.report_settled_weights_result(index, block)
         except Exception as exc:
@@ -1033,23 +1041,21 @@ class Validator:
                 )
             )
             confirmed = None
-        pending = "" if confirmed is not None else json.dumps({"tempo_index": index, "block": block})
+        pending = await self._pending_inclusions()
+        if confirmed is not None:
+            pending.pop(str(index), None)
+        else:
+            pending[str(index)] = block
         try:
-            await self.redis_service.set(PENDING_INCLUSION_KEY, pending)
+            await self.redis_service.set(PENDING_INCLUSION_KEY, json.dumps(pending))
         except Exception as exc:
             logger.warning(
-                _m("[settlement] could not keep the pending inclusion", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+                _m("[settlement] could not keep the pending inclusions", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
             )
 
     async def _retry_pending_inclusion(self) -> None:
-        try:
-            pending = await self.redis_service.get(PENDING_INCLUSION_KEY)
-        except Exception:
-            return
-        if not pending:
-            return
-        kept = json.loads(pending)
-        await self._confirm_inclusion(int(kept["tempo_index"]), int(kept["block"]))
+        for index, block in sorted((await self._pending_inclusions()).items()):
+            await self._confirm_inclusion(int(index), int(block))
 
     async def _submit_fallback(self, index: int, reason: str) -> None:
         vector = dict(self.fallback_scores)
