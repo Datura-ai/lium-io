@@ -354,6 +354,17 @@ class RentalDockerSdkClient:
             ) from exc
         return tuple(local_image.get("RepoDigests") or ())
 
+    async def image_default_command(self, *, image: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The local image's (Entrypoint, Cmd) as `docker run` would use them with no override."""
+        try:
+            image_attrs = await _in_docker_thread(self._api_client.inspect_image, image)
+            config = image_attrs.get("Config") or {}
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect image failed", exc)
+            ) from exc
+        return tuple(config.get("Entrypoint") or ()), tuple(config.get("Cmd") or ())
+
     async def local_image_is_current(
         self, *, image: str, auth_config: dict[str, str] | None = None
     ) -> bool:
@@ -930,6 +941,29 @@ class RentalDockerSdkClientFactory:
                 key_path=key_path,
                 known_hosts_path=known_hosts_path,
             )
+
+
+# A pod's container must keep running so the SSH keys can be installed and the renter can log
+# in. An image whose default command is a bare shell (`pytorch/pytorch`, `nvidia/cuda`:
+# CMD ["/bin/bash"]) exits at once without a TTY: the most common failed rent of a renter image
+# in early October 2026.
+_INTERACTIVE_SHELLS = frozenset(
+    {"sh", "bash", "zsh", "/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/bash", "/usr/bin/zsh"}
+)
+KEEP_ALIVE_COMMAND: tuple[str, ...] = ("sleep", "infinity")
+
+
+def keep_alive_command_for(entrypoint: tuple[str, ...], cmd: tuple[str, ...]) -> tuple[str, ...]:
+    """`sleep infinity` when the image's default command would exit at start; () keeps it.
+
+    The command replaces only Cmd, so an entrypoint wrapper that ends in `exec "$@"`
+    (nvidia/cuda's) still runs.
+    """
+    if len(cmd) == 1 and cmd[0] in _INTERACTIVE_SHELLS:
+        return KEEP_ALIVE_COMMAND
+    if not cmd and not entrypoint:
+        return KEEP_ALIVE_COMMAND
+    return ()
 
 
 def build_container_command_argv(startup_commands: str | None) -> tuple[str, ...]:
