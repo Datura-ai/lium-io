@@ -1248,6 +1248,7 @@ def _wire_customer_create_over_the_host(
     monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
     monkeypatch.setattr(settings, "RENTAL_VOLUME_FAST_PATH_ENABLED", True)
     ssh_client = _deploy_ssh_client()
+    answer_as_the_deploy_host = ssh_client.run.side_effect
     names_on_host = list(probe.container_names or () if containers_on_host is None else containers_on_host)
     listings = 0
 
@@ -1267,7 +1268,7 @@ def _wire_customer_create_over_the_host(
                 return _ssh_result(exit_status=1)
             ids = container_ids or {}
             return _ssh_result(stdout="".join(f"{name} {ids.get(name, '')}\n" for name in names_on_host))
-        return _ssh_result()
+        return answer_as_the_deploy_host(cmd, *args, **kwargs)
 
     ssh_client.run.side_effect = answer
     _wire(svc, monkeypatch, ssh_client, probe_result=probe)
@@ -1336,8 +1337,12 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the listing that finds the filler at SSH connect, then the rm and its confirming listing in one command
-    assert _cmds(ssh_client) == ([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL])
+    # the listing that finds the filler at SSH connect, then the rm and its confirming listing in one command,
+    # and the pid_max read every rental makes
+    assert _cmds(ssh_client) == [
+        *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL]),
+        "cat /proc/sys/kernel/pid_max",
+    ]
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
     assert (handed_on.container_names, handed_on.mounted_volume_names) == (("pod_keep",), ("volume_keep",))
@@ -1566,7 +1571,8 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _cmds(ssh_client) == commands
+    # and the pid_max read every rental makes
+    assert _cmds(ssh_client) == [*commands, "cat /proc/sys/kernel/pid_max"]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)
