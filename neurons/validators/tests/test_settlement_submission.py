@@ -10,7 +10,7 @@ import pytest
 from clients.backend_client import BackendClient, BackendRejected, SettledWeights
 from clients.subtensor_client import fold_unregistered_into_burner, scored_registered_neurons
 from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
-from core.validator import UNACKED_CYCLE_REPORTS_KEY, Validator
+from core.validator import PENDING_INCLUSION_KEY, UNACKED_CYCLE_REPORTS_KEY, Validator
 from incentive.burn_service import verified_burner_hotkey
 
 WINDOW = SettledWeights(
@@ -240,7 +240,9 @@ def test_the_fallback_moves_every_idle_share_to_the_burner_and_keeps_the_total()
 
     vector = fallback_vector(scores, rows, "burn")
 
-    assert vector == pytest.approx({"hk": 0.3, "sp": 0.0, "burn": 1.7, "referrer": 0.2})
+    assert vector == pytest.approx(
+        {"hk": 0.3, "sp": 0.1, "burn": 1.6, "referrer": 0.2}
+    )  # spot pay stays
     assert sum(vector.values()) == pytest.approx(sum(scores.values()))
     assert fallback_vector(scores, rows, None) == scores
 
@@ -369,3 +371,33 @@ async def test_a_cycle_report_the_backend_rejects_is_dropped_not_replayed():
     )
 
     validator.redis_service.lpush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unacknowledged_inclusion_is_kept_and_retried_next_cycle():
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.backend_client.report_settled_weights_result = AsyncMock(return_value=None)
+
+    await validator.submit_settled_window()
+
+    validator.redis_service.set.assert_any_await(
+        PENDING_INCLUSION_KEY, json.dumps({"tempo_index": 342, "block": 123456})
+    )
+
+    validator.redis_service.get = AsyncMock(
+        return_value=json.dumps({"tempo_index": 342, "block": 123456})
+    )
+    validator.backend_client.report_settled_weights_result = AsyncMock(
+        return_value=MagicMock(inclusion_block=123456)
+    )
+    await validator.report_cycle_scores(
+        {"hk": 1.0},
+        [],
+        "burn",
+        "2026-10-06 10:00:00",
+        500,
+        datetime(2026, 10, 6, 10, 0, tzinfo=UTC),
+    )
+
+    validator.backend_client.report_settled_weights_result.assert_awaited_once_with(342, 123456)
+    validator.redis_service.set.assert_any_await(PENDING_INCLUSION_KEY, "")

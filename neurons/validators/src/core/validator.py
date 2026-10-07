@@ -61,6 +61,9 @@ MINER_SCORES_KEY = "miner_scores"
 # DAH-4001: this tempo's vector with every idle share moved to the verified burner, submitted when the backend
 # cannot serve the settled one; persisted like the accumulator so a restart does not lose it
 FALLBACK_SCORES_KEY = "settlement_fallback_scores"
+# an accepted submission whose inclusion the backend has not acknowledged yet: {"tempo_index", "block"}, retried
+# every cycle until it does, so the attribution has the block the vector went in at
+PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
 # cycle reports the backend has not acknowledged yet, replayed every cycle until it does
 UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
 UNACKED_CYCLE_REPORTS_MAX = 200
@@ -872,6 +875,7 @@ class Validator:
             "node_shares": node_shares,
         }
         await self._replay_unacked_cycle_reports()
+        await self._retry_pending_inclusion()
         if not await self._deliver_cycle_report(payload):
             await self._keep_cycle_report(payload)
 
@@ -995,15 +999,7 @@ class Validator:
             self._settled_tempo_done = index
             block = self._current_block_or_none()
             if block is not None:
-                try:
-                    await self.backend_client.report_settled_weights_result(index, block)
-                except Exception as exc:
-                    logger.warning(
-                        _m(
-                            "[settlement] inclusion report failed",
-                            extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
-                        )
-                    )
+                await self._confirm_inclusion(index, block)
         else:
             self._alert_if_near_activity_cutoff()
         logger.info(
@@ -1017,11 +1013,43 @@ class Validator:
                         "hotkeys": len(window.hotkey_scores),
                         "withheld_shares": window.withheld_count,
                         "withheld_total": window.withheld_total,
+                        "refunded_shares": window.refunded_count,
+                        "refunded_total": window.refunded_total,
                         "mass_inactive_skipped": window.mass_inactive_skipped,
                     }
                 ),
             )
         )
+
+    async def _confirm_inclusion(self, index: int, block: int) -> None:
+        """Tell the backend where the tempo's vector went in; kept and retried every cycle until it answers."""
+        try:
+            confirmed = await self.backend_client.report_settled_weights_result(index, block)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[settlement] inclusion report raised",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
+                )
+            )
+            confirmed = None
+        pending = "" if confirmed is not None else json.dumps({"tempo_index": index, "block": block})
+        try:
+            await self.redis_service.set(PENDING_INCLUSION_KEY, pending)
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not keep the pending inclusion", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+
+    async def _retry_pending_inclusion(self) -> None:
+        try:
+            pending = await self.redis_service.get(PENDING_INCLUSION_KEY)
+        except Exception:
+            return
+        if not pending:
+            return
+        kept = json.loads(pending)
+        await self._confirm_inclusion(int(kept["tempo_index"]), int(kept["block"]))
 
     async def _submit_fallback(self, index: int, reason: str) -> None:
         vector = dict(self.fallback_scores)
@@ -1099,6 +1127,8 @@ class Validator:
                         "hotkeys": len(window.hotkey_scores),
                         "withheld_shares": window.withheld_count,
                         "withheld_total": window.withheld_total,
+                        "refunded_shares": window.refunded_count,
+                        "refunded_total": window.refunded_total,
                         "mass_inactive_skipped": window.mass_inactive_skipped,
                         "share_moved_vs_live": round(share_moved(self.miner_scores, window.hotkey_scores), 6),
                     }

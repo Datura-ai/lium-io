@@ -37,13 +37,16 @@ def cycle_node_shares(job_results: dict[str, list]) -> list[dict]:
 def fallback_vector(
     cycle_scores: dict[str, float], node_shares: list[dict], burner_hotkey: str | None
 ) -> dict[str, float]:
-    """The cycle's vector with every idle share moved to the verified burner: what the validator submits when the
-    backend cannot serve a tempo. Rental and referral stay as scored; the idle of that tempo is forfeited to the
-    burner rather than paid from a stale vector. With no verified burner the vector is submitted as scored."""
+    """The cycle's vector with every Secure idle share moved to the verified burner: what the validator submits
+    when the backend cannot serve a tempo. Rental, referral and spot pay stay as scored; the Secure idle of that
+    tempo is forfeited to the burner rather than paid from a stale vector. With no verified burner the vector is
+    submitted as scored."""
     if burner_hotkey is None:
         return dict(cycle_scores)
     vector = Counter(cycle_scores)
     for row in node_shares:
+        if row.get("spot"):
+            continue  # spot-node pay is never withheld, not even here
         moved = min(float(row["idle"]), vector.get(row["hotkey"], 0.0))
         if moved <= 0:
             continue

@@ -60,6 +60,8 @@ class SettledWeights(BaseModel):
     hotkey_scores: dict[str, float]
     withheld_count: int
     withheld_total: float
+    refunded_count: int = 0
+    refunded_total: float = 0.0
     mass_inactive_skipped: bool
     inclusion_block: int | None = None
 
