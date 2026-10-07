@@ -27,6 +27,7 @@ INTERCONNECT_HELPERS = {
     "TOPO_NVLINK_CELL_PATTERN",
     "NVLINK_ACTIVE_LINK_PATTERN",
     "NVLINK_GPU_HEADER_PATTERN",
+    "TERMINAL_ESCAPE_PATTERN",
     "parse_topology_matrix",
     "count_active_nvlinks_per_gpu",
     "GpuInterconnectObservation",
@@ -111,6 +112,32 @@ PCIE_CARD_NVLINK_STATUS = (
 )
 
 
+# `nvidia-smi topo -m` as the driver prints it on an 8-GPU HGX board, piped: the header
+# is wrapped in an underline escape (ESC[4m ... ESC[0m), cells are tab separated, the self cell is
+# " X ", NUMA Affinity is empty (two tabs) and NIC rows and the legend follow.
+HGX_TOPO_RAW = (
+    "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\tNIC0\tNIC1\t"
+    "CPU Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+    + "".join(
+        f"GPU{i}\t" + "\t".join(" X " if i == j else "NV18" for j in range(8))
+        + ("\tPIX\tSYS\t0-47,96-143\t0\t\tN/A\n" if i < 4 else "\tSYS\tPIX\t48-95,144-191\t1\t\tN/A\n")
+        for i in range(8)
+    )
+    + "NIC0\tPIX\tPIX\tPIX\tPIX\tSYS\tSYS\tSYS\tSYS\t X \tSYS\t\t\t\n"
+    + "NIC1\tSYS\tSYS\tSYS\tSYS\tPIX\tPIX\tPIX\tPIX\tSYS\t X \t\t\t\n"
+    + TOPO_LEGEND
+)
+
+# The same table from a driver that also underlines each row label.
+HGX_TOPO_RAW_UNDERLINED_ROWS = re.sub(r"^(GPU\d+|NIC\d+)\t", "\x1b[4m\\1\x1b[0m\t", HGX_TOPO_RAW, flags=re.M)
+
+HGX_P2P_RAW = (
+    " \t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\t\x1b[0m\n"
+    + "".join(f" GPU{i}\t" + "\t".join("X" if i == j else "OK" for j in range(8)) + "\t\n" for i in range(8))
+    + "\nLegend:\n\n  X    = Self\n  OK   = Status Ok\n  NS   = Not supported\n"
+)
+
+
 @pytest.fixture
 def scrape() -> dict[str, Any]:
     return build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", INTERCONNECT_HELPERS, {"re": re})
@@ -162,6 +189,29 @@ def test_p2p_table_is_read_by_the_same_parser(scrape: dict[str, Any]) -> None:
     assert len(labels) == 8
     assert rows[0][0] == "X"
     assert rows[0][1] == "NS"
+
+
+@pytest.mark.parametrize("output", [HGX_TOPO_RAW, HGX_TOPO_RAW_UNDERLINED_ROWS], ids=["header", "header-and-rows"])
+def test_topology_matrix_reads_the_escaped_header_nvidia_smi_prints(scrape: dict[str, Any], output: str) -> None:
+    # Act
+    labels, rows = scrape["parse_topology_matrix"](output)
+
+    # Assert
+    assert labels == [f"GPU{i}" for i in range(8)]
+    assert rows[0] == ["X"] + ["NV18"] * 7
+    assert rows[7] == ["NV18"] * 7 + ["X"]
+
+
+def test_hgx_host_with_the_escaped_tables_is_nvlink(scrape: dict[str, Any]) -> None:
+    # Act
+    payload = scrape["summarize_gpu_interconnect"](HGX_TOPO_RAW, HGX_P2P_RAW, nvlink_status([18] * 8))
+
+    # Assert
+    assert payload["ic_devices"] == 8
+    assert payload["ic_nvlink"] is True
+    assert payload["ic_nvlink_pairs"] == 28
+    assert payload["ic_nvlink_links"] == 18
+    assert payload["ic_p2p"] is True
 
 
 # -- summarize_gpu_interconnect ----------------------------------------------------------------------
