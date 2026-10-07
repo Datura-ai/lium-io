@@ -16,10 +16,11 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
   removal commands as the per-command path for the same host facts; a failed section falls back;
 - `create_container`: flag off → never probes; flag on → one probe handed to every consumer; the
   docker listings are withdrawn after a removal; the last-resort power raise never reads the probe;
-- a customer create that removed only a filler, cleanly, keeps every probe and relists
-  nothing; any other removal, a survivor or a failed rm relists as before;
-- that removal and its confirmation are the create's one host command; a removal that
-  times out fails the create at the cleanup step.
+- a customer create that removed only a filler, cleanly, keeps the probe's listings and relists
+  nothing, but sizes the volume on a fresh volume probe; any other removal, a survivor or a
+  failed rm relists as before;
+- that removal and its confirmation are the create's one host command besides the probes; a
+  removal that times out fails the create at the cleanup step.
 """
 
 from __future__ import annotations
@@ -1231,7 +1232,6 @@ def _wire_customer_create_over_the_host(
     docker_rm_exit: int = 0,
     ps_after_rm: str = "",
     docker_rm_raises: Exception | None = None,
-    df_after_rm: str | None = None,
 ) -> AsyncMock:
     """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it."""
@@ -1245,8 +1245,7 @@ def _wire_customer_create_over_the_host(
                 raise docker_rm_raises
             # the removal command reports the rm's status and the names left after it
             names_after = "".join(f"NAME\t{name}\n" for name in ps_after_rm.split())
-            df_line = f"DF\t{df_after_rm}\n" if df_after_rm is not None else ""
-            return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t0\n{df_line}")
+            return _ssh_result(stdout=f"RM\t{docker_rm_exit}\n{names_after}PS\t0\n")
         if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
             return _ssh_result(stdout=ps_after_rm)
         return _ssh_result()
@@ -1284,24 +1283,37 @@ def _relisting_commands(ssh_client) -> list[str]:
     ]
 
 
+def _fresh_sizing_payload(**over):
+    # the DAH-2183 contract: the volume is sized on the host's free disk
+    return _deploy_payload(disk_share=0.5, volume_limit_gb=1000, min_volume_gb=2, **over)
+
+
 @pytest.mark.asyncio
-async def test_customer_create_keeps_the_probes_after_removing_only_a_filler(svc_fixture, monkeypatch):
-    """The filler's removal is the only host change; nothing is listed or probed again."""
+async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after_removing_only_a_filler(
+    svc_fixture, monkeypatch
+):
+    """Nothing is listed again; the rm freed disk, so the volume is sized on a live probe, never the early one."""
     svc = svc_fixture
+    gb = ds_module._FRESH_SIZING_GB_BYTES
     ssh_client = _wire_customer_create_over_the_host(
         svc, monkeypatch, probe=_probe_with_containers("filler_x")
     )
+    svc.probe_volume_host = AsyncMock(
+        side_effect=[VolumeHostProbe("/var/lib/docker", size * gb, [], True) for size in (100, 140)]
+    )
+    monkeypatch.delattr(svc, "resolve_volume_sizing")
     # the backend protects a preempted filler's volume until its own filler delete
-    payload = _deploy_payload(active_volume_names=["volume_x"])
+    payload = _fresh_sizing_payload(active_volume_names=["volume_x"])
 
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the rm and its confirming listing are the one host command of the whole create
+    # the rm and its confirming listing are the one host command of the create besides the probes
     assert _cmds(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [])]
     assert _relisting_commands(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
-    svc.probe_volume_host.assert_awaited_once()
+    # 0.5 x (free - 20 GB overhead), two thirds of it the volume: the early 100 GB -> 26, the live 140 GB -> 40
+    assert svc.create_local_volume.await_args.kwargs["limit"] == 40
 
 
 @pytest.mark.asyncio
@@ -1358,64 +1370,6 @@ async def test_customer_create_without_a_filler_runs_the_same_commands_as_before
     assert _cmds(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
     svc.probe_volume_host.assert_awaited_once()
-
-
-def _df_record(avail_bytes: int) -> str:
-    # `df -P -B1` output with "\r" in place of "\n", as the removal command's DF line carries it
-    return f"0\tFilesystem 1-blocks Used Available Capacity Mounted on\r/dev/vda1 0 0 {avail_bytes} 50% /hostfs\r"
-
-
-def _fresh_sizing_payload(**over):
-    # the DAH-2183 contract: the volume is sized on the host's df
-    return _deploy_payload(disk_share=0.5, volume_limit_gb=1000, min_volume_gb=2, **over)
-
-
-@pytest.mark.asyncio
-async def test_a_filler_removal_sizes_the_volume_on_the_df_read_after_its_rm(svc_fixture, monkeypatch):
-    """Both dfs clear the minimum but size different volumes; the early one predates the disk the rm freed."""
-    svc = svc_fixture
-    gb = ds_module._FRESH_SIZING_GB_BYTES
-    ssh_client = _wire_customer_create_over_the_host(
-        svc, monkeypatch, probe=_probe_with_containers("filler_x"), df_after_rm=_df_record(140 * gb)
-    )
-    svc.probe_volume_host = AsyncMock(
-        return_value=VolumeHostProbe(
-            docker_root_dir="/var/lib/docker",
-            df_avail_bytes=100 * gb,
-            vloopback_volume_names=[],
-            loopback_plugin_enabled=True,
-        )
-    )
-    monkeypatch.delattr(svc, "resolve_volume_sizing")
-
-    result = await _run_create_container(svc, _fresh_sizing_payload(active_volume_names=["volume_x"]))
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _cmds(ssh_client) == [_remove_and_list_containers_command(["filler_x"], [], with_df=True)]
-    svc.probe_volume_host.assert_awaited_once()
-    # 0.5 x (df - 20 GB overhead), two thirds of it the volume: 100 GB -> 26 GB, 140 GB -> 40 GB
-    assert svc.create_local_volume.await_args.kwargs["limit"] == 40
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "df_after_rm", [None, "137\tFilesystem\r/dev/vda1 9 2 42"], ids=["not_read", "died_mid_output"]
-)
-async def test_a_filler_removal_without_its_df_measures_the_volume_facts_again(svc_fixture, monkeypatch, df_after_rm):
-    """The removal's df was not read, or not to its end: the early df is not used in its place."""
-    svc = svc_fixture
-    gb = ds_module._FRESH_SIZING_GB_BYTES
-    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"), df_after_rm=df_after_rm)
-    svc.probe_volume_host = AsyncMock(
-        side_effect=[VolumeHostProbe("/var/lib/docker", size * gb, [], True) for size in (100, 140)]
-    )
-    monkeypatch.delattr(svc, "resolve_volume_sizing")
-
-    result = await _run_create_container(svc, _fresh_sizing_payload(active_volume_names=["volume_x"]))
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # sized on the live probe's 140 GB, not on the early 100 GB
-    assert svc.create_local_volume.await_args.kwargs["limit"] == 40
 
 
 @pytest.mark.asyncio
