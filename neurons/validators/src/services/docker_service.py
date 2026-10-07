@@ -1215,6 +1215,9 @@ class _EditSwap:
         self.ssh_client = ssh_client
         self.container_name = container_name
         self.parked_name: str | None = None
+        # the parked container's own Docker ID: its removal after the reply can land after a later edit
+        # of the pod parked another container under the same name, and removing by name would delete that one
+        self.parked_id: str | None = None
         self.default_extra = default_extra
         # How restore() brings the parked container back up. Set by the create path once it knows
         # the pod's volume path: a bare `docker start` drops the gocryptfs plaintext mount and the
@@ -1235,10 +1238,13 @@ class _EditSwap:
         """Rename the running container aside and stop it. None when there is nothing to park."""
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
         listed = await self.ssh_client.run(
-            f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" '
+            f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" '
             f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
         )
-        names = set((listed.stdout or "").split())
+        ids_by_name = dict(line.split()[:2] for line in (listed.stdout or "").splitlines() if len(line.split()) >= 2)
+        names = set(ids_by_name)
+        # the container this edit parks: the pod's, or the one recovered from a crashed edit below
+        container_id = ids_by_name.get(self.container_name) or ids_by_name.get(parked)
         if self.container_name not in names:
             if parked in names:
                 # An earlier edit crashed between park and restore: the parked container is the
@@ -1266,6 +1272,7 @@ class _EditSwap:
         if renamed.exit_status != 0:
             raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
         self.parked_name = parked
+        self.parked_id = container_id
         stopped = await self.ssh_client.run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
         if stopped.exit_status != 0:
             # The container cannot be stopped: give it its name back and fail the edit with the
@@ -1294,7 +1301,9 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_name)}")
+                removed = await self.ssh_client.run(
+                    f"/usr/bin/docker rm -fv {shlex.quote(self.parked_id or self.parked_name)}"
+                )
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(

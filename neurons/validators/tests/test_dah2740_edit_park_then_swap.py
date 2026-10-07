@@ -49,7 +49,7 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
         if "docker ps -a" in cmd and "--filter name=" in cmd:
             names = [part.split()[0].rstrip("$").strip("'") for part in cmd.split("--filter name=^")[1:]]
             present = [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
-            return _ssh_result(stdout="".join(f"{n}\n" for n in present))
+            return _ssh_result(stdout="".join(f"{n} id-{n}\n" for n in present))
         if "docker stop" in cmd:
             return _ssh_result(exit_status=stop_exit, stderr="tried to kill container, but did not receive an exit event")
         if "docker rename" in cmd and cmd.split()[-2].endswith(EDIT_PARKED_SUFFIX):  # parked -> original name
@@ -95,8 +95,9 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
     # the sweep was told the parked name is not stale
     protected = svc.clean_existing_containers.await_args.kwargs["active_container_names"]
     assert protected == ["pod_someone_else", parked]
-    # only after the replacement is up is the old container removed; the new one never is
-    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv {parked}"
+    # only after the replacement is up is the old container removed, by its ID: a later edit may park
+    # another container under the same name before a late rm lands; the new one is never removed
+    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
     assert f"/usr/bin/docker rm -fv {name} 2>/dev/null || true" not in ssh.commands
 
 
@@ -112,7 +113,7 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     assert ssh.commands == [
-        f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" --filter name=^{name}$ --filter name=^{parked}$',
+        f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$',
         f"/usr/bin/docker rename {name} {parked}",
         f"/usr/bin/docker stop -t 10 {parked}",
         '/usr/bin/docker volume ls --format "{{.Name}}"',
@@ -122,7 +123,7 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
-        f"/usr/bin/docker rm -fv {parked}",
+        f"/usr/bin/docker rm -fv id-{name}",
     ]
 
 
@@ -152,7 +153,7 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
 
     assert isinstance(result, ContainerCreated)
     assert steps_finished is False
-    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv {parked}"
+    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
     assert f"/usr/bin/docker rename {parked} {name}" not in ssh.commands
 
 
@@ -188,7 +189,7 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     assert isinstance(first_edit, ContainerCreated)
     assert isinstance(second_edit_result, ContainerCreated)
     parks = [i for i, command in enumerate(ssh.commands) if command == f"/usr/bin/docker rename {name} {parked}"]
-    first_parked_removal = ssh.commands.index(f"/usr/bin/docker rm -fv {parked}")
+    first_parked_removal = ssh.commands.index(f"/usr/bin/docker rm -fv id-{name}")
     assert len(parks) == 2
     assert first_parked_removal < parks[1]
 
@@ -337,7 +338,7 @@ async def test_a_parked_container_left_by_a_crashed_edit_is_the_pod_and_is_never
         f"/usr/bin/docker rename {name} {parked}",   # parked again for this edit
     ]
     assert not any(c.startswith(f"/usr/bin/docker rm -fv {parked} 2>/dev/null") for c in ssh.commands)
-    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv {parked}"  # only after the replacement is up
+    assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{parked}"  # only after the replacement is up
 
 
 @pytest.mark.asyncio
