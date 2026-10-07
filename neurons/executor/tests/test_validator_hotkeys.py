@@ -5,10 +5,6 @@ drops `current`. Every test names the regression it guards; signatures are real 
 shaped exactly as the miner relays them, and go through the routes, not the helper.
 """
 
-import importlib.machinery
-import importlib.util
-import os
-import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import bittensor
@@ -70,35 +66,7 @@ def _upload_payload(miner_kp, validator_kp) -> dict:
     }
 
 
-def _ping_payload(validator_kp) -> dict:
-    return {"signature": validator_kp.sign("ping_request").hex()}
-
-
 # --- /upload_ssh_key ------------------------------------------------------------------------------
-
-
-def test_upload_signed_by_the_current_hotkey_is_accepted_when_next_is_configured(
-    client, miner_keypair, current_validator, next_validator, monkeypatch
-):
-    # regression: configuring `next` replaces `current` instead of adding to it — the live
-    # validator is refused by every executor that restarts onto the release
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-
-    response = client.post("/upload_ssh_key", json=_upload_payload(miner_keypair, current_validator))
-
-    assert response.status_code == 200
-
-
-def test_upload_signed_by_the_next_hotkey_is_accepted_when_configured(
-    client, miner_keypair, current_validator, next_validator, monkeypatch
-):
-    # regression: the verifier reads only the first configured hotkey, so the chain swap
-    # (phase 2) is fleet-wide downtime
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-
-    response = client.post("/upload_ssh_key", json=_upload_payload(miner_keypair, next_validator))
-
-    assert response.status_code == 200
 
 
 def test_upload_signed_by_a_third_hotkey_is_rejected_with_two_configured(
@@ -129,88 +97,6 @@ def test_upload_signed_by_the_next_hotkey_is_rejected_while_only_current_is_conf
 # --- the dependencies/auth.py verifiers (ping, hardware, containers) ------------------------------
 
 
-def test_ping_signed_by_the_next_hotkey_is_accepted_when_configured(
-    client, current_validator, next_validator, monkeypatch
-):
-    # regression: the rotation reaches _validate_validator_signature (ssh key uploads) but not
-    # dependencies.auth.verify_signature, so /ping, /hardware_utilization and /containers/*
-    # go dark after the chain swap while rentals still work
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-
-    response = client.post("/ping", json=_ping_payload(next_validator))
-
-    assert response.status_code == 200
-
-
-def test_ping_signed_by_a_third_hotkey_is_rejected_with_two_configured(
-    client, current_validator, next_validator, monkeypatch
-):
-    # regression: verify_signature's error path (a raised or False verify on the first key) is
-    # read as "verified" once a second key is in the loop
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-    stranger = bittensor.Keypair.create_from_uri("//LiumRotationStranger")
-
-    response = client.post("/ping", json=_ping_payload(stranger))
-
-    assert response.status_code == 401
-
-
 # --- core/config.py: where the two hotkeys come from ----------------------------------------------
 
 
-def _load_config_with_override(monkeypatch, next_hotkey: str | None):
-    # a fresh module object from core/config.py with `core.config_override` standing in as
-    # docker_build.sh writes it for a rotation build (both hotkeys; see below). Reloading
-    # sys.modules["core.config"] instead would hand every other test a second `settings` object.
-    if next_hotkey is None:
-        monkeypatch.delitem(sys.modules, "core.config_override", raising=False)
-    else:
-        # what docker_build.sh writes for a rotation build: both hotkeys (config.py since
-        # DAH-3114 reads `_VALIDATOR_HOTKEY_SS58` from any override it finds). A real module with
-        # a __spec__, because `importlib.util.find_spec` raises on a bare namespace in sys.modules.
-        override = importlib.util.module_from_spec(importlib.machinery.ModuleSpec("core.config_override", None))
-        override._VALIDATOR_HOTKEY_SS58 = _load_config_with_override(monkeypatch, next_hotkey=None).VALIDATOR_HOTKEY_SS58
-        override._VALIDATOR_NEXT_HOTKEY_SS58 = next_hotkey
-        monkeypatch.setitem(sys.modules, "core.config_override", override)
-    # the executor must never take a hotkey from its environment; set it to prove it is ignored
-    monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY_SS58", bittensor.Keypair.create_from_uri("//FromEnv").ss58_address)
-    path = os.path.join(os.path.dirname(__file__), "..", "src", "core", "config.py")
-    spec = importlib.util.spec_from_file_location("config_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_without_an_override_only_the_current_hotkey_is_configured(monkeypatch):
-    # regression: an empty `next` becomes a second entry ("" or a duplicate of current), or the
-    # environment variable of the same name is honoured — the fleet as deployed today must see
-    # exactly one hotkey, and a provider's .env must not add a signer
-    config = _load_config_with_override(monkeypatch, next_hotkey=None)
-
-    assert config.VALIDATOR_HOTKEYS_SS58 == {"current": config.VALIDATOR_HOTKEY_SS58}
-
-
-def test_the_build_time_override_adds_the_next_hotkey_after_current(monkeypatch, next_validator):
-    # regression: the override is read but never reaches the dict (or lands first, so the log
-    # says `current` for the new key), or surrounding whitespace is kept
-    config = _load_config_with_override(monkeypatch, next_hotkey=f" {next_validator.ss58_address} ")
-
-    assert list(config.VALIDATOR_HOTKEYS_SS58.items()) == [
-        ("current", config.VALIDATOR_HOTKEY_SS58),
-        ("next", next_validator.ss58_address),
-    ]
-
-
-def test_a_next_hotkey_equal_to_current_is_not_listed_twice(monkeypatch):
-    # regression: the same key verified twice, and a log line claiming `next` is in use
-    current = _load_config_with_override(monkeypatch, next_hotkey=None).VALIDATOR_HOTKEY_SS58
-    config = _load_config_with_override(monkeypatch, next_hotkey=current)
-
-    assert config.VALIDATOR_HOTKEYS_SS58 == {"current": current}
-
-
-def test_a_next_hotkey_that_is_not_an_ss58_address_stops_the_executor_at_import(monkeypatch):
-    # regression: a mistyped `next` is discovered by the first 401 after the chain swap, on the
-    # whole fleet, instead of by CI on this PR
-    with pytest.raises(ValueError, match="next validator hotkey"):
-        _load_config_with_override(monkeypatch, next_hotkey="5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13q")

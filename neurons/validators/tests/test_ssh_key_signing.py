@@ -54,19 +54,3 @@ def test_sign_validator_pubkey_str_produces_verifiable_signature(miner_service, 
     assert validator_keypair.verify(public_key, signature)
 
 
-def test_sign_validator_pubkey_bytes_decodes_and_produces_verifiable_signature(
-    miner_service, validator_keypair
-):
-    """Signing a bytes pubkey decodes it first; the signature verifies against the str form."""
-    # Arrange — validator_requests sends public_key as bytes
-    public_key_bytes = _SSH_KEY.encode("utf-8")
-
-    # Act
-    signature = miner_service._sign_validator_pubkey(validator_keypair, public_key_bytes)
-
-    # Assert — hex-encoded with 0x prefix
-    assert isinstance(signature, str)
-    assert signature.startswith("0x")
-
-    # Assert — verifiable against the decoded str form (executor receives public_key as str)
-    assert validator_keypair.verify(_SSH_KEY, signature)

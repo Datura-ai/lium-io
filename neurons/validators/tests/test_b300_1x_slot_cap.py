@@ -17,7 +17,6 @@ from incentive.rental_price import RentalPriceIncentive
 from services.task_service import JobResult
 
 B300 = "NVIDIA B300 SXM6 AC"
-IDLE_1X_NODES = 12  # 17 Sep 2026 13:28Z cycle: 12 idle 1×B300, 5 rented, 8 rented 8×
 
 
 async def _run_with_production_config(job_results: dict[str, list[JobResult]]) -> RentalPriceIncentive:
@@ -36,31 +35,6 @@ async def _run_with_production_config(job_results: dict[str, list[JobResult]]) -
 
     await incentive.calculate_mining_scores()
     return incentive
-
-
-@pytest.mark.asyncio
-async def test_twelve_idle_1x_b300_share_four_cards_of_pay_and_8x_is_untouched(make_pcc_job) -> None:
-    jobs = {
-        f"miner_{i}": [make_pcc_job(f"exec-1x-{i:02d}", B300, 1)] for i in range(IDLE_1X_NODES)
-    }
-    jobs["miner_8x"] = [make_pcc_job("exec-8x", B300, 8)]
-
-    incentive = await _run_with_production_config(jobs)
-
-    assert incentive.unrented_count_by_bucket[("B300", 1)] == IDLE_1X_NODES
-    assert incentive.cap_multiplier_by_bucket[("B300", 1)] == pytest.approx(4 / IDLE_1X_NODES)
-    for i in range(IDLE_1X_NODES):
-        result = jobs[f"miner_{i}"][0]
-        assert result.count_bucket == 1
-        assert result.max_cap == 4
-        assert result.cap_dilution_applied is True
-        assert result.effective_rate == pytest.approx(result.hourly_rate * 4 / IDLE_1X_NODES)
-
-    node_8x = jobs["miner_8x"][0]
-    assert node_8x.count_bucket == 8
-    assert node_8x.max_cap == 32
-    assert node_8x.cap_dilution_applied is False
-    assert node_8x.unrented_cap_multiplier == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio

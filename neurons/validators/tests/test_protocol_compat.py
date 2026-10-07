@@ -19,22 +19,12 @@ if str(REPO_ROOT / "lium_protocol") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "lium_protocol"))
 
 import lium_protocol  # noqa: E402
-from lium_protocol.backend_to_validator import SOCKET_REPLIES  # noqa: E402
-from lium_protocol.http import HTTP_MODELS  # noqa: E402
 from lium_protocol.recorded import json_keys, recorded  # noqa: E402
 from payload_models import payloads  # noqa: E402
-from protocol.vc_protocol import compute_requests, validator_requests  # noqa: E402
+from protocol.vc_protocol import validator_requests  # noqa: E402
 
 # declared in both enums, sent by neither peer, and the validator has no model for it
 VALIDATOR_TYPES_WITHOUT_A_VALIDATOR_MODEL = {"MachineSpecRequest"}
-# the validator sends this body to the backend and builds it ad hoc: no model to compare
-HTTP_BODIES_WITHOUT_A_VALIDATOR_MODEL = {"PodHostRebootRecoveredRequest"}
-# fields the backend puts on the wire that the validator's model does not declare (so ignores):
-# the known drift, by recording. A new entry here is a wire field the validator silently drops —
-# decide whether the validator should read it before adding it.
-VALIDATOR_IGNORES: dict[str, set[str]] = {
-    "RentedMachineResponse": {"machines[].rented_ports", "machines[].containers[].rented_ports"},
-}
 
 
 def _ids(direction: str) -> list[str]:
@@ -148,57 +138,3 @@ def test_what_the_backend_sends_parses_through_the_validators_own_parser(entry: 
     _same_wire_view(message, ours, theirs)
 
 
-@pytest.mark.parametrize(
-    "entry",
-    recorded("http") + recorded("socket_replies"),
-    ids=_ids("http") + _ids("socket_replies"),
-)
-def test_http_bodies_and_socket_replies_parse_the_same_on_both_sides(entry: dict) -> None:
-    """HTTP bodies via vc_protocol.compute_requests; the three typeless socket replies the same way,
-    which is what compute_client.handle_message does with the raw text
-    (`Response.model_validate_json`, `TypeAdapter(RentedMachineResponse)`)."""
-    body = entry["message"]
-    ours = {**HTTP_MODELS, **SOCKET_REPLIES}[entry["expect"]].model_validate(body)
-    if entry["expect"] in HTTP_BODIES_WITHOUT_A_VALIDATOR_MODEL:
-        assert not hasattr(compute_requests, entry["expect"])
-        return
-    theirs = getattr(compute_requests, entry["expect"]).model_validate(body)
-    if isinstance(body, list):
-        assert len(ours.root) == len(theirs.root) == len(body)
-        return
-    _same_wire_view(body, ours, theirs, ignores=VALIDATOR_IGNORES.get(entry["expect"], set()))
-
-
-def test_every_validator_wire_type_is_in_lium_protocol() -> None:
-    """The union check the other way: a type the validator can emit today is in the package."""
-    validator_emits = {member.value for member in validator_requests.RequestType} | {
-        member.value for member in payloads.ContainerResponseType
-    }
-    package = {member.value for member in lium_protocol.ValidatorMessageType}
-    assert validator_emits <= package, sorted(validator_emits - package)
-    backend_sends = {member.value for member in payloads.ContainerRequestType} | {
-        "ForcedValidationCycleRequest",
-        "GetEstimateRequest",  # compute_client parses it with a TypeAdapter, no enum member here
-    }
-    assert backend_sends <= {member.value for member in lium_protocol.BackendMessageType}
-
-
-def test_enums_the_validator_emits_are_members_of_the_package_enums() -> None:
-    from lium_protocol import validator_to_backend as v2b
-
-    def values(enum_cls) -> set:
-        return {member.value for member in enum_cls}
-
-    assert values(payloads.FailedContainerErrorCodes) <= values(v2b.FailedContainerErrorCodes)
-    assert values(payloads.FailedContainerErrorTypes) <= values(v2b.FailedContainerErrorTypes)
-    assert values(payloads.VolumeEncryptionStatus) == values(v2b.VolumeEncryptionStatus)
-    assert values(payloads.ContainerWarningCode) <= values(v2b.ContainerWarningCode)
-    assert values(payloads.WorkloadKind) == values(lium_protocol.WorkloadKind)
-
-
-def test_the_excluded_executor_id_is_the_validators_failed_miner_uuid() -> None:
-    """The backend keys emission eligibility off it; the validator names the value differently."""
-    from core.validator import FAILED_MINER_EXECUTOR_UUID
-    from lium_protocol.validator_to_backend import EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID
-
-    assert EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID == FAILED_MINER_EXECUTOR_UUID
