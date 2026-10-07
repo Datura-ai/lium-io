@@ -13,7 +13,7 @@ dockerhub-push" and never gets a Docker Hub token.
 The one exception is `executor_cd_dev.yml`, the dev build developers dispatch from feature
 branches: off `main` it runs in a second environment, `dockerhub-push-dev`, with no branch policy.
 Docker trusts that subject only for `daturaai/compute-subnet-executor-dev` and
-`…-executor-runner-dev` (ruleset `lium-io-dev`, `../DOCKERHUB_OIDC.md`), so a branch build
+`daturaai/compute-subnet-runner-dev` (ruleset `lium-io-dev`, `../DOCKERHUB_OIDC.md`), so a branch build
 gets a token that cannot push a release image, whatever its workflow file says. From `main` it
 keeps `dockerhub-push` and the release repositories' `dev` tag. `miner_cd_dev.yml` and
 `validator_cd_dev.yml` are dispatched from `main` only.
