@@ -412,6 +412,12 @@ class Settings(BaseSettings):
     # future resets only: an executor already reset stays inactive until its next clean scrape, and
     # cycles already skipped are not billed or paid afterwards.
     RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)
+    # A rented pod whose reboot failed (backend status REBOOT_FAILED) and whose container is not running:
+    # the validator asks the host to start a throwaway GPU container (the executor's own image,
+    # `nvidia-smi -L`). If the Docker daemon or the NVIDIA runtime refuses, the host is at fault and the
+    # verified job is cleared, so the backend marks the executor inactive and billing stops. A transport
+    # error or timeout decides nothing. Off by default: the pod keeps the plain POD_NOT_RUNNING verdict.
+    REBOOT_FAILED_HOST_CHECK_ENABLED: bool = Field(env="REBOOT_FAILED_HOST_CHECK_ENABLED", default=False)
     # Report a rented node that lost a GPU to the backend from the first cycle that sees it (a possible
     # glitch waits one more); observation only, no score change. Off by default.
     RENTED_GPU_DROP_CHECK_ENABLED: bool = Field(env="RENTED_GPU_DROP_CHECK_ENABLED", default=False)
