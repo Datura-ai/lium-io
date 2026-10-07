@@ -389,6 +389,9 @@ _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
 # has to go. Covers the image layers and scratch the pod needs beyond its own volume.
 RENTAL_DISK_HEADROOM_GB = 20
+# Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
+# of 0 or below would read as "unlimited" to Docker, so never emit one.
+_MIN_RENTAL_PIDS_LIMIT = 512
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -2259,6 +2262,7 @@ class DockerService:
         gpu_devices,
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
+        host_pid_max: int | None = None,
         quote_socket: bool = False,
     ) -> ContainerRunSpec:
         environment = {
@@ -2317,6 +2321,7 @@ class DockerService:
             cpu_count=cpu_count,
             memory_gb=payload.memory_gb,
             storage_limit_gb=effective_storage_limit_gb,
+            pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -2380,6 +2385,58 @@ class DockerService:
     @staticmethod
     def _forwards_rdma(devices: tuple[DeviceMount, ...]) -> bool:
         return any(device.path_on_host.startswith("/dev/infiniband/") for device in devices)
+
+    @staticmethod
+    def _rental_pids_limit(cpu_count: int | None, host_pid_max: int | None = None) -> int | None:
+        """cgroup pids.max for a rental container, or None to leave the daemon default.
+
+        A tenant fork bomb otherwise exhausts the host's global PID space, and the executor's own
+        daemon and sshd can no longer fork — the validator then reads the node as unreachable
+        mid-rental and the provider is penalized. The memory cgroup is not a ceiling here: on a
+        whole-host rental mem_limit is host-sized, so a bomb of light tasks exhausts PIDs long
+        before RAM. Scaled per allocated CPU (a real workload's thread/process count tracks its
+        cores); a rental with no per-pod CPU cap (whole host / CVM) gets the absolute cap.
+
+        The cap must sit below the executor's real kernel.pid_max, or on a host configured with a
+        low pid_max (e.g. 32768) the fork bomb exhausts the global PID space before the container
+        reaches its cgroup wall and the executor is starved anyway. The cap is clamped to
+        ``kernel.pid_max - RENTAL_PIDS_LIMIT_HOST_MARGIN``, never below ``_MIN_RENTAL_PIDS_LIMIT``
+        (0 or a negative would read as "unlimited" to Docker). When ``host_pid_max`` is None (it could
+        not be read) the scaled cap is returned unclamped; the caller refuses the rental before that
+        happens. RENTAL_PIDS_LIMIT_PER_CPU=0 disables the limit for rollback.
+        """
+        per_cpu = settings.RENTAL_PIDS_LIMIT_PER_CPU
+        if per_cpu <= 0:
+            return None
+        cap = settings.RENTAL_PIDS_LIMIT_CAP
+        want = min(per_cpu * cpu_count, cap) if cpu_count and cpu_count > 0 else cap
+        if host_pid_max and host_pid_max > 0:
+            host_room = max(host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN, _MIN_RENTAL_PIDS_LIMIT)
+            want = min(want, host_room)
+        return want
+
+    async def _read_host_pid_max(self, ssh_client) -> int | None:
+        """The executor host's kernel.pid_max, read before `docker run`, or None when unreadable.
+
+        Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
+        ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Bounded:
+        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded by asyncssh's own
+        `timeout`; it deliberately does not shell out to `timeout`, whose absence would otherwise
+        turn into a miss and fail the read.
+        """
+        try:
+            res = await ssh_client.run(
+                "cat /proc/sys/kernel/pid_max", check=False, timeout=15
+            )
+        except (asyncssh.Error, asyncio.TimeoutError, OSError):
+            return None
+        if getattr(res, "exit_status", 1) != 0:
+            return None
+        try:
+            value = int((res.stdout or "").strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -7036,6 +7093,27 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
                 prev_timestamp = now_ms()
 
+                # Read the host's real kernel.pid_max and decide fail-closed BEFORE anything is
+                # created on the host (the local volume, a filler's GPU power cap) so a refusal
+                # leaves nothing behind (review finding on PR #1531). The limit is enabled unless
+                # RENTAL_PIDS_LIMIT_PER_CPU=0; refuse when the host PID margin cannot be guaranteed:
+                # the value is unreadable, or it is so low that even the floored cgroup cap would not
+                # reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the host's own tasks. No fixed fallback is
+                # safe on a host whose real pid_max is lower, so a tenant fork bomb would starve
+                # sshd/dockerd and take the executor offline mid-rental.
+                host_pid_max = await self._read_host_pid_max(ssh_client)
+                if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
+                    current_step = "host_pid_max"
+                    if host_pid_max is None:
+                        raise RuntimeError(
+                            "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
+                        )
+                    if host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT:
+                        raise RuntimeError(
+                            f"host kernel.pid_max ({host_pid_max}) is too low to reserve the host PID "
+                            "margin; refusing to start a rental"
+                        )
+
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
                 effective_volume_limit_gb = payload.volume_limit_gb
@@ -7288,6 +7366,8 @@ class DockerService:
                     )
                     # the broker cold start (image pull, socket wait) must not read as port-check wait
                     prev_timestamp = now_ms()
+                # host_pid_max was read and validated fail-closed before any host side-effect above
+                # (review finding on PR #1531); here it only sizes the container's pids.max.
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -7300,6 +7380,7 @@ class DockerService:
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
+                    host_pid_max=host_pid_max,
                     quote_socket=quote_socket,
                 )
 
