@@ -7361,9 +7361,15 @@ class DockerService:
                 fillers_removed_at_ssh_connect = FillerRemovalAtSshConnect(
                     listed_id_by_filler_name={}, removed_cleanly_without_volume_rm=False
                 )
+                removal_at_ssh_connect_lost_its_channel = False
                 if filler_removal_at_ssh_connect is not None:
                     filler_removal, filler_removal_at_ssh_connect = filler_removal_at_ssh_connect, None
-                    fillers_removed_at_ssh_connect = await filler_removal
+                    try:
+                        fillers_removed_at_ssh_connect = await filler_removal
+                    except asyncssh.ChannelOpenError:
+                        # an sshd with MaxSessions=1, busy with the probes, refused one of its channels: the cleanup
+                        # step removes what is left, and an rm that did run freed disk, so the host counts as changed
+                        removal_at_ssh_connect_lost_its_channel = True
                 cleanup_report = ContainerCleanupReport()
                 removed_containers = await self.clean_existing_containers(
                     ssh_client=ssh_client,
@@ -7443,7 +7449,8 @@ class DockerService:
                     host_probe=docker_listing_probe,
                 )
                 cleanup_changed_host = bool(
-                    removed_containers
+                    removal_at_ssh_connect_lost_its_channel
+                    or removed_containers
                     or removed_vloopback_volumes
                     or swept_cache_volumes
                     or reclaimed_cache_volumes

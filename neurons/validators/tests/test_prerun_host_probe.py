@@ -1308,9 +1308,11 @@ def _fresh_sizing_payload(**over):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("probe_saw_the_filler", [True, False], ids=["probe_listed_the_filler", "probe_listed_after_the_removal"])
+# the last row: the removal at SSH connect ran its rm, then a MaxSessions=1 sshd busy with the probes refused it a channel
+@pytest.mark.parametrize(("probe_saw_the_filler", "removal_lost_its_channel"), [(True, False), (False, False), (False, True)],
+                         ids=["probe_listed_the_filler", "probe_listed_after_the_removal", "removal_lost_its_channel_after_its_rm"])
 async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after_removing_only_a_filler(
-    svc_fixture, monkeypatch, probe_saw_the_filler
+    svc_fixture, monkeypatch, probe_saw_the_filler, removal_lost_its_channel
 ):
     """Nothing is listed again: whether the probe listed the host before or after the removal at SSH connect, it hands
     on a listing without the filler. The rm freed disk, so the volume is sized on a live probe, never the early one."""
@@ -1324,6 +1326,8 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
         side_effect=[VolumeHostProbe("/var/lib/docker", size * gb, [], True) for size in (100, 140)]
     )
     monkeypatch.delattr(svc, "resolve_volume_sizing")
+    if removal_lost_its_channel:
+        svc.remove_fillers_at_ssh_connect = AsyncMock(side_effect=asyncssh.ChannelOpenError(1, "open failed"))
     # the backend protects a preempted filler's volume until its own filler delete
     payload = _fresh_sizing_payload(
         active_container_names=["pod_keep"], active_volume_names=["volume_keep", "volume_x"]
@@ -1333,7 +1337,7 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     # the listing that finds the filler at SSH connect, then the rm and its confirming listing in one command
-    assert _cmds(ssh_client) == [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL]
+    assert _cmds(ssh_client) == ([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL])
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
     assert (handed_on.container_names, handed_on.mounted_volume_names) == (("pod_keep",), ("volume_keep",))
