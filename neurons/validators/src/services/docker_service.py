@@ -6892,10 +6892,12 @@ class DockerService:
                             "margin; refusing to start a rental"
                         )
 
-                # host RAM: only a rental sent without a memory limit (legacy ram_total 0 rows) needs
-                # it, to size one. Under host contention — the exact condition that delays this SSH
-                # probe — an unlimited rental lets the renter exhaust host RAM and OOM the
-                # executor/sshd, so refuse rather than fall through to no mem_limit.
+                # host RAM: needed only when the rental was sent without a memory limit, to size one.
+                # That is the legacy ram_total 0 pod rows AND the validator's own rental probe, whose
+                # _probe_payload sends no memory_gb — so the messages below say "a rental sent without
+                # a memory limit", not "legacy". Under host contention — the exact condition that
+                # delays this SSH probe — an unlimited rental lets the renter exhaust host RAM and OOM
+                # the executor/sshd, so refuse rather than fall through to no mem_limit.
                 host_ram_kib: int | None = None
                 rental_gpu_share = 1.0
                 if not payload.memory_gb:
@@ -6903,10 +6905,10 @@ class DockerService:
                     host_ram_kib = await self._read_host_ram_kib(ssh_client)
                     if host_ram_kib is None:
                         raise RuntimeError(
-                            "host MemTotal could not be read; refusing to start a legacy rental without a safe memory limit"
+                            "host MemTotal could not be read; refusing to start a rental sent without a memory limit"
                         )
                     # A split-host rental gets its GPU share of host RAM, matching the backend's own
-                    # sizing (models.executor.pod_ram_total_kib). Two legacy zero-RAM pods on one host
+                    # sizing (models.executor.pod_ram_total_kib). Two zero-RAM pods on one split host
                     # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
                     if payload.gpu_uuids:
                         current_step = "host_gpu_count"
@@ -6914,7 +6916,7 @@ class DockerService:
                         if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
                             raise RuntimeError(
                                 "host GPU count could not be read or is below the rented GPU count; "
-                                "refusing to start a legacy split rental without a safe memory limit"
+                                "refusing to start a split rental sent without a memory limit"
                             )
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
 
