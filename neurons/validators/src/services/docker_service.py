@@ -9,7 +9,9 @@ import random
 import re
 import secrets
 import shlex
+import threading
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
@@ -114,6 +116,7 @@ from services.rental_docker_observability import (
 from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     HOST_KILL_EXIT_CODES,
+    ContainerCreateRefused,
     ContainerExecSpec,
     ContainerGoneBeforeExec,
     ContainerRunSpec,
@@ -840,6 +843,10 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
+class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
+    """Raised at a filler's `docker run` while a customer create runs on the same executor."""
+
+
 class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
@@ -1289,6 +1296,92 @@ class _InflightCreateRegistry:
 # In-process: a pod's create and delete are driven by the same validator event loop. Move it to
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
+
+
+class _CustomerCreateRegistry:
+    """Customer creates this connector runs per executor, and what each filler create saw of them.
+
+    A customer create is counted from before it waits for the executor's create lock, so a filler
+    create holding that lock stands down at `docker run` instead of starting a container the
+    customer's sweep would remove; if the lock lapsed (its 360 s TTL, Redis unreachable), the filler
+    would start beside the renter after that sweep. A customer create can also start and finish
+    between two of the filler's checks (a slow create_container, a queued Docker thread), so the
+    executor also counts the customer creates that ended, and a filler create remembers that count
+    from its own start: one ended since then refuses the filler like one running now. Keyed by (miner
+    hotkey, executor id): an executor id is unique only within its miner, and other executors are not
+    affected. Read from the Docker thread too (_refuse_filler_during_customer_create), hence the lock,
+    held for one update or read, never across an await.
+    """
+
+    def __init__(self) -> None:
+        self._running_by_executor: Counter[tuple[str, str]] = Counter()
+        # ponytail: never shrinks, one int per executor that had a customer create since the connector
+        # started (bounded by the fleet); a filler's snapshot must outlive the customer create it missed.
+        self._ended_by_executor: Counter[tuple[str, str]] = Counter()
+        # keyed by the payload object, not the pod id: two creates of one pod can overlap (a retry)
+        self._ended_seen_by_filler_create: dict[int, int] = {}
+        self._lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def track(self, payload: ContainerCreateRequest) -> Iterator[None]:
+        executor = (payload.miner_hotkey, payload.executor_id)
+        if payload.workload_kind == WorkloadKind.FILLER:
+            with self._lock:
+                self._ended_seen_by_filler_create[id(payload)] = self._ended_by_executor[executor]
+            try:
+                yield
+            finally:
+                with self._lock:
+                    del self._ended_seen_by_filler_create[id(payload)]
+            return
+        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+            yield
+            return
+        with self._lock:
+            self._running_by_executor[executor] += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._running_by_executor[executor] -= 1
+                self._ended_by_executor[executor] += 1
+                if self._running_by_executor[executor] <= 0:
+                    del self._running_by_executor[executor]
+
+    def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
+        with self._lock:
+            return (miner_hotkey, executor_id) in self._running_by_executor
+
+    def ran_since_filler_started(self, filler: ContainerCreateRequest) -> bool:
+        # a customer create on the filler's executor running now or ended since the filler's track();
+        # one that started after it is running or ended. A filler never tracked: only a running one.
+        executor = (filler.miner_hotkey, filler.executor_id)
+        with self._lock:
+            seen = self._ended_seen_by_filler_create.get(id(filler))
+            return executor in self._running_by_executor or (
+                seen is not None and seen != self._ended_by_executor[executor]
+            )
+
+
+# In-process like inflight_creates: both creates for one executor go through the connector of the
+# validator that owns it.
+customer_creates = _CustomerCreateRegistry()
+
+
+def _is_filler_create_beside_customer_create(payload: ContainerCreateRequest) -> bool:
+    return (
+        payload.workload_kind == WorkloadKind.FILLER
+        and customer_creates.ran_since_filler_started(payload)
+    )
+
+
+def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> None:
+    """Stop a filler create while this connector runs, or since the filler's start ran, a customer
+    create on the same executor."""
+    if _is_filler_create_beside_customer_create(payload):
+        raise _FillerRefusedForCustomerCreate(
+            f"a customer create is running on executor {payload.executor_id}; filler {payload.pod_id} not started"
+        )
 
 
 class _OwnSweepRegistry:
@@ -1876,7 +1969,8 @@ class DockerService:
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
-        Returns the container's ID, or None when the client gave none.
+        Returns the container's ID, or None when the client gave none. A ContainerCreateRefused of
+        the spec's `before_create` (checked before every attempt) is raised as is.
 
         Port collision (PORT_COLLISION_RETRY_ENABLED): when dockerd refuses the bind of a host port
         and `port_maps` / `spare_port_pairs` are given, the colliding mapping moves to the next
@@ -1903,6 +1997,8 @@ class DockerService:
                     **rental_run_spec_log_fields(run_spec),
                 )
                 return container_id if isinstance(container_id, str) else None
+            except ContainerCreateRefused:
+                raise
             except Exception as exc:
                 if _should_repair_stale_mountpoint(
                     exc,
@@ -2224,6 +2320,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            before_create=lambda: _refuse_filler_during_customer_create(payload),
         )
 
     async def _ensure_pod_quote_socket(
@@ -7255,6 +7352,10 @@ class DockerService:
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     await self.stream_log("Creating docker container", "success", log_tag)
+                    # No await between this check and the hand-off to the Docker thread, which checks
+                    # again right before the create: a customer create may register while the run
+                    # waits for a thread.
+                    _refuse_filler_during_customer_create(payload)
                     container_id = await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
@@ -7278,6 +7379,9 @@ class DockerService:
                         ),
                     )
                     edit_swap.replacement_id = container_id
+                    # A customer create that ran while the daemon created this container may have
+                    # swept the host before it was listed: remove it by its ID (handler below).
+                    _refuse_filler_during_customer_create(payload)
                     if jupyter_port_map:
                         # a port collision may have moved the Jupyter mapping: the URL below
                         # and the answer to the backend read the port the pod really got
@@ -7339,7 +7443,7 @@ class DockerService:
                             logger.error(_m("docker run failed", extra=log_extra))
 
                         raise Exception("Run docker run command but container is not running")
-                except Exception:
+                except Exception as docker_run_error:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -7356,6 +7460,19 @@ class DockerService:
                             pod_id=payload.pod_id,
                             default_extra=default_extra,
                         )
+                    if isinstance(
+                        docker_run_error, _FillerRefusedForCustomerCreate
+                    ) or _is_filler_create_beside_customer_create(payload):
+                        # DAH-2356: the PEARL cap applied above must not stay on the GPUs the customer
+                        # is about to get; lifted only after the container is removed.
+                        await restore_filler_pod_gpu_power_limits(
+                            ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+                        )
+                        # A run that failed because the customer's sweep removed the container (create
+                        # lock lapsed), before its start or before the running-state check, is that
+                        # refusal, not a filler fault: not ContainerVanished, counted against the host.
+                        container_vanished = False
+                        _refuse_filler_during_customer_create(payload)
                     raise
 
                 # Add profiler for the post-run container running-state poll
@@ -7723,6 +7840,8 @@ class DockerService:
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
+            elif isinstance(e, _FillerRefusedForCustomerCreate):
+                current_step = "customer_create_in_flight"
             # `error_class` (e.g. `port_collision`: dockerd could not bind the pod's host port)
             # rides in the event's detail next to the stage so the backend can count the class
             error_class = port_collision_error_class(e)
@@ -7751,6 +7870,13 @@ class DockerService:
                             "reason": "cancelled_by_delete",
                             "failure_step": current_step,
                         }),
+                    )
+                )
+            elif isinstance(e, _FillerRefusedForCustomerCreate):
+                logger.info(
+                    _m(
+                        "filler create refused: a customer create is running on this executor",
+                        extra=get_extra_info({**default_extra, "reason": current_step}),
                     )
                 )
             elif isinstance(
@@ -7808,6 +7934,8 @@ class DockerService:
                 error_code=(
                     FailedContainerErrorCodes.ContainerVanished
                     if container_vanished
+                    else FailedContainerErrorCodes.RentingInProgress
+                    if isinstance(e, _FillerRefusedForCustomerCreate)
                     else FailedContainerErrorCodes.UnknownError
                 ),
                 failure_step=current_step,
