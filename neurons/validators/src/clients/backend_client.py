@@ -1,6 +1,7 @@
 """Standardized HTTP client for backend API requests with validator signature."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -45,30 +46,27 @@ class CycleScoresReport(BaseModel):
     """The backend's receipt for a cycle's vector (DAH-4001)."""
 
     cycle_id: str
-    matures_at: datetime
     created: bool
 
 
-class WeightBatch(BaseModel):
-    """One immutable weight vector the backend built from matured cycles (DAH-4001)."""
+class SettledWeights(BaseModel):
+    """The vector the backend settled for one tempo (DAH-4001): the cycles scored a day earlier, the withhold
+    rule applied, frozen on first read. Empty `hotkey_scores` means nothing was scored in that window."""
 
-    batch_id: str
+    tempo_index: int
+    window_from_block: int
+    window_to_block: int
     cycle_ids: list[str]
     hotkey_scores: dict[str, float]
-    attempts: int
-    status: str
-    # set by the validator on the cached copy: the block the chain accepted it at
-    submitted_block: int | None = None
+    withheld_count: int
+    withheld_total: float
+    mass_inactive_skipped: bool
+    inclusion_block: int | None = None
 
 
-class WeightBatchNext(BaseModel):
-    batch: WeightBatch | None = None
-
-
-class WeightBatchResult(BaseModel):
-    batch_id: str
-    status: str
-    attempts: int
+class SettledWeightsResult(BaseModel):
+    tempo_index: int
+    inclusion_block: int | None = None
 
 
 class BackendClient:
@@ -127,6 +125,39 @@ class BackendClient:
             "signature": f"0x{self.keypair.sign(str(timestamp)).hex()}",
         }
 
+    @staticmethod
+    def signed_request_message(method: str, path_with_query: str, body: bytes, timestamp: str) -> str:
+        """What the settlement routes verify (backend utils/auth.py validator_signed_message): the method, the path
+        with its query, the body's hash and the timestamp, so a captured signature fits no other request."""
+        return "\n".join(
+            ["lium-validator-v1", method.upper(), path_with_query, hashlib.sha256(body).hexdigest(), timestamp]
+        )
+
+    def _get_signed_request_headers(self, method: str, path_with_query: str, body: bytes) -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        message = self.signed_request_message(method, path_with_query, body, timestamp)
+        return {
+            "hotkey": self.keypair.ss58_address,
+            "timestamp": timestamp,
+            "signature": f"0x{self.keypair.sign(message).hex()}",
+            "content-type": "application/json",
+        }
+
+    async def _signed_request(
+        self, method: str, path_with_query: str, response_model: type[T], *, json_data: dict[str, Any] | None = None
+    ) -> T | None:
+        """A settlement call: the body is serialized once, and the signature covers these exact bytes."""
+        body = b"" if json_data is None else json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
+        path = "/" + path_with_query.lstrip("/")
+        return await self._request(
+            method,
+            path,
+            response_model,
+            add_signature=False,
+            extra_headers=self._get_signed_request_headers(method, path, body),
+            raw_body=body if json_data is not None else None,
+        )
+
     async def get(
         self,
         path: str,
@@ -178,6 +209,7 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
         non_200_log_level: int = logging.ERROR,
+        raw_body: bytes | None = None,
     ) -> T | None:
         # single signed round-trip, retrying connection-level errors per backoff schedule.
         # `non_200_log_level`: an optional call whose route may not exist on the backend yet logs
@@ -198,7 +230,8 @@ class BackendClient:
                         method,
                         url,
                         headers=headers,
-                        json=json_data,
+                        json=json_data if raw_body is None else None,
+                        data=raw_body,
                         timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as resp:
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -535,24 +568,19 @@ class BackendClient:
     # DAH-4001 — rolling idle settlement
 
     async def report_cycle_scores(self, payload: dict[str, Any]) -> CycleScoresReport | None:
-        """Hand a cycle's per-hotkey vector to the backend, which settles it a day later. `payload` is the
-        request body (see Validator.cycle_report_payload); the caller keeps it for replay when this returns None."""
-        path = f"/validator/{self.keypair.ss58_address}/cycles"
-        return await self.post(path, CycleScoresReport, json_data=payload)
+        """Hand a cycle's vector and per-node rows to the backend, which settles it a day later. `payload` is the
+        request body (see core/settlement.py); the caller keeps it for replay when this returns None."""
+        return await self._signed_request(
+            "POST", f"/validator/{self.keypair.ss58_address}/cycles", CycleScoresReport, json_data=payload
+        )
 
-    async def claim_weight_batch(self, mode: str) -> WeightBatch | None:
-        """The batch to submit this tempo, built from cycles recorded under `mode`; None when nothing matured
-        (or the backend is unreachable)."""
-        path = f"/validator/{self.keypair.ss58_address}/weight-batches/next"
-        response = await self.post(path, WeightBatchNext, json_data={"mode": mode})
-        return response.batch if response is not None else None
+    async def get_settled_weights(self, tempo_index: int, tempo_blocks: int) -> SettledWeights | None:
+        """The vector to submit this tempo; None when the backend is unreachable."""
+        path = f"/validator/{self.keypair.ss58_address}/settled-weights?tempo_index={tempo_index}&tempo_blocks={tempo_blocks}"
+        return await self._signed_request("GET", path, SettledWeights)
 
-    async def report_weight_batch_result(
-        self, batch_id: str, *, success: bool, block: int | None, error: str | None, shadow: bool
-    ) -> WeightBatchResult | None:
-        path = f"/validator/{self.keypair.ss58_address}/weight-batches/{batch_id}/result"
-        return await self.post(
-            path,
-            WeightBatchResult,
-            json_data={"success": success, "block": block, "error": error, "shadow": shadow},
+    async def report_settled_weights_result(self, tempo_index: int, inclusion_block: int) -> SettledWeightsResult | None:
+        path = f"/validator/{self.keypair.ss58_address}/settled-weights/{tempo_index}/result"
+        return await self._signed_request(
+            "POST", path, SettledWeightsResult, json_data={"inclusion_block": inclusion_block}
         )

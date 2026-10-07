@@ -4,8 +4,10 @@ import os
 import time
 from datetime import UTC, datetime
 
-from clients.backend_client import BackendClient, WeightBatch
+from clients.backend_client import BackendClient
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
+from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
+from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
@@ -56,8 +58,9 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
-# DAH-4001: the last batch the chain accepted, resubmitted when nothing new has matured
-LAST_WEIGHT_BATCH_KEY = "settlement_last_weight_batch"
+# DAH-4001: this tempo's vector with every idle share moved to the verified burner, submitted when the backend
+# cannot serve the settled one; persisted like the accumulator so a restart does not lose it
+FALLBACK_SCORES_KEY = "settlement_fallback_scores"
 # cycle reports the backend has not acknowledged yet, replayed every cycle until it does
 UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
 UNACKED_CYCLE_REPORTS_MAX = 200
@@ -91,7 +94,6 @@ class Validator:
         # DAH-4001: block of the last settled submission attempt, accepted or not. Nothing is attempted again inside
         # the chain's weights rate limit: an accepted one would only be rejected, and a failed one retried every sync
         # tick would use up a batch's attempts in under a minute of chain trouble.
-        self._settled_submission_block: int | None = None
 
         # set incentive algorithm from setting
         self.incentive = settings.incentive
@@ -158,6 +160,15 @@ class Validator:
             cycle_inputs=self.express_lane_cycle_inputs,
         )
 
+        self.fallback_scores: dict[str, float] = {}
+        try:
+            fallback_json = await self.redis_service.get(FALLBACK_SCORES_KEY)
+            if fallback_json is not None:
+                self.fallback_scores = json.loads(fallback_json)
+        except Exception as e:
+            logger.warning(
+                _m("[initiate_services] could not load the settlement fallback vector", extra=get_extra_info({**self.default_extra, "error": str(e)}))
+            )
         # init miner_scores: always load from Redis if present so accumulated
         # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
         try:
@@ -277,27 +288,18 @@ class Validator:
                         )
                         self.miner_scores = {}
                     elif settings.SETTLEMENT_MODE == SETTLEMENT_ENFORCE:
-                        # DAH-4001: the accumulator is scored but not submitted; the backend's matured batch is
-                        await self.submit_settled_batch()
+                        # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is
+                        await self.submit_settled_window()
                         self.miner_scores = {}
+                        self.fallback_scores = {}
                     else:
                         if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
-                            await self.shadow_settled_batch()
-                        accepted = await self.subtensor_client.set_weights(
+                            await self.shadow_settled_window()
+                        await self.subtensor_client.set_weights(
                             miner_scores=self.miner_scores,
                             active_hotkeys=self.active_hotkeys,
                         )
-                        if accepted and settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
-                            # the first day of enforce has nothing matured: it resubmits this live vector
-                            await self._cache_last_batch(
-                                WeightBatch(
-                                    batch_id="live",
-                                    cycle_ids=[],
-                                    hotkey_scores=dict(self.miner_scores),
-                                    attempts=0,
-                                    status="live",
-                                )
-                            )
+                        self.fallback_scores = {}
                         self.miner_scores = {}
             except Exception as e:
                 logger.error(
@@ -667,14 +669,11 @@ class Validator:
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
                     if settings.SETTLEMENT_MODE != SETTLEMENT_OFF:
-                        idle_executor_count = sum(
-                            1
-                            for results in incentive.job_results.values()
-                            for result in results
-                            if (result.incentive_idle or 0) > 0
-                        )
+                        node_shares = cycle_node_shares(incentive.job_results)
+                        burner_hotkey = verified_burner_hotkey(miners)
+                        accumulate(self.fallback_scores, fallback_vector(cycle_scores, node_shares, burner_hotkey))
                         await self.report_cycle_scores(
-                            cycle_scores, job_batch_id, job_block, scored_at, miners, idle_executor_count
+                            cycle_scores, node_shares, burner_hotkey, job_batch_id, job_block, scored_at
                         )
 
                     # DAH-2748: a cycle where most nodes failed at the connect is our own
@@ -818,6 +817,7 @@ class Validator:
                 await self.redis_service.set(
                     MINER_SCORES_KEY, json.dumps(self.miner_scores)
                 )
+                await self.redis_service.set(FALLBACK_SCORES_KEY, json.dumps(self.fallback_scores))
             except Exception as e:
                 logger.warning(
                     _m(
@@ -831,29 +831,31 @@ class Validator:
     async def report_cycle_scores(
         self,
         cycle_scores: dict[str, float],
+        node_shares: list[dict],
+        burner_hotkey: str | None,
         job_batch_id: str,
         job_block: int,
         scored_at: datetime,
-        miners: list,
-        idle_executor_count: int,
     ) -> None:
-        """DAH-4001: hand the cycle's vector to the backend for delayed settlement. Never fails the cycle.
+        """DAH-4001: hand the cycle's vector and per-node rows to the backend for delayed settlement. Never fails
+        the cycle.
 
         A report the backend does not acknowledge is kept in Redis and replayed at every later cycle, so a
         backend outage delays a cycle's settlement instead of dropping its scores: under enforce nothing else
         ever submits them.
         """
-        burner_uid = (settings.NEW_BURNERS if settings.ENABLE_NEW_BURN_LOGIC else settings.BURNERS)[0]
-        burn_hotkey = next((miner.hotkey for miner in miners if miner.uid == burner_uid), None)
-        if burn_hotkey is None:
-            # no burner on this chain (testnet, a dev environment): withheld amounts go to our own hotkey instead
-            burn_hotkey = self.backend_client.keypair.ss58_address
-            logger.warning(
-                _m(
-                    "[settlement] burner uid not in this cycle's miners; withheld amounts go to the validator hotkey",
-                    extra=get_extra_info({**self.default_extra, "burner_uid": burner_uid, "cycle_id": job_batch_id}),
+        if burner_hotkey is None:
+            if settings.BITTENSOR_NETWORK == "finney":
+                # withheld shares have nowhere safe to go; a substitute recipient is worse than a skipped cycle
+                logger.error(
+                    _m(
+                        "[settlement] no verified burner in this cycle's miners; cycle not reported",
+                        extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                    )
                 )
-            )
+                return
+            # a test network has no burner: our own hotkey stands in
+            burner_hotkey = self.backend_client.keypair.ss58_address
         try:
             cycle_started_at = datetime.strptime(job_batch_id, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         except ValueError:
@@ -863,10 +865,10 @@ class Validator:
             "cycle_started_at": cycle_started_at.isoformat(),
             "scored_at": scored_at.isoformat(),
             "block": job_block,
-            "burn_hotkey": burn_hotkey,
+            "burn_hotkey": burner_hotkey,
             "hotkey_scores": cycle_scores,
             "mode": settings.SETTLEMENT_MODE,
-            "idle_executor_count": idle_executor_count,
+            "node_shares": node_shares,
         }
         await self._replay_unacked_cycle_reports()
         if not await self._deliver_cycle_report(payload):
@@ -892,7 +894,6 @@ class Validator:
                     {
                         **self.default_extra,
                         "cycle_id": receipt.cycle_id,
-                        "matures_at": receipt.matures_at.isoformat(),
                         "created": receipt.created,
                         "hotkeys": len(payload["hotkey_scores"]),
                     }
@@ -931,130 +932,9 @@ class Validator:
             except Exception:
                 pass
 
-    async def _cache_last_batch(self, batch: WeightBatch) -> None:
-        try:
-            await self.redis_service.set(LAST_WEIGHT_BATCH_KEY, batch.model_dump_json())
-        except Exception as exc:
-            logger.warning(
-                _m("[settlement] could not cache the last batch", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
-            )
-
-    async def _claim_batch(self) -> WeightBatch | None:
-        try:
-            return await self.backend_client.claim_weight_batch(settings.SETTLEMENT_MODE)
-        except Exception as exc:
-            logger.error(
-                _m("[settlement] batch claim failed", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
-            )
-            return None
-
-    async def _cached_last_batch(self) -> WeightBatch | None:
-        try:
-            cached = await self.redis_service.get(LAST_WEIGHT_BATCH_KEY)
-        except Exception as exc:
-            logger.warning(
-                _m("[settlement] could not read the cached batch", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
-            )
-            return None
-        return WeightBatch.model_validate_json(cached) if cached is not None else None
-
-    async def _report_batch(
-        self, batch: WeightBatch, *, success: bool, error: str | None, shadow: bool, block: int | None = None
-    ) -> None:
-        if block is None:
-            block = self._current_block_or_none()
-        try:
-            await self.backend_client.report_weight_batch_result(
-                batch.batch_id, success=success, block=block, error=error, shadow=shadow
-            )
-        except Exception as exc:
-            logger.error(
-                _m(
-                    "[settlement] batch result report failed",
-                    extra=get_extra_info({**self.default_extra, "batch_id": batch.batch_id, "error": str(exc)}),
-                )
-            )
-
-    async def submit_settled_batch(self) -> None:
-        """DAH-4001 enforce: submit the backend's matured batch; with none, resubmit the last accepted one.
-
-        A resubmission keeps the previous weights in force on chain and is not reported: the backend
-        already holds that batch's outcome. With no accepted batch cached either, the tempo is skipped
-        and the weights already on chain stay active.
-        """
-        if self._inside_weights_rate_limit():
-            return
-        batch = await self._claim_batch()
-        cached = await self._cached_last_batch()
-        if batch is not None and cached is not None and cached.batch_id == batch.batch_id:
-            # the chain accepted this batch earlier and the result report was lost: report it with the block it
-            # landed at, instead of committing it a second time under a later block
-            logger.warning(
-                _m(
-                    "[settlement] batch already accepted earlier; reporting the lost result",
-                    extra=get_extra_info({**self.default_extra, "batch_id": batch.batch_id, "block": cached.submitted_block}),
-                )
-            )
-            await self._report_batch(batch, success=True, error=None, shadow=False, block=cached.submitted_block)
-            return
-        resubmission = batch is None
-        if resubmission:
-            if cached is None:
-                logger.warning(
-                    _m(
-                        "[settlement] nothing matured and no accepted batch to resubmit; skipping this tempo",
-                        extra=get_extra_info(self.default_extra),
-                    )
-                )
-                self._alert_if_near_activity_cutoff()
-                return
-            batch = cached
-            logger.warning(
-                _m(
-                    "[settlement] nothing matured; resubmitting the last accepted batch",
-                    extra=get_extra_info({**self.default_extra, "batch_id": batch.batch_id}),
-                )
-            )
-        error: str | None = None
-        try:
-            accepted = await self.subtensor_client.set_weights(
-                miner_scores=batch.hotkey_scores,
-                active_hotkeys=self.active_hotkeys,
-                wait_for_inclusion=True,
-                include_registered_scored=True,
-            )
-        except Exception as exc:
-            # a timeout here is ambiguous: the commit may have landed. The batch is immutable, so the retry
-            # next tempo commits the same vector again, which is harmless if the first one did land.
-            accepted = False
-            error = f"set_weights raised: {exc}"
-        self._settled_submission_block = self._current_block_or_none()
-        if accepted:
-            if batch.submitted_block is None:
-                # the block the chain first accepted this vector at; a later resubmission of the same batch while
-                # the backend was unreachable must not move it, attribution dates the batch from here
-                batch.submitted_block = self._settled_submission_block
-            await self._cache_last_batch(batch)
-        else:
-            self._alert_if_near_activity_cutoff()
-        logger.info(
-            _m(
-                "[settlement] batch submitted" if accepted else "[settlement] batch submission failed",
-                extra=get_extra_info(
-                    {
-                        **self.default_extra,
-                        "batch_id": batch.batch_id,
-                        "cycles": len(batch.cycle_ids),
-                        "hotkeys": len(batch.hotkey_scores),
-                        "resubmission": resubmission,
-                    }
-                ),
-            )
-        )
-        if not resubmission:
-            await self._report_batch(
-                batch, success=accepted, error=None if accepted else error or "set_weights failed", shadow=False
-            )
+    def _current_tempo(self) -> tuple[int, int]:
+        tempo = int(self.subtensor_client.get_tempo())
+        return tempo_index(int(self.subtensor_client.get_current_block()), tempo), tempo
 
     def _current_block_or_none(self) -> int | None:
         try:
@@ -1062,20 +942,97 @@ class Validator:
         except Exception:
             return None
 
-    def _inside_weights_rate_limit(self) -> bool:
-        """should_set_weights stays true for a tick or two after an accepted submission, until the chain
-        reflects it, and for every tick after a failed one; today the emptied accumulator makes those ticks
-        no-ops. Here a second attempt inside the rate limit would be rejected, and attempts every tick after a
-        failure would stop the batch within a minute, so both are skipped until the limit has passed."""
-        last = getattr(self, "_settled_submission_block", None)
-        if last is None:
-            return False
+    async def _fetch_settled_window(self, index: int, tempo: int):
         try:
-            current_block = self.subtensor_client.get_current_block()
-            rate_limit = int(self.subtensor_client.get_weights_rate_limit())
-        except Exception:
+            return await self.backend_client.get_settled_weights(index, tempo)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[settlement] settled weights request raised",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
+                )
+            )
+            return None
+
+    async def _submit_vector(self, vector: dict[str, float]) -> bool:
+        try:
+            return await self.subtensor_client.set_weights(
+                miner_scores=vector,
+                active_hotkeys=self.active_hotkeys,
+                wait_for_inclusion=True,
+                include_registered_scored=True,
+            )
+        except Exception as exc:
+            logger.error(
+                _m("[settlement] set_weights raised", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
             return False
-        return current_block - last < rate_limit
+
+    async def submit_settled_window(self) -> None:
+        """DAH-4001 enforce: submit the backend's settled vector for this tempo. When the backend cannot serve one
+        (unreachable, or nothing scored in its window) submit the fallback instead: this tempo's rental and
+        referral as scored, its idle to the verified burner. Never an older vector: weights are a state, and a
+        stale one pays nodes that may have left since."""
+        index, tempo = self._current_tempo()
+        window = await self._fetch_settled_window(index, tempo)
+        if window is None or not window.hotkey_scores:
+            await self._submit_fallback(index, "backend unreachable" if window is None else "empty window")
+            return
+        accepted = await self._submit_vector(window.hotkey_scores)
+        if accepted:
+            block = self._current_block_or_none()
+            if block is not None:
+                try:
+                    await self.backend_client.report_settled_weights_result(index, block)
+                except Exception as exc:
+                    logger.warning(
+                        _m(
+                            "[settlement] inclusion report failed",
+                            extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
+                        )
+                    )
+        else:
+            self._alert_if_near_activity_cutoff()
+        logger.info(
+            _m(
+                "[settlement] window submitted" if accepted else "[settlement] window submission failed",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "tempo_index": index,
+                        "cycles": len(window.cycle_ids),
+                        "hotkeys": len(window.hotkey_scores),
+                        "withheld_nodes": window.withheld_count,
+                        "withheld_total": window.withheld_total,
+                        "mass_inactive_skipped": window.mass_inactive_skipped,
+                    }
+                ),
+            )
+        )
+
+    async def _submit_fallback(self, index: int, reason: str) -> None:
+        vector = dict(self.fallback_scores)
+        if not vector:
+            logger.error(
+                _m(
+                    "[settlement] no settled vector and no fallback; this tempo is skipped",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "reason": reason}),
+                )
+            )
+            self._alert_if_near_activity_cutoff()
+            return
+        accepted = await self._submit_vector(vector)
+        if not accepted:
+            self._alert_if_near_activity_cutoff()
+        # an error either way: a tempo's idle went to the burner because of our side, and someone repays it
+        logger.error(
+            _m(
+                "[settlement] fallback submitted" if accepted else "[settlement] fallback submission failed",
+                extra=get_extra_info(
+                    {**self.default_extra, "tempo_index": index, "reason": reason, "hotkeys": len(vector)}
+                ),
+            )
+        )
 
     def _alert_if_near_activity_cutoff(self) -> None:
         """Error-log when no weights of ours were accepted for more than half the subnet's activity cutoff."""
@@ -1104,37 +1061,32 @@ class Validator:
             )
         )
 
-    async def shadow_settled_batch(self) -> None:
-        """DAH-4001 shadow: claim the matured batch, log how far it sits from the live accumulator, close it unsubmitted."""
-        batch = await self._claim_batch()
-        if batch is None:
-            logger.info(_m("[settlement] shadow: nothing matured this tempo", extra=get_extra_info(self.default_extra)))
-            return
-        live_total = sum(self.miner_scores.values()) or 1.0
-        settled_total = sum(batch.hotkey_scores.values()) or 1.0
-        hotkeys = set(self.miner_scores) | set(batch.hotkey_scores)
-        share_moved = (
-            sum(
-                abs(self.miner_scores.get(hotkey, 0.0) / live_total - batch.hotkey_scores.get(hotkey, 0.0) / settled_total)
-                for hotkey in hotkeys
+    async def shadow_settled_window(self) -> None:
+        """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live accumulator."""
+        index, tempo = self._current_tempo()
+        window = await self._fetch_settled_window(index, tempo)
+        if window is None:
+            logger.warning(
+                _m("[settlement] shadow: backend unreachable", extra=get_extra_info({**self.default_extra, "tempo_index": index}))
             )
-            / 2
-        )
+            return
         logger.info(
             _m(
-                "[settlement] shadow batch",
+                "[settlement] shadow window",
                 extra=get_extra_info(
                     {
                         **self.default_extra,
-                        "batch_id": batch.batch_id,
-                        "cycles": len(batch.cycle_ids),
-                        "hotkeys": len(batch.hotkey_scores),
-                        "share_moved_vs_live": round(share_moved, 6),
+                        "tempo_index": index,
+                        "cycles": len(window.cycle_ids),
+                        "hotkeys": len(window.hotkey_scores),
+                        "withheld_nodes": window.withheld_count,
+                        "withheld_total": window.withheld_total,
+                        "mass_inactive_skipped": window.mass_inactive_skipped,
+                        "share_moved_vs_live": round(share_moved(self.miner_scores, window.hotkey_scores), 6),
                     }
                 ),
             )
         )
-        await self._report_batch(batch, success=False, error=None, shadow=True)
 
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
@@ -1358,6 +1310,7 @@ class Validator:
 
         try:
             await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
+            await self.redis_service.set(FALLBACK_SCORES_KEY, json.dumps(self.fallback_scores))
         except Exception as e:
             logger.info(
                 _m(

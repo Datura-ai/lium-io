@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings
+from incentive.burn_service import verified_burner_hotkey
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
 
@@ -61,6 +62,18 @@ def scored_registered_neurons(
     """Registered neurons with a score that the served-miner list does not carry."""
     selected = {miner.hotkey for miner in miners}
     return [neuron for neuron in registered if neuron.hotkey in miner_scores and neuron.hotkey not in selected]
+
+
+def fold_unregistered_into_burner(
+    miner_scores: dict[str, float], present_hotkeys: set[str], burner_hotkey: str | None
+) -> dict[str, float]:
+    """A settled vector is a day old and may name a hotkey that deregistered since. Its share goes to the verified
+    burner instead of to everyone else through normalization; with no verified burner it is dropped as before."""
+    folded = {hotkey: score for hotkey, score in miner_scores.items() if hotkey in present_hotkeys}
+    lost = sum(score for hotkey, score in miner_scores.items() if hotkey not in present_hotkeys)
+    if lost > 0 and burner_hotkey is not None and burner_hotkey in present_hotkeys:
+        folded[burner_hotkey] = folded.get(burner_hotkey, 0.0) + lost
+    return folded
 
 
 @contextlib.contextmanager
@@ -813,6 +826,9 @@ class SubtensorClient:
             # DAH-4001: a settled batch is a day old. A provider that removed its last node since then is no longer
             # in the served-miner list, but its hotkey is still registered and the pay the backend approved is its.
             miners = list(miners) + scored_registered_neurons(miners, metagraph.neurons, miner_scores)
+            miner_scores = fold_unregistered_into_burner(
+                miner_scores, {miner.hotkey for miner in miners}, verified_burner_hotkey(metagraph.neurons)
+            )
         self._log_scored_hotkeys_missing_from_selected_miners(
             miner_scores=miner_scores,
             selected_miners=miners,
@@ -925,7 +941,9 @@ class SubtensorClient:
         }
         await self.send_weights_to_lium(payload)
 
-        result, msg = self.subtensor.set_weights(
+        # the chain call blocks until inclusion when asked to; off the event loop so the cycle keeps running
+        result, msg = await asyncio.to_thread(
+            self.subtensor.set_weights,
             wallet=self.wallet,
             netuid=self.netuid,
             uids=uint_uids,

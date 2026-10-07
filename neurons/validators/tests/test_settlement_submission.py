@@ -1,157 +1,167 @@
-"""DAH-4001: what the validator submits at tempo under SETTLEMENT_MODE=enforce."""
+"""DAH-4001: what the validator reports every cycle and submits at tempo under SETTLEMENT_MODE."""
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from clients.backend_client import WeightBatch
-from core.validator import LAST_WEIGHT_BATCH_KEY, UNACKED_CYCLE_REPORTS_KEY, Validator
+from clients.backend_client import BackendClient, SettledWeights
+from clients.subtensor_client import fold_unregistered_into_burner, scored_registered_neurons
+from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
+from core.validator import UNACKED_CYCLE_REPORTS_KEY, Validator
+from incentive.burn_service import verified_burner_hotkey
+
+WINDOW = SettledWeights(
+    tempo_index=342,
+    window_from_block=115560,
+    window_to_block=115920,
+    cycle_ids=["c1", "c2"],
+    hotkey_scores={"hk": 0.7, "burn": 0.3},
+    withheld_count=1,
+    withheld_total=0.1,
+    mass_inactive_skipped=False,
+)
 
 
 def _validator(
-    *, claimed: WeightBatch | None, cached: WeightBatch | None, accepted: bool
+    *, window: SettledWeights | None, accepted: bool, fallback: dict | None = None
 ) -> Validator:
     validator = Validator.__new__(Validator)
     validator.default_extra = {}
     validator.active_hotkeys = set()
+    validator.miner_scores = {"hk": 0.5, "burn": 0.5}
+    validator.fallback_scores = dict(fallback or {})
     validator.backend_client = MagicMock(
-        claim_weight_batch=AsyncMock(return_value=claimed),
-        report_weight_batch_result=AsyncMock(return_value=None),
+        get_settled_weights=AsyncMock(return_value=window),
+        report_settled_weights_result=AsyncMock(return_value=None),
+        report_cycle_scores=AsyncMock(return_value=None),
     )
+    validator.backend_client.keypair = MagicMock(ss58_address="validator-hotkey")
     validator.redis_service = MagicMock(
-        get=AsyncMock(return_value=cached.model_dump_json() if cached else None),
+        get=AsyncMock(return_value=None),
         set=AsyncMock(),
         lrange=AsyncMock(return_value=[]),
         lpush=AsyncMock(),
         ltrim=AsyncMock(),
         lrem=AsyncMock(),
     )
-    validator.backend_client.keypair = MagicMock(ss58_address="validator-hotkey")
-    validator.backend_client.report_cycle_scores = AsyncMock(return_value=None)
     validator.subtensor_client = MagicMock(
         set_weights=AsyncMock(return_value=accepted),
-        get_current_block=MagicMock(return_value=123),
+        get_current_block=MagicMock(return_value=123456),
+        get_tempo=MagicMock(return_value=360),
         get_last_update=MagicMock(return_value=50),
         get_weights_rate_limit=MagicMock(return_value=100),
         netuid=51,
     )
-    validator._settled_submission_block = None
     validator.subtensor_client.subtensor.get_subnet_hyperparameters.return_value = MagicMock(
         activity_cutoff=12000
     )
     return validator
 
 
-BATCH = WeightBatch(
-    batch_id="b1",
-    cycle_ids=["c1", "c2"],
-    hotkey_scores={"hk": 0.7, "burn": 0.3},
-    attempts=0,
-    status="open",
-)
-
-
 @pytest.mark.asyncio
-async def test_matured_batch_is_submitted_cached_and_reported():
-    validator = _validator(claimed=BATCH, cached=None, accepted=True)
+async def test_the_settled_window_is_submitted_and_its_inclusion_reported():
+    validator = _validator(window=WINDOW, accepted=True)
 
-    await validator.submit_settled_batch()
+    await validator.submit_settled_window()
 
+    validator.backend_client.get_settled_weights.assert_awaited_once_with(342, 360)
     validator.subtensor_client.set_weights.assert_awaited_once_with(
-        miner_scores=BATCH.hotkey_scores,
+        miner_scores=WINDOW.hotkey_scores,
         active_hotkeys=set(),
         wait_for_inclusion=True,
         include_registered_scored=True,
     )
-    validator.redis_service.set.assert_awaited_once()
-    assert json.loads(validator.redis_service.set.await_args.args[1])["batch_id"] == "b1"
-    validator.backend_client.report_weight_batch_result.assert_awaited_once_with(
-        "b1", success=True, block=123, error=None, shadow=False
-    )
+    validator.backend_client.report_settled_weights_result.assert_awaited_once_with(342, 123456)
 
 
 @pytest.mark.asyncio
-async def test_failed_submission_is_reported_and_not_cached():
-    validator = _validator(claimed=BATCH, cached=None, accepted=False)
+async def test_a_rejected_submission_reports_no_inclusion():
+    validator = _validator(window=WINDOW, accepted=False)
 
-    await validator.submit_settled_batch()
+    await validator.submit_settled_window()
 
-    validator.redis_service.set.assert_not_awaited()
-    validator.backend_client.report_weight_batch_result.assert_awaited_once_with(
-        "b1", success=False, block=123, error="set_weights failed", shadow=False
-    )
+    validator.backend_client.report_settled_weights_result.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_nothing_matured_resubmits_the_last_accepted_batch_without_reporting():
-    validator = _validator(claimed=None, cached=BATCH, accepted=True)
+async def test_backend_unreachable_submits_the_fallback_not_an_old_vector():
+    validator = _validator(window=None, accepted=True, fallback={"hk": 0.2, "burn": 0.8})
 
-    await validator.submit_settled_batch()
+    await validator.submit_settled_window()
 
     validator.subtensor_client.set_weights.assert_awaited_once()
-    validator.backend_client.report_weight_batch_result.assert_not_awaited()
+    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {
+        "hk": 0.2,
+        "burn": 0.8,
+    }
+    validator.backend_client.report_settled_weights_result.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_nothing_matured_and_nothing_cached_skips_the_tempo():
-    validator = _validator(claimed=None, cached=None, accepted=True)
+async def test_an_empty_window_submits_the_fallback():
+    empty = WINDOW.model_copy(update={"cycle_ids": [], "hotkey_scores": {}})
+    validator = _validator(window=empty, accepted=True, fallback={"burn": 1.0})
 
-    await validator.submit_settled_batch()
+    await validator.submit_settled_window()
+
+    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {"burn": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_no_window_and_no_fallback_skips_the_tempo():
+    validator = _validator(window=None, accepted=True)
+
+    await validator.submit_settled_window()
 
     validator.subtensor_client.set_weights.assert_not_awaited()
-    validator.redis_service.get.assert_awaited_once_with(LAST_WEIGHT_BATCH_KEY)
 
 
 @pytest.mark.asyncio
-async def test_set_weights_raising_is_reported_as_a_failure_with_the_block():
-    validator = _validator(claimed=BATCH, cached=None, accepted=True)
-    validator.subtensor_client.set_weights = AsyncMock(side_effect=TimeoutError("rpc"))
+async def test_set_weights_raising_is_a_failure_with_no_inclusion_report():
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.subtensor_client.set_weights = AsyncMock(side_effect=RuntimeError("rpc down"))
 
-    await validator.submit_settled_batch()
+    await validator.submit_settled_window()
 
-    validator.redis_service.set.assert_not_awaited()
-    validator.backend_client.report_weight_batch_result.assert_awaited_once_with(
-        "b1", success=False, block=123, error="set_weights raised: rpc", shadow=False
-    )
+    validator.backend_client.report_settled_weights_result.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_cache_write_failure_does_not_stop_the_result_report():
-    validator = _validator(claimed=BATCH, cached=None, accepted=True)
-    validator.redis_service.set = AsyncMock(side_effect=ConnectionError("redis down"))
+async def test_shadow_reads_the_window_and_submits_nothing_itself():
+    validator = _validator(window=WINDOW, accepted=True)
 
-    await validator.submit_settled_batch()
+    await validator.shadow_settled_window()
 
-    validator.backend_client.report_weight_batch_result.assert_awaited_once_with(
-        "b1", success=True, block=123, error=None, shadow=False
-    )
+    validator.backend_client.get_settled_weights.assert_awaited_once_with(342, 360)
+    validator.subtensor_client.set_weights.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_an_unacknowledged_cycle_report_is_kept_and_replayed_next_cycle():
-    validator = _validator(claimed=None, cached=None, accepted=True)
-    miners = [MagicMock(uid=47, hotkey="burn")]
+    validator = _validator(window=None, accepted=True)
     scored_at = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
+    rows = [{"executor_id": "e1", "hotkey": "hk", "rented": 0.0, "idle": 0.8, "spot": False}]
 
     await validator.report_cycle_scores(
-        {"hk": 0.8, "burn": 0.2}, "2026-10-06 10:00:00", 500, scored_at, miners, 3
+        {"hk": 0.8, "burn": 0.2}, rows, "burn", "2026-10-06 10:00:00", 500, scored_at
     )
 
     validator.redis_service.lpush.assert_awaited_once()
     kept = validator.redis_service.lpush.await_args.args[1]
     assert (
         json.loads(kept)["cycle_id"] == "2026-10-06 10:00:00"
-        and json.loads(kept)["idle_executor_count"] == 3
+        and json.loads(kept)["node_shares"] == rows
     )
 
     validator.redis_service.lrange = AsyncMock(return_value=[kept])
     validator.backend_client.report_cycle_scores = AsyncMock(
-        return_value=MagicMock(cycle_id="2026-10-06 10:00:00", matures_at=scored_at, created=True)
+        return_value=MagicMock(cycle_id="2026-10-06 10:00:00", created=True)
     )
     await validator.report_cycle_scores(
-        {"hk": 1.0}, "2026-10-06 10:15:00", 575, scored_at, miners, 1
+        {"hk": 1.0}, [], "burn", "2026-10-06 10:15:00", 575, scored_at
     )
 
     validator.redis_service.lrem.assert_awaited_once_with(UNACKED_CYCLE_REPORTS_KEY, kept)
@@ -159,32 +169,8 @@ async def test_an_unacknowledged_cycle_report_is_kept_and_replayed_next_cycle():
 
 
 @pytest.mark.asyncio
-async def test_a_tick_inside_the_rate_limit_after_an_accepted_submission_does_nothing():
-    validator = _validator(claimed=BATCH, cached=None, accepted=True)
-
-    await validator.submit_settled_batch()  # accepted at block 123
-    await validator.submit_settled_batch()  # same block: inside the 100-block rate limit
-
-    validator.backend_client.claim_weight_batch.assert_awaited_once()
-    validator.subtensor_client.set_weights.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_a_claimed_batch_the_cache_says_was_accepted_is_reported_not_resubmitted():
-    accepted_earlier = BATCH.model_copy(update={"submitted_block": 100})
-    validator = _validator(claimed=BATCH, cached=accepted_earlier, accepted=True)
-
-    await validator.submit_settled_batch()
-
-    validator.subtensor_client.set_weights.assert_not_awaited()
-    validator.backend_client.report_weight_batch_result.assert_awaited_once_with(
-        "b1", success=True, block=100, error=None, shadow=False
-    )
-
-
-@pytest.mark.asyncio
 async def test_replay_stops_at_the_first_report_that_still_fails():
-    validator = _validator(claimed=None, cached=None, accepted=True)
+    validator = _validator(window=None, accepted=True)
     older, newer = (
         json.dumps({"cycle_id": "older", "hotkey_scores": {}}).encode(),
         json.dumps({"cycle_id": "newer", "hotkey_scores": {}}).encode(),
@@ -200,31 +186,75 @@ async def test_replay_stops_at_the_first_report_that_still_fails():
 
 
 @pytest.mark.asyncio
-async def test_a_failed_attempt_is_not_retried_until_the_rate_limit_has_passed():
-    validator = _validator(claimed=BATCH, cached=None, accepted=False)
+async def test_no_verified_burner_on_mainnet_skips_the_report_on_a_test_network_our_hotkey_stands_in(
+    monkeypatch,
+):
+    validator = _validator(window=None, accepted=True)
+    scored_at = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
 
-    await validator.submit_settled_batch()  # fails at block 123
-    await validator.submit_settled_batch()  # same block: no second attempt yet
+    monkeypatch.setattr("core.config.settings.BITTENSOR_NETWORK", "finney")
+    await validator.report_cycle_scores(
+        {"hk": 1.0}, [], None, "2026-10-06 10:00:00", 500, scored_at
+    )
+    validator.backend_client.report_cycle_scores.assert_not_awaited()
 
-    validator.subtensor_client.set_weights.assert_awaited_once()
-    validator.backend_client.report_weight_batch_result.assert_awaited_once()
+    monkeypatch.setattr("core.config.settings.BITTENSOR_NETWORK", "test")
+    await validator.report_cycle_scores(
+        {"hk": 1.0}, [], None, "2026-10-06 10:00:00", 500, scored_at
+    )
+    assert (
+        validator.backend_client.report_cycle_scores.await_args.args[0]["burn_hotkey"]
+        == "validator-hotkey"
+    )
 
 
-@pytest.mark.asyncio
-async def test_resubmitting_the_cached_batch_keeps_its_first_acceptance_block():
-    accepted_earlier = BATCH.model_copy(update={"submitted_block": 100})
-    validator = _validator(
-        claimed=None, cached=accepted_earlier, accepted=True
-    )  # accepted again at block 123
+def test_node_shares_describe_every_priced_result():
+    def result(uuid, rented, idle, spot=False):
+        return MagicMock(
+            executor_info=MagicMock(uuid=uuid),
+            incentive_rented=rented,
+            incentive_idle=idle,
+            is_spot=spot,
+        )
 
-    await validator.submit_settled_batch()
+    rows = cycle_node_shares(
+        {
+            "hk": [result("a", 0.0, 0.6), result("b", 0.3, 0.0), result("z", 0.0, 0.0)],
+            "sp": [result("c", 0.0, 0.1, True)],
+        }
+    )
 
-    assert json.loads(validator.redis_service.set.await_args.args[1])["submitted_block"] == 100
+    assert rows == [
+        {"executor_id": "a", "hotkey": "hk", "rented": 0.0, "idle": 0.6, "spot": False},
+        {"executor_id": "b", "hotkey": "hk", "rented": 0.3, "idle": 0.0, "spot": False},
+        {"executor_id": "c", "hotkey": "sp", "rented": 0.0, "idle": 0.1, "spot": True},
+    ]
+
+
+def test_the_fallback_moves_every_idle_share_to_the_burner_and_keeps_the_total():
+    scores = {"hk": 0.9, "sp": 0.1, "burn": 1.0, "referrer": 0.2}
+    rows = [
+        {"executor_id": "a", "hotkey": "hk", "rented": 0.3, "idle": 0.6, "spot": False},
+        {"executor_id": "c", "hotkey": "sp", "rented": 0.0, "idle": 0.1, "spot": True},
+    ]
+
+    vector = fallback_vector(scores, rows, "burn")
+
+    assert vector == pytest.approx({"hk": 0.3, "sp": 0.0, "burn": 1.7, "referrer": 0.2})
+    assert sum(vector.values()) == pytest.approx(sum(scores.values()))
+    assert fallback_vector(scores, rows, None) == scores
+
+
+def test_accumulate_and_tempo_index_and_share_moved():
+    into = {"hk": 0.1}
+    accumulate(into, {"hk": 0.2, "burn": 0.3})
+
+    assert into == pytest.approx({"hk": 0.3, "burn": 0.3})
+    assert tempo_index(123456, 360) == 342
+    assert share_moved({"a": 1.0, "b": 1.0}, {"a": 2.0, "b": 0.0}) == pytest.approx(0.5)
 
 
 def test_a_registered_hotkey_with_a_settled_score_is_paid_even_when_it_serves_no_node():
-    from clients.subtensor_client import scored_registered_neurons
-
     serving = [MagicMock(uid=1, hotkey="still-here")]
     registered = [
         MagicMock(uid=1, hotkey="still-here"),
@@ -237,3 +267,69 @@ def test_a_registered_hotkey_with_a_settled_score_is_paid_even_when_it_serves_no
     )
 
     assert [neuron.uid for neuron in extra] == [2]
+
+
+def test_a_deregistered_hotkeys_share_goes_to_the_verified_burner_not_to_everyone_else():
+    scores = {"here": 0.5, "gone": 0.3, "burn": 0.2}
+
+    assert fold_unregistered_into_burner(scores, {"here", "burn"}, "burn") == {
+        "here": 0.5,
+        "burn": 0.5,
+    }
+    assert fold_unregistered_into_burner(scores, {"here", "burn"}, None) == {
+        "here": 0.5,
+        "burn": 0.2,
+    }
+
+
+def test_the_verified_burner_is_the_first_slot_only_with_its_own_coldkey(monkeypatch):
+    monkeypatch.setattr("core.config.settings.ENABLE_NEW_BURN_LOGIC", True)
+    monkeypatch.setattr("core.config.settings.NEW_BURNERS", [47, 47])
+    monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {47: "cold-47"})
+    burner = MagicMock(uid=47, hotkey="burn-hk", coldkey="cold-47")
+    impostor = MagicMock(uid=47, hotkey="burn-hk", coldkey="someone-else")
+
+    assert verified_burner_hotkey([MagicMock(uid=1, hotkey="m"), burner]) == "burn-hk"
+    assert verified_burner_hotkey([impostor]) is None
+    assert verified_burner_hotkey([MagicMock(uid=1, hotkey="m")]) is None
+
+
+def test_the_signed_request_message_matches_the_backend_format():
+    body = b'{"a":1}'
+
+    message = BackendClient.signed_request_message(
+        "post", "/validator/hk/cycles?x=1", body, "1700000000"
+    )
+
+    assert message == "\n".join(
+        [
+            "lium-validator-v1",
+            "POST",
+            "/validator/hk/cycles?x=1",
+            hashlib.sha256(body).hexdigest(),
+            "1700000000",
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_signed_request_signs_the_exact_bytes_it_sends():
+    client = BackendClient.__new__(BackendClient)
+    client.keypair = MagicMock(ss58_address="hk", sign=MagicMock(return_value=b"\x01\x02"))
+    client._request = AsyncMock(return_value=None)
+
+    await client._signed_request(
+        "POST", "validator/hk/cycles", SettledWeights, json_data={"b": 2, "a": [1, 2]}
+    )
+
+    kwargs = client._request.await_args.kwargs
+    assert kwargs["raw_body"] == b'{"a":[1,2],"b":2}'
+    assert (
+        kwargs["extra_headers"]["signature"] == "0x0102"
+        and kwargs["extra_headers"]["hotkey"] == "hk"
+    )
+    signed = client.keypair.sign.call_args.args[0]
+    assert (
+        hashlib.sha256(b'{"a":[1,2],"b":2}').hexdigest() in signed
+        and "/validator/hk/cycles" in signed
+    )
