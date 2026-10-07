@@ -339,52 +339,34 @@ async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypa
     assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
 
 
-def _ssh_client_with_meminfo(meminfo_result):
-    client = _ssh_client()
-
-    def _side(cmd, *args, **kwargs):
-        if cmd == "cat /proc/sys/kernel/pid_max":
-            return _ssh_result(exit_status=0, stdout="4194304\n")
-        if cmd == "cat /proc/meminfo":
-            return meminfo_result
-        return _ssh_result(exit_status=0)
-
-    client.run = AsyncMock(side_effect=_side)
-    return client
+def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram():
+    """A legacy pod row (ram_total 0) arrives as memory_gb 0; the limit becomes host RAM less the 4 GiB host
+    reserve, so the renter cannot starve the executor of memory. 64 GiB host - 4 GiB = 60 GiB."""
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024) == 60
 
 
-@pytest.mark.asyncio
-async def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram(svc, monkeypatch):
-    """A legacy pod row (ram_total 0) arrives as memory_gb 0; the container still gets a mem_limit, host RAM
-    less the 4 GiB host reserve, so the renter cannot starve the executor of memory."""
-    meminfo = _ssh_result(stdout="MemTotal:       67108864 kB\nMemFree:        1 kB\n")
-    _patch_happy(svc, monkeypatch, _ssh_client_with_meminfo(meminfo))
+def test_a_rental_with_a_memory_limit_keeps_the_backend_value():
+    assert DockerService._rental_memory_gb(8, 64 * 1024 * 1024) == 8
 
-    result = await _run(svc, _payload(memory_gb=0))
 
-    assert isinstance(result, ContainerCreated)
-    assert _docker_client(svc).run_specs[0].memory_gb == 60
+def test_an_unreadable_host_ram_leaves_a_limitless_rental_as_it_was():
+    # host RAM unreadable -> the backend's falsy value is kept, so the rental stays limitless as before
+    assert not DockerService._rental_memory_gb(0, None)
+    assert DockerService._rental_memory_gb(None, None) is None
 
 
 @pytest.mark.asyncio
-async def test_a_rental_with_a_memory_limit_keeps_it_and_skips_the_meminfo_read(svc, monkeypatch):
-    ssh_client = _ssh_client_with_meminfo(_ssh_result(stdout="MemTotal: 67108864 kB\n"))
-    _patch_happy(svc, monkeypatch, ssh_client)
-
-    await _run(svc, _payload(memory_gb=8))
-
-    assert _docker_client(svc).run_specs[0].memory_gb == 8
-    assert "cat /proc/meminfo" not in [call.args[0] for call in ssh_client.run.call_args_list]
+async def test_read_host_ram_kib_parses_memtotal(svc):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="MemTotal:       67108864 kB\nMemFree: 1 kB\n"))
+    assert await svc._read_host_ram_kib(ssh_client) == 67108864
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_meminfo_leaves_a_limitless_rental_as_it_was(svc, monkeypatch):
-    _patch_happy(svc, monkeypatch, _ssh_client_with_meminfo(_ssh_result(exit_status=1)))
-
-    result = await _run(svc, _payload(memory_gb=0))
-
-    assert isinstance(result, ContainerCreated)
-    assert not _docker_client(svc).run_specs[0].memory_gb
+async def test_read_host_ram_kib_returns_none_when_the_read_fails(svc):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
+    assert await svc._read_host_ram_kib(ssh_client) is None
 
 
 @pytest.mark.asyncio
