@@ -1,14 +1,12 @@
 """DAH-4001: the pure parts of delayed settlement on the validator side.
 
 The backend holds every cycle's vector for a day and serves the settled vector per tempo; what lives here is
-how a cycle's per-node rows are described, how the fallback vector is kept, and how a tempo is numbered.
+how a cycle's per-node rows are described and how a tempo is numbered.
 """
-
-from collections import Counter
 
 
 def tempo_index(block: int, tempo: int) -> int:
-    """The tempo a block belongs to: the window the backend serves for it is one tempo of cycles a day earlier."""
+    """The tempo a block belongs to: the backend's window for it ends a delay before the tempo starts."""
     return block // tempo
 
 
@@ -32,32 +30,6 @@ def cycle_node_shares(job_results: dict[str, list]) -> list[dict]:
                 }
             )
     return rows
-
-
-def fallback_vector(
-    cycle_scores: dict[str, float], node_shares: list[dict], burner_hotkey: str | None
-) -> dict[str, float]:
-    """The cycle's vector with every Secure idle share moved to the verified burner: what the validator submits
-    when the backend cannot serve a tempo. Rental, referral and spot pay stay as scored; the Secure idle of that
-    tempo is forfeited to the burner rather than paid from a stale vector. With no verified burner the vector is
-    submitted as scored."""
-    if burner_hotkey is None:
-        return dict(cycle_scores)
-    vector = Counter(cycle_scores)
-    for row in node_shares:
-        if row.get("spot"):
-            continue  # spot-node pay is never withheld, not even here
-        moved = min(float(row["idle"]), vector.get(row["hotkey"], 0.0))
-        if moved <= 0:
-            continue
-        vector[row["hotkey"]] -= moved
-        vector[burner_hotkey] += moved
-    return dict(vector)
-
-
-def accumulate(into: dict[str, float], vector: dict[str, float]) -> None:
-    for hotkey, score in vector.items():
-        into[hotkey] = into.get(hotkey, 0.0) + score
 
 
 def share_moved(live: dict[str, float], settled: dict[str, float]) -> float:

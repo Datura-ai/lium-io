@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
-from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
+from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
@@ -58,9 +58,6 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
-# DAH-4001: this tempo's vector with every idle share moved to the verified burner, submitted when the backend
-# cannot serve the settled one; persisted like the accumulator so a restart does not lose it
-FALLBACK_SCORES_KEY = "settlement_fallback_scores"
 # accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
 # every cycle until its own acknowledgement, so the attribution has the block every vector went in at
 PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
@@ -160,18 +157,11 @@ class Validator:
             cycle_inputs=self.express_lane_cycle_inputs,
         )
 
-        self.fallback_scores: dict[str, float] = {}
+        # the burner the latest cycle was reported with: the fallback pays it when the backend cannot serve a tempo
+        self._fallback_burner: str | None = None
         # the tempo index already submitted (or read, in shadow): should_set_weights stays true for a tick or two
         # after a submission, and a second attempt for the same frozen window would only be rejected as too fast
         self._settled_tempo_done: int | None = None
-        try:
-            fallback_json = await self.redis_service.get(FALLBACK_SCORES_KEY)
-            if fallback_json is not None:
-                self.fallback_scores = json.loads(fallback_json)
-        except Exception as e:
-            logger.warning(
-                _m("[initiate_services] could not load the settlement fallback vector", extra=get_extra_info({**self.default_extra, "error": str(e)}))
-            )
         # init miner_scores: always load from Redis if present so accumulated
         # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
         try:
@@ -290,12 +280,9 @@ class Validator:
                             )
                         )
                         self.miner_scores = {}
-                        self.fallback_scores = {}
                     elif settings.SETTLEMENT_MODE == SETTLEMENT_ENFORCE:
-                        # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is.
-                        # The fallback stays until a tempo is accepted, so a rejected fallback can be retried
-                        if await self.submit_settled_window():
-                            self.fallback_scores = {}
+                        # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is
+                        await self.submit_settled_window()
                         self.miner_scores = {}
                     else:
                         if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
@@ -304,7 +291,6 @@ class Validator:
                             miner_scores=self.miner_scores,
                             active_hotkeys=self.active_hotkeys,
                         )
-                        self.fallback_scores = {}
                         self.miner_scores = {}
             except Exception as e:
                 logger.error(
@@ -674,11 +660,14 @@ class Validator:
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
                     if settings.SETTLEMENT_MODE != SETTLEMENT_OFF:
-                        node_shares = cycle_node_shares(incentive.job_results)
-                        burner_hotkey = verified_burner_hotkey(miners)
-                        accumulate(self.fallback_scores, fallback_vector(cycle_scores, node_shares, burner_hotkey))
+                        self._fallback_burner = self._settlement_burner(miners)
                         await self.report_cycle_scores(
-                            cycle_scores, node_shares, burner_hotkey, job_batch_id, job_block, scored_at
+                            cycle_scores,
+                            cycle_node_shares(incentive.job_results),
+                            self._fallback_burner,
+                            job_batch_id,
+                            job_block,
+                            scored_at,
                         )
 
                     # DAH-2748: a cycle where most nodes failed at the connect is our own
@@ -822,7 +811,6 @@ class Validator:
                 await self.redis_service.set(
                     MINER_SCORES_KEY, json.dumps(self.miner_scores)
                 )
-                await self.redis_service.set(FALLBACK_SCORES_KEY, json.dumps(self.fallback_scores))
             except Exception as e:
                 logger.warning(
                     _m(
@@ -850,17 +838,14 @@ class Validator:
         ever submits them.
         """
         if burner_hotkey is None:
-            if settings.BITTENSOR_NETWORK == "finney":
-                # withheld shares have nowhere safe to go; a substitute recipient is worse than a skipped cycle
-                logger.error(
-                    _m(
-                        "[settlement] no verified burner in this cycle's miners; cycle not reported",
-                        extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
-                    )
+            # withheld shares have nowhere safe to go; a substitute recipient is worse than a skipped cycle
+            logger.error(
+                _m(
+                    "[settlement] no verified burner in this cycle's miners; cycle not reported",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
                 )
-                return
-            # a test network has no burner: our own hotkey stands in
-            burner_hotkey = self.backend_client.keypair.ss58_address
+            )
+            return
         try:
             cycle_started_at = datetime.strptime(job_batch_id, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         except ValueError:
@@ -947,9 +932,18 @@ class Validator:
             except Exception:
                 pass
 
-    def _current_tempo(self) -> tuple[int, int]:
+    def _settlement_burner(self, miners) -> str | None:
+        """The verified burner. A test network has none, so our own hotkey stands in; on mainnet a burner that fails
+        its check is None and nothing is reported or paid to a substitute."""
+        burner = verified_burner_hotkey(miners)
+        if burner is None and settings.BITTENSOR_NETWORK != "finney":
+            return self.backend_client.keypair.ss58_address
+        return burner
+
+    def _current_tempo(self) -> tuple[int, int, int]:
         tempo = int(self.subtensor_client.get_tempo())
-        return tempo_index(int(self.subtensor_client.get_current_block()), tempo), tempo
+        block = int(self.subtensor_client.get_current_block())
+        return tempo_index(block, tempo), tempo, block
 
     def _current_block_or_none(self) -> int | None:
         try:
@@ -985,10 +979,10 @@ class Validator:
 
     async def submit_settled_window(self) -> bool:
         """DAH-4001 enforce: submit the backend's settled vector for this tempo. When the backend cannot serve one
-        (unreachable, or nothing scored in its window) submit the fallback instead: this tempo's rental and
-        referral as scored, its idle to the verified burner. Never an older vector: weights are a state, and a
-        stale one pays nodes that may have left since. Returns whether this tempo is settled on chain."""
-        index, tempo = self._current_tempo()
+        (unreachable, or nothing scored in its window) submit the fallback instead (all weight to the burner).
+        Never an older vector: weights are a state, and a stale one pays nodes that may have left since. Returns
+        whether this tempo is settled on chain."""
+        index, tempo, block_before = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
             return True
         window = await self._fetch_settled_window(index, tempo)
@@ -998,8 +992,9 @@ class Validator:
         if accepted:
             self._settled_tempo_done = index
             block = self._current_block_or_none()
-            if block is not None:
-                await self._confirm_inclusion(index, block)
+            # the block read before the submission when the read after it fails: the window's deposits are owed
+            # back only once its inclusion is reported, so it is never left unreported
+            await self._confirm_inclusion(index, block if block is not None else block_before)
         else:
             self._alert_if_near_activity_cutoff()
         logger.info(
@@ -1022,11 +1017,12 @@ class Validator:
         )
         return accepted
 
-    async def _pending_inclusions(self) -> dict[str, int]:
+    async def _pending_inclusions(self) -> dict[str, int] | None:
+        """None when Redis cannot be read: the caller must not write the map back, or it erases older entries."""
         try:
             kept = await self.redis_service.get(PENDING_INCLUSION_KEY)
         except Exception:
-            return {}
+            return None
         return json.loads(kept) if kept else {}
 
     async def _confirm_inclusion(self, index: int, block: int) -> None:
@@ -1044,6 +1040,14 @@ class Validator:
             )
             confirmed = None
         pending = await self._pending_inclusions()
+        if pending is None:
+            logger.warning(
+                _m(
+                    "[settlement] could not read the pending inclusions; left as they are",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "confirmed": confirmed is not None}),
+                )
+            )
+            return
         if confirmed is not None:
             pending.pop(str(index), None)
         else:
@@ -1056,20 +1060,23 @@ class Validator:
             )
 
     async def _retry_pending_inclusion(self) -> None:
-        for index, block in sorted((await self._pending_inclusions()).items()):
+        for index, block in sorted((await self._pending_inclusions() or {}).items()):
             await self._confirm_inclusion(int(index), int(block))
 
     async def _submit_fallback(self, index: int, reason: str) -> bool:
-        vector = dict(self.fallback_scores)
-        if not vector:
+        """All weight to the burner: the validator stays active and no cycle is paid here, so none is paid twice
+        when the backend serves it later (the next window covers every cycle since the last one served). The
+        tempo's emission sits with the burner and is repaid by hand."""
+        if self._fallback_burner is None:
             logger.error(
                 _m(
-                    "[settlement] no settled vector and no fallback; this tempo is skipped",
+                    "[settlement] no settled vector and no burner to fall back to; this tempo is skipped",
                     extra=get_extra_info({**self.default_extra, "tempo_index": index, "reason": reason}),
                 )
             )
             self._alert_if_near_activity_cutoff()
             return False
+        vector = {self._fallback_burner: 1.0}
         accepted = await self._submit_vector(vector)
         if accepted:
             self._settled_tempo_done = index
@@ -1115,7 +1122,7 @@ class Validator:
 
     async def shadow_settled_window(self) -> None:
         """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live accumulator."""
-        index, tempo = self._current_tempo()
+        index, tempo, _ = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
             return
         window = await self._fetch_settled_window(index, tempo)
@@ -1367,7 +1374,6 @@ class Validator:
 
         try:
             await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
-            await self.redis_service.set(FALLBACK_SCORES_KEY, json.dumps(self.fallback_scores))
         except Exception as e:
             logger.info(
                 _m(

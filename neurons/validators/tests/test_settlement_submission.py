@@ -14,7 +14,7 @@ from clients.backend_client import (
     SettledWeights,
 )
 from clients.subtensor_client import fold_unregistered_into_burner, scored_registered_neurons
-from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
+from core.settlement import cycle_node_shares, share_moved, tempo_index
 from core.validator import PENDING_INCLUSION_KEY, UNACKED_CYCLE_REPORTS_KEY, Validator
 from incentive.burn_service import verified_burner_hotkey
 
@@ -31,13 +31,13 @@ WINDOW = SettledWeights(
 
 
 def _validator(
-    *, window: SettledWeights | None, accepted: bool, fallback: dict | None = None
+    *, window: SettledWeights | None, accepted: bool, burner: str | None = "burn"
 ) -> Validator:
     validator = Validator.__new__(Validator)
     validator.default_extra = {}
     validator.active_hotkeys = set()
     validator.miner_scores = {"hk": 0.5, "burn": 0.5}
-    validator.fallback_scores = dict(fallback or {})
+    validator._fallback_burner = burner
     validator.backend_client = MagicMock(
         get_settled_weights=AsyncMock(return_value=window),
         report_settled_weights_result=AsyncMock(return_value=None),
@@ -92,23 +92,20 @@ async def test_a_rejected_submission_reports_no_inclusion():
 
 
 @pytest.mark.asyncio
-async def test_backend_unreachable_submits_the_fallback_not_an_old_vector():
-    validator = _validator(window=None, accepted=True, fallback={"hk": 0.2, "burn": 0.8})
+async def test_backend_unreachable_puts_all_weight_on_the_burner_and_pays_no_cycle():
+    validator = _validator(window=None, accepted=True)
 
     await validator.submit_settled_window()
 
     validator.subtensor_client.set_weights.assert_awaited_once()
-    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {
-        "hk": 0.2,
-        "burn": 0.8,
-    }
+    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {"burn": 1.0}
     validator.backend_client.report_settled_weights_result.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_an_empty_window_submits_the_fallback():
     empty = WINDOW.model_copy(update={"cycle_ids": [], "hotkey_scores": {}})
-    validator = _validator(window=empty, accepted=True, fallback={"burn": 1.0})
+    validator = _validator(window=empty, accepted=True)
 
     await validator.submit_settled_window()
 
@@ -116,8 +113,8 @@ async def test_an_empty_window_submits_the_fallback():
 
 
 @pytest.mark.asyncio
-async def test_no_window_and_no_fallback_skips_the_tempo():
-    validator = _validator(window=None, accepted=True)
+async def test_no_window_and_no_burner_skips_the_tempo():
+    validator = _validator(window=None, accepted=True, burner=None)
 
     await validator.submit_settled_window()
 
@@ -191,26 +188,26 @@ async def test_replay_stops_at_the_first_report_that_still_fails():
 
 
 @pytest.mark.asyncio
-async def test_no_verified_burner_on_mainnet_skips_the_report_on_a_test_network_our_hotkey_stands_in(
-    monkeypatch,
-):
+async def test_a_cycle_with_no_burner_is_not_reported():
     validator = _validator(window=None, accepted=True)
-    scored_at = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
 
-    monkeypatch.setattr("core.config.settings.BITTENSOR_NETWORK", "finney")
     await validator.report_cycle_scores(
-        {"hk": 1.0}, [], None, "2026-10-06 10:00:00", 500, scored_at
+        {"hk": 1.0}, [], None, "2026-10-06 10:00:00", 500, datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
     )
+
     validator.backend_client.report_cycle_scores.assert_not_awaited()
 
+
+def test_our_hotkey_stands_in_for_the_burner_on_a_test_network_never_on_mainnet(monkeypatch):
+    validator = _validator(window=None, accepted=True)
+    monkeypatch.setattr("core.validator.verified_burner_hotkey", lambda miners: None)
+
+    monkeypatch.setattr("core.config.settings.BITTENSOR_NETWORK", "finney")
+    on_mainnet = validator._settlement_burner([])
     monkeypatch.setattr("core.config.settings.BITTENSOR_NETWORK", "test")
-    await validator.report_cycle_scores(
-        {"hk": 1.0}, [], None, "2026-10-06 10:00:00", 500, scored_at
-    )
-    assert (
-        validator.backend_client.report_cycle_scores.await_args.args[0]["burn_hotkey"]
-        == "validator-hotkey"
-    )
+    on_testnet = validator._settlement_burner([])
+
+    assert (on_mainnet, on_testnet) == (None, "validator-hotkey")
 
 
 def test_node_shares_describe_every_priced_result():
@@ -236,27 +233,7 @@ def test_node_shares_describe_every_priced_result():
     ]
 
 
-def test_the_fallback_moves_every_idle_share_to_the_burner_and_keeps_the_total():
-    scores = {"hk": 0.9, "sp": 0.1, "burn": 1.0, "referrer": 0.2}
-    rows = [
-        {"executor_id": "a", "hotkey": "hk", "rented": 0.3, "idle": 0.6, "spot": False},
-        {"executor_id": "c", "hotkey": "sp", "rented": 0.0, "idle": 0.1, "spot": True},
-    ]
-
-    vector = fallback_vector(scores, rows, "burn")
-
-    assert vector == pytest.approx(
-        {"hk": 0.3, "sp": 0.1, "burn": 1.6, "referrer": 0.2}
-    )  # spot pay stays
-    assert sum(vector.values()) == pytest.approx(sum(scores.values()))
-    assert fallback_vector(scores, rows, None) == scores
-
-
-def test_accumulate_and_tempo_index_and_share_moved():
-    into = {"hk": 0.1}
-    accumulate(into, {"hk": 0.2, "burn": 0.3})
-
-    assert into == pytest.approx({"hk": 0.3, "burn": 0.3})
+def test_tempo_index_and_share_moved():
     assert tempo_index(123456, 360) == 342
     assert share_moved({"a": 1.0, "b": 1.0}, {"a": 2.0, "b": 0.0}) == pytest.approx(0.5)
 
@@ -422,14 +399,34 @@ async def test_a_later_confirmation_does_not_clear_an_earlier_pending_one():
 
 
 @pytest.mark.asyncio
-async def test_the_fallback_is_kept_after_a_rejected_fallback_submission():
-    validator = _validator(window=None, accepted=False, fallback={"burn": 1.0})
+async def test_a_rejected_fallback_is_retried_on_the_next_tick():
+    validator = _validator(window=None, accepted=False)
 
-    settled = await validator.submit_settled_window()
+    first = await validator.submit_settled_window()
+    validator.subtensor_client.set_weights = AsyncMock(return_value=True)
+    second = await validator.submit_settled_window()
 
-    assert settled is False  # the sync loop keeps fallback_scores for the next tick on False
+    assert (first, second) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_the_inclusion_is_reported_with_the_block_before_submission_when_the_read_after_fails():
     validator = _validator(window=WINDOW, accepted=True)
-    assert await validator.submit_settled_window() is True
+    validator.subtensor_client.get_current_block = MagicMock(side_effect=[123456, RuntimeError("rpc down")])
+
+    await validator.submit_settled_window()
+
+    validator.backend_client.report_settled_weights_result.assert_awaited_once_with(342, 123456)
+
+
+@pytest.mark.asyncio
+async def test_a_redis_read_failure_never_overwrites_the_pending_inclusions():
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.redis_service.get = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    await validator._confirm_inclusion(343, 123800)
+
+    validator.redis_service.set.assert_not_awaited()
 
 
 def test_only_a_wrong_request_is_dropped_a_bad_moment_is_retried():
