@@ -444,6 +444,9 @@ _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
 # (30 s); a probe slower than this is a hung host, and the per-command path takes over.
 _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
+# DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
+# customer's create at the cleanup step instead of hanging it
+_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -592,6 +595,73 @@ class VolumeHostProbe:
     vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
     loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
     loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
+
+
+@dataclass
+class ContainerCleanupReport:
+    """What `clean_existing_containers` vouches for about its removal, filled in when passed."""
+
+    # one `docker rm -fv` exited 0, the re-read `docker ps -a` lists no filler, no `docker volume rm` ran
+    removed_cleanly_without_volume_rm: bool = False
+
+
+def _remove_and_list_containers_command(targets: list[str], volume_names: list[str]) -> str:
+    """One shell line for a customer create's removal (DAH-3980): `docker rm -fv` of the ``targets``
+    (a listed ID, or the name when no ID was listed), its exit status, the `docker ps -a` names and
+    full IDs left after it, that listing's exit status, then `docker volume rm` of the unprotected
+    volumes, if any. Every output line is tagged so the parser never guesses."""
+    names = " ".join(shlex.quote(target) for target in targets)
+    command = (
+        f"/usr/bin/docker rm -fv {names} >/dev/null; rm_rc=$?; printf 'RM\\t%s\\n' \"$rm_rc\"; "
+        "/usr/bin/docker ps -a --no-trunc --format 'NAME\\t{{.Names}} {{.ID}}'; ps_rc=$?; "
+        "printf 'PS\\t%s\\n' \"$ps_rc\""
+    )
+    if volume_names:
+        volumes = " ".join(shlex.quote(volume) for volume in volume_names)
+        command += f"; /usr/bin/docker volume rm {volumes} >/dev/null 2>&1 || true"
+    return command
+
+
+# `docker ps -a` as parse_container_listing reads it: the names, and name -> full ID
+ContainerListing = tuple[tuple[str, ...], dict[str, str]]
+
+
+def _docker_rm_command(targets: list[str]) -> str:
+    return "/usr/bin/docker rm -fv " + " ".join(shlex.quote(target) for target in targets)
+
+
+class CustomerContainerRemoval(NamedTuple):
+    first_rm_exited_zero: bool
+    listing_after_rm: ContainerListing | None
+
+
+class RemoveAndListContainersOutput(NamedTuple):
+    rm_exit_status: int | None
+    listing_after_rm: ContainerListing | None
+
+
+def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOutput:
+    """(rm exit status, the listing after the rm). The status is None when its line is missing,
+    repeated or not a number; the listing is None unless it exited 0 -- an untagged line makes both
+    None, so an ambiguous output never reads as a clean removal."""
+    rm_statuses: list[str] = []
+    ps_statuses: list[str] = []
+    names: list[str] = []
+    for line in stdout.splitlines():
+        tag, _, value = line.partition("\t")
+        if tag == "RM":
+            rm_statuses.append(value)
+        elif tag == "PS":
+            ps_statuses.append(value)
+        elif tag == "NAME":
+            if value:
+                names.append(value)
+        else:
+            return RemoveAndListContainersOutput(None, None)
+    rm_exit_status = int(rm_statuses[0]) if len(rm_statuses) == 1 and rm_statuses[0].isdigit() else None
+    return RemoveAndListContainersOutput(
+        rm_exit_status, parse_container_listing(names) if ps_statuses == ["0"] else None
+    )
 
 
 def _volume_host_probe_command(*, with_df: bool) -> str:
@@ -1434,10 +1504,6 @@ class _OwnSweepRegistry:
 
 
 own_sweep_removals = _OwnSweepRegistry()
-
-
-# The `rm` and its confirmation share it. A timeout leaves the IDs marked as ours: the `rm` may have run.
-_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS = 60
 
 
 class _MarkOwnRemovalsOnSubmit:
@@ -3146,6 +3212,7 @@ class DockerService:
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
         remove_every_filler: bool = False,
+        report: ContainerCleanupReport | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
@@ -3209,19 +3276,8 @@ class DockerService:
                 ),
             )
 
-            swept = {name: listed_ids[name] for name in stale_containers if name in listed_ids}
-            targets = [swept.get(name, name) for name in stale_containers]
-            survivors = await self._remove_stale_containers(
-                ssh_client, default_extra, pod_name, stale_containers, targets, remove_every_filler,
-                own_ids=list(swept.values()),
-            )
-            if remove_every_filler and survivors:
-                replacements = {n: i for n, i in survivors.items() if n in swept and i and i != swept[n]}
-                if replacements:
-                    await self._remove_replacement_fillers(ssh_client, default_extra, pod_name, replacements)
-
+            volumes_to_remove = []
             if clear_volume:
-                volumes_to_remove = []
                 for name in stale_containers:
                     volume_id = name
                     for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):
@@ -3231,12 +3287,24 @@ class DockerService:
                     volume_name = f"volume_{volume_id}"
                     if volume_name not in active_volume_set:
                         volumes_to_remove.append(volume_name)
-                if volumes_to_remove:
-                    volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
-                    command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
-                    await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+
+            removed_cleanly = await self._remove_stale_containers(
+                ssh_client,
+                default_extra,
+                pod_name,
+                stale_containers,
+                remove_every_filler,
+                volumes_to_remove,
+                {name: listed_ids[name] for name in stale_containers if name in listed_ids},
+            )
+            if report is not None:
+                report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
             return stale_containers
         return []
+
+    @staticmethod
+    async def _remove_volumes(ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]) -> None:
+        await retry_ssh_command(ssh_client, DockerCommand.volume_remove(*volume_names), 'clean_existing_containers')
 
     async def _remove_stale_containers(
         self,
@@ -3244,31 +3312,60 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         stale_containers: list[str],
-        targets: list[str],
         remove_every_filler: bool,
-        own_ids: Iterable[str] = (),
-    ) -> dict[str, str] | None:
-        """`docker rm -fv` the ``targets`` (an ID, or the name when no ID was listed). Returns the removed
-        fillers' names seen on the host after it, with the ID each one has now ("" when not listed); None
-        when that could not be read. A customer create (DAH-3706) uses the tolerant rm and then confirms
-        that no filler survived. ``own_ids`` are marked as ours when their `rm` is sent."""
+        volumes_to_remove: list[str],
+        listed_ids: dict[str, str],
+    ) -> bool:
+        """`docker rm -fv` the stale containers (by ``listed_ids``, by name where none was listed), then
+        `docker volume rm` the given volumes. A customer create (DAH-3706) uses the tolerant rm and then
+        confirms that no filler survived; True only when that rm exited 0 at once and the confirmation
+        lists no filler. The listed IDs are marked as ours when their `rm` is sent. After a replacement filler's rm, the
+        volume rm runs again."""
+        targets = [listed_ids.get(name, name) for name in stale_containers]
         if not remove_every_filler:
-            await self._rm_containers(ssh_client, targets, own_ids=own_ids)
-            return {}
+            await self._rm_containers(ssh_client, targets, own_ids=listed_ids.values())
+            if volumes_to_remove:
+                await self._remove_volumes(ssh_client, volumes_to_remove)
+            return False
 
-        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, targets, own_ids=own_ids)
+        # one deadline for the whole customer cleanup: the steps after the first removal get what is left of it
+        cleanup_deadline = asyncio.get_running_loop().time() + _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+        removed_at_once, listing_after = await self._remove_stale_containers_tolerantly(
+            ssh_client, default_extra, stale_containers, targets, volumes_to_remove, cleanup_deadline,
+            own_ids=list(listed_ids.values()),
+        )
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not removed_fillers:
-            return {}
-        survivors = await self._confirm_fillers_removed(
-            ssh_client=ssh_client,
+            return False
+        survivors = self._confirm_fillers_removed(
             default_extra=default_extra,
             pod_name=pod_name,
             removed_fillers=removed_fillers,
+            listing_after=listing_after,
         )
-        if survivors is None:
-            return None
-        return {name: container_id for name, container_id in survivors.items() if name in removed_fillers}
+        # a filler retry's new container under a removed filler's name: not the instance listed,
+        # but a customer's node keeps no filler, so it goes too, by its own ID
+        replacements = {
+            name: container_id
+            for name, container_id in (survivors or {}).items()
+            if container_id and name in listed_ids and container_id != listed_ids[name]
+        }
+        if replacements:
+            await self._remove_replacement_fillers(
+                ssh_client, default_extra, pod_name, replacements, cleanup_deadline
+            )
+            # a replacement mounts its filler's volume_<id>, so the volume rm before its removal found it in use
+            if volumes_to_remove:
+                try:
+                    async with asyncio.timeout_at(cleanup_deadline):
+                        await self._remove_volumes(ssh_client, volumes_to_remove)
+                except TimeoutError as exc:
+                    raise Exception(
+                        "[clean_existing_containers] the volume rm after a replacement filler's removal did not "
+                        f"finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+                    ) from exc
+            return False
+        return removed_at_once and survivors == {}
 
     async def _remove_replacement_fillers(
         self,
@@ -3276,31 +3373,22 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         replacements: dict[str, str],
+        cleanup_deadline: float,
     ) -> None:
-        """A customer create's sweep found a filler retry's new container under a removed filler's name:
-        remove it by its own ID (one attempt), then confirm again. Its ID is ours once the `rm` is handed to SSH,
-        as in the sweep (_MarkOwnRemovalsOnSubmit), whatever the `rm` answers or the confirmation lists. A failure
-        is logged; a filler that still survives is reported by the confirmation, and the create goes on."""
+        """`docker rm -fv` the replacement fillers by their IDs (one attempt), then confirm again, both within
+        the cleanup's ``cleanup_deadline``. Their IDs are ours once the `rm` is handed to SSH, as in the
+        sweep, whatever the `rm` answers or the confirmation lists. A timeout fails the create like the
+        first removal's; any other failure is logged, a filler that still survives is reported by the
+        confirmation, and the create goes on."""
         ids = list(replacements.values())
         try:
-            async with asyncio.timeout(_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS):
-                await self._remove_replacement_fillers_once(ssh_client, default_extra, pod_name, replacements, ids)
+            async with asyncio.timeout_at(cleanup_deadline):
+                await self._rm_containers(ssh_client, ids, max_attempts=1, own_ids=ids)
         except TimeoutError as exc:
             raise Exception(
-                "[clean_existing_containers] replacement filler removal did not finish in "
-                f"{_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS} s"
+                "[clean_existing_containers] docker rm -fv of a replacement filler did not finish in "
+                f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
             ) from exc
-
-    async def _remove_replacement_fillers_once(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        default_extra: dict,
-        pod_name: str,
-        replacements: dict[str, str],
-        ids: list[str],
-    ) -> None:
-        try:
-            await self._rm_containers(ssh_client, ids, max_attempts=1, own_ids=ids)
         except Exception as exc:
             logger.warning(
                 _m(
@@ -3312,28 +3400,35 @@ class DockerService:
                     }),
                 )
             )
-        await self._confirm_fillers_removed(
-            ssh_client=ssh_client,
+        try:
+            async with asyncio.timeout_at(cleanup_deadline):
+                listing_after = await self._list_all_containers(ssh_client)
+        except TimeoutError as exc:
+            raise Exception(
+                "[clean_existing_containers] the listing after a replacement filler's docker rm -fv did not "
+                f"finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from exc
+        self._confirm_fillers_removed(
             default_extra=default_extra,
             pod_name=pod_name,
             removed_fillers=list(replacements),
+            listing_after=listing_after,
         )
 
-    async def _confirm_fillers_removed(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
+    @staticmethod
+    def _confirm_fillers_removed(
         default_extra: dict,
         pod_name: str,
         removed_fillers: list[str],
+        listing_after: ContainerListing | None,
     ) -> dict[str, str] | None:
-        """Re-read `docker ps -a` after a customer create's filler removal; log and return any survivor,
-        each name with the full ID it is listed under ("" when the listing carried none).
+        """Check the `docker ps -a` listing read after a customer create's filler removal; log and
+        return any surviving filler, each name with the full ID it is listed under ("" when none).
 
-        A listing that fails, times out or exits non-zero is logged as well and returns None -- the
-        confirmation never fails the create.
+        A listing that could not be read (None: failed, timed out, exited non-zero) is logged as
+        well and returns None -- the confirmation never fails the create.
         """
-        listing = await self._list_all_containers(ssh_client)
-        if listing is None:
+        if listing_after is None:
             logger.warning(
                 _m(
                     "Unable to confirm the filler removal before the customer's create",
@@ -3345,8 +3440,10 @@ class DockerService:
                 )
             )
             return None
-        names_after, ids_after = listing
-        survivors = {name: ids_after.get(name, "") for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)}
+        names_after, ids_after = listing_after
+        survivors = {
+            name: ids_after.get(name, "") for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)
+        }
         if survivors:
             logger.warning(
                 _m(
@@ -3367,42 +3464,101 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
+        stale_containers: list[str],
         targets: list[str],
+        volumes_to_remove: list[str],
+        cleanup_deadline: float,
         own_ids: Iterable[str] = (),
-    ) -> None:
+    ) -> CustomerContainerRemoval:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
+        DAH-3980: the rm, the listing and the volume rm travel as one command, bounded by
+        _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS; a timeout fails the create at the cleanup step.
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
-        for nothing. So: one attempt; on an error re-read `docker ps -a`; names already gone are not an
-        error; names still there get retry_ssh_command's full budget (and raise as before). A re-read
-        that cannot be made re-raises the rm error. A listed ID is looked for by that ID: a same-name
-        container created since the listing is not a stale one.
+        for nothing. So on an rm error the listing decides: names already gone are not an error; names
+        still there get retry_ssh_command's attempts (and raise as before), and the volume rm runs again
+        after them. Those steps, the listings among them, share ``cleanup_deadline``; a timeout fails the
+        create too. A listing that cannot be read even on its own re-raises the rm error. A
+        listed ID is looked for by that ID: a same-name container created since is not a stale one.
+        ``own_ids`` are marked as ours when a command carrying their `rm` is sent.
         """
+        own_ids = list(own_ids)
+        command = _remove_and_list_containers_command(targets, volumes_to_remove)
+        started = time.monotonic()
+        timeout_error: TimeoutError | None = None
         try:
-            await self._rm_containers(ssh_client, targets, max_attempts=1, own_ids=own_ids)
-            return
-        except Exception:
-            still_present = await self._targets_still_on_host(ssh_client, targets)
-            if still_present is None:
-                raise
-        if not still_present:
-            logger.info(
-                _m(
-                    "docker rm -fv reported an error but every stale container is gone; continuing",
-                    extra=get_extra_info({**default_extra, "container_names": targets}),
-                ),
+            # asyncssh's timeout= bounds only the command, not its channel open
+            async with asyncio.timeout_at(cleanup_deadline):
+                result = await (_MarkOwnRemovalsOnSubmit(ssh_client, own_ids) if own_ids else ssh_client).run(
+                    command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+                )
+        except TimeoutError as exc:
+            timeout_error = exc
+            rm_exit_status, listing_after = None, None
+        except Exception as exc:
+            rm_error: Exception = exc
+            rm_exit_status, listing_after = None, None
+        else:
+            rm_exit_status, listing_after = _parse_remove_and_list_containers(result.stdout or "")
+            rm_error = Exception(
+                f"[clean_existing_containers] command: {command} exit_code {rm_exit_status}, "
+                f"stderr: {(result.stderr or '').strip()}"
             )
-            return
         logger.info(
             _m(
-                "docker rm -fv failed with containers still on the host; retrying those",
-                extra=get_extra_info({**default_extra, "container_names": still_present}),
-            ),
+                "customer_container_removal",
+                extra=get_extra_info({
+                    **default_extra,
+                    "removal_ms": int((time.monotonic() - started) * 1000),
+                    "rm_exit_status": rm_exit_status,
+                    "listing_read": listing_after is not None,
+                    "volume_rm": bool(volumes_to_remove),
+                }),
+            )
         )
-        await self._rm_containers(
-            ssh_client, still_present, own_ids=[i for i in own_ids if i in still_present]
-        )
+        if timeout_error is not None:
+            raise Exception(
+                f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from timeout_error
+        if rm_exit_status == 0:
+            return CustomerContainerRemoval(True, listing_after)
+
+        try:
+            async with asyncio.timeout_at(cleanup_deadline):
+                if listing_after is None:
+                    listing_after = await self._list_all_containers(ssh_client)
+                    if listing_after is None:
+                        raise rm_error
+                names_on_host, ids_on_host = listing_after
+                on_host = set(names_on_host) | set(ids_on_host.values())
+                still_present = [target for target in targets if target in on_host]
+                if not still_present:
+                    logger.info(
+                        _m(
+                            "docker rm -fv reported an error but every stale container is gone; continuing",
+                            extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                        ),
+                    )
+                else:
+                    logger.info(
+                        _m(
+                            "docker rm -fv failed with containers still on the host; retrying those",
+                            extra=get_extra_info({**default_extra, "container_names": still_present}),
+                        ),
+                    )
+                    await self._rm_containers(
+                        ssh_client, still_present, own_ids=[i for i in own_ids if i in still_present]
+                    )
+                    listing_after = await self._list_all_containers(ssh_client)
+                if volumes_to_remove:
+                    await self._remove_volumes(ssh_client, volumes_to_remove)
+        except TimeoutError as exc:
+            raise Exception(
+                "[clean_existing_containers] the steps after a failed docker rm -fv did not finish in "
+                f"{_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
+            ) from exc
+        return CustomerContainerRemoval(False, listing_after)
 
     @staticmethod
     async def _rm_containers(
@@ -3411,24 +3567,25 @@ class DockerService:
         max_attempts: int = 5,
         own_ids: Iterable[str] = (),
     ) -> None:
+        own_ids = list(own_ids)
         await retry_ssh_command(
-            _MarkOwnRemovalsOnSubmit(ssh_client, list(own_ids)) if own_ids else ssh_client,
-            "/usr/bin/docker rm -fv " + " ".join(shlex.quote(t) for t in targets),
+            _MarkOwnRemovalsOnSubmit(ssh_client, own_ids) if own_ids else ssh_client,
+            _docker_rm_command(targets),
             'clean_existing_containers',
             max_attempts=max_attempts,
         )
 
     @staticmethod
-    async def _list_all_containers(
-        ssh_client: asyncssh.SSHClientConnection,
-    ) -> tuple[tuple[str, ...], dict[str, str]] | None:
+    async def _list_all_containers(ssh_client: asyncssh.SSHClientConnection) -> ContainerListing | None:
         """`docker ps -a` names and full IDs with the prerun probe's timeout; None when the listing raised,
         timed out or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
         caller must not hang or read an empty listing as 'confirmed')."""
         try:
-            result = await ssh_client.run(
-                DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
-            )
+            # asyncssh's timeout= bounds only the command, not its channel open
+            async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
+                result = await ssh_client.run(
+                    DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+                )
         except Exception as exc:
             # typed fields only: an asyncssh error's text can carry the host's banner
             logger.warning(
@@ -3445,18 +3602,6 @@ class DockerService:
             return None
         return parse_container_listing(result.stdout.splitlines())
 
-    async def _targets_still_on_host(
-        self, ssh_client: asyncssh.SSHClientConnection, targets: list[str]
-    ) -> list[str] | None:
-        """Which of ``targets`` (IDs or names) `docker ps -a` still lists; None when the listing could
-        not be read."""
-        listing = await self._list_all_containers(ssh_client)
-        if listing is None:
-            return None
-        names, ids = listing
-        on_host = set(names) | set(ids.values())
-        return [target for target in targets if target in on_host]
-
     async def clean_stale_vloopback_volumes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -3468,7 +3613,8 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
-        caller passes it only while nothing has removed a container since the probe ran.
+        caller passes it only while nothing but the fillers it was adjusted for has been
+        removed since the probe ran.
         """
         skip_set = {name for name in (skip_volume_names or []) if name}
         list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_CMD
@@ -7003,6 +7149,7 @@ class DockerService:
                 # wait_for_port_check_containers just before `docker run`, and the
                 # 90s _run_docker_create_with_port_retry budget), so we no longer
                 # block the critical path for ~10s. (sleep defaults to 0.)
+                cleanup_report = ContainerCleanupReport()
                 removed_containers = await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
@@ -7015,9 +7162,22 @@ class DockerService:
                     # create removes every filler_* whatever the backend listed; a filler create
                     # keeps protecting its listed sibling bundle (DAH-2465).
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
+                    report=cleanup_report,
                 )
-                if removed_containers:
+                # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
+                # filler delete) changes no listing but the containers and their mounts, so the listings
+                # stay; the rm frees disk, so the volume facts are measured again (cleanup_changed_host).
+                removed_only_fillers_cleanly = (
+                    cleanup_report.removed_cleanly_without_volume_rm
+                    and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in removed_containers)
+                )
+                if removed_containers and not removed_only_fillers_cleanly:
                     docker_listing_probe = None
+                elif removed_containers and docker_listing_probe is not None:
+                    docker_listing_probe = docker_listing_probe.without_containers(
+                        removed_containers,
+                        [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
+                    )
 
                 removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(
                     ssh_client=ssh_client,
