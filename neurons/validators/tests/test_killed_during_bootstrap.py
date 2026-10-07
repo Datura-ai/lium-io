@@ -496,7 +496,7 @@ async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, fr
         if from_probe else None
     )  # fmt: skip
 
-    async def remove(_ssh, _extra, _names, _targets, _volumes, _deadline, _with_df, own_ids=()):
+    async def remove(_ssh, _extra, _names, _targets, _volumes, _deadline, own_ids=()):
         assert list(own_ids) == [swept_id]
         if rm_error is not None:
             raise rm_error

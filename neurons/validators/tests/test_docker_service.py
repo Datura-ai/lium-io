@@ -5824,7 +5824,7 @@ def _make_sizing_ssh_client(
     def run(command, **kwargs):
         if "docker info" in command:
             return Mock(stdout="/var/lib/docker\n", exit_status=0)
-        if "df -P -B1 /free" in command:
+        if "df -P -B1 /hostfs" in command:
             if df_error:
                 raise Exception("df boom")
             return Mock(
@@ -5860,14 +5860,14 @@ async def test_get_fs_available_bytes_happy_parse(docker_service):
     )
 
     # Act
-    avail = await docker_service._get_fs_available_bytes(ssh_client)
+    avail = await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
 
     # Assert
     assert avail == 20266668032
     command = ssh_client.run.call_args.args[0]
     assert command == (
-        "/usr/bin/docker run --rm --mount type=volume,dst=/free "
-        "docker.io/library/alpine:3.19 df -P -B1 /free"
+        "/usr/bin/docker run --rm -v /var/lib/docker:/hostfs:ro "
+        "docker.io/library/alpine:3.19 df -P -B1 /hostfs"
     )
 
 
@@ -5881,7 +5881,7 @@ async def test_get_fs_available_bytes_nonzero_exit_raises(docker_service):
 
     # Act / Assert
     with pytest.raises(Exception, match="docker: boom"):
-        await docker_service._get_fs_available_bytes(ssh_client)
+        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
 
 
 @pytest.mark.asyncio
@@ -5894,7 +5894,7 @@ async def test_get_fs_available_bytes_garbage_output_raises(docker_service):
 
     # Act / Assert
     with pytest.raises(Exception, match="Unexpected df output"):
-        await docker_service._get_fs_available_bytes(ssh_client)
+        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
 
 
 @pytest.mark.asyncio
@@ -5905,7 +5905,7 @@ async def test_get_fs_available_bytes_short_output_raises(docker_service):
 
     # Act / Assert
     with pytest.raises(Exception, match="Unexpected df output"):
-        await docker_service._get_fs_available_bytes(ssh_client)
+        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
 
 
 @pytest.mark.asyncio
@@ -6111,7 +6111,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     def ssh_run(command, **kwargs):
         if "docker info" in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
-        if "df -P -B1 /free" in command:
+        if "df -P -B1 /hostfs" in command:
             return _make_ssh_command_result(
                 stdout=(
                     "Filesystem           1-blocks       Used Available Capacity Mounted on\n"
