@@ -413,21 +413,61 @@ async def test_rm_that_fails_and_cannot_be_re_read_raises_the_rm_error(
         await _clean_for_customer(docker_service, ssh_client)
 
 
+async def _run_like_asyncssh(answer, open_s: float | None, command_s: float, timeout: float | None):
+    # asyncssh's run(): create_process (the channel open, no timeout of its own), then wait(check, timeout)
+    if open_s is None:
+        await asyncio.Event().wait()  # an sshd that never confirms the channel open
+    await asyncio.sleep(open_s)
+    try:
+        await asyncio.wait_for(asyncio.sleep(command_s), timeout)
+    except TimeoutError:
+        raise asyncssh.TimeoutError(None, None, None, None, None, None, "", "") from None
+    return answer
+
+
+_SLOW_SSH_ROWS = pytest.mark.parametrize(
+    ("open_s", "command_s"),
+    [(0, 1), (None, 0), (0.15, 0.15)],
+    ids=["command_hangs", "channel_never_opens", "slow_open_then_slow_command"],
+)
+
+
 @pytest.mark.asyncio
-async def test_a_removal_that_times_out_fails_the_cleanup(docker_service, retry_ssh_mock):
+@_SLOW_SSH_ROWS
+async def test_a_removal_that_times_out_fails_the_cleanup(
+    docker_service, retry_ssh_mock, monkeypatch, open_s, command_s
+):
+    async def run(cmd, *args, timeout=None, **kwargs):
+        if cmd == ds_module.DOCKER_PS_ALL_NAMES_IDS_CMD:
+            return _listing("pod_target\nfiller_x\n")
+        return await _run_like_asyncssh(_removal(), open_s, command_s, timeout)
+
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=[
-            _listing("pod_target\nfiller_x\n"),
-            asyncssh.TimeoutError(None, None, None, None, None, None, "", ""),
-        ]
-    )
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.2)
+    started = asyncio.get_running_loop().time()
 
     with pytest.raises(Exception, match="did not finish"):
-        await _clean_for_customer(docker_service, ssh_client)
+        await asyncio.wait_for(_clean_for_customer(docker_service, ssh_client), 2)
+    assert asyncio.get_running_loop().time() - started < 0.3
     # a hung dockerd is not asked again
     assert ssh_client.run.await_count == 2
     retry_ssh_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@_SLOW_SSH_ROWS
+async def test_a_listing_that_times_out_is_unread_within_its_bound(monkeypatch, open_s, command_s):
+    async def run(cmd, *args, timeout=None, **kwargs):
+        return await _run_like_asyncssh(_listing("filler_x\n"), open_s, command_s, timeout)
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(ds_module, "_PRERUN_HOST_PROBE_TIMEOUT_SECONDS", 0.2)
+    started = asyncio.get_running_loop().time()
+
+    assert await asyncio.wait_for(DockerService._list_all_containers(ssh_client), 2) is None
+    assert asyncio.get_running_loop().time() - started < 0.3
 
 
 @pytest.mark.asyncio

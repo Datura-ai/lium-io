@@ -3569,9 +3569,11 @@ class DockerService:
         started = time.monotonic()
         timeout_error: TimeoutError | None = None
         try:
-            result = await (_MarkOwnRemovalsOnSubmit(ssh_client, own_ids) if own_ids else ssh_client).run(
-                command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
-            )
+            # asyncssh's timeout= bounds only the command, not its channel open
+            async with asyncio.timeout_at(cleanup_deadline):
+                result = await (_MarkOwnRemovalsOnSubmit(ssh_client, own_ids) if own_ids else ssh_client).run(
+                    command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+                )
         except TimeoutError as exc:
             timeout_error = exc
             rm_exit_status, listing_after = None, None
@@ -3660,9 +3662,11 @@ class DockerService:
         timed out or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
         caller must not hang or read an empty listing as 'confirmed')."""
         try:
-            result = await ssh_client.run(
-                DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
-            )
+            # asyncssh's timeout= bounds only the command, not its channel open
+            async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
+                result = await ssh_client.run(
+                    DOCKER_PS_ALL_NAMES_IDS_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+                )
         except Exception as exc:
             # typed fields only: an asyncssh error's text can carry the host's banner
             logger.warning(
