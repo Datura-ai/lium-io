@@ -7093,6 +7093,27 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
                 prev_timestamp = now_ms()
 
+                # Read the host's real kernel.pid_max and decide fail-closed BEFORE anything is
+                # created on the host (the local volume, a filler's GPU power cap) so a refusal
+                # leaves nothing behind (review finding on PR #1531). The limit is enabled unless
+                # RENTAL_PIDS_LIMIT_PER_CPU=0; refuse when the host PID margin cannot be guaranteed:
+                # the value is unreadable, or it is so low that even the floored cgroup cap would not
+                # reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the host's own tasks. No fixed fallback is
+                # safe on a host whose real pid_max is lower, so a tenant fork bomb would starve
+                # sshd/dockerd and take the executor offline mid-rental.
+                host_pid_max = await self._read_host_pid_max(ssh_client)
+                if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
+                    current_step = "host_pid_max"
+                    if host_pid_max is None:
+                        raise RuntimeError(
+                            "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
+                        )
+                    if host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT:
+                        raise RuntimeError(
+                            f"host kernel.pid_max ({host_pid_max}) is too low to reserve the host PID "
+                            "margin; refusing to start a rental"
+                        )
+
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
                 effective_volume_limit_gb = payload.volume_limit_gb
@@ -7345,15 +7366,8 @@ class DockerService:
                     )
                     # the broker cold start (image pull, socket wait) must not read as port-check wait
                     prev_timestamp = now_ms()
-                # Clamp the container's pids.max below the host's real kernel.pid_max so a tenant
-                # fork bomb cannot exhaust the global PID space on a low-pid_max host (review finding
-                # on PR #1531). Bounded; an unreadable value refuses the create (fail closed), since no
-                # fixed assumption is safe on a host whose real pid_max is lower.
-                host_pid_max = await self._read_host_pid_max(ssh_client)
-                if host_pid_max is None and settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
-                    raise RuntimeError(
-                        "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
-                    )
+                # host_pid_max was read and validated fail-closed before any host side-effect above
+                # (review finding on PR #1531); here it only sizes the container's pids.max.
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,

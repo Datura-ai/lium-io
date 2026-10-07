@@ -341,16 +341,53 @@ async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypa
 
 @pytest.mark.asyncio
 async def test_rental_is_refused_when_the_host_pid_max_cannot_be_read(svc, monkeypatch):
-    """An unreadable kernel.pid_max fails closed: no fixed pids limit is safe on an unknown host."""
+    """An unreadable kernel.pid_max fails closed, and before any host side-effect.
+
+    Review finding on #1531: the refusal must sit ahead of local-volume creation and the filler
+    GPU power cap, or a refusal leaks a volume / leaves GPUs capped with no container. Only the
+    pid_max read fails here (every other command succeeds) so the flow reaches the read, and we
+    assert create_local_volume was never awaited — it runs before the volume (and the later
+    power cap), so neither is reached.
+    """
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
-    ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
+
+    def _only_pid_max_fails(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=1)
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_only_pid_max_fails)
 
     result = await _run(svc, _payload())
 
     assert not isinstance(result, ContainerCreated)
     assert _docker_client(svc).run_specs == []
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rental_is_refused_when_the_host_pid_max_is_too_low_for_the_margin(svc, monkeypatch):
+    """A readable but tiny kernel.pid_max also fails closed before any host side-effect.
+
+    Review finding on #1531: a host whose pid_max cannot reserve RENTAL_PIDS_LIMIT_HOST_MARGIN
+    (here 512 with the 4096 default margin) would otherwise hand the container every PID.
+    """
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+
+    def _tiny_pid_max(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="512\n")
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_tiny_pid_max)
+
+    result = await _run(svc, _payload())
+
+    assert not isinstance(result, ContainerCreated)
+    assert _docker_client(svc).run_specs == []
+    svc.create_local_volume.assert_not_awaited()
 
 
 @pytest.mark.asyncio
