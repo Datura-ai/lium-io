@@ -5,6 +5,7 @@ from typing import NamedTuple, TypeVar
 
 from core.utils import _m, get_extra_info
 from services.rental_docker_sdk import (
+    ContainerCreateRefused,
     ContainerExecResult,
     ContainerExecSpec,
     ContainerRunSpec,
@@ -31,13 +32,16 @@ def _failure_level_and_reason(operation: str, exc: Exception) -> _FailureLog:
 
     A remove that finds nothing to remove and a workload container that keeps restarting are
     expected outcomes, not validator faults: the first is a delete racing failed-create cleanup
-    (idempotent by design, DAH-2345), the second a renter or filler image that exits at start.
+    (idempotent by design, DAH-2345), the second a renter or filler image that exits at start. A create
+    refused by its spec's `before_create` is the caller's decision, not a fault either.
     Everything else keeps ERROR with no reason (the logger drops None fields).
     """
     if operation.startswith("remove") and is_docker_not_found_error(exc):
         return _FailureLog(logging.INFO, "already_gone")
     if isinstance(exc, RentalDockerContainerRestartingError):
         return _FailureLog(logging.WARNING, "workload_container_restarting")
+    if isinstance(exc, ContainerCreateRefused):
+        return _FailureLog(logging.INFO, "create_refused")
     return _FailureLog(logging.ERROR, None)
 
 
