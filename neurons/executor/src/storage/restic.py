@@ -30,7 +30,9 @@ TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
-ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
+# Without `|| exit`, a failed cd leaves sh in the helper's own directory and restic backs that up instead.
+ENCRYPTED_BACKUP_SCRIPT = 'cd "$1" || exit 66; shift; exec "$@"'
+BACKUP_SOURCE_MISSING_EXIT = 66
 
 class ResticOperationError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
@@ -349,8 +351,12 @@ class ResticStorageRunner:
             f"lium-operation:{self._operation.operation_id}",
             ".",
         ]
+        if isinstance(self._workspace, LocalWorkspace) and not self._workspace.path.is_dir():
+            raise ResticOperationError("the backup path does not exist in the volume")
         exit_code, summary = self._stream(command, working_directory=True)
         snapshot_id = _snapshot_id(summary)
+        if exit_code == BACKUP_SOURCE_MISSING_EXIT and not snapshot_id:
+            raise ResticOperationError("the backup path does not exist in the volume")
         if exit_code == 0 and snapshot_id:
             return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
         if exit_code == 3 and snapshot_id:
