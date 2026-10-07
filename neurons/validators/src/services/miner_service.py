@@ -1,10 +1,11 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shlex
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -53,6 +54,7 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
     WorkloadKind,
+    now_ms,
 )
 from tenacity import RetryError
 
@@ -61,7 +63,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, customer_creates, inflight_creates
+from services.docker_service import DockerService, create_steps_after_reply, customer_creates, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
@@ -1468,7 +1470,8 @@ class MinerService:
                 miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
-            async with miner_client:
+            async with contextlib.AsyncExitStack() as miner_connection:
+                await miner_connection.enter_async_context(miner_client)
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
@@ -1573,6 +1576,7 @@ class MinerService:
                         # DAH-3436 (review): the rental probe takes the same per-executor lock before its
                         # own create, so its sweep of `pod_*` containers never runs beside this create
                         async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                            customer_creates.reached_create_container(payload)
                             result = await docker_service.create_container(
                                 payload,
                                 executor,
@@ -1580,15 +1584,22 @@ class MinerService:
                                 private_key.decode("utf-8"),
                             )
 
-                        await miner_client.send_model(
+                        # DAH-3980: a create's reply does not wait for the miner; the steps after it own
+                        # the miner's socket and close it once the removal is sent
+                        remove_ssh_key = self._remove_ssh_key_via_websocket(
+                            miner_client,
+                            miner_connection.pop_all(),
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
-                            )
+                            ),
+                            log_extra=default_extra,
                         )
-
+                        create_steps_after_reply.start(
+                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                        )
                         return result
 
                     elif isinstance(payload, ContainerDeleteRequest):
@@ -2378,6 +2389,48 @@ class MinerService:
             )
             return False
 
+    async def _remove_ssh_key_via_websocket(
+        self,
+        miner_client: MinerClient,
+        miner_connection: contextlib.AsyncExitStack,
+        remove_request: SSHPubKeyRemoveRequest,
+        log_extra: dict,
+    ) -> bool:
+        # the WebSocket twin of _remove_ssh_key_via_rest: logs a failure instead of raising it, then closes the socket
+        async with miner_connection:
+            try:
+                await miner_client.send_model(remove_request)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to remove SSH key via WebSocket. Validator key may still be present on miner",
+                        extra=get_extra_info({**log_extra, "error_type": type(exc).__name__}),
+                    )
+                )
+                return False
+        return True
+
+    async def _log_ssh_key_removal_after_reply(self, remove_ssh_key: Awaitable[bool], log_extra: dict) -> None:
+        # the removal logs its own failure; this line puts it after the reply in the log
+        started_ms = now_ms()
+        try:
+            ssh_key_removed = await remove_ssh_key
+        except asyncio.CancelledError:
+            # a delete's wait for the steps after the reply timed out, or the connector stops
+            logger.warning(
+                _m(
+                    "Validator SSH key removal after reply cancelled; the key may stay at the miner",
+                    extra=get_extra_info({**log_extra, "duration_ms": now_ms() - started_ms}),
+                )
+            )
+            raise
+        logger.info(
+            _m(
+                "Validator SSH key removal after reply finished",
+                extra=get_extra_info({**log_extra, "removed": ssh_key_removed, "duration_ms": now_ms() - started_ms}),
+            )
+        )
+
     def _serialize_request(self, request) -> dict:
         """Serialize a Pydantic request model to dict for JSON serialization.
         
@@ -2802,6 +2855,7 @@ class MinerService:
                     )
                     # DAH-3436 (review): shared with the rental probe's create, see executor_create_exclusion
                     async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                        customer_creates.reached_create_container(payload)
                         result = await docker_service.create_container(
                             payload,
                             executor,
@@ -2863,7 +2917,7 @@ class MinerService:
 
                 # Remove SSH key after operation only if it was accepted
                 if ssh_key_accepted:
-                    await self._remove_ssh_key_via_rest(
+                    remove_ssh_key = self._remove_ssh_key_via_rest(
                         base_url=base_url,
                         my_key=my_key,
                         public_key=public_key,
@@ -2871,6 +2925,13 @@ class MinerService:
                         executor_id=payload.executor_id,
                         log_extra=default_extra,
                     )
+                    if isinstance(payload, ContainerCreateRequest):
+                        # DAH-3980: a create's reply does not wait for the miner
+                        create_steps_after_reply.start(
+                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                        )
+                    else:
+                        await remove_ssh_key
 
                 return result
 
