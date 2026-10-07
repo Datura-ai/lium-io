@@ -339,7 +339,6 @@ async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypa
     assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
 
 
-@pytest.mark.asyncio
 def _ssh_client_with_meminfo(meminfo_result):
     client = _ssh_client()
 
@@ -354,6 +353,7 @@ def _ssh_client_with_meminfo(meminfo_result):
     return client
 
 
+@pytest.mark.asyncio
 async def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram(svc, monkeypatch):
     """A legacy pod row (ram_total 0) arrives as memory_gb 0; the container still gets a mem_limit, host RAM
     less the 4 GiB host reserve, so the renter cannot starve the executor of memory."""
@@ -366,6 +366,7 @@ async def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram(svc
     assert _docker_client(svc).run_specs[0].memory_gb == 60
 
 
+@pytest.mark.asyncio
 async def test_a_rental_with_a_memory_limit_keeps_it_and_skips_the_meminfo_read(svc, monkeypatch):
     ssh_client = _ssh_client_with_meminfo(_ssh_result(stdout="MemTotal: 67108864 kB\n"))
     _patch_happy(svc, monkeypatch, ssh_client)
@@ -376,6 +377,7 @@ async def test_a_rental_with_a_memory_limit_keeps_it_and_skips_the_meminfo_read(
     assert "cat /proc/meminfo" not in [call.args[0] for call in ssh_client.run.call_args_list]
 
 
+@pytest.mark.asyncio
 async def test_an_unreadable_meminfo_leaves_a_limitless_rental_as_it_was(svc, monkeypatch):
     _patch_happy(svc, monkeypatch, _ssh_client_with_meminfo(_ssh_result(exit_status=1)))
 
@@ -385,6 +387,7 @@ async def test_an_unreadable_meminfo_leaves_a_limitless_rental_as_it_was(svc, mo
     assert not _docker_client(svc).run_specs[0].memory_gb
 
 
+@pytest.mark.asyncio
 async def test_rental_is_refused_when_the_host_pid_max_cannot_be_read(svc, monkeypatch):
     """An unreadable kernel.pid_max fails closed, and before any host side-effect.
 
