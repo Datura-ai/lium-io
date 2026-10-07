@@ -47,16 +47,16 @@ subject-claim rule, resources and a scope:
 | Label | Subject claim | Resources (Docker Hub repositories) | Scope |
 |---|---|---|---|
 | `lium-io-publish` | `repo:Datura-ai/lium-io:environment:dockerhub-push` | `daturaai/compute-subnet-executor`, `…-executor-runner`, `…-miner`, `…-miner-runner`, `…-validator`, `…-validator-runner`, `daturaai/lium-watchtower` | image push |
-| `lium-io-dev` | `repo:Datura-ai/lium-io:environment:dockerhub-push-dev` | `daturaai/compute-subnet-executor-dev`, `daturaai/compute-subnet-executor-runner-dev` (only these two) | image push |
+| `lium-io-dev` | `repo:Datura-ai/lium-io:environment:dockerhub-push-dev` | `daturaai/compute-subnet-executor-dev`, `daturaai/compute-subnet-runner-dev` (only these two) | image push |
 
 `lium-io-dev` is the branch path: `executor_cd_dev` dispatched from any branch but `main` runs in
 `dockerhub-push-dev`, which has no branch policy, and pushes `daturaai/compute-subnet-executor-dev:dev`
-and `…-executor-runner-dev:dev` (the runner pins the `-dev` executor by digest). A ruleset covers
+and `daturaai/compute-subnet-runner-dev:dev` (the runner pins the `-dev` executor by digest). A ruleset covers
 repositories, not tags, so the dev subject must never be added to `lium-io-publish`: a branch
 could then edit its workflow and push `:latest`. Create the two `-dev` repositories (Docker Hub →
 `daturaai` → Create repository) before the ruleset. A dev stack tests a branch image by pointing
 `EXECUTOR_IMAGE_REF` at `daturaai/compute-subnet-executor-dev:dev` (and its updater's
-`WATCHTOWER_IMAGE` at `daturaai/compute-subnet-executor-runner-dev`). A dispatch from `main` still
+`WATCHTOWER_IMAGE` at `daturaai/compute-subnet-runner-dev`). A dispatch from `main` still
 pushes the `dev` tag of the release repositories, which the dev and staging stacks pull.
 `miner_cd_dev` and `validator_cd_dev` stay `main`-only (no branch run since April).
 

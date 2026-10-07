@@ -55,7 +55,7 @@ def test_branch_build_names_only_dev_repositories(tmp_path):
     """Regression: a branch build tags or bakes in a release repository, so its push needs the
     release token (refused off main) or its runner pulls the release executor instead of its own."""
     tags, services = _build(tmp_path, "-dev")
-    assert tags == ["daturaai/compute-subnet-executor-dev:dev", "daturaai/compute-subnet-executor-runner-dev:dev"]
+    assert tags == ["daturaai/compute-subnet-executor-dev:dev", "daturaai/compute-subnet-runner-dev:dev"]
     assert _executor_images(services) == {f"daturaai/compute-subnet-executor-dev@{DIGEST}"}
 
 
