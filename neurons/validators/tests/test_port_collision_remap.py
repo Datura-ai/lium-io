@@ -92,12 +92,15 @@ def service() -> DockerService:
     lock.__aenter__ = Mock(return_value=lock)
     lock.__aexit__ = Mock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock)
-    return DockerService(
+    service = DockerService(
         ssh_service=Mock(),
         redis_service=redis_service,
         attestation_service=Mock(),
         rental_docker_client_factory=RecordingRentalDockerFactory(),
     )
+    # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    return service
 
 
 @pytest.fixture
