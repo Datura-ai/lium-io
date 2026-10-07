@@ -403,6 +403,28 @@ class TenantEnforcementCheck:
                 failure=None, ssh_pub_keys=ssh_pub_keys, container_state=ContainerState.RUNNING
             )
 
+        if _restarting_on_its_own(diagnostics):
+            # A renter can make their own pod crash-loop (kill PID 1, break the entrypoint, hit its own memory
+            # limit); dockerd then restarts it under the pod's policy, which only works on a healthy host. No
+            # clear_verified_job: that would penalise the provider for the renter's workload.
+            event = render_message(
+                Msg.POD_RESTARTING,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "pod_id": pod_id,
+                    "container_name": container_name,
+                    "executor_uuid": ctx.executor.uuid,
+                    "container": _penalty_evidence_from_diagnostics(diagnostics),
+                },
+                extra=extra,
+            )
+            return _DownedPodOutcome(
+                failure=CheckResult(passed=False, event=event, updates={"default_extra": extra}),
+                ssh_pub_keys=[],
+                container_state=container_state,
+            )
+
         event = render_message(
             Msg.POD_NOT_RUNNING,
             ctx=ctx,
@@ -438,6 +460,12 @@ class TenantEnforcementCheck:
             ssh_pub_keys=[],
             container_state=container_state,
         )
+
+
+def _restarting_on_its_own(diagnostics: dict[str, object]) -> bool:
+    # `restarting` is dockerd between a process exit and the policy's next start; an error is a start that
+    # failed (runtime, devices, mounts), which is the host's.
+    return diagnostics.get("container_status") == "restarting" and not diagnostics.get("container_error")
 
 
 def _container_state_from_diagnostics(diagnostics: dict[str, object]) -> ContainerState:

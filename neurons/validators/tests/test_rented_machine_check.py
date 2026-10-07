@@ -1217,6 +1217,50 @@ async def test_pod_states_reports_exited_when_inspect_shows_a_stopped_container(
     assert _pod_states(result) == {"pod-1": "exited"}
 
 
+class RestartingContainerSSHClient(DummySSHClient):
+    """`docker ps` lists nothing and `docker inspect` shows dockerd between restarts of the pod."""
+
+    def __init__(self, *, error: str = ""):
+        super().__init__(pod_running=False)
+        self.error = error
+
+    async def run(self, command: str):
+        if "docker inspect" in command:
+            self.commands_called.append(command)
+            state = {"Status": "restarting", "ExitCode": 1, "Error": self.error, "FinishedAt": self.container_finished_at}
+            return Mock(stdout=json.dumps(state), stderr="")
+        return await super().run(command)
+
+
+@pytest.mark.asyncio
+async def test_a_pod_crash_looping_on_its_own_keeps_the_verification(context_factory):
+    ctx = _tenant_ctx(
+        context_factory,
+        RestartingContainerSSHClient(),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_RESTARTING.reason
+    assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_pod_whose_restart_fails_to_start_is_still_not_running(context_factory):
+    ctx = _tenant_ctx(
+        context_factory,
+        RestartingContainerSSHClient(error="OCI runtime create failed: nvidia-container-cli: initialization error"),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+
+
 @pytest.mark.asyncio
 async def test_pod_states_reports_absent_when_no_container_of_that_name_exists(context_factory):
     ctx = _tenant_ctx(
