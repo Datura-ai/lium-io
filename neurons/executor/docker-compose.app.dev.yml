@@ -22,7 +22,6 @@ services:
     # the executor under contention (the renter keeps full cores while the executor is idle), keep a
     # small RAM reservation, and tell the kernel OOM killer to spare it.
     cpu_shares: 4096
-    mem_reservation: 2g
     oom_score_adj: -900
     environment:
       - NVIDIA_DRIVER_CAPABILITIES=all
@@ -42,6 +41,7 @@ services:
     deploy:
       resources:
         reservations:
+          memory: 2g
           devices:
             - driver: nvidia
               count: all
