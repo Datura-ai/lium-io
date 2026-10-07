@@ -4535,6 +4535,39 @@ def test_rental_pids_limit_disabled_returns_none(monkeypatch):
     assert DockerService._rental_pids_limit(None) is None
 
 
+def test_rental_pids_limit_clamps_below_a_low_host_pid_max(monkeypatch):
+    # Review finding on #1531: on a host with a low kernel.pid_max the scaled cap must be clamped
+    # below it (minus a host margin) or a fork bomb exhausts the global PID space first.
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_HOST_MARGIN", 4096)
+    # whole-host / CVM (cpu_count None) on a 32768-pid_max host: cap clamped to 32768 - 4096
+    assert DockerService._rental_pids_limit(None, 32768) == 28672
+    # an 8-CPU rental would scale to 32768, still clamped under the host ceiling
+    assert DockerService._rental_pids_limit(8, 32768) == 28672
+    # a roomy host (default ~4M) leaves the scaled cap alone
+    assert DockerService._rental_pids_limit(8, 4_194_304) == 32768
+    assert DockerService._rental_pids_limit(None, 4_194_304) == 1_048_576
+
+
+def test_rental_pids_limit_never_emits_zero_or_negative(monkeypatch):
+    # A pathologically low pid_max must not drive the limit to 0/negative (Docker reads that as
+    # unlimited); it floors at _MIN_RENTAL_PIDS_LIMIT instead.
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_HOST_MARGIN", 4096)
+    assert DockerService._rental_pids_limit(None, 4096) == docker_service_module._MIN_RENTAL_PIDS_LIMIT
+    assert DockerService._rental_pids_limit(8, 2048) == docker_service_module._MIN_RENTAL_PIDS_LIMIT
+
+
+def test_rental_pids_limit_unreadable_host_pid_max_keeps_scaled_cap(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    # None (could not read pid_max) → no host clamp, scaled cap stands
+    assert DockerService._rental_pids_limit(8, None) == 32768
+    assert DockerService._rental_pids_limit(None, None) == 1_048_576
+
+
 @pytest.mark.asyncio
 async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     docker_service,

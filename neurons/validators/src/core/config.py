@@ -792,6 +792,15 @@ class Settings(BaseSettings):
             "the cgroup wall first."
         ),
     )
+    RENTAL_PIDS_LIMIT_HOST_MARGIN: int = Field(
+        env="RENTAL_PIDS_LIMIT_HOST_MARGIN", default=4096, ge=0,
+        description=(
+            "PIDs reserved for the host's own tasks (sshd, dockerd, the executor) when a rental "
+            "container's pids.max is clamped to the executor's actual kernel.pid_max. The container "
+            "gets min(scaled cap, kernel.pid_max - this), so on a host with a low kernel.pid_max it "
+            "still cannot exhaust the global PID space before hitting its own cgroup wall."
+        ),
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(

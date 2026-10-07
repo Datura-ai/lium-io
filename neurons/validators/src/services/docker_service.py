@@ -389,6 +389,9 @@ _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
 # has to go. Covers the image layers and scratch the pod needs beyond its own volume.
 RENTAL_DISK_HEADROOM_GB = 20
+# Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
+# of 0 or below would read as "unlimited" to Docker, so never emit one.
+_MIN_RENTAL_PIDS_LIMIT = 512
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -2259,6 +2262,7 @@ class DockerService:
         gpu_devices,
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
+        host_pid_max: int | None = None,
         quote_socket: bool = False,
     ) -> ContainerRunSpec:
         environment = {
@@ -2317,7 +2321,7 @@ class DockerService:
             cpu_count=cpu_count,
             memory_gb=payload.memory_gb,
             storage_limit_gb=effective_storage_limit_gb,
-            pids_limit=self._rental_pids_limit(cpu_count),
+            pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -2383,7 +2387,7 @@ class DockerService:
         return any(device.path_on_host.startswith("/dev/infiniband/") for device in devices)
 
     @staticmethod
-    def _rental_pids_limit(cpu_count: int | None) -> int | None:
+    def _rental_pids_limit(cpu_count: int | None, host_pid_max: int | None = None) -> int | None:
         """cgroup pids.max for a rental container, or None to leave the daemon default.
 
         A tenant fork bomb otherwise exhausts the host's global PID space, and the executor's own
@@ -2391,16 +2395,46 @@ class DockerService:
         mid-rental and the provider is penalized. The memory cgroup is not a ceiling here: on a
         whole-host rental mem_limit is host-sized, so a bomb of light tasks exhausts PIDs long
         before RAM. Scaled per allocated CPU (a real workload's thread/process count tracks its
-        cores) and clamped to a cap kept below kernel.pid_max; a rental with no per-pod CPU cap gets
-        the cap. RENTAL_PIDS_LIMIT_PER_CPU=0 disables the limit for rollback.
+        cores); a rental with no per-pod CPU cap (whole host / CVM) gets the absolute cap.
+
+        The cap must sit below the executor's real kernel.pid_max, or on a host configured with a
+        low pid_max (e.g. 32768) the fork bomb exhausts the global PID space before the container
+        reaches its cgroup wall and the executor is starved anyway. When ``host_pid_max`` is known
+        the cap is clamped to ``host_pid_max - RENTAL_PIDS_LIMIT_HOST_MARGIN``, never below
+        ``_MIN_RENTAL_PIDS_LIMIT`` (0 or a negative would read as "unlimited" to Docker). A host
+        pid_max we could not read leaves the scaled cap alone. RENTAL_PIDS_LIMIT_PER_CPU=0 disables
+        the limit for rollback.
         """
         per_cpu = settings.RENTAL_PIDS_LIMIT_PER_CPU
         if per_cpu <= 0:
             return None
         cap = settings.RENTAL_PIDS_LIMIT_CAP
-        if cpu_count and cpu_count > 0:
-            return min(per_cpu * cpu_count, cap)
-        return cap
+        want = min(per_cpu * cpu_count, cap) if cpu_count and cpu_count > 0 else cap
+        if host_pid_max and host_pid_max > 0:
+            host_room = max(host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN, _MIN_RENTAL_PIDS_LIMIT)
+            want = min(want, host_room)
+        return want
+
+    async def _read_host_pid_max(self, ssh_client) -> int | None:
+        """The executor host's kernel.pid_max, read before `docker run`, or None when unreadable.
+
+        Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
+        ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Best-effort
+        and bounded: any miss leaves the scaled cgroup cap in place.
+        """
+        try:
+            res = await ssh_client.run(
+                "timeout -k 2 10 cat /proc/sys/kernel/pid_max", check=False, timeout=15
+            )
+        except (asyncssh.Error, asyncio.TimeoutError, OSError):
+            return None
+        if getattr(res, "exit_status", 1) != 0:
+            return None
+        try:
+            value = int((res.stdout or "").strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -7309,6 +7343,10 @@ class DockerService:
                     )
                     # the broker cold start (image pull, socket wait) must not read as port-check wait
                     prev_timestamp = now_ms()
+                # Clamp the container's pids.max below the host's real kernel.pid_max so a tenant
+                # fork bomb cannot exhaust the global PID space on a low-pid_max host (review finding
+                # on PR #1531). Bounded, best-effort; a miss leaves the scaled cgroup cap in place.
+                host_pid_max = await self._read_host_pid_max(ssh_client)
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -7321,6 +7359,7 @@ class DockerService:
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
+                    host_pid_max=host_pid_max,
                     quote_socket=quote_socket,
                 )
 
