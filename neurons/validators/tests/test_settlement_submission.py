@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from clients.backend_client import BackendClient, SettledWeights
+from clients.backend_client import BackendClient, BackendRejected, SettledWeights
 from clients.subtensor_client import fold_unregistered_into_burner, scored_registered_neurons
 from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
 from core.validator import UNACKED_CYCLE_REPORTS_KEY, Validator
@@ -333,3 +333,39 @@ async def test_a_signed_request_signs_the_exact_bytes_it_sends():
         hashlib.sha256(b'{"a":[1,2],"b":2}').hexdigest() in signed
         and "/validator/hk/cycles" in signed
     )
+
+
+@pytest.mark.asyncio
+async def test_a_tempo_is_submitted_once_even_while_should_set_weights_stays_true():
+    validator = _validator(window=WINDOW, accepted=True)
+
+    await validator.submit_settled_window()
+    await validator.submit_settled_window()
+
+    validator.subtensor_client.set_weights.assert_awaited_once()
+    validator.subtensor_client.get_current_block.return_value = 123456 + 360
+    await validator.submit_settled_window()
+    assert validator.subtensor_client.set_weights.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_submission_is_retried_on_the_next_tick():
+    validator = _validator(window=WINDOW, accepted=False)
+
+    await validator.submit_settled_window()
+    await validator.submit_settled_window()
+
+    assert validator.subtensor_client.set_weights.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_report_the_backend_rejects_is_dropped_not_replayed():
+    validator = _validator(window=None, accepted=True)
+    validator.backend_client.report_cycle_scores = AsyncMock(side_effect=BackendRejected(422))
+    scored_at = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
+
+    await validator.report_cycle_scores(
+        {"hk": 1.0}, [], "burn", "2026-10-06 10:00:00", 500, scored_at
+    )
+
+    validator.redis_service.lpush.assert_not_awaited()

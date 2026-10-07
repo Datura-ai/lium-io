@@ -4,7 +4,7 @@ import os
 import time
 from datetime import UTC, datetime
 
-from clients.backend_client import BackendClient
+from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
 from core.settlement import accumulate, cycle_node_shares, fallback_vector, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
@@ -91,9 +91,6 @@ class Validator:
         # Used to skip the first post-restart set_weights when the in-memory
         # accumulator may have been re-built from a partial cycle.
         self.completed_cycles_since_start = 0
-        # DAH-4001: block of the last settled submission attempt, accepted or not. Nothing is attempted again inside
-        # the chain's weights rate limit: an accepted one would only be rejected, and a failed one retried every sync
-        # tick would use up a batch's attempts in under a minute of chain trouble.
 
         # set incentive algorithm from setting
         self.incentive = settings.incentive
@@ -161,6 +158,9 @@ class Validator:
         )
 
         self.fallback_scores: dict[str, float] = {}
+        # the tempo index already submitted (or read, in shadow): should_set_weights stays true for a tick or two
+        # after a submission, and a second attempt for the same frozen window would only be rejected as too fast
+        self._settled_tempo_done: int | None = None
         try:
             fallback_json = await self.redis_service.get(FALLBACK_SCORES_KEY)
             if fallback_json is not None:
@@ -287,6 +287,7 @@ class Validator:
                             )
                         )
                         self.miner_scores = {}
+                        self.fallback_scores = {}
                     elif settings.SETTLEMENT_MODE == SETTLEMENT_ENFORCE:
                         # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is
                         await self.submit_settled_window()
@@ -877,6 +878,15 @@ class Validator:
     async def _deliver_cycle_report(self, payload: dict) -> bool:
         try:
             receipt = await self.backend_client.report_cycle_scores(payload)
+        except BackendRejected as exc:
+            # a 4xx is the report itself being wrong; keeping it would block every later report behind it
+            logger.error(
+                _m(
+                    "[settlement] cycle report rejected by the backend; dropped",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": payload["cycle_id"], "error": str(exc)}),
+                )
+            )
+            return True
         except Exception as exc:
             receipt = None
             logger.error(
@@ -974,12 +984,15 @@ class Validator:
         referral as scored, its idle to the verified burner. Never an older vector: weights are a state, and a
         stale one pays nodes that may have left since."""
         index, tempo = self._current_tempo()
+        if index == getattr(self, "_settled_tempo_done", None):
+            return
         window = await self._fetch_settled_window(index, tempo)
         if window is None or not window.hotkey_scores:
             await self._submit_fallback(index, "backend unreachable" if window is None else "empty window")
             return
         accepted = await self._submit_vector(window.hotkey_scores)
         if accepted:
+            self._settled_tempo_done = index
             block = self._current_block_or_none()
             if block is not None:
                 try:
@@ -1002,7 +1015,7 @@ class Validator:
                         "tempo_index": index,
                         "cycles": len(window.cycle_ids),
                         "hotkeys": len(window.hotkey_scores),
-                        "withheld_nodes": window.withheld_count,
+                        "withheld_shares": window.withheld_count,
                         "withheld_total": window.withheld_total,
                         "mass_inactive_skipped": window.mass_inactive_skipped,
                     }
@@ -1022,7 +1035,9 @@ class Validator:
             self._alert_if_near_activity_cutoff()
             return
         accepted = await self._submit_vector(vector)
-        if not accepted:
+        if accepted:
+            self._settled_tempo_done = index
+        else:
             self._alert_if_near_activity_cutoff()
         # an error either way: a tempo's idle went to the burner because of our side, and someone repays it
         logger.error(
@@ -1064,12 +1079,15 @@ class Validator:
     async def shadow_settled_window(self) -> None:
         """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live accumulator."""
         index, tempo = self._current_tempo()
+        if index == getattr(self, "_settled_tempo_done", None):
+            return
         window = await self._fetch_settled_window(index, tempo)
         if window is None:
             logger.warning(
                 _m("[settlement] shadow: backend unreachable", extra=get_extra_info({**self.default_extra, "tempo_index": index}))
             )
             return
+        self._settled_tempo_done = index
         logger.info(
             _m(
                 "[settlement] shadow window",
@@ -1079,7 +1097,7 @@ class Validator:
                         "tempo_index": index,
                         "cycles": len(window.cycle_ids),
                         "hotkeys": len(window.hotkey_scores),
-                        "withheld_nodes": window.withheld_count,
+                        "withheld_shares": window.withheld_count,
                         "withheld_total": window.withheld_total,
                         "mass_inactive_skipped": window.mass_inactive_skipped,
                         "share_moved_vs_live": round(share_moved(self.miner_scores, window.hotkey_scores), 6),

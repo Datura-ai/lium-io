@@ -69,6 +69,14 @@ class SettledWeightsResult(BaseModel):
     inclusion_block: int | None = None
 
 
+class BackendRejected(Exception):
+    """The backend answered 4xx: the request is wrong, and sending it again would be wrong again."""
+
+    def __init__(self, status: int):
+        super().__init__(f"backend answered {status}")
+        self.status = status
+
+
 class BackendClient:
     """HTTP client with session pooling and validator signature headers."""
 
@@ -144,7 +152,13 @@ class BackendClient:
         }
 
     async def _signed_request(
-        self, method: str, path_with_query: str, response_model: type[T], *, json_data: dict[str, Any] | None = None
+        self,
+        method: str,
+        path_with_query: str,
+        response_model: type[T],
+        *,
+        json_data: dict[str, Any] | None = None,
+        raise_on_4xx: bool = False,
     ) -> T | None:
         """A settlement call: the body is serialized once, and the signature covers these exact bytes."""
         body = b"" if json_data is None else json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
@@ -156,6 +170,7 @@ class BackendClient:
             add_signature=False,
             extra_headers=self._get_signed_request_headers(method, path, body),
             raw_body=body if json_data is not None else None,
+            raise_on_4xx=raise_on_4xx,
         )
 
     async def get(
@@ -210,6 +225,7 @@ class BackendClient:
         extra_headers: dict[str, str] | None = None,
         non_200_log_level: int = logging.ERROR,
         raw_body: bytes | None = None,
+        raise_on_4xx: bool = False,
     ) -> T | None:
         # single signed round-trip, retrying connection-level errors per backoff schedule.
         # `non_200_log_level`: an optional call whose route may not exist on the backend yet logs
@@ -249,6 +265,8 @@ class BackendClient:
                                     extra=get_extra_info({**context, "status": resp.status}),
                                 ),
                             )
+                            if raise_on_4xx and 400 <= resp.status < 500:
+                                raise BackendRejected(resp.status)
                             return None
 
                         try:
@@ -287,6 +305,8 @@ class BackendClient:
                 _m(f"{method} client error", extra=get_extra_info({**context, "error": str(e)}))
             )
             return None
+        except BackendRejected:
+            raise
         except Exception as e:
             logger.error(
                 _m(f"{method} error", extra=get_extra_info({**context, "error": str(e)})), exc_info=True
@@ -571,7 +591,11 @@ class BackendClient:
         """Hand a cycle's vector and per-node rows to the backend, which settles it a day later. `payload` is the
         request body (see core/settlement.py); the caller keeps it for replay when this returns None."""
         return await self._signed_request(
-            "POST", f"/validator/{self.keypair.ss58_address}/cycles", CycleScoresReport, json_data=payload
+            "POST",
+            f"/validator/{self.keypair.ss58_address}/cycles",
+            CycleScoresReport,
+            json_data=payload,
+            raise_on_4xx=True,
         )
 
     async def get_settled_weights(self, tempo_index: int, tempo_blocks: int) -> SettledWeights | None:

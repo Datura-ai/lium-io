@@ -823,7 +823,7 @@ class SubtensorClient:
 
         metagraph = self.get_metagraph()
         if include_registered_scored:
-            # DAH-4001: a settled batch is a day old. A provider that removed its last node since then is no longer
+            # DAH-4001: a settled vector is a day old. A provider that removed its last node since then is no longer
             # in the served-miner list, but its hotkey is still registered and the pay the backend approved is its.
             miners = list(miners) + scored_registered_neurons(miners, metagraph.neurons, miner_scores)
             miner_scores = fold_unregistered_into_burner(
@@ -941,9 +941,9 @@ class SubtensorClient:
         }
         await self.send_weights_to_lium(payload)
 
-        # the chain call blocks until inclusion when asked to; off the event loop so the cycle keeps running
-        result, msg = await asyncio.to_thread(
-            self.subtensor.set_weights,
+        # stays on the event loop on purpose: the substrate websocket behind `self.subtensor` is shared with every
+        # other chain read and is not thread-safe, so a thread here could interleave frames with a concurrent read
+        result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.netuid,
             uids=uint_uids,
