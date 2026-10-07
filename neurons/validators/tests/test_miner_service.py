@@ -17,13 +17,16 @@ from uuid import uuid4
 
 import pytest
 
+from core.config import settings
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
+from datura.requests.validator_requests import SSHPubKeyRemoveRequest
 from payload_models.payloads import (
     ContainerCreateRequest,
     CustomOptions,
     PayloadPortMapping,
 )
 from services import docker_service as docker_service_module
+from services.docker_service import customer_creates
 from services.miner_service import MinerService
 
 
@@ -148,22 +151,52 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
     wait_mock.assert_not_awaited()
 
 
+@pytest.mark.parametrize("use_rest_api", [True, False], ids=["rest", "websocket"])
 @pytest.mark.asyncio
-async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, miner_service, caplog):
+async def test_create_reply_does_not_wait_for_the_validator_key_removal(mocker, miner_service, caplog, use_rest_api):
+    """A miner holding or failing the key removal cannot hold or fail the created pod's reply, on either route; the
+    customer create counts against fillers on its executor while it runs and until its reply."""
     executor_id = str(uuid4())
     payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
+    mocker.patch.object(settings, "USE_REST_API", use_rest_api)
     created = Mock()
-    mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=created))
-    remove_key = mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", AsyncMock(return_value=True))
+    customer_create_counted_while_it_ran: list[bool] = []
+
+    async def create_container(*args) -> Mock:
+        customer_create_counted_while_it_ran.append(customer_creates.is_running(payload.miner_hotkey, executor_id))
+        return created
+
+    mocker.patch("services.miner_service.DockerService.create_container", create_container)
+    removal_released = asyncio.Event()
+
+    async def rest_removal_held_by_the_miner(**kwargs) -> bool:
+        await removal_released.wait()
+        return False
+
+    async def send_model(model) -> None:
+        if isinstance(model, SSHPubKeyRemoveRequest):
+            await removal_released.wait()
+            raise OSError("the miner closed its socket")
+
+    mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", rest_removal_held_by_the_miner)
+    miner_client = MagicMock(send_model=send_model)
+    miner_client.job_state.miner_accepted_ssh_key_or_failed_future = asyncio.get_running_loop().create_future()
+    miner_client.job_state.miner_accepted_ssh_key_or_failed_future.set_result(
+        AcceptSSHKeyRequest(executors=[_make_executor_info(executor_id)])
+    )
+    mocker.patch("services.miner_service.MinerClient", return_value=miner_client)
 
     with caplog.at_level("INFO"):
-        result = await miner_service._handle_container(payload)
-        remove_key.assert_not_awaited()
+        result = await asyncio.wait_for(miner_service.handle_container(payload), 5)
+        counted_after_the_reply = customer_creates.is_running(payload.miner_hotkey, executor_id)
+        socket_closes_before_the_removal = miner_client.__aexit__.await_count
+        removal_released.set()
         assert await docker_service_module.create_steps_after_reply.wait_until_done(payload.pod_id, 5)
 
     assert result is created
-    remove_key.assert_awaited_once()
+    assert (customer_create_counted_while_it_ran, counted_after_the_reply) == ([True], False)
+    assert (socket_closes_before_the_removal, miner_client.__aexit__.await_count) == (0, 0 if use_rest_api else 1)
     assert any("Validator SSH key removal after reply finished" in r.getMessage() for r in caplog.records)
 
 
