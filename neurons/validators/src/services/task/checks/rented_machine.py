@@ -403,30 +403,6 @@ class TenantEnforcementCheck:
                 failure=None, ssh_pub_keys=ssh_pub_keys, container_state=ContainerState.RUNNING
             )
 
-        if _restarting_on_its_own(diagnostics):
-            # A renter can make their own pod crash-loop (kill PID 1, break the entrypoint, hit its own memory
-            # limit); dockerd then restarts it under the pod's policy, which only works on a healthy host. We
-            # reach here only with affirmative renter-fault evidence (see `_restarting_on_its_own`); without it
-            # the code below treats the pod as POD_NOT_RUNNING. No clear_verified_job: that would penalise the
-            # provider for the renter's workload.
-            event = render_message(
-                Msg.POD_RESTARTING,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "pod_id": pod_id,
-                    "container_name": container_name,
-                    "executor_uuid": ctx.executor.uuid,
-                    "container": _penalty_evidence_from_diagnostics(diagnostics),
-                },
-                extra=extra,
-            )
-            return _DownedPodOutcome(
-                failure=CheckResult(passed=False, event=event, updates={"default_extra": extra}),
-                ssh_pub_keys=[],
-                container_state=container_state,
-            )
-
         event = render_message(
             Msg.POD_NOT_RUNNING,
             ctx=ctx,
@@ -462,35 +438,6 @@ class TenantEnforcementCheck:
             ssh_pub_keys=[],
             container_state=container_state,
         )
-
-
-# Docker reports 128 + signal for anything that killed PID 1 from outside the process: `docker kill`
-# (incl. `--signal=SEGV/ABRT/HUP/...`), `docker stop`, a daemon restart, the kernel OOM-killer. A
-# provider controls that tooling, so no 128+N code — not SIGKILL(137)/SIGTERM(143), and not SIGSEGV(139)
-# or SIGABRT(134) either — is affirmative proof the renter caused the exit. A clean exit 0 is the same:
-# a graceful daemon restart (PID 1 handles SIGTERM) produces it. Only an application exit the process
-# chose itself, 0 < code < 128, is unforgeable by the provider's host tooling — the container runs the
-# renter's own image/command, which a provider cannot make exit with an arbitrary low code without a
-# signal. (Repo-canonical host-kill set: rental_docker_sdk.HOST_KILL_EXIT_CODES; all its codes are >= 128.)
-_RENTER_EXIT_CODE_CEILING = 128
-
-
-def _restarting_on_its_own(diagnostics: dict[str, object]) -> bool:
-    # `restarting` is dockerd between a process exit and the policy's next start; an error is a start that
-    # failed (runtime, devices, mounts), which is the host's. But `restarting` + empty error does NOT prove
-    # the renter caused it: a provider daemon restart or a host/provider SIGKILL/OOM/other-signal leaves the
-    # same shape (review finding, Serhii, #1534). Shield the provider ONLY with affirmative renter-fault
-    # evidence — the renter's PID 1 chose to exit with its own application code (0 < code < 128), which the
-    # provider's host tooling cannot forge. Everything else — a signal-derived exit (>= 128), a clean exit 0,
-    # an OOM, or no exit code at all — falls through to POD_NOT_RUNNING (clears the verified job, provider
-    # path). OOM is never shielded: Docker's OOMKilled cannot separate the renter's cgroup limit from a host
-    # OOM, so it is treated as the provider's.
-    if diagnostics.get("container_status") != "restarting" or diagnostics.get("container_error"):
-        return False
-    if diagnostics.get("container_oom_killed"):
-        return False
-    exit_code = diagnostics.get("container_exit_code")
-    return isinstance(exit_code, int) and 0 < exit_code < _RENTER_EXIT_CODE_CEILING
 
 
 def _container_state_from_diagnostics(diagnostics: dict[str, object]) -> ContainerState:

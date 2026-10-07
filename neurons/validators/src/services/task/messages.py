@@ -978,8 +978,8 @@ class TenantEnforcementMessages:
         category="runtime",
         impact="No verdict for this cycle - verification kept",
         remediation=(
-            "The pod's own process keeps exiting and dockerd keeps restarting it: the renter's workload, not the "
-            "host. No action needed from the provider."
+            "The pod is restarting under its restart policy; the host cannot tell whether the renter's process or "
+            "the host caused the exits."
         ),
     )
     STALE_POD_NOT_RUNNING = MessageTemplate(

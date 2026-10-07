@@ -1241,23 +1241,6 @@ class RestartingContainerSSHClient(DummySSHClient):
 
 
 @pytest.mark.asyncio
-async def test_a_pod_crash_looping_on_its_own_keeps_the_verification(context_factory):
-    # The renter's PID 1 ran and exited with its own code (1): affirmative renter-fault evidence, so the
-    # provider is shielded (POD_RESTARTING, verification kept).
-    ctx = _tenant_ctx(
-        context_factory,
-        RestartingContainerSSHClient(exit_code=1),
-        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
-    )
-
-    result = await TenantEnforcementCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.reason_code == Msg.POD_RESTARTING.reason
-    assert "clear_verified_job_reason" not in result.updates
-
-
-@pytest.mark.asyncio
 async def test_a_pod_whose_restart_fails_to_start_is_still_not_running(context_factory):
     ctx = _tenant_ctx(
         context_factory,
@@ -1275,6 +1258,7 @@ async def test_a_pod_whose_restart_fails_to_start_is_still_not_running(context_f
 @pytest.mark.parametrize(
     ("exit_code", "oom_killed", "case"),
     [
+        (1, False, "provider sent a handled SIGUSR1; PID 1 chose exit 1"),
         (0, False, "graceful daemon restart — PID 1 handled SIGTERM and exited 0"),
         (143, False, "daemon stop / SIGTERM (128+15)"),
         (137, False, "host SIGKILL (128+9)"),
@@ -1289,7 +1273,7 @@ async def test_a_restarting_pod_without_renter_fault_evidence_is_not_shielded(
 ):
     """Review finding (Serhii, #1534): a provider Docker-daemon restart or a host/provider signal can leave
     an unless-stopped container `restarting` with an empty State.Error, and the provider controls that
-    tooling — no signal-derived (>= 128) or clean (0) exit is affirmative renter attribution. Each such case
+    tooling — no exit code (a handled signal can make PID 1 pick any) is trusted renter attribution. Each such case
     must fall through to POD_NOT_RUNNING (clears the verified job, provider-fault path), not be labelled a
     renter crash-loop that keeps verification."""
     ctx = _tenant_ctx(
