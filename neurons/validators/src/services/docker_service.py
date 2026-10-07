@@ -1829,6 +1829,14 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "local_volume": local_volume}),
                             )
                         )
+                        # the mount fails at start, after create: the Created container still holds the
+                        # name and the retry would fail on a 409 name conflict
+                        await self._remove_failed_container_for_retry(
+                            ssh_client=ssh_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="STALE_MOUNT_RETRY_RM_FAILED",
+                        )
                         continue
 
                 port_allocation_phrase = next((p for p in _PORT_ALLOCATED_PHRASES if p in str(e)), None)
@@ -1922,6 +1930,14 @@ class DockerService:
                                     {**default_extra, "local_volume": local_volume}
                                 ),
                             )
+                        )
+                        # the mount fails at start, after create: the Created container still holds the
+                        # name and the retry would fail on a 409 name conflict
+                        await self._remove_failed_rental_container_for_retry(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="STALE_MOUNT_RETRY_RM_FAILED",
                         )
                         continue
 

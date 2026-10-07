@@ -32,6 +32,7 @@ from services.docker_service import (
 )
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
     _wrap_error_message,
@@ -4843,7 +4844,40 @@ async def test_create_container_repairs_stale_vloopback_mountpoint_then_retries(
     assert calls["n"] == 2
     assert seen_commands[0] == seen_commands[1]
     repair.assert_awaited_once_with(ssh_client, "volume_test", {})
-    ssh_client.run.assert_not_awaited()
+    ssh_client.run.assert_awaited_once_with("/usr/bin/docker rm -fv pod_test")
+
+
+@pytest.mark.asyncio
+async def test_rental_create_removes_the_failed_container_before_the_stale_mount_retry(
+    docker_service, monkeypatch,
+):
+    events: list[str] = []
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if events.count("run") == 1:
+                raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
+            return "cid"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
+    )
+
+    container_id = await docker_service._run_rental_docker_create_with_port_retry(
+        docker_client=FakeRentalClient(),
+        ssh_client=Mock(),
+        run_spec=ContainerRunSpec(image="img", name="pod_test"),
+        container_name="pod_test",
+        default_extra={},
+        local_volume="volume_test",
+    )
+
+    assert container_id == "cid"
+    assert events == ["run", "rm pod_test", "run"]
 
 
 @pytest.mark.asyncio
