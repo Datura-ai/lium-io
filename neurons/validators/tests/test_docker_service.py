@@ -4511,6 +4511,30 @@ def test_local_volume_timeout_preserves_larger_explicit_timeout():
     assert DockerService._get_local_volume_create_timeout(1024, 0) == 0
 
 
+def test_rental_pids_limit_scales_per_cpu_and_clamps_to_cap(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    # a per-pod CPU cap gives a proportionate ceiling
+    assert DockerService._rental_pids_limit(1) == 4096
+    assert DockerService._rental_pids_limit(8) == 32768
+    # a huge share is clamped to the cap, never above kernel.pid_max
+    assert DockerService._rental_pids_limit(1000) == 1_048_576
+
+
+def test_rental_pids_limit_uses_cap_for_whole_host_rentals(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_CAP", 1_048_576)
+    # no per-pod CPU cap (whole host) still gets a finite ceiling
+    assert DockerService._rental_pids_limit(None) == 1_048_576
+    assert DockerService._rental_pids_limit(0) == 1_048_576
+
+
+def test_rental_pids_limit_disabled_returns_none(monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 0)
+    assert DockerService._rental_pids_limit(8) is None
+    assert DockerService._rental_pids_limit(None) is None
+
+
 @pytest.mark.asyncio
 async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     docker_service,

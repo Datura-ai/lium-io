@@ -775,6 +775,23 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_DIND_MEMORY", default="8g",
         description="--memory limit for the throwaway DinD build container.",
     )
+    RENTAL_PIDS_LIMIT_PER_CPU: int = Field(
+        env="RENTAL_PIDS_LIMIT_PER_CPU", default=4096, ge=0,
+        description=(
+            "cgroup pids.max granted to a rental container per allocated CPU. 0 disables the limit "
+            "(rollback switch). The product is clamped to RENTAL_PIDS_LIMIT_CAP; a rental with no "
+            "per-pod CPU cap (whole host) gets RENTAL_PIDS_LIMIT_CAP. Stops a tenant fork bomb from "
+            "exhausting the host PID space and taking the executor offline mid-rental."
+        ),
+    )
+    RENTAL_PIDS_LIMIT_CAP: int = Field(
+        env="RENTAL_PIDS_LIMIT_CAP", default=1_048_576, gt=0,
+        description=(
+            "Absolute ceiling for a rental container's pids.max, and the value used when the rental "
+            "has no per-pod CPU cap. Kept well below a host's kernel.pid_max so a fork bomb still hits "
+            "the cgroup wall first."
+        ),
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(

@@ -2317,6 +2317,7 @@ class DockerService:
             cpu_count=cpu_count,
             memory_gb=payload.memory_gb,
             storage_limit_gb=effective_storage_limit_gb,
+            pids_limit=self._rental_pids_limit(cpu_count),
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -2380,6 +2381,26 @@ class DockerService:
     @staticmethod
     def _forwards_rdma(devices: tuple[DeviceMount, ...]) -> bool:
         return any(device.path_on_host.startswith("/dev/infiniband/") for device in devices)
+
+    @staticmethod
+    def _rental_pids_limit(cpu_count: int | None) -> int | None:
+        """cgroup pids.max for a rental container, or None to leave the daemon default.
+
+        A tenant fork bomb otherwise exhausts the host's global PID space, and the executor's own
+        daemon and sshd can no longer fork — the validator then reads the node as unreachable
+        mid-rental and the provider is penalized. The memory cgroup is not a ceiling here: on a
+        whole-host rental mem_limit is host-sized, so a bomb of light tasks exhausts PIDs long
+        before RAM. Scaled per allocated CPU (a real workload's thread/process count tracks its
+        cores) and clamped to a cap kept below kernel.pid_max; a rental with no per-pod CPU cap gets
+        the cap. RENTAL_PIDS_LIMIT_PER_CPU=0 disables the limit for rollback.
+        """
+        per_cpu = settings.RENTAL_PIDS_LIMIT_PER_CPU
+        if per_cpu <= 0:
+            return None
+        cap = settings.RENTAL_PIDS_LIMIT_CAP
+        if cpu_count and cpu_count > 0:
+            return min(per_cpu * cpu_count, cap)
+        return cap
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
