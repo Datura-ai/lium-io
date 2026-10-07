@@ -1275,18 +1275,23 @@ async def test_a_pod_whose_restart_fails_to_start_is_still_not_running(context_f
 @pytest.mark.parametrize(
     ("exit_code", "oom_killed", "case"),
     [
-        (143, False, "daemon restart (SIGTERM) with empty error"),
-        (137, False, "host SIGKILL with empty error"),
-        (137, True, "host OOM-kill with empty error"),
+        (0, False, "graceful daemon restart — PID 1 handled SIGTERM and exited 0"),
+        (143, False, "daemon stop / SIGTERM (128+15)"),
+        (137, False, "host SIGKILL (128+9)"),
+        (137, True, "host OOM-kill"),
+        (139, False, "docker kill --signal=SEGV (128+11), forgeable by the provider"),
+        (134, False, "docker kill --signal=ABRT (128+6), forgeable by the provider"),
+        (129, False, "SIGHUP (128+1), a repo-canonical host kill"),
     ],
 )
 async def test_a_restarting_pod_without_renter_fault_evidence_is_not_shielded(
     context_factory, exit_code, oom_killed, case
 ):
-    """Review finding (Serhii, #1534): a provider Docker-daemon restart or a host SIGKILL/OOM can leave an
-    unless-stopped container `restarting` with an empty State.Error. Without affirmative renter-fault
-    evidence the cycle must fall through to POD_NOT_RUNNING (clears the verified job, provider-fault path),
-    not label the provider outage as a renter crash-loop and keep verification."""
+    """Review finding (Serhii, #1534): a provider Docker-daemon restart or a host/provider signal can leave
+    an unless-stopped container `restarting` with an empty State.Error, and the provider controls that
+    tooling — no signal-derived (>= 128) or clean (0) exit is affirmative renter attribution. Each such case
+    must fall through to POD_NOT_RUNNING (clears the verified job, provider-fault path), not be labelled a
+    renter crash-loop that keeps verification."""
     ctx = _tenant_ctx(
         context_factory,
         RestartingContainerSSHClient(exit_code=exit_code, oom_killed=oom_killed),

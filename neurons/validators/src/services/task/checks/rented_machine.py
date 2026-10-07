@@ -464,27 +464,33 @@ class TenantEnforcementCheck:
         )
 
 
-# 128 + SIGKILL(9) and 128 + SIGTERM(15): an external kill, not the renter's own process exiting. A
-# provider Docker-daemon restart (unless-stopped → SIGTERM/SIGKILL) and a host SIGKILL/OOM-kill all land
-# here, and all can leave an `unless-stopped` container `restarting` with an empty State.Error.
-_EXTERNAL_KILL_EXIT_CODES = frozenset({137, 143})
+# Docker reports 128 + signal for anything that killed PID 1 from outside the process: `docker kill`
+# (incl. `--signal=SEGV/ABRT/HUP/...`), `docker stop`, a daemon restart, the kernel OOM-killer. A
+# provider controls that tooling, so no 128+N code — not SIGKILL(137)/SIGTERM(143), and not SIGSEGV(139)
+# or SIGABRT(134) either — is affirmative proof the renter caused the exit. A clean exit 0 is the same:
+# a graceful daemon restart (PID 1 handles SIGTERM) produces it. Only an application exit the process
+# chose itself, 0 < code < 128, is unforgeable by the provider's host tooling — the container runs the
+# renter's own image/command, which a provider cannot make exit with an arbitrary low code without a
+# signal. (Repo-canonical host-kill set: rental_docker_sdk.HOST_KILL_EXIT_CODES; all its codes are >= 128.)
+_RENTER_EXIT_CODE_CEILING = 128
 
 
 def _restarting_on_its_own(diagnostics: dict[str, object]) -> bool:
     # `restarting` is dockerd between a process exit and the policy's next start; an error is a start that
     # failed (runtime, devices, mounts), which is the host's. But `restarting` + empty error does NOT prove
-    # the renter caused it: a provider daemon restart or a host SIGKILL/OOM leaves the same shape (review
-    # finding, Serhii, #1534). Shield the provider ONLY with affirmative renter-fault evidence — the renter's
-    # PID 1 ran and exited with its own code — and never on an external kill or an OOM we cannot attribute to
-    # the renter. Absent that, the caller falls through to POD_NOT_RUNNING (clears the verified job, provider
-    # path). An unattributable OOM is deliberately not shielded: Docker's OOMKilled cannot separate the
-    # renter's own cgroup limit from a host OOM, so it is treated as the provider's.
+    # the renter caused it: a provider daemon restart or a host/provider SIGKILL/OOM/other-signal leaves the
+    # same shape (review finding, Serhii, #1534). Shield the provider ONLY with affirmative renter-fault
+    # evidence — the renter's PID 1 chose to exit with its own application code (0 < code < 128), which the
+    # provider's host tooling cannot forge. Everything else — a signal-derived exit (>= 128), a clean exit 0,
+    # an OOM, or no exit code at all — falls through to POD_NOT_RUNNING (clears the verified job, provider
+    # path). OOM is never shielded: Docker's OOMKilled cannot separate the renter's cgroup limit from a host
+    # OOM, so it is treated as the provider's.
     if diagnostics.get("container_status") != "restarting" or diagnostics.get("container_error"):
         return False
     if diagnostics.get("container_oom_killed"):
         return False
     exit_code = diagnostics.get("container_exit_code")
-    return isinstance(exit_code, int) and exit_code not in _EXTERNAL_KILL_EXIT_CODES
+    return isinstance(exit_code, int) and 0 < exit_code < _RENTER_EXIT_CODE_CEILING
 
 
 def _container_state_from_diagnostics(diagnostics: dict[str, object]) -> ContainerState:
