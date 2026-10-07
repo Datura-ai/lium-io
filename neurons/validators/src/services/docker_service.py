@@ -6868,6 +6868,56 @@ class DockerService:
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
 
+                # Read the host's real limits and decide fail-closed BEFORE any host side-effect —
+                # the edit-swap park, the stale-container/filler cleanup (an irreversible rm), the
+                # image pull, or the local volume — so a refusal leaves the host exactly as it was
+                # (review findings on PR #1531 and #1534: these probes sat after park and cleanup, so
+                # a failed probe could strand a host whose filler had already been removed).
+                #
+                # kernel.pid_max: the limit is enabled unless RENTAL_PIDS_LIMIT_PER_CPU=0; refuse when
+                # the host PID margin cannot be guaranteed — the value is unreadable, or so low that
+                # even the floored cgroup cap would not reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the
+                # host's own tasks. No fixed fallback is safe on a host whose real pid_max is lower, so
+                # a tenant fork bomb would starve sshd/dockerd and take the executor offline mid-rental.
+                host_pid_max = await self._read_host_pid_max(ssh_client)
+                if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
+                    current_step = "host_pid_max"
+                    if host_pid_max is None:
+                        raise RuntimeError(
+                            "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
+                        )
+                    if host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT:
+                        raise RuntimeError(
+                            f"host kernel.pid_max ({host_pid_max}) is too low to reserve the host PID "
+                            "margin; refusing to start a rental"
+                        )
+
+                # host RAM: only a rental sent without a memory limit (legacy ram_total 0 rows) needs
+                # it, to size one. Under host contention — the exact condition that delays this SSH
+                # probe — an unlimited rental lets the renter exhaust host RAM and OOM the
+                # executor/sshd, so refuse rather than fall through to no mem_limit.
+                host_ram_kib: int | None = None
+                rental_gpu_share = 1.0
+                if not payload.memory_gb:
+                    current_step = "host_ram_kib"
+                    host_ram_kib = await self._read_host_ram_kib(ssh_client)
+                    if host_ram_kib is None:
+                        raise RuntimeError(
+                            "host MemTotal could not be read; refusing to start a legacy rental without a safe memory limit"
+                        )
+                    # A split-host rental gets its GPU share of host RAM, matching the backend's own
+                    # sizing (models.executor.pod_ram_total_kib). Two legacy zero-RAM pods on one host
+                    # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
+                    if payload.gpu_uuids:
+                        current_step = "host_gpu_count"
+                        host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                        if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
+                            raise RuntimeError(
+                                "host GPU count could not be read or is below the rented GPU count; "
+                                "refusing to start a legacy split rental without a safe memory limit"
+                            )
+                        rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
+
                 # set real-time logging
                 self.log_task = asyncio.create_task(
                     self.handle_stream_logs(
@@ -7316,54 +7366,6 @@ class DockerService:
                 # Add profiler for docker volume creation
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
                 prev_timestamp = now_ms()
-
-                # Read the host's real kernel.pid_max and decide fail-closed BEFORE anything is
-                # created on the host (the local volume, a filler's GPU power cap) so a refusal
-                # leaves nothing behind (review finding on PR #1531). The limit is enabled unless
-                # RENTAL_PIDS_LIMIT_PER_CPU=0; refuse when the host PID margin cannot be guaranteed:
-                # the value is unreadable, or it is so low that even the floored cgroup cap would not
-                # reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the host's own tasks. No fixed fallback is
-                # safe on a host whose real pid_max is lower, so a tenant fork bomb would starve
-                # sshd/dockerd and take the executor offline mid-rental.
-                host_pid_max = await self._read_host_pid_max(ssh_client)
-                if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
-                    current_step = "host_pid_max"
-                    if host_pid_max is None:
-                        raise RuntimeError(
-                            "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
-                        )
-                    if host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT:
-                        raise RuntimeError(
-                            f"host kernel.pid_max ({host_pid_max}) is too low to reserve the host PID "
-                            "margin; refusing to start a rental"
-                        )
-
-                # Only a rental sent without a memory limit (legacy ram_total 0 rows) needs the host's
-                # RAM, to size one. Decide fail-closed BEFORE any host side-effect, like host_pid_max
-                # above (review finding on PR #1534): under host contention — the exact condition that
-                # delays this SSH probe — an unlimited rental lets the renter exhaust host RAM and OOM
-                # the executor/sshd. Refuse rather than fall through to no mem_limit.
-                host_ram_kib: int | None = None
-                rental_gpu_share = 1.0
-                if not payload.memory_gb:
-                    current_step = "host_ram_kib"
-                    host_ram_kib = await self._read_host_ram_kib(ssh_client)
-                    if host_ram_kib is None:
-                        raise RuntimeError(
-                            "host MemTotal could not be read; refusing to start a legacy rental without a safe memory limit"
-                        )
-                    # A split-host rental gets its GPU share of host RAM, matching the backend's own
-                    # sizing (models.executor.pod_ram_total_kib). Two legacy zero-RAM pods on one host
-                    # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
-                    if payload.gpu_uuids:
-                        current_step = "host_gpu_count"
-                        host_gpu_count = await self._read_host_gpu_count(ssh_client)
-                        if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
-                            raise RuntimeError(
-                                "host GPU count could not be read or is below the rented GPU count; "
-                                "refusing to start a legacy split rental without a safe memory limit"
-                            )
-                        rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
 
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.

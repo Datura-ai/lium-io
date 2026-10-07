@@ -478,6 +478,31 @@ async def test_a_legacy_rental_is_refused_when_the_host_ram_cannot_be_read(svc, 
 
 
 @pytest.mark.asyncio
+async def test_a_legacy_rental_probe_failure_leaves_the_filler_in_place(svc, monkeypatch):
+    """Review finding #1534 (round 2): the host-limit probes must run BEFORE the stale-container
+    cleanup, not after. clean_existing_containers force-removes a co-tenant filler (an irreversible
+    `docker rm`); if the probe failed after that, the host would be left with neither the filler nor
+    the new rental. Only the meminfo read fails here, so the refusal must happen with
+    clean_existing_containers never awaited — the filler is still running."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _only_meminfo_fails(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=1)
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_only_meminfo_fails)
+
+    result = await _run(svc, _payload(memory_gb=0))
+
+    assert not isinstance(result, ContainerCreated)
+    svc.clean_existing_containers.assert_not_awaited()
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_split_legacy_rental_is_refused_when_the_host_gpu_count_cannot_be_read(svc, monkeypatch):
     """Review finding #1534: a legacy split rental whose host GPU count is unreadable fails closed too —
     without it the GPU share is unknown, so sizing to the whole host (less reserve) would hand each of two
@@ -586,11 +611,12 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _docker_client(svc).login_calls == []
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
-        '/usr/bin/docker volume ls --format "{{.Name}}"',
-        # the host's kernel.pid_max, read before any host side-effect so a rental whose pids.max
-        # can't be clamped below it is refused with nothing to undo; a bare cat bounded by
-        # asyncssh's timeout, no `timeout` binary to be absent
+        # the host's kernel.pid_max, read FIRST — before any host side-effect (the stale-container
+        # cleanup, the pull, the volume) and so before the concurrent early host probe below — so a
+        # rental whose pids.max can't be clamped below it is refused with nothing to undo; a bare cat
+        # bounded by asyncssh's timeout, no `timeout` binary to be absent
         "cat /proc/sys/kernel/pid_max",
+        '/usr/bin/docker volume ls --format "{{.Name}}"',
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",

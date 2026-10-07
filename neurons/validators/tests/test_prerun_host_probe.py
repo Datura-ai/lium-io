@@ -1309,11 +1309,12 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the rm and its confirming listing are the one host command of the create besides the probes
-    # and the pid_max read every rental makes
+    # the pid_max read every rental makes comes FIRST (review finding #1534: the fail-closed host
+    # probes must run before the filler rm, or a failed probe strands a host whose filler is already
+    # gone); the rm and its confirming listing are the one other host command of the create.
     assert _cmds(ssh_client) == [
-        _remove_and_list_containers_command(["filler_x"], []),
         "cat /proc/sys/kernel/pid_max",
+        _remove_and_list_containers_command(["filler_x"], []),
     ]
     assert _relisting_commands(ssh_client) == []
     svc.probe_prerun_host.assert_awaited_once()
