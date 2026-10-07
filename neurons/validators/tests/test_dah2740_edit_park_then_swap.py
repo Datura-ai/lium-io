@@ -159,8 +159,8 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(svc, monkeypatch):
-    """The first edit's steps after its reply remove `<name>_parked`; a second edit of the same pod
-    that parked before them would lose its parked container, the pod's only copy until it succeeds."""
+    """The first edit's steps after its reply (its inspector start, its parked container's removal by ID) finish
+    before a second edit of the same pod parks."""
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)

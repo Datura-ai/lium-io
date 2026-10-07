@@ -1576,6 +1576,7 @@ class MinerService:
                         # DAH-3436 (review): the rental probe takes the same per-executor lock before its
                         # own create, so its sweep of `pod_*` containers never runs beside this create
                         async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                            customer_creates.reached_create_container(payload)
                             result = await docker_service.create_container(
                                 payload,
                                 executor,
@@ -2854,6 +2855,7 @@ class MinerService:
                     )
                     # DAH-3436 (review): shared with the rental probe's create, see executor_create_exclusion
                     async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                        customer_creates.reached_create_container(payload)
                         result = await docker_service.create_container(
                             payload,
                             executor,

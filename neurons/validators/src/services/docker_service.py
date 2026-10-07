@@ -24,11 +24,11 @@ import bittensor
 import redis.exceptions
 from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
-    DOCKER_VOLUMES_DF_COMMAND,
     ContainerDeathDiagnostics,
     DockerCommand,
     collect_container_death_diagnostics,
     df_available_bytes,
+    df_command,
     parse_df_available_bytes,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -444,8 +444,6 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
-# the df that removal reads after its rm is optional: its helper `docker run` gets this bound
-_DF_AFTER_REMOVAL_TIMEOUT_SECONDS = 5
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -602,19 +600,13 @@ class ContainerCleanupReport:
 
     # one `docker rm -fv` exited 0, the re-read `docker ps -a` lists no filler, no `docker volume rm` ran
     removed_cleanly_without_volume_rm: bool = False
-    # df of docker's volumes read by that removal command after its rm; None when not asked or not read
-    df_avail_bytes_after_removal: int | None = None
 
 
-def _remove_and_list_containers_command(
-    targets: list[str], volume_names: list[str], *, with_df: bool = False
-) -> str:
+def _remove_and_list_containers_command(targets: list[str], volume_names: list[str]) -> str:
     """One shell line for a customer create's removal (DAH-3980): `docker rm -fv` of the ``targets``
     (a listed ID, or the name when no ID was listed), its exit status, the `docker ps -a` names and
     full IDs left after it, that listing's exit status, then `docker volume rm` of the unprotected
-    volumes, if any, and ``with_df`` the volume probe's df of docker's volumes, read after all of
-    them when the rm and the listing exited 0 early enough, with the exit status of that step (0
-    only for a df read to its end). Every output line is tagged so the parser never guesses."""
+    volumes, if any. Every output line is tagged so the parser never guesses."""
     names = " ".join(shlex.quote(target) for target in targets)
     command = (
         f"/usr/bin/docker rm -fv {names} >/dev/null; rm_rc=$?; printf 'RM\\t%s\\n' \"$rm_rc\"; "
@@ -624,21 +616,6 @@ def _remove_and_list_containers_command(
     if volume_names:
         volumes = " ".join(shlex.quote(volume) for volume in volume_names)
         command += f"; /usr/bin/docker volume rm {volumes} >/dev/null 2>&1 || true"
-    if with_df:
-        # ponytail: +1 helper `docker run` (~0.3 s on the lab box) on every such removal; skip it when
-        # the early df already sizes the volume at the request cap, if it matters
-        bound = f"timeout -k 1 {_DF_AFTER_REMOVAL_TIMEOUT_SECONDS}"
-        # the df never fails the removal: it starts only after a clean rm and listing (any other
-        # removal drops it and needs what is left of the deadline) and while the bounded df, at four
-        # times its worst case, still ends inside the removal's timeout; a hung or failed one only
-        # leaves a non-zero status
-        latest_start = _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS - 4 * (_DF_AFTER_REMOVAL_TIMEOUT_SECONDS + 1)
-        command = (
-            f"t0=$(date +%s); {command}; [ \"$rm_rc\" = 0 ] && [ \"$ps_rc\" = 0 ] && [ -n \"$t0\" ] && "
-            f"[ $(($(date +%s) - t0)) -lt {latest_start} ] && "
-            f"df_out=\"$({bound} {DOCKER_VOLUMES_DF_COMMAND})\"; "
-            "printf 'DF\\t%s\\t%s\\n' \"$?\" \"$(printf '%s' \"$df_out\" | tr '\\n' '\\r')\""
-        )
     return command
 
 
@@ -653,34 +630,27 @@ def _docker_rm_command(targets: list[str]) -> str:
 class CustomerContainerRemoval(NamedTuple):
     first_rm_exited_zero: bool
     listing_after_rm: ContainerListing | None
-    df_avail_bytes_after_rm: int | None = None
 
 
 class FillerRemovalAtSshConnect(NamedTuple):
     # every filler it removed (or tried to); "" when the listing carried no ID
     listed_id_by_filler_name: dict[str, str]
     removed_cleanly_without_volume_rm: bool
-    # df of the docker root its removal command read after the rm; None when not asked or not read
-    df_avail_bytes_after_removal: int | None = None
 
 
 class RemoveAndListContainersOutput(NamedTuple):
     rm_exit_status: int | None
     listing_after_rm: ContainerListing | None
-    df_avail_bytes_after_rm: int | None = None
 
 
 def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOutput:
-    """(rm exit status, the listing after the rm, the df after it). The status is None when its line
-    is missing, repeated or not a number; the listing is None unless it exited 0; the df is None
-    unless one DF line carries exit status 0 and parses -- an untagged line makes all None, so an
-    ambiguous output never reads as a clean removal."""
+    """(rm exit status, the listing after the rm). The status is None when its line is missing,
+    repeated or not a number; the listing is None unless it exited 0 -- an untagged line makes both
+    None, so an ambiguous output never reads as a clean removal."""
     rm_statuses: list[str] = []
     ps_statuses: list[str] = []
     names: list[str] = []
-    df_outputs: list[str] = []
-    # split on "\n" only: str.splitlines() would also split at the "\r" the DF record uses
-    for line in stdout.removesuffix("\n").split("\n"):
+    for line in stdout.splitlines():
         tag, _, value = line.partition("\t")
         if tag == "RM":
             rm_statuses.append(value)
@@ -689,18 +659,11 @@ def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOut
         elif tag == "NAME":
             if value:
                 names.append(value)
-        elif tag == "DF":
-            df_outputs.append(value)
         else:
             return RemoveAndListContainersOutput(None, None)
     rm_exit_status = int(rm_statuses[0]) if len(rm_statuses) == 1 and rm_statuses[0].isdigit() else None
-    df_avail_bytes = None
-    df_exit_status, _, df_record = df_outputs[0].partition("\t") if len(df_outputs) == 1 else ("", "", "")
-    if df_exit_status == "0":
-        with contextlib.suppress(Exception):
-            df_avail_bytes = parse_df_available_bytes(df_record.replace("\r", "\n"))
     return RemoveAndListContainersOutput(
-        rm_exit_status, parse_container_listing(names) if ps_statuses == ["0"] else None, df_avail_bytes
+        rm_exit_status, parse_container_listing(names) if ps_statuses == ["0"] else None
     )
 
 
@@ -709,9 +672,10 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
     list and the loopback plugin state, each output line tagged so the parser never guesses.
     Sections are joined with `;` — a failing section leaves its tag out (the volume list, whose
     empty output is legitimate, is followed by a `VOLS\\t<exit status>` line) and the parser raises."""
+    df_cmd = df_command('"$root"')
     df_part = (
         # df prints two lines; fold them onto one tagged line (\n → \r) so every record stays one line
-        f"printf 'DF\\t%s\\n' \"$({DOCKER_VOLUMES_DF_COMMAND} | tr '\\n' '\\r')\"; "
+        f"printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\"; "
         if with_df
         else ""
     )
@@ -1454,7 +1418,17 @@ class _CreateStepsAfterReplyRegistry:
     async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
         """Wait for this pod's steps; cancel what is left after the timeout and wait for it once more
         as long. False on a cancel."""
-        tasks = set(self._tasks_by_pod_id.get(pod_id, ()))
+        return await self._wait_or_cancel(set(self._tasks_by_pod_id.get(pod_id, ())), timeout)
+
+    async def wait_until_all_done(self) -> bool:
+        """The same for every pod's steps, bounded as a delete's wait: the connector's shutdown, so it does
+        not cut a key removal."""
+        return await self._wait_or_cancel(
+            set().union(*self._tasks_by_pod_id.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+        )
+
+    @staticmethod
+    async def _wait_or_cancel(tasks: set[asyncio.Task], timeout: float) -> bool:
         if not tasks:
             return True
         _, pending = await asyncio.wait(tasks, timeout=timeout)
@@ -1480,7 +1454,7 @@ class _CustomerCreateRegistry:
     customer's sweep would remove; if the lock lapsed (its 360 s TTL, Redis unreachable), the filler
     would start beside the renter after that sweep. A customer create can also start and finish
     between two of the filler's checks (a slow create_container, a queued Docker thread), so the
-    executor also counts the customer creates that ended, and a filler create remembers that count
+    executor also counts the customer creates that ended after reaching create_container, and a filler create remembers that count
     from its own start: one ended since then refuses the filler like one running now. Keyed by (miner
     hotkey, executor id): an executor id is unique only within its miner, and other executors are not
     affected. Read from the Docker thread too (_refuse_filler_during_customer_create), hence the lock,
@@ -1494,6 +1468,9 @@ class _CustomerCreateRegistry:
         self._ended_by_executor: Counter[tuple[str, str]] = Counter()
         # keyed by the payload object, not the pod id: two creates of one pod can overlap (a retry)
         self._ended_seen_by_filler_create: dict[int, int] = {}
+        # a customer request that failed before create_container (the miner left the executor out) touched
+        # no host: it ends as no create, so a filler that started before it is not refused
+        self._customer_create_reached_create_container: dict[int, bool] = {}
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
@@ -1513,14 +1490,21 @@ class _CustomerCreateRegistry:
             return
         with self._lock:
             self._running_by_executor[executor] += 1
+            self._customer_create_reached_create_container[id(payload)] = False
         try:
             yield
         finally:
             with self._lock:
                 self._running_by_executor[executor] -= 1
-                self._ended_by_executor[executor] += 1
+                if self._customer_create_reached_create_container.pop(id(payload)):
+                    self._ended_by_executor[executor] += 1
                 if self._running_by_executor[executor] <= 0:
                     del self._running_by_executor[executor]
+
+    def reached_create_container(self, payload: ContainerCreateRequest) -> None:
+        with self._lock:
+            if id(payload) in self._customer_create_reached_create_container:
+                self._customer_create_reached_create_container[id(payload)] = True
 
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
@@ -3311,7 +3295,6 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         active_volume_names: list[str] | None,
-        with_df: bool = False,
     ) -> FillerRemovalAtSshConnect:
         """DAH-3980: a customer create's `filler_*` removal, started as soon as the SSH session is up
         so the kill overlaps the image inspect and the host probes. The same removal and confirmation
@@ -3335,7 +3318,7 @@ class DockerService:
             for name in filler_names_on_host
             if (volume_name := f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}") not in protected_volumes
         ]
-        removed_cleanly, df_avail_bytes_after_removal = await self._remove_stale_containers(
+        removed_cleanly = await self._remove_stale_containers(
             ssh_client,
             default_extra,
             pod_name,
@@ -3343,12 +3326,10 @@ class DockerService:
             True,
             volumes_to_remove,
             {name: listed_ids[name] for name in filler_names_on_host if name in listed_ids},
-            with_df and not volumes_to_remove,
         )
         return FillerRemovalAtSshConnect(
             listed_id_by_filler_name={name: listed_ids.get(name, "") for name in filler_names_on_host},
             removed_cleanly_without_volume_rm=removed_cleanly and not volumes_to_remove,
-            df_avail_bytes_after_removal=df_avail_bytes_after_removal,
         )
 
     async def clean_existing_containers(
@@ -3364,7 +3345,6 @@ class DockerService:
         remove_every_filler: bool = False,
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
-        with_df_after_removal: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
@@ -3384,9 +3364,6 @@ class DockerService:
         A stale container whose full ID the listing carried is removed by that ID, so a same-name
         container created after the listing is left alone; own_sweep_removals records each such ID
         before its `rm` is sent. A name listed without an ID is removed by name and not recorded.
-
-        ``with_df_after_removal`` (a customer's create) has the removal command read df after the rm
-        too, into ``report``.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -3453,7 +3430,7 @@ class DockerService:
                     if volume_name not in active_volume_set:
                         volumes_to_remove.append(volume_name)
 
-            removed_cleanly, df_avail_bytes_after_removal = await self._remove_stale_containers(
+            removed_cleanly = await self._remove_stale_containers(
                 ssh_client,
                 default_extra,
                 pod_name,
@@ -3461,14 +3438,9 @@ class DockerService:
                 remove_every_filler,
                 volumes_to_remove,
                 {name: listed_ids[name] for name in stale_containers if name in listed_ids},
-                # any other removal has the volume facts measured again, so its df would go unread
-                with_df_after_removal
-                and not volumes_to_remove
-                and all(name.startswith(FILLER_CONTAINER_PREFIX) for name in stale_containers),
             )
             if report is not None:
                 report.removed_cleanly_without_volume_rm = removed_cleanly and not volumes_to_remove
-                report.df_avail_bytes_after_removal = df_avail_bytes_after_removal
             return stale_containers
         return []
 
@@ -3485,30 +3457,28 @@ class DockerService:
         remove_every_filler: bool,
         volumes_to_remove: list[str],
         listed_ids: dict[str, str],
-        with_df: bool = False,
-    ) -> tuple[bool, int | None]:
+    ) -> bool:
         """`docker rm -fv` the stale containers (by ``listed_ids``, by name where none was listed), then
         `docker volume rm` the given volumes. A customer create (DAH-3706) uses the tolerant rm and then
         confirms that no filler survived; True only when that rm exited 0 at once and the confirmation
-        lists no filler, beside the df its command read after the rm (``with_df``; None otherwise).
-        The listed IDs are marked as ours when their `rm` is sent. After a replacement filler's rm, the
+        lists no filler. The listed IDs are marked as ours when their `rm` is sent. After a replacement filler's rm, the
         volume rm runs again."""
         targets = [listed_ids.get(name, name) for name in stale_containers]
         if not remove_every_filler:
             await self._rm_containers(ssh_client, targets, own_ids=listed_ids.values())
             if volumes_to_remove:
                 await self._remove_volumes(ssh_client, volumes_to_remove)
-            return False, None
+            return False
 
         # one deadline for the whole customer cleanup: the steps after the first removal get what is left of it
         cleanup_deadline = asyncio.get_running_loop().time() + _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
-        removed_at_once, listing_after, df_avail_bytes_after_rm = await self._remove_stale_containers_tolerantly(
-            ssh_client, default_extra, stale_containers, targets, volumes_to_remove, cleanup_deadline, with_df,
+        removed_at_once, listing_after = await self._remove_stale_containers_tolerantly(
+            ssh_client, default_extra, stale_containers, targets, volumes_to_remove, cleanup_deadline,
             own_ids=list(listed_ids.values()),
         )
         removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
         if not removed_fillers:
-            return False, None
+            return False
         survivors = self._confirm_fillers_removed(
             default_extra=default_extra,
             pod_name=pod_name,
@@ -3536,8 +3506,8 @@ class DockerService:
                         "[clean_existing_containers] the volume rm after a replacement filler's removal did not "
                         f"finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
                     ) from exc
-            return False, None
-        return removed_at_once and survivors == {}, df_avail_bytes_after_rm
+            return False
+        return removed_at_once and survivors == {}
 
     async def _remove_replacement_fillers(
         self,
@@ -3640,12 +3610,11 @@ class DockerService:
         targets: list[str],
         volumes_to_remove: list[str],
         cleanup_deadline: float,
-        with_df: bool = False,
         own_ids: Iterable[str] = (),
     ) -> CustomerContainerRemoval:
         """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
-        DAH-3980: the rm, the listing, the volume rm and (``with_df``) a df travel as one command, bounded by
+        DAH-3980: the rm, the listing and the volume rm travel as one command, bounded by
         _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS; a timeout fails the create at the cleanup step.
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
@@ -3657,7 +3626,7 @@ class DockerService:
         ``own_ids`` are marked as ours when a command carrying their `rm` is sent.
         """
         own_ids = list(own_ids)
-        command = _remove_and_list_containers_command(targets, volumes_to_remove, with_df=with_df)
+        command = _remove_and_list_containers_command(targets, volumes_to_remove)
         started = time.monotonic()
         timeout_error: TimeoutError | None = None
         try:
@@ -3666,12 +3635,12 @@ class DockerService:
             )
         except TimeoutError as exc:
             timeout_error = exc
-            rm_exit_status, listing_after, df_avail_bytes = None, None, None
+            rm_exit_status, listing_after = None, None
         except Exception as exc:
             rm_error: Exception = exc
-            rm_exit_status, listing_after, df_avail_bytes = None, None, None
+            rm_exit_status, listing_after = None, None
         else:
-            rm_exit_status, listing_after, df_avail_bytes = _parse_remove_and_list_containers(result.stdout or "")
+            rm_exit_status, listing_after = _parse_remove_and_list_containers(result.stdout or "")
             rm_error = Exception(
                 f"[clean_existing_containers] command: {command} exit_code {rm_exit_status}, "
                 f"stderr: {(result.stderr or '').strip()}"
@@ -3685,7 +3654,6 @@ class DockerService:
                     "rm_exit_status": rm_exit_status,
                     "listing_read": listing_after is not None,
                     "volume_rm": bool(volumes_to_remove),
-                    "df_avail_bytes": df_avail_bytes,
                 }),
             )
         )
@@ -3694,7 +3662,7 @@ class DockerService:
                 f"[clean_existing_containers] docker rm -fv did not finish in {_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS} s"
             ) from timeout_error
         if rm_exit_status == 0:
-            return CustomerContainerRemoval(True, listing_after, df_avail_bytes)
+            return CustomerContainerRemoval(True, listing_after)
 
         try:
             async with asyncio.timeout_at(cleanup_deadline):
@@ -3947,7 +3915,8 @@ class DockerService:
             # the renter's side and give the cache back unconditionally; the filler re-downloads it
             # after the rental, which is the filler's cost to pay, not the customer's.
             if requested_gb:
-                free_bytes = await self._get_fs_available_bytes(ssh_client)
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
+                free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 free_gb = free_bytes / (1024**3)
                 if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
                     return False
@@ -4015,7 +3984,8 @@ class DockerService:
             return list(payload.cache_volumes)
 
         try:
-            free_gb: float = await self._get_fs_available_bytes(ssh_client) / (1024**3)
+            docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
+            free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4473,14 +4443,21 @@ class DockerService:
         )
         # `docker inspect` on the host, not `id` in the container: a renter image is not
         # guaranteed to ship coreutils. Read beside the exec, it costs no round trip of its own.
+        def run_setup():
+            return ssh_client.run(setup_command, input=setup_script + key_data, check=False)
+
+        def run_user_inspect():
+            return ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}", check=False)
+
         setup_result, user_inspect_result = await asyncio.gather(
-            ssh_client.run(setup_command, input=setup_script + key_data, check=False),
-            ssh_client.run(
-                f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
-                check=False,
-            ),
-            return_exceptions=True,
+            run_setup(), run_user_inspect(), return_exceptions=True
         )
+        # an sshd with MaxSessions=1 refuses whichever channel opens second; nothing ran on it, so it runs
+        # again alone once the other one succeeded (after a failure the create fails anyway)
+        if isinstance(setup_result, asyncssh.ChannelOpenError) and getattr(user_inspect_result, "exit_status", None) == 0:
+            setup_result = await run_setup()
+        if isinstance(user_inspect_result, asyncssh.ChannelOpenError) and getattr(setup_result, "exit_status", None) == 0:
+            user_inspect_result = await run_user_inspect()
         # both settled: a failed inspect must not leave the setup running beside the failure cleanup
         for outcome in (setup_result, user_inspect_result):
             if isinstance(outcome, BaseException):
@@ -5439,11 +5416,15 @@ class DockerService:
             timeout_seconds=timeout,
         )
 
-    async def _get_fs_available_bytes(self, ssh_client: asyncssh.SSHClientConnection) -> int:
+    async def _get_fs_available_bytes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_root_dir: str,
+    ) -> int:
         # Delegates to the shared helper so the grant path (here) and the disk-tight reclaim
         # (container_cleanup) can never disagree on how free disk is measured — a df fix landing in
         # one copy only would make the validator grant a cache the backstop immediately reclaims.
-        return await df_available_bytes(ssh_client)
+        return await df_available_bytes(ssh_client, docker_root_dir)
 
     async def _get_existing_vloopback_bytes(
         self,
@@ -5612,7 +5593,7 @@ class DockerService:
                 )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                df_avail_bytes = await self._get_fs_available_bytes(ssh_client)
+                df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
         except asyncio.CancelledError:
             raise
@@ -6945,8 +6926,6 @@ class DockerService:
                             default_extra,
                             self.get_container_name(payload),
                             payload.active_volume_names,
-                            # the early volume probe may read df before this rm frees the disk
-                            with_df=measures_host and wants_volume_probe,
                         )
                     )
                     connections.push_async_callback(settle_filler_removal_at_ssh_connect)
@@ -7322,8 +7301,8 @@ class DockerService:
                         default_extra=default_extra,
                     )
                     current_step = "park_current_container"
-                    # DAH-3980: an earlier edit's steps after its reply remove `<name>_parked`; parked
-                    # before they ran, this edit's parked container would be the one removed
+                    # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
+                    # its removal of the container it parked, by that one's ID (never the one this edit parks)
                     if not await create_steps_after_reply.wait_until_done(
                         payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
                     ):
@@ -7400,18 +7379,10 @@ class DockerService:
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
-                    # the early volume probe's df predates the rm, which frees disk
-                    with_df_after_removal=measures_host and early_volume_probe is not None and image_present,
-                )
-                # the df read after the last removal: the cleanup's, or the SSH-connect one's if it removed nothing
-                df_after_removal = (
-                    cleanup_report.df_avail_bytes_after_removal
-                    if removed_containers
-                    else fillers_removed_at_ssh_connect.df_avail_bytes_after_removal
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
-                # filler delete) changes no listing but the containers and their mounts, and frees
-                # disk, so the probes stay; the volume is sized on the df the removal read after its rm.
+                # filler delete) changes no listing but the containers and their mounts, so the listings
+                # stay; the rm frees disk, so the volume facts are measured again (cleanup_changed_host).
                 removed_only_fillers_cleanly = (
                     (cleanup_report.removed_cleanly_without_volume_rm or not removed_containers)
                     and (
@@ -7472,7 +7443,7 @@ class DockerService:
                     host_probe=docker_listing_probe,
                 )
                 cleanup_changed_host = bool(
-                    (removed_containers and not removed_only_fillers_cleanly)
+                    removed_containers
                     or removed_vloopback_volumes
                     or swept_cache_volumes
                     or reclaimed_cache_volumes
@@ -7589,18 +7560,9 @@ class DockerService:
                     # passthrough contract needs neither, so it pays for no command
                     if wants_volume_probe:
                         current_step = "volume_host_probe"
-                        # a removal frees disk: the early df stands only with the df read after the rm
-                        early_df_stands = not (removed_containers and measures_host) or df_after_removal is not None
-                        if (
-                            early_volume_probe is not None
-                            and image_present
-                            and not cleanup_changed_host
-                            and early_df_stands
-                        ):
+                        if early_volume_probe is not None and image_present and not cleanup_changed_host:
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
-                            if volume_probe is not None and df_after_removal is not None:
-                                volume_probe = dataclasses.replace(volume_probe, df_avail_bytes=df_after_removal)
                         else:
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
