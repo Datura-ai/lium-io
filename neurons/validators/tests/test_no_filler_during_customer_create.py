@@ -140,7 +140,7 @@ async def test_customer_create_registering_until_the_filler_container_exists_ref
             stream_log_blocked.set()
             await stream_log_released.wait()
 
-    async def customer_sweeps_the_running_filler(*_args) -> bool:
+    async def customer_sweeps_the_running_filler(*_args, **_kwargs) -> bool:
         register_customer()
         return False
 
