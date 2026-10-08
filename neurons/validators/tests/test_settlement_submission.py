@@ -16,7 +16,7 @@ from clients.backend_client import (
 )
 from clients.subtensor_client import fold_unregistered_into_burner, scored_registered_neurons
 from core.settlement import cycle_node_shares, share_moved, tempo_index
-from core.validator import PENDING_INCLUSION_KEY, UNACKED_CYCLE_REPORTS_KEY, UNACKED_CYCLE_REPORTS_MAX, Validator
+from core.validator import PENDING_INCLUSION_KEY, UNACKED_CYCLE_REPORTS_MAX, Validator
 from incentive.burn_service import verified_burner_hotkey
 
 WINDOW = SettledWeights(
