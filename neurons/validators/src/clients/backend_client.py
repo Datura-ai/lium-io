@@ -613,5 +613,5 @@ class BackendClient:
     async def report_settled_weights_result(self, tempo_index: int, inclusion_block: int) -> SettledWeightsResult | None:
         path = f"/validator/{self.keypair.ss58_address}/settled-weights/{tempo_index}/result"
         return await self._signed_request(
-            "POST", path, SettledWeightsResult, json_data={"inclusion_block": inclusion_block}
+            "POST", path, SettledWeightsResult, json_data={"inclusion_block": inclusion_block}, raise_on_4xx=True
         )

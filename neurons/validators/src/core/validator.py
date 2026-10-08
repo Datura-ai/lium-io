@@ -210,6 +210,8 @@ class Validator:
         # the tempo index already submitted (or read, in shadow, or found empty): should_set_weights stays true for a
         # tick or two after a submission, and a second attempt for the same frozen window would be rejected as too fast
         self._settled_tempo_done: int | None = None
+        # inclusions not acknowledged yet, also held here: a Redis down at both keeps must not lose one
+        self._unacknowledged_inclusions: dict[str, int] = {}
         # init miner_scores: always load from Redis if present so accumulated
         # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
         try:
@@ -1144,7 +1146,7 @@ class Validator:
             kept = await self.redis_service.get(PENDING_INCLUSION_KEY)
         except Exception:
             return None
-        return json.loads(kept) if kept else {}
+        return {**(json.loads(kept) if kept else {}), **self._unacknowledged_inclusions}
 
     async def _confirm_inclusion(self, index: int, block: int) -> bool:
         """Tell the backend the block read right after the chain accepted the tempo's vector (the extrinsic landed
@@ -1153,6 +1155,16 @@ class Validator:
         await self._keep_pending_inclusion(index, block)
         try:
             confirmed = await self.backend_client.report_settled_weights_result(index, block)
+        except BackendRejected as exc:
+            # the backend has no such window: waiting would hold every later window back for good
+            logger.error(
+                _m(
+                    "[settlement] inclusion report rejected by the backend; dropped",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
+                )
+            )
+            await self._keep_pending_inclusion(index, None)
+            return True
         except Exception as exc:
             logger.warning(
                 _m(
@@ -1167,6 +1179,10 @@ class Validator:
 
     async def _keep_pending_inclusion(self, index: int, block: int | None) -> None:
         # None drops the tempo's entry. Each tempo's stays until its own acknowledgement: a later one never clears it
+        if block is None:
+            self._unacknowledged_inclusions.pop(str(index), None)
+        else:
+            self._unacknowledged_inclusions[str(index)] = block
         pending = await self._pending_inclusions()
         if pending is None:
             logger.warning(
