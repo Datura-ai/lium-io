@@ -1337,11 +1337,11 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the listing that finds the filler at SSH connect, then the rm and its confirming listing in one command,
-    # and the pid_max read every rental makes after
+    # the fail-closed pid_max read every rental makes first, then the listing that finds the filler and the
+    # rm with its confirming listing in one command — the removal starts only once the host reads succeed
     assert _cmds(ssh_client) == [
-        *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL]),
         "cat /proc/sys/kernel/pid_max",
+        *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL]),
     ]
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
@@ -1497,31 +1497,14 @@ async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("docker_rm_seconds", "docker_rm_raises", "delete_seconds", "logged_error_types"),
-    [
-        # the create fails while the removal is in flight: the removal is cancelled, nothing logged
-        (5, None, 0, []),
-        # the removal failed first on a host's crafted text: only the error's type reaches the log
-        (0, asyncssh.ConnectionLost("HOSTILE-BANNER-6f1c\nforged log line"), 0.05, ["ConnectionLost"]),
-    ],
-    ids=["removal_in_flight", "removal_failed"],
-)
-async def test_create_failing_before_the_cleanup_settles_the_removal_at_ssh_connect(
-    svc_fixture, monkeypatch, caplog, docker_rm_seconds, docker_rm_raises, delete_seconds, logged_error_types
-):
+async def test_a_create_cancelled_at_ssh_connect_never_starts_the_filler_removal(svc_fixture, monkeypatch, caplog):
+    """The removal is irreversible, so it starts only after the fail-closed host reads. A create cancelled
+    at SSH connect (before those reads) must never have removed the filler, or a cancel would strand the
+    host with neither workload — the ordering the review required at 65b84b3."""
     svc = svc_fixture
-    _wire_customer_create_over_the_host(
-        svc,
-        monkeypatch,
-        probe=_probe_with_containers("filler_x"),
-        docker_rm_seconds=docker_rm_seconds,
-        docker_rm_raises=docker_rm_raises,
-        listings_that_answer=1,  # the listing after a failed rm fails too, so the rm's error is raised
-    )
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
 
     async def deleted(*args, **kwargs):
-        await asyncio.sleep(delete_seconds)
         raise RuntimeError("deleted")
 
     monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock(side_effect=deleted))
@@ -1532,18 +1515,15 @@ async def test_create_failing_before_the_cleanup_settles_the_removal_at_ssh_conn
 
     assert type(result).__name__ == "FailedContainerRequest"
     assert result.failure_step == "ssh_connect"
+    # the filler's docker rm never ran, no removal task lingers, and nothing is logged about a removal
+    assert not [cmd for cmd in _cmds(ssh_client) if "/usr/bin/docker rm -fv" in cmd]
     assert not [
         task for task in asyncio.all_tasks() if "remove_fillers_at_ssh_connect" in repr(task.get_coro()) and not task.done()
     ]
-    assert logged_error_types == [
-        record.msg.extra["error_type"] for record in caplog.records
+    assert not [
+        record for record in caplog.records
         if getattr(record.msg, "message", None) == "Filler removal at SSH connect failed before the cleanup step"
     ]
-    logged = "".join(
-        record.msg.to_full_string() if hasattr(record.msg, "to_full_string") else record.getMessage()
-        for record in caplog.records
-    )
-    assert "HOSTILE-BANNER-6f1c" not in logged
 
 
 @pytest.mark.asyncio
@@ -1571,10 +1551,9 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # a customer create removes the filler at SSH connect, before the pid_max read; a bootstrap restore
-    # removes it at the cleanup step, after the fail-closed probe that every rental runs first
-    expected = ["cat /proc/sys/kernel/pid_max", *commands] if bootstrap_restore else [*commands, "cat /proc/sys/kernel/pid_max"]
-    assert _cmds(ssh_client) == expected
+    # the fail-closed pid_max read every rental makes comes first; only then does the removal run (at SSH
+    # connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
+    assert _cmds(ssh_client) == ["cat /proc/sys/kernel/pid_max", *commands]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)

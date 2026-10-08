@@ -7015,8 +7015,9 @@ class DockerService:
             probe_with_power = not brings_own_power_cap
             early_host_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
             early_volume_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
-            # DAH-3980: a customer's create removes every filler (DAH-3706); started with the probes,
-            # the kill runs beside the image inspect instead of after it. Any other create (a filler
+            # DAH-3980: a customer's create removes every filler (DAH-3706). The kill is started after the
+            # fail-closed host reads below (never before — a refused probe must leave the filler in place),
+            # so it still runs beside the image inspect instead of after it. Any other create (a filler
             # create, a restore, a custom build, a local volume) keeps the removal at the cleanup step.
             removes_fillers_at_ssh_connect = (
                 early_probes_allowed
@@ -7043,17 +7044,7 @@ class DockerService:
                     )
 
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
-                nonlocal early_host_probe, early_volume_probe, filler_removal_at_ssh_connect
-                if removes_fillers_at_ssh_connect:
-                    filler_removal_at_ssh_connect = asyncio.create_task(
-                        self.remove_fillers_at_ssh_connect(
-                            connected_ssh_client,
-                            default_extra,
-                            self.get_container_name(payload),
-                            payload.active_volume_names,
-                        )
-                    )
-                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
+                nonlocal early_host_probe, early_volume_probe
                 if not early_probes_allowed:
                     return
                 if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
@@ -7182,6 +7173,22 @@ class DockerService:
                                 "refusing to start a split rental sent without a memory limit"
                             )
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
+
+                # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
+                # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
+                # MaxSessions=1 denying its channel while the removal held the session) would reject the rental
+                # after the filler was already gone, stranding the host. So the removal starts only now, once the
+                # host reads have succeeded, and still runs beside the image inspect/pull below.
+                if removes_fillers_at_ssh_connect:
+                    filler_removal_at_ssh_connect = asyncio.create_task(
+                        self.remove_fillers_at_ssh_connect(
+                            ssh_client,
+                            default_extra,
+                            self.get_container_name(payload),
+                            payload.active_volume_names,
+                        )
+                    )
+                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
 
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
