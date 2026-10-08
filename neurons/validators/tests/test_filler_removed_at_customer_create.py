@@ -831,6 +831,27 @@ async def test_a_late_fillers_power_cap_is_lifted_once_it_is_confirmed_gone(svc,
 
 
 @pytest.mark.asyncio
+async def test_a_power_restore_that_never_answers_fails_the_customer_create(svc, monkeypatch):
+    ssh_client = _customer_create_host(
+        svc,
+        monkeypatch,
+        listing_at_running_check=f"NAME\tfiller_stuck {_FILLER_ID}\nPS\t0\n",
+        listing_after_rm="RM\t0\nPS\t0\n",
+    )
+
+    async def restore_whose_channel_never_opens(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", restore_whose_channel_never_opens)
+    monkeypatch.setattr(ds_module, "_FILLER_POWER_RESTORE_TIMEOUT_SECONDS", 0.05)
+
+    result = await asyncio.wait_for(_run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL)), timeout=5)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "container_cleanup"
+    assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
+
+@pytest.mark.asyncio
 async def test_a_running_check_that_never_answers_fails_the_customer_create(svc, monkeypatch):
     ssh_client = _customer_create_host(svc, monkeypatch, listing_at_running_check="PS\t0\n", listing_after_rm="")
     default_run = ssh_client.run.side_effect

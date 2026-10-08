@@ -449,6 +449,9 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
+# a filler's power restore is one nvidia-smi query and a few sets that take seconds; a hung host fails the
+# customer's create instead of hanging it
+_FILLER_POWER_RESTORE_TIMEOUT_SECONDS = 60
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -954,8 +957,8 @@ class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
 
 
 class _FillerBesideCustomerContainer(Exception):
-    """Raised by a customer create's running check: a `filler_*` on the host survived its removal, or the
-    host could not be listed to confirm there is none."""
+    """Raised by a customer create's running check: a `filler_*` on the host survived its removal, the host
+    could not be listed to confirm there is none, or the removed filler's GPU power restore did not finish."""
 
 
 class ImageExitedDuringKeyInjection(Exception):
@@ -3409,10 +3412,21 @@ class DockerService:
             raise _FillerBesideCustomerContainer(f"{sorted(survivors)} still on the host after docker rm -fv")
         # DAH-2356: a PEARL filler caps its GPUs before its `docker run`, possibly after this create's
         # last power restore; lifted only now that it is confirmed gone
-        for name in fillers:
-            await restore_filler_pod_gpu_power_limits(
-                ssh_client, self.redis_service, name.removeprefix(FILLER_CONTAINER_PREFIX), log_extra=default_extra
-            )
+        try:
+            # its nvidia-smi calls bound only the command, not their channel open
+            async with asyncio.timeout(_FILLER_POWER_RESTORE_TIMEOUT_SECONDS):
+                for name in fillers:
+                    await restore_filler_pod_gpu_power_limits(
+                        ssh_client,
+                        self.redis_service,
+                        name.removeprefix(FILLER_CONTAINER_PREFIX),
+                        log_extra=default_extra,
+                    )
+        except TimeoutError as exc:
+            raise _FillerBesideCustomerContainer(
+                f"the GPU power restore after removing {fillers} did not finish in "
+                f"{_FILLER_POWER_RESTORE_TIMEOUT_SECONDS} s"
+            ) from exc
 
     async def wait_for_port_check_containers(
         self,
