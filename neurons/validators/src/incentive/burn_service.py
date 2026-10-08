@@ -39,6 +39,19 @@ def _burner_coldkey_matches(miner: bittensor.NeuronInfo) -> bool:
     return False
 
 
+def verified_burner_hotkey(miners: list[bittensor.NeuronInfo]) -> str | None:
+    """The first burner slot's hotkey, only while its coldkey is the configured one (DAH-4001).
+
+    Withheld idle shares and the fallback vector's idle go to it, so it passes the same check as the burn share.
+    None when the uid is not in `miners` or another coldkey holds it: the caller must not pick a substitute.
+    """
+    burner_uid = (settings.NEW_BURNERS if settings.ENABLE_NEW_BURN_LOGIC else settings.BURNERS)[0]
+    burner = next((miner for miner in miners if miner.uid == burner_uid), None)
+    if burner is None or not _burner_coldkey_matches(burner):
+        return None
+    return burner.hotkey
+
+
 class BurnService:
     """Service for calculating burn emission distribution across burner nodes.
 

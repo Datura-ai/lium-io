@@ -510,6 +510,12 @@ class Settings(BaseSettings):
     )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
+    # DAH-4001 — delayed idle settlement. off: today's behaviour, nothing reported. shadow: post every cycle's
+    # vector and per-node rows to the backend and read its settled vector every tempo for comparison only; live
+    # weights unchanged. enforce: submit the backend's settled vector (the cycles scored a day earlier, inactive
+    # nodes' idle shares moved to the verified burner); with none to serve, submit this tempo's vector with its
+    # idle moved to the burner, never an older vector.
+    SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
     EXECUTOR_IMAGE_REF: str = Field(
