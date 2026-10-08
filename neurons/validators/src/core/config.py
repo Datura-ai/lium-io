@@ -1,3 +1,4 @@
+import logging
 import pathlib
 from datetime import datetime
 from enum import Enum
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
 
 from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureFlag(str, Enum):
@@ -781,6 +784,32 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_DIND_MEMORY", default="8g",
         description="--memory limit for the throwaway DinD build container.",
     )
+    RENTAL_PIDS_LIMIT_PER_CPU: int = Field(
+        env="RENTAL_PIDS_LIMIT_PER_CPU", default=4096, ge=0,
+        description=(
+            "cgroup pids.max granted to a rental container per allocated CPU. 0 disables the limit "
+            "(rollback switch). The product is clamped to RENTAL_PIDS_LIMIT_CAP; a rental with no "
+            "per-pod CPU cap (whole host) gets RENTAL_PIDS_LIMIT_CAP. Stops a tenant fork bomb from "
+            "exhausting the host PID space and taking the executor offline mid-rental."
+        ),
+    )
+    RENTAL_PIDS_LIMIT_CAP: int = Field(
+        env="RENTAL_PIDS_LIMIT_CAP", default=1_048_576, gt=0,
+        description=(
+            "Absolute ceiling for a rental container's pids.max, and the value used when the rental "
+            "has no per-pod CPU cap. Kept well below a host's kernel.pid_max so a fork bomb still hits "
+            "the cgroup wall first."
+        ),
+    )
+    RENTAL_PIDS_LIMIT_HOST_MARGIN: int = Field(
+        env="RENTAL_PIDS_LIMIT_HOST_MARGIN", default=4096, ge=0,
+        description=(
+            "PIDs reserved for the host's own tasks (sshd, dockerd, the executor) when a rental "
+            "container's pids.max is clamped to the executor's actual kernel.pid_max. The container "
+            "gets min(scaled cap, kernel.pid_max - this), so on a host with a low kernel.pid_max it "
+            "still cannot exhaust the global PID space before hitting its own cgroup wall."
+        ),
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(
@@ -833,6 +862,14 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
                     "of at least 32 characters"
+                )
+            # one unit of up to 8 bytes repeated holds at most 64 bits however long it is; a random secret
+            # of 32+ characters is never one (odds about 2^-96 for hex). A warning, not a refusal: the
+            # remedy, a new secret, leaves every volume encrypted under the old one unreadable
+            encoded = secret.encode()
+            if any(encoded[period:] == encoded[:-period] for period in range(1, 9)):
+                logger.warning(
+                    "VOLUME_MASTER_SECRET repeats a unit of at most 8 bytes, so it holds at most 64 bits"
                 )
         return self
 

@@ -83,6 +83,8 @@ def _ssh_client(*, inspect_exit: int = 0, inspect_raises: bool = False):
     client.image_exists_error = RuntimeError("probe boom") if inspect_raises else None
 
     def _side(cmd, *args, **kwargs):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
         return _ssh_result(exit_status=0)
 
     client.run = AsyncMock(side_effect=_side)
@@ -338,6 +340,57 @@ async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_rental_is_refused_when_the_host_pid_max_cannot_be_read(svc, monkeypatch):
+    """An unreadable kernel.pid_max fails closed, and before any host side-effect.
+
+    Review finding on #1531: the refusal must sit ahead of local-volume creation and the filler
+    GPU power cap, or a refusal leaks a volume / leaves GPUs capped with no container. Only the
+    pid_max read fails here (every other command succeeds) so the flow reaches the read, and we
+    assert create_local_volume was never awaited — it runs before the volume (and the later
+    power cap), so neither is reached.
+    """
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+
+    def _only_pid_max_fails(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=1)
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_only_pid_max_fails)
+
+    result = await _run(svc, _payload())
+
+    assert not isinstance(result, ContainerCreated)
+    assert _docker_client(svc).run_specs == []
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rental_is_refused_when_the_host_pid_max_is_too_low_for_the_margin(svc, monkeypatch):
+    """A readable but tiny kernel.pid_max also fails closed before any host side-effect.
+
+    Review finding on #1531: a host whose pid_max cannot reserve RENTAL_PIDS_LIMIT_HOST_MARGIN
+    (here 512 with the 4096 default margin) would otherwise hand the container every PID.
+    """
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+
+    def _tiny_pid_max(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="512\n")
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_tiny_pid_max)
+
+    result = await _run(svc, _payload())
+
+    assert not isinstance(result, ContainerCreated)
+    assert _docker_client(svc).run_specs == []
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_present_image_is_used_when_the_registry_check_fails(svc, monkeypatch):
     """DAH-3873: fail open. A registry that does not answer must not block the rental."""
     _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
@@ -390,7 +443,11 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     _docker_client(svc).repo_digests = ("daturaai/pytorch@sha256:current",)
     no_docker_hub_digest_on_rent_path.return_value = "sha256:current"
 
-    result = await _run(svc, _payload(docker_image="daturaai/pytorch:prod"))
+    payload = _payload(docker_image="daturaai/pytorch:prod")
+
+    result = await _run(svc, payload)
+    # the inspector start runs after the reply
+    await ds_module.create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
 
     assert isinstance(result, ContainerCreated)
     no_docker_hub_digest_on_rent_path.assert_awaited_once_with("daturaai/pytorch:prod")
@@ -399,7 +456,13 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _docker_client(svc).login_calls == []
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
+        # a customer's create looks for fillers to remove as soon as the SSH session is up
+        '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"',
         '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the host's kernel.pid_max, read before any host side-effect so a rental whose pids.max
+        # can't be clamped below it is refused with nothing to undo; a bare cat bounded by
+        # asyncssh's timeout, no `timeout` binary to be absent
+        "cat /proc/sys/kernel/pid_max",
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
@@ -690,11 +753,11 @@ async def test_summary_emitted_on_success(svc, monkeypatch):
     assert isinstance(extra["total_duration_ms"], int)
     names = {s["name"] for s in extra["profile_steps"]}
     assert "Docker pull step finished" in names
-    assert "Inspector collector start step finished" in names
+    assert "Inspector collector start runs after the reply" in names
     assert "Finished in subnet." in names
     inspector = next(
         s for s in extra["profile_steps"]
-        if s["name"] == "Inspector collector start step finished"
+        if s["name"] == "Inspector collector start runs after the reply"
     )
     assert inspector["skipped"] is True
 

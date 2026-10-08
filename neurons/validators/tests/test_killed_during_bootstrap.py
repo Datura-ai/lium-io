@@ -29,6 +29,7 @@ from services.docker_service import (
     KILLED_DURING_BOOTSTRAP_STEP,
     OOM_DURING_BOOTSTRAP_STEP,
     ContainerKilledDuringBootstrap,
+    CustomerContainerRemoval,
     DockerService,
     container_gone_cause,
     inflight_creates,
@@ -495,14 +496,14 @@ async def test_the_stale_sweep_records_the_container_ids_it_sends_rm_for(svc, fr
         if from_probe else None
     )  # fmt: skip
 
-    async def remove(_ssh, _extra, _pod, _names, _targets, _every, own_ids=()):
+    async def remove(_ssh, _extra, _names, _targets, _volumes, _deadline, own_ids=()):
         assert list(own_ids) == [swept_id]
         if rm_error is not None:
             raise rm_error
         own_sweep_removals.mark(own_ids)  # what the real `rm` does once it is sent
-        return survivors
+        return CustomerContainerRemoval(True, (tuple(survivors), survivors))
 
-    svc._remove_stale_containers = remove
+    svc._remove_stale_containers_tolerantly = remove
     sweep = svc.clean_existing_containers(
         ssh_client=ssh, default_extra={}, pod_name="pod_new", clear_volume=False,
         active_container_names=["pod_keep", "filler_swept-1"], remove_every_filler=True,
@@ -624,7 +625,8 @@ async def test_a_replacement_filler_is_ours_once_its_rm_is_handed_to_ssh(svc, mo
 
     ssh.run = AsyncMock(side_effect=run)
 
-    await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
+    deadline = asyncio.get_running_loop().time() + 60
+    await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id}, deadline)
 
     assert own_sweep_removals.sent_rm_for(replacement_id) == (after != "rm-never-sent")
 
@@ -633,7 +635,6 @@ async def test_a_replacement_filler_is_ours_once_its_rm_is_handed_to_ssh(svc, mo
 async def test_a_wedged_replacement_filler_rm_fails_the_create_at_the_cleanup_deadline(svc, monkeypatch):
     """SSH stays up but `docker rm -fv` never answers: the shared deadline fails the cleanup, and the ID
     stays ours, since the `rm` may have run."""
-    monkeypatch.setattr(docker_service_module, "_REPLACEMENT_FILLER_CLEANUP_TIMEOUT_SECONDS", 0.05)
     replacement_id = _container_id("filler_swept-1", generation=1)
     ssh = _sweep_host("")
     listing = ssh.run.side_effect
@@ -645,8 +646,9 @@ async def test_a_wedged_replacement_filler_rm_fails_the_create_at_the_cleanup_de
 
     ssh.run = AsyncMock(side_effect=run)
 
-    with pytest.raises(Exception, match=r"\[clean_existing_containers\] replacement filler removal did not finish"):
-        await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id})
+    deadline = asyncio.get_running_loop().time() + 0.05
+    with pytest.raises(Exception, match=r"\[clean_existing_containers\] docker rm -fv of a replacement filler did not"):
+        await svc._remove_replacement_fillers(ssh, {}, "pod_new", {"filler_swept-1": replacement_id}, deadline)
 
     assert own_sweep_removals.sent_rm_for(replacement_id)
 
@@ -711,7 +713,8 @@ def test_the_killed_diagnosis_names_the_cause_and_the_status_it_was_read_in(
 @pytest.mark.parametrize(
     "case",
     ["acknowledged", "node-removed-it-first", "replaced-by-a-new-same-name-container", "no-id-listed",
-     "acknowledged-then-a-later-target-failed", "rm-sent-answer-lost", "rm-sent-answer-lost-confirmation-failed"],
+     "acknowledged-then-a-later-target-failed", "rm-sent-answer-lost", "rm-sent-answer-lost-confirmation-failed",
+     "rm-never-sent-then-retried"],
 )  # fmt: skip
 async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, case):
     """The sweep removes by the listed ID and records each ID before its `rm` is sent, whatever the `rm`
@@ -727,16 +730,21 @@ async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, 
         "node-removed-it-first": "",
         "replaced-by-a-new-same-name-container": f"filler_a {new}\n",
         "acknowledged-then-a-later-target-failed": f"filler_b {other}\n",
+        "rm-never-sent-then-retried": listing,
     }.get(case, "")
     listings = iter([listing, after, after, after])
     rms: list[list[str]] = []
 
     async def run(command, **_kwargs):
         if command.startswith("/usr/bin/docker rm -fv "):
-            targets = command.removeprefix("/usr/bin/docker rm -fv ").split()
+            # the first removal carries its own listing in the same command; a retry or a replacement's rm is bare
+            one_command = "; rm_rc=$?" in command
+            targets = command.removeprefix("/usr/bin/docker rm -fv ").split(" >/dev/null")[0].split()
             rms.append(targets)
             if targets == [new]:
                 return Mock(stdout=f"{new}\n", stderr="", exit_status=0)
+            if case == "rm-never-sent-then-retried" and one_command:
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed")
             if case.startswith("rm-sent-answer-lost"):
                 raise ConnectionResetError("SSH dropped after the rm was sent")
             if case in ("node-removed-it-first", "replaced-by-a-new-same-name-container"):
@@ -745,13 +753,16 @@ async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, 
                 printed, code = [t for t in targets if t != other], 1
             else:
                 printed, code = targets, 0
+            if one_command:
+                listed = "".join(f"NAME\t{line}\n" for line in next(listings).splitlines())
+                return Mock(stdout=f"RM\t{code}\n{listed}PS\t0\n", stderr="err", exit_status=0)
             return Mock(stdout="".join(f"{t}\n" for t in printed), stderr="err", exit_status=code)
         text = next(listings)
         if case == "rm-sent-answer-lost-confirmation-failed" and text is not listing:
             return Mock(stdout="", stderr="daemon unreachable", exit_status=1)
         if [new] in rms:  # the replacement is gone once its own rm ran
             text = "".join(line for line in text.splitlines(keepends=True) if new not in line)
-        if "--no-trunc" not in command:  # the names-only confirmation listing
+        if "--no-trunc" not in command:  # a names-only listing: none since the one command, every listing carries IDs
             text = "".join(f"{line.split()[0]}\n" for line in text.splitlines() if line.strip())
         return Mock(stdout=text, stderr="", exit_status=0)
 
@@ -765,7 +776,7 @@ async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, 
         with pytest.raises(Exception, match="exit_code 1"):
             await sweep
     elif case == "rm-sent-answer-lost-confirmation-failed":
-        # nothing shows the rm took effect: the sweep fails, and its finalizer still records the IDs
+        # nothing shows the rm took effect: the sweep fails, and the IDs marked when the one command was sent stay ours
         with pytest.raises(ConnectionResetError):
             await sweep
     else:
@@ -782,6 +793,19 @@ async def test_every_listed_id_the_sweep_sends_rm_for_is_ours(svc, monkeypatch, 
     assert rms[0] == [old, other]
     assert own_sweep_removals.sent_rm_for(old) and own_sweep_removals.sent_rm_for(other)
     assert own_sweep_removals.sent_rm_for(new) == replaced
+
+
+@pytest.mark.asyncio
+async def test_a_filler_create_sweep_records_the_ids_it_sends_rm_for(svc):
+    old = _container_id("filler_a")
+    ssh = _sweep_host(f"filler_a {old}\n")
+
+    await svc.clean_existing_containers(
+        ssh_client=ssh, default_extra={}, pod_name="filler_new", clear_volume=False, active_container_names=[]
+    )
+
+    assert ssh.rms == [[old]]
+    assert own_sweep_removals.sent_rm_for(old)
 
 
 def test_the_listing_maps_each_name_to_its_full_container_id():

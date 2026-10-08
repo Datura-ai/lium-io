@@ -40,8 +40,10 @@ from services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
 )
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.duplicate_executor import keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
@@ -58,6 +60,49 @@ WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
 # Executor uuid request_job_to_miner reports a miner-level failure under (no real executor).
 FAILED_MINER_EXECUTOR_UUID = "11111111-1111-1111-1111-111111111111"
+
+
+def settle_cycle_results(
+    all_job_results: dict[str, list[JobResult]],
+    default_extra: dict,
+    rented_executors: RentedExecutorsResponse | None = None,
+) -> dict[str, int]:
+    """Settle machines scored under more than one hotkey, then count the scored GPUs per model.
+
+    The count comes after: a copy zeroed there must not count in its tier. A failure of the
+    duplicate pass is logged and the cycle scores its results as they are.
+    """
+    try:
+        rental_hotkeys = {
+            str(executor_id).lower(): rented.miner_hotkey
+            for executor_id, rented in (rented_executors.executors if rented_executors else {}).items()
+        }
+        keep_one_miner_per_executor(all_job_results, default_extra, rental_hotkeys)
+    except Exception as exc:
+        logger.error(
+            _m("[sync] Duplicate-executor pass failed; results left as they are", extra=get_extra_info({**default_extra, "error": str(exc)})),
+            exc_info=True,
+        )
+    total_gpu_model_count_map: dict[str, int] = {}
+    for job_results in all_job_results.values():
+        for job_result in job_results:
+            if (
+                job_result.gpu_model
+                and job_result.gpu_count
+                and (job_result.score > 0 or job_result.job_score > 0)
+                and not job_result.is_spot
+                and not is_missing_discord_after_cutoff(job_result)
+                and not (
+                    job_result.is_new_rentals_paused and not job_result.is_rented
+                )
+            ):
+                total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
+    return total_gpu_model_count_map
+
+
+def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
+    """All but a zeroed duplicate under the keeper's own executor UUID: that backend row hears the keeper."""
+    return [result for result in results if not result.duplicate_shares_kept_row]
 
 
 class Validator:
@@ -415,7 +460,6 @@ class Validator:
                     }
 
                 try:
-                    total_gpu_model_count_map = {}
                     all_job_results = {}
                     miner_coldkeys = {}
 
@@ -449,19 +493,6 @@ class Validator:
 
                                 all_job_results[miner_hotkey] = job_results
                                 miner_coldkeys[miner_hotkey] = miner_coldkey
-
-                                for job_result in job_results:
-                                    if (
-                                        job_result.gpu_model
-                                        and job_result.gpu_count
-                                        and (job_result.score > 0 or job_result.job_score > 0)
-                                        and not job_result.is_spot
-                                        and not is_missing_discord_after_cutoff(job_result)
-                                        and not (
-                                            job_result.is_new_rentals_paused and not job_result.is_rented
-                                        )
-                                    ):
-                                        total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 
                             else:
                                 info = task_info.get(task, {})
@@ -515,6 +546,12 @@ class Validator:
                             )
                             task.cancel()
 
+                    total_gpu_model_count_map = settle_cycle_results(
+                        all_job_results,
+                        {**self.default_extra, "job_batch_id": job_batch_id},
+                        rented_executors,
+                    )
+
                     try:
                         open_fd_count = len(os.listdir('/proc/self/fd'))
                     except FileNotFoundError:
@@ -545,11 +582,12 @@ class Validator:
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
                     # withheld result (DAH-3405) got no verdict on that executor this cycle, so it
-                    # is treated as active as well.
+                    # is treated as active as well, and so is one whose passed copy another
+                    # hotkey kept the score for.
                     self.active_hotkeys = {
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
-                        if any(result.is_successful for result in results)
+                        if any(result.is_successful or result.duplicate_kept_by for result in results)
                     } | {withheld.miner_hotkey for withheld in withheld_results}
 
                     incentive = IncentiveFactory.create(
@@ -667,7 +705,11 @@ class Validator:
                     for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
-                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
+                            await self.miner_service.publish_machine_specs(
+                                specs_to_publish(results), miner_hotkey, miner_coldkey
+                            )
+                            # an unpublished duplicate copy is still handled by this cycle: the
+                            # express lane must not run it as a new node
                             published_executor_ids.extend(
                                 result.executor_info.uuid
                                 for result in results

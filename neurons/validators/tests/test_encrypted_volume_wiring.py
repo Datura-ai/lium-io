@@ -51,8 +51,8 @@ async def _setup(ssh_client) -> None:
     )
 
 
-# upload, run setup, wipe tmp, verify mount, inspect USER, chown, probe
-_UP_TO_PROBE: list[tuple[int, str]] = [(0, ""), (0, ""), (0, ""), (0, ""), (0, "prism\n"), (0, "")]
+# setup exec, inspect USER (beside it), chown, probe
+_UP_TO_PROBE: list[tuple[int, str]] = [(0, ""), (0, "prism\n"), (0, "")]
 
 
 @pytest.mark.asyncio
@@ -76,7 +76,7 @@ async def test_successful_probe_lets_the_setup_finish():
 @pytest.mark.asyncio
 async def test_root_image_skips_chown_and_probe_entirely():
     # inspect returns an empty USER -> nothing to hand over
-    ssh_client = _ScriptedSshClient([(0, ""), (0, ""), (0, ""), (0, ""), (0, "\n")])
+    ssh_client = _ScriptedSshClient([(0, ""), (0, "\n")])
 
     await _setup(ssh_client)
 
