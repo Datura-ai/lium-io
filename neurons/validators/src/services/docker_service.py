@@ -953,9 +953,6 @@ class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
     """Raised at a filler's `docker run` while a customer create runs on the same executor."""
 
 
-FINAL_FILLER_CHECK_STEP = "final_filler_check"
-
-
 class _FillerBesideCustomerContainer(Exception):
     """Raised by a customer create's running check: a `filler_*` on the host survived its removal, or the
     host could not be listed to confirm there is none."""
@@ -3329,7 +3326,7 @@ class DockerService:
         DAH-3980: ``remove_every_filler`` (a customer's create) lists the host in the same exec; once the
         container runs, every `filler_*` on that listing is removed and confirmed gone, or the create
         fails (_FillerBesideCustomerContainer). That covers a survivor of the sweep before `docker run`
-        and a filler created since it.
+        and a filler created since it. That exec is bounded; one that does not answer fails the create.
         """
         start_time = time.time()
         name_filter = shlex.quote(f"name={container_name}")
@@ -3337,11 +3334,19 @@ class DockerService:
         if remove_every_filler:
             command += f"; {_RUNNING_CHECK_LISTING_CMD}"
         while time.time() - start_time < timeout:
-            result = await ssh_client.run(command)
             if not remove_every_filler:
+                result = await ssh_client.run(command)
                 if result.stdout.strip():
                     return True
             else:
+                try:
+                    # asyncssh's timeout= bounds only the command, not its channel open
+                    async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
+                        result = await ssh_client.run(command, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+                except TimeoutError as exc:
+                    raise _FillerBesideCustomerContainer(
+                        f"the running check's listing did not answer in {_PRERUN_HOST_PROBE_TIMEOUT_SECONDS} s"
+                    ) from exc
                 running, listing = _parse_running_check_with_listing(result.stdout or "")
                 if running:
                     await self._remove_fillers_beside_customer_container(
@@ -3402,6 +3407,12 @@ class DockerService:
             raise _FillerBesideCustomerContainer(f"the removal of {fillers} could not be confirmed")
         if survivors:
             raise _FillerBesideCustomerContainer(f"{sorted(survivors)} still on the host after docker rm -fv")
+        # DAH-2356: a PEARL filler caps its GPUs before its `docker run`, possibly after this create's
+        # last power restore; lifted only now that it is confirmed gone
+        for name in fillers:
+            await restore_filler_pod_gpu_power_limits(
+                ssh_client, self.redis_service, name.removeprefix(FILLER_CONTAINER_PREFIX), log_extra=default_extra
+            )
 
     async def wait_for_port_check_containers(
         self,
@@ -8175,7 +8186,9 @@ class DockerService:
                             default_extra=default_extra,
                         )
                     except _FillerBesideCustomerContainer:
-                        current_step = FINAL_FILLER_CHECK_STEP
+                        # the sweep's own rm and listing, failed after `docker run`: the backend counts this
+                        # step as the node's failure (creation-failure run), as it does before it
+                        current_step = "container_cleanup"
                         raise
                     if not container_running:
                         # Capture the failure reason and check whether it points to our

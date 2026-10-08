@@ -775,7 +775,7 @@ async def test_a_filler_that_cannot_be_removed_fails_the_customer_create(svc, mo
     result = await _run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
 
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "final_filler_check"
+    assert result.failure_step == "container_cleanup"
     assert "filler_stuck" in result.detail
     # the customer's own container is removed, as on any failed run
     assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
@@ -799,3 +799,52 @@ async def test_a_clean_node_lists_fillers_in_the_running_checks_own_exec(svc, mo
     # nothing after it lists or removes: the clean node's check is the one exec it was before
     after_running_check = commands[commands.index(running_check) + 1:]
     assert not [cmd for cmd in after_running_check if "docker ps" in cmd or "docker rm" in cmd]
+
+
+@pytest.mark.asyncio
+async def test_a_late_fillers_power_cap_is_lifted_once_it_is_confirmed_gone(svc, monkeypatch):
+    # a PEARL filler capped its GPUs after the customer's last restore before `docker run`
+    filler_pod_id = "0b6c2e4a-7f1d-4c3b-9a5e-2d8f6b1c4e7a"
+    ssh_client = _customer_create_host(
+        svc,
+        monkeypatch,
+        listing_at_running_check=f"NAME\tfiller_{filler_pod_id} {_FILLER_ID}\nPS\t0\n",
+        listing_after_rm="RM\t0\nPS\t0\n",
+    )
+    steps: list[str] = []
+    default_run = ssh_client.run.side_effect
+
+    def run(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker rm -fv") and "printf 'RM" in cmd:
+            steps.append("filler rm")
+        return default_run(cmd, *args, **kwargs)
+
+    ssh_client.run.side_effect = run
+    restore = AsyncMock(side_effect=lambda *_args, **_kwargs: steps.append("power restore"))
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", restore)
+
+    result = await _run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, ContainerCreated)
+    assert restore.await_args.args[2] == filler_pod_id
+    assert steps == ["filler rm", "power restore"]
+
+
+@pytest.mark.asyncio
+async def test_a_running_check_that_never_answers_fails_the_customer_create(svc, monkeypatch):
+    ssh_client = _customer_create_host(svc, monkeypatch, listing_at_running_check="PS\t0\n", listing_after_rm="")
+    default_run = ssh_client.run.side_effect
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker ps -q --filter"):
+            await asyncio.Event().wait()
+        return default_run(cmd, *args, **kwargs)
+
+    ssh_client.run.side_effect = run
+    monkeypatch.setattr(ds_module, "_PRERUN_HOST_PROBE_TIMEOUT_SECONDS", 0.05)
+
+    result = await asyncio.wait_for(_run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL)), timeout=5)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "container_cleanup"
+    assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
