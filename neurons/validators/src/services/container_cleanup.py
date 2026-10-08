@@ -616,16 +616,22 @@ class ContainerCleanup:
             )
             return False
 
-        # Remove associated volume if it's a pod container
-        if container_name.startswith(POD_CONTAINER_PREFIX):
-            pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
+        # A create names both the container and its volume after payload.pod_id (the pod id or the
+        # filler run id), so `volume_<id>` is this container's own volume and no one else's.
+        for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):
+            if not container_name.startswith(prefix):
+                continue
+            volume_name = f"volume_{container_name.removeprefix(prefix)}"
             try:
-                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
+                result = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
+                error = "" if result.exit_status == 0 else (result.stderr or result.stdout or "").strip()
             except Exception as e:
+                error = str(e)
+            if error and "no such volume" not in error.lower():
                 logger.warning(
                     _m(
                         f"Removed container {container_name} but not its volume",
-                        extra={"container_name": container_name, "volume": f"volume_{pod_id}", "error": str(e)},
+                        extra={"container_name": container_name, "volume": volume_name, "error": error},
                     )
                 )
 

@@ -174,6 +174,75 @@ async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
     assert (removed_count, removed_names, unremovable) == (0, [], [name])
 
 
+FILLER_RUN_ID = "3f1c2b9e-8d47-4a6e-9b21-5c0e7a4d6f18"
+SECOND_FILLER_RUN_ID = "a92e4d1c-6b38-4f07-8e5a-1d7c3b0f9e42"
+CUSTOMER_POD_ID = "c4b7e2a1-9f53-4d86-a0e1-7b2d5c8f3a69"
+
+
+def _removed_volume_names(rm_calls: list[str]) -> list[str]:
+    return [c.split("docker volume rm ")[1].split()[0] for c in rm_calls if "docker volume rm" in c]
+
+
+@pytest.mark.asyncio
+async def test_reaper_removes_a_stale_filler_and_its_own_volume():
+    """A filler create no longer sweeps unmounted volumes, so the reaper must take the
+    `volume_<run id>` of a filler it removes, or the preallocated volume holds the disk."""
+    name = f"filler_{FILLER_RUN_ID}"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+
+    removed_count, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [name]
+    assert any("docker rm -f" in c and name in c for c in rm_calls)
+    assert _removed_volume_names(rm_calls) == [f"volume_{FILLER_RUN_ID}"]
+
+
+@pytest.mark.asyncio
+async def test_reaper_removes_only_the_filler_volume_and_leaves_a_customers():
+    """The filler's volume is named from its own container name, not matched across volumes."""
+    filler = f"filler_{FILLER_RUN_ID}"
+    customer_pod = f"pod_{CUSTOMER_POD_ID}"
+    ssh, rm_calls = _make_ssh_mock(containers=[filler, customer_pod], ages_by_name={filler: 30, customer_pod: 30})
+
+    _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, [customer_pod]), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [filler]
+    assert _removed_volume_names(rm_calls) == [f"volume_{FILLER_RUN_ID}"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_filler_volume_rm_is_logged_and_the_reaper_goes_on(caplog):
+    first_filler = f"filler_{FILLER_RUN_ID}"
+    second_filler = f"filler_{SECOND_FILLER_RUN_ID}"
+    ssh, rm_calls = _make_ssh_mock(
+        containers=[first_filler, second_filler], ages_by_name={first_filler: 30, second_filler: 30}
+    )
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if f"docker volume rm volume_{FILLER_RUN_ID}" in cmd:
+            rm_calls.append(cmd)
+            # a command ending in `|| true` hides the failure from the caller, as the shell would
+            exit_status = 0 if cmd.rstrip().endswith("|| true") else 1
+            return MagicMock(exit_status=exit_status, stdout="", stderr="Error response from daemon: volume is in use")
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+
+    with caplog.at_level(logging.WARNING, logger="services.container_cleanup"):
+        removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+            ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
+        )
+
+    assert (removed_count, removed_names, unremovable) == (2, [first_filler, second_filler], [])
+    assert _removed_volume_names(rm_calls) == [f"volume_{FILLER_RUN_ID}", f"volume_{SECOND_FILLER_RUN_ID}"]
+    assert any(f"Removed container {first_filler} but not its volume" in r.getMessage() for r in caplog.records)
+
+
 async def cleanup_with_hook(ssh, on_before_remove):
     return await ContainerCleanup(stale_threshold_minutes=15).cleanup(
         ssh_client=ssh,
