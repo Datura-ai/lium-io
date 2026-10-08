@@ -1571,8 +1571,10 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # and the pid_max read every rental makes
-    assert _cmds(ssh_client) == [*commands, "cat /proc/sys/kernel/pid_max"]
+    # and the pid_max read every rental makes: before the bootstrap restore's removal at the cleanup step
+    # (the fail-closed host probes run before any filler rm, review finding #1534), after the others' listing
+    pid_max = "cat /proc/sys/kernel/pid_max"
+    assert _cmds(ssh_client) == ([pid_max, *commands] if bootstrap_restore else [*commands, pid_max])
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)
