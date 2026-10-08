@@ -1,5 +1,6 @@
 """DAH-4001: what the validator reports every cycle and submits at tempo under SETTLEMENT_MODE."""
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -172,9 +173,38 @@ async def test_a_failing_shadow_comparison_never_skips_the_live_weights(monkeypa
     assert validator.miner_scores == {}
 
 
+class RedisList:
+    """The three list calls the cycle report queue uses, with Redis semantics (lpush puts the newest at the head)."""
+
+    def __init__(self):
+        self.items: list[bytes] = []
+
+    async def lpush(self, key, value):
+        self.items.insert(0, value)
+
+    async def ltrim(self, key, max_length):
+        del self.items[max_length:]
+
+    async def lrange(self, key):
+        return list(self.items)
+
+    async def lrem(self, key, value):
+        self.items.remove(value)
+
+
+def _with_report_queue(validator: Validator) -> RedisList:
+    queue = RedisList()
+    validator.redis_service.lpush = queue.lpush
+    validator.redis_service.ltrim = queue.ltrim
+    validator.redis_service.lrange = queue.lrange
+    validator.redis_service.lrem = queue.lrem
+    return queue
+
+
 @pytest.mark.asyncio
 async def test_an_unacknowledged_cycle_report_is_kept_and_replayed_next_cycle():
     validator = _validator(window=None, accepted=True)
+    queue = _with_report_queue(validator)
     scored_at = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
     rows = [{"executor_id": "e1", "hotkey": "hk", "rented": 0.0, "idle": 0.8, "spot": False}]
 
@@ -182,23 +212,55 @@ async def test_an_unacknowledged_cycle_report_is_kept_and_replayed_next_cycle():
         {"hk": 0.8, "burn": 0.2}, rows, "burn", "2026-10-06 10:00:00", 500, scored_at
     )
 
-    validator.redis_service.lpush.assert_awaited_once()
-    kept = validator.redis_service.lpush.await_args.args[1]
-    assert (
-        json.loads(kept)["cycle_id"] == "2026-10-06 10:00:00"
-        and json.loads(kept)["node_shares"] == rows
-    )
+    assert [json.loads(raw)["cycle_id"] for raw in queue.items] == ["2026-10-06 10:00:00"]
+    assert json.loads(queue.items[0])["node_shares"] == rows
 
-    validator.redis_service.lrange = AsyncMock(return_value=[kept])
     validator.backend_client.report_cycle_scores = AsyncMock(
-        return_value=MagicMock(cycle_id="2026-10-06 10:00:00", created=True)
+        return_value=MagicMock(cycle_id="any", created=True)
     )
     await validator.report_cycle_scores(
         {"hk": 1.0}, [], "burn", "2026-10-06 10:15:00", 575, scored_at
     )
 
-    validator.redis_service.lrem.assert_awaited_once_with(UNACKED_CYCLE_REPORTS_KEY, kept)
-    assert validator.backend_client.report_cycle_scores.await_count == 2
+    delivered = [call.args[0]["cycle_id"] for call in validator.backend_client.report_cycle_scores.await_args_list]
+    assert delivered == ["2026-10-06 10:00:00", "2026-10-06 10:15:00"]  # oldest first
+    assert queue.items == []
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_backend_is_cut_off_at_the_reporting_budget_and_the_report_stays_kept(monkeypatch):
+    monkeypatch.setattr("core.validator.SETTLEMENT_REPORTING_BUDGET_SECONDS", 0.05)
+    validator = _validator(window=None, accepted=True)
+    queue = _with_report_queue(validator)
+
+    async def hang(payload):
+        await asyncio.sleep(10)
+
+    validator.backend_client.report_cycle_scores = hang
+
+    await asyncio.wait_for(
+        validator.report_cycle_scores(
+            {"hk": 1.0}, [], "burn", "2026-10-06 10:00:00", 500, datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
+        ),
+        timeout=1,
+    )
+
+    assert [json.loads(raw)["cycle_id"] for raw in queue.items] == ["2026-10-06 10:00:00"]
+
+
+@pytest.mark.asyncio
+async def test_a_report_redis_cannot_keep_is_sent_once_directly():
+    validator = _validator(window=None, accepted=True)
+    validator.redis_service.lpush = AsyncMock(side_effect=ConnectionError("redis down"))
+    validator.backend_client.report_cycle_scores = AsyncMock(
+        return_value=MagicMock(cycle_id="2026-10-06 10:00:00", created=True)
+    )
+
+    await validator.report_cycle_scores(
+        {"hk": 1.0}, [], "burn", "2026-10-06 10:00:00", 500, datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
+    )
+
+    validator.backend_client.report_cycle_scores.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -219,22 +281,18 @@ async def test_replay_stops_at_the_first_report_that_still_fails():
 
 
 @pytest.mark.asyncio
-async def test_replay_stops_once_its_time_budget_is_spent(monkeypatch):
-    validator = _validator(window=None, accepted=True)
-    older, newer = (
-        json.dumps({"cycle_id": "older", "hotkey_scores": {}}).encode(),
-        json.dumps({"cycle_id": "newer", "hotkey_scores": {}}).encode(),
-    )
-    validator.redis_service.lrange = AsyncMock(return_value=[newer, older])  # lpush order: newest first
-    validator.backend_client.report_cycle_scores = AsyncMock(return_value=MagicMock(cycle_id="older", created=True))
-    # start, before the oldest report, then past the 60 s budget before the newer one
-    monkeypatch.setattr("core.validator.time", MagicMock(monotonic=MagicMock(side_effect=[0.0, 0.0, 61.0])))
+async def test_a_hanging_shadow_read_is_cut_off_and_never_raises(monkeypatch):
+    monkeypatch.setattr("core.validator.SHADOW_COMPARISON_BUDGET_SECONDS", 0.05)
+    validator = _validator(window=WINDOW, accepted=True)
 
-    await validator._replay_unacked_cycle_reports()
+    async def hang(index, tempo):
+        await asyncio.sleep(10)
 
-    validator.backend_client.report_cycle_scores.assert_awaited_once()
-    assert validator.backend_client.report_cycle_scores.await_args.args[0]["cycle_id"] == "older"
-    validator.redis_service.lrem.assert_awaited_once_with(UNACKED_CYCLE_REPORTS_KEY, older)
+    validator.backend_client.get_settled_weights = hang
+
+    await asyncio.wait_for(validator.shadow_settled_window({"hk": 1.0}), timeout=1)
+
+    assert getattr(validator, "_settled_tempo_done", None) is None
 
 
 @pytest.mark.asyncio
@@ -395,6 +453,7 @@ async def test_a_rejected_submission_is_retried_on_the_next_tick():
 @pytest.mark.asyncio
 async def test_a_cycle_report_the_backend_rejects_is_dropped_not_replayed():
     validator = _validator(window=None, accepted=True)
+    queue = _with_report_queue(validator)
     validator.backend_client.report_cycle_scores = AsyncMock(side_effect=BackendRejected(422))
     scored_at = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
 
@@ -402,7 +461,8 @@ async def test_a_cycle_report_the_backend_rejects_is_dropped_not_replayed():
         {"hk": 1.0}, [], "burn", "2026-10-06 10:00:00", 500, scored_at
     )
 
-    validator.redis_service.lpush.assert_not_awaited()
+    validator.backend_client.report_cycle_scores.assert_awaited_once()
+    assert queue.items == []
 
 
 @pytest.mark.asyncio
