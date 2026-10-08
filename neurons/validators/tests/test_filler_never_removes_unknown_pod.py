@@ -15,9 +15,9 @@ from unittest.mock import Mock
 
 import pytest
 from payload_models.payloads import ContainerCreated, FailedContainerErrorCodes, WorkloadKind
-from services.docker_service import DockerService
+from services.docker_service import DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD, DockerService
 from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
-from services.rental_docker_sdk import RENTAL_NETWORK_OPTIONS, RentalDockerSdkClient
+from services.rental_docker_sdk import FILLER_VOLUME_LABELS, RENTAL_NETWORK_OPTIONS, RentalDockerSdkClient
 from test_deploy_optimizations import (
     _docker_client,
     _patch_happy,
@@ -36,9 +36,16 @@ def svc() -> DockerService:
     return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
 
 
-def _host_listing(svc, monkeypatch, container_names: list[str], unmounted_vloopback_volumes: tuple[str, ...] = ()):
+def _host_listing(
+    svc,
+    monkeypatch,
+    container_names: list[str],
+    unmounted_vloopback_volumes: tuple[str, ...] = (),
+    unmounted_filler_volumes: tuple[str, ...] = (),
+):
     """The create path with its real cleanups on a host whose `docker ps -a` lists ``container_names``
-    and whose `docker volume ls` lists ``unmounted_vloopback_volumes`` (no container mounts them)."""
+    and whose `docker volume ls` lists ``unmounted_vloopback_volumes`` and ``unmounted_filler_volumes``
+    (no container mounts them); only the latter carry the filler label."""
     ssh_client = _ssh_client()
     answer_like_a_clean_host = ssh_client.run.side_effect
 
@@ -46,7 +53,10 @@ def _host_listing(svc, monkeypatch, container_names: list[str], unmounted_vloopb
         if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
             return _ssh_result(exit_status=0, stdout="".join(f"{name}\n" for name in container_names))
         if cmd == DOCKER_VOLUME_LS_NAME_DRIVER_CMD:
-            return _ssh_result(exit_status=0, stdout="".join(f"{name} vloopback\n" for name in unmounted_vloopback_volumes))
+            volumes = (*unmounted_vloopback_volumes, *unmounted_filler_volumes)
+            return _ssh_result(exit_status=0, stdout="".join(f"{name} vloopback\n" for name in volumes))
+        if cmd == DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD:
+            return _ssh_result(exit_status=0, stdout="".join(f"{name} vloopback\n" for name in unmounted_filler_volumes))
         return answer_like_a_clean_host(cmd, *args, **kwargs)
 
     ssh_client.run.side_effect = run
@@ -153,6 +163,42 @@ async def test_filler_create_never_removes_an_unmounted_customer_volume(svc, mon
 
     assert isinstance(result, ContainerCreated)
     assert not any(_CUSTOMER_VOLUME in targets for targets in _removals(ssh_client))
+
+
+@pytest.mark.asyncio
+async def test_filler_create_sweeps_an_unmounted_filler_volume_but_never_a_customers(svc, monkeypatch) -> None:
+    # a filler volume left without its container (a failed `docker volume rm`, a validator restart mid-create)
+    ssh_client = _host_listing(
+        svc,
+        monkeypatch,
+        [],
+        unmounted_vloopback_volumes=(_CUSTOMER_VOLUME,),
+        unmounted_filler_volumes=("volume_ended-filler-run",),
+    )
+    filler = _payload(workload_kind=WorkloadKind.FILLER)
+
+    result = await _run(svc, filler)
+
+    assert isinstance(result, ContainerCreated)
+    assert any("volume_ended-filler-run" in targets for targets in _removals(ssh_client))
+    assert not any(_CUSTOMER_VOLUME in targets for targets in _removals(ssh_client))
+
+
+@pytest.mark.parametrize(
+    ("workload_kind", "labels"),
+    [(WorkloadKind.FILLER, FILLER_VOLUME_LABELS), (WorkloadKind.CUSTOMER_RENTAL, None)],
+    ids=["filler", "customer"],
+)
+@pytest.mark.asyncio
+async def test_only_a_filler_volume_is_created_with_the_filler_label(
+    svc, monkeypatch, workload_kind: WorkloadKind, labels: dict[str, str] | None
+) -> None:
+    _host_listing(svc, monkeypatch, [])
+
+    result = await _run(svc, _payload(workload_kind=workload_kind))
+
+    assert isinstance(result, ContainerCreated)
+    assert svc.create_local_volume.await_args.kwargs["labels"] == labels
 
 
 @pytest.mark.asyncio

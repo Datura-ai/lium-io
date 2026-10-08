@@ -72,6 +72,8 @@ RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+# a filler create sweeps only unmounted volumes with this label: a customer's volume never has it
+FILLER_VOLUME_LABELS = {"io.lium.workload": "filler"}
 logger = logging.getLogger(__name__)
 
 
@@ -86,7 +88,7 @@ class RentalDockerConnectionError(RuntimeError):
 
 
 class ContainerCreateRefused(Exception):
-    """Raised by a run spec's `before_create` check; nothing was created."""
+    """Raised by a run spec's `before_create` (nothing was created) or `before_start` (created, never started)."""
 
 
 class RentalDockerOperationError(RuntimeError):
@@ -707,6 +709,7 @@ class RentalDockerSdkClient:
         driver: str | None = None,
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         # The retry adopts a volume of this name and driver if the first `volumes/create` reached
         # the daemon before the channel dropped; a same-name volume on another driver is refused.
@@ -717,6 +720,7 @@ class RentalDockerSdkClient:
                 driver=driver,
                 driver_opts=driver_opts,
                 timeout=timeout,
+                labels=labels,
                 adopt_existing=False,
             ),
             resume=lambda: self._create_volume_once(
@@ -724,6 +728,7 @@ class RentalDockerSdkClient:
                 driver=driver,
                 driver_opts=driver_opts,
                 timeout=timeout,
+                labels=labels,
                 adopt_existing=True,
             ),
         )
@@ -735,6 +740,7 @@ class RentalDockerSdkClient:
         driver: str | None,
         driver_opts: dict[str, str] | None,
         timeout: int | None,
+        labels: dict[str, str] | None,
         adopt_existing: bool,
     ) -> None:
         try:
@@ -744,6 +750,7 @@ class RentalDockerSdkClient:
                 driver=driver,
                 driver_opts=driver_opts,
                 timeout=timeout,
+                labels=labels,
                 adopt_existing=adopt_existing,
             )
         except RentalDockerOperationError:
@@ -1073,6 +1080,7 @@ class RentalDockerSdkClient:
         driver: str | None,
         driver_opts: dict[str, str] | None,
         timeout: int | None,
+        labels: dict[str, str] | None = None,
         adopt_existing: bool = False,
     ) -> None:
         if adopt_existing and self._adopt_volume_by_name_sync(volume_name, driver):
@@ -1089,6 +1097,7 @@ class RentalDockerSdkClient:
                 name=volume_name,
                 driver=driver,
                 driver_opts=driver_opts,
+                labels=labels,
             )
         finally:
             if should_override_timeout:

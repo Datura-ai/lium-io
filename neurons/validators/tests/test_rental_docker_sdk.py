@@ -14,6 +14,7 @@ from docker.types import ContainerConfig
 import services.rental_docker_sdk as rental_docker_sdk
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.rental_docker_sdk import (
+    FILLER_VOLUME_LABELS,
     RENTAL_NETWORK_ICC_OPTION,
     RENTAL_NETWORK_LABELS,
     RENTAL_NETWORK_NAME,
@@ -1220,6 +1221,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         driver="vloopback",
         driver_opts={"size": "23g"},
         timeout=133,
+        labels=FILLER_VOLUME_LABELS,
     )
     await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
@@ -1229,6 +1231,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
             "name": "volume_test",
             "driver": "vloopback",
             "driver_opts": {"size": "23g"},
+            "labels": FILLER_VOLUME_LABELS,
             "client_timeout": 133,
         }
     ]

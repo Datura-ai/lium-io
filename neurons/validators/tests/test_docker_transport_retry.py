@@ -129,7 +129,7 @@ class _FakeApiClient:
             raise _not_found(f"No such container: {name}")
         return self.existing_containers[name]
 
-    def create_volume(self, *, name, driver, driver_opts):
+    def create_volume(self, *, name, driver, driver_opts, labels=None):
         self.calls.append("create_volume")
         self._pop(self.create_volume_errors)
         self.existing_volumes[name] = {"Name": name, "Driver": driver or "local"}
@@ -224,7 +224,7 @@ async def test_create_volume_retry_adopts_the_volume_the_lost_first_attempt_made
     adapter = _FakeAdapter()
     api = _FakeApiClient(adapter=adapter)
 
-    def create_then_drop(*, name, driver, driver_opts):
+    def create_then_drop(*, name, driver, driver_opts, labels=None):
         api.calls.append("create_volume")
         api.existing_volumes[name] = {"Name": name, "Driver": "vloopback:latest"}
         raise EOFError()

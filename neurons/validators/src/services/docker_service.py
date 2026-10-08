@@ -115,6 +115,7 @@ from services.rental_docker_observability import (
 )
 from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
+    FILLER_VOLUME_LABELS,
     HOST_KILL_EXIT_CODES,
     ContainerCreateRefused,
     ContainerExecSpec,
@@ -401,6 +402,11 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
+DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD = DOCKER_VOLUME_LS_NAME_DRIVER_CMD.replace(
+    "volume ls",
+    "volume ls " + " ".join(f"--filter label={key}={value}" for key, value in FILLER_VOLUME_LABELS.items()),
+    1,
+)
 # Where the gocryptfs passphrase and the script that carries it live for the second they exist
 # inside the rental container. /dev/shm is the tmpfs Docker (and sysbox) mount into every
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
@@ -1557,8 +1563,10 @@ def _refuse_filler_beside_unlisted_pod(payload: ContainerCreateRequest, containe
 
     The backend builds that list when it sends the filler, so an unlisted pod is a customer's that came
     after it (a late or retried send, a lapsed create lock, a second connector), or one of an ended
-    rental. Running or exited alike: the filler neither removes it nor runs beside it; the validator's
-    stale-container reaper removes a pod the backend no longer lists. Refused like #1518 (no strike).
+    rental. Running or exited alike: the filler does not remove it and is not started beside it. A pod
+    created after the last listing, before `start`, is not seen here: that window is the customer
+    side's to close. The validator's stale-container reaper removes a pod the backend no longer
+    lists. Refused like #1518 (no strike).
     """
     if payload.workload_kind != WorkloadKind.FILLER:
         return
@@ -3926,8 +3934,11 @@ class DockerService:
         default_extra: dict,
         skip_volume_names: list[str] | set[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        filler_volumes_only: bool = False,
     ) -> list[str]:
         """Remove vloopback `volume_*` volumes no container mounts (minus ``skip_volume_names``).
+
+        ``filler_volumes_only`` limits it to volumes a filler create labelled (FILLER_VOLUME_LABELS).
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
@@ -3936,6 +3947,10 @@ class DockerService:
         """
         skip_set = {name for name in (skip_volume_names or []) if name}
         list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_CMD
+        if filler_volumes_only:
+            # the host probe's volume listing carries no labels
+            host_probe = None if host_probe is None else dataclasses.replace(host_probe, volumes=None)
+            list_volumes_cmd = DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD
         mounted_volumes_cmd = DOCKER_MOUNTED_VOLUME_NAMES_CMD
 
         try:
@@ -5510,6 +5525,7 @@ class DockerService:
         timeout: int = 10,
         sparse: bool = False,
         host_probe: VolumeHostProbe | None = None,
+        labels: dict[str, str] | None = None,
     ):
         requested_timeout = timeout
         _quote_safe_docker_volume_name(
@@ -5593,6 +5609,7 @@ class DockerService:
                 driver=volume_driver,
                 driver_opts=volume_driver_opts,
                 timeout=timeout,
+                labels=labels,
             ),
             volume_name=local_volume,
             volume_driver=volume_driver,
@@ -7653,17 +7670,14 @@ class DockerService:
                         [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
                     )
 
-                # A filler skips the sweep: a customer's fresh volume is unmounted until its `docker run`,
-                # and a create lock that lapsed or a second connector would let the filler remove it.
-                removed_vloopback_volumes = (
-                    await self.clean_stale_vloopback_volumes(
-                        ssh_client=ssh_client,
-                        default_extra=default_extra,
-                        skip_volume_names=protected_volume_names,
-                        host_probe=docker_listing_probe,
-                    )
-                    if payload.workload_kind != WorkloadKind.FILLER
-                    else []
+                # A filler sweeps filler volumes only: a customer's fresh volume is unmounted until its
+                # `docker run`, and a lapsed create lock or a second connector would let a filler remove it.
+                removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    skip_volume_names=protected_volume_names,
+                    host_probe=docker_listing_probe,
+                    filler_volumes_only=payload.workload_kind == WorkloadKind.FILLER,
                 )
                 if removed_vloopback_volumes:
                     docker_listing_probe = None
@@ -7859,6 +7873,7 @@ class DockerService:
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
                         host_probe=volume_probe,
+                        labels=FILLER_VOLUME_LABELS if payload.workload_kind == WorkloadKind.FILLER else None,
                     )
                     created_local_volume = True
 
