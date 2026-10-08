@@ -297,13 +297,14 @@ async def test_run_container_retry_adopts_the_container_the_lost_create_made():
 
     def create_then_drop(**kwargs):
         api.calls.append("create_container")
-        api.existing_containers[kwargs["name"]] = {"Config": {"Image": kwargs["image"]}}
+        api.existing_containers[kwargs["name"]] = {"Id": "adopted-id", "Config": {"Image": kwargs["image"]}}
         raise EOFError()
 
     api.create_container = create_then_drop
 
-    await _client(api).run_container(_run_spec())
+    container_id = await _client(api).run_container(_run_spec())
 
+    assert container_id == "adopted-id"
     assert adapter.reopen_calls == 1
     # one create, then the retry finds it by name and only starts it
     assert api.calls == ["create_container", "inspect_container", "start"]

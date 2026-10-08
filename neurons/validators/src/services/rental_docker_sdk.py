@@ -963,7 +963,8 @@ class RentalDockerSdkClient:
         if spec.network:
             self._ensure_rental_network_sync(spec.network)
         created = None
-        if not (adopt_existing and self._adopt_container_by_name_sync(spec)):
+        adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None
+        if adopted_id is None:
             host_config = self._api_client.create_host_config(
                 **_build_host_config_kwargs(spec)
             )
@@ -981,27 +982,28 @@ class RentalDockerSdkClient:
                 host_config=host_config,
             )
         self._api_client.start(spec.name)
-        container_id = created.get("Id") if isinstance(created, dict) else None
+        container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         return container_id if isinstance(container_id, str) and container_id else None
 
-    def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> bool:
+    def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
         """The idempotency check before a retried `containers/create`.
 
-        True when a container named `spec.name` already exists and runs `spec.image` — the first
-        attempt's create reached the daemon and only its answer was lost — so the retry skips
-        `create` and goes straight to `start`. A same-name container on another image is not
+        The inspected `Id` ("" when the daemon sent none) when a container named `spec.name` already
+        exists and runs `spec.image` — the first attempt's create reached the daemon and only its
+        answer was lost — so the retry skips `create` and goes straight to `start`; None otherwise. A same-name container on another image is not
         ours to adopt or remove: the retry refuses it with the conflict named.
         """
         try:
             info = self._api_client.inspect_container(spec.name)
         except Exception as exc:
             if _is_docker_not_found_error(exc):
-                return False
+                return None
             raise
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
         if existing_image == spec.image:
-            return True
+            existing_id = info.get("Id")
+            return existing_id if isinstance(existing_id, str) else ""
         raise RentalDockerOperationError(
             "Docker SDK run container refused after a transport retry: a container named "
             f"{spec.name} already exists with image {existing_image!r}, not {spec.image!r}"
