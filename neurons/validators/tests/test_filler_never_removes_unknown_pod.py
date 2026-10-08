@@ -9,13 +9,14 @@ at the cleanup, on the listing it already has, and in the Docker thread between 
 
 from __future__ import annotations
 
+import logging
 import shlex
 from unittest.mock import Mock
 
 import pytest
 from payload_models.payloads import ContainerCreated, FailedContainerErrorCodes, WorkloadKind
 from services.docker_service import DockerService
-from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD
+from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
 from services.rental_docker_sdk import RENTAL_NETWORK_OPTIONS, RentalDockerSdkClient
 from test_deploy_optimizations import (
     _docker_client,
@@ -27,6 +28,7 @@ from test_deploy_optimizations import (
 )
 
 _CUSTOMER_POD = "pod_6a1f2a52-6f0e-4a3e-9c55-0d3e1b7a9c11"
+_CUSTOMER_VOLUME = "volume_6a1f2a52-6f0e-4a3e-9c55-0d3e1b7a9c11"
 
 
 @pytest.fixture
@@ -34,19 +36,23 @@ def svc() -> DockerService:
     return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
 
 
-def _host_listing(svc, monkeypatch, container_names: list[str]):
-    """The create path with its real cleanup on a host whose `docker ps -a` lists ``container_names``."""
+def _host_listing(svc, monkeypatch, container_names: list[str], unmounted_vloopback_volumes: tuple[str, ...] = ()):
+    """The create path with its real cleanups on a host whose `docker ps -a` lists ``container_names``
+    and whose `docker volume ls` lists ``unmounted_vloopback_volumes`` (no container mounts them)."""
     ssh_client = _ssh_client()
     answer_like_a_clean_host = ssh_client.run.side_effect
 
     def run(cmd, *args, **kwargs):
         if cmd == DOCKER_PS_ALL_NAMES_IDS_CMD:
             return _ssh_result(exit_status=0, stdout="".join(f"{name}\n" for name in container_names))
+        if cmd == DOCKER_VOLUME_LS_NAME_DRIVER_CMD:
+            return _ssh_result(exit_status=0, stdout="".join(f"{name} vloopback\n" for name in unmounted_vloopback_volumes))
         return answer_like_a_clean_host(cmd, *args, **kwargs)
 
     ssh_client.run.side_effect = run
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.delattr(svc, "clean_existing_containers")
+    monkeypatch.delattr(svc, "clean_stale_vloopback_volumes")
     return ssh_client
 
 
@@ -134,3 +140,41 @@ async def test_exited_pod_of_an_ended_rental_is_left_to_the_reaper_and_refuses_t
 
     assert result.error_code == FailedContainerErrorCodes.RentingInProgress
     assert _removals(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_filler_create_never_removes_an_unmounted_customer_volume(svc, monkeypatch) -> None:
+    # a customer create made its encrypted volume and has not run its pod yet (the create lock lapsed or
+    # another connector runs it): no `pod_*` exists, so only the volume sweep could touch it
+    ssh_client = _host_listing(svc, monkeypatch, [], unmounted_vloopback_volumes=(_CUSTOMER_VOLUME,))
+    filler = _payload(workload_kind=WorkloadKind.FILLER)
+
+    result = await _run(svc, filler)
+
+    assert isinstance(result, ContainerCreated)
+    assert not any(_CUSTOMER_VOLUME in targets for targets in _removals(ssh_client))
+
+
+@pytest.mark.asyncio
+async def test_customer_create_still_sweeps_unmounted_vloopback_volumes(svc, monkeypatch) -> None:
+    ssh_client = _host_listing(svc, monkeypatch, [], unmounted_vloopback_volumes=("volume_ended-rental",))
+    customer = _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL)
+
+    result = await _run(svc, customer)
+
+    assert isinstance(result, ContainerCreated)
+    assert any("volume_ended-rental" in targets for targets in _removals(ssh_client))
+
+
+@pytest.mark.asyncio
+async def test_refusal_for_an_unlisted_pod_logs_the_pod_not_a_customer_create(svc, monkeypatch, caplog) -> None:
+    _host_listing(svc, monkeypatch, [_CUSTOMER_POD])
+    filler = _payload(workload_kind=WorkloadKind.FILLER)
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        await _run(svc, filler)
+
+    refusals = [r.msg.to_full_string() for r in caplog.records if "filler create refused" in r.getMessage()]
+    assert len(refusals) == 1
+    assert refusals[0].startswith("filler create refused: unlisted pod_* on the node >>> ")
+    assert _CUSTOMER_POD in refusals[0]
