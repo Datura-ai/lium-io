@@ -31,14 +31,11 @@ WINDOW = SettledWeights(
 )
 
 
-def _validator(
-    *, window: SettledWeights | None, accepted: bool, burner: str | None = "burn"
-) -> Validator:
+def _validator(*, window: SettledWeights | None, accepted: bool) -> Validator:
     validator = Validator.__new__(Validator)
     validator.default_extra = {}
     validator.active_hotkeys = set()
     validator.miner_scores = {"hk": 0.5, "burn": 0.5}
-    validator._fallback_burner = burner
     validator.backend_client = MagicMock(
         get_settled_weights=AsyncMock(return_value=window),
         report_settled_weights_result=AsyncMock(return_value=None),
@@ -94,39 +91,34 @@ async def test_a_rejected_submission_reports_no_inclusion():
 
 
 @pytest.mark.asyncio
-async def test_backend_unreachable_puts_all_weight_on_the_burner_and_pays_no_cycle():
+async def test_backend_unreachable_submits_nothing_and_asks_again_on_the_next_tick():
     validator = _validator(window=None, accepted=True)
 
-    await validator.submit_settled_window()
+    first = await validator.submit_settled_window()
+    validator.backend_client.get_settled_weights = AsyncMock(return_value=WINDOW)
+    second = await validator.submit_settled_window()
 
+    assert (first, second) == (False, True)
     validator.subtensor_client.set_weights.assert_awaited_once()
-    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {"burn": 1.0}
-    validator.backend_client.report_settled_weights_result.assert_not_awaited()
+    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == WINDOW.hotkey_scores
 
 
 @pytest.mark.asyncio
-async def test_an_empty_window_submits_the_fallback():
+async def test_an_empty_window_submits_nothing_and_is_not_asked_for_again_in_its_tempo():
     empty = WINDOW.model_copy(update={"cycle_ids": [], "hotkey_scores": {}})
     validator = _validator(window=empty, accepted=True)
 
     await validator.submit_settled_window()
-
-    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {"burn": 1.0}
-
-
-@pytest.mark.asyncio
-async def test_a_window_whose_scores_are_all_zero_submits_the_fallback():
-    zeros = WINDOW.model_copy(update={"hotkey_scores": {"hk": 0.0, "burn": 0.0}})
-    validator = _validator(window=zeros, accepted=True)
-
     await validator.submit_settled_window()
 
-    assert validator.subtensor_client.set_weights.await_args.kwargs["miner_scores"] == {"burn": 1.0}
+    validator.subtensor_client.set_weights.assert_not_awaited()
+    validator.backend_client.get_settled_weights.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_no_window_and_no_burner_skips_the_tempo():
-    validator = _validator(window=None, accepted=True, burner=None)
+async def test_a_window_whose_scores_are_all_zero_submits_nothing():
+    zeros = WINDOW.model_copy(update={"hotkey_scores": {"hk": 0.0, "burn": 0.0}})
+    validator = _validator(window=zeros, accepted=True)
 
     await validator.submit_settled_window()
 
@@ -574,14 +566,35 @@ async def test_a_later_confirmation_does_not_clear_an_earlier_pending_one():
 
 
 @pytest.mark.asyncio
-async def test_a_rejected_fallback_is_retried_on_the_next_tick():
-    validator = _validator(window=None, accepted=False)
+async def test_the_inclusion_is_kept_before_it_is_reported():
+    validator = _validator(window=WINDOW, accepted=True)
+    kept_when_reported = []
 
-    first = await validator.submit_settled_window()
-    validator.subtensor_client.set_weights = AsyncMock(return_value=True)
-    second = await validator.submit_settled_window()
+    async def report(index, block):
+        kept_when_reported.extend(call.args for call in validator.redis_service.set.await_args_list)
 
-    assert (first, second) == (False, True)
+    validator.backend_client.report_settled_weights_result = AsyncMock(side_effect=report)
+
+    await validator.submit_settled_window()
+
+    assert (PENDING_INCLUSION_KEY, json.dumps({"342": 123456})) in kept_when_reported
+
+
+@pytest.mark.asyncio
+async def test_a_pending_inclusion_is_reported_before_the_next_window_is_read():
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.redis_service.get = AsyncMock(return_value=json.dumps({"341": 123000}))
+    calls = []
+    validator.backend_client.report_settled_weights_result = AsyncMock(
+        side_effect=lambda index, block: calls.append(("report", index))
+    )
+    validator.backend_client.get_settled_weights = AsyncMock(
+        side_effect=lambda index, tempo: calls.append(("read", index)) or WINDOW
+    )
+
+    await validator.submit_settled_window()
+
+    assert calls[:2] == [("report", 341), ("read", 342)]
 
 
 @pytest.mark.asyncio
