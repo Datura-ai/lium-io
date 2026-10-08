@@ -909,30 +909,38 @@ class Validator:
             "mode": settings.SETTLEMENT_MODE,
             "node_shares": node_shares,
         }
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SETTLEMENT_REPORTING_BUDGET_SECONDS
         # kept before any network wait: the budget below may cut a delivery off, and the replay then sends it
-        kept = await self._keep_cycle_report(payload)
+        if not await self._keep_cycle_report(payload):
+            # Redis could not keep it, so this send is its only chance: before anything else that needs Redis
+            try:
+                delivered = await asyncio.wait_for(
+                    self._deliver_cycle_report(payload), timeout=SETTLEMENT_REPORTING_BUDGET_SECONDS
+                )
+            except TimeoutError:
+                delivered = False
+            if not delivered:
+                logger.error(
+                    _m(
+                        "[settlement] cycle report neither kept nor delivered; its scores are lost",
+                        extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                    )
+                )
         try:
-            await asyncio.wait_for(
-                self._deliver_settlement_reports(payload, kept), timeout=SETTLEMENT_REPORTING_BUDGET_SECONDS
-            )
+            await asyncio.wait_for(self._deliver_kept_settlement_reports(), timeout=max(0.0, deadline - loop.time()))
         except TimeoutError:
             logger.warning(
                 _m(
-                    "[settlement] reporting budget spent; undelivered reports wait for the next cycle",
+                    "[settlement] reporting budget spent; undelivered kept reports wait for the next cycle",
                     extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
                 )
             )
+        await self._cap_kept_cycle_reports()
 
-    async def _deliver_settlement_reports(self, payload: dict, kept: bool) -> None:
+    async def _deliver_kept_settlement_reports(self) -> None:
         await self._retry_pending_inclusion()
         await self._replay_unacked_cycle_reports()
-        if not kept and not await self._deliver_cycle_report(payload):
-            logger.error(
-                _m(
-                    "[settlement] cycle report neither kept nor delivered; its scores are lost",
-                    extra=get_extra_info({**self.default_extra, "cycle_id": payload["cycle_id"]}),
-                )
-            )
 
     async def _deliver_cycle_report(self, payload: dict) -> bool:
         try:
@@ -974,7 +982,6 @@ class Validator:
     async def _keep_cycle_report(self, payload: dict) -> bool:
         try:
             await self.redis_service.lpush(UNACKED_CYCLE_REPORTS_KEY, json.dumps(payload).encode())
-            await self.redis_service.ltrim(UNACKED_CYCLE_REPORTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
         except Exception as exc:
             logger.error(
                 _m(
@@ -984,6 +991,26 @@ class Validator:
             )
             return False
         return True
+
+    async def _cap_kept_cycle_reports(self) -> None:
+        """Trimmed only after the cycle's delivery pass: trimming before it would drop the oldest report even when the
+        backend is back and could take it. Past the cap during a long outage the oldest are dropped, and logged."""
+        try:
+            kept_count = await self.redis_service.llen(UNACKED_CYCLE_REPORTS_KEY)
+            if kept_count <= UNACKED_CYCLE_REPORTS_MAX:
+                return
+            await self.redis_service.ltrim(UNACKED_CYCLE_REPORTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not cap the kept cycle reports", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        logger.error(
+            _m(
+                "[settlement] kept cycle reports over the cap; the oldest are dropped and their scores lost",
+                extra=get_extra_info({**self.default_extra, "dropped": kept_count - UNACKED_CYCLE_REPORTS_MAX}),
+            )
+        )
 
     async def _replay_unacked_cycle_reports(self) -> None:
         try:
