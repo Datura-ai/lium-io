@@ -66,6 +66,8 @@ PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
 # cycle reports the backend has not acknowledged yet, replayed every cycle until it does
 UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
 UNACKED_CYCLE_REPORTS_MAX = 200
+# replay of kept reports per cycle stops past this, so a slow backend cannot hold up the cycle; the rest wait
+UNACKED_CYCLE_REPORTS_REPLAY_BUDGET_SECONDS = 60
 SETTLEMENT_OFF = "off"
 SETTLEMENT_SHADOW = "shadow"
 SETTLEMENT_ENFORCE = "enforce"
@@ -330,13 +332,15 @@ class Validator:
                         await self.submit_settled_window()
                         self.miner_scores = {}
                     else:
-                        if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
-                            await self.shadow_settled_window()
+                        live_scores = self.miner_scores
                         await self.subtensor_client.set_weights(
-                            miner_scores=self.miner_scores,
+                            miner_scores=live_scores,
                             active_hotkeys=self.active_hotkeys,
                         )
                         self.miner_scores = {}
+                        # after the live submission: a slow or failing backend must not delay or skip it
+                        if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
+                            await self.shadow_settled_window(live_scores)
             except Exception as e:
                 logger.error(
                     _m(
@@ -966,7 +970,16 @@ class Validator:
             return
         # oldest first (lpush puts the newest at the head); the first failure ends the pass, so a backend that is
         # still down costs one timeout per cycle, not one per kept report
-        for raw in reversed(kept):
+        replay_started = time.monotonic()
+        for replayed, raw in enumerate(reversed(kept)):
+            if time.monotonic() - replay_started > UNACKED_CYCLE_REPORTS_REPLAY_BUDGET_SECONDS:
+                logger.warning(
+                    _m(
+                        "[settlement] replay budget spent; the rest of the kept cycle reports wait for the next cycle",
+                        extra=get_extra_info({**self.default_extra, "replayed": replayed, "left": len(kept) - replayed}),
+                    )
+                )
+                break
             if not await self._deliver_cycle_report(json.loads(raw)):
                 break
             try:
@@ -1162,8 +1175,17 @@ class Validator:
             )
         )
 
-    async def shadow_settled_window(self) -> None:
-        """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live accumulator."""
+    async def shadow_settled_window(self, live_scores: dict[str, float]) -> None:
+        """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live one just
+        submitted. Never raises: shadow is a comparison and must not end the sync tick."""
+        try:
+            await self._log_settled_window_against_live(live_scores)
+        except Exception as exc:
+            logger.error(
+                _m("[settlement] shadow comparison failed", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+
+    async def _log_settled_window_against_live(self, live_scores: dict[str, float]) -> None:
         index, tempo, _ = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
             return
@@ -1188,7 +1210,7 @@ class Validator:
                         "refunded_shares": window.refunded_count,
                         "refunded_total": window.refunded_total,
                         "mass_inactive_skipped": window.mass_inactive_skipped,
-                        "share_moved_vs_live": round(share_moved(self.miner_scores, window.hotkey_scores), 6),
+                        "share_moved_vs_live": round(share_moved(live_scores, window.hotkey_scores), 6),
                     }
                 ),
             )

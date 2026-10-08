@@ -145,10 +145,31 @@ async def test_set_weights_raising_is_a_failure_with_no_inclusion_report():
 async def test_shadow_reads_the_window_and_submits_nothing_itself():
     validator = _validator(window=WINDOW, accepted=True)
 
-    await validator.shadow_settled_window()
+    await validator.shadow_settled_window({"hk": 0.5, "burn": 0.5})
 
     validator.backend_client.get_settled_weights.assert_awaited_once_with(342, 360)
     validator.subtensor_client.set_weights.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_shadow_comparison_never_skips_the_live_weights(monkeypatch):
+    monkeypatch.setattr("core.config.settings.SETTLEMENT_MODE", "shadow")
+    monkeypatch.setattr("core.config.settings.DRY_RUN", False)
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.completed_cycles_since_start = 1
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[])
+    validator.subtensor_client.should_set_weights = AsyncMock(return_value=True)
+    validator.subtensor_client.get_tempo = MagicMock(side_effect=RuntimeError("tempo read failed"))
+    # ends the tick right after the weights step; sync() logs it as an unknown error
+    validator.subtensor_client.get_current_block = MagicMock(side_effect=RuntimeError("stop the tick"))
+
+    await validator.sync()
+
+    validator.subtensor_client.set_weights.assert_awaited_once_with(
+        miner_scores={"hk": 0.5, "burn": 0.5}, active_hotkeys=set()
+    )
+    validator.backend_client.get_settled_weights.assert_not_awaited()
+    assert validator.miner_scores == {}
 
 
 @pytest.mark.asyncio
@@ -195,6 +216,25 @@ async def test_replay_stops_at_the_first_report_that_still_fails():
 
     validator.backend_client.report_cycle_scores.assert_awaited_once()  # the oldest, which failed; the newer one waits
     assert validator.backend_client.report_cycle_scores.await_args.args[0]["cycle_id"] == "older"
+
+
+@pytest.mark.asyncio
+async def test_replay_stops_once_its_time_budget_is_spent(monkeypatch):
+    validator = _validator(window=None, accepted=True)
+    older, newer = (
+        json.dumps({"cycle_id": "older", "hotkey_scores": {}}).encode(),
+        json.dumps({"cycle_id": "newer", "hotkey_scores": {}}).encode(),
+    )
+    validator.redis_service.lrange = AsyncMock(return_value=[newer, older])  # lpush order: newest first
+    validator.backend_client.report_cycle_scores = AsyncMock(return_value=MagicMock(cycle_id="older", created=True))
+    # start, before the oldest report, then past the 60 s budget before the newer one
+    monkeypatch.setattr("core.validator.time", MagicMock(monotonic=MagicMock(side_effect=[0.0, 0.0, 61.0])))
+
+    await validator._replay_unacked_cycle_reports()
+
+    validator.backend_client.report_cycle_scores.assert_awaited_once()
+    assert validator.backend_client.report_cycle_scores.await_args.args[0]["cycle_id"] == "older"
+    validator.redis_service.lrem.assert_awaited_once_with(UNACKED_CYCLE_REPORTS_KEY, older)
 
 
 @pytest.mark.asyncio
