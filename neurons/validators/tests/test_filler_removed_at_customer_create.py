@@ -831,34 +831,63 @@ async def test_a_late_fillers_power_cap_is_lifted_once_it_is_confirmed_gone(svc,
 
 
 @pytest.mark.asyncio
-async def test_a_power_restore_that_never_answers_fails_the_customer_create(svc, monkeypatch):
+@pytest.mark.parametrize("late_step", ["running check", "second listing", "filler rm", "power restore"])
+async def test_a_step_after_docker_run_waits_for_a_channel_the_host_opens_late(
+    svc, monkeypatch, late_step
+):
+    # a cancelled channel open that the host confirms later stays open, and a MaxSessions=1 sshd then
+    # refuses the failed-run cleanup's channels: the steps after `docker run` bound commands, not opens
+    filler_listing = f"NAME\tfiller_late {_FILLER_ID}\nPS\t0\n"
     ssh_client = _customer_create_host(
         svc,
         monkeypatch,
-        listing_at_running_check=f"NAME\tfiller_stuck {_FILLER_ID}\nPS\t0\n",
+        # an unread listing (`docker ps -a` exited 1) makes the check read the host once more
+        listing_at_running_check="PS\t1\n" if late_step == "second listing" else filler_listing,
         listing_after_rm="RM\t0\nPS\t0\n",
     )
+    default_run = ssh_client.run.side_effect
 
-    async def restore_whose_channel_never_opens(*_args, **_kwargs):
-        await asyncio.Event().wait()
+    async def run(cmd, *args, timeout=None, **kwargs):
+        # the second listing, by either listing command
+        if cmd == ds_module._RUNNING_CHECK_LISTING_CMD:
+            return await _run_like_asyncssh(_listing(filler_listing), 0.15, 0, timeout)
+        if cmd == ds_module.DOCKER_PS_ALL_NAMES_IDS_CMD:
+            return await _run_like_asyncssh(_listing(f"filler_late {_FILLER_ID}\n"), 0.15, 0, timeout)
+        answer = default_run(cmd, *args, **kwargs)
+        is_late = (
+            late_step == "running check" and cmd.startswith("/usr/bin/docker ps -q --filter")
+        ) or (
+            late_step == "filler rm"
+            and cmd.startswith("/usr/bin/docker rm -fv")
+            and "printf 'RM" in cmd
+        )
+        return await _run_like_asyncssh(answer, 0.15, 0, timeout) if is_late else answer
 
-    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", restore_whose_channel_never_opens)
-    monkeypatch.setattr(ds_module, "_FILLER_POWER_RESTORE_TIMEOUT_SECONDS", 0.05)
+    async def restore(*_args, **_kwargs):
+        if late_step == "power restore":
+            await asyncio.sleep(0.15)
 
-    result = await asyncio.wait_for(_run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL)), timeout=5)
+    ssh_client.run.side_effect = run
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", restore)
+    monkeypatch.setattr(ds_module, "_PRERUN_HOST_PROBE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.05)
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "container_cleanup"
-    assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
+    result = await asyncio.wait_for(
+        _run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL)), timeout=5
+    )
+
+    assert isinstance(result, ContainerCreated)
+
 
 @pytest.mark.asyncio
 async def test_a_running_check_that_never_answers_fails_the_customer_create(svc, monkeypatch):
     ssh_client = _customer_create_host(svc, monkeypatch, listing_at_running_check="PS\t0\n", listing_after_rm="")
     default_run = ssh_client.run.side_effect
 
-    async def run(cmd, *args, **kwargs):
+    async def run(cmd, *args, timeout=None, **kwargs):
         if cmd.startswith("/usr/bin/docker ps -q --filter"):
-            await asyncio.Event().wait()
+            # the channel opens, the command hangs
+            return await _run_like_asyncssh(_listing(""), 0, 1, timeout)
         return default_run(cmd, *args, **kwargs)
 
     ssh_client.run.side_effect = run

@@ -449,9 +449,6 @@ _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
-# a filler's power restore is one nvidia-smi query and a few sets that take seconds; a hung host fails the
-# customer's create instead of hanging it
-_FILLER_POWER_RESTORE_TIMEOUT_SECONDS = 60
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -3329,7 +3326,8 @@ class DockerService:
         DAH-3980: ``remove_every_filler`` (a customer's create) lists the host in the same exec; once the
         container runs, every `filler_*` on that listing is removed and confirmed gone, or the create
         fails (_FillerBesideCustomerContainer). That covers a survivor of the sweep before `docker run`
-        and a filler created since it. That exec is bounded; one that does not answer fails the create.
+        and a filler created since it. That exec's command is bounded, its channel open is not; a command
+        that does not answer fails the create.
         """
         start_time = time.time()
         name_filter = shlex.quote(f"name={container_name}")
@@ -3343,9 +3341,9 @@ class DockerService:
                     return True
             else:
                 try:
-                    # asyncssh's timeout= bounds only the command, not its channel open
-                    async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
-                        result = await ssh_client.run(command, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+                    # the channel open is not bounded: a cancelled open that the host confirms later stays open,
+                    # and a MaxSessions=1 sshd then refuses the failed-run cleanup's channels
+                    result = await ssh_client.run(command, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
                 except TimeoutError as exc:
                     raise _FillerBesideCustomerContainer(
                         f"the running check's listing did not answer in {_PRERUN_HOST_PROBE_TIMEOUT_SECONDS} s"
@@ -3368,7 +3366,16 @@ class DockerService:
     ) -> None:
         # the `filler_*` on a listing taken while the customer's container runs
         if listing is None:
-            listing = await self._list_all_containers(ssh_client)
+            # read once more, the channel open unbounded as the running check's (_list_all_containers bounds it)
+            try:
+                result = await ssh_client.run(
+                    _RUNNING_CHECK_LISTING_CMD, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+                )
+            except Exception as exc:
+                raise _FillerBesideCustomerContainer(
+                    f"the host listing failed: {exc.__class__.__name__}"
+                ) from exc
+            _, listing = _parse_running_check_with_listing(result.stdout or "")
             if listing is None:
                 raise _FillerBesideCustomerContainer("the host could not be listed to confirm no filler runs")
         names, ids = listing
@@ -3390,11 +3397,10 @@ class DockerService:
         filler_ids = [ids[name] for name in fillers if name in ids]
         command = _remove_and_list_containers_command([ids.get(name, name) for name in fillers], [])
         try:
-            # asyncssh's timeout= bounds only the command, not its channel open
-            async with asyncio.timeout(_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS):
-                result = await _MarkOwnRemovalsOnSubmit(ssh_client, filler_ids).run(
-                    command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
-                )
+            # its channel open is not bounded, as the running check's
+            result = await _MarkOwnRemovalsOnSubmit(ssh_client, filler_ids).run(
+                command, check=False, timeout=_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+            )
         except Exception as exc:
             raise _FillerBesideCustomerContainer(
                 f"docker rm -fv of {fillers} failed: {exc.__class__.__name__}"
@@ -3412,21 +3418,13 @@ class DockerService:
             raise _FillerBesideCustomerContainer(f"{sorted(survivors)} still on the host after docker rm -fv")
         # DAH-2356: a PEARL filler caps its GPUs before its `docker run`, possibly after this create's
         # last power restore; lifted only now that it is confirmed gone
-        try:
-            # its nvidia-smi calls bound only the command, not their channel open
-            async with asyncio.timeout(_FILLER_POWER_RESTORE_TIMEOUT_SECONDS):
-                for name in fillers:
-                    await restore_filler_pod_gpu_power_limits(
-                        ssh_client,
-                        self.redis_service,
-                        name.removeprefix(FILLER_CONTAINER_PREFIX),
-                        log_extra=default_extra,
-                    )
-        except TimeoutError as exc:
-            raise _FillerBesideCustomerContainer(
-                f"the GPU power restore after removing {fillers} did not finish in "
-                f"{_FILLER_POWER_RESTORE_TIMEOUT_SECONDS} s"
-            ) from exc
+        for name in fillers:
+            await restore_filler_pod_gpu_power_limits(
+                ssh_client,
+                self.redis_service,
+                name.removeprefix(FILLER_CONTAINER_PREFIX),
+                log_extra=default_extra,
+            )
 
     async def wait_for_port_check_containers(
         self,
