@@ -137,6 +137,7 @@ from services.rental_docker_sdk import (
     is_docker_not_found_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
+    rental_docker_error_class,
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
@@ -1995,6 +1996,7 @@ class DockerService:
             rental_docker_client_factory
             or RentalDockerSdkClientFactory(
                 pull_timeout_seconds=_DOCKER_PULL_TIMEOUT_SECONDS,
+                transport_retry_enabled=lambda: settings.DOCKER_TRANSPORT_RETRY_ENABLED,
             )
         )
         self.lock = asyncio.Lock()
@@ -4846,6 +4848,8 @@ class DockerService:
             )
             return False
 
+        # both execs may run twice after a dropped SSH transport: the copy overwrites the file,
+        # the script ends with sshd listening on its port whichever run got there first
         create_spec = ContainerExecSpec(
             container_name=container_name,
             argv=(
@@ -4855,10 +4859,12 @@ class DockerService:
                 f"&& chmod +x {shlex.quote(container_path)}",
             ),
             stdin=script_content,
+            idempotent=True,
         )
         run_spec = ContainerExecSpec(
             container_name=container_name,
             argv=("sh", container_path),
+            idempotent=True,
         )
 
         try:
@@ -8511,7 +8517,7 @@ class DockerService:
                 current_step = "customer_create_in_flight"
             # `error_class` (e.g. `port_collision`: dockerd could not bind the pod's host port)
             # rides in the event's detail next to the stage so the backend can count the class
-            error_class = port_collision_error_class(e)
+            error_class = rental_docker_error_class(e) or port_collision_error_class(e)
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
