@@ -43,7 +43,6 @@ import urllib3
 
 from core.config import settings
 from core.logger import get_logger
-from services.cache_prefetch_state import describe_error, redact
 from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
@@ -184,7 +183,7 @@ def _pull_pinned(
         api._raise_for_status(response)
         for event in api._stream_helper(response, decode=True) or ():
             if isinstance(event, dict) and event.get("error"):
-                return "pull_failed", redact(str(event["error"]))
+                return "pull_failed", str(event["error"])
             now = time.monotonic()
             if now > deadline:
                 return "timeout", f"exceeded {timeout_seconds:.0f}s"
@@ -312,7 +311,7 @@ class PrePuller:
                                 _pull_pinned, self.client, repo, tag, digest, budget
                             )
                         except Exception as e:
-                            outcome, detail = "pull_failed", describe_error(e)
+                            outcome, detail = "pull_failed", str(e)
             seconds = time.monotonic() - started
             logger.info(
                 f"pre_pull image={image_ref} digest={digest} seconds={seconds:.1f} outcome={outcome}"
