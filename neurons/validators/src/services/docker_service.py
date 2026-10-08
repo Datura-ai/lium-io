@@ -446,6 +446,8 @@ _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
 # (30 s); a probe slower than this is a hung host, and the per-command path takes over.
 _PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
+# the pre-run host-limit reads (pid_max, MemTotal, GPU count): a `cat` of a /proc file
+_HOST_LIMIT_READ_TIMEOUT_SECONDS = 15
 # DAH-3980: a forced rm of a few containers takes about a second; a hung dockerd must fail the
 # customer's create at the cleanup step instead of hanging it
 _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS = 60
@@ -2652,14 +2654,18 @@ class DockerService:
 
         Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
         ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Bounded:
-        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded by asyncssh's own
-        `timeout`; it deliberately does not shell out to `timeout`, whose absence would otherwise
+        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded by asyncio,
+        channel open included; it deliberately does not shell out to `timeout`, whose absence would otherwise
         turn into a miss and fail the read.
         """
         try:
-            res = await ssh_client.run(
-                "cat /proc/sys/kernel/pid_max", check=False, timeout=15
-            )
+            # asyncssh's timeout= bounds only the command, not its channel open
+            async with asyncio.timeout(_HOST_LIMIT_READ_TIMEOUT_SECONDS):
+                res = await ssh_client.run(
+                    "cat /proc/sys/kernel/pid_max",
+                    check=False,
+                    timeout=_HOST_LIMIT_READ_TIMEOUT_SECONDS,
+                )
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
         if getattr(res, "exit_status", 1) != 0:
@@ -2673,7 +2679,10 @@ class DockerService:
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
         try:
-            res = await ssh_client.run("cat /proc/meminfo", check=False, timeout=15)
+            async with asyncio.timeout(_HOST_LIMIT_READ_TIMEOUT_SECONDS):
+                res = await ssh_client.run(
+                    "cat /proc/meminfo", check=False, timeout=_HOST_LIMIT_READ_TIMEOUT_SECONDS
+                )
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
         if getattr(res, "exit_status", 1) != 0:
@@ -2695,9 +2704,12 @@ class DockerService:
         share of host RAM; the caller refuses the rental on a miss so the fallback is never larger than
         the renter's share of the host."""
         try:
-            res = await ssh_client.run(
-                "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", check=False, timeout=15
-            )
+            async with asyncio.timeout(_HOST_LIMIT_READ_TIMEOUT_SECONDS):
+                res = await ssh_client.run(
+                    "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l",
+                    check=False,
+                    timeout=_HOST_LIMIT_READ_TIMEOUT_SECONDS,
+                )
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
         if getattr(res, "exit_status", 1) != 0:
@@ -4396,9 +4408,10 @@ class DockerService:
         )
         started = time.monotonic()
         try:
-            # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent);
-            # asyncio.TimeoutError lands in the except below → None → the per-command path.
-            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+            # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent),
+            # channel open included; TimeoutError lands in the except below → None → the per-command path.
+            async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
+                result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
             probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power)
         except asyncio.CancelledError:
             raise

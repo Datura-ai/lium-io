@@ -18,6 +18,7 @@ Covers (from the plan's Test Plan):
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -450,6 +451,73 @@ async def test_rental_is_refused_when_the_host_pid_max_is_too_low_for_the_margin
     assert not isinstance(result, ContainerCreated)
     assert _docker_client(svc).run_specs == []
     svc.create_local_volume.assert_not_awaited()
+
+
+_HOST_LIMIT_READ_ANSWERS = {
+    "cat /proc/sys/kernel/pid_max": "4194304\n",
+    "cat /proc/meminfo": "MemTotal:       67108864 kB\n",
+    "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l": "8\n",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hung_read", "payload_overrides", "failure_step"),
+    [
+        ("cat /proc/sys/kernel/pid_max", {}, "host_pid_max"),
+        ("cat /proc/meminfo", {"memory_gb": 0}, "host_ram_kib"),
+        ("ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", {"memory_gb": 0, "gpu_uuids": ["GPU-a"]}, "host_gpu_count"),
+    ],
+    ids=["pid_max", "meminfo", "gpu_count"],
+)
+async def test_rental_is_refused_within_the_bound_when_a_host_limit_read_never_opens_its_channel(
+    svc, monkeypatch, hung_read, payload_overrides, failure_step
+):
+    """asyncssh's run(timeout=) bounds the command, not the channel open: an sshd that accepts the
+    connection but never confirms the read's channel used to hang the create for good. Bounded, the
+    read is a miss like today's timeout, and the create fails closed before any host side-effect."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PIDS_LIMIT_PER_CPU", 4096)
+    monkeypatch.setattr(ds_module, "_HOST_LIMIT_READ_TIMEOUT_SECONDS", 0.2)
+
+    async def _hung_read_never_opens_its_channel(cmd, *a, **k):
+        if cmd == hung_read:
+            await asyncio.Event().wait()
+        return _ssh_result(exit_status=0, stdout=_HOST_LIMIT_READ_ANSWERS.get(cmd, ""))
+    ssh_client.run = AsyncMock(side_effect=_hung_read_never_opens_its_channel)
+
+    result = await asyncio.wait_for(_run(svc, _payload(**payload_overrides)), 2)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == failure_step
+    assert _docker_client(svc).run_specs == []
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rental_falls_back_to_its_own_listings_when_the_prerun_host_probe_never_opens_its_channel(
+    svc, monkeypatch
+):
+    """The one-command host probe whose channel never opens gives up within its bound and returns None,
+    like today's timeout: every consumer runs its own listing and the rental is created."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
+    monkeypatch.setattr(ds_module, "_PRERUN_HOST_PROBE_TIMEOUT_SECONDS", 0.2)
+    probe_commands = []
+
+    async def _probe_never_opens_its_channel(cmd, *a, **k):
+        if cmd.startswith("t() {"):
+            probe_commands.append(cmd)
+            await asyncio.Event().wait()
+        return _ssh_result(exit_status=0, stdout=_HOST_LIMIT_READ_ANSWERS.get(cmd, ""))
+    ssh_client.run = AsyncMock(side_effect=_probe_never_opens_its_channel)
+
+    result = await asyncio.wait_for(_run(svc, _payload()), 2)
+
+    assert isinstance(result, ContainerCreated)
+    assert len(probe_commands) == 1
 
 
 @pytest.mark.asyncio
