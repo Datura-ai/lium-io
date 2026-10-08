@@ -11,7 +11,7 @@ import socket
 import struct
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -640,6 +640,7 @@ async def _failed_create(
     service, executor, monkeypatch, run_error: Exception
 ) -> FailedContainerRequest:
     _patch_create_harness(monkeypatch, service, RecordingSSHClient())
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service.rental_docker_client_factory.client.run_container_error = run_error
     result = await service.create_container(
         payload=_base_create_payload(),
