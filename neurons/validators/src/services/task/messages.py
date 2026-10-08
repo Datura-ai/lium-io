@@ -971,6 +971,17 @@ class TenantEnforcementMessages:
         impact="Score set to 0; verification cleared",
         remediation="Start container and ensure it stays healthy.",
     )
+    POD_RESTARTING = MessageTemplate(
+        event="Pod restarting under its own restart policy",
+        reason="POD_RESTARTING",
+        severity="warning",
+        category="runtime",
+        impact="No verdict for this cycle - verification kept",
+        remediation=(
+            "The pod is restarting under its restart policy; the host cannot tell whether the renter's process or "
+            "the host caused the exits."
+        ),
+    )
     STALE_POD_NOT_RUNNING = MessageTemplate(
         event="Stale rented pod not running signal skipped",
         reason="STALE_POD_NOT_RUNNING",

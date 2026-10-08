@@ -392,6 +392,7 @@ RENTAL_DISK_HEADROOM_GB = 20
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
+_KIB_PER_GIB = 1024 * 1024
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -2473,8 +2474,11 @@ class DockerService:
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
         host_pid_max: int | None = None,
+        host_ram_kib: int | None = None,
+        gpu_share: float = 1.0,
         quote_socket: bool = False,
     ) -> ContainerRunSpec:
+        memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
         environment = {
             key: str(value)
             for key, value in (custom_options.environment or {}).items()
@@ -2525,11 +2529,11 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
-            ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
+            ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
-            memory_gb=payload.memory_gb,
+            memory_gb=memory_gb,
             storage_limit_gb=effective_storage_limit_gb,
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
@@ -2647,6 +2651,66 @@ class DockerService:
         except (TypeError, ValueError):
             return None
         return value if value > 0 else None
+
+    async def _read_host_ram_kib(self, ssh_client) -> int | None:
+        """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
+        try:
+            res = await ssh_client.run("cat /proc/meminfo", check=False, timeout=15)
+        except (asyncssh.Error, asyncio.TimeoutError, OSError):
+            return None
+        if getattr(res, "exit_status", 1) != 0:
+            return None
+        for line in (res.stdout or "").splitlines():
+            if line.startswith("MemTotal:"):
+                try:
+                    value = int(line.split()[1])
+                except (IndexError, ValueError):
+                    return None
+                return value if value > 0 else None
+        return None
+
+    async def _read_host_gpu_count(self, ssh_client) -> int | None:
+        """The executor host's GPU count, or None when unreadable. Same bounded read as RAM.
+
+        Counts /dev/nvidiaN device nodes, the same host-GPU enumeration the --device flag path uses
+        (nvidia_devices.GPU_DEVICE_NODES_CMD). Lets a legacy zero-RAM split rental be sized to its GPU
+        share of host RAM; the caller refuses the rental on a miss so the fallback is never larger than
+        the renter's share of the host."""
+        try:
+            res = await ssh_client.run(
+                "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", check=False, timeout=15
+            )
+        except (asyncssh.Error, asyncio.TimeoutError, OSError):
+            return None
+        if getattr(res, "exit_status", 1) != 0:
+            return None
+        try:
+            value = int((res.stdout or "").strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _rental_memory_gb(memory_gb: int | None, host_ram_kib: int | None, gpu_share: float = 1.0) -> int | None:
+        """The rental's memory limit: the backend's, or host RAM less the host reserve when it sent none.
+
+        A pod row saved before the backend sized RAM carries ram_total 0, which arrives as memory_gb 0 and
+        used to mean no mem_limit: the renter could take every byte and the kernel OOM killer would pick
+        sshd or the executor, taking the node offline mid-rental on the provider's account.
+
+        On a split host the fallback follows the backend's own rule (models.executor.pod_ram_total_kib):
+        the renter gets (host - reserve) times its GPU share, not the whole host less the reserve. Without
+        the share, two legacy zero-RAM pods on different GPUs of one host would each be capped near the
+        full host RAM and could together exceed it, re-opening the OOM path this limit exists to close.
+        """
+        if memory_gb or not host_ram_kib:
+            return memory_gb
+        reserve_kib = max(
+            settings.RENTAL_HOST_RAM_RESERVE_GB * _KIB_PER_GIB,
+            host_ram_kib * settings.RENTAL_HOST_RAM_RESERVE_PERCENT / 100,
+        )
+        share = min(max(gpu_share, 0.0), 1.0)
+        return max(int(((host_ram_kib - reserve_kib) * share) // _KIB_PER_GIB), 1)
 
     @classmethod
     def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
@@ -6951,8 +7015,9 @@ class DockerService:
             probe_with_power = not brings_own_power_cap
             early_host_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
             early_volume_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
-            # DAH-3980: a customer's create removes every filler (DAH-3706); started with the probes,
-            # the kill runs beside the image inspect instead of after it. Any other create (a filler
+            # DAH-3980: a customer's create removes every filler (DAH-3706). The kill is started after the
+            # fail-closed host reads below (never before — a refused probe must leave the filler in place),
+            # so it still runs beside the image inspect instead of after it. Any other create (a filler
             # create, a restore, a custom build, a local volume) keeps the removal at the cleanup step.
             removes_fillers_at_ssh_connect = (
                 early_probes_allowed
@@ -6979,17 +7044,7 @@ class DockerService:
                     )
 
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
-                nonlocal early_host_probe, early_volume_probe, filler_removal_at_ssh_connect
-                if removes_fillers_at_ssh_connect:
-                    filler_removal_at_ssh_connect = asyncio.create_task(
-                        self.remove_fillers_at_ssh_connect(
-                            connected_ssh_client,
-                            default_extra,
-                            self.get_container_name(payload),
-                            payload.active_volume_names,
-                        )
-                    )
-                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
+                nonlocal early_host_probe, early_volume_probe
                 if not early_probes_allowed:
                     return
                 if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
@@ -7066,6 +7121,74 @@ class DockerService:
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+
+                # Read the host's real limits and decide fail-closed BEFORE any host side-effect —
+                # the edit-swap park, the stale-container/filler cleanup (an irreversible rm), the
+                # image pull, or the local volume — so a refusal leaves the host exactly as it was
+                # (review findings on PR #1531 and #1534: these probes sat after park and cleanup, so
+                # a failed probe could strand a host whose filler had already been removed).
+                #
+                # kernel.pid_max: the limit is enabled unless RENTAL_PIDS_LIMIT_PER_CPU=0; refuse when
+                # the host PID margin cannot be guaranteed — the value is unreadable, or so low that
+                # even the floored cgroup cap would not reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the
+                # host's own tasks. No fixed fallback is safe on a host whose real pid_max is lower, so
+                # a tenant fork bomb would starve sshd/dockerd and take the executor offline mid-rental.
+                host_pid_max = await self._read_host_pid_max(ssh_client)
+                if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
+                    current_step = "host_pid_max"
+                    if host_pid_max is None:
+                        raise RuntimeError(
+                            "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
+                        )
+                    if host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT:
+                        raise RuntimeError(
+                            f"host kernel.pid_max ({host_pid_max}) is too low to reserve the host PID "
+                            "margin; refusing to start a rental"
+                        )
+
+                # host RAM: needed only when the rental was sent without a memory limit, to size one.
+                # That is the legacy ram_total 0 pod rows AND the validator's own rental probe, whose
+                # _probe_payload sends no memory_gb — so the messages below say "a rental sent without
+                # a memory limit", not "legacy". Under host contention — the exact condition that
+                # delays this SSH probe — an unlimited rental lets the renter exhaust host RAM and OOM
+                # the executor/sshd, so refuse rather than fall through to no mem_limit.
+                host_ram_kib: int | None = None
+                rental_gpu_share = 1.0
+                if not payload.memory_gb:
+                    current_step = "host_ram_kib"
+                    host_ram_kib = await self._read_host_ram_kib(ssh_client)
+                    if host_ram_kib is None:
+                        raise RuntimeError(
+                            "host MemTotal could not be read; refusing to start a rental sent without a memory limit"
+                        )
+                    # A split-host rental gets its GPU share of host RAM, matching the backend's own
+                    # sizing (models.executor.pod_ram_total_kib). Two zero-RAM pods on one split host
+                    # must not each be capped near the whole host. Whole-node rentals keep share 1.0.
+                    if payload.gpu_uuids:
+                        current_step = "host_gpu_count"
+                        host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                        if not host_gpu_count or len(payload.gpu_uuids) > host_gpu_count:
+                            raise RuntimeError(
+                                "host GPU count could not be read or is below the rented GPU count; "
+                                "refusing to start a split rental sent without a memory limit"
+                            )
+                        rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
+
+                # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
+                # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
+                # MaxSessions=1 denying its channel while the removal held the session) would reject the rental
+                # after the filler was already gone, stranding the host. So the removal starts only now, once the
+                # host reads have succeeded, and still runs beside the image inspect/pull below.
+                if removes_fillers_at_ssh_connect:
+                    filler_removal_at_ssh_connect = asyncio.create_task(
+                        self.remove_fillers_at_ssh_connect(
+                            ssh_client,
+                            default_extra,
+                            self.get_container_name(payload),
+                            payload.active_volume_names,
+                        )
+                    )
+                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
 
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
@@ -7545,27 +7668,6 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
                 prev_timestamp = now_ms()
 
-                # Read the host's real kernel.pid_max and decide fail-closed BEFORE anything is
-                # created on the host (the local volume, a filler's GPU power cap) so a refusal
-                # leaves nothing behind (review finding on PR #1531). The limit is enabled unless
-                # RENTAL_PIDS_LIMIT_PER_CPU=0; refuse when the host PID margin cannot be guaranteed:
-                # the value is unreadable, or it is so low that even the floored cgroup cap would not
-                # reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the host's own tasks. No fixed fallback is
-                # safe on a host whose real pid_max is lower, so a tenant fork bomb would starve
-                # sshd/dockerd and take the executor offline mid-rental.
-                host_pid_max = await self._read_host_pid_max(ssh_client)
-                if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
-                    current_step = "host_pid_max"
-                    if host_pid_max is None:
-                        raise RuntimeError(
-                            "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
-                        )
-                    if host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT:
-                        raise RuntimeError(
-                            f"host kernel.pid_max ({host_pid_max}) is too low to reserve the host PID "
-                            "margin; refusing to start a rental"
-                        )
-
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
                 effective_volume_limit_gb = payload.volume_limit_gb
@@ -7833,6 +7935,8 @@ class DockerService:
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
                     host_pid_max=host_pid_max,
+                    host_ram_kib=host_ram_kib,
+                    gpu_share=rental_gpu_share,
                     quote_socket=quote_socket,
                 )
 
