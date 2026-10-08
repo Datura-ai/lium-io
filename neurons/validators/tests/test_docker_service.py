@@ -9,6 +9,7 @@ from services.docker_service import (
 )
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerRunSpec,
     ContainerStateSnapshot,
     build_gpu_docker_config,
 )
@@ -559,4 +560,45 @@ def _state(**overrides) -> ContainerStateSnapshot:
 # DAH-3980: on the encrypted path the keys ride at the end of the one volume setup exec; its exit
 # status says which part failed (90 upload, 91 init/mount, 92 mount check, 93 keys).
 
+
+_VLOOPBACK_STALE_MOUNT_ERR = (
+    "docker: Error response from daemon: failed to populate volume: "
+    "error while mounting volume '/mnt/volume_test': "
+    "VolumeDriver.Mount: error while mounting volume: "
+    "cannot create mount point dir '/mnt/volume_test': "
+    "mkdir /mnt/volume_test: file exists"
+)
+
+
+@pytest.mark.asyncio
+async def test_rental_create_removes_the_failed_container_before_the_stale_mount_retry(
+    docker_service, monkeypatch,
+):
+    events: list[str] = []
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if events.count("run") == 1:
+                raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
+            return "cid"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
+    )
+
+    container_id = await docker_service._run_rental_docker_create_with_port_retry(
+        docker_client=FakeRentalClient(),
+        ssh_client=Mock(),
+        run_spec=ContainerRunSpec(image="img", name="pod_test"),
+        container_name="pod_test",
+        default_extra={},
+        local_volume="volume_test",
+    )
+
+    assert container_id == "cid"
+    assert events == ["run", "rm pod_test", "run"]
 

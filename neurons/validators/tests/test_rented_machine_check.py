@@ -410,3 +410,97 @@ async def test_tenant_enforcement_penalises_when_pod_stays_down_after_recovery(c
 # ---------------------------------------------------------------------------
 
 
+def _tenant_ctx(context_factory, ssh_client, rented_machine, *, backend=None, prior_state=None):
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend or DummyBackendClient(active=True),
+    )
+    state = build_state(
+        gpu_processes=[],
+        gpu_details=[],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=build_rented_data("executor-123", rented_machine),
+        pod_states=prior_state or [],
+    )
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=ssh_client,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+class RestartingContainerSSHClient(DummySSHClient):
+    """`docker ps` lists nothing and `docker inspect` shows dockerd between restarts of the pod."""
+
+    def __init__(self, *, error: str = "", exit_code: int = 1, oom_killed: bool = False):
+        super().__init__(pod_running=False)
+        self.error = error
+        self.exit_code = exit_code
+        self.oom_killed = oom_killed
+
+    async def run(self, command: str):
+        if "docker inspect" in command:
+            self.commands_called.append(command)
+            state = {
+                "Status": "restarting",
+                "ExitCode": self.exit_code,
+                "OOMKilled": self.oom_killed,
+                "Error": self.error,
+                "FinishedAt": self.container_finished_at,
+            }
+            return Mock(stdout=json.dumps(state), stderr="")
+        return await super().run(command)
+
+
+@pytest.mark.asyncio
+async def test_a_pod_whose_restart_fails_to_start_is_still_not_running(context_factory):
+    ctx = _tenant_ctx(
+        context_factory,
+        RestartingContainerSSHClient(error="OCI runtime create failed: nvidia-container-cli: initialization error"),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "oom_killed", "case"),
+    [
+        (1, False, "provider sent a handled SIGUSR1; PID 1 chose exit 1"),
+        (0, False, "graceful daemon restart — PID 1 handled SIGTERM and exited 0"),
+        (143, False, "daemon stop / SIGTERM (128+15)"),
+        (137, False, "host SIGKILL (128+9)"),
+        (137, True, "host OOM-kill"),
+        (139, False, "docker kill --signal=SEGV (128+11), forgeable by the provider"),
+        (134, False, "docker kill --signal=ABRT (128+6), forgeable by the provider"),
+        (129, False, "SIGHUP (128+1), a repo-canonical host kill"),
+    ],
+)
+async def test_a_restarting_pod_without_renter_fault_evidence_is_not_shielded(
+    context_factory, exit_code, oom_killed, case
+):
+    """Review finding (Serhii, #1534): a provider Docker-daemon restart or a host/provider signal can leave
+    an unless-stopped container `restarting` with an empty State.Error, and the provider controls that
+    tooling — no exit code (a handled signal can make PID 1 pick any) is trusted renter attribution. Each such case
+    must fall through to POD_NOT_RUNNING (clears the verified job, provider-fault path), not be labelled a
+    renter crash-loop that keeps verification."""
+    ctx = _tenant_ctx(
+        context_factory,
+        RestartingContainerSSHClient(exit_code=exit_code, oom_killed=oom_killed),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason, case
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+

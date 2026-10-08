@@ -510,6 +510,12 @@ class Settings(BaseSettings):
     )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
+    # DAH-4001 — delayed idle settlement. off: today's behaviour, nothing reported. shadow: post every cycle's
+    # vector and per-node rows to the backend and read its settled vector every tempo for comparison only; live
+    # weights unchanged. enforce: submit the backend's settled vector (the cycles scored a day earlier, inactive
+    # nodes' idle shares moved to the verified burner); with none to serve, submit this tempo's vector with its
+    # idle moved to the burner, never an older vector.
+    SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
     EXECUTOR_IMAGE_REF: str = Field(
@@ -803,6 +809,18 @@ class Settings(BaseSettings):
             "gets min(scaled cap, kernel.pid_max - this), so on a host with a low kernel.pid_max it "
             "still cannot exhaust the global PID space before hitting its own cgroup wall."
         ),
+    )
+    RENTAL_HOST_RAM_RESERVE_GB: int = Field(
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        description=(
+            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
+            "memory limit: the container gets host MemTotal minus max(this, "
+            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+        ),
+    )
+    RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=1.0, ge=0, lt=100,
+        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB.",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
