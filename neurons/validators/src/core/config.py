@@ -810,6 +810,18 @@ class Settings(BaseSettings):
             "still cannot exhaust the global PID space before hitting its own cgroup wall."
         ),
     )
+    RENTAL_HOST_RAM_RESERVE_GB: int = Field(
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        description=(
+            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
+            "memory limit: the container gets host MemTotal minus max(this, "
+            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+        ),
+    )
+    RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=1.0, ge=0, lt=100,
+        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB.",
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(

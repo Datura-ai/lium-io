@@ -339,6 +339,68 @@ async def test_present_image_is_pulled_when_the_registry_tag_moved(svc, monkeypa
     assert len(_docker_client(svc).login_calls) == 1, "the pull that follows must be authenticated"
 
 
+def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram():
+    """A legacy pod row (ram_total 0) arrives as memory_gb 0; the limit becomes host RAM less the 4 GiB host
+    reserve, so the renter cannot starve the executor of memory. 64 GiB host - 4 GiB = 60 GiB."""
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024) == 60
+
+
+def test_a_rental_with_a_memory_limit_keeps_the_backend_value():
+    assert DockerService._rental_memory_gb(8, 64 * 1024 * 1024) == 8
+
+
+def test_an_unreadable_host_ram_leaves_a_limitless_rental_as_it_was():
+    # host RAM unreadable -> the backend's falsy value is kept, so the rental stays limitless as before
+    assert not DockerService._rental_memory_gb(0, None)
+    assert DockerService._rental_memory_gb(None, None) is None
+
+
+def test_a_split_host_legacy_rental_gets_its_gpu_share_of_host_ram():
+    """Review finding #1534: on a split host the fallback follows the backend's (host - reserve) * share
+    (models.executor.pod_ram_total_kib). A 4-of-8 rental on a 64 GiB host gets (64 - 4) * 0.5 = 30 GiB, so
+    two such legacy pods sum to 60 GiB — the whole host less the reserve — and cannot together exceed it
+    and OOM the executor, as they would if each were capped near the full host RAM."""
+    half = DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 0.5)
+    assert half == 30
+    assert half * 2 <= DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 1.0)
+
+
+def test_the_gpu_share_is_clamped_into_range():
+    # a share over 1 (never expected) cannot exceed the whole-host cap; a non-positive share floors at 1 GiB
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 2.0) == 60
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 0.0) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_host_gpu_count_counts_device_nodes(svc):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="8\n"))
+    assert await svc._read_host_gpu_count(ssh_client) == 8
+
+
+@pytest.mark.asyncio
+async def test_read_host_gpu_count_returns_none_when_zero_or_unreadable(svc):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="0\n"))
+    assert await svc._read_host_gpu_count(ssh_client) is None
+    ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
+    assert await svc._read_host_gpu_count(ssh_client) is None
+
+
+@pytest.mark.asyncio
+async def test_read_host_ram_kib_parses_memtotal(svc):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="MemTotal:       67108864 kB\nMemFree: 1 kB\n"))
+    assert await svc._read_host_ram_kib(ssh_client) == 67108864
+
+
+@pytest.mark.asyncio
+async def test_read_host_ram_kib_returns_none_when_the_read_fails(svc):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
+    assert await svc._read_host_ram_kib(ssh_client) is None
+
+
 @pytest.mark.asyncio
 async def test_rental_is_refused_when_the_host_pid_max_cannot_be_read(svc, monkeypatch):
     """An unreadable kernel.pid_max fails closed, and before any host side-effect.
@@ -388,6 +450,103 @@ async def test_rental_is_refused_when_the_host_pid_max_is_too_low_for_the_margin
     assert not isinstance(result, ContainerCreated)
     assert _docker_client(svc).run_specs == []
     svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_rental_is_refused_when_the_host_ram_cannot_be_read(svc, monkeypatch):
+    """Review finding #1534: a legacy ram_total 0 pod (memory_gb 0) whose host MemTotal is unreadable
+    fails closed BEFORE any host side-effect, like host_pid_max. Falling through to no mem_limit is the
+    exact fail-open the limit exists to close, and the host contention that delays this SSH probe is when
+    a limitless renter can OOM the executor. Only the meminfo read fails here, so the flow reaches it and
+    no volume or container is created."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _only_meminfo_fails(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=1)
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_only_meminfo_fails)
+
+    result = await _run(svc, _payload(memory_gb=0))
+
+    assert not isinstance(result, ContainerCreated)
+    assert _docker_client(svc).run_specs == []
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_rental_probe_failure_leaves_the_filler_in_place(svc, monkeypatch):
+    """Review finding #1534 (round 2): the host-limit probes must run BEFORE the stale-container
+    cleanup, not after. clean_existing_containers force-removes a co-tenant filler (an irreversible
+    `docker rm`); if the probe failed after that, the host would be left with neither the filler nor
+    the new rental. Only the meminfo read fails here, so the refusal must happen with
+    clean_existing_containers never awaited — the filler is still running."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _only_meminfo_fails(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=1)
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_only_meminfo_fails)
+
+    result = await _run(svc, _payload(memory_gb=0))
+
+    assert not isinstance(result, ContainerCreated)
+    svc.clean_existing_containers.assert_not_awaited()
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_split_legacy_rental_is_refused_when_the_host_gpu_count_cannot_be_read(svc, monkeypatch):
+    """Review finding #1534: a legacy split rental whose host GPU count is unreadable fails closed too —
+    without it the GPU share is unknown, so sizing to the whole host (less reserve) would hand each of two
+    co-tenant legacy pods near all of host RAM. Only the GPU-count read fails here."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _only_gpu_count_fails(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=0, stdout="MemTotal:       67108864 kB\n")
+        if cmd == "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l":
+            return _ssh_result(exit_status=1)
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_only_gpu_count_fails)
+
+    result = await _run(svc, _payload(memory_gb=0, gpu_uuids=["GPU-a", "GPU-b"]))
+
+    assert not isinstance(result, ContainerCreated)
+    svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_split_legacy_rental_is_sized_to_its_gpu_share(svc, monkeypatch):
+    """The create flow reads host RAM and host GPU count for a legacy ram_total 0 split rental and sizes
+    the mem_limit to the rented GPUs' share: 4 of 8 GPUs on a 64 GiB host -> (64 - 4) * 4/8 = 30 GiB."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    def _host_reads(cmd, *a, **k):
+        if cmd == "cat /proc/sys/kernel/pid_max":
+            return _ssh_result(exit_status=0, stdout="4194304\n")
+        if cmd == "cat /proc/meminfo":
+            return _ssh_result(exit_status=0, stdout="MemTotal:       67108864 kB\n")
+        if cmd == "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l":
+            return _ssh_result(exit_status=0, stdout="8\n")
+        return _ssh_result(exit_status=0)
+    ssh_client.run = AsyncMock(side_effect=_host_reads)
+
+    result = await _run(svc, _payload(memory_gb=0, gpu_uuids=["GPU-a", "GPU-b", "GPU-c", "GPU-d"]))
+
+    assert isinstance(result, ContainerCreated)
+    assert _created_run_spec(svc).memory_gb == 30
 
 
 @pytest.mark.asyncio
@@ -456,13 +615,13 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _docker_client(svc).login_calls == []
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
-        # a customer's create looks for fillers to remove as soon as the SSH session is up
+        # the host's kernel.pid_max first — before any host side-effect (the filler removal below, the
+        # stale-container cleanup, the pull, the volume) so a rental whose pids.max can't be clamped below
+        # it is refused with nothing to undo; a bare cat bounded by asyncssh's timeout, no `timeout` binary
+        "cat /proc/sys/kernel/pid_max",
+        # only once the fail-closed read has passed does a customer's create look for fillers to remove
         '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"',
         '/usr/bin/docker volume ls --format "{{.Name}}"',
-        # the host's kernel.pid_max, read before any host side-effect so a rental whose pids.max
-        # can't be clamped below it is refused with nothing to undo; a bare cat bounded by
-        # asyncssh's timeout, no `timeout` binary to be absent
-        "cat /proc/sys/kernel/pid_max",
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
