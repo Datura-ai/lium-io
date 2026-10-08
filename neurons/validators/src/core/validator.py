@@ -1080,9 +1080,17 @@ class Validator:
         index, tempo, block_before = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
             return True
-        # before the read: a window that landed but was never reported reads as not landed, and this one would
-        # decide its deposits again
-        await self._retry_pending_inclusion()
+        # a window that landed but is not reported reads as not landed, and the next one would decide its deposits
+        # again: it waits, and the landed vector stays in force meanwhile
+        if not await self._retry_pending_inclusion():
+            logger.error(
+                _m(
+                    "[settlement] an accepted window is not reported yet; the next one waits",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index}),
+                )
+            )
+            self._alert_if_near_activity_cutoff()
+            return False
         window = await self._fetch_settled_window(index, tempo)
         if window is None or not any(window.hotkey_scores.values()):  # all zero would land as uniform weights
             if window is not None:
@@ -1138,10 +1146,10 @@ class Validator:
             return None
         return json.loads(kept) if kept else {}
 
-    async def _confirm_inclusion(self, index: int, block: int) -> None:
+    async def _confirm_inclusion(self, index: int, block: int) -> bool:
         """Tell the backend the block read right after the chain accepted the tempo's vector (the extrinsic landed
         at or just before it); kept before the report, so a restart while it is in flight does not lose it, and
-        retried every cycle until the backend answers."""
+        retried until the backend answers. Returns whether it answered."""
         await self._keep_pending_inclusion(index, block)
         try:
             confirmed = await self.backend_client.report_settled_weights_result(index, block)
@@ -1152,9 +1160,10 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
                 )
             )
-            return
-        if confirmed is not None:
-            await self._keep_pending_inclusion(index, None)
+            confirmed = None
+        # kept again when unanswered: the keep above may have met a Redis that has recovered since
+        await self._keep_pending_inclusion(index, block if confirmed is None else None)
+        return confirmed is not None
 
     async def _keep_pending_inclusion(self, index: int, block: int | None) -> None:
         # None drops the tempo's entry. Each tempo's stays until its own acknowledgement: a later one never clears it
@@ -1178,9 +1187,15 @@ class Validator:
                 _m("[settlement] could not keep the pending inclusions", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
             )
 
-    async def _retry_pending_inclusion(self) -> None:
-        for index, block in sorted((await self._pending_inclusions() or {}).items()):
-            await self._confirm_inclusion(int(index), int(block))
+    async def _retry_pending_inclusion(self) -> bool:
+        """Whether every kept inclusion is acknowledged now; stops at the first one the backend does not take."""
+        pending = await self._pending_inclusions()
+        if pending is None:
+            return False
+        for index, block in sorted(pending.items()):
+            if not await self._confirm_inclusion(int(index), int(block)):
+                return False
+        return True
 
     def _alert_if_near_activity_cutoff(self) -> None:
         """Error-log when no weights of ours were accepted for more than half the subnet's activity cutoff."""

@@ -586,7 +586,7 @@ async def test_a_pending_inclusion_is_reported_before_the_next_window_is_read():
     validator.redis_service.get = AsyncMock(return_value=json.dumps({"341": 123000}))
     calls = []
     validator.backend_client.report_settled_weights_result = AsyncMock(
-        side_effect=lambda index, block: calls.append(("report", index))
+        side_effect=lambda index, block: calls.append(("report", index)) or MagicMock(inclusion_block=block)
     )
     validator.backend_client.get_settled_weights = AsyncMock(
         side_effect=lambda index, tempo: calls.append(("read", index)) or WINDOW
@@ -615,6 +615,31 @@ async def test_a_redis_read_failure_never_overwrites_the_pending_inclusions():
     await validator._confirm_inclusion(343, 123800)
 
     validator.redis_service.set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_next_window_waits_while_an_accepted_one_is_not_reported():
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.redis_service.get = AsyncMock(return_value=json.dumps({"341": 123000, "340": 122600}))
+
+    settled = await validator.submit_settled_window()
+
+    assert settled is False
+    validator.backend_client.report_settled_weights_result.assert_awaited_once_with(340, 122600)
+    validator.backend_client.get_settled_weights.assert_not_awaited()
+    validator.subtensor_client.set_weights.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report", [AsyncMock(return_value=None), AsyncMock(side_effect=RuntimeError("down"))])
+async def test_an_inclusion_redis_could_not_keep_before_the_report_is_kept_after_it(report):
+    validator = _validator(window=WINDOW, accepted=True)
+    validator.redis_service.get = AsyncMock(side_effect=[ConnectionError("redis down"), None])
+    validator.backend_client.report_settled_weights_result = report
+
+    await validator._confirm_inclusion(342, 123456)
+
+    validator.redis_service.set.assert_awaited_once_with(PENDING_INCLUSION_KEY, json.dumps({"342": 123456}))
 
 
 def test_only_a_wrong_request_is_dropped_a_bad_moment_is_retried():
