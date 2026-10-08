@@ -496,28 +496,27 @@ async def test_rental_is_refused_within_the_bound_when_a_host_limit_read_never_o
 
 
 @pytest.mark.asyncio
-async def test_rental_falls_back_to_its_own_listings_when_the_prerun_host_probe_never_opens_its_channel(
-    svc, monkeypatch
-):
-    """The one-command host probe whose channel never opens gives up within its bound and returns None,
-    like today's timeout: every consumer runs its own listing and the rental is created."""
+async def test_the_prerun_host_probe_waits_for_a_channel_the_host_opens_late(svc, monkeypatch):
+    """A deadline that cancelled the probe's channel open would leave the channel the host confirms later
+    open and unused until the create's SSH connection closes; a MaxSessions=1 sshd then refuses every later
+    command of the create. So the probe waits for its open, as on main."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.setattr("services.docker_service.settings.RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
-    monkeypatch.setattr(ds_module, "_PRERUN_HOST_PROBE_TIMEOUT_SECONDS", 0.2)
-    probe_commands = []
+    monkeypatch.setattr(ds_module, "_PRERUN_HOST_PROBE_TIMEOUT_SECONDS", 0.05)
+    probe_channels_opened = []
 
-    async def _probe_never_opens_its_channel(cmd, *a, **k):
+    async def _probe_channel_opens_late(cmd, *a, **k):
         if cmd.startswith("t() {"):
-            probe_commands.append(cmd)
-            await asyncio.Event().wait()
+            await asyncio.sleep(0.2)
+            probe_channels_opened.append(cmd)
         return _ssh_result(exit_status=0, stdout=_HOST_LIMIT_READ_ANSWERS.get(cmd, ""))
-    ssh_client.run = AsyncMock(side_effect=_probe_never_opens_its_channel)
+    ssh_client.run = AsyncMock(side_effect=_probe_channel_opens_late)
 
     result = await asyncio.wait_for(_run(svc, _payload()), 2)
 
     assert isinstance(result, ContainerCreated)
-    assert len(probe_commands) == 1
+    assert len(probe_channels_opened) == 1
 
 
 @pytest.mark.asyncio

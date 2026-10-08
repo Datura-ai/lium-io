@@ -4408,10 +4408,11 @@ class DockerService:
         )
         started = time.monotonic()
         try:
-            # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent),
-            # channel open included; TimeoutError lands in the except below → None → the per-command path.
-            async with asyncio.timeout(_PRERUN_HOST_PROBE_TIMEOUT_SECONDS):
-                result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+            # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent);
+            # asyncio.TimeoutError lands in the except below → None → the per-command path.
+            # The channel open is not bounded: a cancelled open that the host confirms later stays open
+            # and unused, and a MaxSessions=1 sshd then refuses the per-command path's channels.
+            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
             probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power)
         except asyncio.CancelledError:
             raise
