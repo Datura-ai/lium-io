@@ -562,8 +562,15 @@ class VolumeSizingResult:
     existing_volumes_bytes: int | None = None
 
 
-_LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
-_LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
+# New volumes go to a second plugin installed beside the old one under the same name with a tag:
+# `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
+# whose volumes live inside its rootfs, so a plugin command must never name it here.
+_LOOPBACK_PLUGIN_ALIAS = f"{_VLOOPBACK_DRIVER_PREFIX}:v2"
+_LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
+# backing files on the host under DockerRootDir (the plugin sees the host's / at /srv), outside the
+# plugin rootfs, on the disk the sizing measures; machine_scrape.py carries the same name
+_LOOPBACK_PLUGIN_DATA_DIR_NAME = "vloopback-v2"
+_LOOPBACK_PLUGIN_STATE_DIR = "/srv/run/docker-volume-loopback-v2"
 _PROBE_OUTPUT_LOG_CAP = 512
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
@@ -3929,7 +3936,7 @@ class DockerService:
             for name, driver in volume_rows:
                 if not (
                     name.startswith("volume_")
-                    and (driver == "vloopback" or driver.startswith("vloopback:"))
+                    and _is_vloopback_driver(driver)
                 ):
                     continue
                 vloopback_volumes.add(name)
@@ -5501,14 +5508,20 @@ class DockerService:
                 )
             elif host_probe is not None and host_probe.loopback_plugin_installed:
                 # Installed but disabled: `docker plugin install` would fail with "already exists"
-                # and the volume create with "plugin vloopback found but disabled".
+                # and the volume create with "plugin vloopback:v2 found but disabled".
                 await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
             else:
                 loopback_plugin_arg = shlex.quote(loopback_plugin_name)
-                data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
+                data_dir_arg = shlex.quote(
+                    f"DATA_DIR=/srv{docker_root_dir}/{_LOOPBACK_PLUGIN_DATA_DIR_NAME}"
+                )
+                state_dir_arg = shlex.quote(f"STATE_DIR={_LOOPBACK_PLUGIN_STATE_DIR}")
+                # a failed install is not checked: the create below then fails on the missing
+                # plugin and the rent fails; never fall back to the old plugin
                 command = (
                     f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
-                    f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
+                    f"--alias {loopback_plugin_arg} --grant-all-permissions "
+                    f"{data_dir_arg} {state_dir_arg}"
                 )
                 # TODO: migrate Docker plugin management if/when plugin setup becomes
                 # part of the SDK migration scope. The user-controlled volume name is

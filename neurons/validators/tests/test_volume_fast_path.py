@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
@@ -105,7 +106,7 @@ def test_probe_command_is_one_line_with_every_section():
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; printf 'VOLS\\t%s\\n' \"$?\"; "
         in command
     )
-    assert "/usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback" in command
+    assert "/usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 " in command
     assert "plugin install" not in command
 
 
@@ -463,7 +464,7 @@ async def test_create_local_volume_with_enabled_plugin_runs_no_ssh_command(docke
     assert created == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "40g"},
             "timeout": 10,
         }
@@ -471,9 +472,11 @@ async def test_create_local_volume_with_enabled_plugin_runs_no_ssh_command(docke
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_with_plugin_absent_still_installs_it(docker_service):
-    # Negative control: the probe saw no enabled plugin → the install command runs as before,
-    # with DATA_DIR taken from the probe's root dir (no second `docker info`).
+async def test_create_local_volume_installs_v2_with_host_data_dir_and_own_state_dir_when_v2_is_absent(
+    docker_service,
+):
+    # The probe saw no v2 plugin → the v2 install runs, with DATA_DIR on the host under the
+    # probe's root dir (no second `docker info`), outside the plugin rootfs.
     ssh_client = Mock()
     ssh_client.run = AsyncMock(return_value=Mock(stdout="", exit_status=0))
     probe = VolumeHostProbe(
@@ -487,10 +490,11 @@ async def test_create_local_volume_with_plugin_absent_still_installs_it(docker_s
 
     assert ssh_client.run.await_count == 1
     assert ssh_client.run.await_args.args[0] == (
-        "/usr/bin/docker plugin install ashald/docker-volume-loopback "
-        "--alias vloopback --grant-all-permissions DATA_DIR=/data/docker/loopback"
+        "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
+        "--alias vloopback:v2 --grant-all-permissions "
+        "DATA_DIR=/srv/data/docker/vloopback-v2 STATE_DIR=/srv/run/docker-volume-loopback-v2"
     )
-    assert created[0]["driver"] == "vloopback"
+    assert created[0]["driver"] == "vloopback:v2"
 
 
 def _disabled_plugin_probe() -> VolumeHostProbe:
@@ -504,15 +508,13 @@ def _disabled_plugin_probe() -> VolumeHostProbe:
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_with_disabled_plugin_enables_it_instead_of_installing(
-    docker_service,
-):
+async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(docker_service):
     # 7fcd02af (20-27 Sep): installed but disabled → `plugin install` failed "already exists"
     # and every create failed "plugin vloopback found but disabled". Enable, re-read, create.
     ssh_client = Mock()
     ssh_client.run = AsyncMock(
         side_effect=[
-            Mock(stdout="vloopback\n", stderr="", exit_status=0),
+            Mock(stdout="vloopback:v2\n", stderr="", exit_status=0),
             Mock(stdout="true\n", stderr="", exit_status=0),
         ]
     )
@@ -521,8 +523,8 @@ async def test_create_local_volume_with_disabled_plugin_enables_it_instead_of_in
 
     calls = ssh_client.run.await_args_list
     assert [c.args[0] for c in calls] == [
-        "/usr/bin/docker plugin enable vloopback",
-        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback 2>/dev/null "
+        "/usr/bin/docker plugin enable vloopback:v2",
+        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 2>/dev/null "
         "|| echo absent) | tail -n 1",
     ]
     assert all(c.kwargs == {"timeout": 10} for c in calls)
@@ -530,7 +532,7 @@ async def test_create_local_volume_with_disabled_plugin_enables_it_instead_of_in
     assert created == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "40g"},
             "timeout": 10,
         }
@@ -590,7 +592,7 @@ async def test_create_local_volume_disabled_plugin_enable_error_logs_only_its_ty
     (logged,), _ = warning.call_args
     assert str(logged).startswith("Loopback plugin enable failed")
     assert logged.extra["error_type"] == "OSError"
-    assert logged.extra["loopback_plugin"] == "vloopback"
+    assert logged.extra["loopback_plugin"] == "vloopback:v2"
     assert "error" not in logged.extra
     full = logged.to_full_string()
     assert "10.1.2.3" not in full and "ghp_leakme" not in full and "id_rsa" not in full
@@ -605,8 +607,189 @@ async def test_create_local_volume_without_probe_keeps_the_per_command_path(dock
 
     commands = [c.args[0] for c in ssh_client.run.await_args_list]
     assert commands[0] == "/usr/bin/docker info --format '{{.DockerRootDir}}'"
-    assert commands[1].startswith("/usr/bin/docker plugin install ashald/docker-volume-loopback ")
+    assert commands[1].startswith(
+        "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
+    )
     assert len(commands) == 2
+
+
+# ---------------------------------------------------------------------------
+# vloopback v2 beside the old plugin: new volumes on `vloopback:v2`, the old one never named
+# ---------------------------------------------------------------------------
+
+_OLD = "vloopback:latest"
+_V2 = "vloopback:v2"
+_STATE_INSPECT_RE = re.compile(r"plugin inspect --format '\{\{\.Enabled\}\}' (\S+) ")
+# a plugin named in a command (`--alias vloopback:v2`, `enable vloopback`), not the v2 data dir path
+_LOOPBACK_ALIAS_RE = re.compile(r"(?<![\w/-])vloopback[\w:.-]*")
+
+
+def _docker_plugin_name(name: str) -> str:
+    return name if ":" in name else f"{name}:latest"
+
+
+class _TwoLoopbackPluginHost:
+    """Both the SSH connection and the Docker SDK client of a host, answering like dockerd with the
+    old `vloopback:latest` and the new `vloopback:v2` plugins: an untagged name is `:latest`, a
+    volume goes to the plugin its driver names, a missing or disabled plugin refuses the create."""
+
+    def __init__(
+        self,
+        *,
+        plugins: dict[str, bool],
+        volumes: dict[str, tuple[str, int]] | None = None,
+        install_fails: bool = False,
+    ):
+        self.plugins = dict(plugins)  # plugin name -> enabled
+        self.volumes = dict(volumes or {})  # volume name -> (driver, declared bytes)
+        self.install_fails = install_fails
+        self.commands: list[str] = []
+
+    def _state(self, command: str) -> str:
+        name = _docker_plugin_name(_STATE_INSPECT_RE.search(command).group(1))
+        if name not in self.plugins:
+            return "absent"
+        return "true" if self.plugins[name] else "false"
+
+    async def run(self, command: str, **kwargs):
+        self.commands.append(command)
+        if command.startswith("root="):  # the volume host probe
+            lines = ["ROOT\t/var/lib/docker"]
+            lines += [f"VOL\t{name}\t{driver}" for name, (driver, _) in self.volumes.items()]
+            lines += ["VOLS\t0", f"PLUGIN\t{self._state(command)}"]
+            return Mock(stdout="\n".join(lines) + "\n", stderr="", exit_status=0)
+        if command.startswith("( /usr/bin/docker plugin inspect"):
+            return Mock(stdout=self._state(command) + "\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker plugin install "):
+            if self.install_fails:
+                return Mock(stdout="", stderr="Error response from daemon: Get https://registry-1.docker.io/v2/: net/http: request canceled", exit_status=1)
+            self.plugins[_docker_plugin_name(command.split("--alias ")[1].split()[0])] = True
+            return Mock(stdout="Installed plugin\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker plugin enable "):
+            name = _docker_plugin_name(command.split()[-1])
+            if name in self.plugins:
+                self.plugins[name] = True
+            return Mock(stdout=command.split()[-1] + "\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker volume inspect "):
+            names = command.split("--format")[0].split()[3:]
+            return Mock(
+                stdout="".join(f"{self.volumes[name][1]}|<no value>\n" for name in names),
+                stderr="",
+                exit_status=0,
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    async def create_volume(self, *, volume_name, driver=None, driver_opts=None, timeout=None):
+        name = _docker_plugin_name(driver)
+        if name not in self.plugins:
+            raise RuntimeError(
+                f"create {volume_name}: error looking up volume plugin {driver}: plugin \"{driver}\" not found"
+            )
+        if not self.plugins[name]:
+            raise RuntimeError(
+                f"create {volume_name}: error looking up volume plugin {driver}: plugin {name} found but disabled"
+            )
+        self.volumes[volume_name] = (name, 0)
+
+    def plugin_commands(self) -> list[str]:
+        return [command for command in self.commands if "docker plugin" in command]
+
+
+async def _rent_a_new_volume(docker_service, host: _TwoLoopbackPluginHost) -> None:
+    docker_service.stream_log = AsyncMock()
+    probe = await docker_service.probe_volume_host(host, with_df=False, log_extra={})
+    await docker_service.create_local_volume(
+        ssh_client=host,
+        docker_client=host,
+        local_volume="volume_new",
+        log_tag="tag",
+        log_text="Creating docker volume volume_new",
+        log_extra={},
+        limit=40,
+        timeout=10,
+        host_probe=probe,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_creates_the_new_volume_on_the_v2_driver(docker_service):
+    host = _TwoLoopbackPluginHost(plugins={_OLD: True, _V2: True})
+
+    await _rent_a_new_volume(docker_service, host)
+
+    assert host.volumes["volume_new"][0] == _V2
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_installs_v2_beside_an_enabled_old_plugin(docker_service):
+    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, volumes={"volume_renter": (_OLD, 10**9)})
+
+    await _rent_a_new_volume(docker_service, host)
+
+    installs = [command for command in host.commands if "plugin install" in command]
+    assert len(installs) == 1 and "--alias vloopback:v2 " in installs[0]
+    assert host.plugins == {_OLD: True, _V2: True}
+    assert host.volumes == {"volume_renter": (_OLD, 10**9), "volume_new": (_V2, 0)}
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_skips_install_when_v2_is_enabled(docker_service):
+    host = _TwoLoopbackPluginHost(plugins={_V2: True})
+
+    await _rent_a_new_volume(docker_service, host)
+
+    assert not any("plugin install" in command for command in host.commands)
+    assert host.volumes["volume_new"][0] == _V2
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_fails_when_v2_install_fails_and_never_names_the_old_alias(
+    docker_service,
+):
+    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, install_fails=True)
+
+    with pytest.raises(Exception, match="vloopback:v2"):
+        await _rent_a_new_volume(docker_service, host)
+
+    assert "volume_new" not in host.volumes
+    assert host.plugins == {_OLD: True}
+    named = {alias for command in host.plugin_commands() for alias in _LOOPBACK_ALIAS_RE.findall(command)}
+    assert named == {_V2}
+
+
+@pytest.mark.asyncio
+async def test_volume_host_probe_keeps_old_and_v2_volume_names(docker_service):
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True},
+        volumes={
+            "volume_old": (_OLD, 10**9),
+            "volume_v2": (_V2, 10**9),
+            "volume_local": ("local", 0),
+        },
+    )
+
+    probe = await docker_service.probe_volume_host(host, with_df=False, log_extra={})
+
+    assert probe.vloopback_volume_names == ["volume_old", "volume_v2"]
+    # the plugin state is v2's: an enabled old plugin must not read as "nothing to install"
+    assert probe.loopback_plugin_enabled is False
+    assert probe.loopback_plugin_installed is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_sums_declared_sizes_of_old_and_v2_volumes(docker_service):
+    # both generations' backing files sit on the DockerRootDir disk, so both declared sizes count
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True, _V2: True},
+        volumes={"volume_old": (_OLD, 300 * _SIZING_GB), "volume_v2": (_V2, 200 * _SIZING_GB)},
+    )
+    probe = await docker_service.probe_volume_host(host, with_df=False, log_extra={})
+    probe.df_avail_bytes = 900 * _SIZING_GB
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
+
+    sizing = await docker_service.resolve_volume_sizing(host, payload, "tag", {}, host_probe=probe)
+
+    assert sizing.existing_volumes_bytes == 500 * _SIZING_GB
 
 
 # ---------------------------------------------------------------------------

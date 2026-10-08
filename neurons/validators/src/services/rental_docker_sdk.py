@@ -1093,8 +1093,9 @@ class RentalDockerSdkClient:
             raise
         existing_driver = info.get("Driver") if isinstance(info, dict) else None
         wanted_driver = driver or "local"
-        # a plugin driver is inspected as `<alias>:<tag>` while it is requested as `<alias>`
-        if isinstance(existing_driver, str) and existing_driver.split(":", 1)[0] == wanted_driver.split(":", 1)[0]:
+        # a plugin driver is inspected as `<alias>:<tag>` while it may be requested as `<alias>`,
+        # which is `<alias>:latest`; another tag is another plugin (vloopback:v2 beside vloopback)
+        if isinstance(existing_driver, str) and _with_default_tag(existing_driver) == _with_default_tag(wanted_driver):
             return True
         raise RentalDockerOperationError(
             "Docker SDK create volume refused after a transport retry: a volume named "
@@ -1742,6 +1743,10 @@ def _raise_pull_event_error(event) -> None:
     from docker.errors import APIError
 
     raise APIError("Docker image pull failed", explanation=str(message))
+
+
+def _with_default_tag(driver: str) -> str:
+    return driver if ":" in driver else f"{driver}:latest"
 
 
 def _is_docker_not_found_error(exc: Exception) -> bool:

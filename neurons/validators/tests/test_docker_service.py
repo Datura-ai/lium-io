@@ -23,6 +23,7 @@ from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
+    LoopbackPluginDisabledError,
     VolumeMinSizeError,
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
@@ -61,6 +62,8 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
+from test_dah2740_edit_park_then_swap import _edit_payload, _run as _run_edit, _ssh_recording
+from test_deploy_optimizations import _patch_happy
 
 
 FAKE_SSH_HOST_KEY = "ssh-ed25519 AAAATESTKEY"
@@ -4042,6 +4045,42 @@ async def test_clean_stale_vloopback_volumes_accepts_tagged_driver(
 
 
 @pytest.mark.asyncio
+async def test_clean_stale_vloopback_volumes_removes_unmounted_old_and_v2_volumes_and_spares_protected_ones(
+    docker_service,
+    retry_ssh_mock,
+):
+    # an unmounted, unprotected `volume_*` is stale whichever plugin generation owns it; the
+    # removal is by name, so Docker routes each to its own plugin
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(
+                stdout=(
+                    "volume_old_stale vloopback:latest\n"
+                    "volume_v2_stale vloopback:v2\n"
+                    "volume_old_protected vloopback:latest\n"
+                    "volume_v2_protected vloopback:v2\n"
+                    "volume_old_mounted vloopback:latest\n"
+                    "volume_v2_mounted vloopback:v2\n"
+                )
+            ),
+            _make_ssh_command_result(stdout="volume_old_mounted\nvolume_v2_mounted\n"),
+        ]
+    )
+
+    removed = await docker_service.clean_stale_vloopback_volumes(
+        ssh_client=ssh_client,
+        default_extra={},
+        skip_volume_names={"volume_old_protected", "volume_v2_protected"},
+    )
+
+    assert removed == ["volume_old_stale", "volume_v2_stale"]
+    assert retry_ssh_mock.call_args_list[0][0][1] == (
+        "/usr/bin/docker volume rm volume_old_stale volume_v2_stale 2>/dev/null || true"
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_container_cleans_stale_vloopback_when_active_volumes_missing(
     docker_service,
     monkeypatch,
@@ -4697,7 +4736,7 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "1024g"},
             "timeout": 133,
         }
@@ -4736,7 +4775,7 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "200g", "sparse": "true"},
             "timeout": 50,
         }
@@ -4769,7 +4808,7 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback",
+            "driver": "vloopback:v2",
             "driver_opts": {"size": "200g"},
             "timeout": 50,
         }
@@ -5146,6 +5185,44 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
         call.kwargs.get("timeout") == 30
         for call in ssh_client.run.await_args_list
     )
+
+
+async def _repair_commands_for_a_volume_on(docker_service, driver: str, plugin_id: str) -> list[str]:
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout=f"{driver} /mnt/volume_test\n"),
+            _make_ssh_command_result(stdout=f"{plugin_id}\n"),
+            _VLOOPBACK_REPAIR_DEFAULT_ROOT,
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(exit_status=0),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is True
+    return _vloopback_repair_commands(ssh_client)
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_uses_the_old_plugin_id_for_an_old_volume(docker_service):
+    commands = await _repair_commands_for_a_volume_on(docker_service, "vloopback:latest", "oldplugin")
+
+    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:latest --format '{{.Id}}'"
+    assert "src=/var/lib/docker/plugins/oldplugin/propagated-mount," in commands[-1]
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_uses_the_v2_plugin_id_for_a_v2_volume(docker_service):
+    commands = await _repair_commands_for_a_volume_on(docker_service, "vloopback:v2", "v2plugin")
+
+    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:v2 --format '{{.Id}}'"
+    assert "src=/var/lib/docker/plugins/v2plugin/propagated-mount," in commands[-1]
 
 
 @pytest.mark.parametrize(
@@ -8531,3 +8608,62 @@ async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_van
         container_missing=container_missing,
     )
     assert result.error_code == getattr(FailedContainerErrorCodes, error_code)
+
+
+# ---------------------------------------------------------------------------
+# vloopback v2: an existing volume stays on the plugin that owns it
+# ---------------------------------------------------------------------------
+
+
+def _edit_service() -> DockerService:
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    return service
+
+
+@pytest.mark.asyncio
+async def test_edit_with_existing_local_volume_sends_no_plugin_and_no_volume_create_command(monkeypatch):
+    # an edit / reboot recreate mounts the pod's volume by name and Docker routes it to the plugin
+    # that owns it: the old `vloopback:latest` for every rental made before v2
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_VOLUME_FAST_PATH_ENABLED", True)
+    svc = _edit_service()
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.delattr(svc, "create_local_volume")  # the real one, should anything reach it
+
+    result = await _run_edit(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert not any("docker plugin" in command or "volume create" in command for command in ssh.commands)
+    run_spec = svc._run_rental_docker_create_with_port_retry.await_args.kwargs["run_spec"]
+    assert [volume.source for volume in run_spec.volumes] == [payload.local_volume]
+
+
+@pytest.mark.asyncio
+async def test_failed_edit_keeps_the_existing_local_volume(monkeypatch):
+    svc = _edit_service()
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    monkeypatch.setattr(
+        svc,
+        "_run_rental_docker_create_with_port_retry",
+        AsyncMock(side_effect=RuntimeError("docker run failed")),
+    )
+
+    result = await _run_edit(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert not any("volume rm" in command for command in ssh.commands)
+
+
+def test_loopback_plugin_disabled_error_keeps_the_plugin_vloopback_phrase():
+    # the stats classifier files any error with "plugin vloopback" + "disabled" as
+    # volume.plugin_disabled; the message names the plugin the rent used
+    message = str(LoopbackPluginDisabledError("enable exit 1, state false"))
+
+    assert "(plugin vloopback:v2: enable exit 1, state false)" in message
+    assert "plugin vloopback" in message and "disabled" in message

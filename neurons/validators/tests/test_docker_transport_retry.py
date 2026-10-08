@@ -254,6 +254,36 @@ async def test_create_volume_retry_refuses_a_same_name_volume_on_another_driver(
 
 
 @pytest.mark.asyncio
+async def test_adopt_refuses_a_same_name_volume_on_the_old_tag_when_v2_is_requested():
+    # `vloopback:latest` and `vloopback:v2` are two plugins: a retried create must not take an
+    # old-plugin volume for the new v2 one
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_volume_errors = [EOFError()]
+    api.existing_volumes["volume_p1"] = {"Name": "volume_p1", "Driver": "vloopback:latest"}
+
+    with pytest.raises(RentalDockerOperationError, match="already exists on driver 'vloopback:latest'"):
+        await _client(api).create_volume(
+            volume_name="volume_p1", driver="vloopback:v2", driver_opts={"size": "10g"}
+        )
+
+    assert api.existing_volumes["volume_p1"]["Driver"] == "vloopback:latest"
+
+
+@pytest.mark.asyncio
+async def test_adopt_accepts_an_untagged_request_for_a_latest_tagged_volume():
+    # Docker resolves an untagged plugin name to `:latest` and reports the volume's driver so
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_volume_errors = [EOFError()]
+    api.existing_volumes["volume_p1"] = {"Name": "volume_p1", "Driver": "vloopback:latest"}
+
+    await _client(api).create_volume(
+        volume_name="volume_p1", driver="vloopback", driver_opts={"size": "10g"}
+    )
+
+    assert api.calls == ["create_volume", "inspect_volume"]
+
+
+@pytest.mark.asyncio
 async def test_create_volume_flag_off_fails_the_first_time_and_never_reopens():
     adapter = _FakeAdapter()
     api = _FakeApiClient(adapter=adapter)

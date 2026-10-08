@@ -1,5 +1,7 @@
+import ast
 import json
 import logging
+import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -21,7 +23,14 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
+import services.docker_service as docker_service_module
+from services.docker_service import (
+    LEGACY_S3FS_PLUGIN_ALIAS,
+    DockerService,
+    _is_safe_docker_volume_name,
+    _is_vloopback_driver,
+    _s3fs_plugin_alias,
+)
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -629,6 +638,65 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
         "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
         "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
     ]
+
+
+_PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES = {"upgrade", "rm", "remove", "disable", "set", "push", "create"}
+_S3FS_PLUGIN_TARGETS = {"{plugin_alias}", "{LEGACY_S3FS_PLUGIN_ALIAS}"}
+
+
+def _docker_plugin_command_templates(source: str) -> list[tuple[str, str, str]]:
+    """(verb, target, rest of the line) of every `docker plugin <verb>` in a string of the code;
+    docstrings and comments are not commands."""
+    tree = ast.parse(source)
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+    }
+    string_line_numbers = {
+        line_number
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str)))
+        and id(node) not in docstrings
+        for line_number in range(node.lineno, node.end_lineno + 1)
+    }
+    lines = source.splitlines()
+    return [
+        template
+        for line_number in sorted(string_line_numbers)
+        for template in re.findall(r"docker plugin (\w+) +([^\s\"',]+)(.*)", lines[line_number - 1])
+    ]
+
+
+def test_loopback_plugin_commands_are_install_enable_inspect_only():
+    # an upgrade, rm, disable or forced command on the loopback plugin loses every volume whose
+    # backing file is in its rootfs: only the per-volume s3fs instances may get one
+    source = open(docker_service_module.__file__).read()
+
+    templates = _docker_plugin_command_templates(source)
+
+    verbs_and_targets = {(verb, target) for verb, target, _ in templates}
+    assert ("install", "{_LOOPBACK_PLUGIN_IMAGE}") in verbs_and_targets
+    assert ("enable", "{shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}") in verbs_and_targets
+    for verb, target, rest in templates:
+        assert verb in {"install", "enable", "inspect"} | _PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES, verb
+        if verb in _PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES or re.search(r"(^|\s)(-f|--force)\b", rest):
+            assert target in _S3FS_PLUGIN_TARGETS, (verb, target, rest)
+    # and `plugin_alias` only ever holds an s3fs instance's name
+    for assigned in re.findall(r"\bplugin_alias(?:: str)? = (.+)", source):
+        assert assigned.startswith("_s3fs_plugin_alias("), assigned
+
+
+@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc", "celium-volume-safe"])
+def test_s3fs_plugin_alias_never_names_a_loopback_plugin(volume_name):
+    assert _is_safe_docker_volume_name(volume_name)
+
+    alias = _s3fs_plugin_alias(volume_name)
+
+    assert alias.startswith("s3fs-")
+    assert not _is_vloopback_driver(alias)
 
 
 @pytest.mark.asyncio
