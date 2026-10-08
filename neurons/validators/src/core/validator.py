@@ -1155,16 +1155,6 @@ class Validator:
         await self._keep_pending_inclusion(index, block)
         try:
             confirmed = await self.backend_client.report_settled_weights_result(index, block)
-        except BackendRejected as exc:
-            # the backend has no such window: waiting would hold every later window back for good
-            logger.error(
-                _m(
-                    "[settlement] inclusion report rejected by the backend; dropped",
-                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "error": str(exc)}),
-                )
-            )
-            await self._keep_pending_inclusion(index, None)
-            return True
         except Exception as exc:
             logger.warning(
                 _m(

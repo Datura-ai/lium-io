@@ -659,18 +659,6 @@ async def test_an_inclusion_redis_never_kept_still_holds_the_next_window_back():
     validator.redis_service.set.assert_any_await(PENDING_INCLUSION_KEY, json.dumps({"342": 123456}))
 
 
-@pytest.mark.asyncio
-async def test_an_inclusion_the_backend_rejects_is_dropped_and_the_next_window_is_read():
-    validator = _validator(window=WINDOW, accepted=True)
-    validator.redis_service.get = AsyncMock(return_value=json.dumps({"341": 123000}))
-    validator.backend_client.report_settled_weights_result = AsyncMock(side_effect=BackendRejected(404))
-
-    await validator.submit_settled_window()
-
-    validator.backend_client.get_settled_weights.assert_awaited_once_with(342, 360)
-    validator.redis_service.set.assert_any_await(PENDING_INCLUSION_KEY, json.dumps({}))
-
-
 def test_only_a_wrong_request_is_dropped_a_bad_moment_is_retried():
     assert DEFINITIVE_REJECTIONS == (400, 404, 422)
     assert 403 not in DEFINITIVE_REJECTIONS and 429 not in DEFINITIVE_REJECTIONS
