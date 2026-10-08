@@ -1547,6 +1547,26 @@ def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> No
         )
 
 
+def _refuse_filler_beside_unlisted_pod(payload: ContainerCreateRequest, container_names: Iterable[str]) -> None:
+    """Stop a filler create on a host with a `pod_*` its active_container_names do not name.
+
+    The backend builds that list when it sends the filler, so an unlisted pod is a customer's that came
+    after it (a late or retried send, a lapsed create lock, a second connector), or one of an ended
+    rental. Running or exited alike: the filler neither removes it nor runs beside it; the validator's
+    stale-container reaper removes a pod the backend no longer lists. Refused like #1518 (no strike).
+    """
+    if payload.workload_kind != WorkloadKind.FILLER:
+        return
+    listed = set(payload.active_container_names or [])
+    listed |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in listed}
+    unlisted = sorted({name for name in container_names if name.startswith(POD_CONTAINER_PREFIX)} - listed)
+    if unlisted:
+        raise _FillerRefusedForCustomerCreate(
+            f"pod containers the filler was not told of are on executor {payload.executor_id}: "
+            f"{', '.join(unlisted)}; filler {payload.pod_id} not started"
+        )
+
+
 class _OwnSweepRegistry:
     """Container IDs this validator sent `docker rm` for in a create's stale sweep (clean_existing_containers)
     or in a customer create's filler removal at SSH connect (remove_fillers_at_ssh_connect).
@@ -2189,7 +2209,7 @@ class DockerService:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
         Returns the container's ID, or None when the client gave none. A ContainerCreateRefused of
-        the spec's `before_create` (checked before every attempt) is raised as is.
+        the spec's `before_create` or `before_start` (checked on every attempt) is raised as is.
 
         Port collision (PORT_COLLISION_RETRY_ENABLED): when dockerd refuses the bind of a host port
         and `port_maps` / `spare_port_pairs` are given, the colliding mapping moves to the next
@@ -2558,6 +2578,12 @@ class DockerService:
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
             before_create=lambda: _refuse_filler_during_customer_create(payload),
+            # a customer pod created since the cleanup's listing is seen here, before the filler starts
+            before_start=(
+                (lambda names: _refuse_filler_beside_unlisted_pod(payload, names))
+                if payload.workload_kind == WorkloadKind.FILLER
+                else None
+            ),
         )
 
     async def _ensure_pod_quote_socket(
@@ -3484,10 +3510,14 @@ class DockerService:
         remove_every_filler: bool = False,
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
+        refuse_before_removal: Callable[[list[str]], None] | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+
+        ``refuse_before_removal`` gets the listing's names before anything is removed and may raise to
+        stop the create there (a filler create on a host with a pod it was not told of).
 
         DAH-3980: ``removed_at_ssh_connect`` holds the fillers `remove_fillers_at_ssh_connect` already
         removed (or tried to), each with the ID it was listed under: the listing may predate that
@@ -3511,6 +3541,8 @@ class DockerService:
             result = await ssh_client.run(DOCKER_PS_ALL_NAMES_IDS_CMD)
             names, listed_ids = parse_container_listing((result.stdout or "").splitlines())
             all_names = list(names)
+        if refuse_before_removal is not None:
+            refuse_before_removal(all_names)
         if all_names:
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
             # deploy-path sleep; the port-race it hedged is now covered by
@@ -7591,6 +7623,7 @@ class DockerService:
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
+                    refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings

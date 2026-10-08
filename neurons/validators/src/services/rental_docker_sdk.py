@@ -302,6 +302,9 @@ class ContainerRunSpec:
     network: str | None = None
     # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
     before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # runs in the Docker thread between the create and the start call with the names of every container
+    # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
+    before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -494,7 +497,8 @@ class RentalDockerSdkClient:
     async def run_container(self, spec: ContainerRunSpec) -> str | None:
         """Creates and starts the container; returns its ID (None if Docker gave none).
 
-        The ContainerCreateRefused of ``spec.before_create`` reaches the caller unwrapped.
+        The ContainerCreateRefused of ``spec.before_create`` or ``spec.before_start`` reaches the caller
+        unwrapped.
         """
         # The retry adopts a container of this name and image if the first attempt's
         # `containers/create` reached the daemon before the channel dropped: `create` is the one
@@ -985,6 +989,14 @@ class RentalDockerSdkClient:
                 name=spec.name,
                 entrypoint=spec.entrypoint or None,
                 host_config=host_config,
+            )
+        if spec.before_start is not None:
+            spec.before_start(
+                [
+                    name.lstrip("/")
+                    for container in self._api_client.containers(all=True)
+                    for name in container.get("Names") or ()
+                ]
             )
         self._api_client.start(spec.name)
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id

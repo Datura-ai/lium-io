@@ -115,6 +115,7 @@ async def test_customer_create_registering_until_the_filler_container_exists_ref
     monkeypatch.delattr(svc, "_run_rental_docker_create_with_port_retry")
     docker_api = Mock(inspect_network=Mock(return_value={"Driver": "bridge", "Options": RENTAL_NETWORK_OPTIONS}))
     docker_api.create_container.return_value = {"Id": "filler-container"}
+    docker_api.containers.return_value = []  # the host listing a filler reads before its start
     _docker_client(svc).run_container = RentalDockerSdkClient(docker_api).run_container
     steps = Mock(cleanup=AsyncMock(return_value=True), restore_power=AsyncMock())  # True: the container is gone
     monkeypatch.setattr(svc, "cleanup_failed_container_creation", steps.cleanup)
