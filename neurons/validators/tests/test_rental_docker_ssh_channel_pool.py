@@ -13,6 +13,7 @@ import select
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 
 import docker
@@ -140,8 +141,11 @@ class _FakeDockerHost:
 
 
 def _close_at_once(end: socket.socket) -> None:
-    # a bare close() waits for the socket's makefile() readers; a paramiko channel closes at once
+    # a bare close() waits for the socket's makefile() readers; a paramiko channel closes at once.
+    # On Linux a close() under a thread blocked in recv() sends no EOF to the peer; shutdown() does
     if end.fileno() != -1:
+        with suppress(OSError):
+            end.shutdown(socket.SHUT_RDWR)
         os.close(end.detach())
 
 
