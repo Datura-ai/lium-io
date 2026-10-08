@@ -456,6 +456,8 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
     assert _docker_client(svc).login_calls == []
     assert _pulled_images(svc) == []
     assert _ssh_run_cmds(ssh_client) == [
+        # a customer's create looks for fillers to remove as soon as the SSH session is up
+        '/usr/bin/docker ps -a --no-trunc --format "{{.Names}} {{.ID}}"',
         '/usr/bin/docker volume ls --format "{{.Name}}"',
         # the host's kernel.pid_max, read before any host side-effect so a rental whose pids.max
         # can't be clamped below it is refused with nothing to undo; a bare cat bounded by
