@@ -66,6 +66,11 @@ PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
 # cycle reports the backend has not acknowledged yet, replayed every cycle until it does
 UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
 UNACKED_CYCLE_REPORTS_MAX = 200
+# one cycle's settlement HTTP (kept reports, pending inclusions, this cycle's report) is cut off past this, retries
+# included, so a slow backend cannot hold up the cycle; what was not delivered stays in Redis for the next cycle
+SETTLEMENT_REPORTING_BUDGET_SECONDS = 60
+# the shadow comparison runs after the live weights; this caps how long it can hold up the rest of the tick
+SHADOW_COMPARISON_BUDGET_SECONDS = 30
 SETTLEMENT_OFF = "off"
 SETTLEMENT_SHADOW = "shadow"
 SETTLEMENT_ENFORCE = "enforce"
@@ -330,13 +335,15 @@ class Validator:
                         await self.submit_settled_window()
                         self.miner_scores = {}
                     else:
-                        if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
-                            await self.shadow_settled_window()
+                        live_scores = self.miner_scores
                         await self.subtensor_client.set_weights(
-                            miner_scores=self.miner_scores,
+                            miner_scores=live_scores,
                             active_hotkeys=self.active_hotkeys,
                         )
                         self.miner_scores = {}
+                        # after the live submission: a slow or failing backend must not delay or skip it
+                        if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
+                            await self.shadow_settled_window(live_scores)
             except Exception as e:
                 logger.error(
                     _m(
@@ -902,10 +909,38 @@ class Validator:
             "mode": settings.SETTLEMENT_MODE,
             "node_shares": node_shares,
         }
-        await self._replay_unacked_cycle_reports()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SETTLEMENT_REPORTING_BUDGET_SECONDS
+        # kept before any network wait: the budget below may cut a delivery off, and the replay then sends it
+        if not await self._keep_cycle_report(payload):
+            # Redis could not keep it, so this send is its only chance: before anything else that needs Redis
+            try:
+                delivered = await asyncio.wait_for(
+                    self._deliver_cycle_report(payload), timeout=SETTLEMENT_REPORTING_BUDGET_SECONDS
+                )
+            except TimeoutError:
+                delivered = False
+            if not delivered:
+                logger.error(
+                    _m(
+                        "[settlement] cycle report neither kept nor delivered; its scores are lost",
+                        extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                    )
+                )
+        try:
+            await asyncio.wait_for(self._deliver_kept_settlement_reports(), timeout=max(0.0, deadline - loop.time()))
+        except TimeoutError:
+            logger.warning(
+                _m(
+                    "[settlement] reporting budget spent; undelivered kept reports wait for the next cycle",
+                    extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
+                )
+            )
+        await self._cap_kept_cycle_reports()
+
+    async def _deliver_kept_settlement_reports(self) -> None:
         await self._retry_pending_inclusion()
-        if not await self._deliver_cycle_report(payload):
-            await self._keep_cycle_report(payload)
+        await self._replay_unacked_cycle_reports()
 
     async def _deliver_cycle_report(self, payload: dict) -> bool:
         try:
@@ -944,17 +979,38 @@ class Validator:
         )
         return True
 
-    async def _keep_cycle_report(self, payload: dict) -> None:
+    async def _keep_cycle_report(self, payload: dict) -> bool:
         try:
             await self.redis_service.lpush(UNACKED_CYCLE_REPORTS_KEY, json.dumps(payload).encode())
-            await self.redis_service.ltrim(UNACKED_CYCLE_REPORTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
         except Exception as exc:
             logger.error(
                 _m(
-                    "[settlement] could not keep the unacknowledged cycle report; its scores are lost",
+                    "[settlement] could not keep the cycle report; sending it once without replay",
                     extra=get_extra_info({**self.default_extra, "cycle_id": payload["cycle_id"], "error": str(exc)}),
                 )
             )
+            return False
+        return True
+
+    async def _cap_kept_cycle_reports(self) -> None:
+        """Trimmed only after the cycle's delivery pass: trimming before it would drop the oldest report even when the
+        backend is back and could take it. Past the cap during a long outage the oldest are dropped, and logged."""
+        try:
+            kept_count = await self.redis_service.llen(UNACKED_CYCLE_REPORTS_KEY)
+            if kept_count <= UNACKED_CYCLE_REPORTS_MAX:
+                return
+            await self.redis_service.ltrim(UNACKED_CYCLE_REPORTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not cap the kept cycle reports", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        logger.error(
+            _m(
+                "[settlement] kept cycle reports over the cap; the oldest are dropped and their scores lost",
+                extra=get_extra_info({**self.default_extra, "dropped": kept_count - UNACKED_CYCLE_REPORTS_MAX}),
+            )
+        )
 
     async def _replay_unacked_cycle_reports(self) -> None:
         try:
@@ -1162,8 +1218,19 @@ class Validator:
             )
         )
 
-    async def shadow_settled_window(self) -> None:
-        """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live accumulator."""
+    async def shadow_settled_window(self, live_scores: dict[str, float]) -> None:
+        """DAH-4001 shadow: fetch this tempo's settled vector and log how far it sits from the live one just
+        submitted. Never raises: shadow is a comparison and must not end the sync tick."""
+        try:
+            await asyncio.wait_for(
+                self._log_settled_window_against_live(live_scores), timeout=SHADOW_COMPARISON_BUDGET_SECONDS
+            )
+        except Exception as exc:
+            logger.error(
+                _m("[settlement] shadow comparison failed", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+
+    async def _log_settled_window_against_live(self, live_scores: dict[str, float]) -> None:
         index, tempo, _ = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
             return
@@ -1188,7 +1255,7 @@ class Validator:
                         "refunded_shares": window.refunded_count,
                         "refunded_total": window.refunded_total,
                         "mass_inactive_skipped": window.mass_inactive_skipped,
-                        "share_moved_vs_live": round(share_moved(self.miner_scores, window.hotkey_scores), 6),
+                        "share_moved_vs_live": round(share_moved(live_scores, window.hotkey_scores), 6),
                     }
                 ),
             )
