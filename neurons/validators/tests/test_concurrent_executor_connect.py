@@ -126,6 +126,31 @@ async def test_a_failed_ssh_connect_closes_the_docker_client_and_raises():
 
 
 @pytest.mark.asyncio
+async def test_ssh_connected_callback_runs_while_docker_still_connects():
+    """DAH-3980: the host probes start on the SSH session without waiting for the slower Docker one."""
+    rec = _Recorder()
+    callback_ran = asyncio.Event()
+
+    @asynccontextmanager
+    async def docker_connect_waiting_for_the_callback():
+        rec.docker_started.set()
+        # a callback that ran only after both connects would never let this context finish
+        await asyncio.wait_for(callback_ran.wait(), timeout=1)
+        yield "docker-client"
+
+    def on_ssh_connected(ssh_client):
+        assert ssh_client == "ssh-client"
+        callback_ran.set()
+
+    async with AsyncExitStack() as stack:
+        connected = await DockerService._connect_ssh_and_docker(
+            stack, _ssh_context(rec), docker_connect_waiting_for_the_callback(), on_ssh_connected=on_ssh_connected
+        )
+
+    assert connected == ("ssh-client", "docker-client")
+
+
+@pytest.mark.asyncio
 async def test_create_container_still_completes_with_one_ssh_connection_step(monkeypatch):
     svc = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
     _patch_happy(svc, monkeypatch, _ssh_client())

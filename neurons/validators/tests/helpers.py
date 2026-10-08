@@ -249,7 +249,6 @@ def build_context_config(**overrides) -> ContextConfig:
         max_gpu_count=None,
         gpu_model_rates={},
         nvml_digest_map={},
-        enable_no_collateral=False,
         verifyx_enabled=False,
         inspector_enabled=False,
         port_private_key=None,
@@ -274,7 +273,6 @@ def build_services(**overrides) -> ContextServices:
         ssh=None,
         # DAH-2870: the rented check keeps per-pod marks in Redis on every rented cycle.
         redis=FakeRedis(),
-        collateral=None,
         validation=None,
         verifyx=None,
         inspector=None,

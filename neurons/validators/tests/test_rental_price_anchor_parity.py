@@ -46,11 +46,14 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
     B300 is pinned at 6.40 by DAH-3542. `NVIDIA B300 SXM6 PC` is the one key the pin may ADD: the
     AC card's alias (derived from the AC entry, never its own price), in the lium-core source table
-    but not yet in the release the lock installs — the union is a no-op once the lock carries it."""
+    but not yet in the release the lock installs — the union is a no-op once the lock carries it.
+    `NVIDIA GB300` is the other: priced at the B300 AC rate for now, its own base model."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
-    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC"}
+    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300"}
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
     assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
+    assert RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+    assert BASE_GPU_MAP["NVIDIA GB300"] == "GB300"
     differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
     assert differing <= {SERVER, "NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 PC"}

@@ -82,7 +82,7 @@ jobs:
     # one listed reviewer approve, and prevent_self_review only blocks the account that started the run; every
     # reviewer is a user (this job's token cannot read team membership, which needs the organization "Members"
     # permission, so a team could hide the loop's account); prevent_self_review is true; can_admins_bypass is false
-    # (with it true, a repository admin — the loop's account is one — can start this job with no reviewer's approval,
+    # (with it true, a repository admin could otherwise start this job with no reviewer's approval,
     # and a missing field counts as true). The guard cannot tell a human from another machine account; the admin
     # lists humans.
     # What this cannot prove: that pypi.org's old `release`-bound publisher is gone (until it is, an edited copy

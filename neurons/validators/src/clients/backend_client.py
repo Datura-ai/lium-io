@@ -19,8 +19,8 @@ from protocol.vc_protocol.compute_requests import (
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
-    PodSshUnreachableResponse,
     RentedExecutorsResponse,
+    RentedGpuDropResponse,
     VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
@@ -299,39 +299,48 @@ class BackendClient:
             timeout=10,
         )
 
-    async def report_pod_ssh_unreachable(
+    async def report_rented_gpu_drop(
         self,
         pod_id: str,
         *,
-        ssh_port: int | None,
-        faults: list[str],
-        first_failed_at: str,
+        state: str,
+        executor_id: str,
+        first_seen_at: str,
         consecutive_cycles: int,
-        boot_id_changed: bool | None,
-        boot_id_at_ok: str | None,
-        boot_id_now: str | None,
-    ) -> PodSshUnreachableResponse | None:
-        """Tell the backend a RUNNING rented pod refuses its renter (DAH-2870).
+        expected_gpu_count: int,
+        visible_gpu_count: int,
+        missing_uuids: list[str],
+        nvml_error_code: int | None,
+        faults: list[str],
+        pod_gpu_count: int | None,
+        rented_gpu_count: int | None,
+        nvml_gpu_count: int,
+    ) -> RentedGpuDropResponse | None:
+        """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
+        (``state="recovered"``).
 
-        Sent on every cycle at or past the threshold until the backend answers 200 with a
-        ``delivery`` other than ``notify_failed`` (the caller keeps that answer in the pod's streak;
-        a ``notify_failed`` answer means the renter's mail was refused, so the caller posts again
-        next cycle and the mail is re-sent — lium-platform#429). The backend records the event
-        against the pod and the provider and tells the renter; it does not change the pod's state.
-        Older backends 404, which is no answer: the caller posts again next cycle, so the outage is
-        not lost.
+        The backend keeps one incident per pod until the recovery and tells the provider, support and
+        the renter once per incident. Older backends 404, which is no answer: the caller reports again
+        next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
+        ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
+        ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
         """
         return await self.post(
-            f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-unreachable",
-            PodSshUnreachableResponse,
+            f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
+            RentedGpuDropResponse,
             json_data={
-                "ssh_port": ssh_port,
-                "faults": faults,
-                "first_failed_at": first_failed_at,
+                "state": state,
+                "executor_id": executor_id,
+                "first_seen_at": first_seen_at,
                 "consecutive_cycles": consecutive_cycles,
-                "boot_id_changed": boot_id_changed,
-                "boot_id_at_ok": boot_id_at_ok,
-                "boot_id_now": boot_id_now,
+                "expected_gpu_count": expected_gpu_count,
+                "visible_gpu_count": visible_gpu_count,
+                "missing_uuids": missing_uuids,
+                "nvml_error_code": nvml_error_code,
+                "faults": faults,
+                "pod_gpu_count": pod_gpu_count,
+                "rented_gpu_count": rented_gpu_count,
+                "nvml_gpu_count": nvml_gpu_count,
             },
             timeout=10,
             non_200_log_level=logging.WARNING,

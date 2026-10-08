@@ -1,7 +1,7 @@
 import pytest
 
 from services.executor_connectivity_service import ExecutorConnectivityService, PortPair
-from services.executor_connectivity.models import PortVerificationResult
+from services.executor_connectivity.models import PortRangeResult, PortVerificationResult
 
 
 @pytest.mark.asyncio
@@ -121,3 +121,31 @@ async def test_verify_ports_merges_rented_and_filler_ports(
     passed = orchestrator.verify.call_args.kwargs
     assert set(passed["unavailable_ports"]) == {40001, 40003, 40100}
     assert "rented_ports" not in passed
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_passes_the_range_tallies_through(
+    mock_ssh_client, sample_executor_info, mocker
+):
+    ranges = (PortRangeResult(first=9000, last=9004, declared=5, probed=3, answered=2),)
+    orchestrator = mocker.Mock()
+    orchestrator.verify = mocker.AsyncMock(
+        return_value=PortVerificationResult(
+            selected_ports=(PortPair(9000, 9000),),
+            successful_ports=(PortPair(9000, 9000),),
+            failed_ports=tuple(),
+            dind_port=PortPair(9000, 9000),
+            dind_ok=True,
+            sysbox_runtime=False,
+            status="ok",
+            port_ranges=ranges,
+            second_pass="ran",
+        )
+    )
+
+    result = await ExecutorConnectivityService(orchestrator=orchestrator).verify_ports(
+        mock_ssh_client, "test_miner", sample_executor_info
+    )
+
+    assert result.port_ranges == ranges
+    assert result.second_pass == "ran"

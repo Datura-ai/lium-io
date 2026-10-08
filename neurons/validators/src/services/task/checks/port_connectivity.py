@@ -3,12 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from core.config import settings
-from services.executor_connectivity.models import PortVerificationResult
+from services.executor_connectivity.models import PortVerificationResult, SecondPass
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-
 
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
@@ -70,6 +69,16 @@ class PortConnectivityCheck:
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
+        # event-only: kept out of default_extra so later checks' log lines stay small
+        event_extra: dict[str, object] = {
+            "port_ranges": [r.as_dict() for r in result.port_ranges],
+            "second_pass": result.second_pass,
+        }
+        if result.second_pass == SecondPass.SKIPPED_BATCH_FAILED:
+            event_extra["second_pass_note"] = (
+                "second port pass skipped: the first pass's batch container didn't complete "
+                "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
+            )
         updated_state = replace(
             ctx.state,
             specs={
@@ -161,9 +170,10 @@ class PortConnectivityCheck:
                     "total_ports_tested": len(result.successful_ports) + len(result.failed_ports),
                     "successful_ports": len(result.successful_ports),
                     "failed_ports": len(result.failed_ports),
+                    **event_extra,
                     **rental_info,
                 },
-                extra=extra_info,
+                extra={**extra_info, **event_extra},
             )
             return CheckResult(
                 passed=False,
@@ -176,7 +186,7 @@ class PortConnectivityCheck:
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
-            extra=extra_info,
+            extra={**extra_info, **event_extra},
         )
         return CheckResult(
             passed=True,

@@ -14,7 +14,9 @@ pipeline context, so there is no shared mutable cache to keep in sync.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 
 import aiohttp
 
@@ -28,6 +30,15 @@ _MANIFEST_ACCEPT = (
 )
 _REGISTRY_AUTH_URL = "https://auth.docker.io/token"
 _REGISTRY_API = "https://registry-1.docker.io/v2"
+# `[docker.io/][namespace/]name:tag` with Docker Hub's own charset: a namespace has no dot, so a
+# registry host (`ghcr.io/app`, `localhost:5000/app`) never matches
+_DOCKER_HUB_TAGGED_REFERENCE = re.compile(
+    r"(?:docker\.io/)?((?:[a-z0-9]+(?:[_-][a-z0-9]+)*/)?[a-z0-9]+(?:[._-][a-z0-9]+)*)"
+    r":([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
+)
+# the host daemon's own registry check costs ~2 s (staging "Docker image inspect" 2490 ms) and a
+# normal lookup ~0.2-0.4 s: a lookup still out after 2 s can no longer beat the daemon path
+_RENT_PATH_DIGEST_TIMEOUT_SECONDS = 2
 
 
 def _shared_config_image_refs() -> tuple[str, ...]:
@@ -117,6 +128,32 @@ async def fetch_default_image_digests() -> dict[str, str]:
             len(digests),
         )
     return digests
+
+
+async def fetch_docker_hub_digest(image: str) -> str | None:
+    """Registry digest of a Docker Hub `repository:tag` image; None for any other reference or error.
+
+    Used on the rent path: the connector answers in ~0.2 s what the host's daemon answers in ~2 s.
+    The renter writes the image name, so only a plain Docker Hub reference reaches the URL — any
+    other registry, a digest reference or an odd name stays with the host's daemon.
+    """
+    match = _DOCKER_HUB_TAGGED_REFERENCE.fullmatch(image)
+    if match is None:
+        return None
+    repository, tag = match.groups()
+    if repository.startswith("localhost/"):  # docker reads `localhost/` as a registry host
+        return None
+    if "/" not in repository:
+        repository = f"library/{repository}"
+    # one bound for the token request and the HEAD together; aiohttp's `total` bounds each request alone
+    try:
+        async with asyncio.timeout(_RENT_PATH_DIGEST_TIMEOUT_SECONDS), aiohttp.ClientSession() as session:
+            return await fetch_registry_digest(session, f"{repository}:{tag}")
+    except TimeoutError:
+        logger.warning(
+            "Docker Hub digest lookup for %s gave no answer in %s s", image, _RENT_PATH_DIGEST_TIMEOUT_SECONDS
+        )
+        return None
 
 
 async def fetch_executor_image_digest() -> str | None:

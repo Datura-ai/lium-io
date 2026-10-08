@@ -131,7 +131,7 @@ class DefaultIncentive(BaseIncentive):
     def _record_validation_failed_reason(result: JobResult) -> None:
         """A result whose run stopped at a failed check earns 0; record that check's code.
 
-        A run that passed every check and still scored 0 (collateral, CPU truth, an outdated
+        A run that passed every check and still scored 0 (CPU truth, an outdated
         image, a rented node's halt) records nothing here: it names no check to fix.
         """
         if result.is_successful:
@@ -324,6 +324,8 @@ class DefaultIncentive(BaseIncentive):
         - **Rental-share keeps first claim.** ``burn_scores`` is already the burn left AFTER
           the rental-share (idle) pool took its cut, and the pool is capped at that residual,
           so a short burn shrinks referral — never the rental-share and never the miners.
+          Spot pay and secure-floor top-ups (``unbucketed_share``) are also taken before this
+          residual, so the referral pool shrinks first when they grow.
         - **Fail closed.** An unset/zero/NaN share, an unreachable/stale/empty feed, no
           residual burn, or no eligible referrer all leave the weight vector exactly as it
           was — no referral emission that cycle.

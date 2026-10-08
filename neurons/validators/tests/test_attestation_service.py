@@ -1,6 +1,5 @@
 import json
 import sys
-import types
 from pathlib import Path
 from typing import Any
 import asyncssh  # noqa: E402
@@ -17,15 +16,6 @@ if str(VALIDATOR_SRC) not in sys.path:
     sys.path.insert(0, str(VALIDATOR_SRC))
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-
-if "celium_collateral_contracts" not in sys.modules:
-    module = types.ModuleType("celium_collateral_contracts")
-
-    class CollateralContract:  # type: ignore
-        ...
-
-    module.CollateralContract = CollateralContract
-    sys.modules["celium_collateral_contracts"] = module
 
 FIXTURE_PATH = THIS_DIR / "fixtures" / "tdx_quote.json"
 VERIFIER_RESPONSE_PATH = THIS_DIR / "fixtures" / "verifier_response.json"

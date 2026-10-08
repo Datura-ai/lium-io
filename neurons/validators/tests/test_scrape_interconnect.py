@@ -399,8 +399,9 @@ def test_interconnect_keys_are_wired_through_both_obfuscation_tables() -> None:
 
 
 def test_no_key_is_a_substring_of_a_later_key_in_the_rename_table() -> None:
-    """ecrypt_miner_job_files renames by sequential str.replace over the whole source: a key that
-    appears inside a LATER key corrupts that later key before its own turn comes."""
+    """ecrypt_miner_job_files renames by sequential str.replace over the whole source: replacing a
+    key also rewrites it inside every LATER key, which then never matches, and a later key that
+    fits a generated "_" + letters name rewrites that name."""
     # Arrange
     service_module = ast.parse((SRC / "services" / "file_encrypt_service.py").read_text())
     all_keys = dict_literal_keys(service_module, "all_keys")
@@ -412,9 +413,11 @@ def test_no_key_is_a_substring_of_a_later_key_in_the_rename_table() -> None:
         for later in all_keys[index + 1 :]
         if earlier != later and earlier in later
     ]
+    keys_that_fit_inside_a_name = [key for key in all_keys if re.fullmatch(r"_?[A-Za-z]+", key)]
 
     # Assert
     assert offenders == []
+    assert keys_that_fit_inside_a_name == []
 
 
 def test_the_obfuscated_scrape_still_summarizes_the_topology() -> None:

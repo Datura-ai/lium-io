@@ -95,7 +95,8 @@ MIN_POWER_LIMIT_RATIO = 0.9
 # node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
 # backend's 30 s preemption wait is for (Loki, 48 h to 15 Sep 2026: 8-GPU PEARL deletes p50
 # 27.7 s, 65 % over 25 s; 1-GPU 7.3 s). Each in-flight set holds one SSH channel; OpenSSH's
-# default MaxSessions is 10, so this stays under it with room for the caller's own channel. A host
+# default MaxSessions is 10. Beside a create's volume step the restore runs at 2 fewer
+# (`create_container`: restore 6 + the create's one session + its volume probe = 8). A host
 # whose sshd allows fewer refuses the extra channel opens (asyncssh.ChannelOpenError); those GPUs
 # are set again one at a time once the others are done (_set_side_by_side), so a low MaxSessions
 # costs time, never a GPU left capped.
@@ -422,8 +423,10 @@ async def _set_side_by_side(
     targets: list[_T],
     set_one: Callable[[_T, _Setter], Awaitable[bool]],
     log_extra: dict[str, object] | None,
+    *,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
-    """Run ``set_one`` for every target, ``POWER_LIMIT_SET_CONCURRENCY`` at a time; the count of True.
+    """Run ``set_one`` for every target, ``concurrency`` at a time; the count of True.
 
     ``set_one(target, setter)`` sets one GPU through ``setter``. Side by side the setter is
     ``_set_and_log_power_limit``, which raises ``asyncssh.ChannelOpenError`` when the host refused the
@@ -433,7 +436,7 @@ async def _set_side_by_side(
     a host with MaxSessions under 8 kept every GPU past the limit capped through the create's
     restore and raise.
     """
-    limit = asyncio.Semaphore(POWER_LIMIT_SET_CONCURRENCY)
+    limit = asyncio.Semaphore(concurrency)
 
     async def guarded(target: _T) -> bool | None:
         async with limit:
@@ -450,7 +453,7 @@ async def _set_side_by_side(
     _log(
         logging.WARNING,
         f"gpu power {action}: the host refused {len(refused)} of {len(targets)} SSH sessions opened side by side "
-        f"(sshd MaxSessions below {POWER_LIMIT_SET_CONCURRENCY}?); setting those GPUs one at a time",
+        f"(sshd MaxSessions below {concurrency}?); setting those GPUs one at a time",
         {"gpu_power_action": action, "refused": len(refused), "targets": len(targets)},
         log_extra,
     )
@@ -535,11 +538,12 @@ async def _restore_records(
     records: list[GpuPowerRestoreRecord],
     state_by_uuid: dict[str, GpuPowerState],
     log_extra: dict[str, object] | None,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
     (a failed restore keeps it for the safety nets to retry). Returns the restored count.
 
-    The records are restored side by side (``POWER_LIMIT_SET_CONCURRENCY`` at a time; a GPU whose
+    The records are restored side by side (``concurrency`` at a time; a GPU whose
     session the host refused is retried alone): each GPU is its own device, and the delete that
     calls this holds the customer's rent until it answers."""
 
@@ -564,7 +568,7 @@ async def _restore_records(
             )
             return False
 
-    return await _set_side_by_side("restore", records, restore_one, log_extra)
+    return await _set_side_by_side("restore", records, restore_one, log_extra, concurrency=concurrency)
 
 
 async def restore_tracked_gpu_power_limits(
@@ -574,6 +578,7 @@ async def restore_tracked_gpu_power_limits(
     log_extra: dict[str, object] | None = None,
     *,
     host_probe: PrerunHostProbe | None = None,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
     """Restore the frozen pre-cap limit of every tracked GPU among ``gpu_uuids``.
 
@@ -588,7 +593,7 @@ async def restore_tracked_gpu_power_limits(
     except Exception as exc:
         _log(logging.WARNING, f"gpu power restore: state query failed: {exc}; restoring without before-values", {}, log_extra)
         state_by_uuid = {}
-    return await _restore_records(ssh, redis, read_result.records, state_by_uuid, log_extra)
+    return await _restore_records(ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency)
 
 
 async def restore_all_host_gpu_power_limits(
@@ -597,6 +602,7 @@ async def restore_all_host_gpu_power_limits(
     log_extra: dict[str, object] | None = None,
     *,
     host_probe: PrerunHostProbe | None = None,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
     """Enumerate the host's GPUs over SSH and restore every tracked one — for whole-node containers
     whose payload names no gpu_uuids. Best-effort; returns the restored count."""
@@ -608,7 +614,7 @@ async def restore_all_host_gpu_power_limits(
     read_result = await read_gpu_power_restore_records(redis, list(state_by_uuid), log_extra)
     if not read_result.records:
         return 0
-    return await _restore_records(ssh, redis, read_result.records, state_by_uuid, log_extra)
+    return await _restore_records(ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency)
 
 
 async def raise_low_power_limits_to_default(
@@ -616,6 +622,8 @@ async def raise_low_power_limits_to_default(
     executor_id: str,
     gpu_uuids: list[str] | None,
     log_extra: dict[str, object] | None = None,
+    *,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
     """State-free last-resort net for rental start: lift every GPU sitting below
     ``MIN_POWER_LIMIT_RATIO`` x its default limit back to the default.
@@ -626,9 +634,10 @@ async def raise_low_power_limits_to_default(
     floor and the default are left alone (a miner may legitimately run there). ``gpu_uuids=None``
     means every host GPU. Best-effort (never raises); returns the raised count.
 
-    Always a live query, never the pre-run probe (DAH-3257): volume creation and a bootstrap
-    restore run between the probe and this call, so the probe's power state can be minutes old,
-    and this net is the last read before the customer's container starts.
+    Always a live query, never the pre-run probe (DAH-3257): volume creation and a bootstrap restore
+    run between the probe and this call, so the probe's power state can be minutes old. Outside a
+    bootstrap restore the create calls it beside the volume create and again right before the
+    customer's container starts; that second call is the create's last power read.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
@@ -665,7 +674,7 @@ async def raise_low_power_limits_to_default(
             log_extra,
         )
 
-    return await _set_side_by_side("raise", below_floor, raise_one, log_extra)
+    return await _set_side_by_side("raise", below_floor, raise_one, log_extra, concurrency=concurrency)
 
 
 async def restore_filler_pod_gpu_power_limits(

@@ -2,8 +2,7 @@ from .banned_gpu import BannedGpuCheck
 from .banned_provider import BannedProviderCheck
 from .cached_template_verification import CachedTemplateVerificationCheck
 from .capability import CapabilityCheck
-from .collateral import CollateralCheck
-from .collateral_prefetch import CollateralPrefetchCheck
+from .collateral_status import CollateralStatusCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
@@ -27,6 +26,7 @@ from .registry_pull import RegistryPullCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
+from .rented_gpu_drop import RentedGpuDropCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
@@ -42,8 +42,7 @@ __all__ = [
     "BannedProviderCheck",
     "CachedTemplateVerificationCheck",
     "CapabilityCheck",
-    "CollateralCheck",
-    "CollateralPrefetchCheck",
+    "CollateralStatusCheck",
     "CpuTruthCheck",
     "DiskHealthCheck",
     "CustomBuildOrphanSweepCheck",
@@ -67,6 +66,7 @@ __all__ = [
     "RegistryPullCheck",
     "RentalProbeCheck",
     "RentalVerificationCheck",
+    "RentedGpuDropCheck",
     "TdxHostCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",

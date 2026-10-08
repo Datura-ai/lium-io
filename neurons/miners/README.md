@@ -103,7 +103,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-associat
 
 ### Transfer TAO to Ethereum Address from your Miner Wallet
 
-You need to fund/transfer TAO into your Ethereum Address to deposit collateral (TAO) for your executors.
+Reclaim transactions (see [Withdrawing Collateral](#withdrawing-collateral)) pay gas from your Ethereum Address, so it needs a small TAO balance first.
 
 To transfer TAO from your miner wallet (the wallet in your env config), you can use the following command 
 
@@ -150,7 +150,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
 2. Use the following command to add an executor to the central miner:
 
     ```bash
-    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --price <gpu-price> [--validator <validator-hotkey>] [--gpu-type <gpu-type>] [--gpu-count <gpu-count>] [--deposit-amount <deposit-amount>] [--private-key <ethereum-private-key>]
+    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --price <gpu-price> [--validator <validator-hotkey>]
     ```
 
     **Required parameters:**
@@ -160,10 +160,6 @@ Executors are machines running on GPUs that you can add to your central miner. T
 
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
-    - `<gpu-type>`: Type of GPU available on the executor.
-    - `<gpu-count>`: Number of GPUs available on the executor.
-    - `<deposit-amount>`: The amount of TAO to deposit as collateral for this executor (must meet minimum required collateral).
-    - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
 
 ### List Executors
 
@@ -213,31 +209,23 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py remove-execu
 
 2. Type "y" and click enter in the interactive shell.
 
+An executor that still holds collateral on the contract stays registered until its collateral is withdrawn (see below).
+
+## Withdrawing Collateral
+
+Executors run and earn without collateral. If an executor still holds a TAO deposit from earlier, withdraw it in two steps: start a reclaim request, then finalize it once the request's deny window has passed. Both steps are transactions from the Ethereum Address associated with your hotkey.
+
+Deposits sit on one of two collateral contracts: version `1.0.2` (current) or `1.0.0` (deposits made before 1.0.2). `reclaim-collateral` and `finalize-reclaim-request` find the contract that holds the executor's collateral or your reclaim request. `reclaim-collateral`, `finalize-reclaim-request` and the three read commands (`get-miner-collateral`, `get-executor-collateral`, `get-reclaim-requests`) also take `--contract <version>` to pick one directly; the read commands ask for the version when it is left out.
+
 ### Getting Miner Collateral
 
-To check the total collateral deposited by the miner, use the following command:
+To check the collateral of the registered executors on one contract version, use the following command:
 
 ```bash
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-miner-collateral
 ```
 
-This will display the total TAO collateral that miner has deposited.
-
-
-### Depositing Collateral for an Executor
-
-To deposit additional collateral for an existing executor, use the following command:
-
-```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py deposit-collateral --address <executor-ip-address> --port <executor-port> --deposit_amount <deposit-amount> --private-key <ethereum-private-key>
-```
-
-- `<executor-ip-address>`: The IP address of the executor machine.
-- `<executor-port>`: The port number used for the executor.
-- `<deposit-amount>`: The amount of TAO to deposit as additional collateral for this executor.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
-
-This command allows you to increase the collateral for an executor already registered in the database.
+This will display the TAO collateral of the executors registered in this miner's database, on the selected contract version only. Run it once per version to see both.
 
 ### Getting Executor Collateral
 
@@ -257,22 +245,25 @@ This will display the TAO collateral associated with the specified executor.
 To reclaim your collateral, use the following command:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-collateral --executor_uuid <executor_uuid> --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-collateral --executor_uuid <executor_uuid>
 ```
 
 - `<executor_uuid>`: The uuid of the executor.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
+- The command asks for the Ethereum private key at a hidden prompt, so the key stays out of shell history and the process list.
 
+The command logs the reclaim request ID; keep it for the finalize step.
+
+If the answer to a reclaim or finalize is lost, run the same command again. It first reads the outcome of the earlier transaction, which is kept in `~/.bittensor/wallets/.lium-collateral-sent.json` (`COLLATERAL_SENT_RECORD`), and sends nothing new until that outcome is known. A mined reclaim is reported with its reclaim request ID. After that, a finalize that was mined shows up as "no open reclaim request". Any error answer to a send keeps that record, since a gateway can pass the transaction on and still answer with an error. If the RPC does not serve the earlier transaction's receipt or its block, run the command again with `SUBTENSOR_EVM_RPC_URL` set to an RPC that does, or look the transaction up on the explorer and, once you know its outcome, delete the file. If the earlier transaction is still not mined after it is broadcast again, do not delete the file: no receipt on one RPC does not prove it can never be mined. Run `docker exec -it <container-id or name> pdm run /root/app/src/cli.py replace-collateral-transaction` instead; it asks for the Ethereum private key at a hidden prompt and takes no `--private-key` option. It signs the same call again at the same nonce with a gas price at least 12.5% higher (and never above `COLLATERAL_MAX_GAS_PRICE_GWEI`), adds it to the file before it broadcasts it, and waits for a receipt of either transaction. Only one of them can be mined, and no other nonce is signed until one of them has a receipt. Then run the reclaim or finalize again if it still needs doing.
 
 ### Getting Miner Reclaim Requests
 
-To view all reclaim requests for the current miner, use the following command:
+To view open reclaim requests, use the following command:
 
 ```bash
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-reclaim-requests
 ```
 
-This will print a JSON list of all reclaim requests made by the miner, including their status and details.
+This prints the open reclaim requests started in the last ~1000 blocks (about 3 hours) for executors in this miner's database. The default finney RPC keeps only about the last 256 blocks (about 50 minutes); with it, the command warns that older requests are not listed. Their IDs are in the output of the reclaim command that started them, or set `SUBTENSOR_EVM_RPC_URL` to an RPC that keeps older blocks.
 
 ### Contract versions
 
@@ -288,13 +279,13 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-cont
 To finalize a reclaim request and reclaim your collateral, use the following command:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim-request-id <reclaim-request-id> --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim-request-id <reclaim-request-id>
 ```
 
 - `<reclaim-request-id>`: The ID of the reclaim request you wish to finalize.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
+- The command asks for the Ethereum private key at a hidden prompt, so the key stays out of shell history and the process list.
 
-This command will finalize the reclaim request and return the collateral to your account.
+This command will finalize the reclaim request and return the collateral to your account. Reclaim request IDs are counted per contract; when the same ID is open on both contracts for your key, the command asks for the version.
 
 ### Monitoring earnings
 

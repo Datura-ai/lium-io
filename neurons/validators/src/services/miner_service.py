@@ -1,10 +1,11 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shlex
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -53,6 +54,7 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
     WorkloadKind,
+    now_ms,
 )
 from tenacity import RetryError
 
@@ -61,7 +63,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, inflight_creates
+from services.docker_service import DockerService, create_steps_after_reply, customer_creates, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
@@ -296,9 +298,14 @@ class MinerService:
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
         that no cycle has published yet, so a long-known executor's scoring is untouched.
-        Flag off: list returned as is.
+        Flag off: the list minus repeats.
+
+        An executor uuid the miner lists more than once is kept once (its first entry), with or
+        without the flag: each entry starts its own pipeline, and a repeat would be validated,
+        and counted in its idle tier, twice in one cycle.
         """
         self._stop_awaiting_wave_list(payload)
+        executors = self._first_entry_per_uuid(executors, default_extra)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -315,13 +322,41 @@ class MinerService:
             claimed.append(executor)
         return claimed
 
+    @staticmethod
+    def _first_entry_per_uuid(
+        executors: list[ExecutorSSHInfo], default_extra: dict
+    ) -> list[ExecutorSSHInfo]:
+        unique: dict[str, ExecutorSSHInfo] = {}
+        repeats: dict[str, int] = {}
+        for executor in executors:
+            if executor.uuid in unique:
+                repeats[executor.uuid] = repeats.get(executor.uuid, 0) + 1
+                continue
+            unique[executor.uuid] = executor
+        for executor_uuid, dropped in repeats.items():
+            logger.warning(
+                _m(
+                    "Executor listed twice by miner; scored once",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": executor_uuid,
+                            "listed_count": dropped + 1,
+                            "dropped_count": dropped,
+                        }
+                    ),
+                ),
+            )
+        return list(unique.values())
+
     def _only_requested(
         self, executors: list[ExecutorSSHInfo], executor_id: str, default_extra: dict
     ) -> list[ExecutorSSHInfo]:
         """The express lane asked the miner for one executor; run the pipeline on that one only.
         A miner that answers with more (an old miner ignoring the filter, or a misbehaving one)
         would otherwise get every extra executor verified here, concurrently with the wave that
-        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958)."""
+        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958).
+        Repeats of the requested uuid are dropped too: each entry would start its own pipeline."""
         requested = [executor for executor in executors if executor.uuid == executor_id]
         if len(requested) != len(executors):
             logger.warning(
@@ -336,7 +371,7 @@ class MinerService:
                     ),
                 )
             )
-        return requested
+        return self._first_entry_per_uuid(requested, default_extra)
 
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
@@ -1212,6 +1247,12 @@ class MinerService:
                         # The spec carries at most the backend's bound; the rest of the list goes
                         # in PodStatesReport chunks below, or waits for the next cycle.
                         "pod_states": self._pod_states_capped_for_spec(result, default_extra),
+                        # None when the cycle's probe saw no rented pod with an ssh_port on this node
+                        "pod_ssh": (
+                            [observation.model_dump(mode="json") for observation in result.pod_ssh]
+                            if result.pod_ssh is not None
+                            else None
+                        ),
                     },
                 )
             except Exception as e:
@@ -1369,7 +1410,7 @@ class MinerService:
         # quicker would otherwise reach the executor first and see a pod that does not exist yet.
         if not isinstance(payload, ContainerCreateRequest):
             return await self._route_container(payload)
-        with inflight_creates.track(payload.pod_id):
+        with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
             return await self._route_container(payload)
 
     async def _route_container(self, payload: ContainerBaseRequest):
@@ -1429,7 +1470,8 @@ class MinerService:
                 miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
-            async with miner_client:
+            async with contextlib.AsyncExitStack() as miner_connection:
+                await miner_connection.enter_async_context(miner_client)
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
@@ -1534,6 +1576,7 @@ class MinerService:
                         # DAH-3436 (review): the rental probe takes the same per-executor lock before its
                         # own create, so its sweep of `pod_*` containers never runs beside this create
                         async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                            customer_creates.reached_create_container(payload)
                             result = await docker_service.create_container(
                                 payload,
                                 executor,
@@ -1541,15 +1584,22 @@ class MinerService:
                                 private_key.decode("utf-8"),
                             )
 
-                        await miner_client.send_model(
+                        # DAH-3980: a create's reply does not wait for the miner; the steps after it own
+                        # the miner's socket and close it once the removal is sent
+                        remove_ssh_key = self._remove_ssh_key_via_websocket(
+                            miner_client,
+                            miner_connection.pop_all(),
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
-                            )
+                            ),
+                            log_extra=default_extra,
                         )
-
+                        create_steps_after_reply.start(
+                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                        )
                         return result
 
                     elif isinstance(payload, ContainerDeleteRequest):
@@ -2339,6 +2389,48 @@ class MinerService:
             )
             return False
 
+    async def _remove_ssh_key_via_websocket(
+        self,
+        miner_client: MinerClient,
+        miner_connection: contextlib.AsyncExitStack,
+        remove_request: SSHPubKeyRemoveRequest,
+        log_extra: dict,
+    ) -> bool:
+        # the WebSocket twin of _remove_ssh_key_via_rest: logs a failure instead of raising it, then closes the socket
+        async with miner_connection:
+            try:
+                await miner_client.send_model(remove_request)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to remove SSH key via WebSocket. Validator key may still be present on miner",
+                        extra=get_extra_info({**log_extra, "error_type": type(exc).__name__}),
+                    )
+                )
+                return False
+        return True
+
+    async def _log_ssh_key_removal_after_reply(self, remove_ssh_key: Awaitable[bool], log_extra: dict) -> None:
+        # the removal logs its own failure; this line puts it after the reply in the log
+        started_ms = now_ms()
+        try:
+            ssh_key_removed = await remove_ssh_key
+        except asyncio.CancelledError:
+            # a delete's wait for the steps after the reply timed out, or the connector stops
+            logger.warning(
+                _m(
+                    "Validator SSH key removal after reply cancelled; the key may stay at the miner",
+                    extra=get_extra_info({**log_extra, "duration_ms": now_ms() - started_ms}),
+                )
+            )
+            raise
+        logger.info(
+            _m(
+                "Validator SSH key removal after reply finished",
+                extra=get_extra_info({**log_extra, "removed": ssh_key_removed, "duration_ms": now_ms() - started_ms}),
+            )
+        )
+
     def _serialize_request(self, request) -> dict:
         """Serialize a Pydantic request model to dict for JSON serialization.
         
@@ -2763,6 +2855,7 @@ class MinerService:
                     )
                     # DAH-3436 (review): shared with the rental probe's create, see executor_create_exclusion
                     async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                        customer_creates.reached_create_container(payload)
                         result = await docker_service.create_container(
                             payload,
                             executor,
@@ -2824,7 +2917,7 @@ class MinerService:
 
                 # Remove SSH key after operation only if it was accepted
                 if ssh_key_accepted:
-                    await self._remove_ssh_key_via_rest(
+                    remove_ssh_key = self._remove_ssh_key_via_rest(
                         base_url=base_url,
                         my_key=my_key,
                         public_key=public_key,
@@ -2832,6 +2925,13 @@ class MinerService:
                         executor_id=payload.executor_id,
                         log_extra=default_extra,
                     )
+                    if isinstance(payload, ContainerCreateRequest):
+                        # DAH-3980: a create's reply does not wait for the miner
+                        create_steps_after_reply.start(
+                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                        )
+                    else:
+                        await remove_ssh_key
 
                 return result
 

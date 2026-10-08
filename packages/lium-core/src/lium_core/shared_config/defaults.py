@@ -138,4 +138,6 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
     require_storage_limit_supported=False,
     payout_delay_days=2,
     payout_processing_hour_utc=17,
+    miner_payment_min_tao=0.0021,
+    miner_payment_min_usd=0.5,
 )

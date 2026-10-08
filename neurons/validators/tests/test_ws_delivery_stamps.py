@@ -4,6 +4,7 @@ pong timeout long enough for the keepalive to survive a scoring-cycle burst.
 """
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
@@ -11,7 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import websockets
-from clients.compute_client import WS_PING_INTERVAL, WS_PING_TIMEOUT, ComputeClient
+from clients.compute_client import (
+    WS_PING_INTERVAL,
+    WS_PING_TIMEOUT,
+    ComputeClient,
+    OutgoingMessages,
+)
 from payload_models.payloads import ContainerCreated, DeliveryStamps
 from protocol.vc_protocol.validator_requests import (
     ExecutorSpecRequest,
@@ -188,6 +194,27 @@ async def test_send_loop_stamps_container_responses_too() -> None:
     # Assert
     assert [message["message_type"] for message in sent] == ["ContainerCreated", "RentedMachineRequest"]
     assert [message["queue_depth"] for message in sent] == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_send_loop_waiting_on_an_empty_queue_sends_an_appended_reply_at_once() -> None:
+    # Arrange: the loop is already idle on an empty queue when the create's reply is appended
+    client = _client()
+    client.message_queue = OutgoingMessages()
+    sent_at: list[float] = []
+    client.ws = MagicMock(send=AsyncMock(side_effect=lambda raw_message: sent_at.append(time.monotonic())))
+    send_loop = asyncio.create_task(client.handle_send_messages())
+    await asyncio.sleep(0.05)
+
+    # Act
+    appended_at = time.monotonic()
+    client.message_queue.append(RentedMachineRequest())
+    await asyncio.sleep(0.05)
+    send_loop.cancel()
+
+    # Assert: sent within the wait above, not on a 1 s poll
+    assert len(sent_at) == 1
+    assert sent_at[0] - appended_at < 0.05
 
 
 @pytest.mark.asyncio

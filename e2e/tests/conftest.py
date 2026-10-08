@@ -1,7 +1,7 @@
 """Suite-wide setup for the tester: the one boundary the stack does not have is the chain.
 
-`services.ioc` constructs every validator service at import; `CollateralContractService` asks `SubtensorClient` for
-its singleton, whose constructor dials `BITTENSOR_CHAIN_ENDPOINT` (else the `BITTENSOR_NETWORK` node) and `exit()`s when the hotkey is not
+`services.ioc` constructs every validator service at import; any of them that asks `SubtensorClient` for its
+singleton gets a constructor that dials `BITTENSOR_CHAIN_ENDPOINT` (else the `BITTENSOR_NETWORK` node) and `exit()`s when the hotkey is not
 registered there. The e2e validator is registered nowhere, so the client is kept but never connected — the same
 state a production validator is in during a chain outage (`_subtensor is None`; every reader either degrades or
 fails the way it does then). Nothing else is patched: miner, executor, SSH, docker, redis and the check pipeline

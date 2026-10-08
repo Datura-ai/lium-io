@@ -1,3 +1,4 @@
+import json
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -63,6 +64,8 @@ def test_default_shared_config_has_all_fields() -> None:
     assert DEFAULT_SHARED_CONFIG.total_burn_emission == 0.91
     assert DEFAULT_SHARED_CONFIG.require_storage_limit_supported is False
     assert DEFAULT_SHARED_CONFIG.multinode_clusters_enabled is False
+    assert DEFAULT_SHARED_CONFIG.miner_payment_min_tao == 0.0021
+    assert DEFAULT_SHARED_CONFIG.miner_payment_min_usd == 0.5
 
 
 def test_multinode_clusters_flag_defaults_to_off() -> None:
@@ -126,6 +129,25 @@ def test_soft_limit_price_rate_defaults_when_absent() -> None:
         {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "soft_limit_price_rate"}
     )
     assert config.soft_limit_price_rate == 1.1
+
+
+@pytest.mark.parametrize(
+    "payment_minimums",
+    [
+        pytest.param({}, id="defaults_when_absent"),
+        pytest.param({"miner_payment_min_tao": 0.003, "miner_payment_min_usd": 0.75}, id="supplied_values"),
+    ],
+)
+def test_miner_payment_minimums_validate_from_json(payment_minimums: dict[str, float]) -> None:
+    payload = {
+        key: value
+        for key, value in DEFAULT_SHARED_CONFIG.model_dump().items()
+        if key not in {"miner_payment_min_tao", "miner_payment_min_usd"}
+    }
+    config = SharedConfig.model_validate_json(json.dumps({**payload, **payment_minimums}))
+
+    assert config.miner_payment_min_tao == payment_minimums.get("miner_payment_min_tao", 0.0021)
+    assert config.miner_payment_min_usd == payment_minimums.get("miner_payment_min_usd", 0.5)
 
 
 def test_shared_config_serializes_to_json() -> None:

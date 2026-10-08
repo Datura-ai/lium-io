@@ -3,7 +3,6 @@ and decides exactly as the serial pipeline does.
 
 - a ParallelStage gives the same verdict, the same failing check and the same final context as the
   serial list on the same checks;
-- the collateral read started early is the one CollateralCheck awaits, with the gate unchanged;
 - the fast-path check list is the serial list re-ordered — no check added, none dropped;
 - the express lane's shorter waits apply only with the flag on.
 """
@@ -13,7 +12,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
-from types import SimpleNamespace
 
 import pytest
 from neurons.validators.src.core import express_lane as express_lane_module
@@ -31,8 +29,6 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
 from neurons.validators.src.services.task.checks import (
     CachedTemplateVerificationCheck,
     CapabilityCheck,
-    CollateralCheck,
-    CollateralPrefetchCheck,
     GpuFaultProbeCheck,
     PortConnectivityCheck,
     PortCountCheck,
@@ -42,8 +38,6 @@ from neurons.validators.src.services.task.checks import (
     TenantEnforcementCheck,
     VerifyXCheck,
 )
-from neurons.validators.src.services.task.checks.collateral_prefetch import collateral_read_args
-from neurons.validators.src.services.task.messages import CollateralMessages
 from neurons.validators.src.services.task.models import ValidationEvent
 from neurons.validators.src.services.task.pipeline import (
     CheckResult,
@@ -54,7 +48,7 @@ from neurons.validators.src.services.task.pipeline import (
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 
 from core.config import settings
-from tests.helpers import build_services, build_state
+from tests.helpers import build_state
 
 # --- fixtures -------------------------------------------------------------------------------------
 
@@ -211,22 +205,6 @@ class _RaisingCheck(_StateCheck):
         raise self._exc
 
 
-class _FakePrefetchTask:
-    def __init__(self):
-        self.cancelled = False
-
-    def done(self):
-        return self.cancelled
-
-    def cancel(self):
-        self.cancelled = True
-
-
-def _with_prefetch(state):
-    task = _FakePrefetchTask()
-    return replace(state, collateral_prefetch=SimpleNamespace(task=task, args=None)), task
-
-
 async def _settled(log, check_id):
     """Wait long enough for `check_id` to have started if nothing had stopped it."""
     await asyncio.sleep(0.1)
@@ -238,8 +216,7 @@ async def test_parallel_stage_cancels_the_sibling_lane_when_a_check_raises(conte
     log = []
     host = [_StateCheck("ports", seconds=0.05, log=log), _StateCheck("rental_verification", log=log)]
     gpu = [_RaisingCheck("matmul", seconds=0.01, log=log)]
-    state, prefetch = _with_prefetch(build_state(specs={"gpu": {"count": 8}}))
-    ctx = context_factory(state=state)
+    ctx = context_factory(state=build_state(specs={"gpu": {"count": 8}}))
     tasks_before = len(asyncio.all_tasks())
 
     with pytest.raises(RuntimeError, match="matmul blew up"):
@@ -250,7 +227,6 @@ async def test_parallel_stage_cancels_the_sibling_lane_when_a_check_raises(conte
     assert not await _settled(log, "rental_verification"), "the sibling lane's next check never started"
     assert ("finalize", "start") not in kinds
     assert len(asyncio.all_tasks()) == tasks_before, "no lane task is left running"
-    assert prefetch.cancelled, "the early collateral read nobody will consume is cancelled"
 
 
 @pytest.mark.asyncio
@@ -270,9 +246,8 @@ async def test_parallel_stage_stops_the_sibling_lane_at_a_fatal_failure(context_
     log = []
     host = [_StateCheck("ports", seconds=0.05, log=log), _StateCheck("rental_verification", log=log)]
     gpu = [_StateCheck("matmul", seconds=0.01, passed=False, log=log), _StateCheck("fault_probe", log=log)]
-    state, prefetch = _with_prefetch(build_state(specs={"gpu": {"count": 8}}))
     sink = _Sink()
-    ctx = context_factory(state=state)
+    ctx = context_factory(state=build_state(specs={"gpu": {"count": 8}}))
     ok, events, last = await Pipeline([ParallelStage([host, gpu]), _StateCheck("finalize", log=log)], sink).run(ctx)
 
     assert ok is False
@@ -284,15 +259,6 @@ async def test_parallel_stage_stops_the_sibling_lane_at_a_fatal_failure(context_
     assert not await _settled(log, "rental_verification"), "a failed node never rents the probe container"
     assert ("fault_probe", "start") not in kinds and ("finalize", "start") not in kinds
     assert "verified_ports" not in last.state.specs
-    assert prefetch.cancelled
-
-
-@pytest.mark.asyncio
-async def test_pipeline_cancels_a_pending_prefetch_when_a_serial_check_fails(context_factory):
-    state, prefetch = _with_prefetch(build_state(specs={"gpu": {"count": 8}}))
-    ok, events, _ = await _run([_StateCheck("gpu_count", passed=False), _StateCheck("collateral")], state=state, context_factory=context_factory)
-    assert ok is False and [e.check_id for e in events] == ["gpu_count"]
-    assert prefetch.cancelled
 
 
 def test_merge_state_applies_each_lane_key_by_key():
@@ -308,71 +274,6 @@ def test_merge_state_applies_each_lane_key_by_key():
     assert merged.gpu_count == 8
     # A lane that changed nothing leaves the current state as it is.
     assert merge_state(merged, base, base) is merged
-
-
-# --- (c) collateral read started early ------------------------------------------------------------
-
-
-class _CountingCollateral:
-    def __init__(self, deposited=True):
-        self.calls = []
-        self.deposited = deposited
-
-    async def is_eligible_executor(self, *, miner_hotkey, executor_uuid, gpu_model, gpu_count):
-        self.calls.append((miner_hotkey, executor_uuid, gpu_model, gpu_count))
-        await asyncio.sleep(0.01)
-        return self.deposited, None if self.deposited else "no bond", "1.2"
-
-
-def _gpu_state(count=2, model="NVIDIA H200"):
-    return build_state(specs={"gpu": {"count": count, "details": [{"name": model}] * count}})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("deposited", [True, False])
-async def test_collateral_check_awaits_the_prefetched_read_and_keeps_its_gate(context_factory, deposited):
-    service = _CountingCollateral(deposited)
-    ctx = context_factory(services=build_services(collateral=service), state=_gpu_state())
-
-    started = await CollateralPrefetchCheck().run(ctx)
-    assert started.passed and started.event.reason_code == "COLLATERAL_READ_STARTED"
-    ctx = ctx.model_copy(update=started.updates)
-    assert ctx.state.collateral_prefetch is not None
-
-    result = await CollateralCheck().run(ctx)
-
-    assert len(service.calls) == 1, "one contract read, started early, awaited here"
-    assert result.passed is deposited, "the fatal collateral gate is unchanged"
-    assert result.event.reason_code == (CollateralMessages.VERIFIED.reason if deposited else CollateralMessages.MISSING.reason)
-    assert result.event.what_we_saw["prefetched"] is True
-    assert result.updates["collateral_deposited"] is deposited
-
-
-@pytest.mark.asyncio
-async def test_collateral_check_reads_again_when_the_prefetch_asked_a_different_question(context_factory):
-    service = _CountingCollateral()
-    ctx = context_factory(services=build_services(collateral=service), state=_gpu_state(count=2))
-    started = await CollateralPrefetchCheck().run(ctx)
-    ctx = ctx.model_copy(update=started.updates)
-    # A later check learned the real GPU count; the early answer is for another question.
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, gpu_count=4)})
-
-    result = await CollateralCheck().run(ctx)
-
-    assert result.passed
-    assert "prefetched" not in result.event.what_we_saw
-    assert [c[3] for c in service.calls][-1] == 4, "the check asked its own question"
-    assert ctx.state.collateral_prefetch.task.cancelled() or ctx.state.collateral_prefetch.task.done()
-    assert collateral_read_args(ctx).gpu_count == 4
-
-
-@pytest.mark.asyncio
-async def test_collateral_prefetch_skips_a_node_with_no_gpu_yet(context_factory):
-    service = _CountingCollateral()
-    ctx = context_factory(services=build_services(collateral=service), state=build_state(specs={}))
-    result = await CollateralPrefetchCheck().run(ctx)
-    assert result.passed and result.event.reason_code == "COLLATERAL_READ_SKIPPED"
-    assert not result.updates and service.calls == []
 
 
 # --- the fast-path list is the serial list, re-ordered -----------------------------------------------
@@ -392,17 +293,15 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
 
     serial_ids = sorted(type(c).__name__ for c in serial)
     fast_ids = sorted(type(c).__name__ for c in flat)
-    assert fast_ids == sorted(serial_ids + ["CollateralPrefetchCheck"]), "one check added (the early read), none dropped"
+    assert fast_ids == serial_ids, "no check added, none dropped"
     assert [type(c) for c in PipelineFactory.build_checks(fast_path=True)] == [type(c) for c in fast]
 
     names = [type(c).__name__ for c in fast]
     stage = next(s for s in fast if isinstance(s, ParallelStage))
     stage_at = fast.index(stage)
     # The gates that must decide before any GPU or port work stay ahead of the stage.
-    for gate in (CollateralCheck, TenantEnforcementCheck, VerifyXCheck):
+    for gate in (TenantEnforcementCheck, VerifyXCheck):
         assert names.index(gate.__name__) < stage_at
-    assert next(c for c in fast if isinstance(c, CollateralCheck)).fatal is True
-    assert names.index("CollateralPrefetchCheck") < names.index("CollateralCheck")
     # VerifyX measures the network alone; the executor refuses VerifyX beside the matmul.
     lane_types = [[type(c) for c in lane] for lane in stage.lanes]
     assert VerifyXCheck not in [t for lane in lane_types for t in lane]
