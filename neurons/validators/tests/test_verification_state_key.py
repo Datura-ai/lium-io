@@ -190,5 +190,6 @@ async def test_executor_id_with_colon_cannot_address_another_hotkeys_record(cont
     assert await service.get_verified_job_info(forged, HOTKEY_B) == {}
     await service.set_verified_job_info(HOTKEY_B, forged, prev_info={}, uuids="gpu-009")
     assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == record
+    service = _redis_service()
     await service.set_verified_job_info(HOTKEY_B, f"prefix:{EXECUTOR}", prev_info={}, uuids="gpu-009")
     assert await service.get_verified_job_info(EXECUTOR, "hotkey-c") == {}

@@ -110,7 +110,7 @@ async def _cycle(
 ):
     """One validation cycle as the service runs it: the record from Redis, the checks through the Pipeline, the
     outcome persisted by the ResultHandler."""
-    verified = await service.get_verified_job_info(EXECUTOR)
+    verified = await service.get_verified_job_info(EXECUTOR, "hk")
     containers = [{"name": "tenant-123", "pod_id": POD_ID}] if rented else []
     ctx = context_factory(
         miner_hotkey=miner_hotkey,
