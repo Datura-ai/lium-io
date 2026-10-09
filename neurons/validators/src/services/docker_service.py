@@ -564,7 +564,7 @@ class VolumeSizingResult:
 
 # New volumes go to a second plugin installed beside the old one under the same name with a tag:
 # `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
-# whose volumes live inside its rootfs, so a plugin command must never name it here.
+# whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
 _LOOPBACK_PLUGIN_ALIAS = f"{_VLOOPBACK_DRIVER_PREFIX}:v2"
 _LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
 # backing files on the host under DockerRootDir (the plugin sees the host's / at /srv), outside the
@@ -574,10 +574,14 @@ _LOOPBACK_PLUGIN_STATE_DIR = "/srv/run/docker-volume-loopback-v2"
 _PROBE_OUTPUT_LOG_CAP = 512
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
-_LOOPBACK_PLUGIN_STATE_COMMAND = (
-    "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
-    f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1"
-)
+def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
+    return (
+        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+        f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null || echo absent) | tail -n 1"
+    )
+
+
+_LOOPBACK_PLUGIN_STATE_COMMAND = _loopback_plugin_state_command(_LOOPBACK_PLUGIN_ALIAS)
 
 
 class LoopbackPluginDisabledError(Exception):
@@ -585,10 +589,10 @@ class LoopbackPluginDisabledError(Exception):
     The message keeps "plugin vloopback" and "disabled" so the platform classifier still files
     it as volume.plugin_disabled."""
 
-    def __init__(self, detail: str):
+    def __init__(self, detail: str, loopback_plugin_alias: str = _LOOPBACK_PLUGIN_ALIAS):
         super().__init__(
             "vloopback plugin disabled on host and could not be enabled "
-            f"(plugin {_LOOPBACK_PLUGIN_ALIAS}: {detail})"
+            f"(plugin {loopback_plugin_alias}: {detail})"
         )
 
 
@@ -5428,17 +5432,20 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         timeout: int,
         log_extra: dict,
+        loopback_plugin_alias: str = _LOOPBACK_PLUGIN_ALIAS,
     ) -> None:
         """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
         again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
         at volume creation with a clear reason instead of Docker's create error."""
         run_kwargs = {"timeout": timeout} if timeout else {}
-        extra = {**log_extra, "loopback_plugin": _LOOPBACK_PLUGIN_ALIAS}
+        extra = {**log_extra, "loopback_plugin": loopback_plugin_alias}
         try:
             result = await ssh_client.run(
-                f"/usr/bin/docker plugin enable {shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}", **run_kwargs
+                f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}", **run_kwargs
             )
-            state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
+            state_result = await ssh_client.run(
+                _loopback_plugin_state_command(loopback_plugin_alias), **run_kwargs
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5450,7 +5457,9 @@ class DockerService:
                     extra=get_extra_info({**extra, "error_type": error_type}),
                 )
             )
-            raise LoopbackPluginDisabledError(f"enable error: {error_type}") from exc
+            raise LoopbackPluginDisabledError(
+                f"enable error: {error_type}", loopback_plugin_alias
+            ) from exc
         state = (state_result.stdout or "").strip()
         if state != "true":
             detail = (result.stderr or result.stdout or "").strip()[:_PROBE_OUTPUT_LOG_CAP]
@@ -5464,9 +5473,49 @@ class DockerService:
             )
             raise LoopbackPluginDisabledError(
                 f"enable exit {result.exit_status}, state {state or 'unknown'}"
-                + (f": {detail}" if detail else "")
+                + (f": {detail}" if detail else ""),
+                loopback_plugin_alias,
             )
         logger.info(_m("Loopback plugin was disabled; enabled it", extra=get_extra_info(extra)))
+
+    async def _fall_back_to_old_loopback_plugin(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_root_dir: str,
+        timeout: int,
+        log_extra: dict,
+        v2_unusable_reason: str,
+    ) -> str:
+        """The old plugin's path, as before v2, for one new volume when v2 cannot be used: until the
+        old plugin is retired a node without v2 keeps renting. Returns the driver to create on.
+        The only place a plugin command may name the old plugin; it goes away with it."""
+        old_plugin_alias = _VLOOPBACK_DRIVER_PREFIX
+        logger.warning(
+            _m(
+                "Loopback plugin v2 unusable; creating this volume on the old plugin",
+                extra=get_extra_info(
+                    {**log_extra, "loopback_plugin": old_plugin_alias, "reason": v2_unusable_reason}
+                ),
+            )
+        )
+        run_kwargs = {"timeout": timeout} if timeout else {}
+        state_result = await ssh_client.run(
+            _loopback_plugin_state_command(old_plugin_alias), **run_kwargs
+        )
+        state = (state_result.stdout or "").strip()
+        if state == "false":
+            await self._enable_loopback_plugin(
+                ssh_client, timeout, log_extra, loopback_plugin_alias=old_plugin_alias
+            )
+        elif state != "true":
+            loopback_plugin_arg = shlex.quote(old_plugin_alias)
+            data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
+            command = (
+                "/usr/bin/docker plugin install ashald/docker-volume-loopback "
+                f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
+            )
+            await ssh_client.run(command)
+        return old_plugin_alias
 
     async def create_local_volume(
         self,
@@ -5509,15 +5558,18 @@ class DockerService:
             elif host_probe is not None and host_probe.loopback_plugin_installed:
                 # Installed but disabled: `docker plugin install` would fail with "already exists"
                 # and the volume create with "plugin vloopback:v2 found but disabled".
-                await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
+                try:
+                    await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
+                except LoopbackPluginDisabledError as exc:
+                    loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
+                        ssh_client, docker_root_dir, requested_timeout, log_extra, str(exc)
+                    )
             else:
                 loopback_plugin_arg = shlex.quote(loopback_plugin_name)
                 data_dir_arg = shlex.quote(
                     f"DATA_DIR=/srv{docker_root_dir}/{_LOOPBACK_PLUGIN_DATA_DIR_NAME}"
                 )
                 state_dir_arg = shlex.quote(f"STATE_DIR={_LOOPBACK_PLUGIN_STATE_DIR}")
-                # a failed install is not checked: the create below then fails on the missing
-                # plugin and the rent fails; never fall back to the old plugin
                 command = (
                     f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
                     f"--alias {loopback_plugin_arg} --grant-all-permissions "
@@ -5526,7 +5578,21 @@ class DockerService:
                 # TODO: migrate Docker plugin management if/when plugin setup becomes
                 # part of the SDK migration scope. The user-controlled volume name is
                 # not used in this shell command; volume creation below is SDK-backed.
-                await ssh_client.run(command)
+                install_result = await ssh_client.run(command)
+                if install_result.exit_status != 0:
+                    # without a probe an installed v2 fails the install with "already exists"
+                    state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND)
+                    v2_state = (state_result.stdout or "").strip()
+                    if v2_state != "true":
+                        install_error = (install_result.stderr or install_result.stdout or "").strip()
+                        loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
+                            ssh_client,
+                            docker_root_dir,
+                            requested_timeout,
+                            log_extra,
+                            f"install exit {install_result.exit_status}, state {v2_state or 'unknown'}: "
+                            f"{install_error[:_PROBE_OUTPUT_LOG_CAP]}",
+                        )
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
             # by default (creation time scales with size). `sparse=true` writes a sparse

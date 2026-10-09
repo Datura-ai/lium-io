@@ -1,8 +1,11 @@
 import ast
+import inspect
 import json
 import logging
 import re
 import shlex
+import textwrap
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -670,16 +673,35 @@ def _docker_plugin_command_templates(source: str) -> list[tuple[str, str, str]]:
     ]
 
 
+def _enable_loopback_plugin_calls_naming_an_alias(source: str) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "_enable_loopback_plugin"
+        and (len(node.args) > 3 or node.keywords)
+    ]
+
+
 def test_loopback_plugin_commands_are_install_enable_inspect_only():
     # an upgrade, rm, disable or forced command on the loopback plugin loses every volume whose
     # backing file is in its rootfs: only the per-volume s3fs instances may get one
     source = open(docker_service_module.__file__).read()
+    fallback_source = textwrap.dedent(inspect.getsource(DockerService._fall_back_to_old_loopback_plugin))
 
     templates = _docker_plugin_command_templates(source)
+    fallback_templates = _docker_plugin_command_templates(fallback_source)
 
     verbs_and_targets = {(verb, target) for verb, target, _ in templates}
     assert ("install", "{_LOOPBACK_PLUGIN_IMAGE}") in verbs_and_targets
-    assert ("enable", "{shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}") in verbs_and_targets
+    assert ("enable", "{shlex.quote(loopback_plugin_alias)}") in verbs_and_targets
+    # the old plugin is installed or enabled only by the fallback for one new volume
+    assert ("install", "ashald/docker-volume-loopback") in {(verb, target) for verb, target, _ in fallback_templates}
+    assert source.count("ashald/") == fallback_source.count("ashald/")
+    for verb, target, _ in Counter(templates) - Counter(fallback_templates):
+        assert verb != "install" or target in {"{_LOOPBACK_PLUGIN_IMAGE}", "{S3FS_PLUGIN_IMAGE}"}, target
+    assert len(_enable_loopback_plugin_calls_naming_an_alias(source)) == 1
+    assert len(_enable_loopback_plugin_calls_naming_an_alias(fallback_source)) == 1
     for verb, target, rest in templates:
         assert verb in {"install", "enable", "inspect"} | _PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES, verb
         if verb in _PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES or re.search(r"(^|\s)(-f|--force)\b", rest):

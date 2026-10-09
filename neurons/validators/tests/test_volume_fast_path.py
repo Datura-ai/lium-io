@@ -540,13 +540,14 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_disabled_plugin_that_will_not_enable_fails_fast(docker_service):
+async def test_create_local_volume_fails_fast_when_neither_v2_nor_the_old_plugin_will_enable(docker_service):
+    enable_failed = Mock(
+        stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1
+    )
+    still_disabled = Mock(stdout="false\n", stderr="", exit_status=0)
     ssh_client = Mock()
     ssh_client.run = AsyncMock(
-        side_effect=[
-            Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1),
-            Mock(stdout="false\n", stderr="", exit_status=0),
-        ]
+        side_effect=[enable_failed, still_disabled, still_disabled, enable_failed, still_disabled]
     )
 
     with pytest.raises(LoopbackPluginDisabledError) as exc_info:
@@ -554,22 +555,21 @@ async def test_create_local_volume_disabled_plugin_that_will_not_enable_fails_fa
 
     message = str(exc_info.value)
     assert message.startswith("vloopback plugin disabled on host and could not be enabled")
-    assert "enable exit 1, state false" in message and "plugin.sock" in message
+    assert "(plugin vloopback: enable exit 1, state false" in message and "plugin.sock" in message
     # lium-platform's classifier files it as volume.plugin_disabled on these two substrings
     assert "plugin vloopback" in message.lower() and "disabled" in message.lower()
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_disabled_plugin_enable_timeout_fails_fast(docker_service):
+async def test_create_local_volume_falls_back_to_the_old_plugin_when_the_v2_enable_times_out(docker_service):
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=asyncio.TimeoutError())
+    ssh_client.run = AsyncMock(side_effect=[asyncio.TimeoutError(), Mock(stdout="true\n", stderr="", exit_status=0)])
 
-    with pytest.raises(LoopbackPluginDisabledError, match="could not be enabled"):
-        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+    created = await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
-    assert ssh_client.run.await_count == 1
-    assert docker_service.rental_docker_client_factory.client.created_volumes == []
+    assert ssh_client.run.await_count == 2
+    assert [volume["driver"] for volume in created] == ["vloopback"]
 
 
 @pytest.mark.asyncio
@@ -580,22 +580,22 @@ async def test_create_local_volume_disabled_plugin_enable_error_logs_only_its_ty
 
     secret_text = "ssh ubuntu@10.1.2.3: token=ghp_leakme at /home/provider/.ssh/id_rsa"
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=OSError(secret_text))
+    ssh_client.run = AsyncMock(side_effect=[OSError(secret_text), Mock(stdout="true\n", stderr="", exit_status=0)])
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
 
-    with pytest.raises(LoopbackPluginDisabledError) as exc_info:
-        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+    await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
-    assert "enable error: OSError" in str(exc_info.value)
-    assert secret_text not in str(exc_info.value)
-    (logged,), _ = warning.call_args
-    assert str(logged).startswith("Loopback plugin enable failed")
-    assert logged.extra["error_type"] == "OSError"
-    assert logged.extra["loopback_plugin"] == "vloopback:v2"
-    assert "error" not in logged.extra
-    full = logged.to_full_string()
-    assert "10.1.2.3" not in full and "ghp_leakme" not in full and "id_rsa" not in full
+    (enable_failed,), _ = warning.call_args_list[0]
+    (fell_back,), _ = warning.call_args_list[1]
+    assert str(enable_failed).startswith("Loopback plugin enable failed")
+    assert enable_failed.extra["error_type"] == "OSError"
+    assert enable_failed.extra["loopback_plugin"] == "vloopback:v2"
+    assert "error" not in enable_failed.extra
+    assert "enable error: OSError" in fell_back.extra["reason"]
+    for logged in (enable_failed, fell_back):
+        full = logged.to_full_string()
+        assert "10.1.2.3" not in full and "ghp_leakme" not in full and "id_rsa" not in full
 
 
 @pytest.mark.asyncio
@@ -611,6 +611,23 @@ async def test_create_local_volume_without_probe_keeps_the_per_command_path(dock
         "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
     )
     assert len(commands) == 2
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_already_exists(docker_service):
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            Mock(stdout="/var/lib/docker\n", stderr="", exit_status=0),
+            Mock(stdout="", stderr="Error response from daemon: plugin vloopback:v2 already exists", exit_status=1),
+            Mock(stdout="true\n", stderr="", exit_status=0),
+        ]
+    )
+
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    assert ssh_client.run.await_count == 3
+    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
 
 
 # ---------------------------------------------------------------------------
@@ -638,11 +655,13 @@ class _TwoLoopbackPluginHost:
         *,
         plugins: dict[str, bool],
         volumes: dict[str, tuple[str, int]] | None = None,
-        install_fails: bool = False,
+        v2_install_fails: bool = False,
+        v2_enable_fails: bool = False,
     ):
         self.plugins = dict(plugins)  # plugin name -> enabled
         self.volumes = dict(volumes or {})  # volume name -> (driver, declared bytes)
-        self.install_fails = install_fails
+        self.v2_install_fails = v2_install_fails
+        self.v2_enable_fails = v2_enable_fails
         self.commands: list[str] = []
 
     def _state(self, command: str) -> str:
@@ -661,12 +680,15 @@ class _TwoLoopbackPluginHost:
         if command.startswith("( /usr/bin/docker plugin inspect"):
             return Mock(stdout=self._state(command) + "\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin install "):
-            if self.install_fails:
+            name = _docker_plugin_name(command.split("--alias ")[1].split()[0])
+            if self.v2_install_fails and name == _V2:
                 return Mock(stdout="", stderr="Error response from daemon: Get https://registry-1.docker.io/v2/: net/http: request canceled", exit_status=1)
-            self.plugins[_docker_plugin_name(command.split("--alias ")[1].split()[0])] = True
+            self.plugins[name] = True
             return Mock(stdout="Installed plugin\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin enable "):
             name = _docker_plugin_name(command.split()[-1])
+            if self.v2_enable_fails and name == _V2:
+                return Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1)
             if name in self.plugins:
                 self.plugins[name] = True
             return Mock(stdout=command.split()[-1] + "\n", stderr="", exit_status=0)
@@ -743,18 +765,73 @@ async def test_create_local_volume_skips_install_when_v2_is_enabled(docker_servi
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_fails_when_v2_install_fails_and_never_names_the_old_alias(
+async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_install_fails(
+    docker_service, monkeypatch
+):
+    from services import docker_service as docker_service_module
+
+    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, v2_install_fails=True)
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
+
+    await _rent_a_new_volume(docker_service, host)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.plugins == {_OLD: True}
+    assert not any("ashald" in command for command in host.commands)
+    (logged,), _ = warning.call_args
+    assert str(logged).startswith("Loopback plugin v2 unusable; creating this volume on the old plugin")
+    assert logged.extra["reason"].startswith("install exit 1, state absent: Error response from daemon")
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_cannot_be_enabled(docker_service):
+    host = _TwoLoopbackPluginHost(plugins={_OLD: True, _V2: False}, v2_enable_fails=True)
+
+    await _rent_a_new_volume(docker_service, host)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.plugins == {_OLD: True, _V2: False}
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_installs_the_old_plugin_as_main_does_when_v2_fails_and_old_is_absent(
     docker_service,
 ):
-    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, install_fails=True)
+    host = _TwoLoopbackPluginHost(plugins={}, v2_install_fails=True)
 
-    with pytest.raises(Exception, match="vloopback:v2"):
-        await _rent_a_new_volume(docker_service, host)
+    await _rent_a_new_volume(docker_service, host)
 
-    assert "volume_new" not in host.volumes
-    assert host.plugins == {_OLD: True}
+    installs = [command for command in host.commands if "plugin install" in command]
+    assert installs[1] == (
+        "/usr/bin/docker plugin install ashald/docker-volume-loopback "
+        "--alias vloopback --grant-all-permissions DATA_DIR=/var/lib/docker/loopback"
+    )
+    assert len(installs) == 2
+    assert host.volumes["volume_new"][0] == _OLD
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_enables_a_disabled_old_plugin_as_main_does_when_v2_fails(docker_service):
+    host = _TwoLoopbackPluginHost(plugins={_OLD: False}, v2_install_fails=True)
+
+    await _rent_a_new_volume(docker_service, host)
+
+    assert "/usr/bin/docker plugin enable vloopback" in host.commands
+    assert sum("plugin install" in command for command in host.commands) == 1
+    assert host.volumes["volume_new"][0] == _OLD
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_with_v2_enabled_never_names_a_disabled_old_plugin(docker_service):
+    host = _TwoLoopbackPluginHost(plugins={_OLD: False, _V2: True})
+
+    await _rent_a_new_volume(docker_service, host)
+
     named = {alias for command in host.plugin_commands() for alias in _LOOPBACK_ALIAS_RE.findall(command)}
     assert named == {_V2}
+    assert host.plugins == {_OLD: False, _V2: True}
+    assert host.volumes["volume_new"][0] == _V2
 
 
 @pytest.mark.asyncio
