@@ -333,7 +333,7 @@ async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "events,ok,reason",
+    "events,ok,reason,extra",
     [
         (
             [
@@ -342,23 +342,25 @@ async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, 
             ],
             True,
             "workload",
+            {},
         ),
         (
             [_event(VERIFYX, "VERIFYX_OK"), _event(CAPABILITY, "GPU_VERIFY_SKIPPED_RENTED")],
             True,
             "workload",
+            {},
         ),
-        ([], True, "no_gpu_step_ran"),
-        ([_event("gpu.count", "GPU_COUNT_MISMATCH")], False, "no_gpu_step_ran"),
+        ([], True, "no_gpu_step_ran", {}),
+        ([_event("gpu.count", "GPU_COUNT_MISMATCH")], False, "no_gpu_step_ran", {}),
         (PASSED, True, "workload", {"rented": True}),
         (PASSED, True, "no_budget", {"deadline_s": 59.0}),
     ],
 )
 async def test_no_gpu_work_where_today_ran_none(
-    keypair, monkeypatch, verifyx_service, events, ok, reason, extra=None
+    keypair, monkeypatch, verifyx_service, events, ok, reason, extra
 ):
     fake = FakeLiumd()
-    extra = dict(extra or {})
+    extra = dict(extra)
     state = None
     if extra.pop("rented", False):
         pod = {"pod_id": "p1", "container_name": "c1"}
