@@ -1415,6 +1415,11 @@ def _create_docker_api_client_with_rental_ssh_adapter(
 
 # The Docker SDK SSH session idles through a long build, so it needs a keepalive.
 RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+# Docker answers exec start / attach with these, then streams raw bytes on the same channel.
+_DOCKER_RAW_STREAM_CONTENT_TYPES = (
+    "application/vnd.docker.raw-stream",
+    "application/vnd.docker.multiplexed-stream",
+)
 
 
 def _build_rental_ssh_http_adapter_class(
@@ -1432,6 +1437,9 @@ def _build_rental_ssh_http_adapter_class(
         gone both end in `'NoneType' object has no attribute 'settimeout'` or a bare `EOFError`.
         Here they raise `RentalDockerTransportDropped`.
         """
+
+        # set while Docker has taken the channel over as a raw stream (exec start, attach)
+        hijacked = False
 
         def connect(self):
             transport = self.ssh_transport
@@ -1452,17 +1460,40 @@ def _build_rental_ssh_http_adapter_class(
             channel.settimeout(self.timeout)
             channel.exec_command("docker system dial-stdio")
             self.sock = channel
+            self.hijacked = False
 
         def getresponse(self):
             if self.sock is None:
                 raise RentalDockerTransportDropped(
                     "the Docker API channel closed before the daemon's answer was read"
                 )
-            return super().getresponse()
+            response = super().getresponse()
+            self.hijacked = response.status == 101 or response.headers.get(
+                "Content-Type", ""
+            ).startswith(_DOCKER_RAW_STREAM_CONTENT_TYPES)
+            return response
+
+        def channel_is_reusable(self) -> bool:
+            # the next call must not land in a raw stream, a closed channel or unread bytes
+            channel = self.sock
+            return not (
+                self.hijacked or channel.closed or channel.eof_received or channel.recv_ready()
+            )
 
     class RentalSSHConnectionPool(SSHConnectionPool):
         def _new_conn(self):
             return RentalSSHConnection(self.ssh_transport, self.timeout, self.ssh_host)
+
+        def _get_conn(self, timeout):
+            # docker-py's override skips urllib3's dropped-connection check (it would call fileno()
+            # on the channel); with one pool for every call, a pooled channel is checked here
+            conn = super()._get_conn(timeout)
+            if conn.sock is None or conn.channel_is_reusable():
+                return conn
+            # a hijacked channel belongs to the stream's reader, who closes it
+            if not conn.hijacked:
+                conn.close()
+            return self._new_conn()
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
         def _connect(self) -> None:
@@ -1496,11 +1527,13 @@ def _build_rental_ssh_http_adapter_class(
             self.ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         def get_connection(self, url, proxies=None):
-            # upstream, minus the shell-out branch this adapter never takes, plus: a pool is
-            # built on a live transport (upstream reconnects only when there is none at all)
+            # upstream, minus the shell-out branch this adapter never takes, plus:
+            # - one pool per host, not per URL: upstream opened a channel and ran
+            #   `docker system dial-stdio` again for every new URL (3 round trips instead of 1);
+            # - a pool is built on a live transport (upstream reconnects only when there is none)
             with self.pools.lock:
-                pool = self.pools.get(url)
-                if pool:
+                pool = self.pools.get(self.ssh_host)
+                if pool and pool.ssh_transport is not None and pool.ssh_transport.is_active():
                     return pool
                 transport = self.ssh_client.get_transport()
                 if transport is None or not transport.is_active():
@@ -1511,7 +1544,7 @@ def _build_rental_ssh_http_adapter_class(
                     maxsize=self.max_pool_size,
                     host=self.ssh_host,
                 )
-                self.pools[url] = pool
+                self.pools[self.ssh_host] = pool
             return pool
 
         def reopen_transport(self) -> None:
