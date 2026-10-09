@@ -144,7 +144,10 @@ async def test_failing_cycle_leaves_legacy_and_other_records_unchanged(context_f
     await service.set_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, success=False)
     await service.clear_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, anchor_broken=True)
 
-    assert await _field(service, EXECUTOR) == json.loads(legacy)
+    # an anchored legacy record only gains the broken mark (as on main); nothing is imported into B's record
+    expected = json.loads(legacy) | ({"anchor_broken": True} if anchor else {})
+    assert await _field(service, EXECUTOR) == expected
+    assert await _field(service, verified_job_field(HOTKEY_B, EXECUTOR)) is None
     assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == json.loads(other)
 
 
