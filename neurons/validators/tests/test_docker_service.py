@@ -5227,19 +5227,14 @@ async def _repair_commands_for_a_volume_on(docker_service, driver: str, plugin_i
 
 
 @pytest.mark.asyncio
-async def test_repair_stale_vloopback_mountpoint_uses_the_old_plugin_id_for_an_old_volume(docker_service):
-    commands = await _repair_commands_for_a_volume_on(docker_service, "vloopback:latest", "oldplugin")
+@pytest.mark.parametrize("driver, plugin_id", [("vloopback:latest", "oldplugin"), ("vloopback:v2", "v2plugin")])
+async def test_repair_stale_vloopback_mountpoint_uses_the_plugin_id_of_the_volume_s_own_driver(
+    docker_service, driver, plugin_id
+):
+    commands = await _repair_commands_for_a_volume_on(docker_service, driver, plugin_id)
 
-    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:latest --format '{{.Id}}'"
-    assert "src=/var/lib/docker/plugins/oldplugin/propagated-mount," in commands[-1]
-
-
-@pytest.mark.asyncio
-async def test_repair_stale_vloopback_mountpoint_uses_the_v2_plugin_id_for_a_v2_volume(docker_service):
-    commands = await _repair_commands_for_a_volume_on(docker_service, "vloopback:v2", "v2plugin")
-
-    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:v2 --format '{{.Id}}'"
-    assert "src=/var/lib/docker/plugins/v2plugin/propagated-mount," in commands[-1]
+    assert commands[1] == f"/usr/bin/docker plugin inspect {driver} --format '{{{{.Id}}}}'"
+    assert f"src=/var/lib/docker/plugins/{plugin_id}/propagated-mount," in commands[-1]
 
 
 @pytest.mark.parametrize(

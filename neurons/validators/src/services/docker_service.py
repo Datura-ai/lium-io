@@ -566,6 +566,8 @@ class VolumeSizingResult:
 # `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
 # whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
 _LOOPBACK_PLUGIN_ALIAS = f"{_VLOOPBACK_DRIVER_PREFIX}:v2"
+# before merge it takes the published digest, `...:1.0.0-lium1@sha256:<digest>`: the docker CLI
+# installs a plugin by a digest reference (only `--alias` may not carry one)
 _LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
 # backing files on the host under DockerRootDir (the plugin sees the host's / at /srv), outside the
 # plugin rootfs, on the disk the sizing measures; machine_scrape.py carries the same name
@@ -577,6 +579,9 @@ _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
 # how much longer than the host's `timeout` the validator waits: for a connection that stops answering
 _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS = 10
 _PROBE_OUTPUT_LOG_CAP = 512
+# the volume host probe (with its df helper container) ends on the host by then; a probe that
+# does not answer returns None and the create takes the per-command path
+_VOLUME_HOST_PROBE_TIMEOUT_SECONDS = 30
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
 def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
@@ -1822,6 +1827,11 @@ async def _with_own_duration(
     return AnswerWithOwnDuration(answer, ProfilerStep.since(step_name, started_ms))
 
 
+class SshSessionMayStillBeTakenError(Exception):
+    """A timed-out channel whose open or close was not confirmed in time may still hold the host's
+    only SSH session (MaxSessions=1): no further command goes on this connection, the rent fails."""
+
+
 def _close_process_opened_late(opening: asyncio.Future) -> None:
     if not opening.cancelled() and opening.exception() is None:
         opening.result().close()
@@ -1830,9 +1840,11 @@ def _close_process_opened_late(opening: asyncio.Future) -> None:
 async def _close_channel_within(process: asyncssh.SSHClientProcess, timeout: float | None) -> None:
     # sshd keeps a closed channel's session while its command still runs (MaxSessions=1)
     process.close()
-    with contextlib.suppress(TimeoutError):
+    try:
         async with asyncio.timeout(timeout):
             await process.wait_closed()
+    except TimeoutError:
+        raise SshSessionMayStillBeTakenError(f"channel close not confirmed within {timeout} s") from None
 
 
 async def _run_closing_channel_on_timeout(
@@ -1840,7 +1852,8 @@ async def _run_closing_channel_on_timeout(
 ) -> asyncssh.SSHCompletedProcess:
     # asyncssh's timeout= bounds neither the channel open nor frees the channel when it fires;
     # closing it lets a host with MaxSessions=1 run the next command. The command's own timeout
-    # starts once its channel is open, as a host-side `timeout` does. Raises TimeoutError.
+    # starts once its channel is open, as a host-side `timeout` does. Raises TimeoutError once the
+    # channel is closed, SshSessionMayStillBeTakenError when that could not be confirmed.
     opening = asyncio.ensure_future(ssh_client.create_process(command))
     try:
         async with asyncio.timeout(timeout):
@@ -1851,7 +1864,10 @@ async def _run_closing_channel_on_timeout(
         done, _ = await asyncio.wait({opening}, timeout=timeout)
         if not done:
             opening.add_done_callback(_close_process_opened_late)
-        elif opening.exception() is None:
+            raise SshSessionMayStillBeTakenError(
+                f"channel open not answered within {2 * timeout} s"
+            ) from None
+        if opening.exception() is None:
             await _close_channel_within(opening.result(), timeout)
         raise
     try:
@@ -5503,9 +5519,8 @@ class DockerService:
         timeout: int,
         log_extra: dict,
     ) -> None:
-        """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
-        again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
-        at volume creation with a clear reason instead of Docker's create error."""
+        """`docker plugin enable` the installed-but-disabled v2 plugin, then read its state again.
+        Raises LoopbackPluginDisabledError when it is still not enabled: the caller falls back."""
         extra = {**log_extra, "loopback_plugin": _LOOPBACK_PLUGIN_ALIAS}
         try:
             # a timed-out enable or read must free its channel: the fallback runs next on it
@@ -5517,7 +5532,7 @@ class DockerService:
             state_result = await _run_with_host_timeout(
                 ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, timeout
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
             raise
         except Exception as exc:
             # typed fields only: an asyncssh error's text can carry the host's banner
@@ -5817,7 +5832,11 @@ class DockerService:
         """
         started = now_ms()
         try:
-            result = await ssh_client.run(_volume_host_probe_command(with_df=with_df))
+            result = await _run_with_host_timeout(
+                ssh_client,
+                _volume_host_probe_command(with_df=with_df),
+                _VOLUME_HOST_PROBE_TIMEOUT_SECONDS,
+            )
             probe = _parse_volume_host_probe(result.stdout or "", with_df=with_df)
         except asyncio.CancelledError:
             raise
