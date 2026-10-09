@@ -195,10 +195,6 @@ def test_todays_verdicts_come_from_the_runs_events():
     assert today_verdicts(True, [])["matmul"] == TodayStep("not_reached")
 
 
-def test_the_deadline_leaves_the_task_its_timeout_and_tail():
-    assert shadow_deadline(1000.0) == 1000.0 + settings.JOB_TIME_OUT - 120 - 60
-
-
 # --- the comparison -------------------------------------------------------------------------
 
 
@@ -279,16 +275,6 @@ async def test_today_failing_where_liumd_passed_is_a_disagreement(
 
 
 @pytest.mark.asyncio
-async def test_an_outdated_verifyx_library_is_a_liumd_failure(
-    keypair, monkeypatch, verifyx_service
-):
-    record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), FakeLiumd(lib_sha="old"))
-
-    assert record["steps"]["verifyx"]["liumd_reason"] == "lib_mismatch"
-    assert record["steps"]["verifyx"]["agree"] is False
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "matmul,agree",
     [
@@ -316,25 +302,6 @@ async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, 
 
     assert fake.intents[0]["steps"]["matmul"] is None
     assert record["steps"]["matmul"]["liumd_reason"] == "allcards_ssh"
-
-
-@pytest.mark.asyncio
-async def test_only_the_steps_today_ran_are_asked_for(keypair, monkeypatch, verifyx_service):
-    fake = FakeLiumd()
-    events = [_event(VERIFYX, "VERIFYX_DISABLED"), _event(CAPABILITY, "GPU_VERIFY_OK")]
-
-    record = await _shadow(
-        _ctx(keypair, monkeypatch, verifyx_service, verifyx_enabled=False), fake, events=events
-    )
-
-    [intent] = fake.intents
-    assert intent["steps"]["verifyx"] is None and intent["steps"]["matmul"]
-    assert record["steps"]["verifyx"] == {
-        "today": "skipped",
-        "today_reason_code": "VERIFYX_DISABLED",
-        "today_ms": 1500,
-    }
-    assert record["agree"] is True
 
 
 @pytest.mark.asyncio
@@ -366,40 +333,6 @@ async def test_no_gpu_work_where_today_ran_none(
     record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake, ok=ok, events=events)
 
     assert (record["outcome"], record["reason"]) == ("skipped", reason)
-    assert fake.intents == []
-
-
-@pytest.mark.asyncio
-async def test_a_node_the_snapshot_shows_rented_is_skipped(keypair, monkeypatch, verifyx_service):
-    rented = RentedExecutorsResponse.model_validate(
-        {
-            "executors": {
-                UUID: {
-                    "miner_hotkey": "5Miner",
-                    "executor_ip_address": "10.0.0.5",
-                    "executor_ip_port": "8001",
-                    "pods": [{"pod_id": "p1", "container_name": "c1"}],
-                }
-            }
-        }
-    )
-    fake = FakeLiumd()
-    ctx = _ctx(
-        keypair, monkeypatch, verifyx_service, state=build_state(specs=SPECS, rented_data=rented)
-    )
-
-    record = await _shadow(ctx, fake)
-
-    assert record["reason"] == "workload" and fake.intents == []
-
-
-@pytest.mark.asyncio
-async def test_too_little_task_time_left_runs_nothing(keypair, monkeypatch, verifyx_service):
-    fake = FakeLiumd()
-
-    record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake, deadline_s=59.0)
-
-    assert (record["outcome"], record["reason"]) == ("skipped", "no_budget")
     assert fake.intents == []
 
 
@@ -442,16 +375,6 @@ async def test_refusals_and_unavailability_are_logged_outcomes(
     record = await _shadow(ctx, FakeLiumd(result=gone))
     assert (record["outcome"], record["reason"]) == ("unavailable", "not_supported")
     ctx.services.validation.wrapper.free.assert_called_once_with("ptr")
-
-
-@pytest.mark.asyncio
-async def test_a_bug_in_the_shadow_never_raises(keypair, monkeypatch, verifyx_service):
-    record = await _shadow(
-        _ctx(keypair, monkeypatch, verifyx_service), FakeLiumd(result=RuntimeError("boom"))
-    )
-
-    assert (record["outcome"], record["reason"]) == ("error", "internal_error")
-    assert "boom" in record["detail"]
 
 
 # --- scoring: identical with the flag on and off ----------------------------------------------

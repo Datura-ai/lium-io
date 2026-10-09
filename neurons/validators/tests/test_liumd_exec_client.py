@@ -12,6 +12,7 @@ import pytest
 from datura.requests.validator_requests import VerifyXStep
 from services.liumd_exec_client import (
     LIUMD_COMMAND,
+    MAX_STDERR_BYTES,
     REFUSAL_ERRORS_BY_EXIT,
     LiumdExecClient,
     LiumdRefusal,
@@ -236,6 +237,17 @@ async def test_one_byte_over_the_cap_stops_reading_and_closes_the_channel(keypai
     assert process.closed
     # Read in 64 KiB chunks until one byte past the cap, never the 4 MiB behind it.
     assert process.stdout.reads == MAX_ANSWER_BYTES // (64 * 1024) + 1
+
+
+@pytest.mark.asyncio
+async def test_endless_stderr_is_cut_off_and_closes_the_channel(keypair, intent):
+    process = FakeProcess(_answer(intent), 0, stderr=b"x" * (MAX_STDERR_BYTES + 1))
+
+    with pytest.raises(LocalVerifyUnavailable) as err:
+        await _run(keypair, intent, FakeConnection(process))
+
+    assert err.value.reason == "malformed"
+    assert process.closed
 
 
 @pytest.mark.asyncio

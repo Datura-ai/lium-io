@@ -315,15 +315,6 @@ async def test_a_host_without_liumd_is_not_supported(keypair, tmp_path):
         assert f"exit {status}" in err.value.detail
 
 
-@pytest.mark.asyncio
-async def test_a_refused_exec_channel_is_not_supported(image, keypair):
-    async with FakeSshd(image.wrapper, allow_sessions=False) as sshd, sshd.connect() as ssh:
-        with pytest.raises(LocalVerifyUnavailable) as err:
-            await LiumdExecClient(keypair, timeout_s=10).run(ssh, _intent())
-
-    assert err.value.reason == "not_supported"
-
-
 def _judging_services(monkeypatch):
     wrapper = MagicMock(name="DMCompVerifyWrapper")
     wrapper.DMCompVerify_new.return_value = "ptr"

@@ -49,6 +49,7 @@ REFUSAL_ERRORS_BY_EXIT: dict[int, frozenset[str]] = {
 }
 NOT_SUPPORTED_EXITS = frozenset({126, 127})
 STDERR_TAIL_BYTES = 4 * 1024
+MAX_STDERR_BYTES = 256 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 
 
@@ -71,6 +72,7 @@ class _Finished:
     stdout: bytes
     oversized: bool
     stderr_tail: bytes
+    stderr_flood: bool = False
 
 
 async def _read_capped(reader, limit: int) -> tuple[bytes, bool]:
@@ -87,14 +89,20 @@ async def _read_capped(reader, limit: int) -> tuple[bytes, bool]:
             return b"".join(chunks)[:limit], True
 
 
-async def _drain_tail(reader, keep: int) -> bytes:
-    """Read `reader` to EOF, keeping the last `keep` bytes: the channel's flow control stalls the
-    remote side when a stream nobody reads fills its window."""
+async def _drain_tail(reader, keep: int, limit: int, on_flood) -> tuple[bytes, bool]:
+    """Read `reader`, keeping the last `keep` bytes and giving up past `limit` bytes in total
+    (`on_flood` is called then): the channel's flow control stalls the remote side when a stream
+    nobody reads fills its window, and the remote side is the provider's to write."""
     tail = b""
+    total = 0
     while True:
         chunk = await reader.read(READ_CHUNK_BYTES)
         if not chunk:
-            return tail
+            return tail, False
+        total += len(chunk)
+        if total > limit:
+            on_flood()
+            return tail, True
         tail = (tail + chunk)[-keep:]
 
 
@@ -141,16 +149,17 @@ class LiumdExecClient:
         try:
             process.stdin.write(json.dumps(signed).encode())
             process.stdin.write_eof()
-            stderr_task = asyncio.ensure_future(_drain_tail(process.stderr, STDERR_TAIL_BYTES))
+            stderr_task = asyncio.ensure_future(_drain_tail(process.stderr, STDERR_TAIL_BYTES, MAX_STDERR_BYTES, process.close)
+            )
             try:
                 stdout, oversized = await _read_capped(process.stdout, MAX_ANSWER_BYTES)
                 if oversized:
                     return _Finished(None, stdout, True, b"")
                 await process.wait_closed()
-                stderr_tail = await stderr_task
+                stderr_tail, flood = await stderr_task
             finally:
                 stderr_task.cancel()
-            return _Finished(process.exit_status, stdout, False, stderr_tail)
+            return _Finished(process.exit_status, stdout, False, stderr_tail, flood)
         except (asyncssh.Error, OSError, BrokenPipeError) as exc:
             raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         finally:
@@ -165,6 +174,10 @@ class LiumdExecClient:
         if finished.oversized:
             raise LocalVerifyUnavailable(
                 "malformed", f"answer longer than {MAX_ANSWER_BYTES} bytes"
+            )
+        if finished.stderr_flood:
+            raise LocalVerifyUnavailable(
+                "malformed", f"stderr longer than {MAX_STDERR_BYTES} bytes"
             )
         status = finished.exit_status
         if status is None:
