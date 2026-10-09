@@ -1670,6 +1670,30 @@ async def test_discarded_early_probe_gets_no_overlapped_row(svc_fixture, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc_fixture, monkeypatch):
+    # one SSH session per host (MaxSessions=1): the second probe must not open a channel beside the first
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    _slow_overlapped_operations(svc, monkeypatch)
+    probes_running: list[int] = []
+
+    async def probe_alone(*args, **kwargs):
+        probes_running.append(1)
+        assert len(probes_running) == 1, "a second volume probe started while the first still ran"
+        await asyncio.sleep(0.2)
+        probes_running.pop()
+        return None
+
+    svc.probe_volume_host = AsyncMock(side_effect=probe_alone)
+    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert svc.probe_volume_host.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_discarded_early_probe_whose_channel_may_hold_the_session_stops_the_create(
     svc_fixture, monkeypatch
 ):

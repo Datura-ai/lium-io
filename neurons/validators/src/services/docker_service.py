@@ -7952,14 +7952,10 @@ class DockerService:
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
                         else:
-                            # a discarded early probe that may have left the only SSH session
-                            # taken stops the create as the probe itself would
-                            if (
-                                early_volume_probe is not None
-                                and early_volume_probe.done()
-                                and not early_volume_probe.cancelled()
-                            ):
-                                early_volume_probe.result()
+                            # a discarded early probe ends (it is bounded) before the next one opens a
+                            # channel (MaxSessions=1), and stops the create as the probe itself would
+                            if early_volume_probe is not None and not early_volume_probe.cancelled():
+                                await early_volume_probe
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
                                 with_df=measures_host,
