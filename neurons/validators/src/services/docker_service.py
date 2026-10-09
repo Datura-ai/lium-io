@@ -572,11 +572,10 @@ _LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
 _LOOPBACK_PLUGIN_DATA_DIR_NAME = "vloopback-v2"
 _LOOPBACK_PLUGIN_STATE_DIR = "/srv/run/docker-volume-loopback-v2"
 # the first rent on every node pulls v2 (~37 MB) from Docker Hub; a pull that stops answering
-# must end in the fallback, not hold the rent: the old plugin's install was never on that path.
-# The host ends the install itself, so sshd frees its session (MaxSessions=1); the validator's own
-# deadline, past the host's kill, is for a connection that stops answering.
+# must end in the fallback, not hold the rent: the old plugin's install was never on that path
 _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
-_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS = _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS + 10
+# how much longer than the host's `timeout` the validator waits: for a connection that stops answering
+_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS = 10
 _PROBE_OUTPUT_LOG_CAP = 512
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
@@ -1850,6 +1849,20 @@ async def _run_closing_channel_on_timeout(
     except TimeoutError:
         await _close_channel_within(process, timeout)
         raise
+
+
+async def _run_with_host_timeout(
+    ssh_client: asyncssh.SSHClientConnection, command: str, host_timeout: float | None
+) -> asyncssh.SSHCompletedProcess:
+    # the host ends the command itself (exit 124), so sshd frees its session before the next
+    # command opens one (MaxSessions=1); without a timeout the command runs unbounded, as before
+    if not host_timeout:
+        return await _run_closing_channel_on_timeout(ssh_client, command, None)
+    return await _run_closing_channel_on_timeout(
+        ssh_client,
+        f"timeout -k 5 {host_timeout} sh -c {shlex.quote(command)}",
+        host_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
+    )
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -5484,17 +5497,15 @@ class DockerService:
         again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
         at volume creation with a clear reason instead of Docker's create error."""
         extra = {**log_extra, "loopback_plugin": loopback_plugin_alias}
-        enable_command = f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}"
         try:
-            # a timed-out enable must free its channel: the fallback runs next on this connection,
-            # and sshd frees it only once the enable has ended, so the host ends it first
-            result = await _run_closing_channel_on_timeout(
+            # a timed-out enable or read must free its channel: the fallback runs next on it
+            result = await _run_with_host_timeout(
                 ssh_client,
-                f"timeout -k 5 {timeout} {enable_command}" if timeout else enable_command,
-                timeout + 10 if timeout else None,
+                f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}",
+                timeout,
             )
-            state_result = await _run_closing_channel_on_timeout(
-                ssh_client, _loopback_plugin_state_command(loopback_plugin_alias), timeout or None
+            state_result = await _run_with_host_timeout(
+                ssh_client, _loopback_plugin_state_command(loopback_plugin_alias), timeout
             )
         except asyncio.CancelledError:
             raise
@@ -5621,7 +5632,6 @@ class DockerService:
                 )
                 state_dir_arg = shlex.quote(f"STATE_DIR={_LOOPBACK_PLUGIN_STATE_DIR}")
                 command = (
-                    f"timeout -k 5 {_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS} "
                     f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
                     f"--alias {loopback_plugin_arg} --grant-all-permissions "
                     f"{data_dir_arg} {state_dir_arg}"
@@ -5630,23 +5640,24 @@ class DockerService:
                 # part of the SDK migration scope. The user-controlled volume name is
                 # not used in this shell command; volume creation below is SDK-backed.
                 try:
-                    install_result = await _run_closing_channel_on_timeout(
-                        ssh_client, command, _LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS
+                    install_result = await _run_with_host_timeout(
+                        ssh_client, command, _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
                     )
                     install_outcome = f"install exit {install_result.exit_status}"
                     install_error = (install_result.stderr or install_result.stdout or "").strip()
                     install_failed = install_result.exit_status != 0
                 except TimeoutError:
                     install_outcome = (
-                        f"install timed out after {_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS} s"
+                        "install timed out after "
+                        f"{_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS} s"
                     )
                     install_error = ""
                     install_failed = True
                 if install_failed:
                     # without a probe an installed v2 fails the install with "already exists"
                     try:
-                        state_result = await _run_closing_channel_on_timeout(
-                            ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout or None
+                        state_result = await _run_with_host_timeout(
+                            ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout
                         )
                         v2_state = (state_result.stdout or "").strip()
                     except TimeoutError:

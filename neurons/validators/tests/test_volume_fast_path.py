@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
@@ -492,8 +493,8 @@ async def test_create_local_volume_installs_v2_with_host_data_dir_and_own_state_
     created = await _create_volume(docker_service, ssh_client, probe)
 
     assert ssh_client.run.await_count == 1
-    assert ssh_client.run.await_args.args[0] == (
-        "timeout -k 5 60 /usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
+    assert ssh_client.run.await_args.args[0] == "timeout -k 5 60 sh -c " + shlex.quote(
+        "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
         "--alias vloopback:v2 --grant-all-permissions "
         "DATA_DIR=/srv/data/docker/vloopback-v2 STATE_DIR=/srv/run/docker-volume-loopback-v2"
     )
@@ -527,9 +528,12 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
 
     calls = ssh_client.run.await_args_list
     assert [c.args[0] for c in calls] == [
-        "timeout -k 5 10 /usr/bin/docker plugin enable vloopback:v2",
-        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 2>/dev/null "
-        "|| echo absent) | tail -n 1",
+        "timeout -k 5 10 sh -c " + shlex.quote("/usr/bin/docker plugin enable vloopback:v2"),
+        "timeout -k 5 10 sh -c "
+        + shlex.quote(
+            "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 2>/dev/null "
+            "|| echo absent) | tail -n 1"
+        ),
     ]
     assert not any("plugin install" in c.args[0] for c in calls)
     assert created == [
@@ -615,7 +619,7 @@ async def test_create_local_volume_without_probe_keeps_the_per_command_path(dock
     commands = [c.args[0] for c in ssh_client.run.await_args_list]
     assert commands[0] == "/usr/bin/docker info --format '{{.DockerRootDir}}'"
     assert commands[1].startswith(
-        "timeout -k 5 60 /usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
+        "timeout -k 5 60 sh -c '/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
     )
     assert len(commands) == 2
 
@@ -657,6 +661,11 @@ def _docker_plugin_name(name: str) -> str:
     return name if ":" in name else f"{name}:latest"
 
 
+def _is_v2_state_read(command: str) -> bool:
+    # the state read alone, bare or under the host's `timeout`; the volume host probe carries one too
+    return not command.startswith("root=") and "plugin inspect" in command and _V2 in command
+
+
 class _TwoLoopbackPluginHost:
     """Both the SSH connection and the Docker SDK client of a host, answering like dockerd with the
     old `vloopback:latest` and the new `vloopback:v2` plugins: an untagged name is `:latest`, a
@@ -676,6 +685,7 @@ class _TwoLoopbackPluginHost:
         v2_state_channel_open_answer_seconds: float = 0,
         v2_state_command_seconds: float = 0,
         v2_enable_seconds: float = 0,
+        v2_state_read_seconds: float = 0,
         max_sessions: int | None = None,
     ):
         self.plugins = dict(plugins)  # plugin name -> enabled
@@ -689,6 +699,7 @@ class _TwoLoopbackPluginHost:
         self.v2_state_channel_open_answer_seconds = v2_state_channel_open_answer_seconds
         self.v2_state_command_seconds = v2_state_command_seconds
         self.v2_enable_seconds = v2_enable_seconds
+        self.v2_state_read_seconds = v2_state_read_seconds
         self.max_sessions = max_sessions
         self.open_channels = 0
         self.commands: list[str] = []
@@ -704,17 +715,9 @@ class _TwoLoopbackPluginHost:
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"
             )
-        if (
-            self.v2_state_channel_open_hangs
-            and command.startswith("( /usr/bin/docker plugin inspect")
-            and _V2 in command
-        ):
+        if self.v2_state_channel_open_hangs and _is_v2_state_read(command):
             await asyncio.Event().wait()
-        if (
-            self.v2_state_channel_open_answer_seconds
-            and command.startswith("( /usr/bin/docker plugin inspect")
-            and _V2 in command
-        ):
+        if self.v2_state_channel_open_answer_seconds and _is_v2_state_read(command):
             # sshd takes the session at once and its confirmation comes late; a cancelled
             # wait leaves the session taken, as asyncssh opens the channel anyway
             self.open_channels += 1
@@ -739,12 +742,19 @@ class _TwoLoopbackPluginHost:
         bounded = re.match(r"timeout -k 5 (\S+) (.*)", command)
         if bounded:
             host_timeout, command = float(bounded.group(1)), bounded.group(2)
+            if command.startswith("sh -c "):
+                command = shlex.split(command)[2]
         if command.startswith("root="):  # the volume host probe
             lines = ["ROOT\t/var/lib/docker"]
             lines += [f"VOL\t{name}\t{driver}" for name, (driver, _) in self.volumes.items()]
             lines += ["VOLS\t0", f"PLUGIN\t{self._state(command)}"]
             return Mock(stdout="\n".join(lines) + "\n", stderr="", exit_status=0)
         if command.startswith("( /usr/bin/docker plugin inspect"):
+            if self.v2_state_read_seconds and _V2 in command:
+                if host_timeout is not None and self.v2_state_read_seconds > host_timeout:
+                    await asyncio.sleep(host_timeout)
+                    return Mock(stdout="", stderr="", exit_status=124)
+                await asyncio.sleep(self.v2_state_read_seconds)
             return Mock(stdout=self._state(command) + "\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin install "):
             name = _docker_plugin_name(command.split("--alias ")[1].split()[0])
@@ -914,7 +924,7 @@ async def test_create_local_volume_falls_back_to_the_old_plugin_when_the_v2_inst
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
     monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS", 2)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 2)
 
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host), timeout=5)
 
@@ -939,7 +949,7 @@ async def test_create_local_volume_waits_for_the_host_side_install_timeout_after
         max_sessions=1,
     )
     monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS", 0.4)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.2)
 
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host), timeout=5)
 
@@ -955,7 +965,8 @@ async def test_create_local_volume_falls_back_and_frees_the_channel_when_the_v2_
     host = _TwoLoopbackPluginHost(plugins={_OLD: True}, v2_install_answer_lost=True, max_sessions=1)
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
-    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.025)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.025)
 
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host), timeout=5)
 
@@ -974,6 +985,7 @@ async def test_create_local_volume_falls_back_when_the_v2_state_read_after_a_hun
         plugins={_OLD: True}, v2_install_hangs=True, v2_state_channel_open_hangs=True
     )
     monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
 
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.05), timeout=5)
 
@@ -982,8 +994,11 @@ async def test_create_local_volume_falls_back_when_the_v2_state_read_after_a_hun
 
 @pytest.mark.asyncio
 async def test_create_local_volume_falls_back_after_a_late_v2_state_channel_open_frees_its_session(
-    docker_service,
+    docker_service, monkeypatch
 ):
+    from services import docker_service as docker_service_module
+
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
     host = _TwoLoopbackPluginHost(
         plugins={_OLD: True},
         v2_install_fails=True,
@@ -999,8 +1014,11 @@ async def test_create_local_volume_falls_back_after_a_late_v2_state_channel_open
 
 @pytest.mark.asyncio
 async def test_create_local_volume_falls_back_once_a_late_v2_state_channel_s_command_has_ended(
-    docker_service,
+    docker_service, monkeypatch
 ):
+    from services import docker_service as docker_service_module
+
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
     # the open answers within the second timeout, its inspect already running: sshd frees the
     # MaxSessions=1 session only when that ends, so the fallback must wait for the close
     host = _TwoLoopbackPluginHost(
@@ -1047,6 +1065,28 @@ async def test_create_local_volume_falls_back_when_the_v2_enable_hangs_past_twic
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "plugins, v2_install_fails",
+    [
+        ({_OLD: True}, True),  # the read after a failed install
+        ({_OLD: True, _V2: False}, False),  # the read after the enable
+    ],
+)
+async def test_create_local_volume_falls_back_when_a_v2_state_read_hangs_past_twice_its_timeout(
+    docker_service, plugins, v2_install_fails
+):
+    # sshd keeps the session while the inspect runs: only the host ending it frees the session
+    host = _TwoLoopbackPluginHost(
+        plugins=plugins, v2_install_fails=v2_install_fails, v2_state_read_seconds=60, max_sessions=1
+    )
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.2), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.open_channels == 0
+
+
+@pytest.mark.asyncio
 async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_cannot_be_enabled(docker_service):
     host = _TwoLoopbackPluginHost(plugins={_OLD: True, _V2: False}, v2_enable_fails=True)
 
@@ -1079,7 +1119,7 @@ async def test_create_local_volume_enables_a_disabled_old_plugin_as_main_does_wh
 
     await _rent_a_new_volume(docker_service, host)
 
-    assert "timeout -k 5 10 /usr/bin/docker plugin enable vloopback" in host.commands
+    assert "timeout -k 5 10 sh -c '/usr/bin/docker plugin enable vloopback'" in host.commands
     assert sum("plugin install" in command for command in host.commands) == 1
     assert host.volumes["volume_new"][0] == _OLD
 
