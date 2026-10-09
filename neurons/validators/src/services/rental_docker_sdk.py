@@ -290,7 +290,7 @@ class ContainerRunSpec:
     device_requests: tuple[GpuDeviceRequest, ...] = ()
     cpu_count: int | None = None
     memory_gb: int | None = None
-    # --memory-swap; equal to memory_gb means the container gets no swap (DAH-3798)
+    # --memory-swap; equal to memory_gb means the container gets no swap
     memory_swap_gb: int | None = None
     oom_score_adj: int | None = None
     storage_limit_gb: int | None = None

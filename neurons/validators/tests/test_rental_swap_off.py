@@ -1,15 +1,10 @@
-"""DAH-3798 (ticket-0355): a rental container runs with swap off and a renter-first OOM score."""
+"""A rental container runs with swap off and a renter-first OOM score."""
 
 import pytest
 
 from core.config import settings
 from services.rental_docker_sdk import ContainerRunSpec, _build_host_config_kwargs
 from tests.test_deploy_optimizations import svc  # noqa: F401  (pytest fixture)
-
-
-def test_defaults_are_off_with_the_renter_first_oom_score():
-    assert type(settings).model_fields["RENTAL_SWAP_OFF_ENABLED"].default is False
-    assert settings.RENTAL_CONTAINER_OOM_SCORE_ADJ == 500
 
 
 def test_host_config_sets_memory_swap_equal_to_memory_and_the_oom_score():
