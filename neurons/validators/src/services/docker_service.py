@@ -5652,7 +5652,8 @@ class DockerService:
                         ssh_client, requested_timeout, log_extra, str(exc)
                     )
             elif not docker_root_dir.startswith("/"):
-                # DATA_DIR is fixed at install: without the data root it would be the host's root disk for good
+                # The validator sets DATA_DIR only at install; without a known Docker data root,
+                # backing files could remain on the host's root disk until manually reconfigured.
                 if await self._get_loopback_v2_state(ssh_client, requested_timeout) != "true":
                     loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
                         ssh_client, requested_timeout, log_extra, f"Docker data root unknown: {docker_root_dir!r}"
