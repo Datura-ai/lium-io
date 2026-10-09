@@ -26,7 +26,6 @@ from services.task.liumd_shadow import (
     LIUMD_SHADOW_EVENT,
     TodayStep,
     run_liumd_shadow,
-    shadow_deadline,
     today_verdicts,
 )
 from services.task.models import JobResult
@@ -78,10 +77,9 @@ class FakeLiumd:
     """`LiumdExecClient` answering as the binary does, per step as told."""
 
     def __init__(
-        self, *, matmul_uuid="challenge", verifyx_ok=True, lib_sha="lib-sha", result=None, matmul=None
+        self, *, verifyx_ok=True, lib_sha="lib-sha", result=None, matmul=None
     ):
         self.matmul = matmul  # a dict replacing the matmul step's reply
-        self.matmul_uuid = matmul_uuid
         self.verifyx_ok = verifyx_ok
         self.lib_sha = lib_sha
         self.result = result
