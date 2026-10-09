@@ -699,12 +699,14 @@ async def test_run_with_host_timeout_frees_the_channel_or_stops_the_create(
     assert channel.close.called is (outcome is not None)
 
 
-def _plugin_host(*, v2_state: str = "absent", old_state: str = "true", install: str = "fails") -> Mock:
+def _plugin_host(
+    *, v2_state: str = "absent", old_state: str = "true", install: str = "fails", docker_root: str = "/var/lib/docker"
+) -> Mock:
     # the host's docker through ssh: a v2 install or enable that fails (or never answers), and the plugin states
     async def answer(command: str):
         command = shlex.split(command)[-1] if command.startswith("timeout -k 5 ") else command
         if "docker info" in command:
-            return Mock(stdout="/var/lib/docker\n", stderr="", exit_status=0)
+            return Mock(stdout=f"{docker_root}\n", stderr="", exit_status=0)
         if "plugin inspect" in command:
             state = v2_state if "vloopback:v2" in command else old_state
             if state == "unreadable":
@@ -772,6 +774,19 @@ async def test_create_local_volume_fails_naming_both_and_never_installs_or_enabl
     assert all("vloopback:v2" in command for command in commands if "plugin install" in command)
     assert not any("plugin enable" in command for command in commands)
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("v2_state, old_state, driver", [("true", "absent", "vloopback:v2"), ("absent", "true", "vloopback")])
+async def test_create_local_volume_without_a_docker_data_root_never_installs_v2(
+    docker_service, v2_state, old_state, driver
+):
+    ssh_client = _plugin_host(v2_state=v2_state, old_state=old_state, docker_root="")
+
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == [driver]
+    assert not any("plugin install" in call.args[0] for call in ssh_client.run.await_args_list)
 
 
 @pytest.mark.asyncio

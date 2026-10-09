@@ -5595,6 +5595,15 @@ class DockerService:
         )
         return old_plugin_alias
 
+    @staticmethod
+    async def _get_loopback_v2_state(ssh_client: asyncssh.SSHClientConnection, requested_timeout: int) -> str:
+        # `plugin inspect` output of v2 ("true", "false", empty when absent), "unknown" when the read timed out
+        try:
+            state_result = await _run_with_host_timeout(ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout)
+        except TimeoutError:
+            return "unknown"
+        return (state_result.stdout or "").strip()
+
     async def create_local_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -5642,6 +5651,12 @@ class DockerService:
                     loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
                         ssh_client, requested_timeout, log_extra, str(exc)
                     )
+            elif not docker_root_dir.startswith("/"):
+                # DATA_DIR is fixed at install: without the data root it would be the host's root disk for good
+                if await self._get_loopback_v2_state(ssh_client, requested_timeout) != "true":
+                    loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
+                        ssh_client, requested_timeout, log_extra, f"Docker data root unknown: {docker_root_dir!r}"
+                    )
             else:
                 loopback_plugin_arg = shlex.quote(loopback_plugin_name)
                 data_dir_arg = shlex.quote(
@@ -5672,13 +5687,7 @@ class DockerService:
                     install_failed = True
                 if install_failed:
                     # without a probe an installed v2 fails the install with "already exists"
-                    try:
-                        state_result = await _run_with_host_timeout(
-                            ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout
-                        )
-                        v2_state = (state_result.stdout or "").strip()
-                    except TimeoutError:
-                        v2_state = "unknown"
+                    v2_state = await self._get_loopback_v2_state(ssh_client, requested_timeout)
                     if v2_state != "true":
                         loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
                             ssh_client,
