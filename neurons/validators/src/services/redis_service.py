@@ -584,7 +584,8 @@ class RedisService:
             data[GPU_ANCHOR_BROKEN_KEY] = True
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
-        if success:
+        if success and ":" not in executor_id:
+            # an id with ":" is never a uuid-only field; it could name another hotkey's record
             await self.hdel(VERIFIED_JOB_COUNT_KEY, executor_id)
 
     async def clear_verified_job_info(
@@ -599,7 +600,13 @@ class RedisService:
         spec = prev_info.get('spec', '')
         uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
-        if not prev_info.get(LEGACY_FALLBACK_KEY):
+        if prev_info.get(LEGACY_FALLBACK_KEY):
+            if anchor_broken and not prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+                # keep main's stickiness: mark the uuid-only record itself, import nothing into this hotkey's record
+                legacy = {k: v for k, v in prev_info.items() if k != LEGACY_FALLBACK_KEY}
+                legacy[GPU_ANCHOR_BROKEN_KEY] = True
+                await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(legacy))
+        else:
             data = {
                 "count": 0,
                 "failed": 0,
@@ -636,6 +643,8 @@ class RedisService:
         if data:
             return json.loads(data)
 
+        if ":" in executor_id:
+            return {}  # uuid-only fields never contain ":"; such an id would read another hotkey's record
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
         if not data:
             return {}
