@@ -519,7 +519,8 @@ async def test_create_local_volume_with_plugin_absent_still_installs_it(docker_s
 
     assert ssh_client.run.await_count == 1
     assert ssh_client.run.await_args.args[0] == _bounded(
-        "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
+        "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1"
+        "@sha256:99eacc306478ae5d03188474d07973078b66109077caa49618c57da211a71309 "
         "--alias vloopback:v2 --grant-all-permissions "
         "DATA_DIR=/srv/data/docker/vloopback-v2 STATE_DIR=/srv/run/docker-volume-loopback-v2",
         60,

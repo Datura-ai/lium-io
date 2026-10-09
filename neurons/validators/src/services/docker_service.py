@@ -67,6 +67,7 @@ from payload_models.payloads import (
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
     EDIT_PARKED_SUFFIX,
+    LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
@@ -565,10 +566,12 @@ class VolumeSizingResult:
 # New volumes go to a second plugin installed beside the old one under the same name with a tag:
 # `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
 # whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
-_LOOPBACK_PLUGIN_ALIAS = f"{_VLOOPBACK_DRIVER_PREFIX}:v2"
-# before merge it takes the published digest, `...:1.0.0-lium1@sha256:<digest>`: the docker CLI
-# installs a plugin by a digest reference (only `--alias` may not carry one)
-_LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
+_LOOPBACK_PLUGIN_ALIAS = LOOPBACK_PLUGIN_ALIAS
+# pinned by digest: the docker CLI installs a plugin by a tag+digest reference (only `--alias` may not carry one)
+_LOOPBACK_PLUGIN_IMAGE = (
+    "daturaai/docker-volume-loopback:1.0.0-lium1"
+    "@sha256:99eacc306478ae5d03188474d07973078b66109077caa49618c57da211a71309"
+)
 # backing files on the host under DockerRootDir (the plugin sees the host's / at /srv), outside the
 # plugin rootfs, on the disk the sizing measures; machine_scrape.py carries the same name
 _LOOPBACK_PLUGIN_DATA_DIR_NAME = "vloopback-v2"
