@@ -186,6 +186,16 @@ async def test_post_success(reset_session, client):
 
 
 @pytest.mark.asyncio
+async def test_check_executor_health_sends_loopback_plugin_only_when_given(client):
+    with patch.object(client, "post", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, loopback_plugin="vloopback:v2")
+
+    assert "loopback_plugin" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["loopback_plugin"] == "vloopback:v2"
+
+
+@pytest.mark.asyncio
 async def test_url_construction(reset_session, client):
     response_data = {"data": "test", "count": 42}
     mock_response = create_mock_response(200, response_data)

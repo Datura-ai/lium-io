@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -21,7 +22,8 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
+import services.docker_service as docker_service_module
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -629,6 +631,29 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
         "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
         "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
     ]
+
+
+def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_removed_or_reconfigured():
+    # disable, rm, set or upgrade on a loopback plugin loses every volume whose backing file is in its rootfs
+    source = open(docker_service_module.__file__).read()
+
+    targets = re.findall(r"""docker plugin (?:disable|rm|remove|set|upgrade|push|create) ([^\s"']+)""", source)
+
+    assert set(targets) == {"{plugin_alias}"}
+    installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
+    assert set(installed_or_enabled) == {
+        "{_LOOPBACK_PLUGIN_IMAGE}",
+        "{S3FS_PLUGIN_IMAGE}",
+        "{shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}",
+        "{plugin_alias}",
+        "{LEGACY_S3FS_PLUGIN_ALIAS}",
+    }
+    assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
+
+
+@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc"])
+def test_s3fs_plugin_alias_never_names_a_loopback_plugin(volume_name):
+    assert not _is_vloopback_driver(_s3fs_plugin_alias(volume_name))
 
 
 @pytest.mark.asyncio

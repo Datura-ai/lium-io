@@ -43,6 +43,7 @@ from services import nvidia_devices as nd
 from services.docker_service import (
     DockerService,
     _ENCRYPTED_VOLUME_IMAGE_LABEL,
+    SshSessionMayStillBeTakenError,
     VolumeHostProbe,
     _remove_and_list_containers_command,
 )
@@ -1666,6 +1667,32 @@ async def test_discarded_early_probe_gets_no_overlapped_row(svc_fixture, monkeyp
         "GPU power restore (parallel)",
         "Prerun host probe (parallel)",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_error", [None, SshSessionMayStillBeTakenError("channel open not answered")])
+async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc_fixture, monkeypatch, probe_error):
+    # one SSH session per host (MaxSessions=1): the second probe must not open a channel beside the first
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    _slow_overlapped_operations(svc, monkeypatch)
+    probes_running: list[int] = []
+
+    async def probe_alone(*args, **kwargs):
+        assert not probes_running, "a second volume probe started while the first still ran"
+        probes_running.append(1)
+        await asyncio.sleep(0.2)
+        probes_running.pop()
+        if probe_error:
+            raise probe_error
+
+    svc.probe_volume_host = AsyncMock(side_effect=probe_alone)
+    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == ("FailedContainerRequest" if probe_error else "ContainerCreated"), getattr(result, "msg", "")
+    assert svc.probe_volume_host.await_count == (1 if probe_error else 2)
 
 
 @pytest.fixture

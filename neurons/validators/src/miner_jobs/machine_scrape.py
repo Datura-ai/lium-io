@@ -648,6 +648,8 @@ DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
 VLOOPBACK_DRIVER_PREFIX = "vloopback"
+# the v2 plugin's DATA_DIR on the host, under DockerRootDir: docker_service._LOOPBACK_PLUGIN_DATA_DIR_NAME
+VLOOPBACK_V2_DATA_DIR_NAME = "vloopback-v2"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -696,6 +698,10 @@ def get_vloopback_volume_bytes(docker_root_dir):
     data_dirs = glob.glob(
         f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
     )
+    # the v2 plugin writes its DATA_DIR on the host itself, outside any plugin rootfs
+    v2_data_dir = f"/proc/1/root{docker_root_dir}/{VLOOPBACK_V2_DATA_DIR_NAME}"
+    if os.path.isdir(v2_data_dir):
+        data_dirs.append(v2_data_dir)
     if not data_dirs:
         # every volume would be counted as 0 and the breakdown would silently under-report by
         # terabytes; fail like the rest of the docker half so the miss lands in an error key

@@ -254,6 +254,24 @@ async def test_create_volume_retry_refuses_a_same_name_volume_on_another_driver(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_driver, adopted", [("vloopback:v2", False), ("vloopback", True)])
+async def test_adopt_takes_a_same_name_volume_only_from_the_requested_plugin_tag(requested_driver, adopted):
+    # `vloopback` is `vloopback:latest`, the old plugin; `vloopback:v2` is another plugin
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_volume_errors = [EOFError()]
+    api.existing_volumes["volume_p1"] = {"Name": "volume_p1", "Driver": "vloopback:latest"}
+    created = _client(api).create_volume(volume_name="volume_p1", driver=requested_driver, driver_opts={"size": "10g"})
+
+    if adopted:
+        await created
+    else:
+        with pytest.raises(RentalDockerOperationError, match="already exists on driver 'vloopback:latest'"):
+            await created
+
+    assert api.calls == ["create_volume", "inspect_volume"]
+
+
+@pytest.mark.asyncio
 async def test_create_volume_flag_off_fails_the_first_time_and_never_reopens():
     adapter = _FakeAdapter()
     api = _FakeApiClient(adapter=adapter)
