@@ -1,5 +1,5 @@
 """`LiumdExecClient`'s exit-status mapping, bounds and exec request,
-against a scripted asyncssh process. The binary itself answers in test_liumd_exec_e2e.py."""
+against a scripted asyncssh process."""
 
 from __future__ import annotations
 
