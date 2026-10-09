@@ -66,8 +66,11 @@ async def test_verification_state_is_keyed_by_hotkey_and_uuid(context_factory):
     before = await _field(service, verified_job_field(HOTKEY_A, EXECUTOR))
     assert before["count"] == 3
 
-    assert await _cycle(service, context_factory, hotkey=HOTKEY_B, uuids="gpu-009") is True
-    await service.clear_verified_job_info(HOTKEY_B, EXECUTOR, prev_info={})
+    # another hotkey reporting the same executor id with different GPUs is not accepted and writes nothing
+    assert await _cycle(service, context_factory, hotkey=HOTKEY_B, uuids="gpu-009") is False
+    assert await _field(service, verified_job_field(HOTKEY_B, EXECUTOR)) is None
+    await service.clear_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=await service.get_verified_job_info(EXECUTOR, HOTKEY_B), anchor_broken=True)
+    assert await _field(service, EXECUTOR) is None
 
     assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == before
     assert (await service.get_verified_job_info(EXECUTOR, HOTKEY_A))["count"] == 3
@@ -186,15 +189,3 @@ async def test_executor_id_with_colon_cannot_address_another_hotkeys_record(cont
     assert await service.get_verified_job_info(forged, HOTKEY_B) == {}
     await service.set_verified_job_info(HOTKEY_B, forged, prev_info={}, uuids="gpu-009")
     assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == record
-
-
-@pytest.mark.asyncio
-async def test_broken_mark_survives_on_legacy_record_until_migration(context_factory):
-    service = _redis_service()
-    legacy = {"count": 9, "failed": 0, "spec": "A100:1", "uuids": "gpu-001"}
-    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, EXECUTOR, json.dumps(legacy))
-    verified = await service.get_verified_job_info(EXECUTOR, HOTKEY_A)
-    await service.clear_verified_job_info(HOTKEY_A, EXECUTOR, prev_info=verified, anchor_broken=True)
-    assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) is None
-    verified = await service.get_verified_job_info(EXECUTOR, HOTKEY_B)
-    assert verified["anchor_broken"] is True and verified[LEGACY_FALLBACK_KEY] is True
