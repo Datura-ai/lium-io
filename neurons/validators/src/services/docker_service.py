@@ -571,6 +571,9 @@ _LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
 # plugin rootfs, on the disk the sizing measures; machine_scrape.py carries the same name
 _LOOPBACK_PLUGIN_DATA_DIR_NAME = "vloopback-v2"
 _LOOPBACK_PLUGIN_STATE_DIR = "/srv/run/docker-volume-loopback-v2"
+# the first rent on every node pulls v2 (~37 MB) from Docker Hub; a pull that stops answering
+# must end in the fallback, not hold the rent: the old plugin's install was never on that path
+_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
 _PROBE_OUTPUT_LOG_CAP = 512
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
@@ -5578,19 +5581,31 @@ class DockerService:
                 # TODO: migrate Docker plugin management if/when plugin setup becomes
                 # part of the SDK migration scope. The user-controlled volume name is
                 # not used in this shell command; volume creation below is SDK-backed.
-                install_result = await ssh_client.run(command)
-                if install_result.exit_status != 0:
+                try:
+                    install_result = await asyncio.wait_for(
+                        ssh_client.run(command), timeout=_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
+                    )
+                    install_outcome = f"install exit {install_result.exit_status}"
+                    install_error = (install_result.stderr or install_result.stdout or "").strip()
+                    install_failed = install_result.exit_status != 0
+                except asyncio.TimeoutError:
+                    install_outcome = (
+                        f"install timed out after {_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS} s"
+                    )
+                    install_error = ""
+                    install_failed = True
+                if install_failed:
                     # without a probe an installed v2 fails the install with "already exists"
-                    state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND)
+                    run_kwargs = {"timeout": requested_timeout} if requested_timeout else {}
+                    state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
                     v2_state = (state_result.stdout or "").strip()
                     if v2_state != "true":
-                        install_error = (install_result.stderr or install_result.stdout or "").strip()
                         loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
                             ssh_client,
                             docker_root_dir,
                             requested_timeout,
                             log_extra,
-                            f"install exit {install_result.exit_status}, state {v2_state or 'unknown'}: "
+                            f"{install_outcome}, state {v2_state or 'unknown'}: "
                             f"{install_error[:_PROBE_OUTPUT_LOG_CAP]}",
                         )
 

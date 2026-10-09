@@ -657,11 +657,13 @@ class _TwoLoopbackPluginHost:
         volumes: dict[str, tuple[str, int]] | None = None,
         v2_install_fails: bool = False,
         v2_enable_fails: bool = False,
+        v2_install_hangs: bool = False,
     ):
         self.plugins = dict(plugins)  # plugin name -> enabled
         self.volumes = dict(volumes or {})  # volume name -> (driver, declared bytes)
         self.v2_install_fails = v2_install_fails
         self.v2_enable_fails = v2_enable_fails
+        self.v2_install_hangs = v2_install_hangs
         self.commands: list[str] = []
 
     def _state(self, command: str) -> str:
@@ -681,6 +683,8 @@ class _TwoLoopbackPluginHost:
             return Mock(stdout=self._state(command) + "\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin install "):
             name = _docker_plugin_name(command.split("--alias ")[1].split()[0])
+            if self.v2_install_hangs and name == _V2:
+                await asyncio.Event().wait()  # a pull from a registry that stopped answering
             if self.v2_install_fails and name == _V2:
                 return Mock(stdout="", stderr="Error response from daemon: Get https://registry-1.docker.io/v2/: net/http: request canceled", exit_status=1)
             self.plugins[name] = True
@@ -782,6 +786,25 @@ async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_install_
     (logged,), _ = warning.call_args
     assert str(logged).startswith("Loopback plugin v2 unusable; creating this volume on the old plugin")
     assert logged.extra["reason"].startswith("install exit 1, state absent: Error response from daemon")
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_falls_back_to_the_old_plugin_when_the_v2_install_hangs(
+    docker_service, monkeypatch
+):
+    from services import docker_service as docker_service_module
+
+    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, v2_install_hangs=True)
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.plugins == {_OLD: True}
+    (logged,), _ = warning.call_args
+    assert logged.extra["reason"].startswith("install timed out after 0.05 s, state absent")
 
 
 @pytest.mark.asyncio
