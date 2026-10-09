@@ -98,6 +98,26 @@ def test_a_container_that_exits_between_stats_and_ps_voids_the_host_reading():
     assert data["docker_containers"][0]["each_cpu_percent"] == 158.0
 
 
+def test_a_container_that_vanishes_during_inspect_is_skipped_and_voids_the_host_reading():
+    stats = f"{RENTER[:12]}|158.00%\n{EXECUTOR[:12]}|12.00%\n"
+    outputs = {
+        f'{{{{.Image}}}}" {EXECUTOR}': RuntimeError("Error: No such object"),
+        **_docker_outputs(stats, [RENTER, EXECUTOR]),
+    }
+
+    data = _scrape(outputs)["get_docker_info"](b"#!/bin/sh\n")
+
+    assert "docker_host_cpu_percent" not in data
+    assert data["docker_containers"] == [
+        {
+            "each_container_id": RENTER,
+            "each_digest": "sha256:digest",
+            "each_name": "pod_renter",
+            "each_cpu_percent": 158.0,
+        }
+    ]
+
+
 def test_a_wedged_docker_daemon_voids_the_reading_and_keeps_the_scrape_alive():
     # Arrange — `timeout 30 docker stats` returns non-zero, so run_cmd raises
     outputs = _docker_outputs(RuntimeError("run_cmd error: timeout"), [RENTER])

@@ -820,31 +820,24 @@ def get_docker_info(content: bytes):
             host_cpu_percent, cpu_percents = None, {}
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
-        container_ids = result.strip().split('\n')
-
-        # A stats row whose container is gone from ps burned CPU inside the sampled window but
-        # cannot be listed -- the subtraction would book that CPU to the provider, so the host
-        # sample is dropped and the CPU signal voids for this cycle (fail-safe).
-        stats_rows_without_a_container = set(cpu_percents) - {
-            container_id[:12] for container_id in container_ids
-        }
-        if host_cpu_percent is not None and not stats_rows_without_a_container:
-            data["docker_host_cpu_percent"] = host_cpu_percent
+        container_ids = [container_id for container_id in result.splitlines() if container_id]
 
         containers = []
 
         for container_id in container_ids:
-            # Get the image ID of the container
-            result = run_cmd(f'{docker_path} inspect --format "{{{{.Image}}}}" {container_id}')
-            image_id = result.strip()
+            try:
+                result = run_cmd(f'{docker_path} inspect --format "{{{{.Image}}}}" {container_id}')
+                image_id = result.strip()
 
-            # Get the image details
-            result = run_cmd(f'{docker_path}  inspect --format "{{{{json .RepoDigests}}}}" {image_id}')
-            repo_digests = json.loads(result.strip())
+                result = run_cmd(f'{docker_path}  inspect --format "{{{{json .RepoDigests}}}}" {image_id}')
+                repo_digests = json.loads(result.strip())
 
-            # Get the container name
-            result = run_cmd(f'{docker_path} inspect --format "{{{{.Name}}}}" {container_id}')
-            container_name = result.strip().lstrip('/')
+                result = run_cmd(f'{docker_path} inspect --format "{{{{.Name}}}}" {container_id}')
+                container_name = result.strip().lstrip('/')
+            except RuntimeError as exc:
+                if "No such object" not in str(exc) and "No such container" not in str(exc):
+                    raise
+                continue
 
             digest = None
             if repo_digests:
@@ -859,6 +852,13 @@ def get_docker_info(content: bytes):
             containers.append(container_entry)
 
         data["docker_containers"] = containers
+
+        # A stats row whose container cannot be listed would book its CPU to the provider.
+        stats_rows_without_a_container = set(cpu_percents) - {
+            container["each_container_id"][:12] for container in containers
+        }
+        if host_cpu_percent is not None and not stats_rows_without_a_container:
+            data["docker_host_cpu_percent"] = host_cpu_percent
 
     finally:
         os.remove(docker_path)
