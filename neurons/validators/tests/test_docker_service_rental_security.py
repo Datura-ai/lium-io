@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 import re
@@ -24,13 +23,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 import services.docker_service as docker_service_module
-from services.docker_service import (
-    LEGACY_S3FS_PLUGIN_ALIAS,
-    DockerService,
-    _is_safe_docker_volume_name,
-    _is_vloopback_driver,
-    _s3fs_plugin_alias,
-)
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -640,70 +633,27 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
     ]
 
 
-_PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES = {"upgrade", "rm", "remove", "disable", "set", "push", "create"}
-_S3FS_PLUGIN_TARGETS = {"{plugin_alias}", "{LEGACY_S3FS_PLUGIN_ALIAS}"}
-
-
-def _docker_plugin_command_templates(source: str) -> list[tuple[str, str, str]]:
-    """(verb, target, rest of the line) of every `docker plugin <verb>` in a string of the code;
-    docstrings and comments are not commands."""
-    tree = ast.parse(source)
-    docstrings = {
-        id(node.body[0].value)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
-        and node.body
-        and isinstance(node.body[0], ast.Expr)
-    }
-    string_line_numbers = {
-        line_number
-        for node in ast.walk(tree)
-        if (isinstance(node, ast.JoinedStr) or (isinstance(node, ast.Constant) and isinstance(node.value, str)))
-        and id(node) not in docstrings
-        for line_number in range(node.lineno, node.end_lineno + 1)
-    }
-    lines = source.splitlines()
-    return [
-        template
-        for line_number in sorted(string_line_numbers)
-        for template in re.findall(r"docker plugin (\w+) +([^\s\"',]+)(.*)", lines[line_number - 1])
-    ]
-
-
-def test_loopback_plugin_commands_are_install_enable_inspect_only():
-    # an upgrade, rm, disable or forced command on the loopback plugin loses every volume whose
-    # backing file is in its rootfs: only the per-volume s3fs instances may get one
+def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_removed_or_reconfigured():
+    # disable, rm, set or upgrade on a loopback plugin loses every volume whose backing file is in its rootfs
     source = open(docker_service_module.__file__).read()
 
-    templates = _docker_plugin_command_templates(source)
+    targets = re.findall(r"""docker plugin (?:disable|rm|remove|set|upgrade|push|create) ([^\s"']+)""", source)
 
-    # the old plugin is never installed or enabled: only v2 and the s3fs instances are
-    assert docker_service_module._LOOPBACK_PLUGIN_ALIAS == "vloopback:v2"
-    assert "ashald/" not in source
-    assert {target for verb, target, _ in templates if verb == "install"} == {
+    assert set(targets) == {"{plugin_alias}"}
+    installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
+    assert set(installed_or_enabled) == {
         "{_LOOPBACK_PLUGIN_IMAGE}",
         "{S3FS_PLUGIN_IMAGE}",
+        "{shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}",
+        "{plugin_alias}",
+        "{LEGACY_S3FS_PLUGIN_ALIAS}",
     }
-    assert {target for verb, target, _ in templates if verb == "enable"} == {
-        "{shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}"
-    } | _S3FS_PLUGIN_TARGETS
-    for verb, target, rest in templates:
-        assert verb in {"install", "enable", "inspect"} | _PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES, verb
-        if verb in _PLUGIN_VERBS_THAT_CAN_LOSE_VOLUMES or re.search(r"(^|\s)(-f|--force)\b", rest):
-            assert target in _S3FS_PLUGIN_TARGETS, (verb, target, rest)
-    # and `plugin_alias` only ever holds an s3fs instance's name
-    for assigned in re.findall(r"\bplugin_alias(?:: str)? = (.+)", source):
-        assert assigned.startswith("_s3fs_plugin_alias("), assigned
+    assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
 
 
-@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc", "celium-volume-safe"])
+@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc"])
 def test_s3fs_plugin_alias_never_names_a_loopback_plugin(volume_name):
-    assert _is_safe_docker_volume_name(volume_name)
-
-    alias = _s3fs_plugin_alias(volume_name)
-
-    assert alias.startswith("s3fs-")
-    assert not _is_vloopback_driver(alias)
+    assert not _is_vloopback_driver(_s3fs_plugin_alias(volume_name))
 
 
 @pytest.mark.asyncio

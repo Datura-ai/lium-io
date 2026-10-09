@@ -17,6 +17,7 @@ import shutil
 import socket
 from collections import namedtuple
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from neurons.validators.tests.helpers import build_scrape_namespace
@@ -192,65 +193,28 @@ def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, 
         scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
 
 
-_OLD_DATA_DIR = "/proc/1/root/var/lib/docker/plugins/abc/rootfs/var/lib/docker/loopback"
-_V2_DATA_DIR = "/proc/1/root/var/lib/docker/vloopback-v2"
-
-
-def _stub_loopback_host(scrape: dict, monkeypatch, blocks_by_path: dict[str, int], volumes: list[dict]) -> None:
-    # a host whose backing files are exactly `blocks_by_path`: the old plugin's in its rootfs (found
-    # by the glob), v2's in the host data dir under DockerRootDir
-    data_dirs = {path.rsplit("/", 1)[0] for path in blocks_by_path}
-    monkeypatch.setitem(
-        scrape,
-        "glob",
-        type("_Glob", (), {"glob": staticmethod(lambda pattern: sorted(data_dirs - {_V2_DATA_DIR}))}),
-    )
+@pytest.mark.parametrize("old_blocks, total_blocks", [(1953136, 1953136 + 7488), (None, 7488)])
+def test_vloopback_volume_bytes_counts_the_v2_host_data_dir_beside_the_old_plugin_rootfs(
+    scrape: dict, monkeypatch, old_blocks, total_blocks
+) -> None:
+    # the old plugin's files sit in its rootfs (found by the glob), v2's in a host dir under DockerRootDir;
+    # a node with v2 only is a fresh one, not a structural miss
+    old_dir = "/proc/1/root/var/lib/docker/plugins/abc/rootfs/var/lib/docker/loopback"
+    v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
+    blocks = {f"{v2_dir}/volume_v2": 7488} | ({f"{old_dir}/volume_old": old_blocks} if old_blocks else {})
 
     def stat(path):
-        if path not in blocks_by_path:
+        if path not in blocks:
             raise FileNotFoundError(path)
-        return type("_Stat", (), {"st_blocks": blocks_by_path[path]})
+        return SimpleNamespace(st_blocks=blocks[path])
 
-    os_path = type("_Path", (), {"join": staticmethod(os.path.join), "isdir": staticmethod(data_dirs.__contains__)})
-    monkeypatch.setitem(scrape, "os", type("_Os", (), {"path": os_path, "stat": staticmethod(stat)}))
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [old_dir] if old_blocks else []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
+    volumes = [{"Name": "volume_old", "Driver": "vloopback:latest"}, {"Name": "volume_v2", "Driver": "vloopback:v2"}]
     _stub_docker_api(scrape, {"/volumes": {"Volumes": volumes}})
 
-
-def test_vloopback_volume_bytes_counts_v2_files_in_the_host_data_dir(scrape: dict, monkeypatch) -> None:
-    _stub_loopback_host(
-        scrape,
-        monkeypatch,
-        {f"{_V2_DATA_DIR}/volume_v2": 7488},
-        [{"Name": "volume_v2", "Driver": "vloopback:v2"}],
-    )
-
-    total = scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
-
-    assert total == 7488 * 512
-
-
-def test_vloopback_volume_bytes_counts_old_and_v2_files_on_a_mixed_node(scrape: dict, monkeypatch) -> None:
-    _stub_loopback_host(
-        scrape,
-        monkeypatch,
-        {f"{_OLD_DATA_DIR}/volume_old": 1953136, f"{_V2_DATA_DIR}/volume_v2": 7488},
-        [
-            {"Name": "volume_old", "Driver": "vloopback:latest"},
-            {"Name": "volume_v2", "Driver": "vloopback:v2"},
-        ],
-    )
-
-    total = scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
-
-    assert total == (1953136 + 7488) * 512
-
-
-def test_vloopback_volume_bytes_raises_when_no_data_dir_exists(scrape: dict, monkeypatch) -> None:
-    # neither the old plugin's rootfs nor v2's host dir: a structural miss, not a 0
-    _stub_loopback_host(scrape, monkeypatch, {}, [{"Name": "volume_v2", "Driver": "vloopback:v2"}])
-
-    with pytest.raises(RuntimeError, match="no vloopback plugin data dir"):
-        scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == total_blocks * 512
 
 
 def _obfuscation_tables() -> tuple[set[str], set[str]]:

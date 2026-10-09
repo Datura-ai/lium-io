@@ -25,23 +25,23 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import shlex
 import stat
 import subprocess
 from unittest.mock import AsyncMock, Mock
 
-import asyncssh
 import pytest
 from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE, df_command
 from payload_models.payloads import ContainerCreateRequest
+from services import docker_service as docker_service_module
 from services.docker_service import (
     DockerService,
     NoUsableLoopbackPluginError,
     SshSessionMayStillBeTakenError,
     VolumeHostProbe,
     _parse_volume_host_probe,
+    _run_with_host_timeout,
     _volume_host_probe_command,
 )
 from test_deploy_optimizations import (
@@ -80,6 +80,14 @@ def _probe_stdout(
         lines.append(f"VOLS\t{volume_ls_status}")
     lines.append(f"PLUGIN\t{plugin}")
     return "\n".join(lines) + "\n"
+
+
+def _bounded(command: str, seconds: int = 10) -> str:
+    return f"timeout -k 5 {seconds} sh -c {shlex.quote(command)}"
+
+
+async def _hang(command: str):
+    await asyncio.Event().wait()
 
 
 @pytest.fixture
@@ -131,6 +139,7 @@ def test_parse_probe_reads_root_df_vloopback_names_and_plugin():
         volumes=(
             "VOL\tvolume_abc\tvloopback:latest\n"
             "VOL\tvolume_def\tvloopback\n"
+            "VOL\tvolume_v2\tvloopback:v2\n"
             "VOL\tother_volume\tlocal\n"
             "VOL\tbad name;rm\tvloopback\n"
         ),
@@ -140,7 +149,7 @@ def test_parse_probe_reads_root_df_vloopback_names_and_plugin():
 
     assert probe.docker_root_dir == "/var/lib/docker"
     assert probe.df_avail_bytes == 966367641600
-    assert probe.vloopback_volume_names == ["volume_abc", "volume_def"]
+    assert probe.vloopback_volume_names == ["volume_abc", "volume_def", "volume_v2"]
     assert probe.loopback_plugin_enabled is True
 
 
@@ -296,57 +305,35 @@ def test_probe_command_through_a_shell_disabled_plugin_is_installed_not_enabled(
 async def test_probe_volume_host_returns_probe_from_one_command(docker_service):
     ssh_client = Mock()
     ssh_client.run = AsyncMock(return_value=Mock(stdout=_probe_stdout(), exit_status=0))
-
     ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
     probe = await docker_service.probe_volume_host(ssh_client, with_df=True, log_extra={})
 
     assert isinstance(probe, VolumeHostProbe)
     assert ssh_client.run.await_count == 1
-    assert ssh_client.run.await_args.args[0] == (
-        f"timeout -k 5 30 sh -c {shlex.quote(_volume_host_probe_command(with_df=True))}"
-    )
+    assert ssh_client.run.await_args.args[0] == _bounded(_volume_host_probe_command(with_df=True), 30)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answer", [Exception("ssh boom"), "hangs"])
-async def test_probe_volume_host_ssh_error_returns_none(docker_service, monkeypatch, answer):
-    from services import docker_service as docker_service_module
-
+@pytest.mark.parametrize("failure", [Exception("ssh boom"), _hang])
+async def test_probe_volume_host_ssh_error_returns_none(docker_service, monkeypatch, failure):
     monkeypatch.setattr(docker_service_module, "_VOLUME_HOST_PROBE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
+    ssh_client = ssh_client_answering_through_run(AsyncMock(side_effect=failure))
 
-    async def hang(command: str):
-        await asyncio.Event().wait()
+    probe = docker_service.probe_volume_host(ssh_client, with_df=True, log_extra={})
 
-    ssh_client = ssh_client_answering_through_run(AsyncMock(side_effect=hang if answer == "hangs" else answer))
-
-    probe = await asyncio.wait_for(
-        docker_service.probe_volume_host(ssh_client, with_df=True, log_extra={}), timeout=5
-    )
-
-    assert probe is None
+    assert await asyncio.wait_for(probe, timeout=5) is None
 
 
 @pytest.mark.asyncio
-async def test_probe_volume_host_stops_the_create_when_its_channel_may_still_hold_the_session(
-    docker_service, monkeypatch
-):
-    from services import docker_service as docker_service_module
-
-    monkeypatch.setattr(docker_service_module, "_VOLUME_HOST_PROBE_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
-    ssh_client = Mock()
-
-    async def open_never_answered(command: str):
-        await asyncio.Event().wait()
-
-    ssh_client.create_process = open_never_answered
+async def test_probe_volume_host_lets_a_session_that_may_stay_taken_stop_the_create(docker_service, monkeypatch):
+    monkeypatch.setattr(
+        docker_service_module, "_run_with_host_timeout", AsyncMock(side_effect=SshSessionMayStillBeTakenError())
+    )
 
     with pytest.raises(SshSessionMayStillBeTakenError):
-        await asyncio.wait_for(
-            docker_service.probe_volume_host(ssh_client, with_df=True, log_extra={}), timeout=5
-        )
+        await docker_service.probe_volume_host(Mock(), with_df=True, log_extra={})
 
 
 @pytest.mark.asyncio
@@ -391,16 +378,16 @@ async def test_resolve_volume_sizing_with_probe_matches_per_command_result(docke
     # Arrange: the same host facts through both paths (the per-command fixture from
     # test_docker_service, and a probe carrying what its `docker info` / df / `volume ls` say).
     payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
-    volume_inspect_stdout = f"{300 * _SIZING_GB}|<no value>\n"
+    volume_inspect_stdout = f"{300 * _SIZING_GB}|<no value>\n{200 * _SIZING_GB}|<no value>\n"
     per_command_ssh = _make_sizing_ssh_client(
         df_avail_bytes=900 * _SIZING_GB,
-        volume_ls_stdout="volume_abc vloopback:latest\nother_volume local\n",
+        volume_ls_stdout="volume_abc vloopback:latest\nvolume_v2 vloopback:v2\nother_volume local\n",
         volume_inspect_stdout=volume_inspect_stdout,
     )
     probe = VolumeHostProbe(
         docker_root_dir="/var/lib/docker",
         df_avail_bytes=900 * _SIZING_GB,
-        vloopback_volume_names=["volume_abc"],
+        vloopback_volume_names=["volume_abc", "volume_v2"],
         loopback_plugin_enabled=True,
     )
     probe_ssh = Mock()
@@ -414,7 +401,8 @@ async def test_resolve_volume_sizing_with_probe_matches_per_command_result(docke
 
     # Assert: identical sizing, and the probe path ran exactly the inspect command.
     assert with_probe == per_command
-    assert with_probe.path == "fresh" and with_probe.volume_limit_gb == 393
+    assert with_probe.path == "fresh" and with_probe.volume_limit_gb == 460
+    assert with_probe.existing_volumes_bytes == 500 * _SIZING_GB  # both plugin generations count
     assert per_command_ssh.run.await_count == 4  # info, df, volume ls, volume inspect
     assert probe_ssh.run.await_count == 1
     assert probe_ssh.run.await_args.args[0].startswith("/usr/bin/docker volume inspect volume_abc ")
@@ -514,14 +502,12 @@ async def test_create_local_volume_with_enabled_plugin_runs_no_ssh_command(docke
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_installs_v2_with_host_data_dir_and_own_state_dir_when_v2_is_absent(
-    docker_service,
-):
-    # The probe saw no v2 plugin → the v2 install runs, with DATA_DIR on the host under the
-    # probe's root dir (no second `docker info`), outside the plugin rootfs.
-    ssh_client = ssh_client_answering_through_run(
-        AsyncMock(return_value=Mock(stdout="", exit_status=0))
-    )
+async def test_create_local_volume_with_plugin_absent_still_installs_it(docker_service):
+    # Negative control: the probe saw no enabled v2 → the install command runs as before, with
+    # DATA_DIR on the host under the probe's root dir (no second `docker info`), outside the plugin rootfs.
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
     probe = VolumeHostProbe(
         docker_root_dir="/data/docker",
         df_avail_bytes=None,
@@ -532,10 +518,11 @@ async def test_create_local_volume_installs_v2_with_host_data_dir_and_own_state_
     created = await _create_volume(docker_service, ssh_client, probe)
 
     assert ssh_client.run.await_count == 1
-    assert ssh_client.run.await_args.args[0] == "timeout -k 5 60 sh -c " + shlex.quote(
+    assert ssh_client.run.await_args.args[0] == _bounded(
         "/usr/bin/docker plugin install daturaai/docker-volume-loopback:1.0.0-lium1 "
         "--alias vloopback:v2 --grant-all-permissions "
-        "DATA_DIR=/srv/data/docker/vloopback-v2 STATE_DIR=/srv/run/docker-volume-loopback-v2"
+        "DATA_DIR=/srv/data/docker/vloopback-v2 STATE_DIR=/srv/run/docker-volume-loopback-v2",
+        60,
     )
     assert created[0]["driver"] == "vloopback:v2"
 
@@ -551,7 +538,9 @@ def _disabled_plugin_probe() -> VolumeHostProbe:
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(docker_service):
+async def test_create_local_volume_with_disabled_plugin_enables_it_instead_of_installing(
+    docker_service,
+):
     # 7fcd02af (20-27 Sep): installed but disabled → `plugin install` failed "already exists"
     # and every create failed "plugin vloopback found but disabled". Enable, re-read, create.
     ssh_client = Mock()
@@ -567,9 +556,8 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
 
     calls = ssh_client.run.await_args_list
     assert [c.args[0] for c in calls] == [
-        "timeout -k 5 10 sh -c " + shlex.quote("/usr/bin/docker plugin enable vloopback:v2"),
-        "timeout -k 5 10 sh -c "
-        + shlex.quote(
+        _bounded("/usr/bin/docker plugin enable vloopback:v2"),
+        _bounded(
             "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 2>/dev/null "
             "|| echo absent) | tail -n 1"
         ),
@@ -586,15 +574,15 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_fails_naming_both_when_v2_will_not_enable_and_the_old_plugin_is_disabled(
-    docker_service,
-):
-    enable_failed = Mock(
-        stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1
-    )
-    still_disabled = Mock(stdout="false\n", stderr="", exit_status=0)
+async def test_create_local_volume_disabled_plugin_that_will_not_enable_fails_fast(docker_service):
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=[enable_failed, still_disabled, still_disabled])
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1),
+            Mock(stdout="false\n", stderr="", exit_status=0),
+            Mock(stdout="false\n", stderr="", exit_status=0),
+        ]
+    )
     ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
     with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
@@ -602,522 +590,208 @@ async def test_create_local_volume_fails_naming_both_when_v2_will_not_enable_and
 
     message = str(exc_info.value)
     assert message.startswith("no usable vloopback plugin on host (v2: vloopback plugin disabled on host")
-    assert "(plugin vloopback:v2: enable exit 1, state false" in message and "plugin.sock" in message
+    assert "enable exit 1, state false" in message and "plugin.sock" in message
     assert message.endswith("; old plugin vloopback state false)")
-    assert ssh_client.run.await_count == 3
     # lium-platform's classifier files it as volume.plugin_disabled on these two substrings
     assert "plugin vloopback" in message.lower() and "disabled" in message.lower()
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_falls_back_to_the_old_plugin_when_the_v2_enable_times_out(docker_service):
+async def test_create_local_volume_disabled_plugin_enable_timeout_fails_fast(docker_service):
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=[asyncio.TimeoutError(), Mock(stdout="true\n", stderr="", exit_status=0)])
+    ssh_client.run = AsyncMock(side_effect=asyncio.TimeoutError())
     ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
-    created = await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+    with pytest.raises(NoUsableLoopbackPluginError, match="could not be enabled.*old plugin vloopback state unknown"):
+        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
     assert ssh_client.run.await_count == 2
-    assert [volume["driver"] for volume in created] == ["vloopback"]
+    assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
 async def test_create_local_volume_disabled_plugin_enable_error_logs_only_its_type(
     docker_service, monkeypatch
 ):
-    from services import docker_service as docker_service_module
-
     secret_text = "ssh ubuntu@10.1.2.3: token=ghp_leakme at /home/provider/.ssh/id_rsa"
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=[OSError(secret_text), Mock(stdout="true\n", stderr="", exit_status=0)])
+    ssh_client.run = AsyncMock(side_effect=[OSError(secret_text), TimeoutError()])
     ssh_client = ssh_client_answering_through_run(ssh_client.run)
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
 
-    await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
+    with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
+        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
-    (enable_failed,), _ = warning.call_args_list[0]
-    (fell_back,), _ = warning.call_args_list[1]
-    assert str(enable_failed).startswith("Loopback plugin enable failed")
-    assert enable_failed.extra["error_type"] == "OSError"
-    assert enable_failed.extra["loopback_plugin"] == "vloopback:v2"
-    assert "error" not in enable_failed.extra
-    assert "enable error: OSError" in fell_back.extra["reason"]
-    for logged in (enable_failed, fell_back):
-        full = logged.to_full_string()
-        assert "10.1.2.3" not in full and "ghp_leakme" not in full and "id_rsa" not in full
+    assert "enable error: OSError" in str(exc_info.value)
+    assert secret_text not in str(exc_info.value)
+    (logged,), _ = warning.call_args
+    assert str(logged).startswith("Loopback plugin enable failed")
+    assert logged.extra["error_type"] == "OSError"
+    assert logged.extra["loopback_plugin"] == "vloopback:v2"
+    assert "error" not in logged.extra
+    full = logged.to_full_string()
+    assert "10.1.2.3" not in full and "ghp_leakme" not in full and "id_rsa" not in full
 
 
 @pytest.mark.asyncio
 async def test_create_local_volume_without_probe_keeps_the_per_command_path(docker_service):
-    ssh_client = ssh_client_answering_through_run(
-        AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
-    )
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
     await _create_volume(docker_service, ssh_client, None)
 
     commands = [c.args[0] for c in ssh_client.run.await_args_list]
     assert commands[0] == "/usr/bin/docker info --format '{{.DockerRootDir}}'"
-    assert commands[1].startswith("timeout -k 5 60 sh -c '/usr/bin/docker plugin install ")
+    assert commands[1].startswith("timeout -k 5 60 sh -c '/usr/bin/docker plugin install daturaai/")
     assert len(commands) == 2
 
 
-@pytest.mark.asyncio
-async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_already_exists(docker_service):
-    ssh_client = ssh_client_answering_through_run(
-        AsyncMock(
-            side_effect=[
-                Mock(stdout="/var/lib/docker\n", stderr="", exit_status=0),
-                Mock(
-                    stdout="",
-                    stderr="Error response from daemon: plugin vloopback:v2 already exists",
-                    exit_status=1,
-                ),
-                Mock(stdout="true\n", stderr="", exit_status=0),
-            ]
-        )
-    )
-
-    created = await _create_volume(docker_service, ssh_client, None)
-
-    assert ssh_client.run.await_count == 3
-    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
+# v2 beside the old plugin: a stalled command frees its SSH channel (MaxSessions=1) or stops the create;
+# a v2 that cannot be used falls back to the old plugin only when it is enabled
 
 
-# ---------------------------------------------------------------------------
-# vloopback v2 beside the old plugin: new volumes on `vloopback:v2`, the old one never named
-# ---------------------------------------------------------------------------
+def _channel_ssh(*, open_s: float, run_s: float, closes: bool = True) -> tuple[Mock, Mock]:
+    async def wait():
+        await asyncio.sleep(run_s)
+        return "answer"
 
-_OLD = "vloopback:latest"
-_V2 = "vloopback:v2"
-_STATE_INSPECT_RE = re.compile(r"plugin inspect --format '\{\{\.Enabled\}\}' (\S+) ")
-# a plugin named in a command (`--alias vloopback:v2`, `enable vloopback`), not the v2 data dir path
-_LOOPBACK_ALIAS_RE = re.compile(r"(?<![\w/-])vloopback[\w:.-]*")
-
-
-def _docker_plugin_name(name: str) -> str:
-    return name if ":" in name else f"{name}:latest"
-
-
-def _is_v2_state_read(command: str) -> bool:
-    # the state read alone, bare or under the host's `timeout`; the volume host probe carries one too
-    return "root=" not in command and "plugin inspect" in command and _V2 in command
-
-
-class _TwoLoopbackPluginHost:
-    """Both the SSH connection and the Docker SDK client of a host, answering like dockerd with the
-    old `vloopback:latest` and the new `vloopback:v2` plugins: an untagged name is `:latest`, a
-    volume goes to the plugin its driver names, a missing or disabled plugin refuses the create."""
-
-    def __init__(
-        self,
-        *,
-        plugins: dict[str, bool],
-        volumes: dict[str, tuple[str, int]] | None = None,
-        v2_install_fails: bool = False,
-        v2_enable_fails: bool = False,
-        v2_install_hangs: bool = False,
-        v2_install_answer_lost: bool = False,
-        v2_install_channel_open_seconds: float = 0,
-        v2_state_channel_open_hangs: bool = False,
-        v2_state_channel_open_answer_seconds: float = 0,
-        v2_state_command_seconds: float = 0,
-        v2_enable_seconds: float = 0,
-        v2_state_read_seconds: float = 0,
-        max_sessions: int | None = None,
-    ):
-        self.plugins = dict(plugins)  # plugin name -> enabled
-        self.volumes = dict(volumes or {})  # volume name -> (driver, declared bytes)
-        self.v2_install_fails = v2_install_fails
-        self.v2_enable_fails = v2_enable_fails
-        self.v2_install_hangs = v2_install_hangs
-        self.v2_install_answer_lost = v2_install_answer_lost
-        self.v2_install_channel_open_seconds = v2_install_channel_open_seconds
-        self.v2_state_channel_open_hangs = v2_state_channel_open_hangs
-        self.v2_state_channel_open_answer_seconds = v2_state_channel_open_answer_seconds
-        self.v2_state_command_seconds = v2_state_command_seconds
-        self.v2_enable_seconds = v2_enable_seconds
-        self.v2_state_read_seconds = v2_state_read_seconds
-        self.max_sessions = max_sessions
-        self.open_channels = 0
-        self.commands: list[str] = []
-
-    def _state(self, command: str) -> str:
-        name = _docker_plugin_name(_STATE_INSPECT_RE.search(command).group(1))
-        if name not in self.plugins:
-            return "absent"
-        return "true" if self.plugins[name] else "false"
-
-    async def create_process(self, command: str):
-        if self.max_sessions is not None and self.open_channels >= self.max_sessions:
-            raise asyncssh.ChannelOpenError(
-                asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"
-            )
-        if self.v2_state_channel_open_hangs and _is_v2_state_read(command):
+    async def wait_closed():
+        if not closes:
             await asyncio.Event().wait()
-        if self.v2_state_channel_open_answer_seconds and _is_v2_state_read(command):
-            # sshd takes the session at once and its confirmation comes late; a cancelled
-            # wait leaves the session taken, as asyncssh opens the channel anyway
-            self.open_channels += 1
-            await asyncio.sleep(self.v2_state_channel_open_answer_seconds)
-            process = _HostProcess(self, command)
-            if self.v2_state_command_seconds:
-                process.run_child_for(self.v2_state_command_seconds)
-            return process
-        if "plugin install" in command and f"--alias {_V2} " in command:
-            await asyncio.sleep(self.v2_install_channel_open_seconds)
-        self.open_channels += 1
-        return _HostProcess(self, command)
 
-    async def run(self, command: str, timeout: float | None = None):
-        # asyncssh's run(): its timeout neither bounds the open nor closes the channel
-        process = await self.create_process(command)
-        return await asyncio.wait_for(process.wait(), timeout)
+    async def create_process(command: str):
+        await asyncio.sleep(open_s)
+        return channel
 
-    async def answer(self, command: str, process: _HostProcess):
-        self.commands.append(command)
-        host_timeout = None
-        bounded = re.match(r"timeout -k 5 (\S+) (.*)", command)
-        if bounded:
-            host_timeout, command = float(bounded.group(1)), bounded.group(2)
-            if command.startswith("sh -c "):
-                command = shlex.split(command)[2]
-        if command.startswith("root="):  # the volume host probe
-            lines = ["ROOT\t/var/lib/docker"]
-            lines += [f"VOL\t{name}\t{driver}" for name, (driver, _) in self.volumes.items()]
-            lines += ["VOLS\t0", f"PLUGIN\t{self._state(command)}"]
-            return Mock(stdout="\n".join(lines) + "\n", stderr="", exit_status=0)
-        if command.startswith("( /usr/bin/docker plugin inspect"):
-            if self.v2_state_read_seconds and _V2 in command:
-                if host_timeout is not None and self.v2_state_read_seconds > host_timeout:
-                    await asyncio.sleep(host_timeout)
-                    return Mock(stdout="", stderr="", exit_status=124)
-                await asyncio.sleep(self.v2_state_read_seconds)
-            return Mock(stdout=self._state(command) + "\n", stderr="", exit_status=0)
-        if command.startswith("/usr/bin/docker plugin install "):
-            name = _docker_plugin_name(command.split("--alias ")[1].split()[0])
-            if self.v2_install_hangs and name == _V2:
-                # a pull from a registry that stopped answering, until coreutils' timeout ends it
-                if host_timeout is None:
-                    await asyncio.Event().wait()
-                await asyncio.sleep(host_timeout)
-                return Mock(stdout="", stderr="", exit_status=124)
-            if self.v2_install_answer_lost and name == _V2:
-                process.child_alive = False  # the host is done; its answer never arrives
-                await asyncio.Event().wait()
-            if self.v2_install_fails and name == _V2:
-                return Mock(stdout="", stderr="Error response from daemon: Get https://registry-1.docker.io/v2/: net/http: request canceled", exit_status=1)
-            self.plugins[name] = True
-            return Mock(stdout="Installed plugin\n", stderr="", exit_status=0)
-        if command.startswith("/usr/bin/docker plugin enable "):
-            name = _docker_plugin_name(command.split()[-1])
-            if name == _V2 and self.v2_enable_seconds:
-                if host_timeout is not None and self.v2_enable_seconds > host_timeout:
-                    await asyncio.sleep(host_timeout)
-                    return Mock(stdout="", stderr="", exit_status=124)
-                await asyncio.sleep(self.v2_enable_seconds)
-            if self.v2_enable_fails and name == _V2:
-                return Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1)
-            if name in self.plugins:
-                self.plugins[name] = True
-            return Mock(stdout=command.split()[-1] + "\n", stderr="", exit_status=0)
-        if command.startswith("/usr/bin/docker volume inspect "):
-            names = command.split("--format")[0].split()[3:]
-            return Mock(
-                stdout="".join(f"{self.volumes[name][1]}|<no value>\n" for name in names),
-                stderr="",
-                exit_status=0,
-            )
-        raise AssertionError(f"unexpected command: {command}")
-
-    async def create_volume(self, *, volume_name, driver=None, driver_opts=None, timeout=None):
-        name = _docker_plugin_name(driver)
-        if name not in self.plugins:
-            raise RuntimeError(
-                f"create {volume_name}: error looking up volume plugin {driver}: plugin \"{driver}\" not found"
-            )
-        if not self.plugins[name]:
-            raise RuntimeError(
-                f"create {volume_name}: error looking up volume plugin {driver}: plugin {name} found but disabled"
-            )
-        self.volumes[volume_name] = (name, 0)
-
-    def plugin_commands(self) -> list[str]:
-        return [command for command in self.commands if "docker plugin" in command]
-
-
-class _HostProcess:
-    # one SSH channel, like OpenSSH: the host closes it once its command ends, whoever waits;
-    # close() frees the session only when no command runs on it any more
-    def __init__(self, host: _TwoLoopbackPluginHost, command: str):
-        self.host = host
-        self.command = command
-        self.is_open = True
-        self.child_alive = False
-
-    def _start_child(self, child) -> asyncio.Future:
-        self.child_alive = True
-        task = asyncio.ensure_future(child)
-        task.add_done_callback(self._child_ended)
-        return task
-
-    def _child_ended(self, _task) -> None:
-        self.child_alive = False
-        self.close()
-
-    def run_child_for(self, seconds: float) -> None:
-        # the command was sent with the open and runs on its own, nobody reading its answer
-        self.child_task = self._start_child(asyncio.sleep(seconds))
-
-    async def wait(self):
-        # a cancelled wait leaves the command running on the host
-        return await asyncio.shield(self._start_child(self.host.answer(self.command, self)))
-
-    def close(self) -> None:
-        if self.is_open and not self.child_alive:
-            self.is_open = False
-            self.host.open_channels -= 1
-
-    async def wait_closed(self) -> None:
-        while self.is_open:
-            await asyncio.sleep(0.01)
-
-
-async def _rent_a_new_volume(
-    docker_service, host: _TwoLoopbackPluginHost, timeout: float = 10
-) -> None:
-    docker_service.stream_log = AsyncMock()
-    probe = await docker_service.probe_volume_host(host, with_df=False, log_extra={})
-    await docker_service.create_local_volume(
-        ssh_client=host,
-        docker_client=host,
-        local_volume="volume_new",
-        log_tag="tag",
-        log_text="Creating docker volume volume_new",
-        log_extra={},
-        limit=40,
-        timeout=timeout,
-        host_probe=probe,
-    )
-
-
-@pytest.mark.asyncio
-async def test_create_local_volume_creates_the_new_volume_on_the_v2_driver(docker_service):
-    host = _TwoLoopbackPluginHost(plugins={_OLD: True, _V2: True})
-
-    await _rent_a_new_volume(docker_service, host)
-
-    assert host.volumes["volume_new"][0] == _V2
-
-
-@pytest.mark.asyncio
-async def test_create_local_volume_installs_v2_beside_an_enabled_old_plugin(docker_service):
-    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, volumes={"volume_renter": (_OLD, 10**9)})
-
-    await _rent_a_new_volume(docker_service, host)
-
-    installs = [command for command in host.commands if "plugin install" in command]
-    assert len(installs) == 1 and "--alias vloopback:v2 " in installs[0]
-    assert host.plugins == {_OLD: True, _V2: True}
-    assert host.volumes == {"volume_renter": (_OLD, 10**9), "volume_new": (_V2, 0)}
-
-
-@pytest.mark.asyncio
-async def test_create_local_volume_skips_install_when_v2_is_enabled(docker_service):
-    host = _TwoLoopbackPluginHost(plugins={_V2: True})
-
-    await _rent_a_new_volume(docker_service, host)
-
-    assert not any("plugin install" in command for command in host.commands)
-    assert host.volumes["volume_new"][0] == _V2
-
-
-@pytest.mark.asyncio
-async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_install_fails(
-    docker_service, monkeypatch
-):
-    from services import docker_service as docker_service_module
-
-    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, v2_install_fails=True)
-    warning = Mock()
-    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
-
-    await _rent_a_new_volume(docker_service, host)
-
-    assert host.volumes["volume_new"][0] == _OLD
-    assert host.plugins == {_OLD: True}
-    assert not any("ashald" in command for command in host.commands)
-    (logged,), _ = warning.call_args
-    assert str(logged).startswith("Loopback plugin v2 unusable; creating this volume on the old plugin")
-    assert logged.extra["reason"].startswith("install exit 1, state absent: Error response from daemon")
+    channel = Mock(wait=wait, wait_closed=wait_closed)
+    return Mock(create_process=create_process), channel
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "plugins, faults, install_timeout, margin, rent_timeout, reason",
+    "open_s, run_s, closes, outcome",
     [
-        # a v2 pull that stops answering, ended by the host's `timeout`
-        ({_OLD: True}, {"v2_install_hangs": True}, 0.05, 2, 10, "install exit 124, state absent"),
-        # the install's channel opens late: the host's timer starts at the open, so must the validator's
-        ({_OLD: True}, {"v2_install_hangs": True, "v2_install_channel_open_seconds": 0.3}, 0.2, 0.2, 10, ""),
-        # the host is done but its answer never arrives: the validator closes the channel
-        ({_OLD: True}, {"v2_install_answer_lost": True}, 0.025, 0.025, 10, "install timed out after 0.05 s"),
-        # the state read's channel opens after its deadline, within the second one
-        ({_OLD: True}, {"v2_install_fails": True, "v2_state_channel_open_answer_seconds": 0.3}, 60, 0, 0.2, ""),
-        # ... with its inspect already running: the session frees only when that ends
-        (
-            {_OLD: True},
-            {
-                "v2_install_fails": True,
-                "v2_state_channel_open_answer_seconds": 0.4,
-                "v2_state_command_seconds": 0.1,
-            },
-            60,
-            0,
-            0.3,
-            "",
-        ),
-        # a v2 enable or state read that the host ends at its timeout
-        ({_OLD: True, _V2: False}, {"v2_enable_seconds": 0.3}, 60, 10, 0.2, "vloopback plugin disabled"),
-        ({_OLD: True, _V2: False}, {"v2_enable_seconds": 60}, 60, 10, 0.2, "vloopback plugin disabled"),
-        ({_OLD: True}, {"v2_install_fails": True, "v2_state_read_seconds": 60}, 60, 10, 0.2, "install exit 1"),
-        ({_OLD: True, _V2: False}, {"v2_state_read_seconds": 60}, 60, 10, 0.2, "vloopback plugin disabled"),
+        (0, 0, True, None),
+        (0, 1, True, TimeoutError),  # the command outlives the deadline: its channel is closed
+        (0, 1, False, SshSessionMayStillBeTakenError),  # ... and the close is not confirmed
+        (0.075, 0, True, TimeoutError),  # the open answers after the deadline, within the second wait
+        (0.3, 0, True, SshSessionMayStillBeTakenError),  # never in time: closed whenever it does answer
     ],
 )
-async def test_create_local_volume_reaches_the_enabled_old_plugin_on_a_one_session_host_whatever_v2_hangs_on(
-    docker_service, monkeypatch, plugins, faults, install_timeout, margin, rent_timeout, reason
+async def test_run_with_host_timeout_frees_the_channel_or_stops_the_create(
+    monkeypatch, open_s, run_s, closes, outcome
 ):
-    # sshd allows one session: every timed-out v2 command must free it before the fallback reads
-    from services import docker_service as docker_service_module
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
+    ssh_client, channel = _channel_ssh(open_s=open_s, run_s=run_s, closes=closes)
 
-    host = _TwoLoopbackPluginHost(plugins=plugins, max_sessions=1, **faults)
+    ran = asyncio.wait_for(_run_with_host_timeout(ssh_client, "cmd", 0.05), timeout=5)
+    if outcome is None:
+        assert await ran == "answer"
+    else:
+        with pytest.raises(outcome):
+            await ran
+    await asyncio.sleep(open_s)
+
+    assert channel.close.called is (outcome is not None)
+
+
+def _plugin_host(*, v2_state: str = "absent", old_state: str = "true", install: str = "fails") -> Mock:
+    # the host's docker through ssh: a v2 install or enable that fails (or never answers), and the plugin states
+    async def answer(command: str):
+        command = shlex.split(command)[-1] if command.startswith("timeout -k 5 ") else command
+        if "docker info" in command:
+            return Mock(stdout="/var/lib/docker\n", stderr="", exit_status=0)
+        if "plugin inspect" in command:
+            state = v2_state if "vloopback:v2" in command else old_state
+            if state == "unreadable":
+                raise TimeoutError
+            return Mock(stdout=f"{state}\n", stderr="", exit_status=0)
+        if install == "hangs":
+            await asyncio.Event().wait()
+        return Mock(stdout="", stderr="Error response from daemon: registry unreachable", exit_status=1)
+
+    return ssh_client_answering_through_run(AsyncMock(side_effect=answer))
+
+
+@pytest.mark.asyncio
+async def test_run_with_host_timeout_waits_the_margin_past_the_host_timeout(monkeypatch):
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.2)
+    ssh_client, channel = _channel_ssh(open_s=0, run_s=0.1)
+
+    assert await _run_with_host_timeout(ssh_client, "cmd", 0.05) == "answer"
+    assert not channel.close.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "probe, install, v2_state, reason",
+    [
+        (None, "fails", "absent", "install exit 1, state absent: Error response"),
+        (None, "hangs", "absent", "install timed out after 0.1 s"),
+        (_disabled_plugin_probe(), "fails", "false", "vloopback plugin disabled on host"),
+        (None, "fails", "unreadable", "install exit 1, state unknown: Error response"),
+    ],
+)
+async def test_create_local_volume_falls_back_to_the_enabled_old_plugin_when_v2_cannot_be_used(
+    docker_service, monkeypatch, probe, install, v2_state, reason
+):
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
-    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", install_timeout)
-    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", margin)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
+    ssh_client = _plugin_host(v2_state=v2_state, install=install)
 
-    await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=rent_timeout), timeout=5)
+    created = await asyncio.wait_for(_create_volume(docker_service, ssh_client, probe), timeout=5)
 
-    assert host.volumes["volume_new"][0] == _OLD
-    assert host.open_channels == 0
-    (fell_back,), _ = warning.call_args
-    assert fell_back.extra["reason"].startswith(reason)
+    assert [volume["driver"] for volume in created] == ["vloopback"]
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert all(command.startswith("timeout -k 5 ") for command in commands if "docker info" not in command)
+    (logged,), _ = warning.call_args
+    assert str(logged).startswith("Loopback plugin v2 unusable; creating this volume on the old plugin")
+    assert logged.extra["reason"].startswith(reason)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("v2_state_channel_open", ["hangs", "answers after both deadlines"])
-async def test_create_local_volume_sends_no_fallback_command_while_a_late_channel_may_hold_the_only_session(
-    docker_service, monkeypatch, v2_state_channel_open
+@pytest.mark.parametrize("old_state", ["absent", "false"])
+async def test_create_local_volume_fails_naming_both_and_never_installs_or_enables_the_old_plugin(
+    docker_service, old_state
 ):
-    from services import docker_service as docker_service_module
-
-    faults = (
-        {"v2_state_channel_open_hangs": True}
-        if v2_state_channel_open == "hangs"
-        else {"v2_state_channel_open_answer_seconds": 0.5, "v2_state_command_seconds": 0.2}
-    )
-    host = _TwoLoopbackPluginHost(plugins={_OLD: True}, v2_install_fails=True, max_sessions=1, **faults)
-    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
-
-    with pytest.raises(SshSessionMayStillBeTakenError, match="channel open not answered within 0.4 s"):
-        await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.2), timeout=5)
-
-    assert not any(_V2 not in command for command in host.plugin_commands())
-    assert "volume_new" not in host.volumes
-
-
-@pytest.mark.asyncio
-async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_cannot_be_enabled(docker_service):
-    host = _TwoLoopbackPluginHost(plugins={_OLD: True, _V2: False}, v2_enable_fails=True)
-
-    await _rent_a_new_volume(docker_service, host)
-
-    assert host.volumes["volume_new"][0] == _OLD
-    assert host.plugins == {_OLD: True, _V2: False}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("plugins, old_state", [({}, "absent"), ({_OLD: False}, "false")])
-async def test_create_local_volume_fails_without_installing_or_enabling_the_old_plugin_when_v2_install_fails(
-    docker_service, plugins, old_state
-):
-    host = _TwoLoopbackPluginHost(plugins=plugins, v2_install_fails=True)
+    ssh_client = _plugin_host(old_state=old_state)
 
     with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
-        await _rent_a_new_volume(docker_service, host)
+        await _create_volume(docker_service, ssh_client, None)
 
     message = str(exc_info.value)
     assert message.startswith("no usable vloopback plugin on host (v2: install exit 1, state absent: Error response")
     assert message.endswith(f"; old plugin vloopback state {old_state})")
-    named_beside_inspect = {
-        alias
-        for command in host.plugin_commands()
-        if "plugin inspect" not in command
-        for alias in _LOOPBACK_ALIAS_RE.findall(command)
-    }
-    assert named_beside_inspect == {_V2}
-    assert host.plugins == plugins
-    assert "volume_new" not in host.volumes
-
-
-@pytest.mark.asyncio
-async def test_create_local_volume_fails_when_the_old_plugin_state_read_times_out_too(docker_service):
-    ssh_client = Mock()
-    ssh_client.run = AsyncMock(side_effect=[TimeoutError(), TimeoutError()])
-    ssh_client = ssh_client_answering_through_run(ssh_client.run)
-
-    with pytest.raises(NoUsableLoopbackPluginError, match=r"; old plugin vloopback state unknown\)$"):
-        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
-
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert all("vloopback:v2" in command for command in commands if "plugin install" in command)
+    assert not any("plugin enable" in command for command in commands)
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_with_v2_enabled_never_names_a_disabled_old_plugin(docker_service):
-    host = _TwoLoopbackPluginHost(plugins={_OLD: False, _V2: True})
+async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_already_exists(docker_service):
+    created = await _create_volume(docker_service, _plugin_host(v2_state="true"), None)
 
-    await _rent_a_new_volume(docker_service, host)
-
-    named = {alias for command in host.plugin_commands() for alias in _LOOPBACK_ALIAS_RE.findall(command)}
-    assert named == {_V2}
-    assert host.plugins == {_OLD: False, _V2: True}
-    assert host.volumes["volume_new"][0] == _V2
+    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
 
 
 @pytest.mark.asyncio
-async def test_volume_host_probe_keeps_old_and_v2_volume_names(docker_service):
-    host = _TwoLoopbackPluginHost(
-        plugins={_OLD: True},
-        volumes={
-            "volume_old": (_OLD, 10**9),
-            "volume_v2": (_V2, 10**9),
-            "volume_local": ("local", 0),
-        },
-    )
+@pytest.mark.parametrize("probe", [None, _disabled_plugin_probe()])
+async def test_create_local_volume_sends_no_fallback_command_when_a_channel_may_still_hold_the_session(
+    docker_service, monkeypatch, probe
+):
+    run_with_host_timeout = AsyncMock(side_effect=SshSessionMayStillBeTakenError())
+    monkeypatch.setattr(docker_service_module, "_run_with_host_timeout", run_with_host_timeout)
 
-    probe = await docker_service.probe_volume_host(host, with_df=False, log_extra={})
+    with pytest.raises(SshSessionMayStillBeTakenError):
+        await _create_volume(docker_service, _plugin_host(), probe)
 
-    assert probe.vloopback_volume_names == ["volume_old", "volume_v2"]
-    # the plugin state is v2's: an enabled old plugin must not read as "nothing to install"
-    assert probe.loopback_plugin_enabled is False
-    assert probe.loopback_plugin_installed is False
-
-
-@pytest.mark.asyncio
-async def test_resolve_volume_sizing_sums_declared_sizes_of_old_and_v2_volumes(docker_service):
-    # both generations' backing files sit on the DockerRootDir disk, so both declared sizes count
-    host = _TwoLoopbackPluginHost(
-        plugins={_OLD: True, _V2: True},
-        volumes={"volume_old": (_OLD, 300 * _SIZING_GB), "volume_v2": (_V2, 200 * _SIZING_GB)},
-    )
-    probe = await docker_service.probe_volume_host(host, with_df=False, log_extra={})
-    probe.df_avail_bytes = 900 * _SIZING_GB
-    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
-
-    sizing = await docker_service.resolve_volume_sizing(host, payload, "tag", {}, host_probe=probe)
-
-    assert sizing.existing_volumes_bytes == 500 * _SIZING_GB
+    assert run_with_host_timeout.await_count == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1670,7 +1670,8 @@ async def test_discarded_early_probe_gets_no_overlapped_row(svc_fixture, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc_fixture, monkeypatch):
+@pytest.mark.parametrize("probe_error", [None, SshSessionMayStillBeTakenError("channel open not answered")])
+async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc_fixture, monkeypatch, probe_error):
     # one SSH session per host (MaxSessions=1): the second probe must not open a channel beside the first
     svc = svc_fixture
     _wire_early_probes(svc, monkeypatch, image_present=True)
@@ -1678,36 +1679,20 @@ async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc
     probes_running: list[int] = []
 
     async def probe_alone(*args, **kwargs):
+        assert not probes_running, "a second volume probe started while the first still ran"
         probes_running.append(1)
-        assert len(probes_running) == 1, "a second volume probe started while the first still ran"
         await asyncio.sleep(0.2)
         probes_running.pop()
-        return None
+        if probe_error:
+            raise probe_error
 
     svc.probe_volume_host = AsyncMock(side_effect=probe_alone)
     svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
 
     result = await _run_create_container(svc, _deploy_payload())
 
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert svc.probe_volume_host.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_discarded_early_probe_whose_channel_may_hold_the_session_stops_the_create(
-    svc_fixture, monkeypatch
-):
-    svc = svc_fixture
-    _wire_early_probes(svc, monkeypatch, image_present=True)
-    _slow_overlapped_operations(svc, monkeypatch)
-    svc.probe_volume_host = AsyncMock(side_effect=SshSessionMayStillBeTakenError("channel open not answered"))
-    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "FailedContainerRequest"
-    assert result.failure_step == "volume_host_probe"
-    assert svc.probe_volume_host.await_count == 1
+    assert type(result).__name__ == ("FailedContainerRequest" if probe_error else "ContainerCreated"), getattr(result, "msg", "")
+    assert svc.probe_volume_host.await_count == (1 if probe_error else 2)
 
 
 @pytest.fixture
