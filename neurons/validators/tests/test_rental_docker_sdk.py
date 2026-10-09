@@ -512,6 +512,19 @@ async def test_image_exists_returns_false_for_missing_image():
 
 
 @pytest.mark.asyncio
+async def test_local_image_repo_digests_reads_one_inspect_and_none_for_a_missing_image():
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["daturaai/pytorch@sha256:abc"]
+    api_client.missing_images.add("daturaai/missing:tag")
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_repo_digests(image="daturaai/pytorch:prod") == ("daturaai/pytorch@sha256:abc",)
+    assert await client.local_image_repo_digests(image="daturaai/missing:tag") is None
+    assert api_client.inspected_images == ["daturaai/pytorch:prod", "daturaai/missing:tag"]
+    assert api_client.distribution_calls == []
+
+
+@pytest.mark.asyncio
 async def test_local_image_is_current_when_a_repo_digest_matches_the_registry():
     api_client = FakeApiClient()
     api_client.repo_digests = ["ghcr.io/org/app@sha256:old", "ghcr.io/org/app@sha256:remote"]
@@ -608,6 +621,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
             cpu_count=2,
             memory_gb=8,
             storage_limit_gb=20,
+            pids_limit=8192,
             shm_size="1g",
         )
     )
@@ -632,6 +646,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["nano_cpus"] == 2_000_000_000
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
+    assert api_client.host_config_kwargs["pids_limit"] == 8192
     assert api_client.started == ["pod_test"]
 
 
@@ -1368,6 +1383,10 @@ def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_p
         "key_filename": str(key_path),
         "look_for_keys": False,
         "allow_agent": False,
+        # a (re)connect is bounded: TCP connect, banner, key auth
+        "timeout": 15,
+        "banner_timeout": 15,
+        "auth_timeout": 15,
     }
     assert calls["host_keys_path"] == str(known_hosts_path)
     assert isinstance(calls["policy"], FakeRejectPolicy)

@@ -2,10 +2,10 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, TypeVar
 
 import aiohttp
 import bittensor
@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings
+from incentive.burn_service import verified_burner_hotkey
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
 
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
+ChainReadResult = TypeVar("ChainReadResult")
 
 SYNC_CYCLE = 12
 SUBTENSOR_BACKOFF_INITIAL = 12
@@ -50,6 +52,28 @@ class MissingScoredHotkeys:
 
 class ProviderPortalDataUnavailable(RuntimeError):
     """No live or Redis-cached provider snapshot is available."""
+
+
+def scored_registered_neurons(
+    miners: Sequence[bittensor.NeuronInfo],
+    registered: Sequence[bittensor.NeuronInfo],
+    miner_scores: dict[str, float],
+) -> list[bittensor.NeuronInfo]:
+    """Registered neurons with a score that the served-miner list does not carry."""
+    selected = {miner.hotkey for miner in miners}
+    return [neuron for neuron in registered if neuron.hotkey in miner_scores and neuron.hotkey not in selected]
+
+
+def fold_unregistered_into_burner(
+    miner_scores: dict[str, float], present_hotkeys: set[str], burner_hotkey: str | None
+) -> dict[str, float]:
+    """A settled vector is a day old and may name a hotkey that deregistered since. Its share goes to the verified
+    burner instead of to everyone else through normalization; with no verified burner it is dropped as before."""
+    folded = {hotkey: score for hotkey, score in miner_scores.items() if hotkey in present_hotkeys}
+    lost = sum(score for hotkey, score in miner_scores.items() if hotkey not in present_hotkeys)
+    if lost > 0 and burner_hotkey is not None and burner_hotkey in present_hotkeys:
+        folded[burner_hotkey] = folded.get(burner_hotkey, 0.0) + lost
+    return folded
 
 
 @contextlib.contextmanager
@@ -195,6 +219,9 @@ class SubtensorClient:
     _initialized = False
     _subtensor = None
     _warm_up_task = None
+    # only the connector reads the chain in a thread: the main validator also calls the same
+    # websocket from the loop, and the sync substrate client cannot serve two threads at once
+    _chain_reads_in_thread = False
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
@@ -219,6 +246,8 @@ class SubtensorClient:
         self.config = settings.get_bittensor_config()
         self.redis_service = RedisService()
         self._has_alerted_for_stale_portal_snapshot = False
+        self._chain_read_lock = asyncio.Lock()
+        self._miners_fetch_lock = asyncio.Lock()
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
@@ -448,18 +477,37 @@ class SubtensorClient:
     def get_evm_address_for_hotkey(self, hotkey):
         return self.hotkey_to_evm_address.get(hotkey, None)
 
-    def sync_evm_address_maps(self):
+    async def _run_chain_read(
+        self, chain_read: Callable[..., ChainReadResult], *args: object
+    ) -> ChainReadResult:
+        # a blocking chain read: in the connector off the event loop, one at a time
+        if not self._chain_reads_in_thread:
+            return chain_read(*args)
+        await self._chain_read_lock.acquire()
+        # cancelling the caller does not stop the thread: the lock is released when the thread
+        # ends, so no second read shares the websocket with it
+        read_in_thread = asyncio.ensure_future(asyncio.to_thread(chain_read, *args))
+        read_in_thread.add_done_callback(lambda _: self._chain_read_lock.release())
+        return await asyncio.shield(read_in_thread)
+
+    def _pause_chain_reads_in_thread(self) -> contextlib.AbstractAsyncContextManager:
+        # the loop-side redial closes or replaces the websocket a chain read thread may be using
+        return self._chain_read_lock if self._chain_reads_in_thread else contextlib.nullcontext()
+
+    def _read_uid_to_evm_address(self) -> dict[int, str]:
         with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
             node = self.get_node()
             associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
-            for uid, evm_address in associated_evms:
-                # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
-                evm_address_hex = evm_address[0]
-                self.uid_to_evm_address[uid] = evm_address_hex
+            # the query map pages lazily, so it is iterated here, inside the timed chain read;
+            # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
+            return {uid: evm_address[0] for uid, evm_address in associated_evms}
 
-            """Update the map of miner_hotkey -> evm_address for all miners."""
-            for miner in self.miners:
-                self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
+    async def sync_evm_address_maps(self) -> None:
+        # the maps are read by the loop, so they are updated here, never from the thread
+        self.uid_to_evm_address.update(await self._run_chain_read(self._read_uid_to_evm_address))
+
+        for miner in self.miners:
+            self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
 
         logger.info(
             _m(
@@ -647,7 +695,9 @@ class SubtensorClient:
                     )
                 )
                 return
-            miners = self._build_serving_miners_with_opted_in_routing(opted_in_miners)
+            miners = await self._run_chain_read(
+                self._build_serving_miners_with_opted_in_routing, opted_in_miners
+            )
 
         logger.info(
             _m(
@@ -668,7 +718,13 @@ class SubtensorClient:
 
     async def get_miners(self) -> list[bittensor.NeuronInfo]:
         if not self.miners:
-            await self.fetch_miners()
+            if not self._chain_reads_in_thread:
+                await self.fetch_miners()
+                return self.miners
+            # a caller arriving during the first load waits for it instead of reading the chain again
+            async with self._miners_fetch_lock:
+                if not self.miners:
+                    await self.fetch_miners()
         return self.miners
     
     async def send_weights_to_lium(self, payload: dict):
@@ -732,7 +788,9 @@ class SubtensorClient:
         self,
         miner_scores: dict[str, float],
         active_hotkeys: set[str] | None = None,
-    ) -> None:
+        wait_for_inclusion: bool = False,
+        include_registered_scored: bool = False,
+    ) -> bool:
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
@@ -761,9 +819,16 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            return
+            return False
 
         metagraph = self.get_metagraph()
+        if include_registered_scored:
+            # DAH-4001: a settled vector is a day old. A provider that removed its last node since then is no longer
+            # in the served-miner list, but its hotkey is still registered and the pay the backend approved is its.
+            miners = list(miners) + scored_registered_neurons(miners, metagraph.neurons, miner_scores)
+            miner_scores = fold_unregistered_into_burner(
+                miner_scores, {miner.hotkey for miner in miners}, verified_burner_hotkey(metagraph.neurons)
+            )
         self._log_scored_hotkeys_missing_from_selected_miners(
             miner_scores=miner_scores,
             selected_miners=miners,
@@ -870,12 +935,14 @@ class SubtensorClient:
             "weights": [int(w) for w in list(uint_weights)],
             "version_key": int(self.version_key),
             "wait_for_finalization": False,
-            "wait_for_inclusion": False,
+            "wait_for_inclusion": wait_for_inclusion,
             "current_block": current_block,
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
         await self.send_weights_to_lium(payload)
 
+        # stays on the event loop on purpose: the substrate websocket behind `self.subtensor` is shared with every
+        # other chain read and is not thread-safe, so a thread here could interleave frames with a concurrent read
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.netuid,
@@ -883,7 +950,7 @@ class SubtensorClient:
             weights=uint_weights,
             version_key=self.version_key,
             wait_for_finalization=False,
-            wait_for_inclusion=False,
+            wait_for_inclusion=wait_for_inclusion,
         )
         if result is True:
             logger.info(
@@ -904,6 +971,7 @@ class SubtensorClient:
                     ),
                 ),
             )
+        return result is True
 
     def get_last_update(self, block):
         try:
@@ -1011,20 +1079,25 @@ class SubtensorClient:
         backoff = SUBTENSOR_BACKOFF_INITIAL
         while True:
             try:
-                self._return_to_first_endpoint()
-                self.set_subtensor()
+                async with self._pause_chain_reads_in_thread():
+                    self._return_to_first_endpoint()
+                    self.set_subtensor()
 
                 if SubtensorClient._subtensor is None:
                     raise RuntimeError("subtensor is not initialized")
 
                 if count == 0:
-                    await self.fetch_miners()
-                    self.sync_evm_address_maps()
+                    # the connector's rents join this first load; the main validator fetches as on main
+                    if self._chain_reads_in_thread:
+                        await self.get_miners()
+                    else:
+                        await self.fetch_miners()
+                    await self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
                     await self.fetch_miners()
-                    self.sync_evm_address_maps()
+                    await self.sync_evm_address_maps()
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
@@ -1041,7 +1114,8 @@ class SubtensorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
-                self._switch_endpoint_after_read_failure(e)
+                async with self._pause_chain_reads_in_thread():
+                    self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(
                         "[_warm_up_subtensor] Failed to connect into subtensor",
@@ -1057,9 +1131,10 @@ class SubtensorClient:
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
 
     @classmethod
-    async def initialize(cls) -> Self:
+    async def initialize(cls, chain_reads_in_thread: bool = False) -> Self:
         """Initialize the singleton instance asynchronously."""
         instance = cls.get_instance()
+        instance._chain_reads_in_thread = chain_reads_in_thread
 
         # Start warm-up task only once (static)
         if cls._warm_up_task is None or cls._warm_up_task.done():
@@ -1075,6 +1150,11 @@ class SubtensorClient:
             try:
                 await cls._warm_up_task
             except asyncio.CancelledError:
+                pass
+        if cls._instance is not None and cls._instance._chain_reads_in_thread:
+            # a read cancelled with the warm-up still runs in its thread; the next instance would
+            # share its websocket if the new instance's own dial failed
+            async with cls._instance._chain_read_lock:
                 pass
         cls._warm_up_task = None
         cls._instance = None

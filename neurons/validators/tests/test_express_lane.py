@@ -26,12 +26,12 @@ from uuid import uuid4
 
 import bittensor
 import pytest
-from fakeredis.aioredis import FakeRedis
-
 import services.file_encrypt_service as file_encrypt_service
 from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, portal_miner_auth_blob
 from core.express_lane import EXPRESS_PUBLISHED_EVENT, MAX_ATTEMPTS, CycleInputs, ExpressLane
-from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
+from fakeredis.aioredis import FakeRedis
+from fixtures.rest_miner_fixtures import VALIDATOR_HOTKEY
+from fixtures.rest_miner_fixtures import executor_info as _executor_info
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.file_encrypt_service import FileEncryptService
@@ -39,9 +39,8 @@ from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, MinerSe
 from services.redis_service import EXPRESS_LANE_VALIDATED_SET, RedisService
 from services.task.models import JobResult
 
-pytest_plugins = ["fixtures.incentive_fixtures"]
+pytest_plugins = ["fixtures.incentive_fixtures", "fixtures.rest_miner_fixtures"]
 
-VALIDATOR_HOTKEY = "validator-hotkey"
 # The first cycle since start began an hour ago; the test executors register after it.
 FLEET_KNOWN_SINCE = datetime.now(UTC) - timedelta(hours=1)
 # Two consecutive cycles' job_batch_id (block time at the cycle's job block, as Validator.sync()
@@ -61,18 +60,6 @@ class _Neuron:
     hotkey: str
     coldkey: str = "miner-coldkey"
     axon_info: _AxonInfo = field(default_factory=_AxonInfo)
-
-
-def _executor_info(executor_id: str) -> ExecutorSSHInfo:
-    return ExecutorSSHInfo(
-        uuid=executor_id,
-        address="198.51.100.7",
-        port=8001,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-    )
 
 
 def _job_result(
@@ -143,55 +130,8 @@ def _redis_service() -> RedisService:
 
 
 @pytest.fixture
-def wallet(mocker):
-    my_key = Mock(ss58_address=VALIDATOR_HOTKEY)
-    my_key.sign.return_value = b"\x01\x02\x03"
-    mocker.patch(
-        "core.config.Settings.get_bittensor_wallet",
-        return_value=Mock(get_hotkey=Mock(return_value=my_key)),
-    )
-    return my_key
-
-
-@pytest.fixture
-def rest_miner_service(mocker, wallet, monkeypatch):
-    """A MinerService whose REST boundary is mocked: the miner accepts the key and returns the
-    executors the test hands it; every executor task resolves to a passing JobResult."""
-    from core.config import settings
-
-    monkeypatch.setattr(settings, "USE_REST_API", True)
-    ssh_service = mocker.Mock()
-    ssh_service.generate_ssh_key.return_value = (b"---PRIV---", b"ssh-ed25519 pub")
-    ssh_service.decrypt_payload.return_value = "---DECRYPTED-PRIV---"
-    task_service = mocker.Mock()
-
-    async def create_task(miner_info, executor_info, **_):
-        return _job_result(executor_info.uuid)
-
-    task_service.create_task = AsyncMock(side_effect=create_task)
-    service = MinerService(
-        ssh_service=ssh_service,
-        task_service=task_service,
-        redis_service=mocker.AsyncMock(),
-        attestation_service=Mock(maybe_issue_nonce=AsyncMock(return_value=None)),
-    )
-    mocker.patch("services.miner_service.measure_and_attach", AsyncMock())
-
-    def miner_returns(*executor_ids: str):
-        service.rest_calls = []
-
-        async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
-            service.rest_calls.append((url.rsplit("/", 1)[-1], json_data))
-            if url.endswith("ssh-pubkey-submit"):
-                return 200, AcceptSSHKeyRequest(
-                    executors=[_executor_info(e) for e in executor_ids]
-                ).model_dump(mode="json")
-            return 200, {"message_type": "SSHKeyRemoved"}
-
-        service._make_rest_request = _make_rest_request
-
-    service.miner_returns = miner_returns
-    return service
+def miner_task_result():
+    return _job_result
 
 
 def _payload() -> MinerJobRequestPayload:

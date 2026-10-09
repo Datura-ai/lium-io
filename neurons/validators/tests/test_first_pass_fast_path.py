@@ -58,7 +58,6 @@ async def test_context_first_pass_needs_the_flag_and_the_caller(monkeypatch, fla
         "validation_service",
         "verifyx_validation_service",
         "inspector_validation_service",
-        "collateral_contract_service",
         "executor_connectivity_service",
         "backend_client",
         "pod_recovery",

@@ -73,7 +73,7 @@ def _validator_hotkeys(current: str, next_: str) -> dict[str, str]:
 VALIDATOR_HOTKEYS_SS58: dict[str, str] = _validator_hotkeys(VALIDATOR_HOTKEY_SS58, VALIDATOR_NEXT_HOTKEY_SS58)
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     PROJECT_NAME: str = "compute-subnet-executor"
 
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8001)

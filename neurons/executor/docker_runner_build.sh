@@ -105,7 +105,9 @@ log_success "All required environment variables are set"
 log_kv "TAG:" "${TAG}"
 log_kv "EXECUTOR_IMAGE_SHA256:" "${EXECUTOR_IMAGE_SHA256}"
 
-IMAGE_NAME="daturaai/compute-subnet-executor-runner:${TAG}"
+# IMAGE_REPO_SUFFIX=-dev (executor_cd_dev from a branch other than main) names the -dev repositories
+# for both images; unset, the names are the release repositories.
+IMAGE_NAME="daturaai/compute-subnet-executor-runner${IMAGE_REPO_SUFFIX:-}:${TAG}"
 
 # ── Validate template file exists ──────────────────────────────────────────────
 log_step "Locating compose template"
@@ -127,6 +129,11 @@ EXECUTOR_IMAGE_SHA256="${EXECUTOR_IMAGE_SHA256}" \
   envsubst '${EXECUTOR_IMAGE_SHA256}' \
   < "$COMPOSE_TEMPLATE" \
   > "$TEMP_COMPOSE_FILE"
+
+# The template names the release repository; a -dev runner must pull the -dev executor it was built with.
+if [[ -n "${IMAGE_REPO_SUFFIX:-}" ]]; then
+  sed -i "s#daturaai/compute-subnet-executor@#daturaai/compute-subnet-executor${IMAGE_REPO_SUFFIX}@#g" "$TEMP_COMPOSE_FILE"
+fi
 
 # Verify the hash was injected correctly in every expected location
 injected_count=$(grep -c "${EXECUTOR_IMAGE_SHA256}" "$TEMP_COMPOSE_FILE" || true)

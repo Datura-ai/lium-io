@@ -167,6 +167,8 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
 # public chip list) takes the AC card's sizes. Derived, never a row of its own: a corrected AC size moves
 # both names. The precheck fails closed on a reading outside the window.
 GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
+# `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300, so the same nominal size; no GB300 reading observed yet.
+GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not

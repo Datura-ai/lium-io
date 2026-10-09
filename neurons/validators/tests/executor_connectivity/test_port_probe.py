@@ -1,6 +1,6 @@
 import pytest
 
-from services.executor_connectivity.models import PortPair
+from services.executor_connectivity.models import BatchResult, PortPair
 from services.executor_connectivity.port_probe import PortProbe
 
 
@@ -9,7 +9,7 @@ async def test_port_probe_uses_batch_when_successful(mocker):
     ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
 
     batch = mocker.Mock()
-    batch.verify = mocker.AsyncMock(return_value=(ports, []))
+    batch.verify = mocker.AsyncMock(return_value=BatchResult(ports, [], True))
     semi = mocker.Mock()
     semi.verify = mocker.AsyncMock()
     fallback = mocker.Mock()
@@ -31,7 +31,7 @@ async def test_port_probe_uses_semi_batch_when_batch_empty(mocker):
     ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
 
     batch = mocker.Mock()
-    batch.verify = mocker.AsyncMock(return_value=([], ports))
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports, True))
     semi = mocker.Mock()
     semi.verify = mocker.AsyncMock(return_value=(ports, []))
     fallback = mocker.Mock()
@@ -55,7 +55,7 @@ async def test_port_probe_keeps_partial_semi_batch_result(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
 
     batch = mocker.Mock()
-    batch.verify = mocker.AsyncMock(return_value=([], ports))
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports, True))
     semi = mocker.Mock()
     semi.verify = mocker.AsyncMock(return_value=(ports[:2], ports[2:]))
     fallback = mocker.Mock()
@@ -75,7 +75,7 @@ async def test_port_probe_falls_through_to_fallback_when_batch_and_semi_empty(mo
     ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
 
     batch = mocker.Mock()
-    batch.verify = mocker.AsyncMock(return_value=([], ports))
+    batch.verify = mocker.AsyncMock(return_value=BatchResult([], ports, True))
     semi = mocker.Mock()
     semi.verify = mocker.AsyncMock(return_value=([], ports))
     fallback = mocker.Mock()

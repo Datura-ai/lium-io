@@ -37,6 +37,20 @@ def uuids_to_match_bans_against(reported: list[str], kernel: list[str] | None) -
     return list(dict.fromkeys(reported + (kernel or [])))
 
 
+def has_live_rental(ctx: Context) -> bool:
+    """Whether a renter's pod is running on this executor right now.
+
+    A ban stops new rentals; it is not a reason to stop verifying a node whose pod is already
+    in use. A node that stops being verified goes stale, is flipped inactive by the hourly
+    sweep and loses renter billing and its payouts, which is not what a ban should do.
+    """
+    rented_data = ctx.state.rented_data
+    if rented_data is None:
+        return False
+    executor = rented_data.executors.get(ctx.executor.uuid)
+    return bool(executor and executor.pods)
+
+
 class BannedProviderCheck:
     check_id = "gpu.validate.banned_provider"
     fatal = True
@@ -89,7 +103,10 @@ class BannedProviderCheck:
         if is_banned:
             event = render_message(Msg.PROVIDER_BANNED, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(
-                passed=False, event=event, updates={**updates, "is_provider_banned": True}
+                passed=False,
+                event=event,
+                updates={**updates, "is_provider_banned": True},
+                fatal=not has_live_rental(ctx),
             )
 
         if foreign_mounts and settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED:

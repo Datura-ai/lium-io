@@ -69,7 +69,7 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
-from services.docker_service import inflight_creates
+from services.docker_service import create_steps_after_reply, inflight_creates
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -95,6 +95,17 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 
 
+class OutgoingMessages(list[DeliveryStamps]):
+    # every append wakes the send loop, so a reply leaves at once instead of on the next 1 s poll
+    def __init__(self) -> None:
+        super().__init__()
+        self.appended = asyncio.Event()
+
+    def append(self, message: DeliveryStamps) -> None:
+        super().append(message)
+        self.appended.set()
+
+
 class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
         self.reason = reason
@@ -115,7 +126,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue: list[DeliveryStamps] = []
+        self.message_queue = OutgoingMessages()
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -169,6 +180,8 @@ class ComputeClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.miner_drivers.put(None)
         await self.miner_driver_awaiter_task
+        # the drivers' creates replied before their key removal and session close; finish those too
+        await create_steps_after_reply.wait_until_all_done()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):
@@ -178,7 +191,7 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        self.subtensor_client = await SubtensorClient.initialize()
+        self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
 
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
@@ -354,6 +367,7 @@ class ComputeClient:
                             batch_total=data.get("batch_total"),
                             availability_errors=data.get("availability_errors"),
                             pod_states=data.get("pod_states"),
+                            pod_ssh=data.get("pod_ssh"),
                         )
 
                         async with self.lock:
@@ -499,7 +513,8 @@ class ComputeClient:
                             )
                         )
             else:
-                await asyncio.sleep(1)
+                self.message_queue.appended.clear()
+                await self.message_queue.appended.wait()
 
     async def poll_rented_machines(self):
         while True:

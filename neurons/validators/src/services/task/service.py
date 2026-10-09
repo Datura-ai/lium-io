@@ -11,7 +11,6 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationError, AttestationNonce, AttestationService
-from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.interactive_shell_service import InteractiveShellService
@@ -23,9 +22,9 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import availability_errors, build_ssh_unreachable_event
-from .messages import TenantEnforcementMessages
-from .models import JobResult
+from .availability import MAX_PEER_TEXT_LENGTH, availability_errors, build_ssh_unreachable_event
+from .messages import REASON_CODE_DOCS_URL, TenantEnforcementMessages
+from .models import JobResult, ValidationEvent, build_msg
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
@@ -41,6 +40,28 @@ def _is_ssh_transport_failure(error: BaseException) -> bool:
     return isinstance(error, (asyncssh.Error, OSError))
 
 
+def _transport_unreachable_event(*, executor_uuid: str, error: BaseException) -> ValidationEvent:
+    """The structured event of a run whose shell died after the connect.
+
+    The rented-machine check's template; no check_id, since the error does not say which check
+    was running when the shell died.
+    """
+    template = TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE
+    return build_msg(
+        event=template.event,
+        reason=template.reason,
+        severity=template.severity,
+        category=template.category,
+        impact=template.impact,
+        remediation=template.remediation,
+        help_uri=template.help_uri or REASON_CODE_DOCS_URL,
+        what={
+            "executor_uuid": executor_uuid,
+            "transport_error": repr(error)[:MAX_PEER_TEXT_LENGTH],
+        },
+    )
+
+
 class TaskService:
     def __init__(
         self,
@@ -48,7 +69,6 @@ class TaskService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
-        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
@@ -68,7 +88,6 @@ class TaskService:
             redis_service=redis_service,
             validation_service=validation_service,
             verifyx_validation_service=verifyx_validation_service,
-            collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             backend_client=backend_client,
             pod_recovery=pod_recovery,
@@ -191,7 +210,12 @@ class TaskService:
                 if settings.DRY_RUN:
                     checks = self.pipeline_factory.build_dry_run_checks()
                 else:
-                    checks = self.pipeline_factory.build_checks()
+                    # Validation fast path: a never-validated idle node's first pass runs the
+                    # same checks arranged to wait less (flag-gated); the wave never does.
+                    if PipelineFactory.takes_fast_path(first_pass, executor_info.uuid, rented_data):
+                        checks = self.pipeline_factory.build_checks(fast_path=True)
+                    else:
+                        checks = self.pipeline_factory.build_checks()
                 pipeline = self.pipeline_factory.build_pipeline(checks)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
@@ -229,6 +253,7 @@ class TaskService:
 
         except Exception as e:
             failure_reason_code = None
+            event = None
             # DAH-2748: SSH we could not open is an availability error, not a verdict on the
             # machine. One is enough to hide the node until a cycle succeeds.
             if is_opening_ssh_connection and _is_ssh_transport_failure(e):
@@ -250,7 +275,8 @@ class TaskService:
                 # backend call included): inside a rollout window that withholds a verdict for two
                 # cycles at most, outside it the name changes nothing.
                 if has_reached_the_node and _is_ssh_transport_failure(e):
-                    failure_reason_code = TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+                    event = _transport_unreachable_event(executor_uuid=executor_info.uuid, error=e)
+                    failure_reason_code = event.reason_code
                 log_text = _m(
                     "Pipeline validation error",
                     extra=get_extra_info({
@@ -286,6 +312,7 @@ class TaskService:
                 gpu_attestation_passed=gpu_attestation_passed,
                 availability_errors=availability_problems,
                 failure_reason_code=failure_reason_code,
+                validation_event=event,
             )
 
 

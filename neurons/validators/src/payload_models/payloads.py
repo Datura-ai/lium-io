@@ -555,7 +555,16 @@ class ProfilerStepName(str, enum.Enum):
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
+    # DAH-3980: the collector starts after the reply, outside the create's window: this row has
+    # no duration, the log line "Create step after reply finished" carries it
+    INSPECTOR_START_AFTER_REPLY = "Inspector collector start runs after the reply"
     FINISHED_IN_SUBNET = "Finished in subnet."
+    # DAH-3980: host work started early that runs beside the steps above; each row is that
+    # work's own start->end, overlapping the step rows (which keep only the residual wait),
+    # so it is never part of a sum of the profile.
+    PRERUN_HOST_PROBE_PARALLEL = "Prerun host probe (parallel)"
+    VOLUME_HOST_PROBE_PARALLEL = "Volume host probe (parallel)"
+    GPU_POWER_RESTORE_PARALLEL = "GPU power restore (parallel)"
     # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
     # appends these to its own profiler and passes the pre-dispatch ones in
     # ContainerCreateRequest.pre_dispatch_profilers; the subnet seeds its profile from them so the
@@ -565,6 +574,13 @@ class ProfilerStepName(str, enum.Enum):
     FILLER_PREEMPTION = "Filler preemption"
     BACKEND_PREP = "Backend rent prep"
     BACKEND_FINALIZE = "Backend finalize"
+
+
+PARALLEL_PROFILER_STEP_NAMES = frozenset({
+    ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+    ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+    ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
+})
 
 
 def now_ms() -> int:

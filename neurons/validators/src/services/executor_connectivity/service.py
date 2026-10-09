@@ -76,6 +76,10 @@ class ExecutorConnectivityService:
                 error=verification.error,
                 elapsed_sec=time.monotonic() - t1,
                 dind_error=verification.dind_error,
+                port_ranges=verification.port_ranges,
+                second_pass=verification.second_pass,
+                probe_tier=verification.probe_tier,
+                declared_port_count=verification.declared_port_count,
             )
 
             return result

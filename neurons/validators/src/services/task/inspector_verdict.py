@@ -1,4 +1,4 @@
-"""Turn an Inspector report into a verdict the validator can act on (DAH-3275).
+"""Turn an Inspector report into a verdict the validator records (DAH-3275).
 
 The sensor reports every `docker exec` / `nsenter` / memory read against a rented pod. Many of
 those are the platform's own: the liveness exec (`checks/rented_machine.py`, `cat
@@ -15,9 +15,10 @@ control-plane action (`DockerExec`, and the `docker cp` / `docker rm` / … the 
 pod's behalf) from inside the executor container is *platform-origin* (the sensor itself already
 drops docker-policy findings whose ancestry reaches sshd or pid 1, so these are the ones it could
 not trust); anything from the host, a `NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
-what the check, the score gate and the renter event act on when it names a rented pod (or names no
-container at all); a finding on any other container is recorded under `unmatched_containers` and
-acts on nobody. The executor's own backup and restore (`executor/src/storage/restic.py`) never
+what the MALICIOUS event records, with the rented pods it names (or every rented pod when it names no
+container at all) in `affected_pod_ids`; a finding on any other container is recorded under
+`unmatched_containers`. The verdict is evidence only: no score, renter message or ban reads it.
+The executor's own backup and restore (`executor/src/storage/restic.py`) never
 reach this module: the sensor classifies the encrypted flow's `nsenter -t <pid> -U` as benign
 (nsenter.rs: a `CLONE_NEWUSER`-only `setns`, judged by nstype, never by a container name) and the
 unencrypted flow's `-v volume_<pod_id>:/workspace` bind as a runtime mount (mount.rs: runc /
@@ -50,7 +51,7 @@ _EXEC_FLAGS = {"-i", "-t", "-it", "-ti", "-d", "--detach", "--privileged", "--in
 _SHELL_WRAPPERS = {"sh", "/bin/sh", "bash", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash"}
 _SHELL_COMMAND_FLAGS = {"-c", "-lc", "-ec", "-lec"}
 # The sensor's `RuntimeInterferenceKind` (celium-gpu-verifier inspector/src/collector/analysis/
-# types.rs, serde PascalCase) — the only strings a renter is shown as a finding kind. Anything else
+# types.rs, serde PascalCase) — the only strings the verdict publishes as a finding kind. Anything else
 # — the report is produced on the provider's root when the sensor is unattested — is shown as
 # `unknown` and kept raw only inside the evidence. Keep in step with types.rs and
 # inspector_summary/sql.py.
@@ -76,10 +77,6 @@ _DOCKER_CONTROL_PLANE_KINDS = (
     frozenset(kind for kind in KNOWN_FINDING_KINDS if kind.startswith("Docker")) - _PATH_SHAPED_KINDS
 )
 RENTAL_VOLUME_TAG = "rental_volume"
-# the renter's pod-log entry carries at most this many evidence hashes; the finding count is the
-# sensor's to choose (21,694 OverlayFsRead in one day, 8 Sep), the full list stays in the
-# inspector event's `context.verdict`
-_RENTER_EVIDENCE_MAX = 20
 UNKNOWN_KIND = "unknown"
 _PAYLOAD_PREVIEW_CHARS = 160
 _PAYLOAD_PREVIEW_MAX = 20
@@ -88,10 +85,6 @@ _UNMATCHED_NAME_CHARS = 128
 
 SENSOR_ATTESTED = "attested"
 SENSOR_UNATTESTED = "unattested"
-ACTION_QUARANTINE = "quarantine"
-ACTION_NONE = "none"
-BAN_SOURCE = "inspector_auto"
-RENTER_EVENT = "provider_access_detected"
 
 
 class VerdictPayload(BaseModel):
@@ -108,38 +101,16 @@ class VerdictPayload(BaseModel):
     evidence_sha256: list[str]
     report_sha256: str
     sensor: str
-    enforce: bool
-    action: str
-    ban_source: str | None
     # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
     platform_exec_commands: list[str]
-    # provider findings on a container that is not in the rented list: recorded, no renter told,
-    # no action
+    # provider findings on a container that is not in the rented list
     unmatched_containers: list[str]
     unmatched_containers_count: int
     # provider findings that named no container and no rental volume: each one marks every rented
-    # pod on the host (the fallback the flag decision has to measure)
+    # pod on the host
     unnamed_findings: int
-    # platform findings by kind, for the shadow numbers
+    # platform findings by kind, for the daily digest
     platform_kind_counts: dict[str, int]
-
-
-class RenterAccessEvent(BaseModel):
-    """One pod-log entry the renter sees in their pod's event stream."""
-
-    log_text: str
-    log_status: str
-    log_tag: str
-    event: str
-    pod_id: str
-    when: str
-    finding_kinds: list[str]
-    provider_findings: int
-    report_sha256: str
-    evidence_sha256: list[str]
-    evidence_sha256_truncated: bool
-    sensor: str
-    action: str
 
 
 @dataclass(frozen=True)
@@ -151,12 +122,9 @@ class InspectorVerdict:
     finding_kinds: list[str]
     affected_pod_ids: list[str]
     sensor_attestation: str
-    enforce: bool
-    action: str
     # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
     platform_exec_commands: list[str] = field(default_factory=list)
-    # provider findings on a container that is not in the rented list: recorded, no renter told,
-    # no action
+    # provider findings on a container that is not in the rented list
     unmatched_containers: list[str] = field(default_factory=list)
     unmatched_containers_count: int = 0
     # provider findings that named no container and no rental volume (every rented pod is marked)
@@ -175,20 +143,12 @@ class InspectorVerdict:
             evidence_sha256=self.evidence_sha256,
             report_sha256=self.report_sha256,
             sensor=self.sensor_attestation,
-            enforce=self.enforce,
-            action=self.action,
-            ban_source=BAN_SOURCE if self.action == ACTION_QUARANTINE else None,
             platform_exec_commands=self.platform_exec_commands,
             unmatched_containers=self.unmatched_containers,
             unmatched_containers_count=self.unmatched_containers_count,
             unnamed_findings=self.unnamed_findings,
             platform_kind_counts=_kind_counts(self.platform_findings),
         )
-
-    def findings_for_pod(self, pod_id: str) -> list[dict[str, Any]]:
-        """The provider findings that concern this pod: the ones naming its container or its volume,
-        and the ones naming nothing (those mark every rented pod on the host)."""
-        return [f for f in self.provider_findings if _concerns_pod(f, pod_id)]
 
 
 def canonical_sha256(value: Any) -> str:
@@ -338,20 +298,12 @@ def _kind_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _concerns_pod(finding: dict[str, Any], pod_id: str) -> bool:
-    """A finding is about this pod when it names its container or volume, or names nothing at all
-    (those mark every rented pod); a foreign container — even one named like a pod id — is nobody's."""
-    name = _named_resource(finding)
-    return name is None or pod_id_of(name) == pod_id
-
-
 def build_verdict(
     report: dict[str, Any],
     findings: list[dict[str, Any]],
     *,
     rented_pod_ids: list[str],
     sensor_attested: bool,
-    enforce: bool,
 ) -> InspectorVerdict:
     provider: list[dict[str, Any]] = []
     platform: list[dict[str, Any]] = []
@@ -370,15 +322,11 @@ def build_verdict(
         elif pod_id in rented:
             affected.add(pod_id)
         else:
-            # a pod that left or joined since the rented list was fetched, or not a pod at all:
-            # recorded, but no renter is told about a container that was not theirs
+            # a pod that left or joined since the rented list was fetched, or not a pod at all
             unmatched.add(name)
     if unnamed:
-        # the sensor named no container at all: every renter on this host is told
+        # the sensor named no container at all: every rented pod on this host is affected
         affected |= rented
-    # Enforcement acts only for a rented pod: a provider inside their own container (a finding
-    # that names no rented pod) is recorded in `unmatched_containers` and quarantines nobody.
-    action = ACTION_QUARANTINE if (affected and enforce) else ACTION_NONE
     names = sorted(unmatched)
     return InspectorVerdict(
         provider_findings=provider,
@@ -388,47 +336,8 @@ def build_verdict(
         finding_kinds=sorted({finding_kind(f) for f in provider}),
         affected_pod_ids=sorted(affected),
         sensor_attestation=SENSOR_ATTESTED if sensor_attested else SENSOR_UNATTESTED,
-        enforce=enforce,
-        action=action,
         platform_exec_commands=_platform_exec_commands(platform),
         unmatched_containers=[name[:_UNMATCHED_NAME_CHARS] for name in names[:_UNMATCHED_MAX]],
         unmatched_containers_count=len(names),
         unnamed_findings=unnamed,
-    )
-
-
-def renter_access_event(
-    verdict: InspectorVerdict,
-    *,
-    pod_id: str,
-    when: str,
-) -> RenterAccessEvent:
-    """One pod-log entry the renter sees in their pod's event stream: only the findings about this
-    pod (its container, its volume, or none named), never another renter's."""
-    findings = verdict.findings_for_pod(pod_id)
-    finding_kinds = sorted({finding_kind(f) for f in findings})
-    evidence = [canonical_sha256(f) for f in findings]
-    kinds = ", ".join(finding_kinds) or "access"
-    sensor = "attested sensor" if verdict.sensor_attestation == SENSOR_ATTESTED else "unattested sensor"
-    # `quarantine` only asks the backend to act; the ban itself is the backend's
-    outcome = (
-        " and asked to take the host off the marketplace." if verdict.action == ACTION_QUARANTINE else "."
-    )
-    return RenterAccessEvent(
-        log_text=(
-            f"Provider-side access to this pod detected ({kinds}; {sensor}). "
-            f"Lium has recorded the evidence{outcome}"
-        ),
-        log_status="error",
-        log_tag=RENTER_EVENT,
-        event=RENTER_EVENT,
-        pod_id=pod_id,
-        when=when,
-        finding_kinds=finding_kinds,
-        provider_findings=len(findings),
-        report_sha256=verdict.report_sha256,
-        evidence_sha256=evidence[:_RENTER_EVIDENCE_MAX],
-        evidence_sha256_truncated=len(evidence) > _RENTER_EVIDENCE_MAX,
-        sensor=verdict.sensor_attestation,
-        action=verdict.action,
     )

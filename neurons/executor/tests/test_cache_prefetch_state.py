@@ -37,12 +37,20 @@ STALE_DIGEST = "sha256:2d19c94ce8a37c6fa364f8a6211d8b6dc1a44ece574c4c22ab5579925
 
 def _make_client(local_digests: list[str] | None = None, image_absent: bool = False) -> MagicMock:
     client = MagicMock()
-    if image_absent:
-        client.images.get.side_effect = docker.errors.ImageNotFound("absent")
-    else:
-        image = MagicMock()
-        image.attrs = {"RepoDigests": [f"{REPO}@{digest}" for digest in (local_digests or [])]}
-        client.images.get.return_value = image
+    local = MagicMock()
+    local.attrs = {"RepoDigests": [f"{REPO}@{digest}" for digest in (local_digests or [])]}
+    # What the lookup after a pull returns; `image_absent` is about the tag before the pull.
+    client.pulled_image = MagicMock()
+
+    def get(ref):
+        if "@" in ref:
+            return client.pulled_image
+        if image_absent:
+            raise docker.errors.ImageNotFound("absent")
+        return local
+
+    client.images.get.side_effect = get
+    client.api.pull.side_effect = lambda *args, **kwargs: iter([{"status": "Pull complete"}])
     client.images.list.return_value = []
     return client
 
@@ -104,7 +112,7 @@ def test_remote_digest_unreadable_keeps_the_registry_error():
     assert "429 Too Many Requests" in record["last_error"]
     assert "429 Too Many Requests" in record["last_remote_error"]
     assert record["remote_digest"] is None
-    client.images.pull.assert_not_called()
+    client.api.pull.assert_not_called()
 
 
 def test_repeated_unreadable_remote_accumulates_a_count():
@@ -133,7 +141,7 @@ def test_insufficient_disk_records_both_numbers(monkeypatch):
     assert record["last_outcome"] == Outcome.INSUFFICIENT_DISK
     assert record["last_disk_required_bytes"] == 30_000
     assert record["last_disk_available_bytes"] == 1_000
-    client.images.pull.assert_not_called()
+    client.api.pull.assert_not_called()
 
 
 def test_lock_held(monkeypatch):
@@ -152,7 +160,7 @@ def test_lock_held(monkeypatch):
     _run(client, _template(FRESH_DIGEST), state)
 
     assert _image(state)["last_outcome"] == Outcome.LOCK_HELD
-    client.images.pull.assert_not_called()
+    client.api.pull.assert_not_called()
 
 
 def test_pull_ok():
@@ -172,7 +180,7 @@ def test_pull_failed_is_recorded_and_re_raised():
     # Today a failed pull aborts the sweep and backs off. Recording must not change that.
     state = CachePrefetchState(path=None)
     client = _make_client(image_absent=True)
-    client.images.pull.side_effect = RuntimeError("manifest unknown")
+    client.api.pull.side_effect = RuntimeError("manifest unknown")
 
     with pytest.raises(RuntimeError):
         _run(client, _template(FRESH_DIGEST), state)
@@ -185,7 +193,14 @@ def test_pull_failed_is_recorded_and_re_raised():
 def test_local_read_error_is_kept():
     state = CachePrefetchState(path=None)
     client = _make_client()
-    client.images.get.side_effect = RuntimeError("daemon busy")
+    lookup = client.images.get.side_effect
+
+    def get(ref):
+        if "@" in ref:
+            return lookup(ref)
+        raise RuntimeError("daemon busy")
+
+    client.images.get.side_effect = get
 
     _run(client, _template(FRESH_DIGEST), state)
 

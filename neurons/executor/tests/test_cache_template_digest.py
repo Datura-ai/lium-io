@@ -26,12 +26,20 @@ TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"
 
 def _make_client(local_digests: list[str] | None = None, image_absent: bool = False) -> MagicMock:
     client = MagicMock()
-    if image_absent:
-        client.images.get.side_effect = docker.errors.ImageNotFound("absent")
-    else:
-        image = MagicMock()
-        image.attrs = {"RepoDigests": [f"{REPO}@{digest}" for digest in (local_digests or [])]}
-        client.images.get.return_value = image
+    local = MagicMock()
+    local.attrs = {"RepoDigests": [f"{REPO}@{digest}" for digest in (local_digests or [])]}
+    # What the lookup after a pull returns; `image_absent` is about the tag before the pull.
+    client.pulled_image = MagicMock()
+
+    def get(ref):
+        if "@" in ref:
+            return client.pulled_image
+        if image_absent:
+            raise docker.errors.ImageNotFound("absent")
+        return local
+
+    client.images.get.side_effect = get
+    client.api.pull.side_effect = lambda *args, **kwargs: iter([{"status": "Pull complete"}])
     client.images.list.return_value = []
     return client
 
@@ -55,37 +63,33 @@ def test_backend_digest_match_skips_pull():
     asyncio.run(cache_template_service._ensure_template(client, _template(EXPECTED_DIGEST)))
 
     # Assert
-    client.images.pull.assert_not_called()
+    client.api.pull.assert_not_called()
     client.images.get_registry_data.assert_not_called()
 
 
 def test_backend_digest_mismatch_pulls_pinned_and_retags():
     # Arrange: local tag poisoned by a stale mirror, backend knows the fresh digest
     client = _make_client(local_digests=[STALE_DIGEST])
-    pulled_image = MagicMock()
-    client.images.pull.return_value = pulled_image
 
     # Act
     asyncio.run(cache_template_service._ensure_template(client, _template(EXPECTED_DIGEST)))
 
     # Assert: content-addressed pull, then the tag is re-pointed at the pinned build
-    client.images.pull.assert_called_once_with(f"{REPO}@{EXPECTED_DIGEST}")
-    pulled_image.tag.assert_called_once_with(REPO, TAG)
+    client.api.pull.assert_called_once_with(REPO, tag=EXPECTED_DIGEST, stream=True, decode=True)
+    client.pulled_image.tag.assert_called_once_with(REPO, TAG)
     client.images.get_registry_data.assert_not_called()
 
 
 def test_backend_digest_image_absent_pulls_pinned():
     # Arrange: nothing cached locally yet
     client = _make_client(image_absent=True)
-    pulled_image = MagicMock()
-    client.images.pull.return_value = pulled_image
 
     # Act
     asyncio.run(cache_template_service._ensure_template(client, _template(EXPECTED_DIGEST)))
 
     # Assert: first pull is digest-pinned too (bypasses the mirror from the start)
-    client.images.pull.assert_called_once_with(f"{REPO}@{EXPECTED_DIGEST}")
-    pulled_image.tag.assert_called_once_with(REPO, TAG)
+    client.api.pull.assert_called_once_with(REPO, tag=EXPECTED_DIGEST, stream=True, decode=True)
+    client.pulled_image.tag.assert_called_once_with(REPO, TAG)
 
 
 def test_no_backend_digest_matching_remote_skips_pull():
@@ -99,7 +103,7 @@ def test_no_backend_digest_matching_remote_skips_pull():
     asyncio.run(cache_template_service._ensure_template(client, _template()))
 
     # Assert
-    client.images.pull.assert_not_called()
+    client.api.pull.assert_not_called()
 
 
 def test_no_backend_digest_changed_remote_pulls_by_tag():
@@ -113,7 +117,7 @@ def test_no_backend_digest_changed_remote_pulls_by_tag():
     asyncio.run(cache_template_service._ensure_template(client, _template()))
 
     # Assert: legacy pull by repo + tag, no digest pinning involved
-    client.images.pull.assert_called_once_with(REPO, TAG)
+    client.api.pull.assert_called_once_with(REPO, tag=TAG, stream=True, decode=True)
 
 
 def test_no_backend_digest_unreadable_remote_keeps_local():
@@ -125,4 +129,4 @@ def test_no_backend_digest_unreadable_remote_keeps_local():
     asyncio.run(cache_template_service._ensure_template(client, _template()))
 
     # Assert
-    client.images.pull.assert_not_called()
+    client.api.pull.assert_not_called()
