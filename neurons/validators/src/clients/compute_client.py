@@ -69,7 +69,7 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
-from services.docker_service import inflight_creates
+from services.docker_service import create_steps_after_reply, inflight_creates
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -180,6 +180,8 @@ class ComputeClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.miner_drivers.put(None)
         await self.miner_driver_awaiter_task
+        # the drivers' creates replied before their key removal and session close; finish those too
+        await create_steps_after_reply.wait_until_all_done()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):

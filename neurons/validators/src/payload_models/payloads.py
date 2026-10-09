@@ -555,6 +555,9 @@ class ProfilerStepName(str, enum.Enum):
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
+    # DAH-3980: the collector starts after the reply, outside the create's window: this row has
+    # no duration, the log line "Create step after reply finished" carries it
+    INSPECTOR_START_AFTER_REPLY = "Inspector collector start runs after the reply"
     FINISHED_IN_SUBNET = "Finished in subnet."
     # DAH-3980: host work started early that runs beside the steps above; each row is that
     # work's own start->end, overlapping the step rows (which keep only the residual wait),

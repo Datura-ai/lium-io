@@ -389,6 +389,11 @@ class RedisService:
         async with self.lock:
             return await self.redis.lrange(key, 0, -1)
 
+    async def llen(self, key: str) -> int:
+        """Number of elements in a list in Redis."""
+        async with self.lock:
+            return await self.redis.llen(key)
+
     async def lrem(self, key: str, element: bytes, count: int = 0):
         """Remove elements from a list in Redis."""
         async with self.lock:

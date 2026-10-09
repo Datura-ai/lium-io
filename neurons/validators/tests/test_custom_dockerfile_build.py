@@ -71,12 +71,15 @@ def deps():
 @pytest_asyncio.fixture
 async def svc(deps):
     ssh_service, redis_service, attestation_service = deps
-    return DockerService(
+    service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
         attestation_service=attestation_service,
         rental_docker_client_factory=_FakeRentalDockerFactory(),
     )
+    # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
+    service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    return service
 
 
 class _FakeRentalDockerClient:
