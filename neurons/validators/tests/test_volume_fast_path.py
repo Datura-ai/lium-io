@@ -671,6 +671,7 @@ class _TwoLoopbackPluginHost:
         v2_install_channel_open_seconds: float = 0,
         v2_state_channel_open_hangs: bool = False,
         v2_state_channel_open_answer_seconds: float = 0,
+        v2_state_command_seconds: float = 0,
         max_sessions: int | None = None,
     ):
         self.plugins = dict(plugins)  # plugin name -> enabled
@@ -682,6 +683,7 @@ class _TwoLoopbackPluginHost:
         self.v2_install_channel_open_seconds = v2_install_channel_open_seconds
         self.v2_state_channel_open_hangs = v2_state_channel_open_hangs
         self.v2_state_channel_open_answer_seconds = v2_state_channel_open_answer_seconds
+        self.v2_state_command_seconds = v2_state_command_seconds
         self.max_sessions = max_sessions
         self.open_channels = 0
         self.commands: list[str] = []
@@ -712,7 +714,10 @@ class _TwoLoopbackPluginHost:
             # wait leaves the session taken, as asyncssh opens the channel anyway
             self.open_channels += 1
             await asyncio.sleep(self.v2_state_channel_open_answer_seconds)
-            return _HostProcess(self, command)
+            process = _HostProcess(self, command)
+            if self.v2_state_command_seconds:
+                process.run_child_for(self.v2_state_command_seconds)
+            return process
         if "plugin install" in command and f"--alias {_V2} " in command:
             await asyncio.sleep(self.v2_install_channel_open_seconds)
         self.open_channels += 1
@@ -784,12 +789,25 @@ class _TwoLoopbackPluginHost:
 
 class _HostProcess:
     # one SSH channel: closed by the host once the command exits, or by close(); like OpenSSH,
-    # the session stays taken while its command still runs
+    # the session stays taken while its command still runs, closed or not
     def __init__(self, host: _TwoLoopbackPluginHost, command: str):
         self.host = host
         self.command = command
         self.is_open = True
         self.child_alive = False
+        self.close_requested = False
+
+    def run_child_for(self, seconds: float) -> None:
+        # the command was sent with the open and runs on its own, nobody reading its answer
+        self.child_alive = True
+
+        async def child() -> None:
+            await asyncio.sleep(seconds)
+            self.child_alive = False
+            if self.close_requested:
+                self.close()
+
+        self.child_task = asyncio.ensure_future(child())
 
     async def wait(self):
         self.child_alive = True
@@ -799,9 +817,14 @@ class _HostProcess:
         return answer
 
     def close(self) -> None:
+        self.close_requested = True
         if self.is_open and not self.child_alive:
             self.is_open = False
             self.host.open_channels -= 1
+
+    async def wait_closed(self) -> None:
+        while self.is_open:
+            await asyncio.sleep(0.01)
 
 
 async def _rent_a_new_volume(
@@ -961,6 +984,26 @@ async def test_create_local_volume_falls_back_after_a_late_v2_state_channel_open
     )
 
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.2), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.open_channels == 0
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_falls_back_once_a_late_v2_state_channel_s_command_has_ended(
+    docker_service,
+):
+    # the open answers within the second timeout, its inspect already running: sshd frees the
+    # MaxSessions=1 session only when that ends, so the fallback must wait for the close
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True},
+        v2_install_fails=True,
+        v2_state_channel_open_answer_seconds=0.4,
+        v2_state_command_seconds=0.1,
+        max_sessions=1,
+    )
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.3), timeout=5)
 
     assert host.volumes["volume_new"][0] == _OLD
     assert host.open_channels == 0

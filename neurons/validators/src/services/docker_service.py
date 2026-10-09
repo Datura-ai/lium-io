@@ -1817,6 +1817,14 @@ def _close_process_opened_late(opening: asyncio.Future) -> None:
         opening.result().close()
 
 
+async def _close_channel_within(process: asyncssh.SSHClientProcess, timeout: float | None) -> None:
+    # sshd keeps a closed channel's session while its command still runs (MaxSessions=1)
+    process.close()
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(timeout):
+            await process.wait_closed()
+
+
 async def _run_closing_channel_on_timeout(
     ssh_client: asyncssh.SSHClientConnection, command: str, timeout: float | None
 ) -> asyncssh.SSHCompletedProcess:
@@ -1828,16 +1836,19 @@ async def _run_closing_channel_on_timeout(
         async with asyncio.timeout(timeout):
             process = await asyncio.shield(opening)
     except TimeoutError:
-        # a cancelled open whose answer comes late leaves its session taken: never cancel it,
-        # close it when it answers, and give it one more timeout to answer before going on
-        opening.add_done_callback(_close_process_opened_late)
-        await asyncio.wait({opening}, timeout=timeout)
+        # a cancelled open whose answer comes late leaves its session taken: never cancel it;
+        # give it one more timeout to answer and close, else close it whenever it answers
+        done, _ = await asyncio.wait({opening}, timeout=timeout)
+        if not done:
+            opening.add_done_callback(_close_process_opened_late)
+        elif opening.exception() is None:
+            await _close_channel_within(opening.result(), timeout)
         raise
     try:
         async with asyncio.timeout(timeout):
             return await process.wait()
     except TimeoutError:
-        process.close()
+        await _close_channel_within(process, timeout)
         raise
 
 
