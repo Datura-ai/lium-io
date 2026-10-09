@@ -27,7 +27,7 @@ from neurons.validators.src.services.task.messages import TenantEnforcementMessa
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 from neurons.validators.src.services.task.runner import SSHCommandResult
-from services.redis_service import RESET_VERIFIED_JOB_CHANNEL, VERIFIED_JOB_COUNT_KEY, RedisService
+from services.redis_service import RESET_VERIFIED_JOB_CHANNEL, VERIFIED_JOB_COUNT_KEY, RedisService, verified_job_field
 from services.ssh_service import SSHService
 from test_rented_machine_check import (
     DummyBackendClient,
@@ -150,7 +150,7 @@ def _resets(service: RedisService) -> list[dict]:
 
 
 async def _record(service: RedisService) -> dict:
-    return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR))
+    return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, verified_job_field("hk", EXECUTOR)))
 
 
 HEALTHY = _scrape_result(stdout=SSHService()._encrypt(ENCRYPT_KEY, json.dumps(HEALTHY_SPECS)), exit_code=0)
