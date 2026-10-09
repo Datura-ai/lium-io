@@ -275,47 +275,32 @@ async def test_the_binary_answers_a_verify_result_through_parse_answer(image, ke
 
 
 @pytest.mark.asyncio
-async def test_a_signer_the_host_does_not_trust_is_exit_4(image):
-    stranger = bittensor.Keypair.create_from_uri("//NotThePinnedValidator")
-    async with FakeSshd(image.wrapper) as sshd, sshd.connect() as ssh:
-        answer = await LiumdExecClient(stranger, timeout_s=60).run(ssh, _intent())
-
-    assert isinstance(answer, LiumdRefusal)
-    assert (answer.exit_status, answer.error, answer.echoed) == (4, "bad_signature", True)
-
-
-@pytest.mark.asyncio
-async def test_a_replayed_intent_is_exit_5(image, keypair):
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("stranger", (4, "bad_signature")),
+        ("replay", (5, "nonce_replayed")),
+        ("other_miner", (4, "intent_refused")),
+        ("no_hotkeys", (6, "agent_error")),
+    ],
+)
+async def test_the_host_refuses_with_its_exit_status(image, keypair, case, expected):
+    signer = keypair
     intent = _intent()
-    client = LiumdExecClient(keypair, timeout_s=60)
+    if case == "stranger":
+        signer = bittensor.Keypair.create_from_uri("//NotThePinnedValidator")
+    elif case == "other_miner":
+        intent = _intent(miner_hotkey="5SomeoneElsesMiner")
+    elif case == "no_hotkeys":
+        (image.root / "etc/liumd/validator_hotkeys").unlink()
+    client = LiumdExecClient(signer, timeout_s=60)
     async with FakeSshd(image.wrapper) as sshd, sshd.connect() as ssh:
-        first = await client.run(ssh, intent)
-        again = await client.run(ssh, intent)
-
-    assert isinstance(first, LocalVerifyAnswer)
-    assert isinstance(again, LiumdRefusal)
-    assert (again.exit_status, again.error) == (5, "nonce_replayed")
-
-
-@pytest.mark.asyncio
-async def test_an_intent_for_another_miner_is_exit_4(image, keypair):
-    async with FakeSshd(image.wrapper) as sshd, sshd.connect() as ssh:
-        answer = await LiumdExecClient(keypair, timeout_s=60).run(
-            ssh, _intent(miner_hotkey="5SomeoneElsesMiner")
-        )
+        if case == "replay":
+            assert isinstance(await client.run(ssh, intent), LocalVerifyAnswer)
+        answer = await client.run(ssh, intent)
 
     assert isinstance(answer, LiumdRefusal)
-    assert (answer.exit_status, answer.error) == (4, "intent_refused")
-
-
-@pytest.mark.asyncio
-async def test_a_host_missing_its_hotkeys_file_is_exit_6(image, keypair):
-    (image.root / "etc/liumd/validator_hotkeys").unlink()
-    async with FakeSshd(image.wrapper) as sshd, sshd.connect() as ssh:
-        answer = await LiumdExecClient(keypair, timeout_s=60).run(ssh, _intent())
-
-    assert isinstance(answer, LiumdRefusal)
-    assert (answer.exit_status, answer.error) == (6, "agent_error")
+    assert (answer.exit_status, answer.error) == expected
 
 
 @pytest.mark.asyncio

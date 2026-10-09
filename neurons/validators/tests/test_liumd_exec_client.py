@@ -187,62 +187,24 @@ async def test_a_refusal_for_another_intent_is_not_echoed(keypair, intent, echo)
     assert (refusal.error, refusal.echoed) == ("busy", False)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("exit_status", [0, 2, 6])
-async def test_a_document_that_is_not_json_is_malformed(keypair, intent, exit_status):
-    conn = FakeConnection(FakeProcess(b"{not json", exit_status))
-
-    with pytest.raises(LocalVerifyUnavailable) as err:
-        await _run(keypair, intent, conn)
-
-    assert err.value.reason == "malformed"
-
-
-@pytest.mark.asyncio
-async def test_a_refusal_that_is_not_an_object_is_malformed(keypair, intent):
-    conn = FakeConnection(FakeProcess(b"[1, 2]", 5))
-
-    with pytest.raises(LocalVerifyUnavailable) as err:
-        await _run(keypair, intent, conn)
-
-    assert err.value.reason == "malformed"
+def _unavailable_cases(intent):
+    return [
+        ("malformed", FakeConnection(FakeProcess(b"{not json", 0))),
+        ("malformed", FakeConnection(FakeProcess(b"{not json", 2))),
+        ("malformed", FakeConnection(FakeProcess(b"[1, 2]", 5))),
+        ("not_supported", FakeConnection(FakeProcess(b"", 126, stderr=b"sh: liumd: not found\n"))),
+        ("not_supported", FakeConnection(FakeProcess(b"", 127, stderr=b"sh: liumd: not found\n"))),
+        ("not_supported", FakeConnection(raises=asyncssh.ChannelOpenError(4, "Session refused"))),
+        ("transport", FakeConnection(raises=asyncssh.ConnectionLost("gone"))),
+        ("unexpected_exit", FakeConnection(FakeProcess(_answer(intent), 1, stderr=b"panicked\n"))),
+        ("transport", FakeConnection(FakeProcess(_answer(intent), None, stderr=b"panicked\n"))),
+    ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exit_status", [126, 127])
-async def test_126_and_127_mean_no_liumd_here(keypair, intent, exit_status):
-    conn = FakeConnection(FakeProcess(b"", exit_status, stderr=b"sh: liumd: not found\n"))
-
-    with pytest.raises(LocalVerifyUnavailable) as err:
-        await _run(keypair, intent, conn)
-
-    assert err.value.reason == "not_supported"
-
-
-@pytest.mark.asyncio
-async def test_a_channel_that_does_not_open_means_no_liumd_here(keypair, intent):
-    conn = FakeConnection(raises=asyncssh.ChannelOpenError(4, "Session refused"))
-
-    with pytest.raises(LocalVerifyUnavailable) as err:
-        await _run(keypair, intent, conn)
-
-    assert err.value.reason == "not_supported"
-
-
-@pytest.mark.asyncio
-async def test_a_dead_session_is_a_transport_error(keypair, intent):
-    conn = FakeConnection(raises=asyncssh.ConnectionLost("gone"))
-
-    with pytest.raises(LocalVerifyUnavailable) as err:
-        await _run(keypair, intent, conn)
-
-    assert err.value.reason == "transport"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("exit_status,reason", [(1, "unexpected_exit"), (None, "transport")])
-async def test_any_other_exit_is_not_an_answer(keypair, intent, exit_status, reason):
-    conn = FakeConnection(FakeProcess(_answer(intent), exit_status, stderr=b"panicked\n"))
+@pytest.mark.parametrize("case", range(9))
+async def test_anything_but_an_answer_or_refusal_is_unavailable(keypair, intent, case):
+    reason, conn = _unavailable_cases(intent)[case]
 
     with pytest.raises(LocalVerifyUnavailable) as err:
         await _run(keypair, intent, conn)

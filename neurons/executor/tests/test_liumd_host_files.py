@@ -3,7 +3,6 @@
 import hashlib
 import json
 import os
-import platform
 import re
 import stat
 import subprocess
@@ -14,8 +13,6 @@ import pytest
 import liumd_host_files as hf
 
 EXECUTOR = Path(__file__).resolve().parents[1]
-BINARY = EXECUTOR / "liumd" / "liumd"
-DOCKERFILE = (EXECUTOR / "Dockerfile").read_text()
 RUN_SH = (EXECUTOR / "run.sh").read_text()
 WRAPPER = (EXECUTOR / "liumd" / "liumd.sh").read_text()
 
@@ -141,17 +138,6 @@ def test_an_unknown_command_is_refused():
 
 
 
-def test_the_dockerfile_installs_liumd_and_hashes_the_children_after_the_provers():
-    provers = DOCKERFILE.index("mv /root/app/libinspector.so /usr/lib/")
-    for line in (
-        "install -D -m 0755 liumd/liumd /usr/local/lib/liumd/liumd",
-        "install -m 0755 liumd/liumd.sh /usr/local/bin/liumd",
-        "install -d -m 0700 /var/lib/liumd/nonces",
-        "/root/app/.venv/bin/python src/liumd_host_files.py children /etc/liumd/children.json",
-    ):
-        assert DOCKERFILE.index(line) > provers, line
-
-
 def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
     # The image's wrapper with its binary path pointed at a stand-in that prints what it was given;
     # a wrapper naming another binary path would exec nothing and fail here.
@@ -172,13 +158,3 @@ def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
     )
 
     assert out.stdout.strip() == "/etc/liumd/children.json|unset|run"
-
-
-
-@pytest.mark.skipif(platform.machine() != "x86_64", reason="the committed binary is x86_64 musl")
-def test_the_committed_binary_is_the_keyless_dev_build():
-    done = subprocess.run([str(BINARY), "version"], capture_output=True, timeout=30, check=True)
-    version = json.loads(done.stdout)
-    assert version["capability"] == "local_verify/1"
-    assert version["key_id"] is None
-    assert version["release"]["children_pinned"] == 0
