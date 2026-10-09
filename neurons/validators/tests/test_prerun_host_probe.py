@@ -43,6 +43,7 @@ from services import nvidia_devices as nd
 from services.docker_service import (
     DockerService,
     _ENCRYPTED_VOLUME_IMAGE_LABEL,
+    SshSessionMayStillBeTakenError,
     VolumeHostProbe,
     _remove_and_list_containers_command,
 )
@@ -1666,6 +1667,23 @@ async def test_discarded_early_probe_gets_no_overlapped_row(svc_fixture, monkeyp
         "GPU power restore (parallel)",
         "Prerun host probe (parallel)",
     ]
+
+
+@pytest.mark.asyncio
+async def test_discarded_early_probe_whose_channel_may_hold_the_session_stops_the_create(
+    svc_fixture, monkeypatch
+):
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    _slow_overlapped_operations(svc, monkeypatch)
+    svc.probe_volume_host = AsyncMock(side_effect=SshSessionMayStillBeTakenError("channel open not answered"))
+    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "FailedContainerRequest"
+    assert result.failure_step == "volume_host_probe"
+    assert svc.probe_volume_host.await_count == 1
 
 
 @pytest.fixture

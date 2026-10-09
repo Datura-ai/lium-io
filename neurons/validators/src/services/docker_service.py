@@ -5827,8 +5827,9 @@ class DockerService:
         Replaces `docker info` + the df helper container + `docker volume ls` (fresh sizing) and the
         second `docker info` + the unconditional `docker plugin install` (create) — five serial
         commands, one of them a Docker Hub round trip — with one command and, when vloopback
-        volumes exist, the same `docker volume inspect` as before. Never fatal: on any failure it
-        returns None and the callers take the exact path they take with the flag off.
+        volumes exist, the same `docker volume inspect` as before. On any failure it returns None
+        and the callers take the exact path they take with the flag off, except when its channel
+        may still hold the host's only SSH session: SshSessionMayStillBeTakenError stops the create.
         """
         started = now_ms()
         try:
@@ -5838,7 +5839,7 @@ class DockerService:
                 _VOLUME_HOST_PROBE_TIMEOUT_SECONDS,
             )
             probe = _parse_volume_host_probe(result.stdout or "", with_df=with_df)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
             raise
         except Exception as exc:
             logger.warning(
@@ -7951,6 +7952,14 @@ class DockerService:
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
                         else:
+                            # a discarded early probe that may have left the only SSH session
+                            # taken stops the create as the probe itself would
+                            if (
+                                early_volume_probe is not None
+                                and early_volume_probe.done()
+                                and not early_volume_probe.cancelled()
+                            ):
+                                early_volume_probe.result()
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
                                 with_df=measures_host,

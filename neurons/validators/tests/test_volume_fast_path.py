@@ -329,6 +329,27 @@ async def test_probe_volume_host_ssh_error_returns_none(docker_service, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_probe_volume_host_stops_the_create_when_its_channel_may_still_hold_the_session(
+    docker_service, monkeypatch
+):
+    from services import docker_service as docker_service_module
+
+    monkeypatch.setattr(docker_service_module, "_VOLUME_HOST_PROBE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(docker_service_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0)
+    ssh_client = Mock()
+
+    async def open_never_answered(command: str):
+        await asyncio.Event().wait()
+
+    ssh_client.create_process = open_never_answered
+
+    with pytest.raises(SshSessionMayStillBeTakenError):
+        await asyncio.wait_for(
+            docker_service.probe_volume_host(ssh_client, with_df=True, log_extra={}), timeout=5
+        )
+
+
+@pytest.mark.asyncio
 async def test_probe_volume_host_garbage_output_returns_none(docker_service):
     ssh_client = Mock()
     ssh_client.run = AsyncMock(return_value=Mock(stdout="nothing useful\n", exit_status=0))
