@@ -81,6 +81,20 @@ def _executor_without_host_key(executor_id: str) -> ExecutorSSHInfo:
     )
 
 
+def ssh_client_answering_through_run(run: AsyncMock) -> Mock:
+    # asyncssh's run() opens a channel per command; a bounded command opens it with create_process
+    ssh_client = Mock(run=run)
+
+    async def create_process(command: str):
+        async def wait():
+            return await run(command)
+
+        return Mock(wait=wait)
+
+    ssh_client.create_process = create_process
+    return ssh_client
+
+
 class _FakeRentalDockerClient:
     def __init__(self):
         self.login_calls = []
@@ -4715,8 +4729,9 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     docker_service,
     monkeypatch,
 ):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(
+        AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    )
     stream_log = AsyncMock()
     monkeypatch.setattr(docker_service, "stream_log", stream_log)
     docker_client = _FakeRentalDockerClient()
@@ -4754,8 +4769,9 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
     monkeypatch,
 ):
     """sparse=True (full-node rental) → `-o sparse=true` appended after the size cap."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(
+        AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    )
     stream_log = AsyncMock()
     monkeypatch.setattr(docker_service, "stream_log", stream_log)
     docker_client = _FakeRentalDockerClient()
@@ -4788,8 +4804,9 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
     monkeypatch,
 ):
     """sparse=False (partial / legacy rental) → no sparse flag; size cap unchanged."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    ssh_client = ssh_client_answering_through_run(
+        AsyncMock(return_value=Mock(stdout="/var/lib/docker\n", exit_status=0))
+    )
     stream_log = AsyncMock()
     monkeypatch.setattr(docker_service, "stream_log", stream_log)
     docker_client = _FakeRentalDockerClient()

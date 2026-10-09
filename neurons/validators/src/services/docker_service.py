@@ -1809,6 +1809,22 @@ async def _with_own_duration(
     return AnswerWithOwnDuration(answer, ProfilerStep.since(step_name, started_ms))
 
 
+async def _run_closing_channel_on_timeout(
+    ssh_client: asyncssh.SSHClientConnection, command: str, timeout: float | None
+) -> asyncssh.SSHCompletedProcess:
+    # asyncssh's timeout= bounds neither the channel open nor frees the channel when it fires;
+    # closing it lets a host with MaxSessions=1 run the next command. Raises TimeoutError.
+    process = None
+    try:
+        async with asyncio.timeout(timeout):
+            process = await ssh_client.create_process(command)
+            return await process.wait()
+    except TimeoutError:
+        if process is not None:
+            process.close()
+        raise
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -5582,13 +5598,13 @@ class DockerService:
                 # part of the SDK migration scope. The user-controlled volume name is
                 # not used in this shell command; volume creation below is SDK-backed.
                 try:
-                    install_result = await asyncio.wait_for(
-                        ssh_client.run(command), timeout=_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
+                    install_result = await _run_closing_channel_on_timeout(
+                        ssh_client, command, _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
                     )
                     install_outcome = f"install exit {install_result.exit_status}"
                     install_error = (install_result.stderr or install_result.stdout or "").strip()
                     install_failed = install_result.exit_status != 0
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     install_outcome = (
                         f"install timed out after {_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS} s"
                     )
@@ -5596,9 +5612,13 @@ class DockerService:
                     install_failed = True
                 if install_failed:
                     # without a probe an installed v2 fails the install with "already exists"
-                    run_kwargs = {"timeout": requested_timeout} if requested_timeout else {}
-                    state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
-                    v2_state = (state_result.stdout or "").strip()
+                    try:
+                        state_result = await _run_closing_channel_on_timeout(
+                            ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout or None
+                        )
+                        v2_state = (state_result.stdout or "").strip()
+                    except TimeoutError:
+                        v2_state = "unknown"
                     if v2_state != "true":
                         loopback_plugin_name = await self._fall_back_to_old_loopback_plugin(
                             ssh_client,
