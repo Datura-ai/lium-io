@@ -1007,8 +1007,9 @@ class RentalDockerSdkClient:
             )
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
-        # by ID, so a same-name container another create made since this one's listing is never started
-        self._api_client.start(container_id or spec.name)
+        # A create with a start check starts the container it checked, by ID, never a same-name successor.
+        # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
+        self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
         return container_id
 
     def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:

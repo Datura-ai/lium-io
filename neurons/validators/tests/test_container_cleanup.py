@@ -180,7 +180,7 @@ def _removed_volume_names(rm_calls: list[str]) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
-    """A filler create no longer sweeps unmounted volumes, so the reaper must take the `volume_<run id>` of a
+    """A filler create sweeps only filler-labelled volumes, so the reaper must take the `volume_<run id>` of a
     filler it removes, or the preallocated volume holds the disk."""
     filler = "filler_run-1"
     customer_pod = "pod_customer"
