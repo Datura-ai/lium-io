@@ -834,17 +834,23 @@ def get_docker_info(content: bytes):
         containers = []
 
         for container_id in container_ids:
-            # Get the image ID of the container
-            result = run_cmd(f'{docker_path} inspect --format "{{{{.Image}}}}" {container_id}')
-            image_id = result.strip()
+            try:
+                # Get the image ID of the container
+                result = run_cmd(f'{docker_path} inspect --format "{{{{.Image}}}}" {container_id}')
+                image_id = result.strip()
 
-            # Get the image details
-            result = run_cmd(f'{docker_path}  inspect --format "{{{{json .RepoDigests}}}}" {image_id}')
-            repo_digests = json.loads(result.strip())
+                # Get the image details
+                result = run_cmd(f'{docker_path}  inspect --format "{{{{json .RepoDigests}}}}" {image_id}')
+                repo_digests = json.loads(result.strip())
 
-            # Get the container name
-            result = run_cmd(f'{docker_path} inspect --format "{{{{.Name}}}}" {container_id}')
-            container_name = result.strip().lstrip('/')
+                # Get the container name
+                result = run_cmd(f'{docker_path} inspect --format "{{{{.Name}}}}" {container_id}')
+                container_name = result.strip().lstrip('/')
+            except RuntimeError:
+                # The container was removed between ps and inspect: skip it and keep the rest.
+                # Its CPU may sit in the host reading, so the reading is dropped (fail-safe).
+                data.pop("docker_host_cpu_percent", None)
+                continue
 
             digest = None
             if repo_digests:

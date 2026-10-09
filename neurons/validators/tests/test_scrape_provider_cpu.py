@@ -112,6 +112,23 @@ def test_a_wedged_docker_daemon_voids_the_reading_and_keeps_the_scrape_alive():
     assert data["docker_version"] == "24.0.7"
 
 
+def test_a_container_removed_between_ps_and_inspect_is_skipped_and_the_rest_are_listed():
+    # Arrange — the executor's inspect fails (container gone); the renter's succeeds
+    outputs = _docker_outputs(f"{RENTER[:12]}|158.00%\n", [EXECUTOR, RENTER])
+    outputs = {
+        f"{{{{.Image}}}}\" {EXECUTOR}": RuntimeError("run_cmd error: No such object"),
+        **outputs,
+    }
+    scrape = _scrape(outputs)
+
+    # Act
+    data = scrape["get_docker_info"](b"#!/bin/sh\n")
+
+    # Assert — the scrape survives, lists the other container, and voids the host reading
+    assert [c["each_container_id"] for c in data["docker_containers"]] == [RENTER]
+    assert "docker_host_cpu_percent" not in data
+
+
 def test_an_unparsable_stats_row_raises_so_the_caller_voids_the_reading():
     # Arrange — a row the window cannot account for must not be dropped silently
     scrape = _scrape(_docker_outputs(f"{RENTER[:12]}|--\n", [RENTER]))
