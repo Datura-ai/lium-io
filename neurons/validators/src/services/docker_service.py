@@ -537,6 +537,7 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
 # from on-host disk state when the backend sends disk_share.
 _FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
 _FRESH_SIZING_HEADROOM_GB = 10   # min free space left on the fs after volume allocation
+_FRESH_SIZING_MAX_VOLUME_GB = 16000   # one ext4 file tops out at 16 TiB; larger sparse data files fail with EFBIG
 _FRESH_SIZING_GB_BYTES = 1024 ** 3
 _VOLUME_SIZE_OPTION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", re.IGNORECASE)
 _VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
@@ -5780,6 +5781,9 @@ class DockerService:
                     0,
                 ),
             )
+        )
+        slice_candidates.append(
+            ("fs_file_limit", _FRESH_SIZING_MAX_VOLUME_GB * _FRESH_SIZING_GB_BYTES * 1.5)
         )
         capped_by, slice_bytes = min(slice_candidates, key=lambda item: item[1])
 
