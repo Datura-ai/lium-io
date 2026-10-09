@@ -1812,14 +1812,27 @@ async def _with_own_duration(
     return AnswerWithOwnDuration(answer, ProfilerStep.since(step_name, started_ms))
 
 
+def _close_process_opened_late(opening: asyncio.Future) -> None:
+    if not opening.cancelled() and opening.exception() is None:
+        opening.result().close()
+
+
 async def _run_closing_channel_on_timeout(
     ssh_client: asyncssh.SSHClientConnection, command: str, timeout: float | None
 ) -> asyncssh.SSHCompletedProcess:
     # asyncssh's timeout= bounds neither the channel open nor frees the channel when it fires;
     # closing it lets a host with MaxSessions=1 run the next command. The command's own timeout
     # starts once its channel is open, as a host-side `timeout` does. Raises TimeoutError.
-    async with asyncio.timeout(timeout):
-        process = await ssh_client.create_process(command)
+    opening = asyncio.ensure_future(ssh_client.create_process(command))
+    try:
+        async with asyncio.timeout(timeout):
+            process = await asyncio.shield(opening)
+    except TimeoutError:
+        # a cancelled open whose answer comes late leaves its session taken: never cancel it,
+        # close it when it answers, and give it one more timeout to answer before going on
+        opening.add_done_callback(_close_process_opened_late)
+        await asyncio.wait({opening}, timeout=timeout)
+        raise
     try:
         async with asyncio.timeout(timeout):
             return await process.wait()

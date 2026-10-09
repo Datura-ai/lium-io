@@ -670,6 +670,7 @@ class _TwoLoopbackPluginHost:
         v2_install_answer_lost: bool = False,
         v2_install_channel_open_seconds: float = 0,
         v2_state_channel_open_hangs: bool = False,
+        v2_state_channel_open_answer_seconds: float = 0,
         max_sessions: int | None = None,
     ):
         self.plugins = dict(plugins)  # plugin name -> enabled
@@ -680,6 +681,7 @@ class _TwoLoopbackPluginHost:
         self.v2_install_answer_lost = v2_install_answer_lost
         self.v2_install_channel_open_seconds = v2_install_channel_open_seconds
         self.v2_state_channel_open_hangs = v2_state_channel_open_hangs
+        self.v2_state_channel_open_answer_seconds = v2_state_channel_open_answer_seconds
         self.max_sessions = max_sessions
         self.open_channels = 0
         self.commands: list[str] = []
@@ -701,6 +703,16 @@ class _TwoLoopbackPluginHost:
             and _V2 in command
         ):
             await asyncio.Event().wait()
+        if (
+            self.v2_state_channel_open_answer_seconds
+            and command.startswith("( /usr/bin/docker plugin inspect")
+            and _V2 in command
+        ):
+            # sshd takes the session at once and its confirmation comes late; a cancelled
+            # wait leaves the session taken, as asyncssh opens the channel anyway
+            self.open_channels += 1
+            await asyncio.sleep(self.v2_state_channel_open_answer_seconds)
+            return _HostProcess(self, command)
         if "plugin install" in command and f"--alias {_V2} " in command:
             await asyncio.sleep(self.v2_install_channel_open_seconds)
         self.open_channels += 1
@@ -935,6 +947,23 @@ async def test_create_local_volume_falls_back_when_the_v2_state_read_after_a_hun
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.05), timeout=5)
 
     assert host.volumes["volume_new"][0] == _OLD
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_falls_back_after_a_late_v2_state_channel_open_frees_its_session(
+    docker_service,
+):
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True},
+        v2_install_fails=True,
+        v2_state_channel_open_answer_seconds=0.3,
+        max_sessions=1,
+    )
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.2), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.open_channels == 0
 
 
 @pytest.mark.asyncio
