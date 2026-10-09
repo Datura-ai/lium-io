@@ -207,11 +207,11 @@ class Validator:
             cycle_inputs=self.express_lane_cycle_inputs,
         )
 
-        # the burner the latest cycle was reported with: the fallback pays it when the backend cannot serve a tempo
-        self._fallback_burner: str | None = None
-        # the tempo index already submitted (or read, in shadow): should_set_weights stays true for a tick or two
-        # after a submission, and a second attempt for the same frozen window would only be rejected as too fast
+        # the tempo index already submitted (or read, in shadow, or found empty): should_set_weights stays true for a
+        # tick or two after a submission, and a second attempt for the same frozen window would be rejected as too fast
         self._settled_tempo_done: int | None = None
+        # inclusions not acknowledged yet, also held here: a Redis down at both keeps must not lose one
+        self._unacknowledged_inclusions: dict[str, int] = {}
         # init miner_scores: always load from Redis if present so accumulated
         # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
         try:
@@ -705,11 +705,10 @@ class Validator:
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
                     if settings.SETTLEMENT_MODE != SETTLEMENT_OFF:
-                        self._fallback_burner = self._settlement_burner(miners)
                         await self.report_cycle_scores(
                             cycle_scores,
                             cycle_node_shares(incentive.job_results),
-                            self._fallback_burner,
+                            self._settlement_burner(miners),
                             job_batch_id,
                             job_block,
                             scored_at,
@@ -1077,15 +1076,41 @@ class Validator:
 
     async def submit_settled_window(self) -> bool:
         """DAH-4001 enforce: submit the backend's settled vector for this tempo. When the backend cannot serve one
-        (unreachable, or nothing scored in its window) submit the fallback instead (all weight to the burner).
-        Never an older vector: weights are a state, and a stale one pays nodes that may have left since. Returns
-        whether this tempo is settled on chain."""
+        (unreachable, or nothing scored in its window) submit nothing: the chain keeps paying the weights already
+        in force, and an unreachable backend is asked again on the next tick. Returns whether this tempo is settled
+        on chain."""
         index, tempo, block_before = self._current_tempo()
         if index == getattr(self, "_settled_tempo_done", None):
             return True
+        # a window that landed but is not reported reads as not landed, and the next one would decide its deposits
+        # again: it waits, and the landed vector stays in force meanwhile
+        if not await self._retry_pending_inclusion():
+            logger.error(
+                _m(
+                    "[settlement] an accepted window is not reported yet; the next one waits",
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index}),
+                )
+            )
+            self._alert_if_near_activity_cutoff()
+            return False
         window = await self._fetch_settled_window(index, tempo)
         if window is None or not any(window.hotkey_scores.values()):  # all zero would land as uniform weights
-            return await self._submit_fallback(index, "backend unreachable" if window is None else "empty window")
+            if window is not None:
+                self._settled_tempo_done = index  # frozen empty: asking again only gets the same answer
+            logger.error(
+                _m(
+                    "[settlement] no settled window; the weights in force stay",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "tempo_index": index,
+                            "reason": "backend unreachable" if window is None else "empty window",
+                        }
+                    ),
+                )
+            )
+            self._alert_if_near_activity_cutoff()
+            return False
         accepted = await self._submit_vector(window.hotkey_scores)
         if accepted:
             self._settled_tempo_done = index
@@ -1121,12 +1146,13 @@ class Validator:
             kept = await self.redis_service.get(PENDING_INCLUSION_KEY)
         except Exception:
             return None
-        return json.loads(kept) if kept else {}
+        return {**(json.loads(kept) if kept else {}), **self._unacknowledged_inclusions}
 
-    async def _confirm_inclusion(self, index: int, block: int) -> None:
+    async def _confirm_inclusion(self, index: int, block: int) -> bool:
         """Tell the backend the block read right after the chain accepted the tempo's vector (the extrinsic landed
-        at or just before it); kept and retried every cycle until the backend answers. Each tempo's confirmation
-        stays until its own acknowledgement: a later one never clears an earlier one."""
+        at or just before it); kept before the report, so a restart while it is in flight does not lose it, and
+        retried until the backend answers. Returns whether it answered."""
+        await self._keep_pending_inclusion(index, block)
         try:
             confirmed = await self.backend_client.report_settled_weights_result(index, block)
         except Exception as exc:
@@ -1137,16 +1163,26 @@ class Validator:
                 )
             )
             confirmed = None
+        # kept again when unanswered: the keep above may have met a Redis that has recovered since
+        await self._keep_pending_inclusion(index, block if confirmed is None else None)
+        return confirmed is not None
+
+    async def _keep_pending_inclusion(self, index: int, block: int | None) -> None:
+        # None drops the tempo's entry. Each tempo's stays until its own acknowledgement: a later one never clears it
+        if block is None:
+            self._unacknowledged_inclusions.pop(str(index), None)
+        else:
+            self._unacknowledged_inclusions[str(index)] = block
         pending = await self._pending_inclusions()
         if pending is None:
             logger.warning(
                 _m(
                     "[settlement] could not read the pending inclusions; left as they are",
-                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "confirmed": confirmed is not None}),
+                    extra=get_extra_info({**self.default_extra, "tempo_index": index}),
                 )
             )
             return
-        if confirmed is not None:
+        if block is None:
             pending.pop(str(index), None)
         else:
             pending[str(index)] = block
@@ -1157,39 +1193,15 @@ class Validator:
                 _m("[settlement] could not keep the pending inclusions", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
             )
 
-    async def _retry_pending_inclusion(self) -> None:
-        for index, block in sorted((await self._pending_inclusions() or {}).items()):
-            await self._confirm_inclusion(int(index), int(block))
-
-    async def _submit_fallback(self, index: int, reason: str) -> bool:
-        """All weight to the burner: the validator stays active and no cycle is paid here, so none is paid twice
-        when the backend serves it later (the next window covers every cycle since the last one served). The
-        tempo's emission sits with the burner and is repaid by hand."""
-        if self._fallback_burner is None:
-            logger.error(
-                _m(
-                    "[settlement] no settled vector and no burner to fall back to; this tempo is skipped",
-                    extra=get_extra_info({**self.default_extra, "tempo_index": index, "reason": reason}),
-                )
-            )
-            self._alert_if_near_activity_cutoff()
+    async def _retry_pending_inclusion(self) -> bool:
+        """Whether every kept inclusion is acknowledged now; stops at the first one the backend does not take."""
+        pending = await self._pending_inclusions()
+        if pending is None:
             return False
-        vector = {self._fallback_burner: 1.0}
-        accepted = await self._submit_vector(vector)
-        if accepted:
-            self._settled_tempo_done = index
-        else:
-            self._alert_if_near_activity_cutoff()
-        # an error either way: a tempo's idle went to the burner because of our side, and someone repays it
-        logger.error(
-            _m(
-                "[settlement] fallback submitted" if accepted else "[settlement] fallback submission failed",
-                extra=get_extra_info(
-                    {**self.default_extra, "tempo_index": index, "reason": reason, "hotkeys": len(vector)}
-                ),
-            )
-        )
-        return accepted
+        for index, block in sorted(pending.items()):
+            if not await self._confirm_inclusion(int(index), int(block)):
+                return False
+        return True
 
     def _alert_if_near_activity_cutoff(self) -> None:
         """Error-log when no weights of ours were accepted for more than half the subnet's activity cutoff."""
