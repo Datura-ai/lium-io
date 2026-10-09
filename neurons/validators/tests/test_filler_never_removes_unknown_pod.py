@@ -11,24 +11,187 @@ from __future__ import annotations
 
 import logging
 import shlex
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import pytest
-from payload_models.payloads import ContainerCreated, FailedContainerErrorCodes, WorkloadKind
+from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import (
+    ContainerCreated,
+    ContainerCreateRequest,
+    FailedContainerErrorCodes,
+    PayloadPortMapping,
+    WorkloadKind,
+)
+
 from services.docker_service import DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD, DockerService
 from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
-from services.rental_docker_sdk import FILLER_VOLUME_LABELS, RENTAL_NETWORK_OPTIONS, RentalDockerSdkClient
-from test_deploy_optimizations import (
-    _docker_client,
-    _patch_happy,
-    _payload,
-    _run,
-    _ssh_client,
-    _ssh_result,
+from services.rental_docker_sdk import (
+    FILLER_VOLUME_LABELS,
+    RENTAL_NETWORK_OPTIONS,
+    ContainerExecResult,
+    ContainerStateSnapshot,
+    RentalDockerSdkClient,
+    build_gpu_docker_config,
 )
 
 _CUSTOMER_POD = "pod_6a1f2a52-6f0e-4a3e-9c55-0d3e1b7a9c11"
 _CUSTOMER_VOLUME = "volume_6a1f2a52-6f0e-4a3e-9c55-0d3e1b7a9c11"
+
+
+class _ConnCtx:
+    def __init__(self, ssh):
+        self.ssh = ssh
+
+    async def __aenter__(self):
+        return self.ssh
+
+    async def __aexit__(self, *exc):
+        return None
+
+
+def _ssh_result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
+    return Mock(exit_status=exit_status, stdout=stdout, stderr=stderr)
+
+
+def _ssh_client():
+    client = AsyncMock()
+
+    def answer_like_a_clean_host(cmd, *args, **kwargs):
+        return _ssh_result(exit_status=0, stdout="4194304\n" if cmd == "cat /proc/sys/kernel/pid_max" else "")
+
+    client.run = AsyncMock(side_effect=answer_like_a_clean_host)
+    return client
+
+
+class _FakeRentalDockerClient:
+    """The rental Docker client with the image already on the host; `run_container` is replaced per test."""
+
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        return None
+
+    async def image_exists(self, *, image: str) -> bool:
+        return True
+
+    async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...]:
+        return ()
+
+    async def local_image_is_current(self, *, image: str, auth_config: dict[str, str] | None = None) -> bool:
+        return True
+
+    async def pull(self, *, image: str) -> None:
+        return None
+
+    async def run_container(self, spec) -> None:
+        return None
+
+    async def exec_in_container(self, spec) -> ContainerExecResult:
+        return ContainerExecResult(exit_status=0)
+
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return ContainerStateSnapshot(
+            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
+            oom_killed=False,
+        )
+
+
+class _FakeRentalDockerFactory:
+    def __init__(self, client):
+        self.client = client
+
+    def connect(self, *, executor_info: ExecutorSSHInfo, private_key: str):
+        return self
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, *exc):
+        return None
+
+
+def _payload(**over) -> ContainerCreateRequest:
+    base = dict(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:1.0.0",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    base.update(over)
+    return ContainerCreateRequest(**base)
+
+
+def _executor_info(payload: ContainerCreateRequest) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+    )
+
+
+def _patch_happy(svc, monkeypatch, ssh_client):
+    """Stub the deploy flow around the create so it reaches a real ContainerCreated."""
+    svc.rental_docker_client_factory = _FakeRentalDockerFactory(_FakeRentalDockerClient())
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(return_value=_ConnCtx(ssh_client)))
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
+    svc.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    svc.redis_service.add_pending_pod = AsyncMock()
+    svc.redis_service.remove_pending_pod = AsyncMock()
+    svc.redis_service.add_rented_pod = AsyncMock()
+    lock = AsyncMock()
+    lock.__aenter__ = AsyncMock(return_value=lock)
+    lock.__aexit__ = AsyncMock(return_value=None)
+    svc.redis_service.acquire_executor_lock = Mock(return_value=lock)
+    monkeypatch.setattr(svc, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    monkeypatch.setattr(svc, "clean_existing_containers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=Mock(volume_limit_gb=10, storage_limit_gb=20))
+    )
+    monkeypatch.setattr(svc, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(svc, "wait_for_port_check_containers", AsyncMock(return_value=(True, "ok")))
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(svc, "check_container_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        svc, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(svc, "run_jupyter", AsyncMock())
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    monkeypatch.setattr(svc, "finish_stream_logs", AsyncMock())
+    monkeypatch.setattr(svc, "handle_stream_logs", AsyncMock())
+
+
+async def _run(svc, payload):
+    return await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+
+def _docker_client(svc):
+    return svc.rental_docker_client_factory.client
 
 
 @pytest.fixture
