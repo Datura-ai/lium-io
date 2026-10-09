@@ -214,8 +214,19 @@ async def test_reaper_removes_only_the_filler_volume_and_leaves_a_customers():
     assert _removed_volume_names(rm_calls) == [f"volume_{FILLER_RUN_ID}"]
 
 
+@pytest.mark.parametrize(
+    ("stderr", "warned"),
+    [
+        ("Error response from daemon: volume is in use", True),
+        ("", True),
+        ("Error response from daemon: get volume_x: no such volume", False),
+    ],
+    ids=["named_error", "failure_without_output", "volume_already_gone"],
+)
 @pytest.mark.asyncio
-async def test_a_failed_filler_volume_rm_is_logged_and_the_reaper_goes_on(caplog):
+async def test_a_failed_filler_volume_rm_is_logged_unless_the_volume_is_gone_and_the_reaper_goes_on(
+    caplog, stderr: str, warned: bool
+):
     first_filler = f"filler_{FILLER_RUN_ID}"
     second_filler = f"filler_{SECOND_FILLER_RUN_ID}"
     ssh, rm_calls = _make_ssh_mock(
@@ -228,7 +239,7 @@ async def test_a_failed_filler_volume_rm_is_logged_and_the_reaper_goes_on(caplog
             rm_calls.append(cmd)
             # a command ending in `|| true` hides the failure from the caller, as the shell would
             exit_status = 0 if cmd.rstrip().endswith("|| true") else 1
-            return MagicMock(exit_status=exit_status, stdout="", stderr="Error response from daemon: volume is in use")
+            return MagicMock(exit_status=exit_status, stdout="", stderr=stderr)
         return await plain_handler(cmd, *args, **kwargs)
 
     ssh.run.side_effect = handler
@@ -240,7 +251,8 @@ async def test_a_failed_filler_volume_rm_is_logged_and_the_reaper_goes_on(caplog
 
     assert (removed_count, removed_names, unremovable) == (2, [first_filler, second_filler], [])
     assert _removed_volume_names(rm_calls) == [f"volume_{FILLER_RUN_ID}", f"volume_{SECOND_FILLER_RUN_ID}"]
-    assert any(f"Removed container {first_filler} but not its volume" in r.getMessage() for r in caplog.records)
+    logged = any(f"Removed container {first_filler} but not its volume" in r.getMessage() for r in caplog.records)
+    assert logged is warned
 
 
 async def cleanup_with_hook(ssh, on_before_remove):

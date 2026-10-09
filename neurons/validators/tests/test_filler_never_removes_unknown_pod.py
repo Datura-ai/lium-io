@@ -9,6 +9,7 @@ at the cleanup, on the listing it already has, and in the Docker thread between 
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shlex
 from unittest.mock import AsyncMock, Mock
@@ -24,7 +25,11 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 
-from services.docker_service import DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD, DockerService
+from services.docker_service import (
+    DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD,
+    DockerService,
+    customer_creates,
+)
 from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
 from services.rental_docker_sdk import (
     FILLER_VOLUME_LABELS,
@@ -261,6 +266,8 @@ async def test_late_filler_create_refuses_and_leaves_the_customer_pod_on_the_hos
 @pytest.mark.asyncio
 async def test_pod_appearing_between_create_and_start_refuses_and_removes_only_the_filler(svc, monkeypatch) -> None:
     ssh_client = _host_listing(svc, monkeypatch, [])
+    restore_power = AsyncMock()
+    monkeypatch.setattr("services.docker_service.restore_filler_pod_gpu_power_limits", restore_power)
     docker_api = _docker_daemon(svc, monkeypatch)
     filler = _payload(workload_kind=WorkloadKind.FILLER)
 
@@ -276,8 +283,40 @@ async def test_pod_appearing_between_create_and_start_refuses_and_removes_only_t
     assert result.failure_step == "customer_create_in_flight"
     docker_api.start.assert_not_called()
     docker_api.containers.assert_called_once_with(all=True)
-    assert any(f"filler_{filler.pod_id}" in targets for targets in _removals(ssh_client))
-    assert not any(_CUSTOMER_POD in targets for targets in _removals(ssh_client))
+    removals = _removals(ssh_client)
+    assert any(f"filler_{filler.pod_id}" in targets for targets in removals)
+    assert any(f"volume_{filler.pod_id}" in targets for targets in removals)
+    assert not any(_CUSTOMER_POD in targets for targets in removals)
+    restore_power.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pod_appearing_beside_a_running_customer_create_still_logs_the_pod(svc, monkeypatch, caplog) -> None:
+    # both guards hold at once: the customer create registered, and its pod is on the host at the start check
+    _host_listing(svc, monkeypatch, [])
+    docker_api = _docker_daemon(svc, monkeypatch)
+    monkeypatch.setattr("services.docker_service.restore_filler_pod_gpu_power_limits", AsyncMock())
+    filler = _payload(workload_kind=WorkloadKind.FILLER)
+    customer = _payload(executor_id=filler.executor_id)
+    customer_registration = contextlib.ExitStack()
+
+    def customer_create_registered_and_pod_created_meanwhile(**_kwargs) -> dict:
+        customer_registration.enter_context(customer_creates.track(customer))
+        customer_creates.reached_create_container(customer)
+        docker_api.containers.return_value = [{"Names": [f"/{_CUSTOMER_POD}"]}]
+        return {"Id": "filler-container"}
+
+    docker_api.create_container.side_effect = customer_create_registered_and_pod_created_meanwhile
+
+    with customer_registration, caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await _run(svc, filler)
+
+    assert result.error_code == FailedContainerErrorCodes.RentingInProgress
+    docker_api.start.assert_not_called()
+    refusals = [r.msg.to_full_string() for r in caplog.records if "filler create refused" in r.getMessage()]
+    assert len(refusals) == 1
+    assert refusals[0].startswith("filler create refused: unlisted pod_* on the node >>> ")
+    assert _CUSTOMER_POD in refusals[0]
 
 
 @pytest.mark.parametrize(

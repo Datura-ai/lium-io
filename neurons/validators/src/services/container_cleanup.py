@@ -624,9 +624,10 @@ class ContainerCleanup:
             volume_name = f"volume_{container_name.removeprefix(prefix)}"
             try:
                 result = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
-                error = "" if result.exit_status == 0 else (result.stderr or result.stdout or "").strip()
+                output = (result.stderr or result.stdout or "").strip()
+                error = "" if result.exit_status == 0 else output or f"exit_status={result.exit_status}"
             except Exception as e:
-                error = str(e)
+                error = str(e) or type(e).__name__
             if error and "no such volume" not in error.lower():
                 logger.warning(
                     _m(

@@ -8190,7 +8190,8 @@ class DockerService:
                         # lock lapsed), before its start or before the running-state check, is that
                         # refusal, not a filler fault: not ContainerVanished, counted against the host.
                         container_vanished = False
-                        _refuse_filler_during_customer_create(payload)
+                        if not isinstance(docker_run_error, _FillerRefusedBesideUnlistedPod):
+                            _refuse_filler_during_customer_create(payload)
                     raise
 
                 # Add profiler for the post-run container running-state poll

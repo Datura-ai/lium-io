@@ -33,7 +33,7 @@ def _failure_level_and_reason(operation: str, exc: Exception) -> _FailureLog:
     A remove that finds nothing to remove and a workload container that keeps restarting are
     expected outcomes, not validator faults: the first is a delete racing failed-create cleanup
     (idempotent by design, DAH-2345), the second a renter or filler image that exits at start. A create
-    refused by its spec's `before_create` is the caller's decision, not a fault either.
+    refused by its spec's `before_create` or `before_start` is the caller's decision, not a fault either.
     Everything else keeps ERROR with no reason (the logger drops None fields).
     """
     if operation.startswith("remove") and is_docker_not_found_error(exc):
