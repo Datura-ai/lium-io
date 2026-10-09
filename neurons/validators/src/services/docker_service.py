@@ -572,8 +572,11 @@ _LOOPBACK_PLUGIN_IMAGE = "daturaai/docker-volume-loopback:1.0.0-lium1"
 _LOOPBACK_PLUGIN_DATA_DIR_NAME = "vloopback-v2"
 _LOOPBACK_PLUGIN_STATE_DIR = "/srv/run/docker-volume-loopback-v2"
 # the first rent on every node pulls v2 (~37 MB) from Docker Hub; a pull that stops answering
-# must end in the fallback, not hold the rent: the old plugin's install was never on that path
+# must end in the fallback, not hold the rent: the old plugin's install was never on that path.
+# The host ends the install itself, so sshd frees its session (MaxSessions=1); the validator's own
+# deadline, past the host's kill, is for a connection that stops answering.
 _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
+_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS = _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS + 10
 _PROBE_OUTPUT_LOG_CAP = 512
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
@@ -5590,6 +5593,7 @@ class DockerService:
                 )
                 state_dir_arg = shlex.quote(f"STATE_DIR={_LOOPBACK_PLUGIN_STATE_DIR}")
                 command = (
+                    f"timeout -k 5 {_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS} "
                     f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
                     f"--alias {loopback_plugin_arg} --grant-all-permissions "
                     f"{data_dir_arg} {state_dir_arg}"
@@ -5599,14 +5603,14 @@ class DockerService:
                 # not used in this shell command; volume creation below is SDK-backed.
                 try:
                     install_result = await _run_closing_channel_on_timeout(
-                        ssh_client, command, _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS
+                        ssh_client, command, _LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS
                     )
                     install_outcome = f"install exit {install_result.exit_status}"
                     install_error = (install_result.stderr or install_result.stdout or "").strip()
                     install_failed = install_result.exit_status != 0
                 except TimeoutError:
                     install_outcome = (
-                        f"install timed out after {_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS} s"
+                        f"install timed out after {_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS} s"
                     )
                     install_error = ""
                     install_failed = True
