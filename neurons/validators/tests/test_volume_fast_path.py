@@ -38,7 +38,7 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, df_command
 from payload_models.payloads import ContainerCreateRequest
 from services.docker_service import (
     DockerService,
-    LoopbackPluginDisabledError,
+    NoUsableLoopbackPluginError,
     VolumeHostProbe,
     _parse_volume_host_probe,
     _volume_host_probe_command,
@@ -547,23 +547,25 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_fails_fast_when_neither_v2_nor_the_old_plugin_will_enable(docker_service):
+async def test_create_local_volume_fails_naming_both_when_v2_will_not_enable_and_the_old_plugin_is_disabled(
+    docker_service,
+):
     enable_failed = Mock(
         stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1
     )
     still_disabled = Mock(stdout="false\n", stderr="", exit_status=0)
     ssh_client = Mock()
-    ssh_client.run = AsyncMock(
-        side_effect=[enable_failed, still_disabled, still_disabled, enable_failed, still_disabled]
-    )
+    ssh_client.run = AsyncMock(side_effect=[enable_failed, still_disabled, still_disabled])
     ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
-    with pytest.raises(LoopbackPluginDisabledError) as exc_info:
+    with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
         await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
     message = str(exc_info.value)
-    assert message.startswith("vloopback plugin disabled on host and could not be enabled")
-    assert "(plugin vloopback: enable exit 1, state false" in message and "plugin.sock" in message
+    assert message.startswith("no usable vloopback plugin on host (v2: vloopback plugin disabled on host")
+    assert "(plugin vloopback:v2: enable exit 1, state false" in message and "plugin.sock" in message
+    assert message.endswith("; old plugin vloopback state false)")
+    assert ssh_client.run.await_count == 3
     # lium-platform's classifier files it as volume.plugin_disabled on these two substrings
     assert "plugin vloopback" in message.lower() and "disabled" in message.lower()
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
@@ -1097,31 +1099,39 @@ async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_cannot_b
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_installs_the_old_plugin_as_main_does_when_v2_fails_and_old_is_absent(
-    docker_service,
+@pytest.mark.parametrize("plugins, old_state", [({}, "absent"), ({_OLD: False}, "false")])
+async def test_create_local_volume_fails_without_installing_or_enabling_the_old_plugin_when_v2_install_fails(
+    docker_service, plugins, old_state
 ):
-    host = _TwoLoopbackPluginHost(plugins={}, v2_install_fails=True)
+    host = _TwoLoopbackPluginHost(plugins=plugins, v2_install_fails=True)
 
-    await _rent_a_new_volume(docker_service, host)
+    with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
+        await _rent_a_new_volume(docker_service, host)
 
-    installs = [command for command in host.commands if "plugin install" in command]
-    assert installs[1] == (
-        "/usr/bin/docker plugin install ashald/docker-volume-loopback "
-        "--alias vloopback --grant-all-permissions DATA_DIR=/var/lib/docker/loopback"
-    )
-    assert len(installs) == 2
-    assert host.volumes["volume_new"][0] == _OLD
+    message = str(exc_info.value)
+    assert message.startswith("no usable vloopback plugin on host (v2: install exit 1, state absent: Error response")
+    assert message.endswith(f"; old plugin vloopback state {old_state})")
+    named_beside_inspect = {
+        alias
+        for command in host.plugin_commands()
+        if "plugin inspect" not in command
+        for alias in _LOOPBACK_ALIAS_RE.findall(command)
+    }
+    assert named_beside_inspect == {_V2}
+    assert host.plugins == plugins
+    assert "volume_new" not in host.volumes
 
 
 @pytest.mark.asyncio
-async def test_create_local_volume_enables_a_disabled_old_plugin_as_main_does_when_v2_fails(docker_service):
-    host = _TwoLoopbackPluginHost(plugins={_OLD: False}, v2_install_fails=True)
+async def test_create_local_volume_fails_when_the_old_plugin_state_read_times_out_too(docker_service):
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(side_effect=[TimeoutError(), TimeoutError()])
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
-    await _rent_a_new_volume(docker_service, host)
+    with pytest.raises(NoUsableLoopbackPluginError, match=r"; old plugin vloopback state unknown\)$"):
+        await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
-    assert "timeout -k 5 10 sh -c '/usr/bin/docker plugin enable vloopback'" in host.commands
-    assert sum("plugin install" in command for command in host.commands) == 1
-    assert host.volumes["volume_new"][0] == _OLD
+    assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
