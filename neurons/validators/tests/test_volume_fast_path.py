@@ -521,6 +521,7 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
             Mock(stdout="true\n", stderr="", exit_status=0),
         ]
     )
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
     created = await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
@@ -530,7 +531,6 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
         "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 2>/dev/null "
         "|| echo absent) | tail -n 1",
     ]
-    assert all(c.kwargs == {"timeout": 10} for c in calls)
     assert not any("plugin install" in c.args[0] for c in calls)
     assert created == [
         {
@@ -552,6 +552,7 @@ async def test_create_local_volume_fails_fast_when_neither_v2_nor_the_old_plugin
     ssh_client.run = AsyncMock(
         side_effect=[enable_failed, still_disabled, still_disabled, enable_failed, still_disabled]
     )
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
     with pytest.raises(LoopbackPluginDisabledError) as exc_info:
         await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
@@ -568,6 +569,7 @@ async def test_create_local_volume_fails_fast_when_neither_v2_nor_the_old_plugin
 async def test_create_local_volume_falls_back_to_the_old_plugin_when_the_v2_enable_times_out(docker_service):
     ssh_client = Mock()
     ssh_client.run = AsyncMock(side_effect=[asyncio.TimeoutError(), Mock(stdout="true\n", stderr="", exit_status=0)])
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
 
     created = await _create_volume(docker_service, ssh_client, _disabled_plugin_probe())
 
@@ -584,6 +586,7 @@ async def test_create_local_volume_disabled_plugin_enable_error_logs_only_its_ty
     secret_text = "ssh ubuntu@10.1.2.3: token=ghp_leakme at /home/provider/.ssh/id_rsa"
     ssh_client = Mock()
     ssh_client.run = AsyncMock(side_effect=[OSError(secret_text), Mock(stdout="true\n", stderr="", exit_status=0)])
+    ssh_client = ssh_client_answering_through_run(ssh_client.run)
     warning = Mock()
     monkeypatch.setattr(docker_service_module.logger, "warning", warning)
 
@@ -672,6 +675,7 @@ class _TwoLoopbackPluginHost:
         v2_state_channel_open_hangs: bool = False,
         v2_state_channel_open_answer_seconds: float = 0,
         v2_state_command_seconds: float = 0,
+        v2_enable_seconds: float = 0,
         max_sessions: int | None = None,
     ):
         self.plugins = dict(plugins)  # plugin name -> enabled
@@ -684,6 +688,7 @@ class _TwoLoopbackPluginHost:
         self.v2_state_channel_open_hangs = v2_state_channel_open_hangs
         self.v2_state_channel_open_answer_seconds = v2_state_channel_open_answer_seconds
         self.v2_state_command_seconds = v2_state_command_seconds
+        self.v2_enable_seconds = v2_enable_seconds
         self.max_sessions = max_sessions
         self.open_channels = 0
         self.commands: list[str] = []
@@ -723,9 +728,10 @@ class _TwoLoopbackPluginHost:
         self.open_channels += 1
         return _HostProcess(self, command)
 
-    async def run(self, command: str, **kwargs):
+    async def run(self, command: str, timeout: float | None = None):
+        # asyncssh's run(): its timeout neither bounds the open nor closes the channel
         process = await self.create_process(command)
-        return await process.wait()
+        return await asyncio.wait_for(process.wait(), timeout)
 
     async def answer(self, command: str, process: _HostProcess):
         self.commands.append(command)
@@ -757,6 +763,8 @@ class _TwoLoopbackPluginHost:
             return Mock(stdout="Installed plugin\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin enable "):
             name = _docker_plugin_name(command.split()[-1])
+            if name == _V2:
+                await asyncio.sleep(self.v2_enable_seconds)
             if self.v2_enable_fails and name == _V2:
                 return Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1)
             if name in self.plugins:
@@ -788,36 +796,33 @@ class _TwoLoopbackPluginHost:
 
 
 class _HostProcess:
-    # one SSH channel: closed by the host once the command exits, or by close(); like OpenSSH,
-    # the session stays taken while its command still runs, closed or not
+    # one SSH channel, like OpenSSH: the host closes it once its command ends, whoever waits;
+    # close() frees the session only when no command runs on it any more
     def __init__(self, host: _TwoLoopbackPluginHost, command: str):
         self.host = host
         self.command = command
         self.is_open = True
         self.child_alive = False
-        self.close_requested = False
+
+    def _start_child(self, child) -> asyncio.Future:
+        self.child_alive = True
+        task = asyncio.ensure_future(child)
+        task.add_done_callback(self._child_ended)
+        return task
+
+    def _child_ended(self, _task) -> None:
+        self.child_alive = False
+        self.close()
 
     def run_child_for(self, seconds: float) -> None:
         # the command was sent with the open and runs on its own, nobody reading its answer
-        self.child_alive = True
-
-        async def child() -> None:
-            await asyncio.sleep(seconds)
-            self.child_alive = False
-            if self.close_requested:
-                self.close()
-
-        self.child_task = asyncio.ensure_future(child())
+        self.child_task = self._start_child(asyncio.sleep(seconds))
 
     async def wait(self):
-        self.child_alive = True
-        answer = await self.host.answer(self.command, self)
-        self.child_alive = False
-        self.close()
-        return answer
+        # a cancelled wait leaves the command running on the host
+        return await asyncio.shield(self._start_child(self.host.answer(self.command, self)))
 
     def close(self) -> None:
-        self.close_requested = True
         if self.is_open and not self.child_alive:
             self.is_open = False
             self.host.open_channels -= 1
@@ -1004,6 +1009,20 @@ async def test_create_local_volume_falls_back_once_a_late_v2_state_channel_s_com
     )
 
     await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.3), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.open_channels == 0
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_falls_back_once_a_timed_out_v2_enable_has_freed_its_session(
+    docker_service,
+):
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True, _V2: False}, v2_enable_seconds=0.3, max_sessions=1
+    )
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.2), timeout=5)
 
     assert host.volumes["volume_new"][0] == _OLD
     assert host.open_channels == 0

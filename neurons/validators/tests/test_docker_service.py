@@ -89,7 +89,7 @@ def ssh_client_answering_through_run(run: AsyncMock) -> Mock:
         async def wait():
             return await run(command)
 
-        return Mock(wait=wait)
+        return Mock(wait=wait, wait_closed=AsyncMock())
 
     ssh_client.create_process = create_process
     return ssh_client

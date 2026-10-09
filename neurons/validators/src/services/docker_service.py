@@ -5483,14 +5483,16 @@ class DockerService:
         """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
         again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
         at volume creation with a clear reason instead of Docker's create error."""
-        run_kwargs = {"timeout": timeout} if timeout else {}
         extra = {**log_extra, "loopback_plugin": loopback_plugin_alias}
         try:
-            result = await ssh_client.run(
-                f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}", **run_kwargs
+            # a timed-out enable must free its channel: the fallback runs next on this connection
+            result = await _run_closing_channel_on_timeout(
+                ssh_client,
+                f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}",
+                timeout or None,
             )
-            state_result = await ssh_client.run(
-                _loopback_plugin_state_command(loopback_plugin_alias), **run_kwargs
+            state_result = await _run_closing_channel_on_timeout(
+                ssh_client, _loopback_plugin_state_command(loopback_plugin_alias), timeout or None
             )
         except asyncio.CancelledError:
             raise
