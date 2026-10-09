@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import logging
 import socket as socket_module
 import tempfile
 import threading
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import TypeVar
 
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -24,6 +27,33 @@ _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
 _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
+# A dropped SSH transport under a Docker SDK call costs one re-open (bounded by these paramiko
+# timeouts) plus one more attempt of the same call with its own timeout; there is no third try.
+_DOCKER_SSH_REOPEN_TIMEOUT_SECONDS = 15
+TRANSPORT_ERROR_CLASS = "transport"
+# The texts docker-py/urllib3/paramiko produce when the SSH channel under a Docker call is gone.
+# Plain substrings, matched against every exception text in the cause chain.
+_TRANSPORT_ERROR_TEXTS = (
+    "Read timed out",
+    "'NoneType' object has no attribute 'settimeout'",
+    "SSH session not active",
+    "SSH transport dropped",
+    "Socket is closed",  # paramiko: a send over a channel whose transport is gone
+    # http.client/urllib3 when the link drops mid-call. "Broken pipe" and "Connection reset by
+    # peer" are not here: a container's own stderr says them; they count by type, below
+    "Remote end closed connection without response",
+    "('Connection aborted.',",
+)
+_TRANSPORT_ERROR_TYPES = (
+    EOFError,
+    ConnectionResetError,  # RemoteDisconnected is one too
+    ConnectionAbortedError,
+    BrokenPipeError,
+    http.client.IncompleteRead,
+)
+# paramiko's EOFError has no text; the SDK client wraps it as "<operation> failed: EOFError".
+_TRANSPORT_EOF_SUFFIX = ": EOFError"
+_T = TypeVar("_T")
 # DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
 # the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
 # a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
@@ -55,8 +85,78 @@ class RentalDockerConnectionError(RuntimeError):
     """Raised when Docker SDK over SSH cannot be constructed safely."""
 
 
+class ContainerCreateRefused(Exception):
+    """Raised by a run spec's `before_create` check; nothing was created."""
+
+
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class RentalDockerTransportDropped(RentalDockerConnectionError):
+    """The SSH channel under a Docker SDK call is gone.
+
+    Raised by the rental SSH adapter where docker-py/urllib3 would otherwise dereference a
+    `None` channel (`'NoneType' object has no attribute 'settimeout'`) or surface paramiko's bare
+    `EOFError`; a typed error the retry below can recognise.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(f"SSH transport dropped: {detail}")
+
+
+class RentalDockerTransportError(RentalDockerOperationError):
+    """A Docker SDK call failed on a dropped SSH transport and its one retry did not recover it."""
+
+
+def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        stack.append(current.__cause__)
+        stack.append(current.__context__)
+        # urllib3's MaxRetryError/ProtocolError and requests' ConnectionError carry the socket-level
+        # error in `reason` or in args, not always as __cause__
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            stack.append(reason)
+        for arg in getattr(current, "args", ()):
+            if isinstance(arg, BaseException):
+                stack.append(arg)
+
+
+def is_rental_docker_transport_error(exc: BaseException) -> bool:
+    """True when `exc` (or anything in its cause chain) is a dropped-SSH-transport failure.
+
+    Membership is by type (`RentalDockerTransportDropped`, paramiko's `EOFError`, http.client's
+    `RemoteDisconnected`, a reset or broken pipe, a cut-off body, a urllib3 read timeout) and by
+    the exact texts those errors carry once wrapped into a string by the SDK
+    client, so a `RentalDockerOperationError("Docker SDK run container failed: EOFError")` counts
+    too. A Docker daemon answer (409, 500, no such image) is never a transport error.
+    """
+    for item in _iter_exception_chain(exc):
+        if isinstance(item, (RentalDockerTransportDropped, *_TRANSPORT_ERROR_TYPES)):
+            return True
+        if item.__class__.__name__ in {"ReadTimeoutError", "ReadTimeout"}:
+            return True
+        text = str(item)
+        if text == "EOFError" or text.endswith(_TRANSPORT_EOF_SUFFIX):
+            return True
+        if any(marker in text for marker in _TRANSPORT_ERROR_TEXTS):
+            return True
+    return False
+
+
+def rental_docker_error_class(exc: BaseException) -> str | None:
+    """The failure class a create failure carries for the backend's counter, or None."""
+    if is_rental_docker_transport_error(exc):
+        return TRANSPORT_ERROR_CLASS
+    return None
 
 
 class ContainerGoneBeforeExec(RentalDockerOperationError):
@@ -194,10 +294,17 @@ class ContainerRunSpec:
     memory_swap_gb: int | None = None
     oom_score_adj: int | None = None
     storage_limit_gb: int | None = None
+    # cgroup pids.max for the container. Caps total tasks (processes + threads) so a tenant fork
+    # bomb cannot exhaust the host's global PID space and starve the executor/sshd of forks. None
+    # keeps the daemon default (unlimited); the memory cgroup is no ceiling here because on a
+    # whole-host rental mem_limit is host-sized.
+    pids_limit: int | None = None
     shm_size: str | None = None
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
+    before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -206,6 +313,10 @@ class ContainerExecSpec:
     argv: tuple[str, ...]
     stdin: str | bytes | None = None
     environment: dict[str, str] = field(default_factory=dict)
+    # True only when running the command a second time leaves the container as one run would (a
+    # convergent script, an overwrite). An exec that appends is never retried on a dropped
+    # transport: whether the first run happened cannot be known from this side.
+    idempotent: bool = False
 
 
 @dataclass(slots=True)
@@ -285,9 +396,11 @@ class RentalDockerSdkClient:
         api_client,
         *,
         pull_timeout_seconds: int | float | None = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
+        transport_retry_enabled: bool = False,
     ):
         self._api_client = api_client
         self._pull_timeout_seconds = pull_timeout_seconds
+        self._transport_retry_enabled = transport_retry_enabled
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         # docker-py stores the credential under docker.io unless the registry
@@ -329,6 +442,12 @@ class RentalDockerSdkClient:
             ) from exc
 
     async def image_exists(self, *, image: str) -> bool:
+        return await self._retry_once_on_transport_drop(
+            operation="inspect image",
+            attempt=lambda: self._image_exists_once(image=image),
+        )
+
+    async def _image_exists_once(self, *, image: str) -> bool:
         try:
             await _in_docker_thread(self._api_client.inspect_image, image)
         except Exception as exc:
@@ -376,15 +495,38 @@ class RentalDockerSdkClient:
         )
 
     async def run_container(self, spec: ContainerRunSpec) -> str | None:
-        """Creates and starts the container; returns its ID (None if Docker gave none)."""
+        """Creates and starts the container; returns its ID (None if Docker gave none).
+
+        The ContainerCreateRefused of ``spec.before_create`` reaches the caller unwrapped.
+        """
+        # The retry adopts a container of this name and image if the first attempt's
+        # `containers/create` reached the daemon before the channel dropped: `create` is the one
+        # call here that must not run twice, `start` on a running container is a no-op.
+        return await self._retry_once_on_transport_drop(
+            operation="run container",
+            attempt=lambda: self._run_container_once(spec, adopt_existing=False),
+            resume=lambda: self._run_container_once(spec, adopt_existing=True),
+        )
+
+    async def _run_container_once(self, spec: ContainerRunSpec, *, adopt_existing: bool) -> str | None:
         try:
-            return await _in_docker_thread(self._run_container_sync, spec)
+            return await _in_docker_thread(self._run_container_sync, spec, adopt_existing=adopt_existing)
+        except (RentalDockerOperationError, ContainerCreateRefused):
+            raise
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK run container failed", exc)
             ) from exc
 
     async def exec_in_container(self, spec: ContainerExecSpec) -> ContainerExecResult:
+        if not spec.idempotent:
+            return await self._exec_in_container_once(spec)
+        return await self._retry_once_on_transport_drop(
+            operation="exec",
+            attempt=lambda: self._exec_in_container_once(spec),
+        )
+
+    async def _exec_in_container_once(self, spec: ContainerExecSpec) -> ContainerExecResult:
         last_restart_error: Exception | None = None
         for attempt in range(len(_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS) + 1):
             retry_result: ContainerExecResult | None = None
@@ -457,10 +599,14 @@ class RentalDockerSdkClient:
         return f"exit_code={exit_code}"
 
     async def start(self, *, container_name: str) -> None:
-        await self._call_api(
-            container_name,
-            operation_label="start",
-            api_method=self._api_client.start,
+        # starting a running container answers 304, so a second start after a drop is safe
+        await self._retry_once_on_transport_drop(
+            operation="start",
+            attempt=lambda: self._call_api(
+                container_name,
+                operation_label="start",
+                api_method=self._api_client.start,
+            ),
         )
 
     async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
@@ -490,6 +636,12 @@ class RentalDockerSdkClient:
         )
 
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        return await self._retry_once_on_transport_drop(
+            operation="inspect container",
+            attempt=lambda: self._inspect_container_state_once(container_name=container_name),
+        )
+
+    async def _inspect_container_state_once(self, *, container_name: str) -> ContainerStateSnapshot:
         try:
             return await _in_docker_thread(self._inspect_container_state_sync, container_name)
         except RentalDockerOperationError:
@@ -522,6 +674,20 @@ class RentalDockerSdkClient:
         container_name: str,
         destination: str,
     ) -> str | None:
+        return await self._retry_once_on_transport_drop(
+            operation="inspect container",
+            attempt=lambda: self._mount_source_for_destination_once(
+                container_name=container_name,
+                destination=destination,
+            ),
+        )
+
+    async def _mount_source_for_destination_once(
+        self,
+        *,
+        container_name: str,
+        destination: str,
+    ) -> str | None:
         try:
             return await _in_docker_thread(
                 self._mount_source_for_destination_sync,
@@ -541,6 +707,35 @@ class RentalDockerSdkClient:
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
     ) -> None:
+        # The retry adopts a volume of this name and driver if the first `volumes/create` reached
+        # the daemon before the channel dropped; a same-name volume on another driver is refused.
+        await self._retry_once_on_transport_drop(
+            operation="create volume",
+            attempt=lambda: self._create_volume_once(
+                volume_name=volume_name,
+                driver=driver,
+                driver_opts=driver_opts,
+                timeout=timeout,
+                adopt_existing=False,
+            ),
+            resume=lambda: self._create_volume_once(
+                volume_name=volume_name,
+                driver=driver,
+                driver_opts=driver_opts,
+                timeout=timeout,
+                adopt_existing=True,
+            ),
+        )
+
+    async def _create_volume_once(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None,
+        driver_opts: dict[str, str] | None,
+        timeout: int | None,
+        adopt_existing: bool,
+    ) -> None:
         try:
             await _in_docker_thread(
                 self._create_volume_sync,
@@ -548,11 +743,82 @@ class RentalDockerSdkClient:
                 driver=driver,
                 driver_opts=driver_opts,
                 timeout=timeout,
+                adopt_existing=adopt_existing,
             )
+        except RentalDockerOperationError:
+            raise
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK create volume failed", exc)
             ) from exc
+
+    async def _retry_once_on_transport_drop(
+        self,
+        *,
+        operation: str,
+        attempt: Callable[[], Awaitable[_T]],
+        resume: Callable[[], Awaitable[_T]] | None = None,
+    ) -> _T:
+        """Run `attempt`; on a dropped SSH transport re-open it and run `resume` (or `attempt`) once.
+
+        Budget per call: the first attempt with its own timeout, one re-open bounded by
+        `_DOCKER_SSH_REOPEN_TIMEOUT_SECONDS`, one more attempt with the same timeout — never a
+        third. Any other failure, and every failure while the flag is off, propagates unchanged;
+        `rental_docker_error_class` still names it for the failure event.
+        """
+        started = time.monotonic()
+        try:
+            return await attempt()
+        except Exception as exc:
+            if not self._transport_retry_enabled or not is_rental_docker_transport_error(exc):
+                raise
+            first_error = exc
+
+        first_error_text = str(first_error)
+        reopened = await self._reopen_transport(operation=operation, first_error=first_error)
+        logger.warning(
+            _m(
+                "Docker SDK call retried once after the SSH transport dropped",
+                extra=get_extra_info(
+                    {
+                        "docker_operation": operation,
+                        "error_class": TRANSPORT_ERROR_CLASS,
+                        "first_error": first_error_text,
+                        "first_attempt_ms": int((time.monotonic() - started) * 1000),
+                        "transport_reopened": reopened,
+                    }
+                ),
+            )
+        )
+        try:
+            return await (resume or attempt)()
+        except Exception as retry_exc:
+            if not is_rental_docker_transport_error(retry_exc):
+                # the daemon answered this time: its answer is the cause, not the transport
+                raise
+            raise RentalDockerTransportError(
+                f"Docker SDK {operation} failed on a dropped SSH transport and once more after "
+                f"re-opening it: {first_error_text}; retry: {retry_exc}"
+            ) from retry_exc
+
+    async def _reopen_transport(self, *, operation: str, first_error: Exception) -> bool:
+        """Close the dead SSH session under the API client and open a new one.
+
+        Returns False when the client has no rental adapter to re-open (a test double, a non-SSH
+        client) — the retry then runs on whatever connection docker-py hands out.
+        """
+        adapter = getattr(self._api_client, "_custom_adapter", None)
+        reopen = getattr(adapter, "reopen_transport", None)
+        if not callable(reopen):
+            return False
+        try:
+            await _in_docker_thread(reopen)
+        except Exception as exc:
+            raise RentalDockerTransportError(
+                f"Docker SDK {operation} failed on a dropped SSH transport and the transport could "
+                f"not be re-opened: {first_error}; re-open: {_error_text(exc)}"
+            ) from exc
+        return True
 
     async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
         await self._call_api(
@@ -701,27 +967,55 @@ class RentalDockerSdkClient:
                 return mount.get("Name") or mount.get("Source") or None
         return None
 
-    def _run_container_sync(self, spec: ContainerRunSpec) -> str | None:
+    def _run_container_sync(self, spec: ContainerRunSpec, *, adopt_existing: bool = False) -> str | None:
         if spec.network:
             self._ensure_rental_network_sync(spec.network)
-        host_config = self._api_client.create_host_config(
-            **_build_host_config_kwargs(spec)
-        )
-        created = self._api_client.create_container(
-            image=spec.image,
-            command=list(spec.command) or None,
-            detach=True,
-            ports=_container_ports(spec.ports) or None,
-            environment=spec.environment or None,
-            volumes=_container_volumes(spec.volumes) or None,
-            name=spec.name,
-            entrypoint=spec.entrypoint or None,
-            host_config=host_config,
-        )
-        _log_create_warnings(spec, created)
+        created = None
+        adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None
+        if adopted_id is None:
+            host_config = self._api_client.create_host_config(
+                **_build_host_config_kwargs(spec)
+            )
+            if spec.before_create is not None:
+                spec.before_create()
+            created = self._api_client.create_container(
+                image=spec.image,
+                command=list(spec.command) or None,
+                detach=True,
+                ports=_container_ports(spec.ports) or None,
+                environment=spec.environment or None,
+                volumes=_container_volumes(spec.volumes) or None,
+                name=spec.name,
+                entrypoint=spec.entrypoint or None,
+                host_config=host_config,
+            )
         self._api_client.start(spec.name)
-        container_id = created.get("Id") if isinstance(created, dict) else None
+        container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         return container_id if isinstance(container_id, str) and container_id else None
+
+    def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
+        """The idempotency check before a retried `containers/create`.
+
+        The inspected `Id` ("" when the daemon sent none) when a container named `spec.name` already
+        exists and runs `spec.image` — the first attempt's create reached the daemon and only its
+        answer was lost — so the retry skips `create` and goes straight to `start`; None otherwise. A same-name container on another image is not
+        ours to adopt or remove: the retry refuses it with the conflict named.
+        """
+        try:
+            info = self._api_client.inspect_container(spec.name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise
+        config = info.get("Config") if isinstance(info, dict) else None
+        existing_image = config.get("Image") if isinstance(config, dict) else None
+        if existing_image == spec.image:
+            existing_id = info.get("Id")
+            return existing_id if isinstance(existing_id, str) else ""
+        raise RentalDockerOperationError(
+            "Docker SDK run container refused after a transport retry: a container named "
+            f"{spec.name} already exists with image {existing_image!r}, not {spec.image!r}"
+        )
 
     def _ensure_rental_network_sync(self, name: str) -> None:
         """The container's network exists on the host and has inter-container traffic off.
@@ -770,7 +1064,10 @@ class RentalDockerSdkClient:
         driver: str | None,
         driver_opts: dict[str, str] | None,
         timeout: int | None,
+        adopt_existing: bool = False,
     ) -> None:
+        if adopt_existing and self._adopt_volume_by_name_sync(volume_name, driver):
+            return
         original_timeout = getattr(self._api_client, "timeout", None)
         should_override_timeout = timeout is not None and hasattr(
             self._api_client,
@@ -787,6 +1084,25 @@ class RentalDockerSdkClient:
         finally:
             if should_override_timeout:
                 self._api_client.timeout = original_timeout
+
+    def _adopt_volume_by_name_sync(self, volume_name: str, driver: str | None) -> bool:
+        """The idempotency check before a retried `volumes/create`: adopt a same-name volume on
+        the requested driver (Docker's default `local` when none was asked for); refuse another."""
+        try:
+            info = self._api_client.inspect_volume(volume_name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return False
+            raise
+        existing_driver = info.get("Driver") if isinstance(info, dict) else None
+        wanted_driver = driver or "local"
+        # a plugin driver is inspected as `<alias>:<tag>` while it is requested as `<alias>`
+        if isinstance(existing_driver, str) and existing_driver.split(":", 1)[0] == wanted_driver.split(":", 1)[0]:
+            return True
+        raise RentalDockerOperationError(
+            "Docker SDK create volume refused after a transport retry: a volume named "
+            f"{volume_name} already exists on driver {existing_driver!r}, not {wanted_driver!r}"
+        )
 
     def _pull_sync(self, image: str) -> None:
         # docker.APIClient.pull() hardcodes timeout=None for /images/create.
@@ -849,6 +1165,8 @@ class RentalDockerSdkClientFactory:
     api_client_factory: Callable[..., object] | None = None
     timeout: int = 60
     pull_timeout_seconds: int = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
+    # DOCKER_TRANSPORT_RETRY_ENABLED: a bool, or a callable read once per connect (the settings flag)
+    transport_retry_enabled: bool | Callable[[], bool] = False
 
     @asynccontextmanager
     async def connect(
@@ -858,6 +1176,11 @@ class RentalDockerSdkClientFactory:
         private_key: str,
     ) -> AsyncIterator[RentalDockerSdkClient]:
         host_key = require_rental_docker_ssh_host_key(executor_info)
+        transport_retry_enabled = (
+            bool(self.transport_retry_enabled())
+            if callable(self.transport_retry_enabled)
+            else bool(self.transport_retry_enabled)
+        )
 
         with tempfile.TemporaryDirectory(prefix="lium-rental-docker-ssh-") as temp_dir:
             ssh_home = Path(temp_dir)
@@ -879,13 +1202,34 @@ class RentalDockerSdkClientFactory:
             known_hosts_path.chmod(0o600)
             _validate_paramiko_known_hosts(known_hosts_path)
 
+            create = partial(
+                _in_docker_thread,
+                self._create_api_client,
+                _build_docker_ssh_base_url(executor_info),
+                key_path,
+                known_hosts_path,
+            )
             try:
-                api_client = await _in_docker_thread(
-                    self._create_api_client,
-                    _build_docker_ssh_base_url(executor_info),
-                    key_path,
-                    known_hosts_path,
-                )
+                try:
+                    api_client = await create()
+                except Exception as exc:
+                    # the client asks the daemon for its version: a drop there costs one more
+                    # connect (nothing on the host has changed yet), never a third
+                    if not transport_retry_enabled or not is_rental_docker_transport_error(exc):
+                        raise
+                    logger.warning(
+                        _m(
+                            "Docker SDK connect retried once after the SSH transport dropped",
+                            extra=get_extra_info(
+                                {
+                                    "docker_operation": "connect",
+                                    "error_class": TRANSPORT_ERROR_CLASS,
+                                    "first_error": str(exc),
+                                }
+                            ),
+                        )
+                    )
+                    api_client = await create()
             except Exception as exc:
                 raise RentalDockerConnectionError(
                     _wrap_error_message("Docker SDK client construction failed", exc)
@@ -894,6 +1238,7 @@ class RentalDockerSdkClientFactory:
             client = RentalDockerSdkClient(
                 api_client,
                 pull_timeout_seconds=self.pull_timeout_seconds,
+                transport_retry_enabled=transport_retry_enabled,
             )
             try:
                 yield client
@@ -1008,6 +1353,8 @@ def build_remove_authorized_keys_exec_spec(
         container_name=container_name,
         argv=("sh", "-c", script),
         stdin=key_data,
+        # filtering the same keys out twice leaves the same file
+        idempotent=True,
     )
 
 
@@ -1078,7 +1425,47 @@ def _build_rental_ssh_http_adapter_class(
     key_path: Path,
     known_hosts_path: Path,
 ):
-    from docker.transport.sshconn import SSHHTTPAdapter
+    from docker.transport.sshconn import SSHConnection, SSHConnectionPool, SSHHTTPAdapter
+
+    class RentalSSHConnection(SSHConnection):
+        """docker-py's SSH channel connection with the dropped-transport cases made typed.
+
+        Upstream `connect()` dereferences whatever `open_session()` hands back and urllib3's
+        `getresponse()` calls `settimeout` on `self.sock` unguarded; with the paramiko transport
+        gone both end in `'NoneType' object has no attribute 'settimeout'` or a bare `EOFError`.
+        Here they raise `RentalDockerTransportDropped`.
+        """
+
+        def connect(self):
+            transport = self.ssh_transport
+            if transport is None or not transport.is_active():
+                raise RentalDockerTransportDropped(
+                    "the SSH session to the executor is closed; no channel for the Docker API"
+                )
+            try:
+                channel = transport.open_session()
+            except EOFError as exc:
+                raise RentalDockerTransportDropped(
+                    "the SSH session ended while a Docker API channel was being opened"
+                ) from exc
+            if channel is None:
+                raise RentalDockerTransportDropped(
+                    "the SSH session returned no channel for the Docker API"
+                )
+            channel.settimeout(self.timeout)
+            channel.exec_command("docker system dial-stdio")
+            self.sock = channel
+
+        def getresponse(self):
+            if self.sock is None:
+                raise RentalDockerTransportDropped(
+                    "the Docker API channel closed before the daemon's answer was read"
+                )
+            return super().getresponse()
+
+    class RentalSSHConnectionPool(SSHConnectionPool):
+        def _new_conn(self):
+            return RentalSSHConnection(self.ssh_transport, self.timeout, self.ssh_host)
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
         def _connect(self) -> None:
@@ -1103,9 +1490,40 @@ def _build_rental_ssh_http_adapter_class(
                 "key_filename": str(key_path),
                 "look_for_keys": False,
                 "allow_agent": False,
+                # bounds a (re)connect: TCP connect, server banner, key auth
+                "timeout": _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS,
+                "banner_timeout": _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS,
+                "auth_timeout": _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS,
             }
             self.ssh_client.load_host_keys(str(known_hosts_path))
             self.ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+        def get_connection(self, url, proxies=None):
+            # upstream, minus the shell-out branch this adapter never takes, plus: a pool is
+            # built on a live transport (upstream reconnects only when there is none at all)
+            with self.pools.lock:
+                pool = self.pools.get(url)
+                if pool:
+                    return pool
+                transport = self.ssh_client.get_transport()
+                if transport is None or not transport.is_active():
+                    self._connect()
+                pool = RentalSSHConnectionPool(
+                    ssh_client=self.ssh_client,
+                    timeout=self.timeout,
+                    maxsize=self.max_pool_size,
+                    host=self.ssh_host,
+                )
+                self.pools[url] = pool
+            return pool
+
+        def reopen_transport(self) -> None:
+            """Drop every pool (their channels sit on the dead transport), close the SSH session
+            and open a new one with the same key and known_hosts; the next call gets a live channel."""
+            with self.pools.lock:
+                self.pools.clear()
+            self.ssh_client.close()
+            self._connect()
 
     RentalSSHHTTPAdapter.__name__ = "RentalSSHHTTPAdapter"
     return RentalSSHHTTPAdapter
@@ -1129,6 +1547,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
             f"{spec.memory_swap_gb}g" if spec.memory_gb and spec.memory_swap_gb else None
         ),
         "oom_score_adj": spec.oom_score_adj,
+        "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
             {"size": f"{spec.storage_limit_gb}g"}
             if spec.storage_limit_gb
@@ -1138,29 +1557,6 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "network_mode": spec.network,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
-
-
-def _log_create_warnings(spec: ContainerRunSpec, created: object) -> None:
-    """Log the daemon's create warnings; a memory limit it discarded is an error (DAH-3798).
-
-    A kernel without the memory cgroup makes Docker drop --memory with only a warning in the create
-    reply ("Limitation discarded"), and the container then runs with the host's whole RAM.
-    """
-    warnings = created.get("Warnings") if isinstance(created, dict) else None
-    if not warnings:
-        return
-    memory_discarded = spec.memory_gb is not None and any(
-        "memory" in str(warning).lower() for warning in warnings
-    )
-    log = logger.error if memory_discarded else logger.warning
-    log(
-        _m(
-            "rental_memory_limit_discarded" if memory_discarded else "docker_create_warnings",
-            extra=get_extra_info(
-                {"container_name": spec.name, "memory_gb": spec.memory_gb, "warnings": list(warnings)}
-            ),
-        )
-    )
 
 
 def _require_icc_off(name: str, network: dict) -> None:
@@ -1500,6 +1896,9 @@ def _validate_paramiko_known_hosts(known_hosts_path: Path) -> None:
         ) from exc
 
 
+def _error_text(exc: BaseException) -> str:
+    return str(exc) or exc.__class__.__name__
+
+
 def _wrap_error_message(message: str, exc: Exception) -> str:
-    detail = str(exc) or exc.__class__.__name__
-    return f"{message}: {detail}"
+    return f"{message}: {_error_text(exc)}"

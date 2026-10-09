@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings
+from incentive.burn_service import verified_burner_hotkey
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
 
@@ -51,6 +52,28 @@ class MissingScoredHotkeys:
 
 class ProviderPortalDataUnavailable(RuntimeError):
     """No live or Redis-cached provider snapshot is available."""
+
+
+def scored_registered_neurons(
+    miners: Sequence[bittensor.NeuronInfo],
+    registered: Sequence[bittensor.NeuronInfo],
+    miner_scores: dict[str, float],
+) -> list[bittensor.NeuronInfo]:
+    """Registered neurons with a score that the served-miner list does not carry."""
+    selected = {miner.hotkey for miner in miners}
+    return [neuron for neuron in registered if neuron.hotkey in miner_scores and neuron.hotkey not in selected]
+
+
+def fold_unregistered_into_burner(
+    miner_scores: dict[str, float], present_hotkeys: set[str], burner_hotkey: str | None
+) -> dict[str, float]:
+    """A settled vector is a day old and may name a hotkey that deregistered since. Its share goes to the verified
+    burner instead of to everyone else through normalization; with no verified burner it is dropped as before."""
+    folded = {hotkey: score for hotkey, score in miner_scores.items() if hotkey in present_hotkeys}
+    lost = sum(score for hotkey, score in miner_scores.items() if hotkey not in present_hotkeys)
+    if lost > 0 and burner_hotkey is not None and burner_hotkey in present_hotkeys:
+        folded[burner_hotkey] = folded.get(burner_hotkey, 0.0) + lost
+    return folded
 
 
 @contextlib.contextmanager
@@ -765,7 +788,9 @@ class SubtensorClient:
         self,
         miner_scores: dict[str, float],
         active_hotkeys: set[str] | None = None,
-    ) -> None:
+        wait_for_inclusion: bool = False,
+        include_registered_scored: bool = False,
+    ) -> bool:
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
@@ -794,9 +819,16 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            return
+            return False
 
         metagraph = self.get_metagraph()
+        if include_registered_scored:
+            # DAH-4001: a settled vector is a day old. A provider that removed its last node since then is no longer
+            # in the served-miner list, but its hotkey is still registered and the pay the backend approved is its.
+            miners = list(miners) + scored_registered_neurons(miners, metagraph.neurons, miner_scores)
+            miner_scores = fold_unregistered_into_burner(
+                miner_scores, {miner.hotkey for miner in miners}, verified_burner_hotkey(metagraph.neurons)
+            )
         self._log_scored_hotkeys_missing_from_selected_miners(
             miner_scores=miner_scores,
             selected_miners=miners,
@@ -903,12 +935,14 @@ class SubtensorClient:
             "weights": [int(w) for w in list(uint_weights)],
             "version_key": int(self.version_key),
             "wait_for_finalization": False,
-            "wait_for_inclusion": False,
+            "wait_for_inclusion": wait_for_inclusion,
             "current_block": current_block,
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
         await self.send_weights_to_lium(payload)
 
+        # stays on the event loop on purpose: the substrate websocket behind `self.subtensor` is shared with every
+        # other chain read and is not thread-safe, so a thread here could interleave frames with a concurrent read
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.netuid,
@@ -916,7 +950,7 @@ class SubtensorClient:
             weights=uint_weights,
             version_key=self.version_key,
             wait_for_finalization=False,
-            wait_for_inclusion=False,
+            wait_for_inclusion=wait_for_inclusion,
         )
         if result is True:
             logger.info(
@@ -937,6 +971,7 @@ class SubtensorClient:
                     ),
                 ),
             )
+        return result is True
 
     def get_last_update(self, block):
         try:
