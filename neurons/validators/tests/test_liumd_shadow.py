@@ -77,7 +77,10 @@ def verifyx_service(monkeypatch):
 class FakeLiumd:
     """`LiumdExecClient` answering as the binary does, per step as told."""
 
-    def __init__(self, *, matmul_uuid="challenge", verifyx_ok=True, lib_sha="lib-sha", result=None):
+    def __init__(
+        self, *, matmul_uuid="challenge", verifyx_ok=True, lib_sha="lib-sha", result=None, matmul=None
+    ):
+        self.matmul = matmul  # a dict replacing the matmul step's reply
         self.matmul_uuid = matmul_uuid
         self.verifyx_ok = verifyx_ok
         self.lib_sha = lib_sha
@@ -115,6 +118,8 @@ class FakeLiumd:
                 "stdout": cipher + ("-ok" if self.verifyx_ok else "-no"),
                 "data": {"lib_sha256": self.lib_sha},
             }
+        if self.matmul is not None:
+            steps["matmul"] = self.matmul
         for name in ("docker", "ports", "inspector"):
             steps[name] = {"status": "ok", "ms": 3}
         raw = {
@@ -281,6 +286,36 @@ async def test_an_outdated_verifyx_library_is_a_liumd_failure(
 
     assert record["steps"]["verifyx"]["liumd_reason"] == "lib_mismatch"
     assert record["steps"]["verifyx"]["agree"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "matmul,agree",
+    [
+        ({"status": "skipped", "ms": 0}, None),
+        ({"status": "failed", "ms": 5, "exit_status": 1, "stdout": "", "stderr_tail": ""}, False),
+    ],
+    ids=["skipped", "failed"],
+)
+async def test_a_requested_step_without_a_verdict_leaves_agreement_open(
+    keypair, monkeypatch, verifyx_service, matmul, agree
+):
+    record = await _shadow(
+        _ctx(keypair, monkeypatch, verifyx_service), FakeLiumd(matmul=matmul)
+    )
+
+    assert record["agree"] is agree
+
+
+@pytest.mark.asyncio
+async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    fake = FakeLiumd()
+
+    record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    assert fake.intents[0]["steps"]["matmul"] is None
+    assert record["steps"]["matmul"]["liumd_reason"] == "allcards_ssh"
 
 
 @pytest.mark.asyncio

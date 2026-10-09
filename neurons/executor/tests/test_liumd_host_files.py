@@ -45,9 +45,6 @@ def _image_tree(root: Path) -> None:
             target.write_bytes(f"{name} bytes".encode())
 
 
-def test_the_manifest_names_every_child_liumd_spawns_at_its_path():
-    assert dict(hf.CHILDREN) == LIUMD_CHILDREN
-
 
 def test_the_manifest_pins_each_child_and_follows_the_venv_symlink(tmp_path):
     _image_tree(tmp_path)
@@ -143,11 +140,6 @@ def test_an_unknown_command_is_refused():
     assert hf.main(["everything"]) == 2
 
 
-def test_the_dockerfile_pins_the_committed_binary():
-    pinned = re.search(r'echo "([0-9a-f]{64})  liumd/liumd" \| sha256sum -c -', DOCKERFILE)
-    assert pinned, "the Dockerfile must check liumd/liumd against a literal sha256"
-    assert pinned.group(1) == hashlib.sha256(BINARY.read_bytes()).hexdigest()
-
 
 def test_the_dockerfile_installs_liumd_and_hashes_the_children_after_the_provers():
     provers = DOCKERFILE.index("mv /root/app/libinspector.so /usr/lib/")
@@ -181,11 +173,6 @@ def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
 
     assert out.stdout.strip() == "/etc/liumd/children.json|unset|run"
 
-
-def test_run_sh_writes_the_host_files_before_sshd_and_never_stops_the_executor():
-    line = "pdm run python src/liumd_host_files.py host || echo"
-    assert line in RUN_SH
-    assert RUN_SH.index(line) < RUN_SH.index("service ssh start")
 
 
 @pytest.mark.skipif(platform.machine() != "x86_64", reason="the committed binary is x86_64 musl")

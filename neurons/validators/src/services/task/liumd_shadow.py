@@ -176,9 +176,14 @@ async def _compare(
 ) -> dict[str, Any]:
     today = today_verdicts(ok, events)
     steps = {name: _today_fields(step) for name, step in today.items()}
+    if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
+        steps["matmul"]["liumd_reason"] = "allcards_ssh"
     if _workload_on_node(ctx, today):
         return _skipped("workload", steps=steps)
-    ask_matmul = today["matmul"].verdict in RAN
+    # All-cards enforcement can reject a card before today's matmul; the shadow's one ordinary
+    # matmul is not comparable (checks/local_verify.py `allcards_ssh`).
+    allcards = settings.MATMUL_ALLCARDS_CHECK_ENABLED
+    ask_matmul = today["matmul"].verdict in RAN and not allcards
     ask_verifyx = today["verifyx"].verdict in RAN and ctx.config.verifyx_enabled
     if not (ask_matmul or ask_verifyx):
         return _skipped("no_gpu_step_ran", steps=steps)
@@ -263,6 +268,12 @@ async def _compare(
             matmul_challenge.close()
 
 
+def _not_run_or_fail(step, answer: LocalVerifyAnswer) -> str:
+    # A step the agent skipped, or cut at its own deadline, never ran to a verdict.
+    cut = step.status == "timeout" and answer.deadline_hit
+    return "not_run" if step.status == "skipped" or cut else "fail"
+
+
 def _liumd_fields(step, verdict: str, reason: str) -> dict[str, Any]:
     return {
         "liumd_status": step.status,
@@ -285,7 +296,7 @@ def _judged(
         step = answer.step("matmul")
         if step.status != "ok" or step.stdout is None:
             verdict, reason = (
-                ("not_run" if step.status == "skipped" else "fail"),
+                _not_run_or_fail(step, answer),
                 _step_reason(step),
             )
         else:
@@ -298,7 +309,7 @@ def _judged(
         step = answer.step("verifyx")
         if step.status != "ok" or step.stdout is None:
             verdict, reason = (
-                ("not_run" if step.status == "skipped" else "fail"),
+                _not_run_or_fail(step, answer),
                 _step_reason(step),
             )
         elif step.data.get("lib_sha256") != verifyx_challenge.expected_lib_sha256:
@@ -321,16 +332,21 @@ def _judged(
                 "liumd_ms": answer.steps[name].ms,
             }
 
+    # Every step asked for needs a comparable verdict, else the outcome is incomplete.
+    requested = [
+        n for n, c in (("matmul", matmul_challenge), ("verifyx", verifyx_challenge)) if c is not None
+    ]
     compared = []
-    for name in TODAY_CHECK_IDS:
+    for name in requested:
         entry = steps[name]
         if today[name].verdict in RAN and entry.get("liumd_verdict") in RAN:
             entry["agree"] = entry["liumd_verdict"] == today[name].verdict
             compared.append(entry["agree"])
+    complete = len(compared) == len(requested)
     return {
         "outcome": "compared",
         "reason": "ok",
-        "agree": all(compared) if compared else None,
+        "agree": all(compared) if complete and compared else None,
         "round_trip_ms": answer.round_trip_ms,
         "executor_elapsed_ms": answer.elapsed_ms,
         "executor_version": answer.executor_version,
