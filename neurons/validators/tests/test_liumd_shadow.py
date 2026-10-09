@@ -292,7 +292,7 @@ async def test_agreement_per_step_and_overall(
 
     record = await _shadow(ctx, FakeLiumd(**fake_args), ok=ok, events=events)
 
-    assert record["steps"]["matmul"]["agree"] is matmul_agree
+    assert record["steps"]["matmul"].get("agree") is matmul_agree
     assert record["steps"]["verifyx"]["agree"] is verifyx_agree
     assert record["agree"] is agree
 
