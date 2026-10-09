@@ -294,6 +294,33 @@ async def test_a_requested_step_without_a_verdict_leaves_agreement_open(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply,disabled,step,expected",
+    [
+        ({"lib_sha": "old"}, False, "verifyx", {"liumd_reason": "lib_mismatch", "agree": False}),
+        ({}, True, "verifyx", {"today": "skipped", "today_reason_code": "VERIFYX_DISABLED"}),
+    ],
+    ids=["outdated-library", "verifyx-disabled"],
+)
+async def test_verifyx_library_and_toggle_decide_the_comparison(
+    keypair, monkeypatch, verifyx_service, reply, disabled, step, expected
+):
+    fake = FakeLiumd(**reply)
+    events = PASSED
+    if disabled:
+        events = [_event(VERIFYX, "VERIFYX_DISABLED"), _event(CAPABILITY, "GPU_VERIFY_OK")]
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, verifyx_enabled=not disabled)
+
+    record = await _shadow(ctx, fake, events=events)
+
+    assert expected.items() <= record["steps"][step].items()
+    if disabled:
+        [intent] = fake.intents
+        assert intent["steps"]["verifyx"] is None and intent["steps"]["matmul"]
+        assert record["agree"] is True
+
+
+@pytest.mark.asyncio
 async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, verifyx_service):
     monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     fake = FakeLiumd()
@@ -323,14 +350,29 @@ async def test_all_cards_mode_does_not_compare_the_matmul(keypair, monkeypatch, 
         ),
         ([], True, "no_gpu_step_ran"),
         ([_event("gpu.count", "GPU_COUNT_MISMATCH")], False, "no_gpu_step_ran"),
+        (PASSED, True, "workload", {"rented": True}),
+        (PASSED, True, "no_budget", {"deadline_s": 59.0}),
     ],
 )
 async def test_no_gpu_work_where_today_ran_none(
-    keypair, monkeypatch, verifyx_service, events, ok, reason
+    keypair, monkeypatch, verifyx_service, events, ok, reason, extra=None
 ):
     fake = FakeLiumd()
+    extra = dict(extra or {})
+    state = None
+    if extra.pop("rented", False):
+        pod = {"pod_id": "p1", "container_name": "c1"}
+        node = {
+            "miner_hotkey": "5Miner",
+            "executor_ip_address": "10.0.0.5",
+            "executor_ip_port": "8001",
+            "pods": [pod],
+        }
+        rented = RentedExecutorsResponse.model_validate({"executors": {UUID: node}})
+        state = build_state(specs=SPECS, rented_data=rented)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
 
-    record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake, ok=ok, events=events)
+    record = await _shadow(ctx, fake, ok=ok, events=events, **extra)
 
     assert (record["outcome"], record["reason"]) == ("skipped", reason)
     assert fake.intents == []
