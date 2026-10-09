@@ -1816,15 +1816,15 @@ async def _run_closing_channel_on_timeout(
     ssh_client: asyncssh.SSHClientConnection, command: str, timeout: float | None
 ) -> asyncssh.SSHCompletedProcess:
     # asyncssh's timeout= bounds neither the channel open nor frees the channel when it fires;
-    # closing it lets a host with MaxSessions=1 run the next command. Raises TimeoutError.
-    process = None
+    # closing it lets a host with MaxSessions=1 run the next command. The command's own timeout
+    # starts once its channel is open, as a host-side `timeout` does. Raises TimeoutError.
+    async with asyncio.timeout(timeout):
+        process = await ssh_client.create_process(command)
     try:
         async with asyncio.timeout(timeout):
-            process = await ssh_client.create_process(command)
             return await process.wait()
     except TimeoutError:
-        if process is not None:
-            process.close()
+        process.close()
         raise
 
 

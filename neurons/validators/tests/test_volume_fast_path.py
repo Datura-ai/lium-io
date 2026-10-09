@@ -668,6 +668,7 @@ class _TwoLoopbackPluginHost:
         v2_enable_fails: bool = False,
         v2_install_hangs: bool = False,
         v2_install_answer_lost: bool = False,
+        v2_install_channel_open_seconds: float = 0,
         v2_state_channel_open_hangs: bool = False,
         max_sessions: int | None = None,
     ):
@@ -677,6 +678,7 @@ class _TwoLoopbackPluginHost:
         self.v2_enable_fails = v2_enable_fails
         self.v2_install_hangs = v2_install_hangs
         self.v2_install_answer_lost = v2_install_answer_lost
+        self.v2_install_channel_open_seconds = v2_install_channel_open_seconds
         self.v2_state_channel_open_hangs = v2_state_channel_open_hangs
         self.max_sessions = max_sessions
         self.open_channels = 0
@@ -699,6 +701,8 @@ class _TwoLoopbackPluginHost:
             and _V2 in command
         ):
             await asyncio.Event().wait()
+        if "plugin install" in command and f"--alias {_V2} " in command:
+            await asyncio.sleep(self.v2_install_channel_open_seconds)
         self.open_channels += 1
         return _HostProcess(self, command)
 
@@ -875,6 +879,28 @@ async def test_create_local_volume_falls_back_to_the_old_plugin_when_the_v2_inst
     assert host.plugins == {_OLD: True}
     (logged,), _ = warning.call_args
     assert logged.extra["reason"].startswith("install exit 124, state absent")
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_waits_for_the_host_side_install_timeout_after_a_slow_channel_open(
+    docker_service, monkeypatch
+):
+    # the channel opens late, so the host's timer ends the install after the validator's deadline
+    # would if it counted from before the open: the session would still be taken (MaxSessions=1)
+    from services import docker_service as docker_service_module
+
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True},
+        v2_install_hangs=True,
+        v2_install_channel_open_seconds=0.3,
+        max_sessions=1,
+    )
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(docker_service_module, "_LOOPBACK_PLUGIN_INSTALL_DEADLINE_SECONDS", 0.4)
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
 
 
 @pytest.mark.asyncio
