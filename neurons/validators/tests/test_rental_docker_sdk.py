@@ -648,7 +648,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
     assert api_client.host_config_kwargs["pids_limit"] == 8192
-    assert api_client.started == ["pod_test"]
+    assert api_client.started == ["container-id"]
 
 
 # --- DAH-3199: a rental joins the ICC-off bridge, never docker0 ---

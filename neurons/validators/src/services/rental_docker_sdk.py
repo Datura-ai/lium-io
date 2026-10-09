@@ -1005,9 +1005,11 @@ class RentalDockerSdkClient:
                     for name in container.get("Names") or ()
                 ]
             )
-        self._api_client.start(spec.name)
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
-        return container_id if isinstance(container_id, str) and container_id else None
+        container_id = container_id if isinstance(container_id, str) and container_id else None
+        # by ID, so a same-name container another create made since this one's listing is never started
+        self._api_client.start(container_id or spec.name)
+        return container_id
 
     def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
         """The idempotency check before a retried `containers/create`.
