@@ -527,7 +527,7 @@ async def test_create_local_volume_enables_v2_when_v2_is_installed_but_disabled(
 
     calls = ssh_client.run.await_args_list
     assert [c.args[0] for c in calls] == [
-        "/usr/bin/docker plugin enable vloopback:v2",
+        "timeout -k 5 10 /usr/bin/docker plugin enable vloopback:v2",
         "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback:v2 2>/dev/null "
         "|| echo absent) | tail -n 1",
     ]
@@ -763,7 +763,10 @@ class _TwoLoopbackPluginHost:
             return Mock(stdout="Installed plugin\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin enable "):
             name = _docker_plugin_name(command.split()[-1])
-            if name == _V2:
+            if name == _V2 and self.v2_enable_seconds:
+                if host_timeout is not None and self.v2_enable_seconds > host_timeout:
+                    await asyncio.sleep(host_timeout)
+                    return Mock(stdout="", stderr="", exit_status=124)
                 await asyncio.sleep(self.v2_enable_seconds)
             if self.v2_enable_fails and name == _V2:
                 return Mock(stdout="", stderr="Error response from daemon: dial unix plugin.sock: connect: no such file", exit_status=1)
@@ -1029,6 +1032,21 @@ async def test_create_local_volume_falls_back_once_a_timed_out_v2_enable_has_fre
 
 
 @pytest.mark.asyncio
+async def test_create_local_volume_falls_back_when_the_v2_enable_hangs_past_twice_its_timeout(
+    docker_service,
+):
+    # sshd keeps the session while the enable runs: only the host ending it frees the session
+    host = _TwoLoopbackPluginHost(
+        plugins={_OLD: True, _V2: False}, v2_enable_seconds=60, max_sessions=1
+    )
+
+    await asyncio.wait_for(_rent_a_new_volume(docker_service, host, timeout=0.2), timeout=5)
+
+    assert host.volumes["volume_new"][0] == _OLD
+    assert host.open_channels == 0
+
+
+@pytest.mark.asyncio
 async def test_create_local_volume_falls_back_to_the_old_plugin_when_v2_cannot_be_enabled(docker_service):
     host = _TwoLoopbackPluginHost(plugins={_OLD: True, _V2: False}, v2_enable_fails=True)
 
@@ -1061,7 +1079,7 @@ async def test_create_local_volume_enables_a_disabled_old_plugin_as_main_does_wh
 
     await _rent_a_new_volume(docker_service, host)
 
-    assert "/usr/bin/docker plugin enable vloopback" in host.commands
+    assert "timeout -k 5 10 /usr/bin/docker plugin enable vloopback" in host.commands
     assert sum("plugin install" in command for command in host.commands) == 1
     assert host.volumes["volume_new"][0] == _OLD
 

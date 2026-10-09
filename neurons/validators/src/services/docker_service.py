@@ -5484,12 +5484,14 @@ class DockerService:
         again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
         at volume creation with a clear reason instead of Docker's create error."""
         extra = {**log_extra, "loopback_plugin": loopback_plugin_alias}
+        enable_command = f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}"
         try:
-            # a timed-out enable must free its channel: the fallback runs next on this connection
+            # a timed-out enable must free its channel: the fallback runs next on this connection,
+            # and sshd frees it only once the enable has ended, so the host ends it first
             result = await _run_closing_channel_on_timeout(
                 ssh_client,
-                f"/usr/bin/docker plugin enable {shlex.quote(loopback_plugin_alias)}",
-                timeout or None,
+                f"timeout -k 5 {timeout} {enable_command}" if timeout else enable_command,
+                timeout + 10 if timeout else None,
             )
             state_result = await _run_closing_channel_on_timeout(
                 ssh_client, _loopback_plugin_state_command(loopback_plugin_alias), timeout or None
