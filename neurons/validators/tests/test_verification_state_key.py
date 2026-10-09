@@ -163,7 +163,7 @@ async def test_failed_cycle_does_not_import_another_hotkeys_legacy_identity(cont
         await service.set_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, success=False)
         await service.clear_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, anchor_broken=True)
     else:
-        assert await _cycle(service, context_factory, hotkey=HOTKEY_B, uuids="gpu-009")
+        assert await _cycle(service, context_factory, hotkey=HOTKEY_B, uuids="gpu-009") is a_first
     record = await _field(service, verified_job_field(HOTKEY_B, EXECUTOR))
     assert record is None or record["uuids"] != "gpu-001"
 
