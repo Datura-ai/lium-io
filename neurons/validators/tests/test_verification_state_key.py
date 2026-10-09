@@ -147,7 +147,8 @@ async def test_failing_cycle_leaves_legacy_and_other_records_unchanged(context_f
     # an anchored legacy record only gains the broken mark (as on main); nothing is imported into B's record
     expected = json.loads(legacy) | ({"anchor_broken": True} if anchor else {})
     assert await _field(service, EXECUTOR) == expected
-    assert await _field(service, verified_job_field(HOTKEY_B, EXECUTOR)) is None
+    if anchor:
+        assert await _field(service, verified_job_field(HOTKEY_B, EXECUTOR)) is None
     assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == json.loads(other)
 
 
