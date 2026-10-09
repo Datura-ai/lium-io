@@ -660,7 +660,7 @@ class RedisService:
         async with self.lock:
             async for field, value in self.redis.hscan_iter(VERIFIED_JOB_COUNT_KEY, match=f"*:{executor_id}"):
                 field = field.decode() if isinstance(field, bytes) else field
-                if field == own_field or not field.endswith(f":{executor_id}"):
+                if field == own_field or field.partition(":")[2] != executor_id:
                     continue
                 anchor = json.loads(value).get(GPU_ANCHOR_KEY)
                 if anchor:
