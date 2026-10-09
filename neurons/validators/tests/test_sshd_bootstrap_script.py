@@ -270,7 +270,7 @@ def test_no_grace_wait_when_image_ships_no_sshd_binary(harness):
     assert harness.sshd_start_attempts() == ["started"]
 
 
-def test_apt_install_skips_recommended_packages_and_keeps_terminfo_x11_python3_wget_and_ca_certificates(harness):
+def test_apt_install_skips_recommended_packages_and_keeps_terminfo_x11_python3_wget_certs(harness):
     harness.stage_sshd_payload(SSHD_STARTS)
 
     result = harness.run()
