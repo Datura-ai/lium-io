@@ -409,7 +409,7 @@ class Settings(BaseSettings):
     # would-be hard decision; a missing or added card is GPU_UUID_CHANGED too now that the fingerprint check
     # runs before the spec check (the count change made it SPEC_CHANGED). On = a strict subset of the anchor is GPU_MISSING (score 0
     # this cycle, the node returns when the full set is back); any UUID outside the anchor marks the node
-    # "anchor broken": score 0 on every later cycle under this executor id, no re-verification; the provider
+    # "anchor broken": score 0 on every later cycle under this (hotkey, executor id), no re-verification; the provider
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)

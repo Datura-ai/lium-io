@@ -15,7 +15,7 @@ from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFinge
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
-from services.redis_service import VERIFIED_JOB_COUNT_KEY, RedisService, verified_job_field
+from services.redis_service import LEGACY_FALLBACK_KEY, VERIFIED_JOB_COUNT_KEY, RedisService, verified_job_field
 
 from tests.helpers import build_state
 
@@ -94,7 +94,7 @@ async def test_existing_state_is_preserved_on_upgrade(context_factory):
     legacy = {"count": 40, "failed": 2, "spec": "A100:1", "uuids": "gpu-001"}
     await service.redis.hset(VERIFIED_JOB_COUNT_KEY, EXECUTOR, json.dumps(legacy))
 
-    assert await service.get_verified_job_info(EXECUTOR, HOTKEY_A) == legacy
+    assert await service.get_verified_job_info(EXECUTOR, HOTKEY_A) == {**legacy, LEGACY_FALLBACK_KEY: True}
     assert await _cycle(service, context_factory, hotkey=HOTKEY_A, uuids="gpu-001") is True
 
     record = await _field(service, verified_job_field(HOTKEY_A, EXECUTOR))
@@ -146,3 +146,28 @@ async def test_failing_cycle_leaves_legacy_and_other_records_unchanged(context_f
 
     assert await _field(service, EXECUTOR) == json.loads(legacy)
     assert await _field(service, verified_job_field(HOTKEY_A, EXECUTOR)) == json.loads(other)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("a_first", [False, True])
+@pytest.mark.parametrize("failure", ["pre_fingerprint", "mismatch"])
+async def test_failed_cycle_does_not_import_another_hotkeys_legacy_identity(context_factory, a_first, failure):
+    service = _redis_service()
+    legacy = {"count": 40, "failed": 0, "spec": "A100:1", "uuids": "gpu-001"}
+    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, EXECUTOR, json.dumps(legacy))
+    if a_first:
+        assert await _cycle(service, context_factory, hotkey=HOTKEY_A, uuids="gpu-001")
+
+    verified = await service.get_verified_job_info(EXECUTOR, HOTKEY_B)
+    if failure == "pre_fingerprint":
+        await service.set_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, success=False)
+        await service.clear_verified_job_info(HOTKEY_B, EXECUTOR, prev_info=verified, anchor_broken=True)
+    else:
+        assert await _cycle(service, context_factory, hotkey=HOTKEY_B, uuids="gpu-009")
+    record = await _field(service, verified_job_field(HOTKEY_B, EXECUTOR))
+    assert record is None or record["uuids"] != "gpu-001"
+
+    if not a_first:
+        assert await _cycle(service, context_factory, hotkey=HOTKEY_A, uuids="gpu-001")
+    assert await _cycle(service, context_factory, hotkey=HOTKEY_B, uuids="gpu-009")
+    assert (await _field(service, verified_job_field(HOTKEY_B, EXECUTOR)))["uuids"] == "gpu-009"

@@ -32,6 +32,9 @@ GPU_ANCHOR_KEY = "uuids"
 # DAH-3457: field of a verified-job record, set once by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED and kept by
 # every later write; read back by the same check, which then fails the node without comparing the sets.
 GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
+# Set only on the in-memory dict get_verified_job_info returns for the uuid-only fallback; never stored. The record is
+# another hotkey's until a cycle under this hotkey succeeds, so no failure path may copy it into this hotkey's record.
+LEGACY_FALLBACK_KEY = "legacy_fallback"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
@@ -559,6 +562,8 @@ class RedisService:
         if (success):
             count += 1
         else:
+            if prev_info.get(LEGACY_FALLBACK_KEY):
+                return
             failed += 1
 
         # if failed * 20 >= count:
@@ -594,15 +599,16 @@ class RedisService:
         spec = prev_info.get('spec', '')
         uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
-        data = {
-            "count": 0,
-            "failed": 0,
-            "spec": spec,
-            GPU_ANCHOR_KEY: uuids,
-        }
-        if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
-            data[GPU_ANCHOR_BROKEN_KEY] = True
-        await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
+        if not prev_info.get(LEGACY_FALLBACK_KEY):
+            data = {
+                "count": 0,
+                "failed": 0,
+                "spec": spec,
+                GPU_ANCHOR_KEY: uuids,
+            }
+            if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+                data[GPU_ANCHOR_BROKEN_KEY] = True
+            await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
         # penalty row (lium-platform DAH-3385). Optional on the wire: an older backend ignores the keys.
@@ -636,7 +642,7 @@ class RedisService:
         legacy = json.loads(data)
         if not legacy.get(GPU_ANCHOR_KEY):
             return {}
-        return legacy
+        return {**legacy, LEGACY_FALLBACK_KEY: True}
 
     async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
