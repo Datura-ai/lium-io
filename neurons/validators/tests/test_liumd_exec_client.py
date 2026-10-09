@@ -169,23 +169,25 @@ async def test_exits_2_4_5_6_are_the_refusal_document(keypair, intent, exit_stat
 
 
 @pytest.mark.asyncio
-async def test_a_refusal_code_outside_its_exit_status_is_not_echoed_into_labels(keypair, intent):
-    conn = FakeConnection(FakeProcess(_refusal(intent, "busy", echo=False), 4))
+@pytest.mark.parametrize(
+    "doc,exit_status,expected",
+    [
+        ({"error": "busy"}, 4, "unexpected_error"),
+        ({"nonce": "other"}, 5, "busy"),
+        ({"executor_uuid": "other"}, 5, "busy"),
+    ],
+    ids=["code-outside-its-exit", "other-nonce", "other-executor"],
+)
+async def test_a_refusal_not_for_this_intent_is_not_echoed(
+    keypair, intent, doc, exit_status, expected
+):
+    echo = "error" in doc  # an unechoed document carries no nonce at all
+    body = {**json.loads(_refusal(intent, "busy", echo=not echo)), **doc}
+    conn = FakeConnection(FakeProcess(json.dumps(body).encode(), exit_status))
 
     refusal = await _run(keypair, intent, conn)
 
-    assert (refusal.error, refusal.echoed) == ("unexpected_error", False)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("echo", [{"nonce": "other"}, {"executor_uuid": "other"}])
-async def test_a_refusal_for_another_intent_is_not_echoed(keypair, intent, echo):
-    doc = {**json.loads(_refusal(intent, "busy")), **echo}
-    conn = FakeConnection(FakeProcess(json.dumps(doc).encode(), 5))
-
-    refusal = await _run(keypair, intent, conn)
-
-    assert (refusal.error, refusal.echoed) == ("busy", False)
+    assert (refusal.error, refusal.echoed) == (expected, False)
 
 
 def _unavailable_cases(intent):
@@ -214,25 +216,18 @@ async def test_anything_but_an_answer_or_refusal_is_unavailable(keypair, intent,
 
 
 @pytest.mark.asyncio
-async def test_an_answer_of_exactly_the_cap_is_read(keypair, intent):
+@pytest.mark.parametrize("over", [0, 1], ids=["exactly-the-cap", "one-byte-over"])
+async def test_an_answer_is_read_up_to_the_cap_and_no_further(keypair, intent, over):
     body = _answer(intent)
-    padded = body[:-1] + b" " * (MAX_ANSWER_BYTES - len(body)) + b"}"
-    assert len(padded) == MAX_ANSWER_BYTES
+    padded = body[:-1] + b" " * (MAX_ANSWER_BYTES + over - len(body)) + b"}"
+    # Past the cap there is 4 MiB more, behind a stream that then hangs.
+    process = FakeProcess(padded + b" " * (1 << 22 if over else 0), 0, hang=bool(over))
 
-    answer = await _run(keypair, intent, FakeConnection(FakeProcess(padded, 0)))
-
-    assert isinstance(answer, LocalVerifyAnswer)
-
-
-@pytest.mark.asyncio
-async def test_one_byte_over_the_cap_stops_reading_and_closes_the_channel(keypair, intent):
-    body = _answer(intent)
-    oversized = body[:-1] + b" " * (MAX_ANSWER_BYTES + 1 - len(body)) + b"}" + b" " * (1 << 22)
-    process = FakeProcess(oversized, 0, hang=True)
-
+    if not over:
+        assert isinstance(await _run(keypair, intent, FakeConnection(process)), LocalVerifyAnswer)
+        return
     with pytest.raises(LocalVerifyUnavailable) as err:
         await _run(keypair, intent, FakeConnection(process))
-
     assert err.value.reason == "malformed"
     assert process.closed
     # Read in 64 KiB chunks until one byte past the cap, never the 4 MiB behind it.
@@ -251,23 +246,19 @@ async def test_endless_stderr_is_cut_off_and_closes_the_channel(keypair, intent)
 
 
 @pytest.mark.asyncio
-async def test_a_host_that_never_answers_times_out_and_closes_the_channel(keypair, intent):
+@pytest.mark.parametrize("hang_at", ["answer", "channel-open"])
+async def test_a_host_that_never_answers_times_out_and_closes_the_channel(keypair, intent, hang_at):
     process = FakeProcess(b"", None, hang=True)
+    conn = FakeConnection(process)
+    if hang_at == "channel-open":
 
-    with pytest.raises(LocalVerifyUnavailable) as err:
-        await asyncio.wait_for(_run(keypair, intent, FakeConnection(process), timeout_s=0.05), 5)
-
-    assert err.value.reason == "timeout"
-    assert process.closed
-
-
-@pytest.mark.asyncio
-async def test_a_channel_open_that_hangs_times_out(keypair, intent):
-    class _Hanging(FakeConnection):
-        async def create_process(self, command, **kwargs):
+        async def hang(command, **kwargs):
             await asyncio.Event().wait()
 
+        conn.create_process = hang
+
     with pytest.raises(LocalVerifyUnavailable) as err:
-        await asyncio.wait_for(_run(keypair, intent, _Hanging(), timeout_s=0.05), 5)
+        await asyncio.wait_for(_run(keypair, intent, conn, timeout_s=0.05), 5)
 
     assert err.value.reason == "timeout"
+    assert process.closed == (hang_at == "answer")

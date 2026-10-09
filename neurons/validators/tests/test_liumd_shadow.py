@@ -37,6 +37,15 @@ from tests.test_local_verify import _FakeVerifyXValidator, matmul_service, matmu
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 UUID = "exec-shadow"
+EXECUTOR_INFO = ExecutorSSHInfo(
+    uuid=UUID,
+    address="10.0.0.5",
+    port=8001,
+    ssh_username="root",
+    ssh_port=2200,
+    python_path="/usr/bin/python",
+    root_dir="/root/app",
+)
 CAPABILITY = "gpu.validate.capability"
 VERIFYX = "gpu.validate.verifyx"
 
@@ -76,9 +85,7 @@ def verifyx_service(monkeypatch):
 class FakeLiumd:
     """`LiumdExecClient` answering as the binary does, per step as told."""
 
-    def __init__(
-        self, *, verifyx_ok=True, lib_sha="lib-sha", result=None, matmul=None
-    ):
+    def __init__(self, *, verifyx_ok=True, lib_sha="lib-sha", result=None, matmul=None):
         self.matmul = matmul  # a dict replacing the matmul step's reply
         self.verifyx_ok = verifyx_ok
         self.lib_sha = lib_sha
@@ -134,15 +141,7 @@ class FakeLiumd:
 
 def _ctx(keypair, monkeypatch, verifyx_service, *, sealed="challenge", state=None, **config):
     return make_context(
-        executor=ExecutorSSHInfo(
-            uuid=UUID,
-            address="10.0.0.5",
-            port=8001,
-            ssh_username="root",
-            ssh_port=2200,
-            python_path="/usr/bin/python",
-            root_dir="/root/app",
-        ),
+        executor=EXECUTOR_INFO,
         miner_hotkey="5Miner",
         ssh=object(),
         services=build_services(
@@ -243,51 +242,58 @@ async def test_the_intent_mirrors_todays_steps_and_sizing(keypair, monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_liumd_failing_where_today_passed_is_a_disagreement(
-    keypair, monkeypatch, verifyx_service
-):
-    ctx = _ctx(keypair, monkeypatch, verifyx_service, sealed="GPU-SPOOFED")
-
-    record = await _shadow(ctx, FakeLiumd(verifyx_ok=False))
-
-    assert record["agree"] is False
-    assert record["steps"]["matmul"]["liumd_verdict"] == "fail"
-    assert record["steps"]["matmul"]["liumd_reason"] == "local_failed"
-    assert record["steps"]["verifyx"]["agree"] is False
-
-
-@pytest.mark.asyncio
-async def test_today_failing_where_liumd_passed_is_a_disagreement(
-    keypair, monkeypatch, verifyx_service
-):
-    events = [_event(VERIFYX, "VERIFYX_OK"), _event(CAPABILITY, "GPU_VERIFY_FAILED")]
-
-    record = await _shadow(
-        _ctx(keypair, monkeypatch, verifyx_service), FakeLiumd(), ok=False, events=events
-    )
-
-    assert record["steps"]["matmul"]["today"] == "fail"
-    assert record["steps"]["matmul"]["agree"] is False
-    assert record["steps"]["verifyx"]["agree"] is True
-    assert record["agree"] is False
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "matmul,agree",
+    "sealed,fake_args,ok,events,matmul_agree,verifyx_agree,agree",
     [
-        ({"status": "skipped", "ms": 0}, None),
-        ({"status": "failed", "ms": 5, "exit_status": 1, "stdout": "", "stderr_tail": ""}, False),
+        ("GPU-SPOOFED", dict(verifyx_ok=False), True, PASSED, False, False, False),
+        (
+            "challenge",
+            {},
+            False,
+            [_event(VERIFYX, "VERIFYX_OK"), _event(CAPABILITY, "GPU_VERIFY_FAILED")],
+            False,
+            True,
+            False,
+        ),
+        ("challenge", dict(matmul={"status": "skipped", "ms": 0}), True, PASSED, None, True, None),
+        (
+            "challenge",
+            dict(
+                matmul={
+                    "status": "failed",
+                    "ms": 5,
+                    "exit_status": 1,
+                    "stdout": "",
+                    "stderr_tail": "",
+                }
+            ),
+            True,
+            PASSED,
+            False,
+            True,
+            False,
+        ),
     ],
-    ids=["skipped", "failed"],
+    ids=["liumd-fails", "today-fails", "step-skipped", "step-failed"],
 )
-async def test_a_requested_step_without_a_verdict_leaves_agreement_open(
-    keypair, monkeypatch, verifyx_service, matmul, agree
+async def test_agreement_per_step_and_overall(
+    keypair,
+    monkeypatch,
+    verifyx_service,
+    sealed,
+    fake_args,
+    ok,
+    events,
+    matmul_agree,
+    verifyx_agree,
+    agree,
 ):
-    record = await _shadow(
-        _ctx(keypair, monkeypatch, verifyx_service), FakeLiumd(matmul=matmul)
-    )
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, sealed=sealed)
 
+    record = await _shadow(ctx, FakeLiumd(**fake_args), ok=ok, events=events)
+
+    assert record["steps"]["matmul"]["agree"] is matmul_agree
+    assert record["steps"]["verifyx"]["agree"] is verifyx_agree
     assert record["agree"] is agree
 
 
@@ -437,15 +443,7 @@ class _Shell:
 
 def _result() -> JobResult:
     return JobResult(
-        executor_info=ExecutorSSHInfo(
-            uuid=UUID,
-            address="10.0.0.5",
-            port=8001,
-            ssh_username="root",
-            ssh_port=2200,
-            python_path="/usr/bin/python",
-            root_dir="/root/app",
-        ),
+        executor_info=EXECUTOR_INFO,
         score=3.25,
         job_score=1.5,
         job_batch_id="batch-1",

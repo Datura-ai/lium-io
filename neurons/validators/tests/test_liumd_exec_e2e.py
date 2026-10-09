@@ -20,19 +20,15 @@ import json
 import platform
 import shutil
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import asyncssh
 import bittensor
 import pytest
-import services.matrix_validation_service as mvs
 import services.verifyx_validation_service as vvs
-from datura.requests.miner_requests import ExecutorSSHInfo
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
-from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.liumd_exec_client import LIUMD_COMMAND, LiumdExecClient, LiumdRefusal
 from services.local_verify_client import (
     STEP_NAMES,
@@ -44,13 +40,14 @@ from services.local_verify_client import (
 from services.task.liumd_shadow import run_liumd_shadow
 
 from tests.helpers import build_context_config, build_services, build_state, make_context
+from tests.test_liumd_shadow import EXECUTOR_INFO, PASSED, SPECS, verifyx_service  # noqa: F401
+from tests.test_local_verify import matmul_service
 
 EXECUTOR = Path(__file__).resolve().parents[2] / "executor"
 BINARY = EXECUTOR / "liumd" / "liumd"
 WRAPPER = EXECUTOR / "liumd" / "liumd.sh"
 MINER = "5E2eMinerHotkeyOfTheExecutor"
 UUID = "exec-e2e"
-SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 
 pytestmark = pytest.mark.skipif(
     not BINARY.is_file() or platform.system() != "Linux" or platform.machine() != "x86_64",
@@ -105,24 +102,20 @@ class Image:
             "verifyx": put("lib/libverifyx.so", VERIFYX_LIB),
             "inspector": put("lib/libinspector.so", b"inspector-lib"),
         }
-        put(
-            ".liumd-fixture/docker_info.json",
-            json.dumps(
-                {
-                    "ServerVersion": "27.3.1",
-                    "DockerRootDir": "/var/lib/docker",
-                    "DefaultRuntime": "runc",
-                    "Runtimes": {"runc": {}, "sysbox-runc": {}},
-                }
-            ).encode(),
-        )
-        put(".liumd-fixture/containers.json", b"[]")
-        put(
-            ".liumd-fixture/statvfs.json",
-            json.dumps(
-                {"/var/lib/docker": {"total_bytes": 100, "free_bytes": 40, "used_bytes": 55}}
-            ).encode(),
-        )
+        fixture = {
+            "docker_info": {
+                "ServerVersion": "27.3.1",
+                "DockerRootDir": "/var/lib/docker",
+                "DefaultRuntime": "runc",
+                "Runtimes": {"runc": {}, "sysbox-runc": {}},
+            },
+            "containers": [],
+            "statvfs": {
+                "/var/lib/docker": {"total_bytes": 100, "free_bytes": 40, "used_bytes": 55}
+            },
+        }
+        for name, doc in fixture.items():
+            put(f".liumd-fixture/{name}.json", json.dumps(doc).encode())
         etc = root / "etc/liumd"
         manifest = {
             "schema": host_files.CHILDREN_SCHEMA,
@@ -315,79 +308,24 @@ async def test_a_host_without_liumd_is_not_supported(keypair, tmp_path):
         assert f"exit {status}" in err.value.detail
 
 
-def _judging_services(monkeypatch):
-    wrapper = MagicMock(name="DMCompVerifyWrapper")
-    wrapper.DMCompVerify_new.return_value = "ptr"
-    wrapper.getCipherText.return_value = "deadbeef"
-    wrapper._has_sealed = True
-    generated: list[str] = []
-    wrapper.generateChallenge.side_effect = lambda ptr, seed, info, uuid: generated.append(uuid)
-    wrapper.unsealResult.side_effect = lambda ptr, blob: json.dumps(
-        {"uuid": generated[-1], "metrics": {"tflops": 42.0}}
-    )
-    monkeypatch.setattr(mvs, "DMCompVerifyWrapper", lambda *_a, **_kw: wrapper)
-
-    class _VerifyX:
-        def __init__(self, lib_name, seed):
-            self.seed = seed
-
-        def generate_challenge(self, challenge_input):
-            return f"vx{self.seed}".ljust(vvs.MIN_CIPHER_LEN, "0")
-
-        def verify_response(self, response):
-            if not response.endswith("-ok"):
-                raise RuntimeError("cipher rejected")
-            return {"ok": True}
-
-    monkeypatch.setattr(vvs, "VerifyXValidator", _VerifyX)
-    monkeypatch.setattr(vvs, "sha256_from_path", lambda _p: hashlib.sha256(VERIFYX_LIB).hexdigest())
-    monkeypatch.setattr(
-        vvs,
-        "_perform_verification_checks",
-        lambda payload: {"success": True, "ram": {}, "network": {"download_speed": 900.0}},
-    )
-    return mvs.ValidationService(), vvs.VerifyXValidationService()
-
-
-def _event(check_id: str, reason: str) -> ValidationEvent:
-    return ValidationEvent(
-        event="e",
-        reason_code=reason,
-        severity="info",
-        impact="",
-        check_id=check_id,
-        when=datetime.now(UTC),
-        context={"execution_time_ms": 1500},
-    )
-
-
 @pytest.mark.asyncio
 async def test_the_shadow_compares_the_binarys_answer_with_todays_verdicts(
-    image, keypair, monkeypatch
+    image,
+    keypair,
+    monkeypatch,
+    verifyx_service,  # noqa: F811
 ):
-    validation, verifyx = _judging_services(monkeypatch)
+    monkeypatch.setattr(vvs, "sha256_from_path", lambda _p: hashlib.sha256(VERIFYX_LIB).hexdigest())
     # The top of getrandbits(64)'s range.
     monkeypatch.setattr(vvs.random, "getrandbits", lambda bits: 2**64 - 1)
-    events = [
-        _event("gpu.validate.verifyx", "VERIFYX_OK"),
-        _event("gpu.validate.capability", "GPU_VERIFY_OK"),
-    ]
     async with FakeSshd(image.wrapper) as sshd, sshd.connect() as ssh:
         ctx = make_context(
-            executor=ExecutorSSHInfo(
-                uuid=UUID,
-                address="127.0.0.1",
-                port=8001,
-                ssh_username="root",
-                ssh_port=22,
-                python_path="/usr/bin/python",
-                root_dir="/root/app",
-            ),
+            executor=EXECUTOR_INFO.model_copy(update={"address": "127.0.0.1", "ssh_port": 22}),
             miner_hotkey=MINER,
             ssh=ssh,
             services=build_services(
-                validation=validation,
-                verifyx=verifyx,
+                validation=matmul_service(monkeypatch),
+                verifyx=verifyx_service,
                 redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
             ),
             config=build_context_config(
@@ -398,7 +336,7 @@ async def test_the_shadow_compares_the_binarys_answer_with_todays_verdicts(
         record = await run_liumd_shadow(
             ctx,
             ok=True,
-            events=events,
+            events=PASSED,
             deadline_monotonic=time.monotonic() + 10_000,
         )
 

@@ -8,12 +8,10 @@ import stat
 import subprocess
 from pathlib import Path
 
+import liumd_host_files as hf
 import pytest
 
-import liumd_host_files as hf
-
 EXECUTOR = Path(__file__).resolve().parents[1]
-RUN_SH = (EXECUTOR / "run.sh").read_text()
 WRAPPER = (EXECUTOR / "liumd" / "liumd.sh").read_text()
 
 # liumd's own manifest names and paths (its children.json), less `gpu_sig`, which no verify step
@@ -40,7 +38,6 @@ def _image_tree(root: Path) -> None:
             target.symlink_to(real)
         else:
             target.write_bytes(f"{name} bytes".encode())
-
 
 
 def test_the_manifest_pins_each_child_and_follows_the_venv_symlink(tmp_path):
@@ -135,7 +132,6 @@ def test_host_reads_the_executor_settings(tmp_path, monkeypatch):
 
 def test_an_unknown_command_is_refused():
     assert hf.main(["everything"]) == 2
-
 
 
 def test_the_wrapper_hands_the_image_manifest_to_the_binary(tmp_path):
