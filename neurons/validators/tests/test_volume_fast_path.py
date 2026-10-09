@@ -344,6 +344,18 @@ async def test_measures_host_for_volume_sizing_is_the_predicate_resolve_volume_s
 
 
 @pytest.mark.asyncio
+async def test_fresh_volume_is_capped_below_the_ext4_file_limit(docker_service):
+    # A full-node rental on a ~28.9 TB host must not ask for a sparse file above 16 TiB.
+    payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=int(28.9e12))
+
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    assert result.path == "fresh"
+    assert result.volume_limit_gb <= 16000
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_with_probe_matches_per_command_result(docker_service):
     # Arrange: the same host facts through both paths (the per-command fixture from
     # test_docker_service, and a probe carrying what its `docker info` / df / `volume ls` say).
