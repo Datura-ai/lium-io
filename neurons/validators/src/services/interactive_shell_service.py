@@ -8,6 +8,7 @@ import asyncio
 import logging
 import hashlib
 from core.utils import _m, get_extra_info
+from services.node_host import require_public_host
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,8 @@ class InteractiveShellService:
             raise Exception("i-ssh connection EOF error")
 
     async def connect_asyncssh(self):
+        # a hostname is resolved afresh on every connect, so a node whose IP changed is the same node
+        await require_public_host(self.host, self.port)
         pkey = asyncssh.import_private_key(self.private_key)
         self.ssh_client = await asyncssh.connect(
             host=self.host,
