@@ -21,6 +21,7 @@ from storage.models import (
 )
 from storage.reporting import ReportingLeaseExpired, StorageEventReporter
 from storage.restic import (
+    ENCRYPTED_BACKUP_SCRIPT,
     JsonEventWriter,
     ResticOperationError,
     ResticStorageRunner,
@@ -1168,3 +1169,45 @@ def test_reporter_uses_backup_summary_counters() -> None:
     assert terminal_payload["processed_files"] == 2_002
     assert terminal_payload["total_bytes"] == 268_483_487
     assert terminal_payload["processed_bytes"] == 268_483_487
+
+
+def test_encrypted_backup_script_stops_when_the_backup_path_is_missing(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", ENCRYPTED_BACKUP_SCRIPT, "sh", str(tmp_path / "missing"), "touch", str(marker)],
+        capture_output=True,
+    )
+
+    assert completed.returncode == 66
+    assert not marker.exists()
+
+
+class _MissingSourcePopen(_FakePopen):
+    def __init__(self, command: list[str], *args: object, **kwargs: object) -> None:
+        super().__init__(command, *args, **kwargs)
+        self.stdout = iter(["sh: cd: can't cd to /workspace/missing: No such file or directory\n"])
+
+    def wait(self) -> int:
+        return 66
+
+
+def test_backup_of_a_missing_path_fails_with_a_clear_message(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    monkeypatch.setattr(
+        "storage.restic.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="[]", stderr=""),
+    )
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _MissingSourcePopen)
+
+    with pytest.raises(ResticOperationError, match="backup path does not exist"):
+        runner._backup()
+
+
+def test_local_backup_of_a_missing_directory_fails_before_restic_runs(tmp_path: Path) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path / "missing"))
+
+    with pytest.raises(ResticOperationError, match="backup path does not exist"):
+        runner._backup()
