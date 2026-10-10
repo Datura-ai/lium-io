@@ -1268,6 +1268,9 @@ TOPO_GPU_LABEL_PATTERN = r"^GPU\d+$"
 TOPO_NVLINK_CELL_PATTERN = r"^NV(\d+)$"
 NVLINK_ACTIVE_LINK_PATTERN = r"Link \d+: [\d.]+ GB/s"
 NVLINK_GPU_HEADER_PATTERN = r"^GPU \d+:"
+# nvidia-smi underlines the topology header with SGR escapes (ESC[4m ... ESC[0m) even when piped, so
+# without stripping them the header's first GPU cell never matches and every table parses empty.
+TERMINAL_ESCAPE_PATTERN = r"\x1b\[[0-9;]*m"
 
 
 def parse_topology_matrix(output):
@@ -1282,6 +1285,7 @@ def parse_topology_matrix(output):
     labels = []
     rows = []
     for line in output.splitlines():
+        line = re.sub(TERMINAL_ESCAPE_PATTERN, "", line)
         cells = [cell.strip() for cell in re.split(r"\t+|\s{2,}", line.rstrip())]
         if header is None:
             if len(cells) > 1 and cells[0] == "" and re.match(TOPO_GPU_LABEL_PATTERN, cells[1]):

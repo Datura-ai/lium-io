@@ -27,6 +27,7 @@ INTERCONNECT_HELPERS = {
     "TOPO_NVLINK_CELL_PATTERN",
     "NVLINK_ACTIVE_LINK_PATTERN",
     "NVLINK_GPU_HEADER_PATTERN",
+    "TERMINAL_ESCAPE_PATTERN",
     "parse_topology_matrix",
     "count_active_nvlinks_per_gpu",
     "GpuInterconnectObservation",
@@ -111,6 +112,12 @@ PCIE_CARD_NVLINK_STATUS = (
 )
 
 
+def underlined_header(table: str) -> str:
+    """The table as nvidia-smi pipes it: the header row wrapped in an underline escape (ESC[4m ... ESC[0m)."""
+    header, rest = table.split("\n", 1)
+    return f"\x1b[4m{header}\x1b[0m\n{rest}"
+
+
 @pytest.fixture
 def scrape() -> dict[str, Any]:
     return build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", INTERCONNECT_HELPERS, {"re": re})
@@ -162,6 +169,18 @@ def test_p2p_table_is_read_by_the_same_parser(scrape: dict[str, Any]) -> None:
     assert len(labels) == 8
     assert rows[0][0] == "X"
     assert rows[0][1] == "NS"
+
+
+def test_hgx_host_with_underlined_headers_is_nvlink_with_p2p(scrape: dict[str, Any]) -> None:
+    # Act
+    payload = scrape["summarize_gpu_interconnect"](
+        underlined_header(topo_table(HGX_H200)), underlined_header(p2p_table(uniform(8, "OK"))), nvlink_status([18] * 8)
+    )
+
+    # Assert
+    assert payload["ic_devices"] == 8
+    assert payload["ic_nvlink"] is True
+    assert payload["ic_p2p"] is True
 
 
 # -- summarize_gpu_interconnect ----------------------------------------------------------------------
