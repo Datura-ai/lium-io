@@ -271,8 +271,8 @@ async def test_custom_build_unpacks_the_context_before_the_dockerfile(svc, monke
 
 @pytest.mark.asyncio
 async def test_custom_build_with_a_context_fails_before_the_executor_when_the_setting_is_off(
-    svc, monkeypatch
-):  # noqa: F811
+    svc, monkeypatch  # noqa: F811
+):
     # Arrange
     from core.config import settings
 
@@ -300,8 +300,8 @@ async def test_custom_build_with_a_context_fails_before_the_executor_when_the_se
 
 @pytest.mark.asyncio
 async def test_custom_build_with_a_refused_context_never_starts_the_build_container(
-    svc, monkeypatch
-):  # noqa: F811
+    svc, monkeypatch  # noqa: F811
+):
     # Arrange
     from core.config import settings
 
