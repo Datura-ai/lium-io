@@ -153,6 +153,7 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
+from services.pod_ssh_host_key import derive_pod_ssh_host_key
 from services.volume_keys import VolumeKeyDeriver
 
 logger = logging.getLogger(__name__)
@@ -4956,6 +4957,46 @@ class DockerService:
 
         return True
 
+    def _pod_ssh_host_key_script_path(self) -> Path:
+        return Path(__file__).resolve().parent / "assets" / "pod_ssh_host_key.sh"
+
+    async def install_pod_ssh_host_key(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        pod_id: str,
+        log_extra: dict,
+    ) -> bool:
+        """Give the container the host key derived for this pod, so a recreated container (reboot,
+        edit, template switch) presents the key the renter's known_hosts already holds. Best effort:
+        on any failure the pod keeps the key its image generated, as before."""
+        if not settings.VOLUME_MASTER_SECRET or not pod_id:
+            return False
+        try:
+            host_key = derive_pod_ssh_host_key(settings.VOLUME_MASTER_SECRET, pod_id)
+            script = self._pod_ssh_host_key_script_path().read_text()
+            result = await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_install_pod_ssh_host_key",
+                exec_spec=ContainerExecSpec(
+                    container_name=container_name,
+                    argv=("sh", "-c", script, "pod_ssh_host_key", host_key.public_openssh),
+                    stdin=host_key.private_openssh,
+                    idempotent=True,
+                ),
+                log_extra=log_extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to install pod SSH host key",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": str(exc)}),
+                ),
+            )
+            return False
+        return result.exit_status == 0
+
     async def add_ssh_public_keys_with_rental_docker(
         self,
         docker_client: RentalDockerSdkClient,
@@ -8259,6 +8300,13 @@ class DockerService:
                         raise_if_container_gone=True,
                     ):
                         soft_failed_step = current_step
+                    if soft_failed_step is None:
+                        await self.install_pod_ssh_host_key(
+                            docker_client,
+                            container_name=container_name,
+                            pod_id=payload.pod_id,
+                            log_extra=default_extra,
+                        )
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:

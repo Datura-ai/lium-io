@@ -1103,3 +1103,55 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
 
     assert ssh_client.commands == []
     assert docker_client.created_volumes == []
+
+
+def _pod_host_key_specs(docker_client):
+    return [spec for spec in docker_client.exec_specs if "pod_ssh_host_key" in spec.argv]
+
+
+@pytest.mark.asyncio
+async def test_create_container_installs_the_same_ssh_host_key_each_time_a_pod_is_created(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+
+    for _ in range(2):
+        await docker_service.create_container(
+            payload=_base_create_payload(),
+            executor_info=executor_info,
+            keypair=keypair,
+            private_key="encrypted-private-key",
+        )
+
+    specs = _pod_host_key_specs(docker_service.rental_docker_client_factory.client)
+    assert len(specs) == 2
+    public_keys = {spec.argv[-1] for spec in specs}
+    assert len(public_keys) == 1
+    assert next(iter(public_keys)).startswith("ssh-ed25519 ")
+    assert all("OPENSSH PRIVATE KEY" in spec.stdin for spec in specs)
+    assert all("OPENSSH PRIVATE KEY" not in " ".join(spec.argv) for spec in specs)
+
+
+@pytest.mark.asyncio
+async def test_create_container_skips_the_pod_ssh_host_key_without_a_master_secret(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    monkeypatch.setattr("services.docker_service.settings.VOLUME_MASTER_SECRET", None)
+
+    await docker_service.create_container(
+        payload=_base_create_payload(),
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert _pod_host_key_specs(docker_service.rental_docker_client_factory.client) == []

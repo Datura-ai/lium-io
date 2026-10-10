@@ -629,7 +629,10 @@ async def test_a_present_public_hub_image_rent_makes_the_same_host_calls(
         " --format=csv,noheader,nounits",
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
     ]
-    assert _exec_argv_texts(svc) == ["sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"]
+    exec_argv = _exec_argv_texts(svc)
+    assert exec_argv[0] == "sh -c mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys"
+    # the image ships sshd, so no bootstrap exec; the pod's host key is installed all the same
+    assert len(exec_argv) == 2 and " pod_ssh_host_key ssh-ed25519 " in exec_argv[1]
 
 
 @pytest.mark.asyncio

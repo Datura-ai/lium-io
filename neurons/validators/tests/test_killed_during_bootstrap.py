@@ -911,10 +911,10 @@ async def test_a_healthy_container_bootstraps_as_before(svc, monkeypatch, caplog
 
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     assert _events(caplog) == []
-    # keys, bootstrap script written, bootstrap script run, environment: one inspect, one exec each;
-    # then the State read before the pod is cached
-    assert api.events == ["inspect_container", "exec_create"] * 4 + ["inspect_container"]
-    assert len(client.exec_specs) == 4
+    # keys, bootstrap script written, bootstrap script run, pod host key, environment: one inspect,
+    # one exec each; then the State read before the pod is cached
+    assert api.events == ["inspect_container", "exec_create"] * 5 + ["inspect_container"]
+    assert len(client.exec_specs) == 5
     svc.redis_service.add_rented_pod.assert_awaited_once()
 
 
