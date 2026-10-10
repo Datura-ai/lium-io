@@ -48,7 +48,6 @@ from .checks import (
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
-    NetworkFloorShadowCheck,
     NvmlDigestCheck,
     PortConnectivityCheck,
     PortCountCheck,
@@ -292,7 +291,6 @@ class PipelineFactory:
                 RentedGpuDropCheck(),
                 # Shadow only, flag-gated: log, never score or fail.
                 RentedGpuHealthShadowCheck(),
-                NetworkFloorShadowCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -432,7 +430,6 @@ class PipelineFactory:
                 RentedGpuDropCheck(),
                 # Shadow only, flag-gated: log, never score or fail.
                 RentedGpuHealthShadowCheck(),
-                NetworkFloorShadowCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
@@ -501,7 +498,6 @@ class PipelineFactory:
                 RentedGpuDropCheck(),
                 # Shadow only, flag-gated: log, never score or fail.
                 RentedGpuHealthShadowCheck(),
-                NetworkFloorShadowCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),

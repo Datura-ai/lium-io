@@ -466,38 +466,6 @@ class RentedGpuHealthMessages:
     )
 
 
-class NetworkFloorMessages:
-    SHADOW_BELOW = MessageTemplate(
-        event="Network speed below the GPU-count floor (shadow)",
-        reason="NETWORK_FLOOR_SHADOW_BELOW",
-        severity="warning",
-        category="env",
-        impact="Shadow observation only: score was NOT changed",
-        remediation="The node's measured bandwidth is low for its GPU count (see download/upload EMA and floors).",
-    )
-    SHADOW_OK = MessageTemplate(
-        event="Network speed meets the GPU-count floor (shadow)",
-        reason="NETWORK_FLOOR_SHADOW_OK",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-    NO_READING = MessageTemplate(
-        event="Network floor not judged: no speed reading (shadow)",
-        reason="NETWORK_FLOOR_SHADOW_NO_READING",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-    DISABLED = MessageTemplate(
-        event="Network floor shadow disabled",
-        reason="NETWORK_FLOOR_SHADOW_DISABLED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-
-
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",

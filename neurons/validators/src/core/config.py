@@ -430,14 +430,6 @@ class Settings(BaseSettings):
     # retirement or row remap, recovery action, hardware Xid lines) without GPU work and log the verdict
     # as `rented_gpu_health_shadow`. Never changes the score or fails the cycle. Off by default.
     RENTED_GPU_HEALTH_SHADOW_ENABLED: bool = Field(env="RENTED_GPU_HEALTH_SHADOW_ENABLED", default=False)
-    # Shadow only: a download floor that grows linearly with the GPU count, from MIN at 1 GPU to MAX at
-    # NETWORK_FLOOR_FULL_GPU_COUNT GPUs, and an upload floor of UPLOAD_RATIO times it, read against the
-    # VerifyX EMAs and logged as `network_floor_shadow`. The existing download gate is unchanged.
-    NETWORK_FLOOR_SCALED_SHADOW_ENABLED: bool = Field(env="NETWORK_FLOOR_SCALED_SHADOW_ENABLED", default=False)
-    NETWORK_FLOOR_MIN_DOWNLOAD_MBPS: float = Field(env="NETWORK_FLOOR_MIN_DOWNLOAD_MBPS", default=100.0, gt=0)
-    NETWORK_FLOOR_MAX_DOWNLOAD_MBPS: float = Field(env="NETWORK_FLOOR_MAX_DOWNLOAD_MBPS", default=1000.0, gt=0)
-    NETWORK_FLOOR_FULL_GPU_COUNT: int = Field(env="NETWORK_FLOOR_FULL_GPU_COUNT", default=8, ge=2)
-    NETWORK_FLOOR_UPLOAD_RATIO: float = Field(env="NETWORK_FLOOR_UPLOAD_RATIO", default=0.5, gt=0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement

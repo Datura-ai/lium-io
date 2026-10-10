@@ -19,7 +19,6 @@ from .gpu_vram_precheck import GpuVramPrecheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
-from .network_floor import NetworkFloorShadowCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
@@ -68,7 +67,6 @@ __all__ = [
     "RegistryPullCheck",
     "RentalProbeCheck",
     "RentalVerificationCheck",
-    "NetworkFloorShadowCheck",
     "RentedGpuDropCheck",
     "RentedGpuHealthShadowCheck",
     "TdxHostCheck",
