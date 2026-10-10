@@ -1720,6 +1720,14 @@ class RentalProbeMessages:
         category="runtime",
         impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
     )
+    # the same verdict while RENTAL_PROBE_ENFORCEMENT_ENABLED is off: logged, score unchanged
+    PROBE_FAILED_OBSERVED = MessageTemplate(
+        event="Rental probe failed: a renter could not use this node (not enforced)",
+        reason="RENTAL_PROBE_FAILED_OBSERVED",
+        severity="warning",
+        category="runtime",
+        impact="None: RENTAL_PROBE_ENFORCEMENT_ENABLED is off; the node is probed again after the interval",
+    )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",
         reason="RENTAL_PROBE_INCONCLUSIVE",
