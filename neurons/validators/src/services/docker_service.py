@@ -133,6 +133,7 @@ from services.rental_docker_sdk import (
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_container_command_argv,
+    keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
     build_environment_exec_spec,
@@ -2497,6 +2498,7 @@ class DockerService:
         host_ram_kib: int | None = None,
         gpu_share: float = 1.0,
         quote_socket: bool = False,
+        image_command_fallback: tuple[str, ...] = (),
     ) -> ContainerRunSpec:
         memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
         environment = {
@@ -2541,7 +2543,10 @@ class DockerService:
         return ContainerRunSpec(
             image=payload.docker_image,
             name=container_name,
-            command=build_container_command_argv(custom_options.startup_commands),
+            command=(
+                build_container_command_argv(custom_options.startup_commands)
+                or image_command_fallback
+            ),
             environment=environment,
             ports=_published_ports(port_maps, cluster_udp_ports),
             volumes=tuple(volumes),
@@ -7947,6 +7952,28 @@ class DockerService:
                     )
                     # the broker cold start (image pull, socket wait) must not read as port-check wait
                     prev_timestamp = now_ms()
+                image_command_fallback: tuple[str, ...] = ()
+                if not build_container_command_argv(custom_options.startup_commands) and not (
+                    custom_options.entrypoint and custom_options.entrypoint.strip()
+                ):
+                    try:
+                        image_command_fallback = keep_alive_command_for(
+                            *await docker_client.image_default_command(image=payload.docker_image)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            _m(
+                                "Could not read the image's default command; keeping it",
+                                extra=get_extra_info({**default_extra, "error": str(exc)}),
+                            )
+                        )
+                    if image_command_fallback:
+                        logger.info(
+                            _m(
+                                "Image's default command exits at start; running sleep infinity",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
                 run_spec = self._build_rental_container_run_spec(
@@ -7965,6 +7992,7 @@ class DockerService:
                     host_ram_kib=host_ram_kib,
                     gpu_share=rental_gpu_share,
                     quote_socket=quote_socket,
+                    image_command_fallback=image_command_fallback,
                 )
 
                 logger.info(
