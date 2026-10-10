@@ -17,6 +17,15 @@ from datura.requests.validator_requests import ssh_pubkey_signing_blob
 from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
+from core.logger import _m
+from services.chutes_relay_service import (
+    ChutesBridgeConfigError,
+    ChutesExecutorError,
+    ChutesMalformedResponseError,
+    ChutesRelayDisabledError,
+    ChutesRelayService,
+    ChutesTransportError,
+)
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_docker_client, get_system_metrics, get_container_metrics
@@ -25,6 +34,7 @@ from core.config import settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload, SignaturePayload
+from payloads.chutes import ChutesCommandPayload, ChutesInstallPayload
 from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
 from dependencies.auth import (
     match_validator_hotkey,
@@ -44,6 +54,13 @@ from services.local_verify_service import (
 )
 
 logger = logging.getLogger(__name__)
+_KNOWN_CHUTES_ERRORS = (
+    ChutesRelayDisabledError,
+    ChutesBridgeConfigError,
+    ChutesTransportError,
+    ChutesMalformedResponseError,
+    ChutesExecutorError,
+)
 
 apis_router = APIRouter()
 
@@ -260,6 +277,41 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
         raise HTTPException(status_code=401, detail="Invalid validator signature")
 
 
+def _translate_chutes_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, (ChutesRelayDisabledError, ChutesTransportError)):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ChutesMalformedResponseError):
+        return HTTPException(status_code=502, detail=str(exc))
+    if isinstance(exc, (ChutesExecutorError, ChutesBridgeConfigError)):
+        return HTTPException(status_code=500, detail=str(exc))
+    return HTTPException(status_code=500, detail="Unexpected Chutes relay error")
+
+
+def _log_chutes_error(verb: str, exc: Exception) -> None:
+    logger.error(
+        _m(
+            "Chutes relay request failed",
+            extra={
+                "verb": verb,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        ),
+    )
+
+
+def _validate_chutes_signature(message: str, signature: str) -> None:
+    try:
+        normalized = signature if signature.startswith("0x") else f"0x{signature}"
+        if match_validator_hotkey(message, normalized) is None:
+            raise HTTPException(status_code=401, detail="Invalid validator signature")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Chutes signature verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid validator signature")
+
+
 @apis_router.post("/upload_ssh_key")
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
@@ -368,6 +420,57 @@ async def ping(_: None = Depends(verify_ping_signature)):
         dict: {"status": "pong"}
     """
     return {"status": "pong"}
+
+
+@apis_router.post("/chutes/install")
+def chutes_install(
+    payload: ChutesInstallPayload,
+    relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+):
+    _validate_chutes_signature(payload.node_name, payload.validator_signature)
+    try:
+        return relay_service.install(
+            validator_hotkey=payload.validator_hotkey,
+            hotkey_ss58=payload.hotkey_ss58,
+            hotkey_seed=payload.hotkey_seed,
+            node_name=payload.node_name,
+        )
+    except _KNOWN_CHUTES_ERRORS as exc:
+        _log_chutes_error("install", exc)
+        raise _translate_chutes_error(exc)
+
+
+@apis_router.post("/chutes/start")
+def chutes_start(
+    payload: ChutesCommandPayload,
+    relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+):
+    _validate_chutes_signature("chutes_start", payload.validator_signature)
+    try:
+        return relay_service.start()
+    except _KNOWN_CHUTES_ERRORS as exc:
+        _log_chutes_error("start", exc)
+        raise _translate_chutes_error(exc)
+
+
+@apis_router.post("/chutes/stop")
+def chutes_stop(
+    payload: ChutesCommandPayload,
+    relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+):
+    _validate_chutes_signature("chutes_stop", payload.validator_signature)
+    try:
+        return relay_service.stop()
+    except _KNOWN_CHUTES_ERRORS as exc:
+        _log_chutes_error("stop", exc)
+        raise _translate_chutes_error(exc)
+
+
+@apis_router.get("/chutes/status")
+def chutes_status(
+    relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+):
+    return relay_service.get_status_summary()
 
 
 def _capabilities() -> list[str]:

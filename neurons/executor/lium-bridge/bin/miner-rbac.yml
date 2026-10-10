@@ -1,0 +1,59 @@
+---
+# ClusterRole for read-only access to all resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: miner
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
+
+---
+# ClusterRoleBinding for read-only access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: miner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: miner
+subjects:
+  - kind: User
+    name: miner
+    apiGroup: rbac.authorization.k8s.io
+
+---
+# Role for write access to specific resources in chutes namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: miner
+  namespace: chutes
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+# RoleBinding for write access in chutes namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: miner
+  namespace: chutes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: miner
+subjects:
+  - kind: User
+    name: miner
+    apiGroup: rbac.authorization.k8s.io

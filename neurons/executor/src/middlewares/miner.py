@@ -12,6 +12,11 @@ from core.config import settings
 from core.logger import _m, get_logger
 
 logger = get_logger(__name__)
+_ROUTE_LOCAL_AUTH_PATHS = {
+    "/chutes/install",
+    "/chutes/start",
+    "/chutes/stop",
+}
 
 AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 30
 
@@ -23,8 +28,9 @@ SELF_AUTHENTICATED_GET_PATTERNS = (
     re.compile(r"^/containers/[^/]+/logs/?$"),  # verify_container_logs_signature
 )
 # POST routes that verify a validator signature themselves instead of the miner's
-# (/verify: the validator's hotkey over the whole intent, nonce'd and time-windowed).
-SELF_AUTHENTICATED_POST_PATHS = frozenset({"/hardware_utilization", "/ping", "/verify"})
+# (/verify: the validator's hotkey over the whole intent, nonce'd and time-windowed; the Chutes
+# relay mutation routes own their validator auth contract).
+SELF_AUTHENTICATED_POST_PATHS = frozenset({"/hardware_utilization", "/ping", "/verify", *_ROUTE_LOCAL_AUTH_PATHS})
 SELF_AUTHENTICATED_POST_PATTERNS = (
     re.compile(r"^/containers(/[^/]+)?/?$"),  # verify_container_signature
 )
@@ -57,7 +63,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
             pattern.match(request.url.path) for pattern in SELF_AUTHENTICATED_POST_PATTERNS
         ):
             return await call_next(request)
-            
+
         default_extra = {
             'url': request.url.path,
             'client_host': request.client.host,

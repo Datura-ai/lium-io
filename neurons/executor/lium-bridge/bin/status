@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# bridgectl status — read-only health check, returns JSON
+set -euo pipefail
+
+BRIDGE_DIR="/opt/lium-bridge"
+STATE_FILE="${BRIDGE_DIR}/state.json"
+
+# --- Read persisted state ---
+
+if [[ -f "${STATE_FILE}" ]]; then
+    PERSISTED_STATE=$(python3 -c "import json; print(json.load(open('${STATE_FILE}'))['state'])" 2>/dev/null || echo "unknown")
+    LAST_ERROR=$(python3 -c "import json; v=json.load(open('${STATE_FILE}')).get('last_error'); print(v if v else '')" 2>/dev/null || echo "")
+    NODE_NAME=$(python3 -c "import json; v=json.load(open('${STATE_FILE}')).get('node_name'); print(v if v else '')" 2>/dev/null || echo "")
+    GPU_VERIFIED=$(python3 -c "import json; print(str(json.load(open('${STATE_FILE}')).get('gpu_verified',False)).lower())" 2>/dev/null || echo "false")
+else
+    PERSISTED_STATE="not_installed"
+    LAST_ERROR=""
+    NODE_NAME=""
+    GPU_VERIFIED="false"
+fi
+
+# --- Check Lium executor ---
+
+RUNNER_CONTAINER="executor-runner"
+RUNNER_RUNNING="false"
+if docker inspect "${RUNNER_CONTAINER}" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"; then
+    RUNNER_RUNNING="true"
+fi
+
+# --- Check K3s ---
+
+K3S_ACTIVE="false"
+if systemctl is-active k3s >/dev/null 2>&1; then
+    K3S_ACTIVE="true"
+fi
+
+# --- Check Chutes pods (only if K3s is active) ---
+
+AGENT_HEALTHY="false"
+PODS_RUNNING=0
+SERVER_LOCKED="false"
+
+if [[ "${K3S_ACTIVE}" == "true" ]]; then
+    # Count running pods
+    PODS_RUNNING=$(k3s kubectl get pods --all-namespaces --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+
+    # Check chutes-agent health (chart uses app.kubernetes.io/name=agent)
+    if k3s kubectl get pods -n chutes -l app.kubernetes.io/name=agent --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q "Running"; then
+        AGENT_HEALTHY="true"
+    fi
+fi
+
+# --- Disk free ---
+
+DISK_FREE_GB=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
+
+# --- Determine effective state ---
+# Cross-check persisted state with reality
+
+EFFECTIVE_STATE="${PERSISTED_STATE}"
+
+if [[ "${PERSISTED_STATE}" == "running" && "${K3S_ACTIVE}" == "false" ]]; then
+    EFFECTIVE_STATE="error"
+    LAST_ERROR="State says running but k3s is not active"
+fi
+
+if [[ "${PERSISTED_STATE}" == "stopped" && "${K3S_ACTIVE}" == "true" ]]; then
+    EFFECTIVE_STATE="error"
+    LAST_ERROR="State says stopped but k3s is still active"
+fi
+
+# --- Output JSON ---
+
+json_or_null() {
+    python3 -c "import json, sys; print(json.dumps(sys.argv[1] if sys.argv[1] else None))" "$1"
+}
+
+LAST_ERROR_JSON=$(json_or_null "${LAST_ERROR}")
+NODE_NAME_JSON=$(json_or_null "${NODE_NAME}")
+
+cat <<EOF
+{
+  "ok": true,
+  "state": "${EFFECTIVE_STATE}",
+  "lium": {
+    "runner_container": "${RUNNER_CONTAINER}",
+    "running": ${RUNNER_RUNNING}
+  },
+  "chutes": {
+    "k3s_active": ${K3S_ACTIVE},
+    "agent_healthy": ${AGENT_HEALTHY},
+    "server_locked": ${SERVER_LOCKED},
+    "gpu_verified": ${GPU_VERIFIED},
+    "pods_running": ${PODS_RUNNING},
+    "node_name": ${NODE_NAME_JSON}
+  },
+  "disk_free_gb": ${DISK_FREE_GB},
+  "last_error": ${LAST_ERROR_JSON}
+}
+EOF
