@@ -118,7 +118,7 @@ class RecordingRentalDockerClient:
             oom_killed=False,
         )
 
-    async def start(self, *, container_name: str) -> None:
+    async def start(self, *, container_name: str, network: str | None = None) -> None:
         self.started_containers.append(container_name)
 
     async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:

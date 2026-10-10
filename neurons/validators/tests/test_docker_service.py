@@ -159,7 +159,7 @@ class _FakeRentalDockerClient:
             oom_killed=False,
         )
 
-    async def start(self, *, container_name: str) -> None:
+    async def start(self, *, container_name: str, network: str | None = None) -> None:
         self.started_containers.append(container_name)
         if self.start_error is not None:
             raise self.start_error

@@ -595,8 +595,10 @@ class RentalDockerSdkClient:
             exit_code = None
         return f"exit_code={exit_code}"
 
-    async def start(self, *, container_name: str) -> None:
+    async def start(self, *, container_name: str, network: str | None = None) -> None:
         # starting a running container answers 304, so a second start after a drop is safe
+        if network:
+            await _in_docker_thread(self._move_stopped_container_to_network_sync, container_name, network)
         await self._retry_once_on_transport_drop(
             operation="start",
             attempt=lambda: self._call_api(
@@ -1045,6 +1047,29 @@ class RentalDockerSdkClient:
                         f"Docker network {name} was created but cannot be inspected"
                     )
         _require_icc_off(name, network)
+
+    def _move_stopped_container_to_network_sync(self, container_name: str, network: str) -> bool:
+        """Move a stopped container that predates `network` from docker0 onto it; True when it moved.
+
+        A container keeps the network it was created with across `docker start`, so a pod created
+        before rentals ran on `network` would stay on the shared default bridge for its whole life.
+        Published ports are host config and survive the move. A running container is left alone (a
+        move would cut its live connections), and so is one on host, none or another container's
+        namespace: only the default bridge is the old setup this replaces.
+        """
+        info = self._api_client.inspect_container(container_name)
+        state = info.get("State") or {}
+        if state.get("Running") or state.get("Restarting"):
+            return False
+        attached = set(((info.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+        mode = (info.get("HostConfig") or {}).get("NetworkMode") or "default"
+        if network in attached or mode not in ("default", "bridge"):
+            return False
+        self._ensure_rental_network_sync(network)
+        for name in sorted(attached):
+            self._api_client.disconnect_container_from_network(container_name, name)
+        self._api_client.connect_container_to_network(container_name, network)
+        return True
 
     def _inspect_network_or_none(self, name: str) -> dict | None:
         try:
