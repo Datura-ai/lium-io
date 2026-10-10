@@ -428,8 +428,9 @@ class Settings(BaseSettings):
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
     # Shadow only: on a rented node, read per-card NVML health (visible count, lost cards, pending page
     # retirement or row remap, recovery action, hardware Xid lines) without GPU work and log the verdict
-    # as `rented_gpu_health_shadow`. Never changes the score or fails the cycle. Off by default.
-    RENTED_GPU_HEALTH_SHADOW_ENABLED: bool = Field(env="RENTED_GPU_HEALTH_SHADOW_ENABLED", default=False)
+    # as `rented_gpu_health_shadow`. Never changes the score or fails the cycle. On by default so the shadow
+    # collects verdicts before anyone decides on enforcement; "false" turns it off.
+    RENTED_GPU_HEALTH_SHADOW_ENABLED: bool = Field(env="RENTED_GPU_HEALTH_SHADOW_ENABLED", default=True)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement

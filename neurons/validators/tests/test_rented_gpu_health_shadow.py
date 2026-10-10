@@ -78,8 +78,8 @@ def enabled():
 
 
 @pytest.mark.asyncio
-async def test_disabled_by_default_runs_nothing(context_factory, monkeypatch):
-    monkeypatch.delenv("RENTED_GPU_HEALTH_SHADOW_ENABLED", raising=False)
+async def test_switched_off_runs_nothing(context_factory, monkeypatch):
+    monkeypatch.setenv("RENTED_GPU_HEALTH_SHADOW_ENABLED", "false")
     runner = FakeRunner()
     with patch.object(module, "settings", type(module.settings)(_env_file=None)):
         result = await RentedGpuHealthShadowCheck().run(_ctx(context_factory, runner))
