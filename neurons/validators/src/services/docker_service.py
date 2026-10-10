@@ -8300,12 +8300,13 @@ class DockerService:
                         raise_if_container_gone=True,
                     ):
                         soft_failed_step = current_step
-                    await self.install_pod_ssh_host_key(
-                        docker_client,
-                        container_name=container_name,
-                        pod_id=payload.pod_id,
-                        log_extra=default_extra,
-                    )
+                    if soft_failed_step is None:
+                        await self.install_pod_ssh_host_key(
+                            docker_client,
+                            container_name=container_name,
+                            pod_id=payload.pod_id,
+                            log_extra=default_extra,
+                        )
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:
