@@ -773,6 +773,25 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,
         description="Defense-in-depth cap on dockerfile_content size; route is authoritative.",
     )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_ENABLED: bool = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_ENABLED", default=False,
+        description=(
+            "Build a custom-dockerfile pod with the build context the request names (build_context_url). "
+            "Off: such a request fails at build_context instead of building without the files."
+        ),
+    )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_HOSTS: str = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_HOSTS", default="",
+        description="Comma-separated hosts a build_context_url may name (https only). Empty: none.",
+    )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_BYTES: int = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_BYTES", default=100 * 1024 * 1024, gt=0,
+        description="Largest build-context archive the validator downloads (compressed bytes).",
+    )
+    CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_UNPACKED_BYTES: int = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_CONTEXT_MAX_UNPACKED_BYTES", default=1024 * 1024 * 1024, gt=0,
+        description="Largest total size of the files in a build-context archive.",
+    )
     # DAH-2211 — internet-enabled custom builds run inside a throwaway sysbox
     # Docker-in-Docker container (NOT on the host daemon) so the build can
     # `--network` out for deps while a build-time escape stays confined to an
