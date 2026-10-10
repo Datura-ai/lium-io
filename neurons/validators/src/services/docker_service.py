@@ -887,22 +887,17 @@ def volume_step_detail(exc: BaseException) -> str | None:
     return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
 
 
-# A create that fails here failed on the node itself: its storage refused the volume, a GPU it
-# advertises is gone, or the daemon could not attach a GPU. Such a failure stands like a failed rental
-# probe, so the node scores 0 until a probe on it passes instead of going to the next renter.
+# A create that fails here failed on the node itself: its storage refused the volume, or a GPU it
+# advertises is gone. Such a failure stands like a failed rental probe, so the node scores 0 until a
+# probe on it passes instead of going to the next renter. docker_run is left out: runc echoes the
+# renter's command in its start error, so no text there is the node's alone.
 _HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags"})
-# docker run's own refusal, before any renter process runs; a renter's output never reaches this text
-_HOST_FAULT_DOCKER_RUN_MARKERS = ("nvml error", "requires reset", "error gathering device information")
 # rental_probe.STEP_CONTAINER_START: the stamp reads as that probe step failing at the create step
 _RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
 
 
-def is_host_fault_create_failure(exc: Exception, current_step: str | None) -> bool:
-    if current_step in _HOST_FAULT_CREATE_STEPS:
-        return True
-    if current_step != "docker_run":
-        return False
-    return any(marker in text.lower() for text in _exception_texts(exc) for marker in _HOST_FAULT_DOCKER_RUN_MARKERS)
+def is_host_fault_create_failure(current_step: str | None) -> bool:
+    return current_step in _HOST_FAULT_CREATE_STEPS
 
 
 def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
@@ -8604,7 +8599,7 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            await self.hold_node_until_probe_passes(payload.executor_id, e, current_step, default_extra)
+            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra)
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -8655,7 +8650,7 @@ class DockerService:
             )
 
     async def hold_node_until_probe_passes(
-        self, executor_uuid: str, exc: Exception, current_step: str | None, log_extra: dict
+        self, executor_uuid: str, current_step: str | None, log_extra: dict
     ) -> None:
         """Stamp a host-fault create failure as the node's standing rental probe failure.
 
@@ -8663,7 +8658,7 @@ class DockerService:
         is dropped so that probe runs on the next idle cycle. Without the probe there is nothing to
         clear the stamp, so nothing is stamped while RENTAL_PROBE_ENABLED is off.
         """
-        if not settings.RENTAL_PROBE_ENABLED or not is_host_fault_create_failure(exc, current_step):
+        if not settings.RENTAL_PROBE_ENABLED or not is_host_fault_create_failure(current_step):
             return
         try:
             await self.redis_service.set(
