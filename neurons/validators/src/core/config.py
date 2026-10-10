@@ -296,6 +296,12 @@ class Settings(BaseSettings):
     # session is re-opened; `containers/create` and `volumes/create` first check by name and adopt
     # what the lost first attempt made. Off: the call fails the rent as before. Either way the
     # failure event carries `error_class: transport`.
+    # When a stopped pod is started again (restart, stale-mount recovery, undo of a failed edit) and
+    # it still sits on the default bridge, move it onto the rental network first. Off: it starts on
+    # the network it was created with.
+    RENTAL_NETWORK_MIGRATE_ON_START_ENABLED: bool = Field(
+        env="RENTAL_NETWORK_MIGRATE_ON_START_ENABLED", default=False
+    )
     DOCKER_TRANSPORT_RETRY_ENABLED: bool = Field(env="DOCKER_TRANSPORT_RETRY_ENABLED", default=False)
     # On a rent, when dockerd refuses to bind a host port the backend handed the pod (a stale
     # container or a provider process holds it), the pod moves to the next free pair of the
