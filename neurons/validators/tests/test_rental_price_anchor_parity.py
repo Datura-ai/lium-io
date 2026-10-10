@@ -64,6 +64,12 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
         "NVIDIA RTX PRO 5000 Blackwell",
         "NVIDIA RTX PRO 6000D Blackwell Workstation Edition",
         "NVIDIA RTX 6000D",
+        "NVIDIA GeForce RTX 4080",
+        "NVIDIA GeForce RTX 4080 SUPER",
+        "NVIDIA GeForce RTX 3070",
+        "NVIDIA Quadro RTX 8000",
+        "NVIDIA RTX A4000",
+        "NVIDIA CMP 170HX",
     }
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300"} | added_types
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]

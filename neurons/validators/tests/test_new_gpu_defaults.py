@@ -75,7 +75,8 @@ def test_new_gpu_models_are_supported_with_zero_default_portion():
 # Base models since added to the unrented program (priced and capped in incentive.config).
 UNRENTED_ENABLED_BASE_MODELS = {
     "RTX 5080", "RTX 5070 Ti", "RTX 5060 Ti", "RTX 4060 Ti", "RTX 4070 SUPER", "RTX 3080", "RTX 3060",
-    "RTX 2080 Ti", "V100", "RTX PRO 5000", "RTX PRO 6000D",
+    "RTX 2080 Ti", "V100", "RTX PRO 5000", "RTX PRO 6000D", "RTX 4080", "RTX 4080 SUPER", "RTX 3070",
+    "Quadro RTX 8000", "CMP 170HX",
 }
 
 
