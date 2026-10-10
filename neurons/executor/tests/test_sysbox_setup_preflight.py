@@ -24,7 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -49,6 +49,7 @@ STUBS = {
                     *DockerRootDir*) echo "${STUB_DOCKER_ROOT:-$SYSBOX_SETUP_HOST_ROOT/var/lib/docker}" ;;
                     *Runtimes*) echo "${STUB_DOCKER_RUNTIMES:-\\"runc\\", \\"sysbox-runc\\"}" ;;
                 esac ;;
+            "image inspect") [ -z "${STUB_NO_EXECUTOR_IMAGE:-}" ] || exit 1 ;;
             "run --rm") [ -z "${STUB_SYSBOX_RUN_FAILS:-}" ] && echo ok || { echo "OCI runtime create failed" >&2; exit 125; } ;;
         esac
         """
@@ -58,6 +59,7 @@ STUBS = {
         #!/bin/bash
         case "$1" in
             --query-gpu=driver_version) echo "${STUB_NV_DRIVER:-580.65.06}" ;;
+            --query-gpu=name) for _ in $(seq "${STUB_NV_GPUS:-8}"); do echo "${STUB_NV_NAME:-NVIDIA H100 80GB HBM3}"; done ;;
             --query-gpu=memory.total) for _ in $(seq "${STUB_NV_GPUS:-8}"); do echo "${STUB_NV_MEM_MIB:-81559}"; done ;;
             --list-gpus) for i in $(seq "${STUB_NV_GPUS:-8}"); do echo "GPU $((i - 1)): NVIDIA H100 80GB HBM3"; done ;;
         esac
@@ -67,6 +69,14 @@ STUBS = {
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
     "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
     "fusermount3": "#!/bin/bash\nexit 0\n",
+    # loads the legacy iptables modules into the fixture /proc/modules, or fails with STUB_MODPROBE_FAILS
+    "modprobe": textwrap.dedent(
+        """\
+        #!/bin/bash
+        [ -z "${STUB_MODPROBE_FAILS:-}" ] || exit 1
+        printf "ip_tables 1 0\\niptable_nat 1 0\\niptable_filter 1 0\\n" >> "$SYSBOX_SETUP_HOST_ROOT/proc/modules"
+        """
+    ),
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -81,7 +91,7 @@ STUBS = {
         """\
         #!/bin/bash
         echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
-        echo "/dev/nvme0n1p1 ${STUB_DF_TOTAL_KB:-1048576000} 1 1 1% /"
+        echo "/dev/nvme0n1p1 ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
         """
     ),
 }
@@ -255,10 +265,16 @@ def test_docker_daemon_down_names_systemctl(tmp_path):
     assert "sudo systemctl enable --now docker" in out
 
 
-def test_docker_29_1_passes_but_says_untested(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_docker", env={"STUB_DOCKER_VERSION": "29.1.0"})
+def test_docker_29_0_passes_but_says_untested(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_docker", env={"STUB_DOCKER_VERSION": "29.0.1"})
     assert rc == 0
-    assert "PASS Docker 29.1.0 (29.0–29.1 is untested with sysbox" in out
+    assert "PASS Docker 29.0.1 (29.0 is untested with sysbox" in out
+
+
+def test_docker_29_1_passes_plainly(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_docker", env={"STUB_DOCKER_VERSION": "29.1.3"})
+    assert rc == 0
+    assert "PASS Docker 29.1.3.\n" in out
 
 
 @pytest.mark.parametrize("with_jq", [False, True])
@@ -400,6 +416,20 @@ def test_iptables_built_in_modules_count_as_loaded(tmp_path):
     assert rc == 0, out
 
 
+@pytest.mark.parametrize(
+    ("env", "files", "package"),
+    [
+        ({"STUB_NV_DRIVER": "570.1.1"}, {}, "nvidia-driver-580-server &&"),
+        ({"STUB_NV_DRIVER": "570.1.1"}, {"proc/driver/nvidia/version": "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  570.1.1\n"}, "nvidia-driver-580-server-open"),
+        ({"STUB_NV_DRIVER": "570.1.1", "STUB_NV_NAME": "NVIDIA GeForce RTX 5090"}, {}, "nvidia-driver-580-server-open"),
+    ],
+)
+def test_driver_fix_keeps_the_open_module_where_it_is_needed(tmp_path, env, files, package):
+    rc, out, _ = run_check(tmp_path, "check_nvidia_driver", env=env, files=files)
+    assert rc == 1
+    assert f"sudo apt-get install -y {package}" in out
+
+
 # ── disk >= 1.5x VRAM (validators' MIN_DISK_TO_VRAM_RATE) ────────────────────
 
 
@@ -434,6 +464,24 @@ def test_disk_rule_is_skipped_without_a_gpu(tmp_path):
     rc, out, fix = run_check(tmp_path, "check_total_disk_for_vram", without=("nvidia-smi",))
     assert rc == 0 and fix == 0
     assert "SKIP Disk >= 1.5x VRAM — no NVIDIA driver" in out
+
+
+# ── free disk for the node's images and VerifyX's storage test ───────────────
+
+
+def test_free_disk_needs_room_for_the_images_before_the_first_pull(tmp_path):
+    # a 100 GB disk passes the 1.5x VRAM rule for one 48 GB card and then fails VerifyX
+    env = {"STUB_DF_AVAIL_KB": str(97 * 1024 * 1024), "STUB_NO_EXECUTOR_IMAGE": "1"}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env)
+    assert rc == 1
+    assert "FIX  Free disk 97.0 GB on " in out and "is below 140 GB" in out
+    assert "Use a disk of at least 150 GB" in out
+
+
+def test_free_disk_needs_only_the_storage_test_once_the_images_are_pulled(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env={"STUB_DF_AVAIL_KB": str(120 * 1024 * 1024)})
+    assert rc == 0, out
+    assert "PASS Free disk 120.0 GB on " in out and ">= 100 GB" in out
 
 
 # ── ports ────────────────────────────────────────────────────────────────────
@@ -614,7 +662,7 @@ def test_check_mode_reports_a_missing_fusermount3(tmp_path):
     proc = run_script(tmp_path, "--check", without=("fusermount3",))
     assert proc.returncode == 1
     assert "FIX  fusermount3 is missing" in proc.stdout
-    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 13 PASS, 1 FIX, 0 SKIP." in proc.stdout
 
 
 def test_fuse3_is_installed_before_the_sysbox_deb():
@@ -638,7 +686,7 @@ def test_check_mode_on_a_good_host_exits_zero_with_a_summary(tmp_path):
     proc = run_script(tmp_path, "--check")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FIX  " not in proc.stdout
-    assert "Preflight: 13 PASS, 0 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 14 PASS, 0 FIX, 0 SKIP." in proc.stdout
 
 
 def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_path):
@@ -649,7 +697,7 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "FIX  NVIDIA container toolkit is not installed" in proc.stdout
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
-    assert "Preflight: 10 PASS, 2 FIX, 1 SKIP." in proc.stdout
+    assert "Preflight: 11 PASS, 2 FIX, 1 SKIP." in proc.stdout
     assert f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
 
 
@@ -675,7 +723,7 @@ def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
     # (the stubbed Docker already knows sysbox-runc and runs the GPU probe, so the script ends at "Nothing to do.")
     proc = run_script(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "Preflight: 9 PASS, 0 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 10 PASS, 0 FIX, 0 SKIP." in proc.stdout
     assert "Nothing was installed." not in proc.stdout
     assert "Sysbox is already working. Nothing to do." in proc.stdout
     assert "FIX line(s) at the top" not in proc.stdout
@@ -732,7 +780,7 @@ def test_install_mode_goes_on_after_an_advisory_fix(tmp_path, env, without, fix_
 
 def test_install_mode_goes_on_without_the_iptables_modules(tmp_path):
     # the ticket-0309 cause: the FIX names the modprobe, and the install no longer waits for it
-    proc = run_script(tmp_path, files={"proc/modules": "nf_tables 311296 0\n"})
+    proc = run_script(tmp_path, env={"STUB_MODPROBE_FAILS": "1"}, files={"proc/modules": "nf_tables 311296 0\n"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FIX  Kernel modules ip_tables iptable_nat iptable_filter are not loaded" in proc.stdout
     assert "sudo modprobe -a ip_tables iptable_nat iptable_filter" in proc.stdout
@@ -740,12 +788,21 @@ def test_install_mode_goes_on_without_the_iptables_modules(tmp_path):
     assert "The preflight printed 1 FIX line(s) at the top." in proc.stdout
 
 
+def test_install_mode_loads_the_iptables_modules_itself(tmp_path):
+    proc = run_script(tmp_path, files={"proc/modules": "nf_tables 311296 0\n"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Loaded the iptables modules (ip_tables iptable_nat iptable_filter) and made them load at boot." in proc.stdout
+    assert "The preflight printed" not in proc.stdout
+    conf = tmp_path / "root" / "etc" / "modules-load.d" / "lium-iptables.conf"
+    assert conf.read_text() == "ip_tables\niptable_nat\niptable_filter\n"
+
+
 def test_check_mode_still_exits_one_on_an_advisory_fix(tmp_path):
     # --check reports; the advisory / blocking split is install mode's
     proc = run_script(tmp_path, "--check", env={"STUB_NV_DRIVER": "575.57.08"})
     assert proc.returncode == 1
     assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in proc.stdout
-    assert "Preflight: 12 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "Preflight: 13 PASS, 1 FIX, 0 SKIP." in proc.stdout
     assert "do not stop the install" not in proc.stdout
     # the installer never installs a driver: pointing at it is the reinstall loop of ticket-0309
     script = tmp_path / "executor" / "nvidia_docker_sysbox_setup.sh"

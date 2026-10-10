@@ -170,6 +170,8 @@ fail_no_idmapped() {
 
 MIN_NVIDIA_DRIVER="580.65.06"   # validators' MIN_NVIDIA_DRIVER_VERSION: an idle node below it earns nothing after the cutoff
 MIN_DISK_TO_VRAM_RATE="1.5"     # validators' MIN_DISK_TO_VRAM_RATE (rental_price.py): idle pay needs total disk >= 1.5x total VRAM
+MIN_FREE_STORAGE_GB=100         # VerifyX storage challenge: "Insufficient storage: N GB allocated, 100 GB required"
+NODE_IMAGES_GB=40               # what the node's images take once pulled; a 100 GB disk passes the 1.5x rule and still fails VerifyX
 PREFLIGHT_PASS=0 PREFLIGHT_FIX=0 PREFLIGHT_SKIP=0
 
 pf_pass() { PREFLIGHT_PASS=$((PREFLIGHT_PASS + 1)); echo -e "  ${G}PASS${N} $1"; }
@@ -270,8 +272,9 @@ check_docker() {
         pf_fix "Docker is running but reported no server version." "docker version   # then sudo systemctl restart docker"
         return 1
     fi
-    if docker_version_ge 29 0 && ! docker_version_ge 29 2; then
-        pf_pass "Docker $version (29.0–29.1 is untested with sysbox; 28.x and 29.2+ are)."
+    # 29.1 with sysbox 0.7.1 took a fresh host end to end to listed on 7 Oct 2026
+    if docker_version_ge 29 0 && ! docker_version_ge 29 1; then
+        pf_pass "Docker $version (29.0 is untested with sysbox; 28.x and 29.1+ are)."
     else
         pf_pass "Docker $version."
     fi
@@ -314,11 +317,22 @@ check_fuse3() {
         "or by hand: sudo apt-get install -y fuse3"
 }
 
+nvidia_driver_package() {
+    # Blackwell (RTX 50xx, RTX PRO 6000 Blackwell, B200, B300) runs only the open kernel module, and a host already on
+    # the open module would otherwise be switched to the closed one by the FIX command
+    if grep -q "Open Kernel Module" "$(host_path /proc/driver/nvidia/version)" 2>/dev/null \
+        || nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -Eq 'RTX 50[0-9]{2}|Blackwell|B200|B300'; then
+        echo nvidia-driver-580-server-open
+    else
+        echo nvidia-driver-580-server
+    fi
+}
+
 check_nvidia_driver() {
     local driver
     if ! command -v nvidia-smi &>/dev/null; then
         pf_fix "nvidia-smi not found — no NVIDIA driver installed." \
-            "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # Ubuntu; or your vendor's driver package"
+            "sudo apt-get install -y $(nvidia_driver_package) && sudo reboot   # Ubuntu; or your vendor's driver package"
         return 1
     fi
     # nvidia-smi prints its errors on stdout ("Failed to initialize NVML: Driver/library version mismatch"), so only a
@@ -334,7 +348,7 @@ check_nvidia_driver() {
         return 0
     fi
     pf_fix "NVIDIA driver $driver is below $MIN_NVIDIA_DRIVER, the validators' minimum — an idle node below it earns nothing." \
-        "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # stop rentals first"
+        "sudo apt-get install -y $(nvidia_driver_package) && sudo reboot   # stop rentals first"
 }
 
 check_nvidia_toolkit() {
@@ -348,16 +362,31 @@ check_nvidia_toolkit() {
         "$(self_cmd)   # adds NVIDIA's apt repository and installs nvidia-container-toolkit"
 }
 
-check_iptables_modules() {
-    # The validators' Docker-in-Docker probe runs legacy iptables inside the pod; on an nftables
-    # host without these modules its dockerd fails with "can't initialize iptables table 'nat'",
-    # sshd never starts and the node is scored as having no sysbox (ticket-0309: three reinstalls).
+missing_iptables_modules() {
     local mod missing=""
     for mod in ip_tables iptable_nat iptable_filter; do
         grep -q "^$mod " "$(host_path /proc/modules)" 2>/dev/null && continue
         [ -d "$(host_path "/sys/module/$mod")" ] && continue
         missing="${missing:+$missing }$mod"
     done
+    echo "$missing"
+}
+
+load_iptables_modules() {
+    # install mode does the iptables FIX itself instead of leaving two commands and a re-run to the provider
+    [ -n "$(missing_iptables_modules)" ] || return 1
+    modprobe -a ip_tables iptable_nat iptable_filter 2>/dev/null || return 1
+    [ -z "$(missing_iptables_modules)" ] || return 1
+    mkdir -p "$(host_path /etc/modules-load.d)" 2>/dev/null
+    printf 'ip_tables\niptable_nat\niptable_filter\n' > "$(host_path /etc/modules-load.d/lium-iptables.conf)"
+}
+
+check_iptables_modules() {
+    # The validators' Docker-in-Docker probe runs legacy iptables inside the pod; on an nftables
+    # host without these modules its dockerd fails with "can't initialize iptables table 'nat'",
+    # sshd never starts and the node is scored as having no sysbox (ticket-0309: three reinstalls).
+    local missing
+    missing=$(missing_iptables_modules)
     if [ -z "$missing" ]; then
         pf_pass "Legacy iptables modules loaded (ip_tables iptable_nat iptable_filter) for the validators' Docker-in-Docker probe."
         return 0
@@ -389,6 +418,26 @@ check_total_disk_for_vram() {
     fi
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+}
+
+check_free_disk_for_node() {
+    # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
+    # still have to come out of the same free space
+    local data_root free_kb free_gb needed_gb
+    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
+    [ -d "$data_root" ] || data_root=/
+    free_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $4}')
+    [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $data_root."; return 0; }
+    free_gb=$(awk -v k="$free_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
+    needed_gb=$MIN_FREE_STORAGE_GB
+    docker image inspect "$VERIFY_IMAGE" &>/dev/null || needed_gb=$((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB))
+    if awk -v f="$free_gb" -v n="$needed_gb" 'BEGIN {exit !(f >= n)}'; then
+        pf_pass "Free disk ${free_gb} GB on $data_root >= ${needed_gb} GB for the node's images and the validators' ${MIN_FREE_STORAGE_GB} GB storage test."
+        return 0
+    fi
+    pf_fix "Free disk ${free_gb} GB on $data_root is below ${needed_gb} GB — the validators' storage test needs ${MIN_FREE_STORAGE_GB} GB free after the node's images (~${NODE_IMAGES_GB} GB) are pulled, so \`lium mine\` would fail at validation." \
+        "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
 }
 
 resolve_preflight_ports() {
@@ -520,6 +569,7 @@ preflight_advisory() {
     check_nvidia_driver || true
     check_iptables_modules || true
     check_total_disk_for_vram || true
+    check_free_disk_for_node || true
     check_ports || true
 }
 
@@ -587,6 +637,11 @@ preflight_summary || echo "  The FIX lines above do not stop the install: the no
 echo -e "\n  This will install sysbox, configure Docker, restart Docker, and verify."
 if [ -t 0 ]; then
     read -rp "  Continue? [Y/n]: " c; [ "$c" = "n" ] || [ "$c" = "N" ] && { ok "Aborted."; exit 0; }
+fi
+
+if load_iptables_modules; then
+    ok "Loaded the iptables modules (ip_tables iptable_nat iptable_filter) and made them load at boot."
+    PREFLIGHT_FIX=$((PREFLIGHT_FIX - 1))
 fi
 
 # ── 2. Already working? ─────────────────────────────────
