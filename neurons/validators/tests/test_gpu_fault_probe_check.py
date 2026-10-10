@@ -687,7 +687,7 @@ def test_setup_calls_in_the_probe_are_errors_not_faults():
 def test_new_xid_lines_count_only_for_probed_cards_and_hardware_types():
     # dmesg is host-wide: a rented pod's illegal address on another card (Xid 31) or a sibling executor's
     # fault must not be scored against this executor; an application Xid on our own card is not hardware either
-    namespace = _probe_namespace("xid_faults", "pci_key", "SOFTWARE_XIDS")
+    namespace = _probe_namespace("xid_faults", "parse_xid", "pci_key", "SOFTWARE_XIDS")
     import re as _re
 
     namespace["re"] = _re
