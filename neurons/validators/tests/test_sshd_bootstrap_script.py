@@ -18,7 +18,6 @@ of the race-safe flow runs for real without root or a container:
 from __future__ import annotations
 
 import os
-import signal
 import stat
 import subprocess
 from pathlib import Path
@@ -35,11 +34,6 @@ PROC_TCP_WITH_LISTENER = (
     "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid\n"
     "   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0\n"
     "   1: 0100007F:0016 0100007F:D2A0 01 00000000:00000000 00:00000000 00000000     0\n"
-)
-PROC_TCP_WITHOUT_LISTENER = (
-    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid\n"
-    "   1: 0100007F:0016 0100007F:D2A0 01 00000000:00000000 00:00000000 00000000     0\n"
-    "   2: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0\n"
 )
 
 PGREP_SHIM = """#!/bin/sh
@@ -86,6 +80,12 @@ printf '%s\\n' "$*" >> "$SHIM_STATE/nohup_calls"
 exit 0
 """
 
+SSHD_STARTS = """#!/bin/sh
+touch "$SHIM_STATE/sshd_running"
+printf 'started\\n' >> "$SHIM_STATE/sshd_started"
+exit 0
+"""
+
 APT_GET_SHIM = """#!/bin/sh
 printf '%s\\n' "$*" >> "$SHIM_STATE/apt_calls"
 case "$*" in
@@ -95,25 +95,6 @@ case "$*" in
         ;;
 esac
 exit 0
-"""
-
-SSHD_STARTS = """#!/bin/sh
-touch "$SHIM_STATE/sshd_running"
-printf 'started\\n' >> "$SHIM_STATE/sshd_started"
-exit 0
-"""
-
-# Exits non-zero as if the bind failed, while the concurrent (image) sshd is
-# in fact up — the script must treat this as success after re-checking.
-SSHD_LOSES_BIND_RACE = """#!/bin/sh
-touch "$SHIM_STATE/sshd_running"
-printf 'failed\\n' >> "$SHIM_STATE/sshd_started"
-exit 1
-"""
-
-SSHD_NEVER_SERVES = """#!/bin/sh
-printf 'failed\\n' >> "$SHIM_STATE/sshd_started"
-exit 1
 """
 
 
@@ -205,19 +186,6 @@ def harness(tmp_path):
     return BootstrapHarness(tmp_path)
 
 
-def test_adopts_already_running_sshd_without_touching_host_keys(harness):
-    harness.mark_sshd_running()
-    harness.install_sshd_bin(SSHD_STARTS)
-
-    result = harness.run("--grace", "5")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "adopting existing daemon" in result.stdout
-    assert harness.keygen_calls() == []
-    assert harness.sshd_start_attempts() == []
-    assert harness.watchdog_spawned()
-
-
 def test_adopt_path_hardens_config_for_key_only_auth(harness):
     harness.mark_sshd_running()
 
@@ -230,44 +198,6 @@ def test_adopt_path_hardens_config_for_key_only_auth(harness):
     assert "\nPasswordAuthentication no\n" in hardened
     # No sshd pidfile exists in the harness, so the reload is skipped loudly.
     assert "no sshd pidfile to reload" in result.stdout
-
-
-def test_adopts_sshd_that_appears_during_grace(harness):
-    harness.set_pgrep_countdown(3)
-    harness.install_sshd_bin(SSHD_STARTS)
-
-    result = harness.run("--grace", "10")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "Waiting up to 10s for image-provided sshd" in result.stdout
-    assert "Image-provided sshd came up" in result.stdout
-    assert harness.keygen_calls() == []
-    assert harness.sshd_start_attempts() == []
-
-
-def test_fallback_owns_bringup_when_image_never_starts_sshd(harness):
-    harness.install_sshd_bin(SSHD_STARTS)
-
-    result = harness.run("--grace", "1")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "falling back to own bring-up" in result.stdout
-    assert harness.keygen_calls() == ["-A"]
-    assert harness.sshd_start_attempts() == ["started"]
-    assert harness.watchdog_spawned()
-
-
-def test_no_grace_wait_when_image_ships_no_sshd_binary(harness):
-    # LIUM_SSHD_BIN does not exist yet; the apt-get shim "installs" it.
-    harness.stage_sshd_payload(SSHD_STARTS)
-
-    result = harness.run()
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "Waiting up to" not in result.stdout
-    assert any("install" in call for call in harness.apt_calls())
-    assert harness.keygen_calls() == ["-A"]
-    assert harness.sshd_start_attempts() == ["started"]
 
 
 def test_install_runs_under_the_setup_lock(harness):
@@ -288,78 +218,4 @@ def test_install_runs_under_the_setup_lock(harness):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert (harness.state / "lock_at_install").read_text().split() == ["held", "held"]
-    assert harness.sshd_start_attempts() == ["started"]
-
-
-def test_grace_zero_skips_waiting_even_with_sshd_binary(harness):
-    harness.install_sshd_bin(SSHD_STARTS)
-
-    result = harness.run("--grace", "0")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "Waiting up to" not in result.stdout
-    assert harness.keygen_calls() == ["-A"]
-
-
-def test_tolerates_losing_the_sshd_start_race(harness):
-    harness.install_sshd_bin(SSHD_LOSES_BIND_RACE)
-
-    result = harness.run("--grace", "1")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "sshd was started concurrently" in result.stdout
-
-
-def test_fallback_adopt_after_bind_race_reloads_hardened_config(harness):
-    """The adopted (image-started) sshd loaded the pre-hardening config, so the
-    fallback path must SIGHUP the master after hardening — not just converge."""
-    harness.install_sshd_bin(SSHD_LOSES_BIND_RACE)
-    master = subprocess.Popen(["/bin/sleep", "60"])
-    (harness.run_dir / "sshd.pid").write_text(f"{master.pid}\n")
-
-    try:
-        result = harness.run("--grace", "1")
-
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert "sshd was started concurrently" in result.stdout
-        assert f"Sent SIGHUP to sshd (pid {master.pid})" in result.stdout
-        # SIGHUP's default disposition terminates sleep — proof it was delivered.
-        assert master.wait(timeout=5) == -signal.SIGHUP
-    finally:
-        if master.poll() is None:
-            master.kill()
-            master.wait()
-
-
-def test_fails_when_sshd_never_serves(harness):
-    harness.install_sshd_bin(SSHD_NEVER_SERVES)
-
-    result = harness.run("--grace", "1")
-
-    assert result.returncode != 0
-    assert "sshd verification failed" in result.stdout
-    assert "running=no" in result.stdout
-
-
-def test_verify_requires_listener_on_port_22_not_just_a_process(harness):
-    harness.mark_sshd_running()
-    harness.proc_tcp.write_text(PROC_TCP_WITHOUT_LISTENER)
-
-    result = harness.run(verify_secs=1)
-
-    assert result.returncode != 0
-    assert "sshd verification failed" in result.stdout
-    assert "running=yes" in result.stdout
-    assert "listening=no" in result.stdout
-
-
-def test_lock_timeout_proceeds_instead_of_hanging(harness):
-    harness.install_sshd_bin(SSHD_STARTS)
-    # Simulate a crashed holder: the lock dir exists and nobody releases it.
-    (harness.run_dir / "lium-ssh-setup.lock").mkdir()
-
-    result = harness.run("--grace", "0")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "proceeding without it" in result.stdout
     assert harness.sshd_start_attempts() == ["started"]

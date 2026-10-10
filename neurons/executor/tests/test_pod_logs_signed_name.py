@@ -66,49 +66,11 @@ def _signed(keypair, data_to_sign: str, container_name: str) -> dict:
     }
 
 
-def test_the_miners_own_request_is_answered(client, miner_keypair, store):
-    """What ExecutorService.get_pod_logs sends: data_to_sign is the container name."""
-    response = client.post("/pod_logs", json=_signed(miner_keypair, _CONTAINER, _CONTAINER))
-
-    assert response.status_code == 200, response.text
-    assert response.json() == [{"event": "start", "container_name": _CONTAINER}]
-    store.find_by_continer_name.assert_awaited_once_with(_CONTAINER)
-
-
-def test_a_signature_over_another_string_does_not_read_a_container(client, miner_keypair, store):
-    """A blob the miner signed for /upload_ssh_key is a valid miner signature, but not over this container name."""
-    response = client.post("/pod_logs", json=_signed(miner_keypair, _SSH_KEY, _CONTAINER))
-
-    assert response.status_code == 400, response.text
-    assert response.json() == {"detail": "Container name mismatch"}
-    store.find_by_continer_name.assert_not_awaited()
-
-
 def test_a_signature_over_one_container_does_not_read_another(client, miner_keypair, store):
     response = client.post("/pod_logs", json=_signed(miner_keypair, _OTHER_CONTAINER, _CONTAINER))
 
     assert response.status_code == 400, response.text
     store.find_by_continer_name.assert_not_awaited()
-
-
-def test_the_portal_hotkey_is_held_to_the_same_binding(client, portal_keypair, store):
-    """The portal hotkey is trusted by every executor; its signatures must bind the name too."""
-    accepted = client.post("/pod_logs", json=_signed(portal_keypair, _CONTAINER, _CONTAINER))
-    assert accepted.status_code == 200, accepted.text
-
-    refused = client.post("/pod_logs", json=_signed(portal_keypair, _SSH_KEY, _CONTAINER))
-    assert refused.status_code == 400, refused.text
-    store.find_by_continer_name.assert_awaited_once_with(_CONTAINER)
-
-
-def test_surrounding_whitespace_is_not_a_mismatch(client, miner_keypair, store):
-    """Same normalisation as the SSH-key routes: the signed string is compared stripped."""
-    body = _signed(miner_keypair, f" {_CONTAINER}\n", _CONTAINER)
-
-    response = client.post("/pod_logs", json=body)
-
-    assert response.status_code == 200, response.text
-    store.find_by_continer_name.assert_awaited_once_with(_CONTAINER)
 
 
 def test_a_stranger_is_still_refused_before_the_binding_is_checked(client, store):

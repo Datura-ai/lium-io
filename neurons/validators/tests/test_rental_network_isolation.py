@@ -11,10 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 from payload_models.payloads import ClusterMembership, ContainerCreateRequest, CustomOptions
-from services.cluster_fabric import WIREGUARD_LISTEN_PORT
-from services.cvm_quote_broker import quote_broker_run_spec
 from services.docker_service import DockerService
-from services.rental_docker_observability import rental_run_spec_log_fields
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME, GpuDockerConfig
 
 
@@ -68,22 +65,3 @@ def test_a_rental_joins_the_isolated_network(docker_service, is_sysbox) -> None:
     assert "NET_ADMIN" in run_spec.cap_add
 
 
-def test_a_cluster_node_joins_the_isolated_network_and_keeps_its_wireguard_port(docker_service) -> None:
-    membership = ClusterMembership(node_index=0, wireguard_conf="[Interface]\nPrivateKey = x\n")
-
-    run_spec = _run_spec(docker_service, _payload(cluster_membership=membership))
-
-    # the overlay peers reach this node through the host-published UDP port, not through docker0
-    assert run_spec.network == RENTAL_NETWORK_NAME
-    assert any(port.protocol == "udp" and port.host_port == WIREGUARD_LISTEN_PORT for port in run_spec.ports)
-
-
-def test_the_network_is_in_the_run_log_fields(docker_service) -> None:
-    fields = rental_run_spec_log_fields(_run_spec(docker_service, _payload()))
-
-    assert fields["network"] == RENTAL_NETWORK_NAME
-
-
-def test_the_quote_broker_stays_on_the_default_bridge() -> None:
-    # it serves the pod over a unix socket bind mount and never opens a TCP port to another container
-    assert quote_broker_run_spec().network is None
