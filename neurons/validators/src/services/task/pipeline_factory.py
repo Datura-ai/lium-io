@@ -56,6 +56,7 @@ from .checks import (
     RentalProbeCheck,
     RentalVerificationCheck,
     RentedGpuDropCheck,
+    RentedGpuHealthShadowCheck,
     ScoreCheck,
     SpecChangeCheck,
     StaleContainerCleanupCheck,
@@ -288,6 +289,8 @@ class PipelineFactory:
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
                 RentedGpuDropCheck(),
+                # Shadow only, flag-gated: log, never score or fail.
+                RentedGpuHealthShadowCheck(),
                 # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
                 # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
                 # the published specs had no tdx_host_supported key and the backend stored false,
@@ -425,6 +428,8 @@ class PipelineFactory:
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
                 RentedGpuDropCheck(),
+                # Shadow only, flag-gated: log, never score or fail.
+                RentedGpuHealthShadowCheck(),
                 TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
@@ -491,6 +496,8 @@ class PipelineFactory:
                 MachineSpecScrapeCheck(),
                 # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
+                # Shadow only, flag-gated: log, never score or fail.
+                RentedGpuHealthShadowCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
                 GpuCountCheck(),

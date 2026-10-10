@@ -53,6 +53,8 @@ DMESG_TIMEOUT_SECONDS = 5
 # Xid types an application raises on a healthy card (graphics exception, MMU fault, channel reset, preemptive
 # cleanup): a rented pod's own bug, not the hardware. The probe's own kernels report those through CUresult.
 SOFTWARE_XIDS = {13, 31, 43, 45}
+# Xid types `--health` reports: double-bit ECC, fallen off the bus, contained / uncontained ECC.
+HEALTH_XIDS = {48, 79, 94, 95}
 
 # fmix32-style mixer whose every step is a bijection on [0, 2**k): (x + seed) mod 2**k, odd multiplier
 # mod 2**k, xorshift within k bits. Mirrored in PTX by k_perm; the host replays it to check the chase.
@@ -752,6 +754,30 @@ def _device_count(mp) -> int:
     return reply["count"]
 
 
+def _read_counters(pynvml, handle, gpu: dict, errors: list | None = None) -> None:
+    """Fill `gpu` with the fault counters; a read that fails is None (NotSupported on consumer cards,
+    missing on old bindings). `errors` collects every failure that is not NOT_SUPPORTED (3)."""
+    for key, read in (
+        ("uuid", lambda h: pynvml.nvmlDeviceGetUUID(h)),
+        ("pci_bus_id", lambda h: pynvml.nvmlDeviceGetPciInfo(h).busId),
+        (
+            "ecc_uncorrected",
+            lambda h: pynvml.nvmlDeviceGetTotalEccErrors(
+                h, pynvml.NVML_MEMORY_ERROR_TYPE_UNCORRECTED, pynvml.NVML_VOLATILE_ECC
+            ),
+        ),
+        ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
+        ("recovery_action", lambda h: pynvml.nvmlDeviceGetGpuRecoveryAction(h)),
+    ):
+        try:
+            value = read(handle)
+            gpu[key] = value.decode() if isinstance(value, bytes) else value
+        except Exception as exc:  # noqa: BLE001
+            gpu[key] = None
+            if errors is not None and getattr(exc, "value", None) != 3:
+                errors.append(f"{key}: {exc}"[:200])
+
+
 def nvml_snapshot() -> dict:
     """Per-GPU counters that move when hardware faults: uncorrected ECC, remapped rows, recovery action."""
     try:
@@ -767,43 +793,67 @@ def nvml_snapshot() -> dict:
         for i in range(pynvml.nvmlDeviceGetCount()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             gpu: dict = {"index": i}
-            for key, read in (
-                ("uuid", lambda h: pynvml.nvmlDeviceGetUUID(h)),
-                ("pci_bus_id", lambda h: pynvml.nvmlDeviceGetPciInfo(h).busId),
-                (
-                    "ecc_uncorrected",
-                    lambda h: pynvml.nvmlDeviceGetTotalEccErrors(
-                        h, pynvml.NVML_MEMORY_ERROR_TYPE_UNCORRECTED, pynvml.NVML_VOLATILE_ECC
-                    ),
-                ),
-                ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
-                ("recovery_action", lambda h: pynvml.nvmlDeviceGetGpuRecoveryAction(h)),
-            ):
-                try:
-                    value = read(handle)
-                    gpu[key] = value.decode() if isinstance(value, bytes) else value
-                except Exception:  # noqa: BLE001 - NotSupported on consumer cards, missing on old bindings
-                    gpu[key] = None
+            _read_counters(pynvml, handle, gpu)
             gpus.append(gpu)
     finally:
         pynvml.nvmlShutdown()
     return {"available": True, "gpus": gpus}
 
 
-def _nvml_worker(conn) -> None:
+def nvml_health() -> dict:
+    """`--health`: the same counters per card plus retired pages pending, no CUDA. A card NVML cannot
+    open (GPU is lost) is listed with its error instead of ending the read."""
+    try:
+        import pynvml
+    except ImportError:
+        return {"available": False}
+    try:
+        pynvml.nvmlInit()
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": str(exc)[:200]}
+    gpus = []
+    try:
+        count = pynvml.nvmlDeviceGetCount()
+        for i in range(count):
+            gpu: dict = {"index": i}
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            except Exception as exc:  # noqa: BLE001
+                gpu["error"] = str(exc)[:200]
+                gpus.append(gpu)
+                continue
+            errors: list = []
+            _read_counters(pynvml, handle, gpu, errors)
+            try:
+                gpu["retired_pages_pending"] = bool(
+                    pynvml.nvmlDeviceGetRetiredPagesPendingStatus(handle)
+                )
+            except Exception as exc:  # noqa: BLE001
+                gpu["retired_pages_pending"] = None
+                if getattr(exc, "value", None) != 3:
+                    errors.append(f"retired_pages_pending: {exc}"[:200])
+            if errors:
+                gpu["read_errors"] = errors
+            gpus.append(gpu)
+    finally:
+        pynvml.nvmlShutdown()
+    return {"available": True, "count": count, "gpus": gpus}
+
+
+def _nvml_worker(conn, read=None) -> None:
     _quiet_child()
     try:
-        conn.send(nvml_snapshot())
+        conn.send((read or nvml_snapshot)())
     except Exception as exc:  # noqa: BLE001
         conn.send({"available": False, "error": f"{type(exc).__name__}: {exc}"})
     conn.close()
 
 
-def nvml_snapshot_forked(mp) -> dict:
+def nvml_snapshot_forked(mp, read=None) -> dict:
     # in its own fork with a deadline: nvmlInit and the per-GPU reads block on a card that has wedged the
     # driver, and this parent must always print its verdict
     parent_conn, child_conn = mp.Pipe(duplex=False)
-    process = mp.Process(target=_nvml_worker, args=(child_conn,))
+    process = mp.Process(target=_nvml_worker, args=(child_conn, read))
     process.start()
     child_conn.close()
     try:
@@ -906,6 +956,33 @@ def pci_key(bus_id) -> str | None:
     return f"{parts[0][-4:].rjust(4, '0')}:{parts[1]}:{parts[2]}"
 
 
+def parse_xid(line: str) -> tuple[str | None, int | None]:
+    """An `NVRM: Xid (PCI:…): N` line's card (pci_key) and Xid number; None for what it lacks."""
+    pci = re.search(r"Xid \(PCI:([0-9a-fA-F:.]+)\)", line)
+    code = re.search(r"Xid \([^)]*\): (\d+)", line)
+    return (pci_key(pci.group(1)) if pci else None), (int(code.group(1)) if code else None)
+
+
+def health_report(mp) -> dict:
+    """`--health`: NVML per-card health and the hardware Xid lines already in the kernel log.
+
+    Reads only: no CUDA context, no kernels, no allocation, so it is safe beside a rented workload."""
+    xid = xid_lines()
+    hardware = []
+    for line in xid.get("lines") or []:
+        pci, code = parse_xid(line)
+        if code in HEALTH_XIDS:
+            hardware.append({"pci": pci, "xid": code, "line": line[:200]})
+    nvml = nvml_snapshot_forked(mp, nvml_health)
+    # dmesg is host-wide: each card gets only the lines naming its own PCI id
+    for gpu in nvml.get("gpus") or []:
+        bus = pci_key(gpu.get("pci_bus_id"))
+        gpu["hardware_xids"] = sorted({h["xid"] for h in hardware if bus and h["pci"] == bus})
+    xid_report = {k: v for k, v in xid.items() if k not in ("lines", "last")}
+    xid_report["hardware"] = hardware[-16:]
+    return {"status": "health", "nvml": nvml, "xid": xid_report}
+
+
 def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list[str]]:
     """New Xid lines split into this executor's hardware faults and evidence about other cards.
 
@@ -918,16 +995,9 @@ def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list
     new_lines = (after.get("lines") or [])[len(before.get("lines") or []) :]
     faults, other = [], []
     for line in new_lines:
-        pci = re.search(r"Xid \(PCI:([0-9a-fA-F:.]+)\)", line)
-        code = re.search(r"Xid \([^)]*\): (\d+)", line)
-        xid = int(code.group(1)) if code else None
+        pci, xid = parse_xid(line)
         # a line whose Xid number the regex misses is kept as "other", not scored as hardware (review)
-        if (
-            pci
-            and pci_key(pci.group(1)) in bus_ids
-            and xid is not None
-            and xid not in SOFTWARE_XIDS
-        ):
+        if pci and pci in bus_ids and xid is not None and xid not in SOFTWARE_XIDS:
             faults.append(f"new NVRM Xid on a probed GPU: {line[:200]}")
         else:
             other.append(line[:200])
@@ -1009,9 +1079,18 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--device", type=int, action="append", help="probe only this index (repeatable)"
     )
+    parser.add_argument(
+        "--health", action="store_true", help="read NVML health and Xid lines only, no kernels"
+    )
     args = parser.parse_args(argv)
 
     started = time.perf_counter()
+    if args.health:
+        result = health_report(multiprocessing.get_context("fork"))
+        result["elapsed_s"] = round(time.perf_counter() - started, 2)
+        print(JSON_MARKER, json.dumps(result, sort_keys=True))
+        return 0
+
     result: dict = {"status": "ok", "devices": [], "faults": []}
     # every CUDA call happens in a forked worker (one per GPU, plus one to count them): a crash or hang
     # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself

@@ -27,6 +27,7 @@ from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_gpu_drop import RentedGpuDropCheck
+from .rented_gpu_health import RentedGpuHealthShadowCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
@@ -67,6 +68,7 @@ __all__ = [
     "RentalProbeCheck",
     "RentalVerificationCheck",
     "RentedGpuDropCheck",
+    "RentedGpuHealthShadowCheck",
     "TdxHostCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
