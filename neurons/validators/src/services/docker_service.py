@@ -115,6 +115,7 @@ from services.rental_docker_observability import (
 )
 from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
+    FILLER_VOLUME_LABELS,
     HOST_KILL_EXIT_CODES,
     ContainerCreateRefused,
     ContainerExecSpec,
@@ -401,6 +402,11 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
+DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD = DOCKER_VOLUME_LS_NAME_DRIVER_CMD.replace(
+    "volume ls",
+    "volume ls " + " ".join(f"--filter label={key}={value}" for key, value in FILLER_VOLUME_LABELS.items()),
+    1,
+)
 # Where the gocryptfs passphrase and the script that carries it live for the second they exist
 # inside the rental container. /dev/shm is the tmpfs Docker (and sysbox) mount into every
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
@@ -928,6 +934,11 @@ class _CreateCancelledByDelete(Exception):
 
 class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
     """Raised at a filler's `docker run` while a customer create runs on the same executor."""
+
+
+class _FillerRefusedBesideUnlistedPod(_FillerRefusedForCustomerCreate):
+    """Raised by a filler create that finds a `pod_*` its active_container_names do not name; the
+    backend gets #1518's refusal, the log names the pods."""
 
 
 class ImageExitedDuringKeyInjection(Exception):
@@ -1546,6 +1557,28 @@ def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> No
     if _is_filler_create_beside_customer_create(payload):
         raise _FillerRefusedForCustomerCreate(
             f"a customer create is running on executor {payload.executor_id}; filler {payload.pod_id} not started"
+        )
+
+
+def _refuse_filler_beside_unlisted_pod(payload: ContainerCreateRequest, container_names: Iterable[str]) -> None:
+    """Stop a filler create on a host with a `pod_*` its active_container_names do not name.
+
+    The backend builds that list when it sends the filler, so an unlisted pod is a customer's that came
+    after it (a late or retried send, a lapsed create lock, a second connector), or one of an ended
+    rental. Running or exited alike: the filler does not remove it and is not started beside it. A pod
+    created after the last listing, before `start`, is not seen here: that window is the customer
+    side's to close. The validator's stale-container reaper removes a pod the backend no longer
+    lists. Refused like #1518 (no strike).
+    """
+    if payload.workload_kind != WorkloadKind.FILLER:
+        return
+    listed = set(payload.active_container_names or [])
+    listed |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in listed}
+    unlisted = sorted({name for name in container_names if name.startswith(POD_CONTAINER_PREFIX)} - listed)
+    if unlisted:
+        raise _FillerRefusedBesideUnlistedPod(
+            f"pod containers the filler was not told of are on executor {payload.executor_id}: "
+            f"{', '.join(unlisted)}; filler {payload.pod_id} not started"
         )
 
 
@@ -2191,7 +2224,7 @@ class DockerService:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
         Returns the container's ID, or None when the client gave none. A ContainerCreateRefused of
-        the spec's `before_create` (checked before every attempt) is raised as is.
+        the spec's `before_create` or `before_start` (checked on every attempt) is raised as is.
 
         Port collision (PORT_COLLISION_RETRY_ENABLED): when dockerd refuses the bind of a host port
         and `port_maps` / `spare_port_pairs` are given, the colliding mapping moves to the next
@@ -2560,6 +2593,12 @@ class DockerService:
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
             before_create=lambda: _refuse_filler_during_customer_create(payload),
+            # a customer pod created since the cleanup's listing is seen here, before the filler starts
+            before_start=(
+                (lambda names: _refuse_filler_beside_unlisted_pod(payload, names))
+                if payload.workload_kind == WorkloadKind.FILLER
+                else None
+            ),
         )
 
     async def _ensure_pod_quote_socket(
@@ -3486,10 +3525,14 @@ class DockerService:
         remove_every_filler: bool = False,
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
+        refuse_before_removal: Callable[[list[str]], None] | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+
+        ``refuse_before_removal`` gets the listing's names before anything is removed and may raise to
+        stop the create there (a filler create on a host with a pod it was not told of).
 
         DAH-3980: ``removed_at_ssh_connect`` holds the fillers `remove_fillers_at_ssh_connect` already
         removed (or tried to), each with the ID it was listed under: the listing may predate that
@@ -3513,6 +3556,8 @@ class DockerService:
             result = await ssh_client.run(DOCKER_PS_ALL_NAMES_IDS_CMD)
             names, listed_ids = parse_container_listing((result.stdout or "").splitlines())
             all_names = list(names)
+        if refuse_before_removal is not None:
+            refuse_before_removal(all_names)
         if all_names:
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
             # deploy-path sleep; the port-race it hedged is now covered by
@@ -3891,8 +3936,11 @@ class DockerService:
         default_extra: dict,
         skip_volume_names: list[str] | set[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        filler_volumes_only: bool = False,
     ) -> list[str]:
         """Remove vloopback `volume_*` volumes no container mounts (minus ``skip_volume_names``).
+
+        ``filler_volumes_only`` limits it to volumes a filler create labelled (FILLER_VOLUME_LABELS).
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
@@ -3901,6 +3949,10 @@ class DockerService:
         """
         skip_set = {name for name in (skip_volume_names or []) if name}
         list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_CMD
+        if filler_volumes_only:
+            # the host probe's volume listing carries no labels
+            host_probe = None if host_probe is None else dataclasses.replace(host_probe, volumes=None)
+            list_volumes_cmd = DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD
         mounted_volumes_cmd = DOCKER_MOUNTED_VOLUME_NAMES_CMD
 
         try:
@@ -5475,6 +5527,7 @@ class DockerService:
         timeout: int = 10,
         sparse: bool = False,
         host_probe: VolumeHostProbe | None = None,
+        labels: dict[str, str] | None = None,
     ):
         requested_timeout = timeout
         _quote_safe_docker_volume_name(
@@ -5558,6 +5611,7 @@ class DockerService:
                 driver=volume_driver,
                 driver_opts=volume_driver_opts,
                 timeout=timeout,
+                labels=labels,
             ),
             volume_name=local_volume,
             volume_driver=volume_driver,
@@ -7596,6 +7650,7 @@ class DockerService:
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
+                    refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings
@@ -7620,11 +7675,14 @@ class DockerService:
                         [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
                     )
 
+                # A filler sweeps filler volumes only: a customer's fresh volume is unmounted until its
+                # `docker run`, and a lapsed create lock or a second connector would let a filler remove it.
                 removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     skip_volume_names=protected_volume_names,
                     host_probe=docker_listing_probe,
+                    filler_volumes_only=payload.workload_kind == WorkloadKind.FILLER,
                 )
                 if removed_vloopback_volumes:
                     docker_listing_probe = None
@@ -7820,6 +7878,7 @@ class DockerService:
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
                         host_probe=volume_probe,
+                        labels=FILLER_VOLUME_LABELS if payload.workload_kind == WorkloadKind.FILLER else None,
                     )
                     created_local_volume = True
 
@@ -8136,7 +8195,8 @@ class DockerService:
                         # lock lapsed), before its start or before the running-state check, is that
                         # refusal, not a filler fault: not ContainerVanished, counted against the host.
                         container_vanished = False
-                        _refuse_filler_during_customer_create(payload)
+                        if not isinstance(docker_run_error, _FillerRefusedBesideUnlistedPod):
+                            _refuse_filler_during_customer_create(payload)
                     raise
 
                 # Add profiler for the post-run container running-state poll
@@ -8548,6 +8608,13 @@ class DockerService:
                             "reason": "cancelled_by_delete",
                             "failure_step": current_step,
                         }),
+                    )
+                )
+            elif isinstance(e, _FillerRefusedBesideUnlistedPod):
+                logger.info(
+                    _m(
+                        "filler create refused: unlisted pod_* on the node",
+                        extra=get_extra_info({**default_extra, "reason": "unlisted_pod_on_node", "error": str(e)}),
                     )
                 )
             elif isinstance(e, _FillerRefusedForCustomerCreate):

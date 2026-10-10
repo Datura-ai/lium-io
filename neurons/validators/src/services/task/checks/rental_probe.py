@@ -705,9 +705,9 @@ async def _rented_meanwhile(ctx: Context) -> str | None:
 
     "rented": the backend lists a pod on it now, or this validator holds a pending-pod mark for it (a
     renter's create it is running at this moment; the probe's own mark is already cleared when this
-    runs). "given a filler": the backend lists a filler on it now; a filler's create goes through the
-    same create_container and sweeps `pod_<probe>` the same way, and its pending mark is gone by the
-    time this runs.
+    runs). "given a filler": the backend lists a filler on it now; a filler's create sent meanwhile
+    refuses beside `pod_<probe>` (not on its active_container_names) and removes nothing, and its
+    pending mark is gone by the time this runs.
     """
     try:
         rented = await ctx.services.backend.get_all_rented_executors()

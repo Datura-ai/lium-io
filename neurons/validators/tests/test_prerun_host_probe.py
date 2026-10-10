@@ -41,6 +41,7 @@ from core.config import settings
 from payload_models.payloads import WorkloadKind
 from services import nvidia_devices as nd
 from services.docker_service import (
+    DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD,
     DockerService,
     _ENCRYPTED_VOLUME_IMAGE_LABEL,
     VolumeHostProbe,
@@ -1532,8 +1533,9 @@ async def test_a_create_cancelled_at_ssh_connect_never_starts_the_filler_removal
     [
         # nothing to remove: the commands of before, plus the removal's one read-only listing beside the probes
         ("pod_keep", {"active_container_names": ["pod_keep"], "active_volume_names": ["volume_keep"]}, False, [DOCKER_PS_ALL_NAMES_IDS_CMD]),
-        # a filler create keeps protecting its sibling bundle (DAH-2465) and lists nothing at SSH connect
-        ("filler_sibling", {"workload_kind": WorkloadKind.FILLER, "active_container_names": ["filler_sibling"], "active_volume_names": ["volume_sibling"]}, False, []),
+        # a filler create keeps protecting its sibling bundle (DAH-2465) and lists nothing at SSH connect; its
+        # volume sweep lists the filler-labelled volumes, which the probe's listing cannot tell apart
+        ("filler_sibling", {"workload_kind": WorkloadKind.FILLER, "active_container_names": ["filler_sibling"], "active_volume_names": ["volume_sibling"]}, False, [DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD]),
         # a bootstrap restore removes the filler at the cleanup step
         ("filler_x", {"active_volume_names": ["volume_x"]}, True, [_FILLER_X_REMOVAL]),
     ],

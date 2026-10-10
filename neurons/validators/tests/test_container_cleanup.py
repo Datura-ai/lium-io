@@ -174,6 +174,58 @@ async def test_a_docker_rm_error_still_reports_the_container_as_unremovable():
     assert (removed_count, removed_names, unremovable) == (0, [], [name])
 
 
+def _removed_volume_names(rm_calls: list[str]) -> list[str]:
+    return [c.split("docker volume rm ")[1].split()[0] for c in rm_calls if "docker volume rm" in c]
+
+
+@pytest.mark.asyncio
+async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
+    """A filler create sweeps only filler-labelled volumes, so the reaper must take the `volume_<run id>` of a
+    filler it removes, or the preallocated volume holds the disk."""
+    filler = "filler_run-1"
+    customer_pod = "pod_customer"
+    ssh, rm_calls = _make_ssh_mock(containers=[filler, customer_pod], ages_by_name={filler: 30, customer_pod: 30})
+
+    _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, [customer_pod]), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [filler]
+    assert _removed_volume_names(rm_calls) == ["volume_run-1"]
+
+
+@pytest.mark.parametrize(
+    ("stderr", "warned"),
+    [
+        ("Error response from daemon: volume is in use", True),
+        ("", True),
+        ("Error response from daemon: get volume_x: no such volume", False),
+    ],
+    ids=["named_error", "failure_without_output", "volume_already_gone"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_filler_volume_rm_is_logged_unless_the_volume_is_gone(caplog, stderr: str, warned: bool):
+    filler = "filler_run-1"
+    ssh, _ = _make_ssh_mock(containers=[filler], ages_by_name={filler: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker volume rm" in cmd:
+            # a command ending in `|| true` hides the failure from the caller, as the shell would
+            return MagicMock(exit_status=0 if cmd.rstrip().endswith("|| true") else 1, stdout="", stderr=stderr)
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+
+    with caplog.at_level(logging.WARNING, logger="services.container_cleanup"):
+        await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+            ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID
+        )
+
+    logged = any(f"Removed container {filler} but not its volume" in r.getMessage() for r in caplog.records)
+    assert logged is warned
+
+
 async def cleanup_with_hook(ssh, on_before_remove):
     return await ContainerCleanup(stale_threshold_minutes=15).cleanup(
         ssh_client=ssh,
