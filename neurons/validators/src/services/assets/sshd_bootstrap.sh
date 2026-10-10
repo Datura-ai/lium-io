@@ -141,7 +141,7 @@ install_sshd() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y openssh-server
+        apt-get install -y --no-install-recommends openssh-server ncurses-term xauth python3 wget ca-certificates
         return 0
     fi
 
