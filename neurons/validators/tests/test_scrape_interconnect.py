@@ -27,6 +27,7 @@ INTERCONNECT_HELPERS = {
     "TOPO_NVLINK_CELL_PATTERN",
     "NVLINK_ACTIVE_LINK_PATTERN",
     "NVLINK_GPU_HEADER_PATTERN",
+    "ANSI_SGR_PATTERN",
     "parse_topology_matrix",
     "count_active_nvlinks_per_gpu",
     "GpuInterconnectObservation",
@@ -82,6 +83,12 @@ def p2p_table(cells: list[list[str]]) -> str:
         lines.append(f" GPU{i}\t" + "\t".join("X" if i == j else cell for j, cell in enumerate(row)))
     lines += ["", "Legend:", "", "  X    = Self", "  OK   = Status Ok", "  NS   = Not supported"]
     return "\n".join(lines) + "\n"
+
+
+def underlined_header(table: str) -> str:
+    """The table as nvidia-smi prints it into a pipe: the header line wrapped in ANSI underline codes."""
+    header, rest = table.split("\n", 1)
+    return f"\x1b[4m{header}\x1b[0m\n{rest}"
 
 
 def uniform(count: int, cell: str) -> list[list[str]]:
@@ -162,6 +169,32 @@ def test_p2p_table_is_read_by_the_same_parser(scrape: dict[str, Any]) -> None:
     assert len(labels) == 8
     assert rows[0][0] == "X"
     assert rows[0][1] == "NS"
+
+
+def test_topology_matrix_reads_a_header_underlined_with_ansi_codes(scrape: dict[str, Any]) -> None:
+    # Arrange
+    output = underlined_header(topo_table(HGX_H200))
+
+    # Act
+    labels, rows = scrape["parse_topology_matrix"](output)
+
+    # Assert
+    assert labels == [f"GPU{i}" for i in range(8)]
+    assert rows[0][1] == "NV18"
+
+
+def test_hgx_host_with_underlined_headers_is_nvlink_with_p2p(scrape: dict[str, Any]) -> None:
+    # Arrange
+    topo = underlined_header(topo_table(HGX_H200))
+    p2p = underlined_header(p2p_table(uniform(8, "OK")))
+
+    # Act
+    payload = scrape["summarize_gpu_interconnect"](topo, p2p, nvlink_status([18] * 8))
+
+    # Assert
+    assert payload["ic_devices"] == 8
+    assert payload["ic_nvlink"] is True
+    assert payload["ic_p2p"] is True
 
 
 # -- summarize_gpu_interconnect ----------------------------------------------------------------------
@@ -325,6 +358,24 @@ def test_probe_keeps_the_topo_answer_when_only_optional_tables_fail(scrape: dict
     assert observation.payload["ic_nvlink_active_links"] is None
     assert "nvidia-smi topo -p2p r" in observation.scrape_error
     assert "nvidia-smi nvlink -s" in observation.scrape_error
+
+
+def test_probe_reports_a_topo_table_with_no_gpu_rows(scrape: dict[str, Any]) -> None:
+    # Arrange — the command succeeded but nothing in its output reads as a GPU row
+    scrape["run_cmd"] = _stub_run_cmd(
+        {
+            "nvidia-smi topo -m": "GPU0 GPU1\n",
+            "nvidia-smi topo -p2p r": RuntimeError("run_cmd error proc.returncode=2"),
+            "nvidia-smi nvlink -s": nvlink_status([18] * 2),
+        }
+    )
+
+    # Act
+    observation = scrape["get_gpu_interconnect"]()
+
+    # Assert
+    assert observation.payload["ic_devices"] == 0
+    assert "nvidia-smi topo -m: no GPU rows in 'GPU0 GPU1\\n'" in observation.scrape_error
 
 
 # -- the scrape.ok event -----------------------------------------------------------------------------
