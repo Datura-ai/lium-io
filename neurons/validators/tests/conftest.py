@@ -1,4 +1,3 @@
-import logging
 import os
 import sys
 from collections.abc import Callable
@@ -6,12 +5,8 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import SQLModel
-from sqlmodel.ext.asyncio.session import AsyncSession
 
 from constants import TOTAL_BURN_EMISSION
 
@@ -19,8 +14,6 @@ from constants import TOTAL_BURN_EMISSION
 # defaults keep unit tests self-contained without requiring a local validator env.
 os.environ.setdefault("BITTENSOR_WALLET_NAME", "test-wallet")
 os.environ.setdefault("BITTENSOR_WALLET_HOTKEY_NAME", "test-hotkey")
-os.environ.setdefault("SQLALCHEMY_DATABASE_URI", "sqlite:///:memory:")
-os.environ.setdefault("ASYNC_SQLALCHEMY_DATABASE_URI", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!")
 
 # Prevent network calls during module-level SharedConfigClient instantiation.
@@ -118,23 +111,6 @@ def no_kept_upload_probes_carried_between_tests():
             module._kept_upload_probes.clear()
 
 
-@pytest.fixture(scope="session", autouse=True)
-def setup_sql_logging():
-    """Enable SQL query logging for all tests."""
-    # Configure root logging to show INFO level
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
-
-    # Enable SQLAlchemy engine logging - just set level, let basicConfig handle output
-    sql_logger = logging.getLogger('sqlalchemy.engine')
-    sql_logger.setLevel(logging.INFO)
-
-    # Also enable pool logging for connection monitoring
-    pool_logger = logging.getLogger('sqlalchemy.pool')
-    pool_logger.setLevel(logging.DEBUG)
-
-    print("✅ SQL logging enabled for all tests")
-
-
 @pytest.fixture(autouse=True)
 def _no_collateral_rpc():
     """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so.
@@ -212,64 +188,3 @@ def mock_aiohttp_session():
         session.post.return_value.__aenter__.return_value = response
 
         yield session
-
-
-@pytest_asyncio.fixture(scope="session")
-async def test_engine():
-    """Create an async engine for testing with SQLite in-memory database."""
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        echo=True,
-        future=True,
-    )
-
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
-
-    yield engine
-
-    await engine.dispose()
-
-
-@pytest_asyncio.fixture
-async def test_db_session(test_engine):
-    """Create a test database session for each test."""
-    from sqlalchemy.orm import sessionmaker
-
-    async_session_maker = sessionmaker(
-        bind=test_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-
-    async with async_session_maker() as session:
-        yield session
-        await session.rollback()
-
-
-@pytest.fixture
-def mock_async_session_maker(test_db_session):
-    """Mock the global AsyncSessionMaker to use test database."""
-
-    class MockContextManager:
-        def __init__(self, session):
-            self._session = session
-
-        async def __aenter__(self):
-            return self._session
-
-        async def __aexit__(self, exc_type, exc_val, exc_tb):
-            if exc_type:
-                await self._session.rollback()
-
-    with patch("daos.base.AsyncSessionMaker") as mock_maker:
-        mock_maker.return_value = MockContextManager(test_db_session)
-        yield mock_maker
-
-
-@pytest.fixture
-def port_mapping_dao(mock_async_session_maker):
-    """Create PortMappingDao for testing with test database."""
-    from daos.port_mapping_dao import PortMappingDao
-
-    return PortMappingDao()

@@ -178,7 +178,6 @@ Issues and pull requests are welcome. Open an [issue](https://github.com/Datura-
 ```bash
 cd neurons/validators && pdm install && \
 BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
-SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
 ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
 pdm run pytest tests/ --tb=short --strict-markers
 ```
