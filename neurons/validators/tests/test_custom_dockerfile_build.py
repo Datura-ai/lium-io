@@ -2166,3 +2166,35 @@ def test_A16e_str_of_a_failed_request_leaves_out_the_build_tail():
 
     assert "HF_TOKEN=abc" not in str(request)
     assert request.model_dump()["build_log_tail"] == "#3 ARG HF_TOKEN=abc"
+
+
+def test_A16e_a_buildx_stack_trace_does_not_push_the_error_out_of_the_tail():
+    # Arrange: the error line followed by more stack frames than the tail holds
+    frames = [
+        "sync.(*Once).Do",
+        "/usr/local/go/src/sync/once.go:67",
+        "runtime.goexit",
+        "runtime/asm_amd64.s:1700",
+        "711 v0.21.0 /usr/local/lib/docker/cli-plugins/docker-buildx buildx build --progress=plain --pull -t x /build",
+        "github.com/moby/buildkit/client.(*Client).solve.func2",
+        "github.com/moby/buildkit@v0.20.0/client/solve.go:285",
+        "143 /usr/local/bin/dockerd",
+    ]
+    output = "\n".join(
+        [
+            "#5 [2/3] RUN pip install nope",
+            'ERROR: failed to solve: process "/bin/sh -c pip install nope" did not complete',
+        ]
+        + frames * 10
+    )
+
+    # Act
+    from services.docker_service import custom_build_log_tail
+
+    tail = custom_build_log_tail(output)
+
+    # Assert
+    assert tail.splitlines() == [
+        "#5 [2/3] RUN pip install nope",
+        'ERROR: failed to solve: process "/bin/sh -c pip install nope" did not complete',
+    ]

@@ -806,15 +806,36 @@ class CustomBuildOutcome(NamedTuple):
     log_tail: str | None
 
 
+# A Go stack trace buildx prints after its `ERROR: failed to solve: ...` line on some failures: a frame
+# (`sync.(*Once).Do`), its file (`/usr/local/go/src/sync/once.go:67`) and the `<pid> <version> <binary>` header of
+# each goroutine dump. Kept, they push the one line that names the renter's mistake out of the tail.
+_GO_STACK_FRAME_RE = re.compile(r"^[\w.\-/@*()]+:?\d*$")
+_GO_STACK_HEADER_RE = re.compile(r"^\d+ (?:v\S+ )?/\S+")
+
+
+def _is_go_stack_line(line: str) -> bool:
+    text = line.strip()
+    return bool(
+        _GO_STACK_HEADER_RE.match(text)
+        or (
+            "." in text
+            and ("/" in text or "(" in text or text.startswith("runtime."))
+            and _GO_STACK_FRAME_RE.match(text)
+        )
+    )
+
+
 def custom_build_log_tail(output: str | None) -> str | None:
     """The last CUSTOM_BUILD_LOG_TAIL_LINES non-empty lines of a build's output, cut to
     CUSTOM_BUILD_LOG_TAIL_MAX_CHARS from the end (the error is at the bottom). The BUILD_FAILED_RC=
-    marker line is dropped before the cap, so a failed build yields 25 build lines, not 24 and the
-    marker. None when there is nothing."""
+    marker line and buildx's Go stack trace are dropped before the cap, so a failed build yields 25 build lines,
+    not 24 and the marker. None when there is nothing."""
     lines = [
         line.rstrip()
         for line in (output or "").splitlines()
-        if line.strip() and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+        if line.strip()
+        and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+        and not _is_go_stack_line(line)
     ]
     if not lines:
         return None
