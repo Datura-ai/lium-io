@@ -15,7 +15,7 @@ services:
   # host's /etc/docker/daemon.json can keep serving an old `latest`, which left 99 of 493
   # nodes on an old runner (DAH-3419). The tag is the version in ../../watchtower/pyproject.toml.
   watchtower:
-    image: daturaai/lium-watchtower:1.1.1
+    image: daturaai/lium-watchtower:1.2.0
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
