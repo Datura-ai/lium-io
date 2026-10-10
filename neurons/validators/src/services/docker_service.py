@@ -772,6 +772,9 @@ def _exception_texts(exc: Exception) -> list[str]:
 # wrote the Dockerfile, so its build output is theirs to see; the cap keeps the wire message small.
 CUSTOM_BUILD_LOG_TAIL_LINES = 25
 CUSTOM_BUILD_LOG_TAIL_MAX_CHARS = 2000
+# How many non-blank lines the node sends back. More than the renter's tail, because buildx can print a
+# Go stack trace after the ERROR line; custom_build_log_tail drops it before cutting to 25.
+CUSTOM_BUILD_LOG_SHIPPED_LINES = 200
 # The build command's own exit-code marker on stderr (`echo BUILD_FAILED_RC=$rc >&2`): the streamer's
 # failure signal, not a build line, so it never counts toward the renter's tail.
 CUSTOM_BUILD_FAILED_MARKER = "BUILD_FAILED_RC="
@@ -806,15 +809,36 @@ class CustomBuildOutcome(NamedTuple):
     log_tail: str | None
 
 
+# A Go stack trace buildx prints after its `ERROR: failed to solve: ...` line on some failures: a frame
+# (`sync.(*Once).Do`), its file (`/usr/local/go/src/sync/once.go:67`) and the `<pid> <version> <binary>` header of
+# each goroutine dump. Kept, they push the one line that names the renter's mistake out of the tail.
+_GO_STACK_FRAME_RE = re.compile(r"^[\w.\-/@*()]+:?\d*$")
+_GO_STACK_HEADER_RE = re.compile(r"^\d+ (?:v\S+ )?/\S+")
+
+
+def _is_go_stack_line(line: str) -> bool:
+    text = line.strip()
+    return bool(
+        _GO_STACK_HEADER_RE.match(text)
+        or (
+            "." in text
+            and ("/" in text or "(" in text or text.startswith("runtime."))
+            and _GO_STACK_FRAME_RE.match(text)
+        )
+    )
+
+
 def custom_build_log_tail(output: str | None) -> str | None:
     """The last CUSTOM_BUILD_LOG_TAIL_LINES non-empty lines of a build's output, cut to
     CUSTOM_BUILD_LOG_TAIL_MAX_CHARS from the end (the error is at the bottom). The BUILD_FAILED_RC=
-    marker line is dropped before the cap, so a failed build yields 25 build lines, not 24 and the
-    marker. None when there is nothing."""
+    marker line and buildx's Go stack trace are dropped before the cap, so a failed build yields 25 build lines,
+    not 24 and the marker. None when there is nothing."""
     lines = [
         line.rstrip()
         for line in (output or "").splitlines()
-        if line.strip() and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+        if line.strip()
+        and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+        and not _is_go_stack_line(line)
     ]
     if not lines:
         return None
@@ -830,7 +854,7 @@ def stream_timed_out(err: str | None) -> bool:
 def custom_build_inner_command(image_tag: str, ctx: str) -> str:
     """The `sh -c` body that runs `docker build` inside the DinD container. Build output goes to
     stdout (the streamer's success lines) and to CUSTOM_BUILD_LOG_FILE; on a non-zero exit the last
-    CUSTOM_BUILD_LOG_TAIL_LINES non-blank lines of that file go to stderr, then the
+    CUSTOM_BUILD_LOG_SHIPPED_LINES non-blank lines of that file go to stderr, then the
     BUILD_FAILED_RC=<rc> marker; the exit code is the build's (no pipefail needed: it is read
     back from CUSTOM_BUILD_RC_FILE). An rc file that cannot be written or read makes the build a
     failure (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit`
@@ -841,7 +865,7 @@ def custom_build_inner_command(image_tag: str, ctx: str) -> str:
         f"| tee {CUSTOM_BUILD_LOG_FILE}; rc=$(cat {CUSTOM_BUILD_RC_FILE} 2>/dev/null); "
         'if [ -z "$rc" ]; then rc=1; rc_lost=1; fi; '
         f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {CUSTOM_BUILD_LOG_FILE} '
-        f"| tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} >&2; "
+        f"| tail -n {CUSTOM_BUILD_LOG_SHIPPED_LINES} >&2; "
         f'if [ -n "$rc_lost" ]; then echo "{CUSTOM_BUILD_RC_UNREADABLE_REASON}" >&2; fi; '
         f"echo {CUSTOM_BUILD_FAILED_MARKER}$rc >&2; fi; exit $rc"
     )
