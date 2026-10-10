@@ -63,7 +63,6 @@ RENTAL_PRICES_PER_HOUR.update({
     "NVIDIA GeForce RTX 4080 SUPER": 0.17,
     "NVIDIA GeForce RTX 3070": 0.08,
     "NVIDIA Quadro RTX 8000": 0.19,
-    "NVIDIA RTX A4000": 0.09,
     "NVIDIA CMP 170HX": 0.10,
 })
 
