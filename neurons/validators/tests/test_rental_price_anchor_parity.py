@@ -50,7 +50,22 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
     `NVIDIA GB300` is the other: priced at the B300 AC rate for now, its own base model."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
-    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300"}
+    # The GPU types added to the unrented program after the lock's lium-core release carry no upstream row yet.
+    added_types = {
+        "NVIDIA GeForce RTX 5080",
+        "NVIDIA GeForce RTX 5070 Ti",
+        "NVIDIA GeForce RTX 5060 Ti",
+        "NVIDIA GeForce RTX 4060 Ti",
+        "NVIDIA GeForce RTX 4070 SUPER",
+        "NVIDIA GeForce RTX 3080",
+        "NVIDIA GeForce RTX 3060",
+        "NVIDIA GeForce RTX 2080 Ti",
+        "NVIDIA Tesla V100 Tensor Core GPU",
+        "NVIDIA RTX PRO 5000 Blackwell",
+        "NVIDIA RTX PRO 6000D Blackwell Workstation Edition",
+        "NVIDIA RTX 6000D",
+    }
+    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300"} | added_types
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
     assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
     assert RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
