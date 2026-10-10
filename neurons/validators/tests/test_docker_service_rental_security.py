@@ -15,6 +15,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    ContainerWarningCode,
     CustomOptions,
     ExternalVolumeInfo,
     PayloadPortMapping,
@@ -496,7 +497,7 @@ async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
         ),
     )
 
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=keypair,
@@ -505,6 +506,8 @@ async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
 
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
     assert run_spec.runtime is None
+    # the backend reads this to refuse a rental that asked for nested Docker
+    assert ContainerWarningCode.DockerInDockerDisabled in result.warnings
     streamed_messages = [
         call.args[0] for call in docker_service.stream_log.await_args_list
     ]
