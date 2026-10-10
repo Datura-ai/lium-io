@@ -1,3 +1,4 @@
+from uuid import uuid4
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -602,3 +603,66 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
     assert container_id == "cid"
     assert events == ["run", "rm pod_test", "run"]
 
+
+_SIZING_GB = 1024 ** 3
+
+
+def _make_sizing_payload(**overrides) -> ContainerCreateRequest:
+    defaults = dict(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+    )
+    defaults.update(overrides)
+    return ContainerCreateRequest(**defaults)
+
+
+def _make_sizing_ssh_client(
+    df_avail_bytes: int,
+    volume_ls_stdout: str = "",
+    volume_inspect_stdout: str = "",
+    df_error: bool = False,
+) -> Mock:
+    def run(command, **kwargs):
+        if "docker info" in command:
+            return Mock(stdout="/var/lib/docker\n", exit_status=0)
+        if "df -P -B1 /hostfs" in command:
+            if df_error:
+                raise Exception("df boom")
+            return Mock(
+                stdout=(
+                    "Filesystem           1-blocks       Used Available Capacity Mounted on\n"
+                    f"/dev/vda1            1000 500 {df_avail_bytes}  80% /hostfs\n"
+                ),
+                exit_status=0,
+            )
+        if "volume ls" in command:
+            return Mock(stdout=volume_ls_stdout, exit_status=0)
+        if "volume inspect" in command:
+            return Mock(stdout=volume_inspect_stdout, exit_status=0)
+        raise AssertionError(f"unexpected ssh command: {command}")
+
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    return ssh_client
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_fresh_caps_volume_at_ext4_file_limit(docker_service):
+    # Arrange: ~28 TiB free, whole node -> 2/3 slice is ~18 TiB, above the 16 TiB ext4 file cap.
+    payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=28 * 1024 * _SIZING_GB,
+        volume_ls_stdout="other_volume local\n",
+    )
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.capped_by == "max_file_size"
+    assert result.volume_limit_gb == 16 * 1024 - 1

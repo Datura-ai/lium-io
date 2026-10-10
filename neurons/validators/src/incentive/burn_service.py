@@ -42,7 +42,7 @@ def _burner_coldkey_matches(miner: bittensor.NeuronInfo) -> bool:
 def verified_burner_hotkey(miners: list[bittensor.NeuronInfo]) -> str | None:
     """The first burner slot's hotkey, only while its coldkey is the configured one (DAH-4001).
 
-    Withheld idle shares and the fallback vector's idle go to it, so it passes the same check as the burn share.
+    Withheld idle shares go to it, so it passes the same check as the burn share.
     None when the uid is not in `miners` or another coldkey holds it: the caller must not pick a substitute.
     """
     burner_uid = (settings.NEW_BURNERS if settings.ENABLE_NEW_BURN_LOGIC else settings.BURNERS)[0]
