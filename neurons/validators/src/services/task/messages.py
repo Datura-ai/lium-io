@@ -971,6 +971,17 @@ class TenantEnforcementMessages:
         impact="Score set to 0; verification cleared",
         remediation="Start container and ensure it stays healthy.",
     )
+    REBOOT_FAILED_HOST_FAULT = MessageTemplate(
+        event="Host cannot start a GPU container after a failed pod reboot",
+        reason="REBOOT_FAILED_HOST_FAULT",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0; verification cleared; executor inactive until the host passes again",
+        remediation=(
+            "Run `docker run --rm --gpus all <image> nvidia-smi -L` on the host and fix the Docker daemon or"
+            " the NVIDIA container runtime; check `dmesg` for Xid errors and reboot if a GPU is lost."
+        ),
+    )
     POD_RESTARTING = MessageTemplate(
         event="Pod restarting under its own restart policy",
         reason="POD_RESTARTING",
