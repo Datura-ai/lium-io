@@ -30,7 +30,7 @@ class _SlowFakeRedis:
         await asyncio.sleep(COMMAND_SECONDS)
         return True
 
-    sismember = sadd = hset = hget = _cmd
+    sismember = sadd = hset = hget = hdel = _cmd
 
 
 def _service(monkeypatch, *, lock_enabled: bool) -> RedisService:
@@ -81,7 +81,8 @@ async def test_flag_off_writes_still_reach_the_client(monkeypatch):
     await service.set_verified_job_info("miner", "executor", prev_info={}, success=True)
 
     commands = [call[0] for call in service.redis.calls]
-    assert commands == ["set", "hash", redis_service_module.VERIFIED_JOB_COUNT_KEY]
+    key = redis_service_module.VERIFIED_JOB_COUNT_KEY
+    assert commands == ["set", "hash", key, key]
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,10 @@ GPU_ANCHOR_KEY = "uuids"
 # DAH-3457: field of a verified-job record, set once by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED and kept by
 # every later write; read back by the same check, which then fails the node without comparing the sets.
 GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
+# Set only on the in-memory dict get_verified_job_info returns for the uuid-only fallback; never stored. The record is
+# another hotkey's until a cycle under this hotkey succeeds, so no failure path may copy it into this hotkey's record.
+LEGACY_FALLBACK_KEY = "legacy_fallback"
+FOREIGN_FALLBACK_KEY = "foreign_fallback"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
@@ -155,6 +159,11 @@ class RedisWrites:
 
     def __len__(self) -> int:
         return len(self.ops)
+
+
+def verified_job_field(miner_hotkey: str, executor_id: str) -> str:
+    """Field of an executor's verified-job record in VERIFIED_JOB_COUNT_KEY."""
+    return f"{miner_hotkey}:{executor_id}"
 
 
 class RedisService:
@@ -573,6 +582,8 @@ class RedisService:
         if (success):
             count += 1
         else:
+            if prev_info.get(LEGACY_FALLBACK_KEY):
+                return
             failed += 1
 
         # if failed * 20 >= count:
@@ -592,7 +603,10 @@ class RedisService:
         if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
             data[GPU_ANCHOR_BROKEN_KEY] = True
 
-        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
+        if success and ":" not in executor_id:
+            # an id with ":" is never a uuid-only field; it could name another hotkey's record
+            await self.hdel(VERIFIED_JOB_COUNT_KEY, executor_id)
 
     async def clear_verified_job_info(
         self,
@@ -606,15 +620,22 @@ class RedisService:
         spec = prev_info.get('spec', '')
         uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
-        data = {
-            "count": 0,
-            "failed": 0,
-            "spec": spec,
-            GPU_ANCHOR_KEY: uuids,
-        }
-        if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
-            data[GPU_ANCHOR_BROKEN_KEY] = True
-        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        if prev_info.get(LEGACY_FALLBACK_KEY):
+            if anchor_broken and not prev_info.get(GPU_ANCHOR_BROKEN_KEY) and not prev_info.get(FOREIGN_FALLBACK_KEY):
+                # keep main's stickiness: mark the uuid-only record itself, import nothing into this hotkey's record
+                legacy = {k: v for k, v in prev_info.items() if k != LEGACY_FALLBACK_KEY}
+                legacy[GPU_ANCHOR_BROKEN_KEY] = True
+                await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(legacy))
+        else:
+            data = {
+                "count": 0,
+                "failed": 0,
+                "spec": spec,
+                GPU_ANCHOR_KEY: uuids,
+            }
+            if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+                data[GPU_ANCHOR_BROKEN_KEY] = True
+            await self.hset(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
         # penalty row (lium-platform DAH-3385). Optional on the wire: an older backend ignores the keys.
@@ -633,12 +654,37 @@ class RedisService:
             },
         )
 
-    async def get_verified_job_info(self, executor_id: str):
+    async def get_verified_job_info(self, executor_id: str, miner_hotkey: str):
+        """The record under (miner_hotkey, executor_id), else the uuid-only record written before the key
+        carried the hotkey. The uuid-only record is never written again; it is removed by the first
+        successful write for the executor, so it moves to the hotkey whose GPU UUIDs match its anchor.
+        A uuid-only record without an anchor is not carried: that executor starts a fresh count."""
+        data = await self.hget(VERIFIED_JOB_COUNT_KEY, verified_job_field(miner_hotkey, executor_id))
+        if data:
+            return json.loads(data)
+
+        if ":" in executor_id:
+            return {}  # uuid-only fields never contain ":"; such an id would read another hotkey's record
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
         if not data:
+            return await self._foreign_anchor(executor_id, verified_job_field(miner_hotkey, executor_id))
+        legacy = json.loads(data)
+        if not legacy.get(GPU_ANCHOR_KEY):
             return {}
+        return {**legacy, LEGACY_FALLBACK_KEY: True}
 
-        return json.loads(data)
+    async def _foreign_anchor(self, executor_id: str, own_field: str):
+        """Another hotkey already holds a record for this executor id: carry only its anchor, so the fingerprint
+        check fails a host whose GPUs differ. Nothing else is imported and no failure is written for it."""
+        async with self.lock:
+            async for field, value in self.redis.hscan_iter(VERIFIED_JOB_COUNT_KEY, match=f"*:{executor_id}"):
+                field = field.decode() if isinstance(field, bytes) else field
+                if field == own_field or field.partition(":")[2] != executor_id:
+                    continue
+                anchor = json.loads(value).get(GPU_ANCHOR_KEY)
+                if anchor:
+                    return {GPU_ANCHOR_KEY: anchor, LEGACY_FALLBACK_KEY: True, FOREIGN_FALLBACK_KEY: True}
+        return {}
 
     async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))

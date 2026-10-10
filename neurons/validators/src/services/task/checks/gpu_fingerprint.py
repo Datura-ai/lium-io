@@ -31,7 +31,7 @@ class GpuFingerprintCheck:
 
     The anchor is the `uuids` value of the executor's verified-job record: written on the first successful
     verification and kept by every later write, including the reset (`clear_verified_job_info` copies it),
-    so a node is never re-anchored under the same executor id.
+    so a node is never re-anchored under the same (hotkey, executor id).
 
     Legacy (GPU_ANCHOR_HARD_ENABLED off): any difference is GPU_UUID_CHANGED, fatal, verification reset.
     The event's what_we_saw also carries the hard rule's decision so it can be read from the stored rows.
@@ -44,7 +44,7 @@ class GpuFingerprintCheck:
       first cycle that shows the full set;
     - any UUID outside the anchor  -> GPU_UUID_CHANGED with `anchor_broken`, fatal, verification reset, and
       the record is marked broken: every later cycle fails the same way until the provider re-registers
-      the node (a new executor id gets a new anchor).
+      the node (a new (hotkey, executor id) gets a new anchor).
     A node whose record is already marked broken fails before the sets are compared. With the flag off again
     the mark is kept in the record but ignored; it applies again on the next flip on.
 

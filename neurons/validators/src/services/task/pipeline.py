@@ -231,7 +231,7 @@ class Context(BaseModel):
     clear_verified_job_evidence: dict[str, Any] | None = None
     # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
     # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
-    # node scores 0 on every later cycle under this executor id and is never re-anchored.
+    # node scores 0 on every later cycle under this (hotkey, executor id) and is never re-anchored.
     gpu_anchor_broken: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
