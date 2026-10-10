@@ -297,6 +297,12 @@ class Settings(BaseSettings):
     # what the lost first attempt made. Off: the call fails the rent as before. Either way the
     # failure event carries `error_class: transport`.
     DOCKER_TRANSPORT_RETRY_ENABLED: bool = Field(env="DOCKER_TRANSPORT_RETRY_ENABLED", default=False)
+    # A rental container runs with swap off (--memory-swap = --memory) and
+    # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
+    # memory limit stays the backend's memory_gb. Off (the default until the validator owner turns it on):
+    # the container gets the flags it got before.
+    RENTAL_SWAP_OFF_ENABLED: bool = Field(env="RENTAL_SWAP_OFF_ENABLED", default=False)
+    RENTAL_CONTAINER_OOM_SCORE_ADJ: int = Field(env="RENTAL_CONTAINER_OOM_SCORE_ADJ", default=500)
     # On a rent, when dockerd refuses to bind a host port the backend handed the pod (a stale
     # container or a provider process holds it), the pod moves to the next free pair of the
     # executor's advertised range (≤ 3 candidates, the host's listening sockets read once over the
