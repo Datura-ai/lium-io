@@ -1210,11 +1210,12 @@ async def test_A17_build_command_puts_the_output_tail_on_stderr(svc, monkeypatch
 
     build_cmd = next(c for c in esl.seen if "docker build" in c)
     assert "tee /tmp/lium-build.log" in build_cmd
-    # blank lines are dropped before the cap, so all 25 slots carry build output
-    assert 'grep -v "^[[:space:]]*$" /tmp/lium-build.log | tail -n 25 >&2' in build_cmd
+    # blank lines are dropped before the cap; the node sends more than the renter's 25 so a stack trace
+    # after the ERROR line cannot push it out
+    assert 'grep -v "^[[:space:]]*$" /tmp/lium-build.log | tail -n 200 >&2' in build_cmd
     assert "echo BUILD_FAILED_RC=$rc >&2" in build_cmd
     # the tail goes out before the marker, and the exit code is preserved
-    assert build_cmd.index("tail -n 25") < build_cmd.index("BUILD_FAILED_RC")
+    assert build_cmd.index("tail -n 200") < build_cmd.index("BUILD_FAILED_RC")
     assert build_cmd.rstrip("'").endswith("exit $rc")
     # the log never lands inside the build context (a `COPY .` must not pick it up)
     assert "/build/" not in build_cmd.split("| tee", 1)[1]
@@ -1222,8 +1223,8 @@ async def test_A17_build_command_puts_the_output_tail_on_stderr(svc, monkeypatch
 
 def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
     """The inner command really does what A17 asserts by substring: run it under `sh` with a
-    `docker` stub that prints 30 lines (3 of them blank) and exits 7 — stderr is the last 25
-    NON-blank lines then `BUILD_FAILED_RC=7`, the exit code is 7 without pipefail."""
+    `docker` stub that prints 30 lines (3 of them blank) and exits 7 — with the shipped cap at 25,
+    stderr is the last 25 NON-blank lines then `BUILD_FAILED_RC=7`, the exit code is 7 without pipefail."""
     import subprocess
 
     from services import docker_service
@@ -1241,6 +1242,7 @@ def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
     stub.chmod(0o755)
     monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
     monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "lium-build.rc"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_SHIPPED_LINES", 25)
     inner = custom_build_inner_command("lium-custom-test:latest", "/build")
     run = subprocess.run(
         ["sh", "-c", inner],
@@ -2197,4 +2199,41 @@ def test_A16e_a_buildx_stack_trace_does_not_push_the_error_out_of_the_tail():
     assert tail.splitlines() == [
         "#5 [2/3] RUN pip install nope",
         'ERROR: failed to solve: process "/bin/sh -c pip install nope" did not complete',
+    ]
+
+
+def test_A17e_a_stack_trace_longer_than_the_tail_still_reaches_the_renter_with_its_error(tmp_path, monkeypatch):
+    # Arrange: buildx prints the ERROR line, then 40 Go stack lines, and fails
+    import subprocess
+
+    from services import docker_service
+    from services.docker_service import custom_build_inner_command, custom_build_log_tail
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'echo "#5 [2/3] RUN pip install nope"\n'
+        'echo "ERROR: failed to solve: pip install nope did not complete"\n'
+        'i=1; while [ $i -le 20 ]; do echo "runtime.goexit"; echo "runtime/asm_amd64.s:1700"; i=$((i + 1)); done\n'
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "lium-build.rc"))
+
+    # Act
+    run = subprocess.run(
+        ["sh", "-c", custom_build_inner_command("lium-custom-test:latest", "/build")],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+    )
+    tail = custom_build_log_tail(run.stderr)
+
+    # Assert
+    assert tail.splitlines() == [
+        "#5 [2/3] RUN pip install nope",
+        "ERROR: failed to solve: pip install nope did not complete",
     ]
