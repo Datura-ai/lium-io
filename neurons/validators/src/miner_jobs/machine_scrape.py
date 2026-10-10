@@ -778,7 +778,7 @@ def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float
     # two-sample delta, one call for all containers. Keyed by the 12-char id stats prints.
     # The host CPU is sampled over the SAME window (reset counter -> stats -> read), because the
     # host-minus-containers attribution is only valid when both sides cover the same seconds —
-    # data_cpu's own sample runs ~10s later, after two `docker run` capability tests.
+    # data_cpu's own sample runs seconds later, after the two `docker run` capability tests.
     # `timeout 30` bounds a wedged docker daemon: the signal degrades instead of hanging the
     # whole (fatal) machine scrape.
     psutil.cpu_percent(interval=None)
@@ -1025,6 +1025,25 @@ def check_storage_limit_ability() -> tuple[bool, str]:
 
     except Exception as e:
         return False, f"An unexpected error occurred: {e}"
+
+
+def run_checks_concurrently(checks):
+    # Each capability test is a `docker run --gpus all` that takes seconds and shares nothing with
+    # the other, so they run side by side instead of one after the other; each keeps its own timeout.
+    results = [None] * len(checks)
+    threads = [
+        threading.Thread(target=store_check_result, args=(check, results, index))
+        for index, check in enumerate(checks)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def store_check_result(check, results, index):
+    results[index] = check()
 
 
 NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
@@ -1894,13 +1913,16 @@ def get_machine_specs():
 
     data["data_cpu"] = {"cpu_count": 0, "cpu_model": "", "cpu_clocks": []}
     
-    is_supported, log_text = check_sysbox_gpu_compatibility()
+    sysbox_check, storage_limit_check = run_checks_concurrently(
+        [check_sysbox_gpu_compatibility, check_storage_limit_ability]
+    )
+    is_supported, log_text = sysbox_check
     data["data_sysbox_runtime"] = is_supported
     if not is_supported:
         data["data_sysbox_runtime_scrape_error"] = log_text
     data["data_sysbox_version"] = get_sysbox_version()
         
-    is_supported, log_text = check_storage_limit_ability()
+    is_supported, log_text = storage_limit_check
     data["data_storage_limit_supported"] = is_supported
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
