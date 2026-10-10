@@ -4,10 +4,12 @@ from dataclasses import replace
 
 from core.config import settings
 from services.executor_connectivity.models import PortVerificationResult, SecondPass
+from services.port_utils import get_all_ports
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
 
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
@@ -79,6 +81,17 @@ class PortConnectivityCheck:
                 "second port pass skipped: the first pass's batch container didn't complete "
                 "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
             )
+        # DAH-2647: no_ports carries two different facts. When the executor declares ports and
+        # a rental or filler holds all of them, the selector had nothing LEFT to offer — no
+        # verdict, and during a teardown that snapshot is a moment stale. When the executor
+        # declares none at all, that IS a verdict about the executor and must keep scoring 0.
+        # A malformed port_mappings makes the selector raise, which the service reports as
+        # "error" — so "no declared ports" is a verdict on either status, and only a probe
+        # that died on an executor with a readable declaration is genuinely unmeasured.
+        probe_reached_a_verdict = result.status in ("ok", "no_working_ports") or (
+            result.status in ("no_ports", "error") and self._declares_no_ports(ctx)
+        )
+        verified_port_count_or_none = verified_port_count if probe_reached_a_verdict else None
         updated_state = replace(
             ctx.state,
             specs={
@@ -87,7 +100,7 @@ class PortConnectivityCheck:
                 "verified_ports": [p.external for p in result.successful_ports],
             },
             sysbox_runtime=result.sysbox_runtime,
-            verified_port_count=verified_port_count,
+            verified_port_count=verified_port_count_or_none,
             probed_port_count=probed_port_count,
             declared_port_count=declared_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
@@ -196,6 +209,21 @@ class PortConnectivityCheck:
                 "state": updated_state,
             },
         )
+
+    @staticmethod
+    def _declares_no_ports(ctx: Context) -> bool:
+        """Whether the executor advertises no usable port at all, malformed declaration included.
+
+        get_all_ports parses miner-supplied JSON, so it raises on a malformed port_mappings.
+        Inside verification that raise is caught and surfaces as status="error"; here it would
+        escape the pipeline, so a declaration we cannot read counts as declaring nothing.
+        """
+        try:
+            return not get_all_ports(
+                ctx.executor.port_range, ctx.executor.port_mappings, ctx.executor.ssh_port
+            )
+        except Exception:
+            return True
 
     @staticmethod
     async def _should_keep_last_known_sysbox(

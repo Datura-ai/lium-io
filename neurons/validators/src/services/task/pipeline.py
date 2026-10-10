@@ -142,7 +142,10 @@ class ContextState:
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
     # non-empty = the kernel list above was withheld because it was read through them
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
-    verified_port_count: int = 0
+    # DAH-2647: None = PortConnectivityCheck reached no verdict this cycle — no port could
+    # be selected, or the SSH session died mid-check. Only that check sets None; a zero
+    # would read as "this executor has no working ports" and PortCountCheck scores it 0.
+    verified_port_count: int | None = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,
     # probed - verified were probed and did not answer. None until PortConnectivityCheck runs;
