@@ -1268,6 +1268,9 @@ TOPO_GPU_LABEL_PATTERN = r"^GPU\d+$"
 TOPO_NVLINK_CELL_PATTERN = r"^NV(\d+)$"
 NVLINK_ACTIVE_LINK_PATTERN = r"Link \d+: [\d.]+ GB/s"
 NVLINK_GPU_HEADER_PATTERN = r"^GPU \d+:"
+# nvidia-smi underlines the topo table header with ANSI SGR codes even when stdout is a pipe; left in,
+# the header's first cell is the escape code instead of "" and no GPU row is ever read.
+ANSI_SGR_PATTERN = r"\x1b\[[0-9;]*m"
 
 
 def parse_topology_matrix(output):
@@ -1282,6 +1285,7 @@ def parse_topology_matrix(output):
     labels = []
     rows = []
     for line in output.splitlines():
+        line = re.sub(ANSI_SGR_PATTERN, "", line)
         cells = [cell.strip() for cell in re.split(r"\t+|\s{2,}", line.rstrip())]
         if header is None:
             if len(cells) > 1 and cells[0] == "" and re.match(TOPO_GPU_LABEL_PATTERN, cells[1]):
@@ -1410,6 +1414,9 @@ def get_gpu_interconnect():
         payload = summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output)
     except Exception as exc:
         return GpuInterconnectObservation(None, f"parse: {exc!r}"[:400])
+    if payload["ic_devices"] == 0:
+        # an unreadable table must say so, not pass for a host with no GPU pairs
+        errors.append(f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: no GPU rows in {topo_output[:120]!r}")
     return GpuInterconnectObservation(payload, "; ".join(errors))
 
 
