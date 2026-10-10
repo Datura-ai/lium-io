@@ -74,6 +74,7 @@ from services.executor_image_policy import outdated_image_remediation
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
+        FillerContainerEntry,
         InsufficientDisk,
         MissingFlagshipCapability,
         PortLimitedRemainder,
@@ -104,6 +105,7 @@ class ZeroIncentiveReason(StrEnum):
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
+    FILLER_CONTAINER_ENTERED = "filler_container_entered"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
     # Spot-node pay (ENABLE_SPOT_NODE_PAY): an idle spot node that is not paid
@@ -442,6 +444,29 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_filler_container_entered(
+        result: JobResult, entry: FillerContainerEntry
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.FILLER_CONTAINER_ENTERED,
+            message=(
+                f"No unrented incentive: somebody entered Lium's own job container "
+                f"{entry.container_name} from the host, {int(entry.seconds_after_start / 60)} "
+                f"minutes after the job started (command: {entry.command!r}). An idle executor "
+                "is paid to run Lium's job untouched, so nobody may enter that container - "
+                "`docker exec` and `nsenter` both count, and a script that does it for you "
+                "counts too. Stop entering the container, or rent this executor out to earn."
+            ),
+            extra_fields={
+                "filler_container": entry.container_name,
+                "entry_kind": entry.kind,
+                "entry_seconds_after_start": entry.seconds_after_start,
+                "entry_command": entry.command,
             },
         )
 

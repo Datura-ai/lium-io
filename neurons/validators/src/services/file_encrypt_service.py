@@ -152,6 +152,13 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
+    'data_filler_entries': "filler_entries",
+    'data_filler_entry_scrape_error': "filler_entry_scrape_error",
+    'entry_container': "container",
+    'entry_kind': "kind",
+    'entry_pid': "pid",
+    'entry_seconds_after_start': "seconds_after_start",
+    'entry_command': "command",
     # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
     # keys are prefixed so no existing key is a substring of them (ecrypt_miner_job_files renames by
     # sequential str.replace); the backend names are what MachineSpecs declares.
@@ -353,6 +360,13 @@ class FileEncryptService:
             'data_container_cap_eff': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
+            'data_filler_entries': "",
+            'data_filler_entry_scrape_error': "",
+            'entry_container': "",
+            'entry_kind': "",
+            'entry_pid': "",
+            'entry_seconds_after_start': "",
+            'entry_command': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)
             'data_interconnect_scrape_error': "",
             'data_interconnect': "",

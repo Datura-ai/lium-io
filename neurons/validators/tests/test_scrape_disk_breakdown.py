@@ -28,6 +28,7 @@ DISK_HELPERS = {
     "DOCKER_API_TIMEOUT_SECONDS",
     "VLOOPBACK_DRIVER_PREFIX",
     "UnixSocketHTTPConnection",
+    "docker_api_read",
     "docker_api_get",
     "get_vloopback_volume_bytes",
     "get_container_log_bytes",
