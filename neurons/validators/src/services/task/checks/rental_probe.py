@@ -198,6 +198,10 @@ class RentalProbeCheck:
     marks under the lock, not from the cycle-start snapshot; the lock is released as soon as the
     create returns. Anything the probe cannot read (backend, Redis) makes it skip or reach no verdict;
     it never penalises on missing data alone. RENTAL_PROBE_ENABLED is off by default.
+
+    With RENTAL_PROBE_ENFORCEMENT_ENABLED off (shadow) the probe runs the same way, but a failed step is
+    logged as RENTAL_PROBE_FAILED_OBSERVED and the check passes: no score, job score or verified-job
+    change, no standing failure, and the node is probed again after the interval like a passed one.
     """
 
     check_id = "executor.validate.rental_probe"
@@ -259,14 +263,19 @@ class RentalProbeCheck:
                 standing=standing if rented_meanwhile == "given a filler" else None,
             )
 
-        # a pass stamped earlier in the interval must not shield this failure, and the failure stands
-        # until a probe passes (see _standing_failure)
-        await _clear_last_ok(ctx)
         failure = _Failure(outcome.failed_step, outcome.create_step)
-        await _stamp_failure(ctx, failure)
         what["failed_step"] = outcome.failed_step
         if outcome.create_step:
             what["create_step"] = outcome.create_step
+        if not settings.RENTAL_PROBE_ENFORCEMENT_ENABLED:
+            # shadow: the interval stamp is written on a failure too, so a failing node is probed once per
+            # interval rather than every cycle, and no failure is kept to apply later
+            await _stamp_last_ok(ctx)
+            return self._observed(ctx, failure, what=what, ssh_port=outcome.ssh_port)
+        # a pass stamped earlier in the interval must not shield this failure, and the failure stands
+        # until a probe passes (see _standing_failure)
+        await _clear_last_ok(ctx)
+        await _stamp_failure(ctx, failure)
         return self._failed(ctx, failure, what=what, ssh_port=outcome.ssh_port)
 
     async def _may_probe(self, ctx: Context) -> _ProbeGate | CheckResult:
@@ -400,6 +409,22 @@ class RentalProbeCheck:
                 },
             },
         )
+
+    def _observed(
+        self, ctx: Context, failure: _Failure, *, what: dict[str, Any], ssh_port: int | None
+    ) -> CheckResult:
+        """The failed verdict under RENTAL_PROBE_ENFORCEMENT_ENABLED off: logged with its own reason code,
+        which is never the cycle's failure reason, and no update to the score or the verified job."""
+        event = render_message(
+            Msg.PROBE_FAILED_OBSERVED,
+            ctx=ctx,
+            check_id=self.check_id,
+            what=what,
+            remediation=_remediation(
+                failure, ssh_port=ssh_port, expected_gpus=_expected_gpu_count(ctx)
+            ),
+        )
+        return CheckResult(passed=True, event=event)
 
     def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
@@ -590,7 +615,7 @@ async def _stamp_last_ok(ctx: Context) -> None:
     except Exception:
         logger.warning(
             _m(
-                "Rental probe passed but its interval stamp could not be written",
+                "Rental probe's interval stamp could not be written",
                 extra=get_extra_info(ctx.default_extra),
             ),
             exc_info=True,
@@ -619,6 +644,9 @@ class _Failure:
 async def _standing_failure(ctx: Context) -> _Failure | None:
     """The last probe's failed step, kept until a probe passes; None when there is none or Redis could
     not be read (logged; this cycle then decides as if none stood, which is what today's code does)."""
+    if not settings.RENTAL_PROBE_ENFORCEMENT_ENABLED:
+        # shadow: a failure stamped while enforcement was on fails nothing any more
+        return None
     try:
         raw = await ctx.services.redis.get(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
     except Exception:
