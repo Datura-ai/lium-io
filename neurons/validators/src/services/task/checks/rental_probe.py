@@ -21,6 +21,7 @@ from payload_models.payloads import (
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.redis_service import RENTAL_PROBE_FAILED_PREFIX, RENTAL_PROBE_OK_PREFIX
 
 from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
@@ -115,13 +116,13 @@ _TEARDOWN_DEADLINE_SECONDS = 300
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 # every string copied out of the host into the event is bounded (PR_PROCESS §5)
 _TAIL_CHARS = 600
-_REDIS_LAST_OK_PREFIX = "rental_probe_ok"
+_REDIS_LAST_OK_PREFIX = RENTAL_PROBE_OK_PREFIX
 # the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
 # next cycle must not relist the node without a clean probe). The key has NO lifetime: only a passed
 # probe deletes it (review: with a lifetime, a node skipped or inconclusive for longer than it was
 # relisted without a clean probe). The key is one short string per executor that failed and never
 # passed again, deregistered ones included.
-_REDIS_FAILED_PREFIX = "rental_probe_failed"
+_REDIS_FAILED_PREFIX = RENTAL_PROBE_FAILED_PREFIX
 # the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
 # probe run again on the next idle cycle
 _REDIS_STAMP_TTL_SECONDS = 30 * 24 * 3600

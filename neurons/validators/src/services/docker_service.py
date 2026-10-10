@@ -105,6 +105,8 @@ from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
+    RENTAL_PROBE_FAILED_PREFIX,
+    RENTAL_PROBE_OK_PREFIX,
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
@@ -883,6 +885,19 @@ def volume_step_detail(exc: BaseException) -> str | None:
     if _is_dead_docker_ssh_session(exc):
         text = f"{DEAD_DOCKER_SSH_SESSION_HINT}: {text}"
     return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
+
+
+# A create that fails here failed on the node itself: its storage refused the volume, or a GPU it
+# advertises is gone. Such a failure stands like a failed rental probe, so the node scores 0 until a
+# probe on it passes instead of going to the next renter. docker_run is left out: runc echoes the
+# renter's command in its start error, so no text there is the node's alone.
+_HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags"})
+# rental_probe.STEP_CONTAINER_START: the stamp reads as that probe step failing at the create step
+_RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
+
+
+def is_host_fault_create_failure(current_step: str | None) -> bool:
+    return current_step in _HOST_FAULT_CREATE_STEPS
 
 
 def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
@@ -8584,6 +8599,7 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra)
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -8631,6 +8647,30 @@ class DockerService:
                 # The Docker daemon's reason for a volume failure; the dead-transport hint alone for
                 # any other step it surfaces at (docker_run on a template switch); else None.
                 step_detail=failure_step_detail(e, current_step),
+            )
+
+    async def hold_node_until_probe_passes(
+        self, executor_uuid: str, current_step: str | None, log_extra: dict
+    ) -> None:
+        """Stamp a host-fault create failure as the node's standing rental probe failure.
+
+        The node then scores 0 every cycle until a rental probe passes on it; the probe's interval stamp
+        is dropped so that probe runs on the next idle cycle. Without the probe there is nothing to
+        clear the stamp, so nothing is stamped while RENTAL_PROBE_ENABLED is off.
+        """
+        if not settings.RENTAL_PROBE_ENABLED or not is_host_fault_create_failure(current_step):
+            return
+        try:
+            await self.redis_service.set(
+                f"{RENTAL_PROBE_FAILED_PREFIX}:{executor_uuid}",
+                f"{_RENTAL_PROBE_CONTAINER_START_STEP}:{current_step}",
+            )
+            await self.redis_service.delete(f"{RENTAL_PROBE_OK_PREFIX}:{executor_uuid}")
+        except Exception:  # noqa: BLE001 — the create's own failure reply still goes out
+            logger.warning(
+                _m("Host-fault create failure could not be stamped; the next validation may relist the node",
+                   extra=get_extra_info({**log_extra, "failure_step": current_step})),
+                exc_info=True,
             )
 
     async def _run_bootstrap_restore(
