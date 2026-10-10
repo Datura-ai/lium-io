@@ -538,6 +538,8 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
 _FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
 _FRESH_SIZING_HEADROOM_GB = 10   # min free space left on the fs after volume allocation
 _FRESH_SIZING_GB_BYTES = 1024 ** 3
+# The loopback plugin backs a volume with one sparse file and ext4 caps a file at 16 TiB.
+_FRESH_SIZING_MAX_VOLUME_GB = 16 * 1024 - 1
 _VOLUME_SIZE_OPTION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", re.IGNORECASE)
 _VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
     "": 1,
@@ -5787,6 +5789,9 @@ class DockerService:
         # the min-size check so the check runs against the final value.
         volume_limit_gb = max(math.floor(slice_bytes * 2 / 3 / _FRESH_SIZING_GB_BYTES), 1)
         storage_limit_gb = max(math.floor(slice_bytes / 3 / _FRESH_SIZING_GB_BYTES), 1)
+        if volume_limit_gb > _FRESH_SIZING_MAX_VOLUME_GB:
+            volume_limit_gb = _FRESH_SIZING_MAX_VOLUME_GB
+            capped_by = "max_file_size"
 
         if payload.min_volume_gb is not None and volume_limit_gb < payload.min_volume_gb:
             logger.error(
