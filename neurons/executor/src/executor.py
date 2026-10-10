@@ -13,6 +13,7 @@ from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
 from services.ssh_service import run_uploaded_key_purge
+from vast_api.wiring import attach_vast_api
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -41,10 +42,17 @@ async def lifespan(app: FastAPI):
     prefetch_task = asyncio.create_task(run_cache_template_prefetch())
     # DAH-3394: ssh keys the validator uploaded and never removed expire (EXECUTOR_UPLOADED_KEY_TTL_S)
     key_purge_task = asyncio.create_task(run_uploaded_key_purge())
+    # Watch the nested dockerd for Vast contract start/end edges and report
+    # them to the backend (no-op until the machine is enrolled and configured).
+    events_task = asyncio.create_task(app.state.vast_events_poller.run_forever())
     try:
         yield
     finally:
-        for name, task in (("cache template pre-pull", prefetch_task), ("uploaded ssh key purge", key_purge_task)):
+        for name, task in (
+            ("cache template pre-pull", prefetch_task),
+            ("uploaded ssh key purge", key_purge_task),
+            ("vast contract events", events_task),
+        ):
             task.cancel()
             try:
                 await task
@@ -65,6 +73,7 @@ app = FastAPI(
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_middleware(MinerMiddleware)
 app.include_router(apis_router)
+attach_vast_api(app)
 
 reload = True if settings.ENV == "dev" else False
 
