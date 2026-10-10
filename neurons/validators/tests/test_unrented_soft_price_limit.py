@@ -268,18 +268,18 @@ async def test_eligible_executor_has_no_zero_incentive_reason(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unrented_non_incentive_model_appends_reason():
-    # RTX 5080 is a valid GPU but not in rental_incentive_gpu_types: an unrented
+    # RTX 5070 is a valid GPU but not in rental_incentive_gpu_types: an unrented
     # executor of this model earns nothing while idle and must be told why.
     incentive = _build_incentive()
 
     result = await incentive.calculate_executor_score(
-        _make_job(1.0, gpu_model="NVIDIA GeForce RTX 5080")
+        _make_job(1.0, gpu_model="NVIDIA GeForce RTX 5070")
     )
 
     assert result.mining_score == 0
     log = "\n".join(result.incentive_logs)
     assert "gpu_model_not_eligible_for_unrented_incentive" in log
-    assert "RTX 5080" in log
+    assert "RTX 5070" in log
 
 
 @pytest.mark.asyncio

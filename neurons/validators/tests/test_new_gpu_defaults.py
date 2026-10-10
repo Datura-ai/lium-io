@@ -72,10 +72,21 @@ def test_new_gpu_models_are_supported_with_zero_default_portion():
         assert GPU_MODEL_RATES[model] == 0.0
 
 
+# Base models since added to the unrented program (priced and capped in incentive.config).
+UNRENTED_ENABLED_BASE_MODELS = {
+    "RTX 5080", "RTX 5070 Ti", "RTX 5060 Ti", "RTX 4060 Ti", "RTX 4070 SUPER", "RTX 3080", "RTX 3060",
+    "RTX 2080 Ti", "V100", "RTX PRO 5000", "RTX PRO 6000D", "RTX 4080", "RTX 4080 SUPER", "RTX 3070",
+    "Quadro RTX 8000", "CMP 170HX",
+}
+
+
 def test_new_gpu_models_are_excluded_from_unrented_pool_by_default():
     config = IncentiveConfig()
 
     for model, base_model in NEW_GPU_MODELS.items():
         assert BASE_GPU_MAP[model] == base_model
+        if base_model in UNRENTED_ENABLED_BASE_MODELS:
+            assert base_model in config.rental_incentive_gpu_types
+            continue
         assert base_model not in config.rental_incentive_gpu_types
         assert config.max_unrented_gpus[base_model] == {}
