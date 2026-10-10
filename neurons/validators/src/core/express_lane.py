@@ -48,6 +48,13 @@ RETRY_SECONDS = 120
 # validator's snapshot already lists is often one refresh away on the miner's side. Every other
 # deferral keeps RETRY_SECONDS.
 MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
+# A first pass that failed is published (the provider sees why) and, with
+# EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED, run again after this long instead of waiting for
+# the next cycle (0–15 min to its boundary, then the wave): a node still pulling its images or
+# drawing a cold bandwidth sample often passes a minute later. Same pipeline, same verdict rules.
+FIRST_PASS_FAILED = "first pass failed"
+FIRST_PASS_FAILED_RETRY_SECONDS = 60
+FIRST_PASS_MAX_RUNS = 3
 # job_batch_id format the backend parses into the prod_executors row's time.
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -90,6 +97,9 @@ class _Pending:
     first_seen_at: datetime
     attempts: int = 0
     not_before: float = 0.0  # monotonic
+    # First passes that ran to a failed result; counted apart from attempts, which the miner's
+    # snapshot misses may already have spent.
+    failed_runs: int = 0
 
 
 class ExpressLane:
@@ -394,10 +404,37 @@ class ExpressLane:
         The next scored cycle overwrites the row as today.
         """
         executor_id = pending.executor.id
+        result = results[0]
+        passed = result.score > 0 or result.job_score > 0
+        retry = (
+            not passed
+            and settings.EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED
+            and pending.failed_runs + 1 < FIRST_PASS_MAX_RUNS
+        )
         # One node under the cycle's id: never the miner's batch for that id, the wave's is.
         await self.miner_service.publish_machine_specs(
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
         )
+        if retry:
+            # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
+            # claims it through in_flight and its publish records it.
+            pending.failed_runs += 1
+            pending.not_before = time.monotonic() + FIRST_PASS_FAILED_RETRY_SECONDS
+            self._log_published(pending, result, passed, extra, started)
+            logger.info(
+                _m(
+                    "[express] Executor not verified yet, will retry",
+                    extra=get_extra_info(
+                        {
+                            **extra,
+                            "reason": FIRST_PASS_FAILED,
+                            "failed_runs": pending.failed_runs,
+                            "retry_seconds": FIRST_PASS_FAILED_RETRY_SECONDS,
+                        }
+                    ),
+                )
+            )
+            return
         try:
             await self.redis_service.mark_executors_validated([executor_id])
         except Exception as exc:
@@ -412,9 +449,17 @@ class ExpressLane:
                 ),
             )
         self._pending.pop(executor_id, None)
+        self._log_published(pending, result, passed, extra, started)
 
+    def _log_published(
+        self,
+        pending: _Pending,
+        result: JobResult,
+        passed: bool,
+        extra: dict[str, object],
+        started: float,
+    ) -> None:
         published_at = datetime.now(UTC)
-        result = results[0]
         registered_at = pending.executor.created_at
         logger.info(
             _m(
@@ -422,9 +467,7 @@ class ExpressLane:
                 extra=get_extra_info(
                     {
                         **extra,
-                        "outcome": "passed"
-                        if (result.score > 0 or result.job_score > 0)
-                        else "failed",
+                        "outcome": "passed" if passed else "failed",
                         "score": result.score,
                         "log_status": result.log_status,
                         "registered_at": registered_at.isoformat() if registered_at else None,
