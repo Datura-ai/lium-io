@@ -50,7 +50,7 @@ parse_arguments() {
 
 # Function to detect package manager
 detect_package_manager() {
-    echo "Detecting Linux distribution and package manager..."
+    echo "Detecting Linux distribution and package manager..." >&2
     if command -v apk >/dev/null 2>&1; then
         echo "apk"
     elif command -v apt >/dev/null 2>&1; then
@@ -159,8 +159,8 @@ install_python_packages() {
 
 # Install Python and Jupyter if needed
 install_python_jupyter() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "Python not found. Installing system packages and Python..."
+    if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
+        echo "Python or venv support not found. Installing system packages and Python..."
         install_system_packages
     else
         echo "Python is already installed."
