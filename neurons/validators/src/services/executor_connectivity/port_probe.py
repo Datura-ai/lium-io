@@ -35,6 +35,9 @@ class PortProbe:
             host=host,
             log_ctx=log_ctx,
         )
+        if batch.external_blocked:
+            # the other tiers probe from the validator too, so they would pass the same host
+            return PortProbeResult((), tuple(ports), "external_blocked")
         successful, failed = batch.successful, batch.failed
         tier = "batch"
 

@@ -22,6 +22,8 @@ class PortProbeResult:
 class BatchResult:
     successful: list[PortPair]
     failed: list[PortPair]
+    # DAH-4537: the validator reached the sampled ports but the outside prober reached none of them
+    external_blocked: bool = False
 
 
 @dataclass(frozen=True)

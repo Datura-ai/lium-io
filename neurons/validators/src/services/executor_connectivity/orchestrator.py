@@ -92,9 +92,17 @@ class ConnectivityOrchestrator:
             failed.append(dind_port)
             sysbox_runtime = False
 
+        externally_unreachable = probe_result.tier == "external_blocked"
+        if externally_unreachable:
+            # DAH-4537: renters cannot reach the host, so no port counts, whatever the validator reached
+            failed, successful = failed + successful, []
+
         port_ranges = tally_port_ranges(declared, ports, successful)
 
-        status = "ok" if successful else "no_working_ports"
+        if externally_unreachable:
+            status = "externally_unreachable"
+        else:
+            status = "ok" if successful else "no_working_ports"
         return PortVerificationResult(
             selected_ports=tuple(ports),
             successful_ports=tuple(successful),

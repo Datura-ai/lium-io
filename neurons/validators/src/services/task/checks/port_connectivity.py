@@ -158,6 +158,12 @@ class PortConnectivityCheck:
                 details = "No ports available for docker container - all ports may be in use or misconfigured"
             elif result.status == "no_working_ports":
                 details = f"No working ports found - verified {len(result.failed_ports)} ports, all failed connectivity test"
+            elif result.status == "externally_unreachable":
+                details = (
+                    "Ports answer the validator but not a probe from outside the validator's network: a firewall "
+                    "on the host admits only some source addresses, so renters cannot reach their pods. Allow "
+                    "inbound TCP from any address on the port range"
+                )
             elif result.status == "skipped_rental_active":
                 # This shouldn't happen anymore but provide clear message if it does
                 details = "Port verification was incorrectly skipped due to rental detection - this is a bug"
