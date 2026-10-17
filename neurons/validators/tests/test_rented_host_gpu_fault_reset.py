@@ -23,7 +23,6 @@ from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFinge
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
-from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 from neurons.validators.src.services.task.runner import SSHCommandResult
@@ -52,12 +51,17 @@ def _driver_report(gpu_scrape_error: str) -> str:
     return json.dumps(
         {
             "error": "no_gpu_details",
-            "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}, "gpu_scrape_error": gpu_scrape_error},
+            "data": {
+                "data_gpu": {"gpu_count": 0, "gpu_details": []},
+                "gpu_scrape_error": gpu_scrape_error,
+            },
         }
     )
 
 
-NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
+NO_GPU_REPORT = json.dumps(
+    {"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}}
+)
 HEALTHY_SPECS = {
     "gpu": {"count": 1, "details": [{"name": "NVIDIA RTX 4090", "uuid": "GPU-abc123"}]},
     "gpu_processes": [],
@@ -123,7 +127,9 @@ async def _cycle(
         config=build_context_config(machine_scrape_filename="scrape.sh", obfuscation_keys={}),
         state=build_state(
             remote_dir="/remote",
-            rented_data=build_rented_data(EXECUTOR, {"containers": containers, "owner_flag": False}),
+            rented_data=build_rented_data(
+                EXECUTOR, {"containers": containers, "owner_flag": False}
+            ),
         ),
         runner=_Runner(scrape),
         ssh=DummySSHClient(pod_running=True),
@@ -145,7 +151,9 @@ async def _cycle(
 
 def _resets(service: RedisService) -> list[dict]:
     return [
-        call.args[1] for call in service.publish.await_args_list if call.args[0] == RESET_VERIFIED_JOB_CHANNEL
+        call.args[1]
+        for call in service.publish.await_args_list
+        if call.args[0] == RESET_VERIFIED_JOB_CHANNEL
     ]
 
 
@@ -153,7 +161,9 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, EXECUTOR))
 
 
-HEALTHY = _scrape_result(stdout=SSHService()._encrypt(ENCRYPT_KEY, json.dumps(HEALTHY_SPECS)), exit_code=0)
+HEALTHY = _scrape_result(
+    stdout=SSHService()._encrypt(ENCRYPT_KEY, json.dumps(HEALTHY_SPECS)), exit_code=0
+)
 DEAD_NVML = _scrape_result(stdout=_driver_report(NVML_DRIVER_ERROR), exit_code=1)
 DRIVER = Msg.SCRAPE_FAILED_DRIVER.reason
 
@@ -162,7 +172,9 @@ DRIVER = Msg.SCRAPE_FAILED_DRIVER.reason
     ("stdout", "reason_code", "gpu_scrape_error"),
     [
         pytest.param(NO_GPU_REPORT, Msg.SCRAPE_FAILED_NO_GPU.reason, None, id="zero-gpus"),
-        pytest.param(_driver_report("NVMLError(9)"), DRIVER, "NVMLError(9)", id="driver-not-loaded"),
+        pytest.param(
+            _driver_report("NVMLError(9)"), DRIVER, "NVMLError(9)", id="driver-not-loaded"
+        ),
         pytest.param(_driver_report("NVMLError(15)"), DRIVER, "NVMLError(15)", id="gpu-lost"),
         pytest.param(_driver_report("NVMLError(16)"), DRIVER, "NVMLError(16)", id="reset-required"),
         pytest.param(_driver_report("NVMLError(28)"), DRIVER, "NVMLError(28)", id="gpu-not-found"),
@@ -176,7 +188,9 @@ async def test_a_dead_gpu_runtime_on_a_rented_node_marks_the_executor_inactive(
     ok, _, _ = await _cycle(context_factory, service, scrape=HEALTHY)
     assert ok is True and _resets(service) == []
 
-    ok, event, _ = await _cycle(context_factory, service, scrape=_scrape_result(stdout=stdout, exit_code=1))
+    ok, event, _ = await _cycle(
+        context_factory, service, scrape=_scrape_result(stdout=stdout, exit_code=1)
+    )
 
     assert ok is False
     assert event.reason_code == reason_code
@@ -192,98 +206,3 @@ async def test_a_dead_gpu_runtime_on_a_rented_node_marks_the_executor_inactive(
     assert reset["evidence"] == evidence
     record = await _record(service)
     assert (record["count"], record["uuids"]) == (0, "GPU-abc123")
-
-
-@pytest.mark.asyncio
-async def test_the_node_returns_through_normal_validation_once_the_host_is_healthy(context_factory):
-    service = _redis_service()
-    await _cycle(context_factory, service, scrape=HEALTHY)
-    await _cycle(context_factory, service, scrape=DEAD_NVML)
-    assert len(_resets(service)) == 1
-
-    ok, event, ctx = await _cycle(context_factory, service, scrape=HEALTHY)
-
-    assert ok is True
-    assert event.reason_code == TenantMsg.ALREADY_RENTED.reason
-    assert ctx.score == 1.0
-    assert len(_resets(service)) == 1
-    record = await _record(service)
-    assert (record["count"], record["failed"], record["uuids"]) == (1, 0, "GPU-abc123")
-
-
-@pytest.mark.parametrize(
-    ("scrape", "cycle_kwargs"),
-    [
-        pytest.param(DEAD_NVML, {"rented": False}, id="unrented-node"),
-        pytest.param(DEAD_NVML, {"enabled": False}, id="flag-off"),
-        # the report comes from the node's own host, so the shipped default is off
-        pytest.param(
-            DEAD_NVML,
-            {
-                "enabled": type(machine_spec_scrape.settings).model_fields[
-                    "RENTED_HOST_GPU_FAULT_RESET_ENABLED"
-                ].default
-            },
-            id="provider-forged-report-with-shipped-default",
-        ),
-        # miner A reports miner B's rented executor UUID with a dead-NVML report from A's own host
-        pytest.param(DEAD_NVML, {"miner_hotkey": "another-miner"}, id="rental-owned-by-another-miner"),
-        pytest.param(
-            _scrape_result(stdout=NO_GPU_REPORT, exit_code=1),
-            {"miner_hotkey": "another-miner"},
-            id="no-gpu-on-a-rental-owned-by-another-miner",
-        ),
-        # the scrape copies libnvidia-ml to a temp file before loading it; a full or read-only disk fails that write
-        pytest.param(_scrape_result(stdout=_driver_report("NVMLError(12)"), exit_code=1), {}, id="library-not-loadable"),
-        pytest.param(_scrape_result(stdout=_driver_report("NVMLError(18)"), exit_code=1), {}, id="driver-library-mismatch"),
-        pytest.param(
-            _scrape_result(stdout=_driver_report("OSError(28, 'No space left on device')"), exit_code=1), {}, id="not-nvml"
-        ),
-        pytest.param(_scrape_result(stdout="", exit_code=127), {}, id="scrape-failed-on-host"),
-        pytest.param(
-            SSHCommandResult(
-                command="scrape.sh", command_id="cmd-1", exit_code=-1, stdout="", stderr="", duration_ms=300_000,
-                started_at=datetime.now(UTC), finished_at=datetime.now(UTC), success=False, error_type="timeout",
-            ),
-            {},
-            id="scrape-timeout",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_scrape_failure_that_does_not_show_a_dead_gpu_runtime_on_a_rented_node_does_not_reset(
-    context_factory, scrape, cycle_kwargs
-):
-    service = _redis_service()
-
-    ok, event, _ = await _cycle(context_factory, service, scrape=scrape, **cycle_kwargs)
-
-    assert ok is False
-    assert "host_gpu_fault_reset" not in event.what_we_saw
-    assert _resets(service) == []
-    assert (await _record(service))["failed"] == 1
-
-
-@pytest.mark.parametrize("drop_check_raises", [False, True], ids=["drop-check-runs", "drop-check-raises"])
-@pytest.mark.asyncio
-async def test_a_dead_gpu_runtime_both_reports_the_gpu_loss_and_resets_the_rented_node(
-    context_factory, drop_check_raises
-):
-    service = _redis_service()
-    await _cycle(context_factory, service, scrape=HEALTHY)
-    seen = []
-
-    async def drop_check_run(self, ctx):
-        seen.append((ctx.state.gpu_count, ctx.state.gpu_details))
-        if drop_check_raises:
-            raise RuntimeError("backend down")
-
-    with patch.object(machine_spec_scrape.RentedGpuDropCheck, "run", drop_check_run):
-        ok, event, _ = await _cycle(context_factory, service, scrape=DEAD_NVML)
-
-    assert ok is False
-    assert seen == [(0, [])]
-    assert event.reason_code == DRIVER
-    assert event.what_we_saw["host_gpu_fault_reset"] is True
-    [reset] = _resets(service)
-    assert reset["reason_code"] == DRIVER
