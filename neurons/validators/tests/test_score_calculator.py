@@ -123,3 +123,11 @@ def test_inspector_blind_streak_flag_zeroes_a_rented_score():
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == 0.0
     assert "Rental sensor saw nothing of the rental" in warning
+
+
+def test_rented_pod_resources_flag_zeroes_a_rented_score():
+    """RentedPodResourcesCheck is non-fatal: only this flag, set under enforcement, zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"rented_pod_resources_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "below its deployed CPUs" in warning

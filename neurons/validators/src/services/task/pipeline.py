@@ -259,6 +259,9 @@ class Context(BaseModel):
     # False only once InspectorRentedCheck counts a blind streak at the limit under enforcement;
     # the score gate lives in calculate_scores for the same reason as above.
     inspector_blind_streak_passed: bool = True
+    # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
+    # enforcement; the score gate lives in calculate_scores for the same reason as above.
+    rented_pod_resources_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None

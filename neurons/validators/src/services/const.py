@@ -244,6 +244,8 @@ NETWORK_MIN_DOWNLOAD_SPEED_MBPS = 50.0
 PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009]
 
 POD_CONTAINER_PREFIX = "pod_"
+# DAH-4564: the --cpus a rental container was created with; `docker update` cannot change a label.
+RENTAL_CPU_COUNT_LABEL = "io.lium.cpu_count"
 FILLER_CONTAINER_PREFIX = "filler_"
 # DAH-2740: the name a pod's current container is parked under while an edit builds its replacement.
 # Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to

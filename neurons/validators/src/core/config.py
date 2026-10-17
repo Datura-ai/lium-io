@@ -480,6 +480,13 @@ class Settings(BaseSettings):
     # Report a rented node that lost a GPU to the backend from the first cycle that sees it (a possible
     # glitch waits one more); observation only, no score change. Off by default.
     RENTED_GPU_DROP_CHECK_ENABLED: bool = Field(env="RENTED_GPU_DROP_CHECK_ENABLED", default=False)
+    # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
+    # pinned or throttled the renter below what was deployed. CHECK_ENABLED observes; ENFORCEMENT
+    # additionally zeroes the score. A raised oom_score_adj is recorded only, never scored.
+    RENTED_POD_RESOURCES_CHECK_ENABLED: bool = Field(env="RENTED_POD_RESOURCES_CHECK_ENABLED", default=False)
+    RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED: bool = Field(
+        env="RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED", default=False
+    )
     # The per-pod incident mark expires this long after the last cycle that saw the fault.
     RENTED_GPU_DROP_STATE_TTL_SECONDS: int = Field(env="RENTED_GPU_DROP_STATE_TTL_SECONDS", default=86400, gt=0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
