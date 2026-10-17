@@ -336,7 +336,8 @@ class Settings(BaseSettings):
     FIRST_PASS_MATMUL_VRAM_MB: int = Field(env="FIRST_PASS_MATMUL_VRAM_MB", default=8192)
     # A filler-only node skips the matmul while the filler runs. With N > 0, every Nth such cycle
     # runs the challenge on a small VRAM budget beside the filler and records the answer
-    # (FILLER_MATMUL_SAMPLE); the check result never depends on it. 0 = never, the default.
+    # (FILLER_MATMUL_SAMPLE); the check result never depends on it. Each sample is pinned to the
+    # next claimed card in rotation. 0 = never, the default.
     FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES: int = Field(
         env="FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", default=0, ge=0
     )
