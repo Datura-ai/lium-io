@@ -16,6 +16,7 @@ from ..runner import SSHCommandResult
 from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
+from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
@@ -264,7 +265,10 @@ async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
         gpu_details=[],
     )
     try:
-        await RentedGpuDropCheck().run(ctx.model_copy(update={"state": state}))
+        lost_ctx = ctx.model_copy(update={"state": state})
+        await RentedGpuDropCheck().run(lost_ctx)
+        # DAH-4457: the hold starts here too, so the next clean scrape does not list the node again at once
+        await GpuLossHoldCheck().run(lost_ctx)
     except Exception:
         logger.warning(
             _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),

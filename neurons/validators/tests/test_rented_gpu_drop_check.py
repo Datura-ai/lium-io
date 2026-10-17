@@ -356,7 +356,8 @@ async def test_a_scrape_that_lists_no_gpu_on_an_idle_node_posts_nothing(context_
 
     assert result.passed is False
     services.backend.report_rented_gpu_drop.assert_not_awaited()
-    assert services.redis.calls == 0
+    # only the GPU loss hold (DAH-4457) is written; no rented-GPU-drop mark
+    assert [key.split(":")[0] for key in services.redis.store] == ["gpu_loss_hold"]
 
 
 @pytest.mark.asyncio

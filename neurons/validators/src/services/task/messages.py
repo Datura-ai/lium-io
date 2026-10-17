@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .models import build_msg
+from .models import AVAILABILITY_CATEGORY, build_msg
 
 if TYPE_CHECKING:  # pragma: no cover
     from .pipeline import Context
@@ -460,6 +460,36 @@ class RentedGpuDropMessages:
     DISABLED = MessageTemplate(
         event="Rented GPU drop check disabled",
         reason="RENTED_GPU_DROP_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
+class GpuLossHoldMessages:
+    LOST = MessageTemplate(
+        event="A GPU dropped out on this node",
+        reason="GPU_LOST",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="The node is hidden and takes no new rentals until its GPUs read clean for the hold window "
+        "(see hold_until); an idle node scores 0 meanwhile, a rental already on it is not touched",
+        remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
+        "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
+        "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
+        "window.",
+    )
+    PENDING = MessageTemplate(
+        event="A GPU may have dropped out; judged again next cycle",
+        reason="GPU_LOST_PENDING",
+        severity="warning",
+        category="env",
+        impact="Proceed; the node is hidden if the next cycle shows it again",
+    )
+    OK = MessageTemplate(
+        event="Every GPU is listed",
+        reason="GPU_LOST_NONE",
         severity="info",
         category="env",
         impact="Proceed",
