@@ -35,6 +35,15 @@ def test_entrypoint_without_cmd_is_kept():
     assert keep_alive_command_for(("/start.sh",), ()) == ()
 
 
+def test_pass_through_entrypoint_without_cmd_gets_keep_alive():
+    # modelscope images: Entrypoint nvidia_entrypoint.sh, no Cmd; the wrapper's `exec "$@"` exits at once
+    assert keep_alive_command_for(("/opt/nvidia/nvidia_entrypoint.sh",), ()) == KEEP_ALIVE_COMMAND
+
+
+def test_pass_through_entrypoint_with_its_own_arguments_is_kept():
+    assert keep_alive_command_for(("/opt/nvidia/nvidia_entrypoint.sh", "--serve"), ()) == ()
+
+
 def _run_spec(startup_commands: str | None, image_command_fallback: tuple[str, ...]):
     docker_service = DockerService(
         ssh_service=Mock(),
