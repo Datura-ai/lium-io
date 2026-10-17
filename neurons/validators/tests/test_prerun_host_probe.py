@@ -1316,8 +1316,8 @@ def _fresh_sizing_payload(**over):
 async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after_removing_only_a_filler(
     svc_fixture, monkeypatch, probe_saw_the_filler, removal_lost_its_channel
 ):
-    """Nothing is listed again: whether the probe listed the host before or after the removal at SSH connect, it hands
-    on a listing without the filler. The rm freed disk, so the volume is sized on a live probe, never the early one."""
+    """Only the containers are listed again, after a removal at SSH connect (DAH-4459); whether the probe listed the host
+    before or after that removal, it hands on a listing without the filler. The rm freed disk, so the volume is sized on a live probe, never the early one."""
     svc = svc_fixture
     gb = ds_module._FRESH_SIZING_GB_BYTES
     probe = _probe_with_containers(*(["filler_x"] if probe_saw_the_filler else []), "pod_keep")
@@ -1342,7 +1342,7 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     # rm with its confirming listing in one command — the removal starts only once the host reads succeed
     assert _cmds(ssh_client) == [
         "cat /proc/sys/kernel/pid_max",
-        *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL]),
+        *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
     ]
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)
@@ -1360,7 +1360,7 @@ _POD_OLD_REMOVAL = _remove_and_list_containers_command(["pod_old"], ["volume_old
 @pytest.mark.parametrize(
     ("containers", "active_volume_names", "docker_rm_exit", "ps_after_rm", "listing_after_rm_exit", "removals"),
     [
-        (("filler_x", "pod_old"), ["volume_x"], 0, "", 0, [_FILLER_X_REMOVAL, _POD_OLD_REMOVAL]),  # a pod beside the filler
+        (("filler_x", "pod_old"), ["volume_x"], 0, "pod_old", 0, [_FILLER_X_REMOVAL, _POD_OLD_REMOVAL]),  # a pod beside the filler
         (("filler_x",), [], 0, "", 0, [_remove_and_list_containers_command(["filler_x"], ["volume_x"])]),  # the filler's volume
         (("filler_x",), ["volume_x"], 0, "filler_x\n", 0, [_FILLER_X_REMOVAL]),  # the filler survived the rm
         (("filler_x",), ["volume_x"], 1, "", 0, [_FILLER_X_REMOVAL]),  # the rm failed although the filler is gone
@@ -1435,15 +1435,13 @@ _RECREATED_ID = "b" * 64
         (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
         # a listing without IDs: the removal at SSH connect still targets the ID it listed, not the name
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
-        # a filler created again under the same name since: it goes too, by its own ID
-        (_RECREATED_ID, [_REMOVED_AT_SSH_CONNECT_ID, _RECREATED_ID], 0, 0, []),
         # the kill is issued at SSH connect: confirmed before the image inspect and the probes finish
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["host probed", "image inspected"]),
         # safety order: a PEARL filler is gone before its cap is lifted (beside the volume create, and again
         # right before docker run), and the Dolphin cache is reclaimed only once the filler that mounts it is gone
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["cache reclaim", "docker run", "power restore", "power restore"]),
     ],
-    ids=["same_instance", "cleanup_listing_without_ids", "recreated_filler", "before_the_image_inspect_and_the_probes_finish",
+    ids=["same_instance", "cleanup_listing_without_ids", "before_the_image_inspect_and_the_probes_finish",
          "before_power_restore_cache_reclaim_and_docker_run"],
 )
 async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
@@ -1495,6 +1493,33 @@ async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
     assert events.index("docker run") > events.index(removals[-1])
     after = events[events.index(removals[0]) + 1 :]
     assert sorted(event for event in after if event in after_the_first_removal) == after_the_first_removal
+
+
+@pytest.mark.asyncio
+async def test_cleanup_lists_the_host_again_after_a_removal_at_ssh_connect(docker_service, monkeypatch):
+    """DAH-4459: a filler created again under a name removed at SSH connect, after the probe listed the removed
+    instance, is seen in a fresh listing with its own ID and removed by it, not kept on the probe's stale ID."""
+    ran: list[str] = []
+
+    async def _retry(ssh, command, _tag, **_kwargs):
+        ran.append(command)
+
+    monkeypatch.setattr("services.docker_service.retry_ssh_command", _retry)
+    probe = _probe(container_names=("filler_x",), container_ids={"filler_x": _REMOVED_AT_SSH_CONNECT_ID})
+    ssh = _ssh(_ssh_result(stdout=f"filler_x {_RECREATED_ID}\n"))
+
+    removed = await docker_service.clean_existing_containers(
+        ssh_client=ssh,
+        default_extra={},
+        pod_name="pod_new",
+        clear_volume=False,
+        host_probe=probe,
+        removed_at_ssh_connect={"filler_x": _REMOVED_AT_SSH_CONNECT_ID},
+    )
+
+    assert removed == ["filler_x"]
+    assert _cmds(ssh) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
+    assert ran == [f"/usr/bin/docker rm -fv {_RECREATED_ID}"]
 
 
 @pytest.mark.asyncio
