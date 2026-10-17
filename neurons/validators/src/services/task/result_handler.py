@@ -399,12 +399,19 @@ class ResultHandler:
             # On failure, either clear or mark as failed
             if context.clear_verified_job_info:
                 reason = self._resolve_clear_reason(context.clear_verified_job_reason)
+                # DAH-2865: the address this cycle checked, so the backend can drop a reset that arrives after the
+                # provider moved the node to another address under the same id
+                evidence = {
+                    **(context.clear_verified_job_evidence or {}),
+                    "executor_ip": context.executor.address,
+                    "executor_port": context.executor.port,
+                }
                 await self.redis_service.clear_verified_job_info(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
                     prev_info=verified_job_info,
                     reason=reason,
-                    evidence=context.clear_verified_job_evidence,
+                    evidence=evidence,
                     anchor_broken=context.gpu_anchor_broken,
                     record_owner=record_owner,
                 )

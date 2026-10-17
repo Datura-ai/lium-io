@@ -139,3 +139,21 @@ async def test_an_executor_missing_from_a_sent_map_is_logged(
 )
 def test_every_form_of_an_executor_id_finds_the_same_owner(sent_id):
     assert result_handler._executor_key(sent_id) == "0b6f8a2e-1c3d-4e5f-8a9b-0c1d2e3f4a5b"
+
+
+@pytest.mark.asyncio
+async def test_the_reset_carries_the_address_this_cycle_checked(context_factory):
+    redis = AsyncMock()
+    ctx = _context(context_factory, None)
+    ctx = ctx.model_copy(update={"clear_verified_job_evidence": {"reason_code": "SPEC_CHANGED"}})
+
+    await ResultHandler(redis_service=redis, dry_run=False)._persist_verification_data(
+        "miner-hotkey", "executor-123", VERIFIED_RECORD, ctx, success=False
+    )
+
+    evidence = redis.clear_verified_job_info.await_args.kwargs["evidence"]
+    assert evidence == {
+        "reason_code": "SPEC_CHANGED",
+        "executor_ip": ctx.executor.address,
+        "executor_port": ctx.executor.port,
+    }
