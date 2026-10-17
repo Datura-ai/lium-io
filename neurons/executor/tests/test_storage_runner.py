@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import bz2
+import hashlib
 import io
 import json
+import os
+import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -26,7 +30,7 @@ from storage.reporting import (
     _newest_within_bytes,
 )
 from storage.restic import (
-    ENCRYPTED_BACKUP_SCRIPT,
+    BACKUP_SOURCE_SCRIPT,
     JsonEventWriter,
     ResticOperationError,
     ResticStorageRunner,
@@ -375,7 +379,8 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
 
     assert cwd is None
     assert "customer-volume:/workspace:ro" in command
-    assert command[command.index("--workdir") + 1] == "/workspace/checkpoints"
+    script = command.index(BACKUP_SOURCE_SCRIPT)
+    assert command[script + 2 : script + 4] == ["/workspace/checkpoints", runner._restic_binary]
     assert command[command.index("--log-driver") + 1] == "none"
     assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
     assert "AWS_ACCESS_KEY_ID" in command
@@ -682,6 +687,7 @@ def test_exit_code_three_with_snapshot_is_completed_partial(
     operation = StorageOperationSpec.from_mapping(_operation_payload())
     output = io.StringIO()
     events = JsonEventWriter(str(OPERATION_ID), 0, output=output)
+    (tmp_path / "file").write_text("x")
     workspace = LocalWorkspace(tmp_path)
     runner = ResticStorageRunner(operation, workspace, event_writer=events)
 
@@ -1246,7 +1252,7 @@ def test_encrypted_backup_script_stops_when_the_backup_path_is_missing(tmp_path:
     marker = tmp_path / "ran"
 
     completed = subprocess.run(
-        ["/bin/sh", "-c", ENCRYPTED_BACKUP_SCRIPT, "sh", str(tmp_path / "missing"), "touch", str(marker)],
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "missing"), "touch", str(marker)],
         capture_output=True,
     )
 
@@ -1254,6 +1260,42 @@ def test_encrypted_backup_script_stops_when_the_backup_path_is_missing(tmp_path:
     assert not marker.exists()
     # the reporter keeps the first diagnostic, so sh's own cd error must not reach it ahead of ours
     assert completed.stderr == b""
+
+
+def test_backup_source_script_stops_when_the_backup_path_is_empty(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    (tmp_path / "backup").mkdir()
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
+        capture_output=True,
+    )
+
+    assert completed.returncode == 66
+    assert not marker.exists()
+
+
+def test_backup_source_script_fails_when_the_backup_path_is_a_file(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    (tmp_path / "backup").write_text("x")
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
+        capture_output=True,
+    )
+
+    assert completed.returncode == 1
+    assert not marker.exists()
+
+
+def test_local_backup_of_a_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "backup"
+    path.write_text("x")
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(path))
+    monkeypatch.setattr("storage.restic.subprocess.Popen", lambda *a, **k: pytest.fail("restic ran"))
+
+    with pytest.raises(ResticOperationError, match="not a directory"):
+        runner._backup()
 
 
 class _MissingSourcePopen(_FakePopen):
@@ -1265,8 +1307,9 @@ class _MissingSourcePopen(_FakePopen):
         return 66
 
 
-def test_backup_of_a_missing_path_fails_with_a_clear_message(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_backup_of_a_missing_path_is_an_empty_no_op(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload())
+    (tmp_path / "file").write_text("x")  # past the local pre-check: restic itself reports the missing source
     runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
     monkeypatch.setattr(
         "storage.restic.subprocess.run",
@@ -1274,16 +1317,92 @@ def test_backup_of_a_missing_path_fails_with_a_clear_message(monkeypatch: pytest
     )
     monkeypatch.setattr("storage.restic.subprocess.Popen", _MissingSourcePopen)
 
-    with pytest.raises(ResticOperationError, match="backup path does not exist"):
-        runner._backup()
+    result = runner._backup()
+
+    assert (result.status, result.result_quality, result.snapshot_id) == ("COMPLETED", OperationResultQuality.EMPTY, None)
 
 
-def test_local_backup_of_a_missing_directory_fails_before_restic_runs(tmp_path: Path) -> None:
-    operation = StorageOperationSpec.from_mapping(_operation_payload())
-    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path / "missing"))
+@pytest.mark.parametrize("make_dir", [False, True], ids=["missing", "empty"])
+def test_local_backup_of_a_missing_or_empty_directory_skips_restic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, make_dir: bool
+) -> None:
+    path = tmp_path / "backup"
+    if make_dir:
+        path.mkdir()
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(path))
+    monkeypatch.setattr("storage.restic.subprocess.Popen", lambda *a, **k: pytest.fail("restic ran"))
 
-    with pytest.raises(ResticOperationError, match="backup path does not exist"):
-        runner._backup()
+    result = runner._backup()
+
+    assert (result.status, result.result_quality, result.snapshot_id) == ("COMPLETED", OperationResultQuality.EMPTY, None)
+
+
+def test_backup_passes_the_exclude_patterns_to_restic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payload = _operation_payload()
+    payload["workspace"]["exclude_patterns"] = [".cache", ".ssh"]
+    (tmp_path / "file").write_text("x")
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), LocalWorkspace(tmp_path))
+    commands = []
+    monkeypatch.setattr(runner, "_stream", lambda command, **kwargs: commands.append(command) or (0, {"snapshot_id": SNAPSHOT_ID}))
+
+    runner._backup()
+
+    assert commands[0][-3:] == ["--exclude=.cache", "--exclude=.ssh", "."]
+
+
+# As neurons/executor/Dockerfile pins it.
+RESTIC_URL = "https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2"
+RESTIC_SHA256 = "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c"
+
+
+@pytest.fixture(scope="session")
+def restic_binary(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """restic on PATH, else the pinned release, checksum-verified (CI has no restic)."""
+    if found := shutil.which("restic"):
+        return found
+    archive = requests.get(RESTIC_URL, timeout=60).content
+    assert hashlib.sha256(archive).hexdigest() == RESTIC_SHA256
+    binary = tmp_path_factory.mktemp("restic") / "restic"
+    binary.write_bytes(bz2.decompress(archive))
+    binary.chmod(0o755)
+    return str(binary)
+
+
+def test_real_restic_skips_nested_excludes_and_keeps_neighbours(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restic_binary: str
+) -> None:
+    """The runner's own backup arguments, run by the real restic binary against a local repository."""
+    workspace = tmp_path / "workspace"
+    for name in ("proj/.config/gcloud/credentials.db", "proj/.config/gcloud_notes", "proj/.config/other/x", ".env",
+                 ".env.local", "proj/model.bin"):
+        (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / name).write_text("x")
+    payload = _operation_payload()
+    payload["workspace"]["exclude_patterns"] = [".config/gcloud", ".env"]
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), LocalWorkspace(workspace))
+    commands = []
+    monkeypatch.setattr(runner, "_stream", lambda command, **kwargs: commands.append(command) or (0, {"snapshot_id": SNAPSHOT_ID}))
+    runner._backup()
+    env = {**os.environ, "RESTIC_REPOSITORY": str(tmp_path / "repo"), "RESTIC_PASSWORD": "test"}
+
+    restic = restic_binary
+    subprocess.run([restic, "init"], env=env, check=True, capture_output=True)
+    subprocess.run([restic, *commands[0]], cwd=workspace, env=env, check=True, capture_output=True)
+    listing = subprocess.run([restic, "ls", "latest", "--json"], env=env, check=True, capture_output=True, text=True)
+    paths = {entry["path"] for entry in map(json.loads, listing.stdout.splitlines()) if entry.get("path")}
+
+    assert {"/proj/.config/gcloud_notes", "/proj/.config/other/x", "/.env.local", "/proj/model.bin"} <= paths
+    assert not {path for path in paths if "/.config/gcloud/" in path or path.endswith("/.config/gcloud")}
+    assert "/.env" not in paths
+
+
+@pytest.mark.parametrize("patterns", [".cache", [""], [1]])
+def test_operation_spec_rejects_malformed_exclude_patterns(patterns: object) -> None:
+    payload = _operation_payload()
+    payload["workspace"]["exclude_patterns"] = patterns
+
+    with pytest.raises(OperationSpecError):
+        StorageOperationSpec.from_mapping(payload)
 
 
 def test_queued_diagnostic_logs_stay_under_the_waf_body_limit() -> None:
@@ -1294,3 +1413,35 @@ def test_queued_diagnostic_logs_stay_under_the_waf_body_limit() -> None:
     assert kept == lines[-len(kept) :]
     assert len(json.dumps(kept)) <= PENDING_LOGS_MAX_BYTES + len(kept) * 2
     assert len(json.dumps({"logs": kept})) < 64_000
+
+
+@pytest.mark.parametrize(("kind", "passes"), [("absent", True), ("dir", True), ("file", False)])
+def test_encrypted_backup_preflight_lets_an_absent_path_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str, passes: bool
+) -> None:
+    target = tmp_path / "backup"
+    if kind == "dir":
+        target.mkdir()
+    elif kind == "file":
+        target.write_text("x")
+
+    real_run = subprocess.run
+
+    def run_locally(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        script = command[command.index("-c") + 1]
+        return real_run(["/bin/sh", "-c", script, "sh", str(target)], capture_output=True, text=True)
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_locally)
+    validate = lambda: WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(  # noqa: E731
+        image="executor:test",
+        pid=1,
+        visible_path=PurePosixPath(str(target)),
+        requested_path=PurePosixPath("/root/backup"),
+        action=StorageAction.BACKUP,
+    )
+
+    if passes:
+        validate()
+    else:
+        with pytest.raises(WorkspaceResolutionError):
+            validate()

@@ -180,7 +180,8 @@ class WorkspaceResolver:
         overwrite_fresh_target: bool = False,
     ) -> None:
         if action is StorageAction.BACKUP:
-            check_script = 'test -d "$1"'
+            # DAH-2002: an absent path passes, so BACKUP_SOURCE_SCRIPT turns it into an EMPTY no-op; a file still fails
+            check_script = '[ ! -e "$1" ] || [ -d "$1" ]'
             error = f"backup source is not a directory: {requested_path}"
         elif overwrite_fresh_target:
             # Create-time restore into the pod's fresh mount (DAH-3274): the entrypoint may have

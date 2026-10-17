@@ -75,7 +75,7 @@ from services.task.availability import (
 )
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
-from services.storage_operations import cancel_storage_operation, start_storage_operation
+from services.storage_operations import cancel_storage_operation, start_storage_operation, supports_workspace_field
 
 logger = logging.getLogger(__name__)
 
@@ -2046,6 +2046,13 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.backup_log_id)
+                if payload.exclude_patterns and not await supports_workspace_field(
+                    ssh_client, executor_info.python_path, "exclude_patterns"
+                ):
+                    raise RuntimeError(
+                        "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
+                        "the provider must update the executor image"
+                    )
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,
@@ -2183,6 +2190,7 @@ class MinerService:
                 "volume_path": payload.source_volume_path,
                 "requested_path": payload.backup_path or payload.source_volume_path,
                 "container_name": payload.container_name,
+                "exclude_patterns": payload.exclude_patterns,
             },
             "reporter": {
                 "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,

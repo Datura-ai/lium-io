@@ -199,7 +199,7 @@ async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field
 
     command = ssh_client.run.await_args.args[0]
     assert command.startswith("/usr/bin/python3 -c ")
-    assert "WorkspaceSpec.__dataclass_fields__" in command and "'bootstrap'" in command
+    assert "WorkspaceSpec.__dataclass_fields__" in command and command.endswith(" bootstrap")
 
 
 @pytest.mark.asyncio
@@ -223,10 +223,12 @@ async def test_a_probe_that_cannot_run_is_reported_not_read_as_an_old_image(
     assert stderr[-30:] in str(raised.value)
 
 
-def test_bootstrap_probe_finds_the_field_in_this_repo_s_executor_models() -> None:
+@pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])
+def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(field: str) -> None:
     # The probe imports the executor's own storage.models; run it against this checkout's copy
     # so a renamed field or a wrong sys.path root fails here, not on every encrypted create.
     executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
-    probe = storage_operations._BOOTSTRAP_PROBE.replace("/root/app/src", str(executor_src))
+    probe = storage_operations._WORKSPACE_FIELD_PROBE.replace("/root/app/src", str(executor_src))
 
-    assert subprocess.run([sys.executable, "-c", probe], check=False).returncode == 0
+    assert subprocess.run([sys.executable, "-c", probe, field], check=False).returncode == 0
+    assert subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3

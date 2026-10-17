@@ -451,6 +451,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
     failure_timeout_seconds: int = Field(default=600, gt=0)
+    exclude_patterns: list[str] = []
 
 
 class RestoreContainerRequest(ContainerBaseRequest):

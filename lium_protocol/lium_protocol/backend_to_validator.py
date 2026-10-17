@@ -247,6 +247,8 @@ class BackupContainerRequest(ContainerRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = pydantic.Field(default=None, repr=False)
     failure_timeout_seconds: int = pydantic.Field(default=STORAGE_OPERATION_REPORTING_FAILURE_TIMEOUT_SECONDS, gt=0)
+    # 1.8.0: restic --exclude patterns (the default backup skips caches and keys); an older validator ignores them.
+    exclude_patterns: list[str] = []
 
 
 @BACKEND_MESSAGES.register

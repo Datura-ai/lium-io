@@ -529,6 +529,34 @@ def test_restic_backup_empty_path_targets_the_whole_volume():
     assert spec["reporter"]["failure_timeout_seconds"] == 600
 
 
+@pytest.mark.asyncio
+async def test_restic_backup_with_excludes_stops_on_an_executor_that_cannot_apply_them(monkeypatch):
+    ssh_client = AsyncMock()
+    monkeypatch.setattr(miner_service_module.asyncssh, "connect", Mock(return_value=_FakeSshContext(ssh_client)))
+    monkeypatch.setattr(miner_service_module, "supports_workspace_field", AsyncMock(return_value=False))
+    start = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.backup_log_id = "11111111-1111-4111-8111-111111111111"
+    payload.exclude_patterns = [".ssh"]
+
+    with pytest.raises(RuntimeError, match="exclude_patterns"):
+        await MinerService.__new__(MinerService).handle_backup_container_req(_executor_info(), payload, Mock())
+    start.assert_not_awaited()
+
+
+def test_restic_backup_spec_carries_the_exclude_patterns():
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.repository_password = "repository-password"
+    payload.exclude_patterns = [".cache", ".ssh"]
+
+    spec = MinerService._restic_backup_operation_spec(payload)
+
+    assert spec["workspace"]["exclude_patterns"] == [".cache", ".ssh"]
+
+
 def test_restic_online_restore_empty_path_targets_the_whole_volume():
     payload = _restore_payload()
     payload.backup_engine = "restic"
