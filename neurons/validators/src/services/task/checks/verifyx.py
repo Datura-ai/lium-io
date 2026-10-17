@@ -263,16 +263,12 @@ class VerifyXCheck:
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
-            never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
-            if ema_download is None:
+            gate = download_gate(ema_download, prev_ema, first_pass=ctx.config.first_pass)
+            if gate == "unseeded":
                 # A malformed download reading on a never-measured host: there is no EMA to keep
                 # and none to gate on. The event says why; the next sample seeds it.
                 return CheckResult(passed=True, event=event, updates={"state": updated_state})
-            if (
-                ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
-                and ctx.config.first_pass
-                and never_measured
-            ):
+            if gate == "deferred":
                 # DAH-3011: the first pass is never scored, and a fresh node's single cold sample fails
                 # this gate 14 % of the time (DAH-2959). Publish the raw sample, leave the EMA unseeded
                 # so the first SCORED cycle bootstraps from a warm sample and enforces the gate, and say
@@ -290,7 +286,7 @@ class VerifyXCheck:
                 event.what_we_saw["min_download_speed_mbps"] = MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
                 return CheckResult(passed=True, event=event, updates={"state": updated_state})
 
-            if ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+            if gate == "too_slow":
                 slow_event = render_message(
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
                     ctx=ctx,
@@ -400,6 +396,46 @@ def _feed_ema(
     ema = compute_ema(prev, reading if reading is not None else 0.0)
     network[f"ema_verifyx_{direction}_speed"] = ema
     return ema
+
+
+def gated_download_ema(verifyx_network: dict, prev_ema: NetworkEMA | None) -> float | None:
+    """The download EMA the gate reads for one judged probe: what `_feed_ema` stores for the
+    download direction, computed from the stored EMA without writing anything."""
+    prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
+    reading = verifyx_network.get("download_speed")
+    if reading is None and verifyx_network.get("cloudflare_fallback"):
+        return prev
+    return _ema_if_gated(prev, reading)
+
+
+def download_gate(
+    ema_download: float | None, prev_ema: NetworkEMA | None, *, first_pass: bool
+) -> Literal["unseeded", "deferred", "too_slow", "pass"]:
+    """The download-EMA floor's decision. `unseeded`, `deferred` and `pass` pass the check.
+
+    `deferred` (DAH-3011): a first pass on a never-measured host below the floor; the EMA is left
+    unseeded so the first scored cycle enforces it."""
+    if ema_download is None:
+        return "unseeded"
+    if ema_download >= MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+        return "pass"
+    never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
+    if first_pass and never_measured:
+        return "deferred"
+    return "too_slow"
+
+
+def verifyx_verdict(
+    result_data: dict | None, prev_ema: NetworkEMA | None, *, first_pass: bool
+) -> bool:
+    """Whether `VerifyXCheck.run` passes one judged probe result (`VerifyXResponse.data`) against
+    the stored EMA `prev_ema`, with no state, EMA or tally written. The cold-sample retry, which
+    takes a second sample, is not part of it."""
+    if not (result_data and result_data.get("success")):
+        return False
+    network = result_data.get("network") or {}
+    ema_download = gated_download_ema(network, prev_ema)
+    return download_gate(ema_download, prev_ema, first_pass=first_pass) != "too_slow"
 
 
 def _upload_kept_within_cap(ctx: Context, upload_blocked: bool) -> bool:

@@ -362,6 +362,21 @@ class Settings(BaseSettings):
     # `GET /version` (connect, and twice this as its whole budget) and the tunnel's local bind and
     # connect; the direct-tcpip channel open on the executor runs inside the whole-call budget.
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
+    # The liumd shadow: after the pipeline has produced the node's result, run the same
+    # GPU steps again through `liumd run` on an SSH exec channel of the same session and log one
+    # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
+    # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
+    VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
+    # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
+    # and the matmul (at most 120 s) run one after the other.
+    LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
+    # The only executors the shadow runs on: reserved, non-rentable dev executors, as
+    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries. A pod or filler started
+    # after the cycle's snapshot is not seen, so on a rentable node the shadow could run its
+    # GPU/RAM/disk/network probe next to a workload. Executor UUIDs are miner-chosen, so an entry
+    # matches only that miner's executor at that SSH endpoint. Empty = none.
+    LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
@@ -816,6 +831,23 @@ class Settings(BaseSettings):
 
     def get_allowed_advisory_ids(self) -> set[str]:
         return {s.strip() for s in self.TDX_ALLOWED_ADVISORY_IDS.split(",") if s.strip()}
+
+    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]]:
+        """`LIUMD_SHADOW_RESERVED_EXECUTORS` as (miner_hotkey, executor_uuid, address, ssh_port).
+        A malformed entry raises ValueError rather than being dropped."""
+        reserved = set()
+        for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):
+            if not entry.strip():
+                continue
+            fields = [f.strip() for f in entry.split("/")]
+            if len(fields) != 4 or not all(fields) or not fields[3].isdigit():
+                raise ValueError(
+                    "LIUMD_SHADOW_RESERVED_EXECUTORS entry is not "
+                    f"miner_hotkey/executor_uuid/address/ssh_port: {entry.strip()!r}"
+                )
+            hotkey, uuid, address, ssh_port = fields
+            reserved.add((hotkey, uuid, address, int(ssh_port)))
+        return reserved
 
     def get_allowed_gpu_hwmodels(self) -> set[str]:
         return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}

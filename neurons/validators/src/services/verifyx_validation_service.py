@@ -314,8 +314,13 @@ class VerifyXValidationService:
         challenge: "VerifyXChallenge",
         capture: SSHCapture,
         default_extra: dict,
+        *,
+        record_tally: bool = True,
     ) -> "VerifyXResponse":
-        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike."""
+        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike.
+
+        `record_tally=False` is the evaluation-only mode (the liumd shadow): the verdict is the
+        same, but nothing is counted in the process-wide NETWORK_GATE_TALLY."""
         if capture.transport_error is not None:
             return self._failure_response(
                 error=f"SSH transport error ({capture.transport_error})",
@@ -344,7 +349,7 @@ class VerifyXValidationService:
 
         try:
             payload = challenge.validator.verify_response(challenge_response)
-            verification_result = _perform_verification_checks(payload)
+            verification_result = _perform_verification_checks(payload, record_tally=record_tally)
             _log_verifyx_network_speeds(verification_result.get("network") or {}, default_extra)
             return VerifyXResponse(data=verification_result)
         except Exception as e:
@@ -672,10 +677,12 @@ def _verify_memory_test(challenge_data: dict, response_data: dict) -> Tuple[dict
     return stats, errors
 
 
-def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+def _verify_network_test(
+    challenge_data: dict, response_data: dict, *, record_tally: bool = True
+) -> Tuple[dict, List[str]]:
     """The gated answer's network: Cloudflare capacity is the number. A Cloudflare probe
     failure (429, timeout, outage) falls back to the package download instead of a zero."""
-    return _verify_network_capacity_test(challenge_data, response_data)
+    return _verify_network_capacity_test(challenge_data, response_data, record_tally=record_tally)
 
 
 def _verify_network_package_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
@@ -756,14 +763,18 @@ def _package_fallback_stats(
     package_speed,
     upload_speed,
     errors: list[str],
+    record_tally: bool = True,
 ) -> Tuple[dict, List[str]]:
-    """Use the package download as the gated number when Cloudflare failed. Never feed 0."""
-    NETWORK_GATE_TALLY.probe_fallback += 1
-    logger.warning(
-        "VerifyX Cloudflare probe failed; using the package download reading "
-        f"package_mbps={_format_mbps(package_speed)} "
-        f"error={network_execution.get('error', 'Unknown error')}"
-    )
+    """Use the package download as the gated number when Cloudflare failed. Never feed 0.
+    `record_tally=False` (an evaluation-only judgement) leaves NETWORK_GATE_TALLY untouched and
+    logs nothing: this warning carries no transport marker, so it would read as a live fallback."""
+    if record_tally:
+        NETWORK_GATE_TALLY.probe_fallback += 1
+        logger.warning(
+            "VerifyX Cloudflare probe failed; using the package download reading "
+            f"package_mbps={_format_mbps(package_speed)} "
+            f"error={network_execution.get('error', 'Unknown error')}"
+        )
     success = True
     if package_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
         errors.append(
@@ -784,7 +795,9 @@ def _package_fallback_stats(
     return stats, errors
 
 
-def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+def _verify_network_capacity_test(
+    challenge_data: dict, response_data: dict, *, record_tally: bool = True
+) -> Tuple[dict, List[str]]:
     """libverifyx.so's network: `download_speed` is the Cloudflare capacity. A Cloudflare
     probe failure falls back to the package download instead of a zero. The package download
     keeps its own floor and is published as `package_download_speed`."""
@@ -807,6 +820,7 @@ def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> 
                 capacity_speed=capacity_speed,
                 package_speed=package_speed,
                 upload_speed=upload_speed,
+                record_tally=record_tally,
                 errors=[
                     f"Network execution failed: {network_execution.get('error', 'Unknown error')}"
                 ],
@@ -866,6 +880,7 @@ def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> 
                 package_speed=package_download_speed,
                 upload_speed=upload_speed,
                 errors=errors,
+                record_tally=record_tally,
             )
         errors.append("Network performance data unavailable")
         return {**stats, "success": False, **_cloudflare_upload_mark(network_execution)}, errors
@@ -1013,11 +1028,13 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
     )
 
 
-def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
+def _perform_verification_checks(payload: dict, *, record_tally: bool = True) -> Dict[str, Any]:
     challenge_data = payload["challenge_data"]
     response_data = payload["response_data"]
 
-    network_stats, network_errors = _verify_network_test(challenge_data, response_data)
+    network_stats, network_errors = _verify_network_test(
+        challenge_data, response_data, record_tally=record_tally
+    )
     memory_stats, memory_errors = _verify_memory_test(challenge_data, response_data)
     storage_stats, storage_errors = _verify_storage_test(challenge_data, response_data)
     all_errors = network_errors + memory_errors + storage_errors
@@ -1042,21 +1059,23 @@ def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
 
     if "xet_execution" in response_data:
         xet_stats, xet_errors = _verify_xet_test(challenge_data, response_data)
-        log_extra = {
-            "xet_status": xet_stats.get("status"),
-            "xet_success": xet_stats.get("success"),
-            "xet_bytes_downloaded": xet_stats.get("bytes_downloaded"),
-            "xet_speed_mbps": xet_stats.get("speed_mbps"),
-            "xet_elapsed_ms": xet_stats.get("elapsed_ms"),
-            "xet_token_fetch_ms": xet_stats.get("token_fetch_ms"),
-            "xet_hash": xet_stats.get("hash"),
-            "xet_error": xet_stats.get("error"),
-            "xet_errors": xet_errors,
-        }
-        if xet_stats.get("success"):
-            logger.info(_m("VerifyX Xet execution passed", extra=get_extra_info(log_extra)))
-        else:
-            logger.warning(_m("VerifyX Xet execution failed", extra=get_extra_info(log_extra)))
+        # Evaluation-only (record_tally=False, the liumd shadow): no unmarked Xet log either.
+        if record_tally:
+            log_extra = {
+                "xet_status": xet_stats.get("status"),
+                "xet_success": xet_stats.get("success"),
+                "xet_bytes_downloaded": xet_stats.get("bytes_downloaded"),
+                "xet_speed_mbps": xet_stats.get("speed_mbps"),
+                "xet_elapsed_ms": xet_stats.get("elapsed_ms"),
+                "xet_token_fetch_ms": xet_stats.get("token_fetch_ms"),
+                "xet_hash": xet_stats.get("hash"),
+                "xet_error": xet_stats.get("error"),
+                "xet_errors": xet_errors,
+            }
+            if xet_stats.get("success"):
+                logger.info(_m("VerifyX Xet execution passed", extra=get_extra_info(log_extra)))
+            else:
+                logger.warning(_m("VerifyX Xet execution failed", extra=get_extra_info(log_extra)))
         result["xet"] = xet_stats
 
     return result

@@ -19,6 +19,9 @@ if [ -S "$SOCK" ]; then
   usermod -aG "$GNAME" liumuser || true
 fi
 
+# liumd's host settings, before sshd lets the validator in (the executor itself never runs liumd)
+pdm run python src/liumd_host_files.py host || echo "[liumd] host files not written; continuing"
+
 # start ssh service
 ssh-keygen -A
 service ssh start

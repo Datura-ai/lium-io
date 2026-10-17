@@ -125,7 +125,7 @@ def verifyx_service(monkeypatch):
     monkeypatch.setattr(
         vvs,
         "_perform_verification_checks",
-        lambda payload: {
+        lambda payload, **_: {
             "success": True,
             "ram": {},
             "network": {"download_speed": 900.0, "upload_speed": 500.0, "success": True},
