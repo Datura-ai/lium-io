@@ -544,7 +544,9 @@ def test_no_scoring_or_enforcement_path_reads_inspector_findings():
     # DAH-4271: the one inspector name scoring may read is the blind-streak flag, which says only
     # whether the sensor saw the rental at all, never what it found
     texts = {
-        path: path.read_text(encoding="utf-8").replace("inspector_blind_streak_passed", "")
+        path: path.read_text(encoding="utf-8")
+        .replace("inspector_blind_streak_passed", "")
+        .replace("inspector_host_write_passed", "")  # DAH-4548: host wrote into a rented pod
         for path in scoring
     }
     assert [

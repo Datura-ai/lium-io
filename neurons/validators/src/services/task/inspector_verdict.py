@@ -341,3 +341,80 @@ def build_verdict(
         unmatched_containers_count=len(names),
         unnamed_findings=unnamed,
     )
+
+
+# Docker's copy-up of the image's home files into a freshly created, empty volume (the container
+# create flow mounts `volume_<pod>` on the home dir): a write of these at the volume's top level is
+# Docker populating it, not a provider writing into the rental. The sensor drops dockerd itself, so
+# on 16 Oct the copy-ups arrived attributed to the host's init (pid 1, parent `<kernel>`) or to an
+# unresolved process (empty binary, no parent); a host shell editing `.bashrc` has neither shape
+# and counts.
+_VOLUME_COPY_UP_FILES = frozenset({".bashrc", ".profile"})
+
+
+def _is_volume_copy_up(finding: dict[str, Any]) -> bool:
+    parent = finding.get("parent")
+    writer_is_init = (
+        finding.get("pid") == 1 and isinstance(parent, dict) and parent.get("binary") == "<kernel>"
+    )
+    writer_is_unresolved = not finding.get("binary") and not parent
+    if not (writer_is_init or writer_is_unresolved):
+        return False
+    path = str(finding.get("command") or "")
+    segments = [segment for segment in path.split("/") if segment]
+    for index, segment in enumerate(segments[:-1]):
+        if segment in ("volumes", "propagated-mount"):
+            rest = segments[index + 2 :]
+            if segment == "volumes" and rest[:1] == ["_data"]:
+                rest = rest[1:]
+            # shortcut: matches by name at the volume root, not by time; a later overwrite of
+            # just these two files is missed — add the container's start time to the report if that matters
+            return len(rest) == 1 and rest[0] in _VOLUME_COPY_UP_FILES
+    return False
+
+
+def _is_copy_into_container(finding: dict[str, Any]) -> bool:
+    """`docker cp <src> <ctr>:<dst>` (the CLI) or `PUT …/archive` (the socket) — not a copy out."""
+    command = finding.get("command")
+    if not isinstance(command, str):
+        return False
+    if command.startswith(("PUT ", "GET ", "HEAD ")):
+        return command.startswith("PUT ") and "/archive" in command
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if "cp" not in tokens:
+        return False
+    positional = [token for token in tokens[tokens.index("cp") + 1 :] if not token.startswith("-")]
+    return len(positional) == 2 and ":" in positional[1] and ":" not in positional[0]
+
+
+def host_write_findings(
+    provider_findings: list[dict[str, Any]], rented_pod_ids: list[str]
+) -> list[dict[str, Any]]:
+    """The provider findings in which the host wrote into a rented pod (DAH-4548): a `docker cp`
+    into it, an archive PUT, a write on its volume other than Docker's copy-up, a write into its
+    processes' memory, a `docker update` of it. `provider_findings` already excludes the platform's own (the executor's
+    `docker cp` for restores and key injection carry its ancestry; the scheduled Lium execs are
+    suppressed at the sensor); anything with the executor's ancestry is dropped here too."""
+    rented = set(rented_pod_ids)
+    writes = []
+    for finding in provider_findings:
+        if nested_from_executor(finding):
+            continue
+        name = _named_resource(finding)
+        if not name or pod_id_of(name) not in rented:
+            continue
+        kind = _kind(finding)
+        if kind in ("DockerCp", "DockerSocketWrite"):
+            hit = _is_copy_into_container(finding)
+        elif kind == "OverlayFsWrite":
+            hit = not _is_volume_copy_up(finding)
+        else:
+            # ProcFsWrite: a `/proc/<pid>/mem` write (`procfs mem`);
+            # DockerUpdate: the host changing a rented pod's limits (CLI or POST …/update)
+            hit = kind in ("ProcessMemoryWrite", "ProcFsWrite", "DockerUpdate")
+        if hit:
+            writes.append(finding)
+    return writes

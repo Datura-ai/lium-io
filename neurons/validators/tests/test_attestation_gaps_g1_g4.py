@@ -515,6 +515,7 @@ def _score_ctx(tdx_quote, attestation_passed):
         cpu_truth_passed=True,
         provider_side_load_passed=True,
         inspector_blind_streak_passed=True,
+        inspector_host_write_passed=True,
     )
 
 
