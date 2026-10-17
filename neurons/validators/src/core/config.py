@@ -630,6 +630,9 @@ class Settings(BaseSettings):
     # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
     # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
     EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
+    # A node listed above the hard price limit earns no actual score. False (default): its job
+    # score stays 1, so the unrented incentive can still pay it. True: the job score is 0 as well.
+    PRICE_LIMIT_IDLE_ENFORCEMENT_ENABLED: bool = Field(env="PRICE_LIMIT_IDLE_ENFORCEMENT_ENABLED", default=False)
     # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
     # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
     # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no

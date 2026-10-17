@@ -2,11 +2,17 @@
 speed threshold. Other score_calculator paths (rental, price) are exercised
 via integration in test_score_check.py and test_pipeline_default_scenarios.py.
 """
-import pytest
 
-from neurons.validators.src.services.task.score_calculator import calculate_scores
+import pytest
+from helpers import (
+    build_context_config,
+    build_services,
+    build_state,
+    default_executor,
+    make_context,
+)
 from neurons.validators.src.services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
-from helpers import build_context_config, build_services, build_state, default_executor, make_context
+from neurons.validators.src.services.task.score_calculator import calculate_scores
 
 
 def _ctx_without_specs(specs, price_per_gpu=None):
@@ -105,7 +111,9 @@ def test_executor_without_deposit_scores_in_full(gpu_model):
     """Provider collateral is optional: an executor with nothing deposited keeps a full score, no warning."""
     ctx = make_context(
         executor=default_executor().model_copy(update={"price_per_gpu": None}),
-        state=build_state(gpu_model=gpu_model, specs={"network": {"ema_verifyx_download_speed": 500.0}}),
+        state=build_state(
+            gpu_model=gpu_model, specs={"network": {"ema_verifyx_download_speed": 500.0}}
+        ),
         services=build_services(),
         config=build_context_config(),
         collateral_deposited=False,
@@ -123,3 +131,44 @@ def test_inspector_blind_streak_flag_zeroes_a_rented_score():
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == 0.0
     assert "Rental sensor saw nothing of the rental" in warning
+
+
+@pytest.mark.parametrize("enforced, expected_job_score", [(False, 1.0), (True, 0.0)])
+def test_price_above_hard_limit_zeroes_job_score_only_when_enforced(
+    monkeypatch, enforced, expected_job_score
+):
+    """The unrented incentive pays on a positive job score, so the hard price limit must zero it too to stop idle pay."""
+    from types import SimpleNamespace
+
+    from neurons.validators.src.services.task import score_calculator
+
+    monkeypatch.setattr(
+        score_calculator,
+        "shared_client",
+        SimpleNamespace(
+            config=SimpleNamespace(machine_prices={"NVIDIA B200": 2.0}, machine_max_price_rate=4.0)
+        ),
+    )
+    monkeypatch.setattr(score_calculator.settings, "PRICE_LIMIT_IDLE_ENFORCEMENT_ENABLED", enforced)
+    ctx = make_context(
+        executor=default_executor().model_copy(update={"price_per_gpu": 8.5}),
+        state=build_state(
+            gpu_model="NVIDIA B200", specs={"network": {"ema_verifyx_download_speed": 500.0}}
+        ),
+        services=build_services(),
+        config=build_context_config(),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+    )
+
+    actual_score, job_score, warning = calculate_scores(ctx, rented=False)
+
+    assert actual_score == 0.0
+    assert job_score == expected_job_score
+    assert "GPU price exceeds the limit" in warning
+
+    # at the limit the node keeps both scores
+    ctx = ctx.model_copy(
+        update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 8.0})}
+    )
+    assert calculate_scores(ctx, rented=False)[:2] == (1.0, 1.0)

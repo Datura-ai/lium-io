@@ -51,6 +51,8 @@ def calculate_scores(
     max_price_rate = shared_client.config.machine_max_price_rate
     if price_per_gpu and price_per_gpu > base_price * max_price_rate:
         actual_score = 0.0
+        if settings.PRICE_LIMIT_IDLE_ENFORCEMENT_ENABLED:
+            job_score = 0.0
         warning_messages.append(
             f"GPU price exceeds the limit. limit: {base_price * max_price_rate}, actual: {price_per_gpu}"
         )
