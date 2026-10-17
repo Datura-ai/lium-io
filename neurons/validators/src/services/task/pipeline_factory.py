@@ -177,7 +177,9 @@ class PipelineFactory:
         """
         runner = SSHCommandRunner(shell.ssh_client, max_retries=1)
         verified_job_info = await self.redis_service.get_verified_job_info(
-            executor_info.uuid
+            miner_info.miner_hotkey,
+            executor_info.uuid,
+            rented_data.executor_owner_hotkeys.get(str(executor_info.uuid)) if rented_data else None,
         )
 
         default_extra = {
