@@ -1534,6 +1534,49 @@ class CapabilityMessages:
     )
 
 
+class GpuMemoryHealthMessages:
+    FAILED = MessageTemplate(
+        event="GPU memory reported broken by NVML",
+        reason="GPU_MEMORY_HEALTH_FAILED",
+        severity="error",
+        category="gpu",
+        impact="Node not rentable until the card is reset or replaced (a running rental is kept)",
+        remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
+        "required recovery action on the card(s) in flags; a rented card in this state faults the "
+        "renter's jobs. Check `nvidia-smi -q -d ECC,ROW_REMAPPER`: a pending remap or a "
+        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r` with "
+        "no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
+        "after a reset, mean the card must be replaced. The node passes again on the first "
+        "validation after NVML reads the card clean.",
+    )
+    FLAGGED = MessageTemplate(
+        event="GPU memory reported broken by NVML",
+        reason="GPU_MEMORY_HEALTH_FLAGGED",
+        severity="warning",
+        category="gpu",
+        impact="Proceed; score not changed (GPU_MEMORY_HEALTH_ENFORCEMENT_ENABLED is off)",
+        remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
+        "required recovery action on the card(s) in flags. Check `nvidia-smi -q -d "
+        "ECC,ROW_REMAPPER`: a pending remap or a DRAIN_AND_RESET / GPU_RESET action needs the card "
+        "drained and reset (`nvidia-smi -r` with no process on it, or a host reboot); a failed "
+        "remap, or uncorrected errors that return after a reset, mean the card should be replaced.",
+    )
+    UNKNOWN = MessageTemplate(
+        event="GPU memory health not read",
+        reason="GPU_MEMORY_HEALTH_UNKNOWN",
+        severity="info",
+        category="gpu",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="GPU memory health ok",
+        reason="GPU_MEMORY_HEALTH_OK",
+        severity="info",
+        category="gpu",
+        impact="Proceed",
+    )
+
+
 class GpuFaultProbeMessages:
     """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (GPU_FAULT_PROBE_CHECK_ENABLED
     without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only

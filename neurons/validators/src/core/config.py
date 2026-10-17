@@ -540,6 +540,12 @@ class Settings(BaseSettings):
     # are read and the owner decides.
     GPU_FAULT_PROBE_CHECK_ENABLED: bool = Field(env="GPU_FAULT_PROBE_CHECK_ENABLED", default=True)
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
+    # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
+    # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
+    GPU_MEMORY_HEALTH_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_MEMORY_HEALTH_ENFORCEMENT_ENABLED", default=True
+    )
     # F-1599 — a 64 MB pinned-host-memory H2D/D2H round trip on every GPU of an idle node, compared on the host.
     # A TDX guest whose GPUs are not in CC mode passed every check yet could not DMA pinned memory (8x H200,
     # 13 Oct). CHECK runs it; ENFORCEMENT lets wrong data, a copy error or a hung copy fail the node. CHECK is
