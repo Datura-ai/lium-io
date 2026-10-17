@@ -78,10 +78,9 @@ def widen_default_thread_pool(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def wait_for_services_sync(timeout=30):
-    """Wait until Redis and PostgreSQL connections are working."""
+    """Wait until Redis connection is working."""
     import time
 
-    import psycopg2
     from redis import Redis
     from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -100,21 +99,8 @@ def wait_for_services_sync(timeout=30):
             redis_client.ping()
             logger.info("Connected to Redis.")
 
-            # Check PostgreSQL connection using SQLAlchemy
-            from sqlalchemy import create_engine, text
-            from sqlalchemy.exc import SQLAlchemyError
-
-            engine = create_engine(settings.SQLALCHEMY_DATABASE_URI)
-            try:
-                with engine.connect() as connection:
-                    connection.execute(text("SELECT 1"))
-                logger.info("Connected to PostgreSQL.")
-            except SQLAlchemyError as e:
-                logger.error("Failed to connect to PostgreSQL.")
-                raise e
-
-            break  # Exit loop if both connections are successful
-        except (psycopg2.OperationalError, RedisConnectionError) as e:
+            break  # Exit loop if connection is successful
+        except RedisConnectionError as e:
             if time.time() - start_time > timeout:
                 logger.error("Timeout while waiting for services to be available.")
                 raise e

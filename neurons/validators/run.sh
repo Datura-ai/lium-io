@@ -38,7 +38,6 @@ else
 fi
 
 if [ "$MODE" = "validator" ]; then
-    pdm run alembic upgrade head
     pdm run src/validator.py
 elif [ "$MODE" = "connector" ]; then
     pdm run src/connector.py
