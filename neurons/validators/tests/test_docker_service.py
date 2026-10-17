@@ -3407,6 +3407,91 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
     ]
 
 
+_STALE_MOUNT_START_ERROR = (
+    "error while mounting volume: VolumeDriver.Mount: cannot create mount point dir "
+    "/mnt/volume_x: file exists"
+)
+
+
+async def _start_after_reboot(docker_service, monkeypatch, *, repaired: bool):
+    # the host reboot left the volume's empty mountpoint dir behind: the first start hits
+    # "file exists", and any start after the repair goes through
+    client = docker_service.rental_docker_client_factory.client
+    client.start_error = Exception(_STALE_MOUNT_START_ERROR)
+    real_start = client.start
+
+    async def start_failing_only_first_call(*, container_name: str) -> None:
+        try:
+            await real_start(container_name=container_name)
+        finally:
+            client.start_error = None
+
+    client.start = start_failing_only_first_call
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="volume_x\n"))
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    repair = AsyncMock(return_value=repaired)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair)
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = (
+        AsyncMock(return_value=True)
+    )
+    docker_service.setup_encrypted_local_volume = AsyncMock()
+    monkeypatch.setattr(docker_service, "_encrypted_local_volume_name", AsyncMock(return_value="volume_x"))
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/workspace",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    result = await docker_service.start_container(
+        payload, executor_info, Mock(ss58_address="validator-hotkey"), "encrypted-private-key"
+    )
+    return result, repair, client
+
+
+@pytest.mark.asyncio
+async def test_start_container_clears_the_stale_mountpoint_of_an_encrypted_pod_and_starts_it(
+    docker_service, monkeypatch
+):
+    result, repair, client = await _start_after_reboot(docker_service, monkeypatch, repaired=True)
+
+    assert not isinstance(result, FailedContainerRequest)
+    assert repair.await_args.args[1] == "volume_x"
+    assert client.started_containers == ["pod_test", "pod_test"]
+    # the gocryptfs remount still follows the start, as on any start of an encrypted pod
+    docker_service.setup_encrypted_local_volume.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_container_does_not_retry_when_the_stale_mountpoint_is_not_cleared(
+    docker_service, monkeypatch
+):
+    result, repair, client = await _start_after_reboot(docker_service, monkeypatch, repaired=False)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert client.started_containers == ["pod_test"]
+    docker_service.setup_encrypted_local_volume.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_start_container_remounts_when_container_state_is_encrypted(docker_service, monkeypatch):
     ssh_client = AsyncMock()
