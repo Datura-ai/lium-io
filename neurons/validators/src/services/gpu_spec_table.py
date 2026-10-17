@@ -169,6 +169,8 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
 GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 # `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300, so the same nominal size; no GB300 reading observed yet.
 GPU_VRAM_SIZES_MB["NVIDIA GB300"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
+# `NVIDIA Rubin`: 288 GB HBM4 per GPU (NVIDIA's announced spec), the B300 nominal size; no reading observed yet.
+GPU_VRAM_SIZES_MB["NVIDIA Rubin"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])  # DAH-4506: name unconfirmed until a Rubin host's nvidia-smi is seen; rate pending the art-18 ruling
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
