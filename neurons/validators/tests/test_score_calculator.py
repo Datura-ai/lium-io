@@ -123,3 +123,11 @@ def test_inspector_blind_streak_flag_zeroes_a_rented_score():
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == 0.0
     assert "Rental sensor saw nothing of the rental" in warning
+
+
+def test_gpu_identity_flag_zeroes_a_rented_score():
+    """GpuAttestationIdentityCheck is non-fatal on a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"gpu_attestation_identity_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "GPU identity changed" in warning

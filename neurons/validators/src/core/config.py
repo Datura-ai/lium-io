@@ -789,6 +789,12 @@ class Settings(BaseSettings):
     ENABLE_GPU_ATTESTATION_ENFORCEMENT: bool = Field(
         env="ENABLE_GPU_ATTESTATION_ENFORCEMENT", default=False
     )
+    # DAH-4551 - GpuAttestationIdentityCheck: each Hopper/Blackwell GPU's NVIDIA-signed identity, pinned to its
+    # UUID both ways. Shadow by default: a mismatch or forged evidence is logged as a warning event and the node
+    # passes. On = it fails the node (not fatal with a live rental). Unavailable evidence alone never fails it.
+    GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED", default=False
+    )
     # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
     # this outbound SPOF before fleet enforcement — see remediation plan CD4).
     NVIDIA_NRAS_URL: str = Field(
