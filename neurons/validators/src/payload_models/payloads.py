@@ -340,6 +340,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.
     dockerfile_content: str | None = None
+    # a gzipped tar of the build context for `dockerfile_content` and its sha256 (hex); see
+    # services/build_context.py. None builds with the Dockerfile as the only file.
+    build_context_url: str | None = None
+    build_context_sha256: str | None = None
     # DAH-1524 / DAH-2265 (default-image / cached-template deploy): set truthy by the
     # backend when the user selects the default Docker image or default cache template.
     # Such images run their own start.sh, so the validator skips work the image already

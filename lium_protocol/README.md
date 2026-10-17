@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 16 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.6.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.8.0`) is semver over the wire.
 
 ## Using it
 
@@ -52,6 +52,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.5.0` — `RentedExecutorsResponse.filler_revenue_by_gpu_config` (optional): per (base model, GPU count), `usd_per_gpu_hour` = filler revenue / filler GPU-hours over the trailing 24 hours, with the `gpu_hours` it covers; the spot-node pay and the secure floor read it. `RentedExecutorsResponse.provider_spot_executor_ids` (optional, default empty): the subset of `spot_executor_ids` whose provider chose the Spot tier, with no demotion, force-spot hotkey, pin or no-incentive rental on it; only these may take spot-node pay, so the backend must send it before spot-node pay pays anyone. The validator's `incentive_formula_version` stays `rental_price_v2`, which now has two terms when `incentive_formula_inputs` carries `unbucketed_share`: the rental term `rental_share × gpu_count × effective_rate / total_rental_cost` plus the unbucketed term `unbucketed_share × gpu_count × floor_top_up_rate / unbucketed_rental_cost`. A floored secure node is paid both; a spot node (`spot_pay: true`) only the unbucketed term, with `floor_top_up_rate` = `effective_rate`.
 - `1.6.0` — `RentedExecutorsResponse.executor_owner_hotkeys` (optional, default empty): executor_id → the hotkey the executor is listed under (the pool hotkey for a custodied account, else the miner hotkey of its MinerExecutor row), for every listed executor, rented or not. The validator logs a write to the executor's verified-job record by any other hotkey and, with its owner flag on, refuses it; an executor without an entry, or a reply from a backend that does not send the map, lets every write through.
 - `1.7.0` — `RentedExecutorsResponse.provider_email_held_executor_ids` (optional; the nodes the backend keeps unlisted until the provider confirms an e-mail address).
+- `1.8.0` — `ContainerCreateRequest.build_context_url` and `ContainerCreateRequest.build_context_sha256` (optional): a gzipped tar the validator downloads and checks against the sha256 (hex), then unpacks as the build context of `dockerfile_content`. A validator that does not take build contexts refuses such a request instead of building without the files.
 - `1.0.0` — first release.
 
 ## Tests

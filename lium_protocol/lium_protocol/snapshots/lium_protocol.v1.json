@@ -627,6 +627,30 @@
           ],
           "default": null
         },
+        "build_context_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Context Sha256"
+        },
+        "build_context_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Context Url"
+        },
         "cache_volumes": {
           "anyOf": [
             {
@@ -5749,7 +5773,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.7.0",
+  "protocol_version": "1.8.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
