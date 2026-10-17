@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# bridgectl uninstall — remove K3s + Chutes stack, restore machine to pre-setup state
+# Preserves: /opt/lium-bridge/ (scripts, state, SSH config), lium-bridge user, log file
+set -euo pipefail
+
+# --- Constants ---
+
+BRIDGE_DIR="/opt/lium-bridge"
+STATE_FILE="${BRIDGE_DIR}/state.json"
+LOG_FILE="/var/log/lium-bridge.log"
+KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+
+# --- Logging ---
+
+log() {
+    local level="$1"; shift
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [${level}] $*"
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    echo "${msg}" >&2
+}
+
+fail() {
+    local msg="$1"
+    log "FATAL" "${msg}"
+    python3 -c "
+import json, sys
+state = 'error'
+try:
+    state = json.load(open('${STATE_FILE}'))['state']
+except: pass
+json.dump({'ok': False, 'state': state, 'error': sys.argv[1]}, sys.stdout)
+" "${msg}"
+    echo ""
+    exit 1
+}
+
+read_state() {
+    python3 -c "import json; print(json.load(open('${STATE_FILE}'))['state'])" 2>/dev/null || echo "unknown"
+}
+
+save_state() {
+    local state="$1"
+    python3 -c "
+import json, sys
+s = {'state': sys.argv[1], 'gpu_verified': False, 'node_name': None, 'last_error': None}
+json.dump(s, open('${STATE_FILE}', 'w'))
+" "${state}"
+}
+
+# =============================================================================
+# STEP 1: VALIDATE STATE
+# =============================================================================
+log "INFO" "Step 1: Validating state..."
+
+[[ -f "${STATE_FILE}" ]] || fail "State file not found — nothing to uninstall"
+
+CURRENT_STATE=$(read_state)
+
+# Idempotency: if already not_installed, return success
+if [[ "${CURRENT_STATE}" == "not_installed" ]]; then
+    log "INFO" "Already in 'not_installed' state, nothing to do"
+    cat <<EOF
+{
+  "ok": true,
+  "state": "not_installed",
+  "message": "Already uninstalled"
+}
+EOF
+    exit 0
+fi
+
+log "INFO" "Current state: ${CURRENT_STATE}"
+
+# =============================================================================
+# STEP 2: STOP K3S IF RUNNING
+# =============================================================================
+log "INFO" "Step 2: Stopping K3s if running..."
+
+if systemctl is-active k3s >/dev/null 2>&1; then
+    # Best-effort Helm cleanup while K3s is still up
+    if command -v helm &>/dev/null && [[ -f "${KUBECONFIG}" ]]; then
+        log "INFO" "Removing Helm releases before teardown..."
+        helm uninstall chutes -n chutes --kubeconfig "${KUBECONFIG}" --wait --timeout 2m >> "${LOG_FILE}" 2>&1 || true
+        helm uninstall gpu-operator -n gpu-operator --kubeconfig "${KUBECONFIG}" --wait --timeout 2m >> "${LOG_FILE}" 2>&1 || true
+    fi
+
+    systemctl stop k3s || true
+
+    for i in $(seq 1 12); do
+        if ! systemctl is-active k3s >/dev/null 2>&1; then
+            break
+        fi
+        sleep 5
+    done
+
+    if systemctl is-active k3s >/dev/null 2>&1; then
+        log "WARN" "K3s did not stop gracefully, continuing with uninstall anyway"
+    else
+        log "INFO" "K3s stopped"
+    fi
+else
+    log "INFO" "K3s not running, skipping"
+fi
+
+# =============================================================================
+# STEP 3: RUN K3S BUILT-IN UNINSTALL
+# =============================================================================
+log "INFO" "Step 3: Running K3s uninstall..."
+
+if [[ -x /usr/local/bin/k3s-uninstall.sh ]]; then
+    /usr/local/bin/k3s-uninstall.sh >> "${LOG_FILE}" 2>&1 || true
+    log "INFO" "K3s uninstall script completed"
+else
+    log "INFO" "k3s-uninstall.sh not found, skipping (may already be removed)"
+    # Manual fallback: stop and disable if systemd unit still exists
+    systemctl stop k3s >> "${LOG_FILE}" 2>&1 || true
+    systemctl disable k3s >> "${LOG_FILE}" 2>&1 || true
+fi
+
+# =============================================================================
+# STEP 4: CLEAN UP SYSTEM CONFIG
+# =============================================================================
+log "INFO" "Step 4: Cleaning up system config..."
+
+# Remove sysctl and kernel module configs created by setup-chutes
+rm -f /etc/sysctl.d/99-kubernetes.conf || true
+rm -f /etc/modules-load.d/kubernetes.conf || true
+
+# Remove helm binary
+rm -f /usr/local/bin/helm || true
+
+# Remove K3s registries config (k3s-uninstall may leave /etc/rancher)
+rm -rf /etc/rancher/k3s || true
+
+# Re-enable swap (setup-chutes commented it out in /etc/fstab)
+sed -i '/\sswap\s/s/^#//' /etc/fstab 2>/dev/null || true
+
+log "INFO" "System config cleaned"
+
+# =============================================================================
+# STEP 5: CLEAN HOST MOUNTS
+# =============================================================================
+log "INFO" "Step 5: Cleaning host mounts..."
+
+rm -rf /var/snap/cache || true
+rm -rf /var/lib/chutes || true
+
+log "INFO" "Host mounts cleaned"
+
+# =============================================================================
+# STEP 6: RESTART DOCKER
+# =============================================================================
+# k3s-uninstall.sh flushes ALL iptables rules, which breaks Docker networking
+log "INFO" "Step 6: Restarting Docker to restore iptables rules..."
+
+if systemctl is-active docker >/dev/null 2>&1 || systemctl is-enabled docker >/dev/null 2>&1; then
+    systemctl restart docker >> "${LOG_FILE}" 2>&1 || true
+
+    # Wait for Docker to become healthy
+    for i in $(seq 1 15); do
+        if docker info &>/dev/null; then
+            log "INFO" "Docker restarted and healthy"
+            break
+        fi
+        sleep 2
+    done
+else
+    log "INFO" "Docker not found, skipping"
+fi
+
+# =============================================================================
+# STEP 7: SAVE STATE + OUTPUT
+# =============================================================================
+log "INFO" "Step 7: Saving state..."
+
+save_state "not_installed"
+
+log "INFO" "Uninstall complete — machine restored to pre-setup state"
+
+cat <<EOF
+{
+  "ok": true,
+  "state": "not_installed",
+  "message": "K3s + Chutes stack removed. lium-bridge scripts preserved."
+}
+EOF

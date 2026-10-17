@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# bridgectl start — start K3s + Chutes
+set -euo pipefail
+
+# --- Constants ---
+
+BRIDGE_DIR="/opt/lium-bridge"
+STATE_FILE="${BRIDGE_DIR}/state.json"
+LOG_FILE="/var/log/lium-bridge.log"
+
+# --- Logging ---
+
+log() {
+    local level="$1"; shift
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [${level}] $*"
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    echo "${msg}" >&2
+}
+
+fail() {
+    local msg="$1"
+    log "FATAL" "${msg}"
+    python3 -c "
+import json, sys
+state = 'error'
+try:
+    state = json.load(open('${STATE_FILE}'))['state']
+except: pass
+json.dump({'ok': False, 'state': state, 'error': sys.argv[1]}, sys.stdout)
+" "${msg}"
+    echo ""
+    exit 1
+}
+
+read_state() {
+    python3 -c "import json; print(json.load(open('${STATE_FILE}'))['state'])" 2>/dev/null || echo "unknown"
+}
+
+save_state() {
+    local state="$1"
+    local last_error="${2:-}"
+    python3 -c "
+import json, sys
+s = {
+    'state': sys.argv[1],
+    'gpu_verified': False,
+    'node_name': None,
+    'last_error': sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None,
+}
+try:
+    old = json.load(open('${STATE_FILE}'))
+    for k in ('gpu_verified', 'node_name'):
+        if k in old: s[k] = old[k]
+except: pass
+json.dump(s, open('${STATE_FILE}', 'w'))
+" "${state}" "${last_error}"
+}
+
+# =============================================================================
+# STEP 1: VALIDATE STATE
+# =============================================================================
+log "INFO" "Step 1: Validating state..."
+
+[[ -f "${STATE_FILE}" ]] || fail "State file not found — run setup-chutes first"
+
+CURRENT_STATE=$(read_state)
+
+# Idempotency: if already running, verify and return success
+if [[ "${CURRENT_STATE}" == "running" ]]; then
+    log "INFO" "Already in 'running' state, verifying..."
+    if systemctl is-active k3s >/dev/null 2>&1; then
+        AGENT_HEALTHY="false"
+        if k3s kubectl get pods -n chutes -l app.kubernetes.io/name=agent --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q "Running"; then
+            AGENT_HEALTHY="true"
+        fi
+        log "INFO" "Already running, K3s active"
+        cat <<EOF
+{
+  "ok": true,
+  "state": "running",
+  "chutes": { "k3s_active": true, "agent_healthy": ${AGENT_HEALTHY} }
+}
+EOF
+        exit 0
+    fi
+    log "WARN" "State says running but K3s not active, proceeding with start"
+fi
+
+if [[ "${CURRENT_STATE}" != "installed_stopped" && "${CURRENT_STATE}" != "stopped" ]]; then
+    fail "Cannot start: state is '${CURRENT_STATE}', expected 'installed_stopped' or 'stopped'"
+fi
+
+# =============================================================================
+# STEP 2: START K3S
+# =============================================================================
+log "INFO" "Step 2: Starting K3s..."
+
+systemctl start k3s
+
+log "INFO" "Waiting for node Ready..."
+for i in $(seq 1 24); do
+    if k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; then
+        break
+    fi
+    sleep 5
+done
+k3s kubectl get nodes 2>/dev/null | grep -q " Ready" || fail "K3s node did not become Ready within 2 min"
+
+log "INFO" "K3s node is Ready"
+
+# =============================================================================
+# STEP 3: WAIT FOR PODS HEALTHY
+# =============================================================================
+log "INFO" "Step 3: Waiting for Chutes pods..."
+
+AGENT_HEALTHY="false"
+for i in $(seq 1 36); do
+    if k3s kubectl get pods -n chutes -l app.kubernetes.io/name=agent --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q "Running"; then
+        AGENT_HEALTHY="true"
+        break
+    fi
+    sleep 5
+done
+
+if [[ "${AGENT_HEALTHY}" == "false" ]]; then
+    ERROR_MSG="Agent pod did not become healthy within 3 min"
+    log "FATAL" "${ERROR_MSG}"
+    save_state "error" "${ERROR_MSG}"
+    cat <<EOF
+{
+  "ok": false,
+  "state": "error",
+  "error": "${ERROR_MSG}",
+  "chutes": { "k3s_active": true, "agent_healthy": false }
+}
+EOF
+    exit 1
+fi
+
+log "INFO" "Pods status: agent=${AGENT_HEALTHY}"
+
+# =============================================================================
+# STEP 4: SAVE STATE + OUTPUT
+# =============================================================================
+log "INFO" "Step 4: Saving state..."
+
+save_state "running"
+
+log "INFO" "Start complete — Chutes active"
+
+cat <<EOF
+{
+  "ok": true,
+  "state": "running",
+  "chutes": { "k3s_active": true, "agent_healthy": ${AGENT_HEALTHY} }
+}
+EOF
