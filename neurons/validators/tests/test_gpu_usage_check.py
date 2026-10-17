@@ -236,6 +236,12 @@ def teardown_deferral_on():
         yield
 
 
+@pytest.fixture
+def teardown_deferral_off():
+    with patch.object(gpu_usage.settings, "RENTAL_TEARDOWN_DEFERRAL_ENABLED", False):
+        yield
+
+
 async def _run_the_renter_ending_mid_run(ctx):
     sink = _ListSink()
     rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
@@ -279,6 +285,7 @@ async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(co
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_off")
 async def test_with_the_deferral_off_the_renter_ending_mid_run_scores_0_as_before(context_factory):
     ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
 
@@ -309,6 +316,7 @@ async def test_with_the_deferral_off_the_renter_ending_mid_run_scores_0_as_befor
     ids=["ended-10-min-ago", "started-mid-run"],
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_off")
 async def test_with_the_deferral_off_every_pod_container_is_the_orphan_zero(
     context_factory, make_pod_rental
 ):
