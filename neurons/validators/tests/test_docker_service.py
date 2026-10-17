@@ -7166,6 +7166,8 @@ async def test_create_container_s3fs_external_volume_keeps_encrypted_local_mount
         "create_s3fs_volume",
         AsyncMock(return_value=(True, "ok")),
     )
+    # a single-slice sysbox uid range, so the Volume owner aligns and the pod keeps sysbox
+    monkeypatch.setattr(docker_service, "resolve_sysbox_subuid_base", AsyncMock(return_value=231072))
     monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
     setup_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)

@@ -1133,6 +1133,16 @@ async def _raise_unless_running_before_created(
         )
 
 
+class RequestedCapabilityUnavailable(RuntimeError):
+    """A fresh create refused itself because this node cannot give what the rental asked for (a Volume that
+    did not mount, sysbox that cannot own the Volume). ``renter_sentence`` is the wire `msg`, like
+    ContainerKilledDuringBootstrap's: it names the cause and carries no host detail."""
+
+    def __init__(self, renter_sentence: str):
+        self.renter_sentence = renter_sentence
+        super().__init__(renter_sentence)
+
+
 class ContainerKilledDuringBootstrap(Exception):
     """The container `docker run` started was killed before the bootstrap finished, and no delete of
     ours was in flight (that case is _CreateCancelledByDelete). ``cause`` is `oom`, `killed`,
@@ -5426,6 +5436,39 @@ class DockerService:
             await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}"),
         ]
 
+    async def _drop_refused_create_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        local_volume: str | None,
+        external_volume_name: str | None,
+    ) -> None:
+        """Remove what a create made before refusing itself: the local volume it created and
+        the external volume with its plugin instance. Best effort; the refusal goes out anyway."""
+        try:
+            if external_volume_name:
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker volume rm {shlex.quote(external_volume_name)} 2>/dev/null || true",
+                    "drop_refused_create_volumes",
+                )
+                await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
+            if local_volume:
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker volume rm {shlex.quote(local_volume)} 2>/dev/null || true",
+                    "drop_refused_create_volumes",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to remove the volumes of a refused create",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+            )
+
     async def remove_s3fs_volume_plugin(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -8048,6 +8091,20 @@ class DockerService:
                         prev_timestamp = now_ms()
                         external_volume_name = external_volume_info.name
                         if payload.is_sysbox and sysbox_subuid_base is None:
+                            if not payload.local_volume:
+                                current_step = "external_volume_sysbox_owner"
+                                # A fresh rental asked for sysbox; it fails here, before the
+                                # container exists, instead of starting on runc without it.
+                                await self._drop_refused_create_volumes(
+                                    ssh_client,
+                                    default_extra,
+                                    local_volume=local_volume if created_local_volume else None,
+                                    external_volume_name=external_volume_name,
+                                )
+                                raise RequestedCapabilityUnavailable(
+                                    "This node cannot run the pod with its Volume attached (its sysbox uid range "
+                                    "cannot own the Volume); rent another node"
+                                )
                             # Decided only once the volume is really attached: runc
                             # keeps /mnt writable, sysbox without the base does not.
                             payload.is_sysbox = False
@@ -8056,6 +8113,18 @@ class DockerService:
                                 "warning",
                                 log_tag,
                             )
+                    elif not payload.local_volume:
+                        # A fresh rental asked for the Volume; it fails here, before the container
+                        # exists, instead of starting without /mnt.
+                        await self._drop_refused_create_volumes(
+                            ssh_client,
+                            default_extra,
+                            local_volume=local_volume if created_local_volume else None,
+                            external_volume_name=external_volume_info.name,
+                        )
+                        raise RequestedCapabilityUnavailable(
+                            "The attached Volume could not be mounted on this node; rent again or another node"
+                        )
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
@@ -8819,7 +8888,7 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=(
                     last_exc.renter_sentence
-                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
+                    if isinstance(last_exc, (ContainerKilledDuringBootstrap, RequestedCapabilityUnavailable))
                     else str(log_text)
                 ),
                 detail=failure_detail,
