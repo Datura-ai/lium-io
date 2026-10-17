@@ -311,6 +311,8 @@ class Settings(BaseSettings):
     # what the lost first attempt made. Off: the call fails the rent as before. Either way the
     # failure event carries `error_class: transport`.
     DOCKER_TRANSPORT_RETRY_ENABLED: bool = Field(env="DOCKER_TRANSPORT_RETRY_ENABLED", default=False)
+    # Emergency switch for new volumes only; existing recorded drivers remain usable.
+    LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
