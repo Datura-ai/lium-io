@@ -296,6 +296,21 @@ def test_g3_signing_blob_covers_nonce():
     assert ssh_pubkey_signing_blob("ssh-ed25519 AAAA key", "ff" * 32) != nonce_blob
 
 
+def test_miner_bound_signature_covers_the_miner_hotkey():
+    import bittensor
+    from services.miner_service import MinerService
+
+    kp = bittensor.Keypair.create_from_uri("//LiumTestValidator")
+    svc = MinerService.__new__(MinerService)  # signing needs no service state
+    key, nonce = "ssh-ed25519 AAAA key", "ab" * 32
+    sig = svc._sign_validator_pubkey(kp, key, nonce=nonce, miner_hotkey="5Miner")
+    assert kp.verify(ssh_pubkey_signing_blob(key, nonce, "5Miner"), sig)
+    assert not kp.verify(ssh_pubkey_signing_blob(key, nonce, "5Other"), sig)
+    # the legacy validator_signature blob is unchanged, so executors that predate the check keep working
+    assert not kp.verify(ssh_pubkey_signing_blob(key, nonce), sig)
+    assert kp.verify(ssh_pubkey_signing_blob(key, nonce), svc._sign_validator_pubkey(kp, key, nonce=nonce))
+
+
 # ---------------------------------------------------------------------------
 # G1 — NVIDIA GPU attestation (validator verification side)
 # ---------------------------------------------------------------------------

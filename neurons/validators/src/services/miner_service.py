@@ -397,6 +397,7 @@ class MinerService:
         keypair: bittensor.Keypair,
         public_key: bytes | str,
         nonce: str | None = None,
+        miner_hotkey: str | None = None,
     ) -> str:
         """Sign the canonical SSH-pubkey blob (see datura.ssh_pubkey_signing_blob).
 
@@ -405,7 +406,7 @@ class MinerService:
         is covered by the signature — otherwise the executor rejects the request.
         """
         pubkey = self._normalize_public_key(public_key)
-        return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
+        return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce, miner_hotkey)).hex()}"
 
     @for_payload_miner
     async def request_job_to_miner(
@@ -523,6 +524,9 @@ class MinerService:
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
                         validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
+                        validator_miner_signature=self._sign_validator_pubkey(
+                            my_key, public_key, nonce=nonce_hex, miner_hotkey=payload.miner_hotkey
+                        ),
                         miner_hotkey=payload.miner_hotkey, # include miner's hotkey in the request
                         executor_id=executor_id,
                         nonce=nonce_hex,
@@ -1483,6 +1487,9 @@ class MinerService:
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
                         validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                        validator_miner_signature=self._sign_validator_pubkey(
+                            my_key, public_key, miner_hotkey=payload.miner_hotkey
+                        ),
                         executor_id=payload.executor_id,
                         is_rental_request=isinstance(payload, ContainerCreateRequest),
                         miner_hotkey=payload.miner_hotkey
@@ -1944,6 +1951,9 @@ class MinerService:
                     SSHPubKeySubmitRequest(
                         public_key=payload.public_key,
                         validator_signature=self._sign_validator_pubkey(my_key, payload.public_key),
+                        validator_miner_signature=self._sign_validator_pubkey(
+                            my_key, payload.public_key, miner_hotkey=payload.miner_hotkey
+                        ),
                         executor_id=payload.executor_id,
                         is_rental_request=False,
                         miner_hotkey=payload.miner_hotkey,
@@ -2487,6 +2497,9 @@ class MinerService:
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
+                validator_miner_signature=self._sign_validator_pubkey(
+                    my_key, public_key, nonce=nonce_hex, miner_hotkey=payload.miner_hotkey
+                ),
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=executor_id,
                 nonce=nonce_hex,
@@ -2736,6 +2749,9 @@ class MinerService:
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                validator_miner_signature=self._sign_validator_pubkey(
+                    my_key, public_key, miner_hotkey=payload.miner_hotkey
+                ),
                 executor_id=payload.executor_id,
                 is_rental_request=isinstance(payload, ContainerCreateRequest),
                 miner_hotkey=payload.miner_hotkey
@@ -3111,6 +3127,9 @@ class MinerService:
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key),
+                validator_miner_signature=self._sign_validator_pubkey(
+                    my_key, payload.public_key, miner_hotkey=payload.miner_hotkey
+                ),
                 executor_id=payload.executor_id,
                 is_rental_request=False,
                 miner_hotkey=payload.miner_hotkey,

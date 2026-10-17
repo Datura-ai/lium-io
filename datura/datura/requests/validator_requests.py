@@ -55,7 +55,9 @@ class AuthenticateRequest(BaseValidatorRequest):
         return self.payload.blob_for_signing()
 
 
-def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
+def ssh_pubkey_signing_blob(
+    public_key: str, nonce: str | None = None, miner_hotkey: str | None = None
+) -> str:
     """Canonical message the validator signs over an SSH public key.
 
     CRITICAL: This is the single source of truth for the validator_signature
@@ -67,10 +69,14 @@ def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
     folded into the signed message so it cannot be stripped or swapped in
     transit while keeping a valid signature (a stripped nonce downgrades the
     verification to the legacy blob, which no longer matches the signature).
+
+    With a miner hotkey the blob also names the miner the validator is talking
+    to, so the executor can check the key was meant for its own miner. That form
+    is only used for the separate `validator_miner_signature`; the
+    `validator_signature` blob never carries it, so older executors keep working.
     """
-    if not nonce:
-        return public_key
-    return f"{public_key}\nnonce:{nonce}"
+    blob = f"{public_key}\nnonce:{nonce}" if nonce else public_key
+    return f"{blob}\nminer:{miner_hotkey}" if miner_hotkey else blob
 
 
 # liumd phase 1 (DAH-2834): the validator's one-call verification intent, `POST /verify` on the
@@ -161,6 +167,10 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
     # into TDX report_data[32:64] and the GPU evidence nonce. Optional for
     # backward compatibility with executors that predate the nonce channel.
     nonce: str | None = None
+    # Validator signature over ssh_pubkey_signing_blob(public_key, nonce, miner_hotkey): relayed by
+    # the miner so the executor can check the key was issued for its own miner hotkey. Optional
+    # while validators, miners and executors roll out.
+    validator_miner_signature: str | None = None
 
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):

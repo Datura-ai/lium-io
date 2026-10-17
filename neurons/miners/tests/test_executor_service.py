@@ -121,6 +121,22 @@ async def test_send_pubkey_to_executor_includes_validator_signature(
 
 
 @pytest.mark.asyncio
+async def test_send_pubkey_to_executor_relays_the_miner_bound_signature(executor_service, test_executor):
+    """miner_hotkey and validator_miner_signature reach the executor verbatim; absent when not sent."""
+    mock_session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
+        await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", miner_hotkey="5Miner", validator_miner_signature="0xbb"
+        )
+        sent = mock_session.post.call_args.kwargs["json"]
+        assert (sent["miner_hotkey"], sent["validator_miner_signature"]) == ("5Miner", "0xbb")
+
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")
+        sent = mock_session.post.call_args.kwargs["json"]
+        assert "miner_hotkey" not in sent and "validator_miner_signature" not in sent
+
+
+@pytest.mark.asyncio
 async def test_remove_pubkey_from_executor_includes_validator_signature(
     executor_service, test_executor, validator_keypair
 ):
@@ -204,7 +220,7 @@ async def test_register_pubkey_splits_known_from_accepted(executor_service, vali
     dead = Executor(uuid=uuid4(), validator="//TestValidator", address="203.0.113.11", port=8001)
     executor_service.executor_dao.get_executors_for_validator.return_value = [reachable, dead]
 
-    async def only_the_reachable_one_answers(executor, pubkey, signature, nonce=None):
+    async def only_the_reachable_one_answers(executor, pubkey, signature, nonce=None, **_):
         return _ssh_info(executor) if executor is reachable else None
 
     executor_service.send_pubkey_to_executor = only_the_reachable_one_answers

@@ -95,7 +95,7 @@ defaults are `8001` / `8001` / `2200` (`lium mine` proposes `8080` for the servi
 - **EXTERNAL_PORT**: external expose port of your executor docker container
 - **SSH_PORT**: ssh port map into 22 of your executor docker container
 - **SSH_PUBLIC_PORT**: [Optional] ssh public access port of your executor docker container. If `SSH_PUBLIC_PORT` is equal to `SSH_PORT` then you don't have to specify this port.
-- **MINER_HOTKEY_SS58_ADDRESS**: your provider hotkey (SS58 address)
+- **MINER_HOTKEY_SS58_ADDRESS**: your provider hotkey (SS58 address). It must be the hotkey this node is listed under: the validator signs each SSH key it sends for the miner hotkey it is validating, and the executor logs (and, once enforcement is on, refuses) a key issued for a different hotkey
 - **RENTING_PORT_RANGE**: The port range that are publicly accessible. This can be empty if all ports are open. Available formats are: 
   - Range Specification(`from-to`): a range of ports, such as 2000-2005. This means ports from 2000 to 2005 will be open for the validator to select.
   - Specific Ports(`port1,port2,port3`): individual ports, such as 2000,2001,2002. This means only ports 2000, 2001, and 2002 will be available for the validator.
@@ -113,6 +113,7 @@ Optional, commented out in the template (`src/core/config.py` has the defaults):
 - **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that does not name this host's `MINER_HOTKEY_SS58_ADDRESS`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)
 - **LOCAL_VERIFY_MAX_DEADLINE_SECONDS**: the longest a `/verify` intent may keep the GPU before the executor answers with what finished (default `600`)
 - **LOCAL_VERIFY_INTENT_WINDOW_SECONDS**: how far a `/verify` intent's `issued_at` may be from this host's clock (default `120`; NTP, as above)
+- **REQUIRE_MINER_BOUND_SSH_KEY**: refuse a validator SSH key that was not signed for this host's `MINER_HOTKEY_SS58_ADDRESS` (default `false`: such a key is accepted and logged as `ssh_key_miner_binding`)
 - **NODE_HEARTBEAT_ENABLED**: send a signed heartbeat to `{COMPUTE_REST_API_URL}/v1/node-heartbeat` every interval, signed with this host's SSH ed25519 host key, so the backend sees uptime between validator checks (default `false`; a failed send is logged and retried, and repeated 401/404 answers back off up to one hour). A new container makes a new host key at start, so the backend refuses its heartbeats until the next validator check has connected to the node and passed on the new key
 - **NODE_HEARTBEAT_INTERVAL_SECONDS**: seconds between heartbeats (default `60`; a value below `10` is used as `10` with a warning)
 
