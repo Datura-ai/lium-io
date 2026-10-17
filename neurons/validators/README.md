@@ -80,3 +80,11 @@ Ports already held by a rental or a filler are skipped.
 - **Per-range tally:** the port-connectivity event carries `port_ranges`, a list of `{range, declared, probed, answered}` entries. Declared ports are grouped into buckets of `PORT_RANGE_BUCKET_WIDTH` (5000) ports by external port, so a partial forward shows which part of a wide range answered.
 
 Code: `src/services/executor_connectivity/port_selector.py` (`select`, `tally_port_ranges`) and `orchestrator.py`.
+
+## Download speed from inside a container
+
+The VerifyX speed test runs on the host network. A renter's container goes through the docker bridge and NAT and can get far less, so on an idle node (no pod, no filler) the validator also starts a throwaway `alpine:3.19` container (with `sysbox-runc` where the node has it) once every `CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS` (6) and reads up to 16 MiB of a pinned PyPI wheel (files.pythonhosted.org) and a pinned Hugging Face file, 30 s each. Each run logs `CONTAINER_DOWNLOAD_SPEED` with endpoint, bytes, seconds and Mbps, or an error kind (`dns_failed`, `unreachable`, `timeout`, `http_error`, `no_output`, `other`).
+
+A reading fails when an endpoint reads under `CONTAINER_DOWNLOAD_SPEED_MIN_MBPS` (10), or the container cannot reach an endpoint that the validator itself reaches. Two failing readings in a row (the second 30 min after the first) are the finding: `CONTAINER_DOWNLOAD_SLOW_OBSERVED` (logged only) by default, and `CONTAINER_DOWNLOAD_SLOW` (score 0, until a reading passes) with `CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED=true`. An endpoint the validator cannot reach either, an HTTP error or a container that did not start is no verdict.
+
+Code: `src/services/task/checks/container_download_speed.py`.

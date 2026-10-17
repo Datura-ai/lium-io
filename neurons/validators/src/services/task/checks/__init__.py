@@ -26,6 +26,7 @@ from .pinned_memory_probe import PinnedMemoryProbeCheck
 from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .registry_pull import RegistryPullCheck
+from .container_download_speed import ContainerDownloadSpeedCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
@@ -70,6 +71,7 @@ __all__ = [
     "PortCountCheck",
     "ProviderSideLoadCheck",
     "RegistryPullCheck",
+    "ContainerDownloadSpeedCheck",
     "RentalProbeCheck",
     "RentalVerificationCheck",
     "RentedGpuDropCheck",

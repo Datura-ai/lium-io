@@ -32,6 +32,7 @@ from .checks import (
     CachedTemplateVerificationCheck,
     CapabilityCheck,
     CollateralStatusCheck,
+    ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -354,6 +355,9 @@ class PipelineFactory:
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
                 # renter's pod).
                 RegistryPullCheck(),
+                # DAH-3420: download speed from inside a container, as a renter gets it. Leaves rented and
+                # filler nodes alone itself; after PortConnectivityCheck, which settles sysbox_runtime.
+                ContainerDownloadSpeedCheck(),
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
@@ -470,6 +474,7 @@ class PipelineFactory:
                             PortConnectivityCheck(),
                             PortCountCheck(),
                             RegistryPullCheck(),
+                            ContainerDownloadSpeedCheck(),
                             SysboxRequiredCheck(),
                             RentalVerificationCheck(),
                         ],
@@ -538,6 +543,7 @@ class PipelineFactory:
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # RegistryPullCheck left out: it removes and pulls an image on the executor.
+                # ContainerDownloadSpeedCheck left out: it starts a container on the executor.
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).

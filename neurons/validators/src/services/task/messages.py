@@ -1323,6 +1323,66 @@ class RegistryPullMessages:
     )
 
 
+CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
+    "a container on this node downloads from PyPI or Hugging Face far slower than the host does, so a renter's "
+    "`pip install` or model download crawls; check the docker bridge MTU against the uplink (`ip link`; set "
+    '"mtu" in /etc/docker/daemon.json to the uplink\'s and restart docker), NAT/firewall rules and any traffic '
+    "shaping on docker traffic, then `docker run --rm alpine:3.19 wget -O /dev/null "
+    "https://files.pythonhosted.org/packages/9b/b4/e3c7e6fab0f77fff6194afa173d1f2342073d91b1d3b4b30b17c3fb4407a/"
+    "numpy-2.1.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` on the host must finish in seconds"
+)
+
+
+class ContainerDownloadSpeedMessages:
+    SLOW = MessageTemplate(
+        event="Downloads from inside a container on this node are too slow",
+        reason="CONTAINER_DOWNLOAD_SLOW",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=CONTAINER_DOWNLOAD_SLOW_REMEDIATION,
+    )
+    # the same finding while CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED is off: logged, score unchanged
+    SLOW_OBSERVED = MessageTemplate(
+        event="Downloads from inside a container on this node are too slow (not enforced)",
+        reason="CONTAINER_DOWNLOAD_SLOW_OBSERVED",
+        severity="warning",
+        category="runtime",
+        impact="None: CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED is off",
+        remediation=CONTAINER_DOWNLOAD_SLOW_REMEDIATION,
+    )
+    SLOW_ONCE = MessageTemplate(
+        event="A container download was slow once; the next reading decides",
+        reason="CONTAINER_DOWNLOAD_SLOW_ONCE",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+        remediation=CONTAINER_DOWNLOAD_SLOW_REMEDIATION,
+    )
+    OK = MessageTemplate(
+        event="Container download speed verified",
+        reason="CONTAINER_DOWNLOAD_SPEED_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # an endpoint the validator cannot reach either, an HTTP error, or a container that did not run
+    UNMEASURED = MessageTemplate(
+        event="Container download speed reached no verdict",
+        reason="CONTAINER_DOWNLOAD_SPEED_UNMEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Container download speed check skipped",
+        reason="CONTAINER_DOWNLOAD_SPEED_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 VERIFYX_DEBUG_DOC_URL = (
     "https://github.com/Datura-ai/lium-io/blob/main/docs/lium-io/verifyx-debug.md"
 )
