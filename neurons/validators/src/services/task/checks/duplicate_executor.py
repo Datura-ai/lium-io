@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-from services.redis_service import DUPLICATED_MACHINE_SET
+from services.redis_service import DUPLICATED_MACHINE_SET, GPU_UUID_HOTKEYS_SEEN
 
 from ..messages import DuplicateExecutorMessages as Msg, render_message
 from ..models import JobResult
 from ..pipeline import CheckResult, Context
+from .banned_provider import has_live_rental
 
 logger = get_logger(__name__)
 
@@ -33,6 +36,7 @@ class DuplicateExecutorCheck:
     The set is fed by the backend and keyed per miner hotkey, so it cannot see one machine that
     two hotkeys report under one executor UUID (the backend keeps a single row for it). That case
     is settled once per cycle, after every pipeline has ended, by `keep_one_miner_per_executor`.
+    GPU UUIDs another hotkey reported in earlier cycles are checked by `_cross_hotkey_gpu_uuids`.
     """
 
     check_id = "executor.validate.duplicate"
@@ -71,13 +75,73 @@ class DuplicateExecutorCheck:
                 updates={"clear_verified_job_info": True},
             )
 
+        conflict, seen_writes = await self._cross_hotkey_gpu_uuids(ctx)
+        if conflict is not None:
+            return conflict
+
         event = render_message(
             Msg.UNIQUE,
             ctx=ctx,
             check_id=self.check_id,
             what={"executor_uuid": ctx.executor.uuid},
         )
-        return CheckResult(passed=True, event=event)
+        updates = {"gpu_uuid_hotkeys_seen": seen_writes} if seen_writes else {}
+        return CheckResult(passed=True, event=event, updates=updates)
+
+    async def _cross_hotkey_gpu_uuids(self, ctx: Context) -> tuple[CheckResult | None, dict[str, str]]:
+        """DAH-4546: GPU UUIDs seen under a different miner hotkey within the window.
+
+        GPU_UUID_HOTKEYS_SEEN maps each reported GPU UUID to {hotkey: last seen epoch s}. The current
+        hotkey is recorded only when no other hotkey holds a card inside the window and the whole cycle
+        passes (the check returns the writes; ResultHandler applies them on success), so the hotkey that
+        listed the cards first keeps passing and the relister fails until the first one has not reported
+        them for CROSS_HOTKEY_GPU_UUID_WINDOW_DAYS (a sale or move waits out the window once). The same
+        hotkey under a new executor id matches its own entry and passes. Off = a structured warning only.
+        """
+        uuids = sorted({u for u in (ctx.state.gpu_uuids or "").split(",") if u})
+        if not uuids:
+            return None, {}
+        redis = ctx.services.redis
+        now = time.time()
+        window = settings.CROSS_HOTKEY_GPU_UUID_WINDOW_DAYS * 86400
+        seen: dict[str, dict[str, float]] = {}
+        for uuid in uuids:
+            raw = await redis.hget(GPU_UUID_HOTKEYS_SEEN, uuid)
+            entries = json.loads(raw) if raw else {}
+            seen[uuid] = {hk: ts for hk, ts in entries.items() if now - ts < window}
+        matches = {
+            uuid: sorted(hk for hk in hotkeys if hk != ctx.miner_hotkey)
+            for uuid, hotkeys in seen.items()
+            if any(hk != ctx.miner_hotkey for hk in hotkeys)
+        }
+        if not matches:
+            return None, {uuid: json.dumps({**hotkeys, ctx.miner_hotkey: now}) for uuid, hotkeys in seen.items()}
+
+        enforced = settings.CROSS_HOTKEY_GPU_UUID_ENFORCEMENT_ENABLED
+        what = {
+            "executor_uuid": ctx.executor.uuid,
+            "miner_hotkey": ctx.miner_hotkey,
+            "other_hotkeys": sorted({hk for hks in matches.values() for hk in hks}),
+            "matching_gpu_uuids": sorted(matches),
+            "window_days": settings.CROSS_HOTKEY_GPU_UUID_WINDOW_DAYS,
+            "enforced": enforced,
+        }
+        logger.warning(
+            _m(
+                "GPU UUIDs seen under another miner hotkey",
+                extra=get_extra_info({**ctx.default_extra, "outcome": Msg.CROSS_HOTKEY_GPU_UUID.reason, **what}),
+            )
+        )
+        if not enforced:
+            return None, {}
+        event = render_message(Msg.CROSS_HOTKEY_GPU_UUID, ctx=ctx, check_id=self.check_id, what=what)
+        # A live pod keeps being verified, as with a GPU ban (has_live_rental).
+        return CheckResult(
+            passed=False,
+            event=event,
+            updates={"clear_verified_job_info": True},
+            fatal=not has_live_rental(ctx),
+        ), {}
 
 
 @dataclass(frozen=True)

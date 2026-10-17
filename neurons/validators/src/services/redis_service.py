@@ -24,6 +24,8 @@ POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
+# DAH-4546: hash, GPU UUID -> JSON {miner hotkey: last seen epoch s}; read and written by DuplicateExecutorCheck.
+GPU_UUID_HOTKEYS_SEEN = "gpu_uuid_hotkeys_seen"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 RENTAL_PROBE_OK_PREFIX = "rental_probe_ok"

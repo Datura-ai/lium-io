@@ -398,6 +398,12 @@ class Settings(BaseSettings):
     # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
     # matched on the reported list until this is flipped from a week of clean fleet data.
     KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
+    # DAH-4546: a node whose GPU UUIDs another miner hotkey reported within the window fails with
+    # GPU_UUID_SEEN_UNDER_OTHER_HOTKEY (DuplicateExecutorCheck). Off = a structured warning only (shadow).
+    CROSS_HOTKEY_GPU_UUID_ENFORCEMENT_ENABLED: bool = Field(
+        env="CROSS_HOTKEY_GPU_UUID_ENFORCEMENT_ENABLED", default=False
+    )
+    CROSS_HOTKEY_GPU_UUID_WINDOW_DAYS: int = Field(env="CROSS_HOTKEY_GPU_UUID_WINDOW_DAYS", default=7)
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count) without changing the

@@ -235,6 +235,9 @@ class Context(BaseModel):
     # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
+    # DAH-4546: GPU UUID -> JSON {hotkey: last seen} computed by DuplicateExecutorCheck; ResultHandler writes it
+    # into GPU_UUID_HOTKEYS_SEEN only when the whole cycle passes, so a node failing a later check claims nothing.
+    gpu_uuid_hotkeys_seen: dict[str, str] = {}
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False

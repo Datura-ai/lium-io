@@ -13,7 +13,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import normalize_gpu_model
-from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
+from services.redis_service import GPU_UUID_HOTKEYS_SEEN, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -395,6 +395,8 @@ class ResultHandler:
                     uuids=gpu_uuids,
                     record_owner=record_owner,
                 )
+            for uuid, seen in context.gpu_uuid_hotkeys_seen.items():
+                await self.redis_service.hset(GPU_UUID_HOTKEYS_SEEN, uuid, seen)
         else:
             # On failure, either clear or mark as failed
             if context.clear_verified_job_info:

@@ -209,6 +209,9 @@ class DummyRedisService:
     async def hgetall(self, key: str):
         return dict(self.store.get(key) or {})
 
+    async def hget(self, key: str, field: str):
+        return (self.store.get(key) or {}).get(field)
+
     async def expire(self, key: str, seconds: int):
         pass
 
