@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from collections import Counter
 
-from ..messages import GpuModelMessages as Msg, render_message
+from services.redis_service import GPU_ANCHOR_KEY
+
+from ..messages import GpuModelMessages as Msg
+from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
+from .gpu_fingerprint import split_uuids
+from .post_rental_gpu_recheck import record_gpu_drop
+from .rented_gpu_drop import _listed_uuids
 
 
 class GpuModelValidCheck:
@@ -19,7 +25,8 @@ class GpuModelValidCheck:
     node reports, which is what a card that fell off the bus looks like. The check is fatal and
     runs before SpecChangeCheck, so the reset has to happen here; the node then leaves the market
     through the same path banned_gpu, gpu_fingerprint, duplicate_executor and spec_change use,
-    rented or idle, and is verified again on the first cycle whose scrape lists every card.
+    rented or idle, and is verified again on the first cycle whose scrape lists every card. The drop also
+    owes a post-rental recheck (post_rental_gpu_recheck.py).
 
     Every card is read, not only the first (DAH-4304): each must be a supported model, and a node
     whose cards are more than one model fails with GPU_MODEL_MIXED.
@@ -71,6 +78,8 @@ class GpuModelValidCheck:
                 check_id=self.check_id,
                 what={"gpu_count": gpu_count, "details_len": len(gpu_details)},
             )
+            anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+            await record_gpu_drop(ctx, sorted(set(anchor) - set(_listed_uuids(gpu_details))))
             return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
 
         card_mismatch = self._mixed_or_unsupported_card_result(ctx, card_models, gpu_count)

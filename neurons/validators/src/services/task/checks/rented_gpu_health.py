@@ -23,6 +23,7 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fault_probe import MAX_NVML_GPUS, PROBE_SOURCE, _cap, _parse_report
 from .gpu_fingerprint import split_uuids
+from .post_rental_gpu_recheck import record_marker
 from .rented_gpu_drop import POD_STATUS_RUNNING, _rented_gpu_count
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,9 @@ class RentedGpuHealthShadowCheck:
         what.update(judge_health(nvml, expected))
         xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
         what["xid_readable"] = bool(xid.get("available"))
+        if what["verdict"] != CARD_OK or what["flagged_card_count"]:
+            # DAH-4482: the node owes an every-card recheck on its next unrented cycle
+            await record_marker(ctx, SHADOW_LOG_KEY, what)
         if what["verdict"] == CARD_OK:
             level = logging.WARNING if what["flagged_card_count"] else logging.INFO
             self._log(ctx, what, level)

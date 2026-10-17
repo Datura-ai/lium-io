@@ -506,6 +506,60 @@ class RentedGpuHealthMessages:
     )
 
 
+class PostRentalGpuRecheckMessages:
+    """DAH-4482 — the recheck a node owes after the rented GPU health read flagged it. Shadow while
+    POST_RENTAL_GPU_RECHECK_ENABLED is off: WOULD_REQUIRE is logged and the cycle goes on."""
+
+    NO_MARKER = MessageTemplate(
+        event="Post-rental GPU recheck not needed",
+        reason="POST_RENTAL_GPU_RECHECK_NOT_NEEDED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    WOULD_REQUIRE = MessageTemplate(
+        event="Post-rental GPU recheck would be required (shadow)",
+        reason="POST_RENTAL_GPU_RECHECK_WOULD_REQUIRE",
+        severity="warning",
+        category="env",
+        impact="Shadow observation only: score was NOT changed",
+    )
+    FILLER_SKIPPED = MessageTemplate(
+        event="Post-rental GPU recheck waits: active filler",
+        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
+        severity="info",
+        category="policy",
+        impact="Proceed; the recheck runs on the next cycle without a filler.",
+    )
+    INCONCLUSIVE = MessageTemplate(
+        event="Post-rental GPU recheck gave no verdict",
+        reason="POST_RENTAL_GPU_RECHECK_INCONCLUSIVE",
+        severity="info",
+        category="env",
+        impact="Proceed; the recheck runs again next cycle.",
+    )
+    PASSED = MessageTemplate(
+        event="Post-rental GPU recheck passed",
+        reason="POST_RENTAL_GPU_RECHECK_PASSED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    FAILED = MessageTemplate(
+        event="Post-rental GPU recheck failed",
+        reason="POST_RENTAL_GPU_RECHECK_FAILED",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "A GPU showed a fault during the last rental, and after it at least one card failed the "
+            "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
+            "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
+            "and wait one cycle."
+        ),
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",

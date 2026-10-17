@@ -23,6 +23,7 @@ from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .pinned_memory_probe import PinnedMemoryProbeCheck
 from .port_connectivity import PortConnectivityCheck
+from .post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .registry_pull import RegistryPullCheck
 from .rental_probe import RentalProbeCheck
@@ -67,6 +68,7 @@ __all__ = [
     "PinnedMemoryProbeCheck",
     "PortConnectivityCheck",
     "PortCountCheck",
+    "PostRentalGpuRecheckCheck",
     "ProviderSideLoadCheck",
     "RegistryPullCheck",
     "RentalProbeCheck",

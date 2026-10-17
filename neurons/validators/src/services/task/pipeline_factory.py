@@ -53,6 +53,7 @@ from .checks import (
     PinnedMemoryProbeCheck,
     PortConnectivityCheck,
     PortCountCheck,
+    PostRentalGpuRecheckCheck,
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
@@ -372,6 +373,9 @@ class PipelineFactory:
                 # F-1599: a pinned-host-memory H2D/D2H round trip on every GPU (a TDX guest without GPU CC
                 # passes the matmul but cannot DMA pinned memory). On and enforcing by default.
                 PinnedMemoryProbeCheck(),
+                # DAH-4482: a node the rented health read flagged proves every card before it re-lists.
+                # Rented nodes halted above, so this only runs unrented. Off by default: logs only.
+                PostRentalGpuRecheckCheck(),
                 # DAH-2265 Plan 2: advisory, non-fatal — observes whether the executor has
                 # the recommended default image pre-pulled (DOCKER_PULL no-op). Runs here,
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
@@ -476,6 +480,7 @@ class PipelineFactory:
                             CapabilityCheck(),
                             GpuFaultProbeCheck(),
                             PinnedMemoryProbeCheck(),
+                            PostRentalGpuRecheckCheck(),
                             CachedTemplateVerificationCheck(),
                         ],
                     ]
@@ -553,6 +558,7 @@ class PipelineFactory:
                 CapabilityCheck(),
                 GpuFaultProbeCheck(),
                 PinnedMemoryProbeCheck(),
+                PostRentalGpuRecheckCheck(),
                 RentalVerificationCheck(),
                 # RentalProbeCheck(),  # SKIP: creates and removes a container on the executor
                 ScoreCheck(),
