@@ -1662,3 +1662,40 @@ def test_lium_workload_containers_counts_the_pod_container_of_an_unnamed_pod():
     ctx.state.rented_data = rented_data
 
     assert gpu_usage.lium_workload_containers(ctx) == {f"{POD_CONTAINER_PREFIX}53a68595"}
+
+
+@pytest.mark.parametrize("load", [(100, 61), (2, 3)], ids=["high_load", "low_load"])
+@pytest.mark.parametrize(
+    "scraped_digest, enforced, expected_pass",
+    [
+        ("sha256:filler", True, True),  # the image it was started from
+        ("sha256:other", False, True),  # another image, logged only
+        ("sha256:other", True, False),  # another image under enforcement: foreign GPU work
+        ("", True, True),  # image digest unknown to the scrape: not judged
+    ],
+)
+@pytest.mark.asyncio
+async def test_filler_gpu_work_counts_only_on_the_filler_image(
+    context_factory, monkeypatch, scraped_digest, enforced, expected_pass, load
+):
+    from neurons.validators.src.services.redis_service import FILLER_IMAGE_DIGESTS_PREFIX
+
+    monkeypatch.setattr(gpu_usage.settings, "FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED", enforced)
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    services = build_services()
+    await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{filler_container}", '["sha256:filler"]')
+    state = build_state(
+        gpu_details=[{"gpu_utilization": load[0], "memory_utilization": load[1]}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+        specs={"docker": {"containers": [{"name": filler_container, "digest": scraped_digest}]}},
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == (Msg.USAGE_OK if expected_pass else Msg.USAGE_HIGH).reason

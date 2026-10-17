@@ -382,6 +382,12 @@ class Settings(BaseSettings):
     # filler container. Rollout: shadow first, flip enforcement after the shadow data is clean.
     FILLER_LIVENESS_CHECK_ENABLED: bool = Field(env="FILLER_LIVENESS_CHECK_ENABLED", default=True)
     FILLER_LIVENESS_ENFORCEMENT_ENABLED: bool = Field(env="FILLER_LIVENESS_ENFORCEMENT_ENABLED", default=False)
+    # GPU work inside a filler container counts as the filler's only while the container runs the
+    # image the validator started it from (recorded at create). A mismatch is always logged
+    # (FILLER_IMAGE_MISMATCH); with this on, the GPU usage check judges that work as foreign.
+    FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED: bool = Field(
+        env="FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED", default=False
+    )
     # DAH-2671 spec-truth checks. Each pair mirrors the FILLER_LIVENESS precedent above:
     # CHECK_ENABLED is the master switch — shadow mode computes the signal and emits the event/log
     # but returns passed=True and never changes score; ENFORCEMENT (only effective while

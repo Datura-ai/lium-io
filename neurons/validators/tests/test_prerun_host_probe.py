@@ -1555,7 +1555,11 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     # the fail-closed pid_max read every rental makes comes first; only then does the removal run (at SSH
     # connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
-    assert _cmds(ssh_client) == ["cat /proc/sys/kernel/pid_max", *commands]
+    cmds = _cmds(ssh_client)
+    # a filler create also reads its image digests once it is up (a read-only command, after the removal)
+    image_reads = [cmd for cmd in cmds if cmd.startswith("/usr/bin/docker image inspect --format '{{json .RepoDigests}}'")]
+    assert len(image_reads) == (payload_fields.get("workload_kind") == WorkloadKind.FILLER)
+    assert [cmd for cmd in cmds if cmd not in image_reads] == ["cat /proc/sys/kernel/pid_max", *commands]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)
