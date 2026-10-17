@@ -39,13 +39,16 @@ class PodRecoverer(Protocol):
     # DAH-3436: the rental probe rents the node through the same two entry points a renter's pod
     # takes (miner_service hands the backend's requests to these), so there is one start path and
     # one teardown path to keep correct. `private_key` is the Fernet-encrypted key as the backend
-    # sends it; both decrypt it themselves.
+    # sends it; both decrypt it themselves. `beside_fillers`: the probe's create on a node running
+    # a filler, which leaves the filler and its GPU power cap alone.
     async def create_container(
         self,
         payload: Any,
         executor_info: ExecutorSSHInfo,
         keypair: Any,
         private_key: str,
+        *,
+        beside_fillers: bool = False,
     ) -> Any: ...
 
     async def delete_container(

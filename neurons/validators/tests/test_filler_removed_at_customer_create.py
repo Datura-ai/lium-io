@@ -25,7 +25,7 @@ import asyncssh
 import pytest
 
 from payload_models.payloads import ContainerCreated, WorkloadKind
-from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_client
+from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _run, _ssh_client
 
 import services.docker_service as ds_module
 from services.docker_service import (
@@ -713,3 +713,79 @@ async def test_create_path_asks_for_every_filler_on_a_customer_create_only(
 
     assert isinstance(result, ContainerCreated)
     assert svc.clean_existing_containers.await_args.kwargs["remove_every_filler"] is every_filler
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_beside_fillers_removes_stale_pods_but_no_filler(
+    docker_service, retry_ssh_mock
+):
+    # the rental probe beside a filler: the backend lists no filler to it, and none may go
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=[_listing("pod_target\nfiller_a\npod_stale\n")])
+
+    removed = await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={"executor_uuid": "exec-1"},
+        pod_name="pod_target",
+        active_container_names=[],
+        keep_every_filler=True,
+    )
+
+    assert "filler_a" not in removed
+    rm_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert "pod_stale" in rm_command
+    assert "filler_a" not in rm_command and "volume_a" not in rm_command
+
+
+def _patch_filler_touching_steps(svc, monkeypatch) -> dict[str, AsyncMock]:
+    steps = {
+        "remove_fillers_at_ssh_connect": AsyncMock(
+            return_value=ds_module.FillerRemovalAtSshConnect(
+                listed_id_by_filler_name={}, removed_cleanly_without_volume_rm=False
+            )
+        ),
+        "_restore_gpu_power_for_uncapped_pod": AsyncMock(),
+        "reclaim_dphn_cache_for_rental": AsyncMock(return_value=[]),
+    }
+    for name, mock in steps.items():
+        monkeypatch.setattr(svc, name, mock)
+    return steps
+
+
+@pytest.mark.asyncio
+async def test_a_create_beside_fillers_removes_no_filler_and_lifts_no_power_cap(svc, monkeypatch):
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    steps = _patch_filler_touching_steps(svc, monkeypatch)
+    payload = _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL)
+
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+        beside_fillers=True,
+    )
+
+    assert isinstance(result, ContainerCreated)
+    for mock in steps.values():
+        mock.assert_not_awaited()
+    sweep = svc.clean_existing_containers.await_args.kwargs
+    assert sweep["remove_every_filler"] is False and sweep["keep_every_filler"] is True
+    # nor does the running check after `docker run` remove a filler, should it learn to
+    assert not svc.check_container_running.await_args.kwargs.get("remove_every_filler")
+
+
+@pytest.mark.asyncio
+async def test_a_customer_create_still_removes_fillers_and_restores_power(svc, monkeypatch):
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    steps = _patch_filler_touching_steps(svc, monkeypatch)
+
+    result = await _run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, ContainerCreated)
+    for mock in steps.values():
+        mock.assert_awaited()
+    sweep = svc.clean_existing_containers.await_args.kwargs
+    assert sweep["remove_every_filler"] is True and sweep["keep_every_filler"] is False

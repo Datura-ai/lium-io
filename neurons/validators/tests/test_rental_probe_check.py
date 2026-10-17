@@ -75,9 +75,11 @@ def probe_settings(
     egress_check: bool = False,
     egress_enforced: bool = False,
     enforced: bool = True,
+    beside_fillers: bool = False,
 ):
     with patch("neurons.validators.src.services.task.checks.rental_probe.settings") as s:
         s.RENTAL_PROBE_ENABLED = enabled
+        s.RENTAL_PROBE_BESIDE_FILLERS_ENABLED = beside_fillers
         s.RENTAL_PROBE_ENFORCEMENT_ENABLED = enforced
         s.RENTAL_PROBE_INTERVAL_HOURS = interval_hours
         s.RENTAL_PROBE_SSH_DEADLINE_SECONDS = deadline
@@ -123,10 +125,12 @@ class FakeDocker:
             else ContainerDeleted(miner_hotkey=MINER, executor_id=EXECUTOR.uuid, pod_id="pod")
         )
         self.create_calls: list[tuple] = []
+        self.create_options: list[dict] = []
         self.delete_calls: list[tuple] = []
 
-    async def create_container(self, payload, executor_info, keypair, private_key):
+    async def create_container(self, payload, executor_info, keypair, private_key, **options):
         self.create_calls.append((payload, executor_info, keypair, private_key))
+        self.create_options.append(options)
         if isinstance(self.create_result, Exception):
             raise self.create_result
         return self.create_result
@@ -642,7 +646,7 @@ async def test_the_probe_holds_the_create_lock_from_the_idleness_re_read_until_i
     events: list[str] = []
 
     class RecordingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, **_):
             events.append("create")
             return await super().create_container(payload, executor_info, keypair, private_key)
 
@@ -712,7 +716,7 @@ async def test_the_create_lock_is_released_when_the_create_is_cut_short():
     its TTL, and a renter's create waits that long."""
 
     class RaisingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, **_):
             raise RuntimeError("redis down")
 
     ctx, _, redis = make_probe_context(docker=RaisingDocker())
@@ -722,7 +726,7 @@ async def test_the_create_lock_is_released_when_the_create_is_cut_short():
     assert redis.create_lock_events == ["acquired", "released"]
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, **_):
             await asyncio.sleep(30)
 
     ctx, _, redis = make_probe_context(docker=HangingDocker())
@@ -1123,7 +1127,7 @@ async def test_the_cycles_cancellation_mid_create_still_removes_the_container_by
     mark, and the container binds the verified ports into the next cycle."""
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, **_):
             self.create_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(30)
             return created()
@@ -1275,7 +1279,7 @@ async def test_a_create_that_hangs_is_cut_off_and_its_container_removed_by_name(
     the node."""
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, **_):
             self.create_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(30)
             return created()
@@ -1703,3 +1707,60 @@ async def test_wait_for_sshd_uses_the_rented_probes_identification_rule(greeting
         await server.wait_closed()
 
     assert (error is None) is sshd_up, error
+
+
+def test_probing_beside_fillers_is_off_by_default():
+    fields = type(module.settings).model_fields
+    assert fields["RENTAL_PROBE_BESIDE_FILLERS_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_a_filler_node_is_probed_beside_its_filler_when_enabled():
+    """Regression: an idle node running a Lium filler is never probed, so a node whose renter
+    container cannot start is only found by the renter who preempts the filler."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers)
+    with probe_settings(beside_fillers=True), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
+    assert docker.create_options == [{"beside_fillers": True}]
+    assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_probe_on_a_node_without_a_filler_creates_with_beside_fillers_off():
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(beside_fillers=True), renter_path():
+        await RentalProbeCheck().run(ctx)
+
+    assert docker.create_options == [{"beside_fillers": False}]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_beside_the_filler_it_started_with_fails_the_node():
+    """Regression: the filler the probe ran beside is still listed afterwards and is read as one
+    given during the probe, so a broken filler node is never failed."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=[fillers, fillers])
+    with probe_settings(beside_fillers=True, deadline=1), renter_path(sshd_listens=False):
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert redis.standing_failure() == STEP_SSHD_LISTEN
+
+
+@pytest.mark.asyncio
+async def test_a_filler_given_during_a_probe_beside_another_is_no_verdict():
+    """Regression: a filler create sent during the probe can refuse beside or sweep pod_<probe>,
+    and the probe then fails the node for it."""
+    ctx, docker, redis = make_probe_context(
+        rented=rented_data(fillers=1),
+        rented_now=[rented_data(fillers=1), rented_data(fillers=2)],
+    )
+    with probe_settings(beside_fillers=True, deadline=1), renter_path(sshd_listens=False):
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.what_we_saw["reason"] == "node was given a filler during the probe"
+    assert redis.standing_failure() is None

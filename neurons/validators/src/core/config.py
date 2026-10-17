@@ -576,6 +576,12 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_PROBE_ENFORCEMENT_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
+    # On: an idle node running a Lium filler is probed too, beside the filler: the probe's create
+    # removes no filler_*, lifts no GPU power cap and reclaims no filler cache. Off: such a node is
+    # skipped ("filler running"). Only read while RENTAL_PROBE_ENABLED is on.
+    RENTAL_PROBE_BESIDE_FILLERS_ENABLED: bool = Field(
+        env="RENTAL_PROBE_BESIDE_FILLERS_ENABLED", default=False
+    )
     # A node whose containers cannot reach the internet passed every check. CHECK runs the rental probe's
     # `egress` step, which resolves and fetches pypi.org inside its renter container; ENFORCEMENT fails the
     # probe on it with NO_OUTBOUND_INTERNET (score 0). Slow still passes. Enforcement is off by default,
