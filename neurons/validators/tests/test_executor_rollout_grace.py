@@ -727,3 +727,12 @@ async def test_the_cycle_adds_its_withheld_count_to_the_window_total_only_inside
     assert closed.covers(J2) is False
     await validator_process.record_withheld_verdicts(closed, withheld, job_batch_id="batch-2", job_block=J2)
     assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 3
+
+
+def test_an_idle_node_the_miner_cannot_reach_during_the_rollout_gets_the_rented_twins_grace() -> None:
+    """Regression: EXECUTOR_UNREACHABLE_BY_MINER outside the set, so a rollout scored every
+    restarting idle node 0 while the rented ones (RENTED_EXECUTOR_NOT_LISTED) were withheld."""
+    still_on_old = _failed("node-2", "EXECUTOR_UNREACHABLE_BY_MINER", observed_digest=OLD)
+
+    assert "EXECUTOR_UNREACHABLE_BY_MINER" in ROLLOUT_FAILURE_REASONS
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == "EXECUTOR_UNREACHABLE_BY_MINER"

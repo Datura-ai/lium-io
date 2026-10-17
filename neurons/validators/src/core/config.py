@@ -611,6 +611,14 @@ class Settings(BaseSettings):
     REGISTRY_PULL_PROBE_RETRY_MINUTES: float = Field(
         env="REGISTRY_PULL_PROBE_RETRY_MINUTES", default=30.0, gt=0
     )
+    # DAH-4124, the unrented twin of the rented-not-listed row (DAH-3558, always on since
+    # DAH-4276): a node in the miner's known_executor_ids that is missing
+    # from its accepted executors (the miner could not reach it to install our key) gets no
+    # pipeline and no row, so it only "stops reporting". On, the wave writes one failed result per
+    # such unrented node (EXECUTOR_UNREACHABLE_BY_MINER, score 0, availability error). Off = today.
+    UNREACHABLE_EXECUTOR_REPORT_ENABLED: bool = Field(
+        env="UNREACHABLE_EXECUTOR_REPORT_ENABLED", default=False
+    )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     # DAH-4001 — delayed idle settlement. off: today's behaviour, nothing reported. shadow: post every cycle's

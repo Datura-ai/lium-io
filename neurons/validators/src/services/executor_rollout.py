@@ -73,6 +73,8 @@ ROLLOUT_FAILURE_REASONS = frozenset(
         # DAH-3558: the miner left the restarting executor out of its answer; the validator then
         # wrote this row for the rented node.
         AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED.value,
+        # its idle twin: a restarting unrented executor the miner cannot reach during the rollout
+        AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER.value,
         UploadFilesMessages.UPLOAD_FAILED.reason,
         TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason,
         RentalVerificationMessages.FILLER_TRANSPORT_UNREACHABLE.reason,

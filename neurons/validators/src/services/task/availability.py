@@ -49,6 +49,8 @@ class AvailabilityErrorCode(StrEnum):
     EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
     # DAH-3558: the backend lists the executor as rented, the miner answered the wave without it.
     RENTED_EXECUTOR_NOT_LISTED = "RENTED_EXECUTOR_NOT_LISTED"
+    # An unrented node the miner lists (known_executor_ids) but could not reach to install our key.
+    EXECUTOR_UNREACHABLE_BY_MINER = "EXECUTOR_UNREACHABLE_BY_MINER"
 
 
 def build_availability_event(
@@ -186,6 +188,27 @@ def build_rented_executor_not_listed_event(
             "executor_port": port,
             "miner_hotkey": miner_hotkey,
         },
+    )
+
+
+def build_executor_unreachable_by_miner_event(*, executor_uuid: str, miner_hotkey: str) -> ValidationEvent:
+    """An unrented node the miner lists for this validator and could not reach this wave.
+
+    The miner's answer carries the node's id in ``known_executor_ids`` and not in ``executors``:
+    it tried to install the validator's key and the node did not take it. Without this event the
+    wave writes nothing and the node only "stops reporting". The miner sends no address for it.
+    """
+    return build_availability_event(
+        code=AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER,
+        reach_source=ReachSource.MINER,
+        reach_target=ReachTarget.EXECUTOR_API,
+        event_text="Miner could not reach this node to install the validator's key",
+        impact="Score 0 for this cycle; the node is hidden from the market until a cycle reaches it.",
+        remediation=(
+            "Check that the executor is running and that its API port accepts the miner's "
+            "/upload_ssh_key request."
+        ),
+        what_we_saw={"executor_uuid": executor_uuid, "miner_hotkey": miner_hotkey},
     )
 
 
