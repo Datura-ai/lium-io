@@ -9242,7 +9242,11 @@ class DockerService:
             await run_logged_rental_docker_sdk_operation(
                 operation="start_container",
                 log_extra=default_extra,
-                call=lambda: docker_client.start(container_name=container_name),
+                # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
+                # every `docker start`; start moves it onto the rental network
+                call=lambda: docker_client.start(
+                    container_name=container_name, network=RENTAL_NETWORK_NAME
+                ),
                 container_name=container_name,
             )
             async with asyncssh.connect(
@@ -9277,7 +9281,9 @@ class DockerService:
         await run_logged_rental_docker_sdk_operation(
             operation="start_container",
             log_extra=default_extra,
-            call=lambda: docker_client.start(container_name=container_name),
+            call=lambda: docker_client.start(
+                container_name=container_name, network=RENTAL_NETWORK_NAME
+            ),
             container_name=container_name,
         )
         await self._restore_mount_and_sshd_after_start(

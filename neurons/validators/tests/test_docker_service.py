@@ -87,6 +87,7 @@ class _FakeRentalDockerClient:
         self.run_specs = []
         self.exec_specs = []
         self.started_containers = []
+        self.start_networks = []
         self.stopped_containers = []
         self.stop_grace_seconds_calls = []
         self.removed_containers = []
@@ -159,8 +160,9 @@ class _FakeRentalDockerClient:
             oom_killed=False,
         )
 
-    async def start(self, *, container_name: str) -> None:
+    async def start(self, *, container_name: str, network: str | None = None) -> None:
         self.started_containers.append(container_name)
+        self.start_networks.append(network)
         if self.start_error is not None:
             raise self.start_error
 
@@ -3295,6 +3297,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
     assert docker_service.rental_docker_client_factory.client.started_containers == [
         "pod_test"
     ]
+    assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals"]
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
         docker_client=docker_service.rental_docker_client_factory.client,
         container_name="pod_test",
