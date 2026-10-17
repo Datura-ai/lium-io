@@ -102,6 +102,8 @@ class FailedContainerErrorTypes(enum.Enum):
 
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
+    # the external volume is attached, nested Docker is turned off for it on this node
+    DockerInDockerDisabled = "DockerInDockerDisabled"
 
 
 class ValidatorMessage(Message, DeliveryStamps):
