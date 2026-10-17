@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shlex
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
+
+# A rented node's scrape that hangs on the host for this long in a row is the provider's fault: the
+# cycle then reports SCRAPE_HUNG_ON_HOST and resets the node. Only a timeout after which the host
+# answered a probe on the same connection counts; any other cycle, or none for the gap, ends the run.
+RENTED_SCRAPE_HANG_LIMIT_SECONDS = 6 * 60 * 60
+RENTED_SCRAPE_HANG_GAP_SECONDS = 60 * 60  # four 15-minute cycles
+RENTED_SCRAPE_HANG_KEY_PREFIX = "scrape:rented_hang_since"
+HOST_ANSWER_PROBE_TIMEOUT = 15
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -206,6 +215,72 @@ def _gpu_runtime_is_dead(failure: ScrapeFailure) -> bool:
     return match is not None and int(match.group(1)) in HOST_GPU_RUNTIME_DEAD_NVML_CODES
 
 
+def _rented_pod_ids(ctx: Context) -> list[str]:
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    if not rented_executor or not rented_executor.pods:
+        return []
+    # The executor UUID is the miner's word and the backend resets by UUID alone, so a rental another miner
+    # owns must never be cleared on this miner's report.
+    if rented_executor.miner_hotkey != ctx.miner_hotkey:
+        return []
+    return [pod.pod_id for pod in rented_executor.pods]
+
+
+async def _enforce_rented_scrape_hang(ctx: Context, result: CheckResult, check_id: str) -> CheckResult:
+    """SCRAPE_HUNG_ON_HOST plus a reset once a rented node's scrape has hung on the host for the limit.
+
+    A plain SCRAPE_TIMEOUT stays undetermined: a busy validator or either side's link ends the same way.
+    After it, a trivial command on the same connection tells them apart for this cycle: when the host
+    answers, the validator reached it and only the scrape hung. A probe that fails, any other outcome,
+    a cycle with no rental, or no cycle for RENTED_SCRAPE_HANG_GAP_SECONDS ends the run, so validator-side
+    failures never count and a new rental never inherits an earlier one's hang.
+    A Redis outage decides nothing.
+    """
+    key = f"{RENTED_SCRAPE_HANG_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    try:
+        pod_ids = _rented_pod_ids(ctx) if result.event.reason_code == Msg.SCRAPE_TIMEOUT.reason else []
+        if not pod_ids:
+            await ctx.services.redis.delete(key)
+            return result
+        probe = await ctx.runner.run("true", timeout=HOST_ANSWER_PROBE_TIMEOUT, retryable=False)
+        if not probe.success:
+            await ctx.services.redis.delete(key)
+            return result
+        now = time.time()
+        since = float(await ctx.services.redis.get(key) or now)
+        await ctx.services.redis.set(key, str(since), ex=RENTED_SCRAPE_HANG_GAP_SECONDS)
+    except Exception:
+        logger.warning(
+            _m("RENTED_SCRAPE_HANG_UNAVAILABLE", extra=get_extra_info(ctx.default_extra)), exc_info=True
+        )
+        return result
+    hung_s = int(now - since)
+    if hung_s < RENTED_SCRAPE_HANG_LIMIT_SECONDS or not settings.RENTED_SCRAPE_HANG_RESET_ENABLED:
+        result.event.what_we_saw["host_side_hang_s"] = hung_s
+        return result
+    event = render_message(
+        Msg.SCRAPE_HUNG_ON_HOST,
+        ctx=ctx,
+        check_id=check_id,
+        what={**result.event.what_we_saw, "host_side_hang_s": hung_s},
+    )
+    return CheckResult(
+        passed=False,
+        event=event,
+        updates={
+            "clear_verified_job_info": True,
+            "clear_verified_job_evidence": {
+                "reason_code": Msg.SCRAPE_HUNG_ON_HOST.reason,
+                "check_id": check_id,
+                "pod_id": pod_ids[0],
+                "rented_pod_ids": pod_ids,
+                "host_side_hang_s": hung_s,
+            },
+        },
+    )
+
+
 def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -> dict[str, Any]:
     """The reset a rented node's host-confirmed GPU runtime fault carries, or nothing.
 
@@ -218,15 +293,9 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
         return {}
     if not _gpu_runtime_is_dead(failure):
         return {}
-    rented_data = ctx.state.rented_data
-    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-    if not rented_executor or not rented_executor.pods:
+    pod_ids = _rented_pod_ids(ctx)
+    if not pod_ids:
         return {}
-    # The executor UUID is the miner's word and the backend resets by UUID alone, so a rental another miner
-    # owns must never be cleared on this miner's report.
-    if rented_executor.miner_hotkey != ctx.miner_hotkey:
-        return {}
-    pod_ids = [pod.pod_id for pod in rented_executor.pods]
     evidence: dict[str, Any] = {
         "reason_code": failure.template.reason,
         "check_id": check_id,
@@ -364,8 +433,10 @@ class MachineSpecScrapeCheck:
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
         if ctx.config.machine_scrape_source:
-            return await self._scrape_from_source(ctx, timeout)
-        return await self._scrape_uploaded_binary(ctx, timeout)
+            result = await self._scrape_from_source(ctx, timeout)
+        else:
+            result = await self._scrape_uploaded_binary(ctx, timeout)
+        return await _enforce_rented_scrape_hang(ctx, result, self.check_id)
 
     async def _scrape_from_source(self, ctx: Context, timeout: int) -> CheckResult:
         # pipe the obfuscated source into the executor's own interpreter; binary on failure

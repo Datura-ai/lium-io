@@ -465,6 +465,10 @@ class Settings(BaseSettings):
     # future resets only: an executor already reset stays inactive until its next clean scrape, and
     # cycles already skipped are not billed or paid afterwards.
     RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)
+    # A rented node whose scrape has hung on the host for RENTED_SCRAPE_HANG_LIMIT_SECONDS in a row (the
+    # validator's probe on the same connection answered, the scrape did not) is reset as SCRAPE_HUNG_ON_HOST,
+    # which the backend penalises like GPU_MISSING. On by default; false is the kill switch.
+    RENTED_SCRAPE_HANG_RESET_ENABLED: bool = Field(env="RENTED_SCRAPE_HANG_RESET_ENABLED", default=True)
     # A rented pod whose reboot failed (backend status REBOOT_FAILED) and whose container is not running:
     # the validator asks the host to start a throwaway GPU container (the executor's own image,
     # `nvidia-smi -L`). If the Docker daemon or the NVIDIA runtime refuses, the host is at fault and the

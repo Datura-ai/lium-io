@@ -217,6 +217,20 @@ class MachineSpecMessages:
             " If it repeats, check that `nvidia-smi` answers within seconds on the host."
         ),
     )
+    # Host side: a rented node's scrape timed out on every cycle for hours while the host answered a
+    # probe on the same connection, so the validator reached the host and the scrape hung there.
+    SCRAPE_HUNG_ON_HOST = MessageTemplate(
+        event="Machine specs scrape keeps hanging on the host of a rented node",
+        reason="SCRAPE_HUNG_ON_HOST",
+        severity="error",
+        category="env",
+        impact="Validation halted — verified job cleared, executor marked inactive until a clean scrape",
+        remediation=(
+            "The scrape has timed out on every cycle for hours while the host answered the validator on the"
+            " same SSH connection. Something on the host hangs it, most often a GPU query: run `nvidia-smi`"
+            " on the host, check `dmesg` for Xid errors, then reset the GPU or reboot the host."
+        ),
+    )
     SCRAPE_TRANSPORT_FAILED = MessageTemplate(
         event="Machine specs scrape returned no exit status",
         reason="SCRAPE_TRANSPORT_FAILED",
