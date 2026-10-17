@@ -44,3 +44,9 @@ def _keys_used_for_the_encryption_key() -> list[str]:
 
 def test_encryption_key_order_mirrors_the_scrape_dict() -> None:
     assert _keys_used_for_the_encryption_key() == _gpu_keys_emitted_by_the_scrape()
+
+
+def test_the_scrape_reports_the_enforced_power_limit_next_to_the_management_limit() -> None:
+    keys = _gpu_keys_emitted_by_the_scrape()
+
+    assert keys.index("gpu.power_enforced_limit") == keys.index("gpu.power_max_limit") + 1
