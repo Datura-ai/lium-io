@@ -683,6 +683,14 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
+    # support:node-1690fde2 — True: a power cap this validator recorded for a GPU uuid counts as ours
+    # under any executor id (a box re-registered while our filler ran keeps our cap under its new id).
+    # Off by default: the uuid comes from the miner's machine, so a miner could replay a capped GPU's
+    # uuid on another node to dodge the power-limit penalty. Turning it on is the penalty owners' call.
+    ENABLE_POWER_CAP_RESCUE_ACROSS_EXECUTOR_IDS: bool = Field(
+        env="ENABLE_POWER_CAP_RESCUE_ACROSS_EXECUTOR_IDS", default=False
+    )
+
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.

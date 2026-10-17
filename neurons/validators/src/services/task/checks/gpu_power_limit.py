@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from pydantic import BaseModel
+from core.config import settings
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
@@ -167,9 +168,12 @@ class GpuPowerLimitCheck:
     ) -> ValidationEvent | None:
         """DAH-2356 safety net: skip the penalty when EVERY below-floor GPU is our own stale filler cap.
 
-        A restore record is written only by this validator when it caps a filler on this executor, so
-        a below-floor reading covered by such a record is Lium's doing, not the miner's — never
-        penalize it. Restoring (which also deletes the record) waits out STALE_CAP_GRACE_SECONDS and
+        A restore record is written only by this validator when it caps a filler, keyed by the GPU
+        uuid our own scrape reads, so a below-floor reading covered by such a record is Lium's doing,
+        not the miner's — never penalize it. Only a record for this executor id counts, unless
+        ENABLE_POWER_CAP_RESCUE_ACROSS_EXECUTOR_IDS: a provider who re-registers a box while our
+        filler runs reports the same GPUs under a new id (support:node-1690fde2, 15 Oct). Restoring
+        (which also deletes the record) waits out STALE_CAP_GRACE_SECONDS and
         requires backend data, so a live filler is never uncapped. Any rejected GPU WITHOUT a matching
         record is a genuine miner-side violation → no rescue, normal penalty. Exception: when the
         Redis read itself FAILED, an uncovered GPU may still be our own cap whose record we simply
@@ -187,7 +191,9 @@ class GpuPowerLimitCheck:
             ctx.services.redis, rejected_uuids, log_extra=ctx.default_extra
         )
         own_records: list[GpuPowerRestoreRecord] = [
-            record for record in read_result.records if record.executor_id == ctx.executor.uuid
+            record for record in read_result.records
+            if record.executor_id == ctx.executor.uuid
+            or settings.ENABLE_POWER_CAP_RESCUE_ACROSS_EXECUTOR_IDS
         ]
         covered_uuids = {record.gpu_uuid for record in own_records}
         uncovered_uuids = [uuid for uuid in rejected_uuids if uuid not in covered_uuids]
@@ -203,9 +209,16 @@ class GpuPowerLimitCheck:
                     },
                 )
             return None
+        rented_data = ctx.state.rented_data
         stale_records = [
             record for record in own_records
             if time.time() - record.capped_at >= STALE_CAP_GRACE_SECONDS
+            # a cap recorded under another executor id stays while the backend still runs our filler there
+            and (
+                record.executor_id == ctx.executor.uuid
+                or rented_data is None
+                or rented_data.get_default_job_owner(record.executor_id) != DEFAULT_JOB_OWNER_LIUM
+            )
         ]
         records_restored = 0
         if self.restore_stale_caps and stale_records and ctx.state.rented_data is not None:
