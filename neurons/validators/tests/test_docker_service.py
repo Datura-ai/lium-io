@@ -6662,6 +6662,36 @@ async def test_create_container_encrypted_keys_ride_in_the_volume_setup_exec(doc
     keys_spy.assert_not_awaited()
 
 
+@pytest.mark.parametrize("local_volume, allow_init", [(None, True), ("volume_reused", False)])
+@pytest.mark.asyncio
+async def test_create_container_initialises_only_a_volume_it_created(
+    docker_service, monkeypatch, local_volume, allow_init
+):
+    # a reboot re-runs create with the pod's volume: a missing gocryptfs.conf there must fail, not start empty
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock())
+    setup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
+    payload = _create_payload(str(uuid4()), encrypted=True).model_copy(
+        update={"bootstrap_restore": None, "local_volume": local_volume}
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert setup_spy.await_args.kwargs["allow_init"] is allow_init
+
+
 @pytest.mark.asyncio
 async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_old_executor(
     docker_service,

@@ -8372,6 +8372,10 @@ class DockerService:
                                 pod_id=payload.pod_id,
                                 log_tag=log_tag,
                                 log_extra=default_extra,
+                                # a volume the backend handed back (a reboot) was initialised when it was made: if
+                                # its gocryptfs.conf is gone, docker run just made it empty, and initialising it
+                                # would hand the renter a clean disk as a successful reboot
+                                allow_init=created_local_volume,
                                 authorized_keys=payload.user_public_keys if keys_in_volume_setup else (),
                             )
                         except AuthorizedKeysWriteFailed as exc:
