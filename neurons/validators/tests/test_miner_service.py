@@ -265,8 +265,8 @@ async def test_a_step_stuck_after_its_cancel_does_not_hold_the_wait_past_its_bou
 
 # ---------------------------------------------------------------------------
 # DAH-3338: an executor the miner KNOWS but could not reach is ExecutorUnreachable;
-# InvalidExecutorId is kept for an id the miner does not list at all, worded by DAH-3508's
-# _ssh_key_not_accepted_text (the miner returned no executor here, so "no executor accepted").
+# InvalidExecutorId is kept for an id the miner does not list at all, worded "the miner no longer
+# lists this executor" (DAH-4481); a miner without known_executor_ids keeps DAH-3508's wording.
 # ---------------------------------------------------------------------------
 
 from payload_models.payloads import FailedContainerErrorCodes, FailedContainerRequest
@@ -304,7 +304,7 @@ def _wire_missing_executor(mocker, miner_service, executor_id: str, known: list[
         pytest.param(
             [str(uuid4())],
             FailedContainerErrorCodes.InvalidExecutorId,
-            "Error: no executor accepted the SSH key",
+            "Error: the miner no longer lists this executor",
             id="not-known",
         ),
         pytest.param(
@@ -357,5 +357,9 @@ def test_missing_executor_failure_reads_known_executor_ids():
     assert str(unreachable[0]) == "Error: Executor unreachable"
     assert _missing_executor_failure(unknown, executor_id, extra)[1] is FailedContainerErrorCodes.InvalidExecutorId
     assert _missing_executor_failure(old_miner, executor_id, extra)[1] is FailedContainerErrorCodes.InvalidExecutorId
-    # The wording of the InvalidExecutorId case is DAH-3508's, not the old "Invalid executor id".
-    assert str(_missing_executor_failure(unknown, executor_id, extra)[0]) == "Error: no executor accepted the SSH key"
+    # DAH-4481: a miner that lists its executors but not this one says so, instead of blaming the SSH key.
+    not_listed = _missing_executor_failure(unknown, executor_id, extra)[0]
+    assert str(not_listed) == "Error: the miner no longer lists this executor"
+    assert not_listed.extra["reason_code"] == "EXECUTOR_NOT_LISTED_BY_MINER"
+    # A miner without known_executor_ids keeps DAH-3508's wording, not the old "Invalid executor id".
+    assert str(_missing_executor_failure(old_miner, executor_id, extra)[0]) == "Error: no executor accepted the SSH key"

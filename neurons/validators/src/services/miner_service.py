@@ -126,10 +126,9 @@ def _missing_executor_failure(
 
     DAH-3338: the miner now says which executors it KNOWS (known_executor_ids) apart from which
     ACCEPTED the key (executors). An id the miner lists but did not return is a node it could not
-    reach, ExecutorUnreachable; an id the miner does not list is InvalidExecutorId, worded by
-    `_ssh_key_not_accepted_text` (DAH-3508: "no executor accepted the SSH key" / "the miner
-    returned a different executor id", never the old "Invalid executor id"). A miner that predates
-    known_executor_ids sends None, and every miss stays InvalidExecutorId as before.
+    reach, ExecutorUnreachable; an id the miner does not list is InvalidExecutorId, worded "the
+    miner no longer lists this executor" (DAH-4481). A miner that predates known_executor_ids sends
+    None: it is still InvalidExecutorId, worded by `_ssh_key_not_accepted_text` (DAH-3508).
     Both twins of the container flow (websocket and REST) call this, so they cannot drift apart.
     """
     if msg.known_executor_ids is not None and executor_id in msg.known_executor_ids:
@@ -139,6 +138,23 @@ def _missing_executor_failure(
                 extra=get_extra_info({**default_extra, "executors_returned": len(msg.executors)}),
             ),
             FailedContainerErrorCodes.ExecutorUnreachable,
+        )
+    if msg.known_executor_ids is not None:
+        # DAH-4481: the miner lists its executors and this id is not among them (e.g. the machine was
+        # re-registered under a new id). Saying "no executor accepted the SSH key" sent readers after a
+        # host SSH fault. The code stays InvalidExecutorId, the backend's existing name for this case.
+        return (
+            _m(
+                "Error: the miner no longer lists this executor",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "reason_code": "EXECUTOR_NOT_LISTED_BY_MINER",
+                        "known_executors": len(msg.known_executor_ids),
+                    }
+                ),
+            ),
+            FailedContainerErrorCodes.InvalidExecutorId,
         )
     return _ssh_key_not_accepted_text(msg.executors, default_extra), FailedContainerErrorCodes.InvalidExecutorId
 
