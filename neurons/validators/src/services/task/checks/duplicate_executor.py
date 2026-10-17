@@ -16,6 +16,8 @@ logger = get_logger(__name__)
 CYCLE_CHECK_ID = "executor.cycle.duplicate_across_miners"
 # Loki key for the cycle-level verdicts below, enforced or observed.
 ACROSS_MINERS_OUTCOME = "DUPLICATE_ACROSS_MINERS"
+GPU_ALIAS_OUTCOME = "GPU_ALIAS_SAME_MINER"
+GPU_ALIAS_CHECK_ID = "executor.cycle.gpu_alias_same_miner"
 
 MATCH_SSH_ENDPOINT = "ssh_endpoint"
 MATCH_EXECUTOR_UUID = "executor_uuid"
@@ -279,3 +281,62 @@ def keep_one_miner_per_executor(
             result.duplicate_kept_by = kept_by
             result.duplicate_shares_kept_row = shares_row
     return duplicates
+
+
+def keep_one_executor_per_gpu(
+    job_results: dict[str, list[JobResult]],
+    default_extra: dict | None = None,
+) -> list[tuple[str, JobResult]]:
+    """One miner's GPU earns under one of its executors per cycle.
+
+    Scored executors of one hotkey that report a shared GPU UUID are one set of cards listed
+    more than once. The rented copy keeps the score, else the lowest executor UUID; a rented copy
+    is never zeroed. The others are logged and, with GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED,
+    score 0. Returns the (hotkey, result) pairs that lost the score or would have.
+    """
+    enforce = settings.GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED
+    aliases: list[tuple[str, JobResult]] = []
+    for hotkey in sorted(job_results):
+        by_gpu: dict[str, list[JobResult]] = defaultdict(list)
+        for result in job_results[hotkey]:
+            if result.is_successful:
+                for gpu_uuid in _gpu_uuids(result):
+                    by_gpu[gpu_uuid].append(result)
+        seen: set[int] = set()
+        for gpu_uuid, copies in sorted(by_gpu.items()):
+            if len({str(r.executor_info.uuid).lower() for r in copies}) < 2:
+                continue
+            keeper = min(copies, key=lambda r: (not r.is_rented, str(r.executor_info.uuid).lower()))
+            for result in copies:
+                if result is keeper or result.is_rented or id(result) in seen:
+                    continue
+                seen.add(id(result))
+                aliases.append((hotkey, result))
+                what = {
+                    "executor_uuid": str(result.executor_info.uuid),
+                    "kept_by_executor_uuid": str(keeper.executor_info.uuid),
+                    "gpu_uuid": gpu_uuid,
+                    "miner_hotkey": hotkey,
+                }
+                logger.warning(
+                    _m(
+                        "One miner reported the same GPU under two executors this cycle"
+                        + ("; one executor keeps the score" if enforce else " (logged only)"),
+                        extra=get_extra_info(
+                            {
+                                **(default_extra or {}),
+                                "outcome": GPU_ALIAS_OUTCOME,
+                                "enforced": enforce,
+                                **what,
+                            }
+                        ),
+                    )
+                )
+                if enforce:
+                    result.score = 0
+                    result.job_score = 0
+                    result.failure_reason_code = Msg.GPU_ALIAS.reason
+                    result.validation_event = render_message(
+                        Msg.GPU_ALIAS, ctx=None, check_id=GPU_ALIAS_CHECK_ID, what=what
+                    )
+    return aliases

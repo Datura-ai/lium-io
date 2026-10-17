@@ -620,6 +620,13 @@ class Settings(BaseSettings):
     # idle moved to the burner, never an older vector.
     SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
+    # Two executors of ONE miner hotkey that report the same GPU UUID in one cycle are one set of
+    # cards listed twice. Always logged (GPU_ALIAS_SAME_MINER); with this on, every copy but one
+    # scores 0 for the cycle. Only the miner's own executors are compared, so another miner
+    # reporting the same UUIDs cannot cost it anything.
+    GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", default=False
+    )
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",

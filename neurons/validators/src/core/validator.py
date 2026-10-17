@@ -45,7 +45,7 @@ from services.redis_service import (
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
 from services.task.availability import silence_availability_errors_on_our_own_outage
-from services.task.checks.duplicate_executor import keep_one_miner_per_executor
+from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
@@ -98,6 +98,7 @@ def settle_cycle_results(
             for executor_id, rented in (rented_executors.executors if rented_executors else {}).items()
         }
         keep_one_miner_per_executor(all_job_results, default_extra, rental_hotkeys)
+        keep_one_executor_per_gpu(all_job_results, default_extra)
     except Exception as exc:
         logger.error(
             _m("[sync] Duplicate-executor pass failed; results left as they are", extra=get_extra_info({**default_extra, "error": str(exc)})),

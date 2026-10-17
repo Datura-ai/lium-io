@@ -25,6 +25,7 @@ from services.task.checks.duplicate_executor import (
     MATCH_IP_PORT,
     MATCH_SSH_ENDPOINT,
     MATCH_SSH_HOST_KEY,
+    keep_one_executor_per_gpu,
     keep_one_miner_per_executor,
 )
 from services.task.models import JobResult
@@ -311,3 +312,52 @@ def test_two_nodes_with_their_own_host_keys_match_nothing(enforce):
     second = _verified(_result("uuid-b", port=8002, ssh_port=2201), host_key=HOST_KEY + "2")
 
     assert _host_key_matches(keep_one_miner_per_executor({BOB: [first, second]})) == []
+
+
+GPU_ALIAS_REASON = "EXECUTOR_GPU_ALIAS"
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_one_miners_executors_sharing_a_gpu_uuid_score_once(monkeypatch, enforced):
+    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", enforced)
+    kept = _result("uuid-a", gpu_uuids=("GPU-1", "GPU-2"))
+    alias = _result("uuid-b", address="203.0.113.9", gpu_uuids=("GPU-2", "GPU-3"))
+    other = _result("uuid-c", gpu_uuids=("GPU-9",))
+
+    aliases = keep_one_executor_per_gpu({BOB: [alias, kept, other]})
+
+    assert aliases == [(BOB, alias)]
+    _assert_untouched(kept)
+    _assert_untouched(other)
+    if enforced:
+        assert (alias.score, alias.job_score) == (0, 0)
+        assert alias.failure_reason_code == GPU_ALIAS_REASON
+        assert alias.validation_event.reason_code == GPU_ALIAS_REASON
+    else:
+        _assert_untouched(alias)
+
+
+def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners(monkeypatch):
+    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", True)
+    idle = _result("uuid-a", gpu_uuids=("GPU-1",))
+    rented = _result("uuid-b", gpu_uuids=("GPU-1",), is_rented=True)
+    # another miner reporting the same card is not this pass's business
+    foreign = _result("uuid-c", gpu_uuids=("GPU-1",))
+
+    aliases = keep_one_executor_per_gpu({BOB: [idle, rented], ALICE: [foreign]})
+
+    assert aliases == [(BOB, idle)]
+    assert (idle.score, idle.job_score) == (0, 0)
+    _assert_untouched(rented)
+    _assert_untouched(foreign)
+
+
+def test_gpu_alias_ignores_one_executors_repeat_and_unscored_copies(monkeypatch):
+    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", True)
+    first = _result("uuid-a", gpu_uuids=("GPU-1",))
+    repeat = _result("UUID-A", gpu_uuids=("GPU-1",))
+    failed = _result("uuid-b", gpu_uuids=("GPU-1",), score=0.0)
+
+    assert keep_one_executor_per_gpu({BOB: [first, repeat, failed]}) == []
+    _assert_untouched(first)
+    _assert_untouched(repeat)

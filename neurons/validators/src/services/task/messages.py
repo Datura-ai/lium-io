@@ -778,6 +778,14 @@ class DuplicateExecutorMessages:
         impact="Score set to 0 for this cycle; the other miner keeps it",
         remediation="One machine earns under one miner per cycle. Register it under one miner only.",
     )
+    GPU_ALIAS = MessageTemplate(
+        event="GPU also reported by another executor of this miner this cycle",
+        reason="EXECUTOR_GPU_ALIAS",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; the other executor keeps it",
+        remediation="Each physical GPU earns under one executor. Register every machine once.",
+    )
 
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(
