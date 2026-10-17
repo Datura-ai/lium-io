@@ -398,6 +398,12 @@ class Settings(BaseSettings):
     # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
     # matched on the reported list until this is flipped from a week of clean fleet data.
     KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
+    # DAH-4547 - HardwareIdentityCheck: DMI files not served by sysfs (a cloak script's overlay), the
+    # kernel and NVML GPU lists disagreeing, or DMI identity changing under an unchanged GPU set.
+    # Shadow by default: the finding is logged as a warning event and the node passes.
+    HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED: bool = Field(
+        env="HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED", default=False
+    )
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count) without changing the

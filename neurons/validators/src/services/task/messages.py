@@ -669,6 +669,26 @@ class BannedProviderMessages:
     )
 
 
+class HardwareIdentityMessages:
+    # DAH-4547: emitted as a warning in shadow; fails the node under HARDWARE_FINGERPRINT_ENFORCEMENT_ENABLED.
+    SPOOFED = MessageTemplate(
+        event="Host hardware identity does not match the hardware",
+        reason="HARDWARE_IDENTITY_SPOOFED",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the finding stands",
+        remediation="Remove any mount or script over /sys/class/dmi/id on the host and in the executor "
+        "container, and make sure NVML reports the same GPUs as /proc/driver/nvidia/gpus.",
+    )
+    OK = MessageTemplate(
+        event="Host hardware identity ok",
+        reason="HARDWARE_IDENTITY_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class ExecutorImageMessages:
     CURRENT = MessageTemplate(
         event="Executor image is current",
