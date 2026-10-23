@@ -85,10 +85,10 @@ async def test_a_board_whose_nvlink_multicast_cannot_bind_fails_when_enforced(co
 
 @pytest.mark.asyncio
 async def test_shadow_mode_logs_the_fault_and_the_node_passes(context_factory):
-    # shadow first (taiberium, 23 Oct): ~100 all-NVLink nodes, false-fail count unknown until the logs show it
+    # enforced by default after the shadow run (lio#1836: 0 false fails); the flag stays as the off switch
     assert (
         type(nvlink_fault.settings).model_fields["NVLINK_FAULT_ENFORCEMENT_ENABLED"].default
-        is False
+        is True
     )
     with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", False):
         result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
