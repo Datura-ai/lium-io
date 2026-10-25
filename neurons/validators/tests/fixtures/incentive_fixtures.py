@@ -39,7 +39,6 @@ def mock_settings(monkeypatch):
     monkeypatch.setattr(settings, "BURNERS", [0, 1])
     monkeypatch.setattr(settings, "NEW_BURNERS", [100, 101])
     monkeypatch.setattr(settings, "DRY_RUN", False)
-    monkeypatch.setattr(settings, "SKIP_COLLATERAL_PENALTY", False)
     monkeypatch.setattr(settings, "incentive", IncentiveConfig(
         algorithm="default",
     ))
@@ -54,7 +53,6 @@ def create_job_result():
         gpu_model: str = "H100",
         gpu_count: int = 1,
         sysbox_runtime: bool = True,
-        collateral_deposited: bool = True,
         executor_id: str | None = None,
         job_batch_id: str = "2024-01-01 00:00:00",
         log_text: str = "Test job completed",
@@ -83,7 +81,6 @@ def create_job_result():
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             sysbox_runtime=sysbox_runtime,
-            collateral_deposited=collateral_deposited,
             job_batch_id=job_batch_id,
             log_status="success",
             log_text=log_text,

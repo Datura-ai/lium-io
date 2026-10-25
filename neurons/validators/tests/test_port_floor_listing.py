@@ -189,8 +189,6 @@ def run_context(
         score=1.0,
         job_score=1.0,
         score_warning=score_warning,
-        contract_version="1.0.3",
-        collateral_deposited=True,
     )
 
 

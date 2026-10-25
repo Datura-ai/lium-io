@@ -502,7 +502,7 @@ async def test_a_malicious_finding_on_a_rented_pod_changes_no_score_and_triggers
 
     async def run(findings):
         redis = AsyncMock()
-        ctx, _ = _ctx(context_factory, findings, redis=redis, collateral_deposited=True)
+        ctx, _ = _ctx(context_factory, findings, redis=redis)
         ctx = ctx.model_copy(
             update={
                 # a context every other gate lets through, so a zeroing gate cannot hide in 0 == 0

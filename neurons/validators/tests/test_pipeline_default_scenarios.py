@@ -13,7 +13,6 @@ from neurons.validators.src.services.task.pipeline import Pipeline, LoggerSink
 from neurons.validators.src.services.task.checks import (
     BannedGpuCheck,
     CapabilityCheck,
-    CollateralStatusCheck,
     DuplicateExecutorCheck,
     FinalizeCheck,
     GpuCountCheck,
@@ -389,7 +388,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         SpecChangeCheck(),
         BannedGpuCheck(),
         DuplicateExecutorCheck(),
-        CollateralStatusCheck(),
         TenantEnforcementCheck(),
         GpuUsageCheck(),
         PortConnectivityCheck(),
@@ -406,7 +404,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     # Verify pipeline succeeded
     assert ok is True, "Pipeline should complete successfully"
-    assert len(events) == 19, "Should have events from all 19 checks"
+    assert len(events) == 18, "Should have events from all 18 checks"
 
     # Verify final context state
     assert final_ctx.success is True
@@ -418,7 +416,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     assert final_ctx.state.gpu_model_count == "NVIDIA RTX 4090:2"
     assert final_ctx.state.gpu_uuids == "GPU-abc123,GPU-def456"
     assert final_ctx.state.sysbox_runtime is True
-    assert final_ctx.collateral_deposited is False
 
     # Verify all checks emitted events
     assert all(event.reason_code is not None for event in events)
@@ -573,7 +570,6 @@ async def test_successful_rented_pipeline_flow(context_factory):
         SpecChangeCheck(),
         BannedGpuCheck(),
         DuplicateExecutorCheck(),
-        CollateralStatusCheck(),
         TenantEnforcementCheck(),
         # These checks below should NOT run because pipeline halts
         GpuUsageCheck(),
@@ -598,7 +594,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     # Verify pipeline succeeded but halted early
     assert ok is True, f"Pipeline should complete successfully (halted), but failed at {events[-1].check_id if events else 'unknown'}"
-    assert len(events) == 12, "Should only have events up to TenantEnforcementCheck (12 checks)"
+    assert len(events) == 11, "Should only have events up to TenantEnforcementCheck (11 checks)"
 
     # Verify final context state
     assert final_ctx.success is True

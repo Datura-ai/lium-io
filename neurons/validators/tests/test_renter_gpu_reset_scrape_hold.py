@@ -92,9 +92,7 @@ async def _cycle(context_factory, service, *, scrape, pod_gpu_count: int | None 
         ssh=DummySSHClient(pod_running=True),
         encrypt_key=ENCRYPT_KEY,
         verified=await service.get_verified_job_info(RENTAL_OWNER, EXECUTOR),
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
     with patch.object(machine_spec_scrape.settings, "RENTED_HOST_GPU_FAULT_RESET_ENABLED", True):
         ok, events, ctx = await Pipeline(

@@ -51,9 +51,7 @@ def _ctx(context_factory, rental_miner_hotkey: str, rental_port: str = "22"):
         state=state,
         ssh=DummySSHClient(pod_running=True),
         miner_hotkey="miner-hotkey",
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
 

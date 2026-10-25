@@ -225,8 +225,6 @@ class SubtensorClient:
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
-    uid_to_evm_address: dict[int, str] = {}
-    hotkey_to_evm_address: dict[str, str] = {}
     hotkeys_routed_via_central_miner: frozenset[str] = frozenset()
 
     @classmethod
@@ -470,9 +468,6 @@ class SubtensorClient:
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(hotkey)
 
-    def get_evm_address_for_hotkey(self, hotkey):
-        return self.hotkey_to_evm_address.get(hotkey, None)
-
     async def _run_chain_read(
         self, chain_read: Callable[..., ChainReadResult], *args: object
     ) -> ChainReadResult:
@@ -489,31 +484,6 @@ class SubtensorClient:
     def _pause_chain_reads_in_thread(self) -> contextlib.AbstractAsyncContextManager:
         # the loop-side redial closes or replaces the websocket a chain read thread may be using
         return self._chain_read_lock if self._chain_reads_in_thread else contextlib.nullcontext()
-
-    def _read_uid_to_evm_address(self) -> dict[int, str]:
-        with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
-            node = self.get_node()
-            associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
-            # the query map pages lazily, so it is iterated here, inside the timed chain read;
-            # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
-            return {uid: evm_address[0] for uid, evm_address in associated_evms}
-
-    async def sync_evm_address_maps(self) -> None:
-        # the maps are read by the loop, so they are updated here, never from the thread
-        self.uid_to_evm_address.update(await self._run_chain_read(self._read_uid_to_evm_address))
-
-        for miner in self.miners:
-            self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
-
-        logger.info(
-            _m(
-                "Synced ethereum addresses map",
-                extra=get_extra_info({
-                    **self.default_extra,
-                    "uid_to_evm_address": len(self.uid_to_evm_address),
-                }),
-            ),
-        )
 
     def get_my_uid(self):
         return self.get_uid_for_hotkey(self.wallet.hotkey.ss58_address)
@@ -1099,12 +1069,10 @@ class SubtensorClient:
                         await self.get_miners()
                     else:
                         await self.fetch_miners()
-                    await self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
                     await self.fetch_miners()
-                    await self.sync_evm_address_maps()
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL

@@ -40,8 +40,6 @@ class SharedConfig(BaseModel):
     # machine_prices_p90[gpu] * this rate forfeits the unrented incentive (DAH-2250)
     soft_limit_price_rate: float = Field(default=1.1)
     rental_fees_rate: float
-    collateral_days: int
-    collateral_contract_address: str
     bittensor_netuid: int
     volume_gb_hour_price_usd: float
     max_initial_port_count: int

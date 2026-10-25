@@ -387,7 +387,6 @@ class ComputeClient:
                             executor_port=data["executor_port"],
                             executor_ssh_port=data["executor_ssh_port"],
                             price_per_gpu=data["price_per_gpu"],
-                            collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
                             tee_type=data.get("tee_type"),
                             attestation_digest=data.get("attestation_digest"),
@@ -840,7 +839,6 @@ class ComputeClient:
                 gpu_splitting=req.gpu_splitting,
                 gpu_splitting_min_count=req.gpu_splitting_min_count,
                 sysbox_runtime=req.sysbox_runtime,
-                collateral_deposited=req.collateral_deposited,
             ),
         )
         async with self.lock:

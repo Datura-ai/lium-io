@@ -182,7 +182,6 @@ def _result_missing_job_result(
         ),
         score=0,
         job_score=0,
-        collateral_deposited=False,
         job_batch_id=job_batch_id,
         log_status="error",
         log_text=event.event,

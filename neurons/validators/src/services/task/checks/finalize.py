@@ -31,7 +31,6 @@ class FinalizeCheck:
         what = {
             "gpu_model": ctx.state.gpu_model,
             "gpu_count": ctx.state.gpu_count if ctx.state.gpu_count is not None else 0,
-            "contract_version": ctx.contract_version,
             "unrented_multiplier": UNRENTED_MULTIPLIER,
             "sysbox_runtime": ctx.state.sysbox_runtime,
         }

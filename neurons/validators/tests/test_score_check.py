@@ -25,9 +25,7 @@ class DummyScoreCalculator:
         """Mock score calculator that tracks calls and returns configured scores."""
         self.called_with = {
             "gpu_model": ctx.state.gpu_model,
-            "collateral_deposited": ctx.collateral_deposited,
             "is_rental_succeed": ctx.is_rental_succeed,
-            "contract_version": ctx.contract_version,
             "rented": rented,
             "port_count": ctx.port_count,
         }
@@ -35,28 +33,22 @@ class DummyScoreCalculator:
 
 
 @pytest.mark.parametrize(
-    "gpu_model,collateral_deposited,is_rental_succeed,contract_version,rented,port_count,actual_score,job_score,warning_msg,expected_pass",
+    "gpu_model,is_rental_succeed,rented,port_count,actual_score,job_score,warning_msg,expected_pass",
     [
         # Normal success case: full scores, no warnings
-        ("NVIDIA RTX 4090", True, True, "v1.0.0", False, 10, 1.0, 1.0, "", True),
+        ("NVIDIA RTX 4090", True, False, 10, 1.0, 1.0, "", True),
         # Success with warning (e.g. price exceeds limit — exact text is not asserted, only propagation)
-        ("NVIDIA RTX 3090", True, False, "v1.0.0", False, 10, 0.0, 1.0, " WARNING: GPU price exceeds the limit", True),
-        # Low collateral warning
-        ("NVIDIA RTX 3080", False, True, "v1.0.0", False, 10, 1.0, 1.0, " WARNING: No collateral deposited", True),
+        ("NVIDIA RTX 3090", False, False, 10, 0.0, 1.0, " WARNING: GPU price exceeds the limit", True),
         # Rented machine
-        ("NVIDIA RTX 4090", True, True, "v1.0.0", True, 10, 1.0, 1.0, "", True),
-        # Old contract version
-        ("NVIDIA RTX 3090", True, True, "v0.9.0", False, 10, 0.0, 0.0, " WARNING: Outdated contract version (current: v0.9.0, latest: v1.0.0)", True),
+        ("NVIDIA RTX 4090", True, True, 10, 1.0, 1.0, "", True),
         # Edge case: no GPU model
-        ("", True, True, "v1.0.0", False, 10, 1.0, 1.0, "", True),
+        ("", True, False, 10, 1.0, 1.0, "", True),
     ],
 )
 @pytest.mark.asyncio
 async def test_score_check(
     gpu_model,
-    collateral_deposited,
     is_rental_succeed,
-    contract_version,
     rented,
     port_count,
     actual_score,
@@ -86,9 +78,7 @@ async def test_score_check(
         services=services,
         config=config,
         state=state,
-        collateral_deposited=collateral_deposited,
         is_rental_succeed=is_rental_succeed,
-        contract_version=contract_version,
         rented=rented,
         port_count=port_count,
     )
@@ -103,9 +93,7 @@ async def test_score_check(
     # Verify score calculator was called with correct parameters
     assert score_calculator.called_with is not None
     assert score_calculator.called_with["gpu_model"] == gpu_model
-    assert score_calculator.called_with["collateral_deposited"] is collateral_deposited
     assert score_calculator.called_with["is_rental_succeed"] is is_rental_succeed
-    assert score_calculator.called_with["contract_version"] == contract_version
     assert score_calculator.called_with["rented"] is rented
     assert score_calculator.called_with["port_count"] == port_count
 

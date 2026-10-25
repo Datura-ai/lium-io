@@ -133,8 +133,9 @@ def test_what_the_backend_sends_parses_through_the_validators_own_parser(entry: 
         theirs = pydantic.TypeAdapter(payloads.ForcedValidationCycleRequest).validate_json(raw)
     elif entry["expect"] == "GetEstimateRequest":
         theirs = pydantic.TypeAdapter(payloads.GetEstimateRequest).validate_json(raw)
-        # the validator's model has no message_type: it ignores the discriminator, reads the rest
-        assert _dropped(message, json_keys(theirs.model_dump(mode="json"))) == {"message_type"}
+        # the validator's model has no message_type: it ignores the discriminator, reads the rest;
+        # collateral_deposited is what an older backend still sends, ignored since DAH-4766
+        assert _dropped(message, json_keys(theirs.model_dump(mode="json"))) == {"message_type", "collateral_deposited"}
         assert _dropped(message, json_keys(ours.model_dump(mode="json"))) == set()
         return
     elif entry["expect"] == "DuplicateExecutorsResponse":

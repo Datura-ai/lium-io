@@ -572,7 +572,6 @@ class Settings(BaseSettings):
     UNREACHABLE_EXECUTOR_REPORT_ENABLED: bool = Field(
         env="UNREACHABLE_EXECUTOR_REPORT_ENABLED", default=False
     )
-    SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     # DAH-4001 — delayed idle settlement. off: today's behaviour, nothing reported. shadow: post every cycle's
     # vector and per-node rows to the backend and read its settled vector every tempo for comparison only; live
@@ -668,20 +667,6 @@ class Settings(BaseSettings):
     # the node is hidden. It stops idle pay on those nodes, so it stays off until the validator owner
     # turns it on.
     ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
-
-    # collateral_deposited keeps its meaning for the backend's provider statistics and the support board:
-    # the miner's associated EVM address owns the executor on this contract and its collateral covers
-    # required_deposit_amount × gpu_count × COLLATERAL_DAYS. It has no score effect. The read is the contract's
-    # storage at the finalized block through the Substrate JSON-RPC (state_getStorage), so the URL must be a
-    # Subtensor node; it is cached per executor for COLLATERAL_STATUS_CACHE_SECONDS.
-    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
-    COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env="COLLATERAL_CONTRACT_ADDRESS", default="0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6"
-    )
-    COLLATERAL_CONTRACT_VERSION: str = "1.0.2"
-    COLLATERAL_DAYS: int = 7
-    COLLATERAL_STATUS_TIMEOUT_SECONDS: float = Field(env="COLLATERAL_STATUS_TIMEOUT_SECONDS", default=5.0, gt=0)
-    COLLATERAL_STATUS_CACHE_SECONDS: int = Field(env="COLLATERAL_STATUS_CACHE_SECONDS", default=1800, ge=0)
 
     FEATURE_FLAGS: dict[str, bool] = {
         FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,  # If it's True - then bad internet connection will raise error on synthetic job

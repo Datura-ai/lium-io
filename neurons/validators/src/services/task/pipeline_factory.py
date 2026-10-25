@@ -31,7 +31,6 @@ from .checks import (
     BannedProviderCheck,
     CachedTemplateVerificationCheck,
     CapabilityCheck,
-    CollateralStatusCheck,
     ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
@@ -352,7 +351,6 @@ class PipelineFactory:
                 # judged alike.
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
-                CollateralStatusCheck(),
                 SshdBootstrapCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
@@ -497,7 +495,6 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
-                CollateralStatusCheck(),
                 SshdBootstrapCheck(),
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
@@ -593,7 +590,6 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
-                CollateralStatusCheck(),
                 SshdBootstrapCheck(remove_fillers=False),  # removes no filler on a dry run
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),

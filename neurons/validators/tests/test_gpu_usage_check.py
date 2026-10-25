@@ -198,7 +198,6 @@ def _scored_ctx(context_factory, *, rented_data: RentedExecutorsResponse):
         services=services,
         config=build_context_config(),
         state=state,
-        collateral_deposited=True,
     )
 
 

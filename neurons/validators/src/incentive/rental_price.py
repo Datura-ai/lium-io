@@ -153,7 +153,6 @@ class ExecutorEstimateParams(BaseModel):
     gpu_splitting: bool = False
     gpu_splitting_min_count: int | None = None
     sysbox_runtime: bool = True
-    collateral_deposited: bool = True
 
 
 # ── Estimate model ────────────────────────────────────────────────────────────
@@ -1459,7 +1458,6 @@ class RentalPriceIncentive(DefaultIncentive):
             is_rented=is_rented,
             supports_gpu_splitting=params.gpu_splitting,
             gpu_splitting_min_count=params.gpu_splitting_min_count,
-            collateral_deposited=params.collateral_deposited,
             sysbox_runtime=params.sysbox_runtime,
             # Price estimates assume a compliant driver (no requirement penalty).
             nvidia_driver_version=settings.MIN_NVIDIA_DRIVER_VERSION,

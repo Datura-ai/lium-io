@@ -71,7 +71,6 @@ def _node(uuid: str, **overrides) -> JobResult:
         log_text="ok",
         gpu_model=H100,
         gpu_count=8,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
     fields.update(overrides)
@@ -1223,7 +1222,6 @@ async def _handled(
         tdx_attestation_passed=False,
         score=1.0,
         job_score=1.0,
-        collateral_deposited=True,
         ssh_pub_keys=[],
         rented=False,
         **context_overrides,

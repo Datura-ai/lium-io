@@ -42,7 +42,6 @@ CSV_COLUMNS = [
     "gpu_count",
     "score",
     "job_score",
-    "collateral_deposited",
     "sysbox_runtime",
     "is_rented",
     "is_spot",
@@ -132,7 +131,6 @@ def prod_settings(monkeypatch, prod_snapshot: dict) -> None:
     monkeypatch.setattr(settings, "UPTIME_REQUIRED_MINUTES", s["UPTIME_REQUIRED_MINUTES"])
     monkeypatch.setattr(settings, "BURNERS", s["BURNERS"])
     monkeypatch.setattr(settings, "NEW_BURNERS", s["NEW_BURNERS"])
-    monkeypatch.setattr(settings, "SKIP_COLLATERAL_PENALTY", False)
     monkeypatch.setattr(settings, "incentive", IncentiveConfig(algorithm="default"))
 
 
@@ -161,7 +159,6 @@ def _build_job_results(prod_snapshot: dict) -> dict[str, list[JobResult]]:
                 job_score=r["job_score"],
                 gpu_model=r["gpu_model"],
                 gpu_count=r["gpu_count"],
-                collateral_deposited=r["collateral_deposited"],
                 sysbox_runtime=r["sysbox_runtime"],
                 is_rented=r["is_rented"],
                 # Decides which sysbox rule the rented executor falls under: a rental created
@@ -281,7 +278,6 @@ def _dump_results_csv(
                     "gpu_count": r.gpu_count,
                     "score": r.score,
                     "job_score": r.job_score,
-                    "collateral_deposited": r.collateral_deposited,
                     "sysbox_runtime": r.sysbox_runtime,
                     "is_rented": r.is_rented,
                     "is_spot": r.is_spot,

@@ -64,7 +64,6 @@ def _make_job(
         gpu_model=H200,
         gpu_count=8,
         is_rented=is_rented,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
 

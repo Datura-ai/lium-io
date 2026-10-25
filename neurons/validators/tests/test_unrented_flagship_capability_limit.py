@@ -68,7 +68,6 @@ def _make_job(
         attestation_digest=attestation_digest,
         gpu_attestation_passed=gpu_attestation_passed,
         gpu_splitting_min_count=gpu_splitting_min_count,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
 

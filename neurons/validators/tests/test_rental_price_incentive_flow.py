@@ -251,8 +251,6 @@ async def test_rental_price_scenario_basic_mixed(
         is_rented=True,
         rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
-        collateral_deposited=True,
-        uptime_minutes=120,
     )
 
     unrented_counts = {"H100": 8, "H200": 5}
@@ -708,7 +706,7 @@ def _make_pcc_job(
         score=1.0, job_score=1.0, job_batch_id="pcc-batch",
         log_status="success", log_text="ok",
         gpu_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented,
-        collateral_deposited=True, sysbox_runtime=True,
+        sysbox_runtime=True,
         supports_gpu_splitting=supports_gpu_splitting,
         gpu_splitting_min_count=gpu_splitting_min_count,
     )

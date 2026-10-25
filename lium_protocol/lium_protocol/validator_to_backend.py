@@ -278,6 +278,7 @@ class ExecutorSpecRequest(ValidatorMessage):
     incentive_formula_inputs: dict[str, Any] | None = None
     # None = the publisher did not report the field; [] = no catalogued reason was recorded
     incentive_reasons: list[IncentiveReason] | None = None
+    # deprecated, never sent since collateral was removed (DAH-4766); kept so an older validator still parses
     collateral_deposited: bool | None = None
     ssh_pub_keys: list[str] | None = None
     executor_image: dict[str, Any] | None = None

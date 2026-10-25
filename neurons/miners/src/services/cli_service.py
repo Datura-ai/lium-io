@@ -1,6 +1,5 @@
 import uuid
 import logging
-import json
 import bittensor as bt
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -12,28 +11,10 @@ from daos.executor import ExecutorDao
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 from models.executor import Executor
-from core.collateral import (
-    CollateralConfigError,
-    CollateralTransactionError,
-    h160_to_ss58,
-    rpc_origin,
-)
-from core.utils import get_collateral_contract, versions_holding_collateral, _m
-from bittensor.utils.balance import Balance
+from core.utils import _m
 from protocol.miner_portal_request import AddExecutorFailed
 
 logging.basicConfig(level=logging.INFO)
-
-
-def collateral_error(error: Exception) -> str:
-    """Log text for a collateral contract failure.
-
-    Only this module's own errors keep their message; any other error (a web3 or aiohttp
-    transport error) is named by its class, since its text can carry the RPC URL and its API key.
-    """
-    if isinstance(error, (CollateralTransactionError, CollateralConfigError)):
-        return str(error)
-    return type(error).__name__
 
 
 def require_executor_dao(func):
@@ -46,7 +27,7 @@ def require_executor_dao(func):
 
 
 class CliService:
-    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, version: str = "1.0.2"):
+    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False):
         """
         Initialize the CLI service.
         :param private_key: Ethereum private key for signing (optional).
@@ -57,11 +38,6 @@ class CliService:
         self.config = settings.get_bittensor_config()
         self.hotkey = self.wallet.get_hotkey().ss58_address
         self.private_key = private_key
-        self.version = version
-        self.collateral_contract = (
-            get_collateral_contract(miner_key=private_key, version=version)
-            if private_key else get_collateral_contract(version=version)
-        )
         self.executor_dao = ExecutorDao(session=next(get_db())) if with_executor_db else None
 
         # Create executor_service if with_executor_db is True
@@ -76,9 +52,7 @@ class CliService:
         self.default_extra = {
             "hotkey": self.hotkey,
             "netuid": self.netuid,
-            "contract_address": self.collateral_contract.contract_address,
             "network": settings.BITTENSOR_NETWORK,
-            "rpc_url": rpc_origin(settings.SUBTENSOR_EVM_RPC_URL),
         }
 
     def get_node(self):
@@ -223,56 +197,6 @@ class CliService:
             ))
             return False
 
-    def get_eth_ss58_address(self) -> str:
-        """
-        Get the Ethereum SS58 address for the Bittensor hotkey.
-        :return: Ethereum SS58 address
-        """
-        account = Account.from_key(self.private_key)
-        ss58_address = h160_to_ss58(account.address)
-        return ss58_address
-
-    def transfer_tao_to_eth_address(self, amount: float) -> bool:
-        """
-        Transfer TAO to the Ethereum SS58 address.
-        :param amount: Amount of TAO to transfer
-        :return: True if successful, False otherwise
-        """
-        try:
-            ss58_address = self.get_eth_ss58_address()
-            self.get_node()
-            print(f'Transferring {amount} TAO to Ethereum SS58 address {ss58_address}.')
-            print('Please enter your bittensor wallet password:')
-            self.subtensor.transfer(
-                wallet=self.wallet,
-                destination_ss58=ss58_address,
-                amount=Balance.from_tao(amount, self.netuid),
-                wait_for_inclusion=True,
-                wait_for_finalization=True
-            )
-            self.logger.info(_m(
-                "✅ Transferred TAO to Ethereum SS58 address successfully",
-                extra={**self.default_extra, "amount": amount, "to_address": ss58_address}
-            ))
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to transfer TAO to Ethereum SS58 address",
-                extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
-            ))
-
-    async def get_balance_of_eth_address(self):
-        """The balance in TAO, or None after logging the failure."""
-        try:
-            balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to get the balance of the Eth address",
-                extra={**self.default_extra, "error": collateral_error(e)}
-            ))
-            return None
-        self.logger.info(f"Balance of Eth address: {balance} TAO")
-        return balance
-
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
         return metagraph.hotkeys.index(hotkey)
@@ -325,156 +249,6 @@ class CliService:
             )
         )
         return not isinstance(result, AddExecutorFailed)
-
-    async def reclaim_collateral(self, executor_uuid: str):
-        """
-        Reclaim collateral for a specific executor from the contract.
-        :param executor_uuid: UUID of the executor
-        :return: True if successful, False otherwise
-        """
-        try:
-            balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
-            self.logger.info("Miner balance: %f TAO", balance)
-            reclaim_amount = await self.collateral_contract.get_executor_collateral(executor_uuid)
-            self.logger.info(
-                f"Executor {executor_uuid} is being removed by miner {self.hotkey}. "
-                f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
-            )
-            event = await self.collateral_contract.reclaim_collateral(executor_uuid)
-            import binascii
-            json_payload = {
-                "reclaim_request_id": event['args']['reclaimRequestId'],
-                "amount": event['args']['amount'],  # If you want to convert from wei to TAO, do it here
-                "expiration_time": event['args']['expirationTime'],
-                "url": event['args']['url'],
-                "url_content_md5_checksum": binascii.hexlify(event['args']['urlContentMd5Checksum']).decode(),
-                "block_number": event['blockNumber'],
-                "executor_uuid": event['args']['executorId'].hex()  # or decode as needed
-            }
-
-            self.logger.info(_m(
-                "✅ Reclaimed collateral successfully.",
-                extra={**self.default_extra, "reclaim_info": json_payload}
-            ))
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to reclaim collateral",
-                extra={**self.default_extra, "error": collateral_error(e)}
-            ))
-            return False
-
-    @require_executor_dao
-    async def get_miner_collateral(self):
-        """
-        Get the collateral of the registered executors on this client's contract version.
-        :return: True if successful, False otherwise
-        """
-        try:
-            executors = self.executor_dao.get_all_executors()
-            total_collateral = 0.0
-            for executor in executors:
-                executor_uuid = str(executor.uuid)
-                collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
-                total_collateral += float(collateral)
-                self.logger.info("Executor %s collateral: %f TAO", executor_uuid, collateral)
-            self.logger.info(
-                "Collateral of the registered executors on contract version %s: %f TAO",
-                self.version,
-                total_collateral,
-            )
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed in getting miner collateral",
-                extra={**self.default_extra, "error": collateral_error(e)}
-            ))
-            return False
-
-    @require_executor_dao
-    async def get_executor_collateral(self, address: str, port: int):
-        """
-        Get the collateral amount for a specific executor by address and port.
-        :param address: Executor IP address
-        :param port: Executor port
-        :return: True if successful, False otherwise
-        """
-        try:
-            executor = self.executor_dao.find_one(address, port)
-            if not executor:
-                self.logger.error("No executor at %s:%d", address, port)
-                return False
-            executor_uuid = str(executor.uuid)
-
-            collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
-            self.logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to get executor collateral",
-                extra={**self.default_extra, "error": collateral_error(e)}
-            ))
-            return False
-
-    @require_executor_dao
-    async def get_reclaim_requests(self):
-        """
-        Get reclaim requests for the current miner from the collateral contract.
-        :return: True if successful, False otherwise
-        """
-        try:
-            reclaim_requests = await self.collateral_contract.get_reclaim_events()
-            if not reclaim_requests:
-                self.logger.info(json.dumps([]))
-                return True
-            executors = self.executor_dao.get_all_executors()
-            executor_uuids = set(str(executor.uuid) for executor in executors)
-
-            def to_dict(obj):
-                if hasattr(obj, "__dict__"):
-                    return dict(obj.__dict__)
-                elif hasattr(obj, "_asdict"):
-                    return obj._asdict()
-                else:
-                    return dict(obj)
-            filtered_requests = [
-                req for req in reclaim_requests
-                if getattr(req, "amount", 0) != 0 and str(getattr(req, "executor_uuid", "")) in executor_uuids
-            ]
-            if not filtered_requests:
-                self.logger.info(_m(
-                    "No reclaim requests found for your executors.",
-                    extra=self.default_extra
-                ))
-                return True
-            # Use rich to print as a table
-            json_output = [to_dict(req) for req in filtered_requests]
-            self.logger.info(json.dumps(json_output, indent=4))
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to get miner reclaim requests",
-                extra={**self.default_extra, "error": collateral_error(e)}
-            ))
-            return False
-
-    async def finalize_reclaim_request(self, reclaim_request_id: int):
-        """
-        Finalize a reclaim request by its ID.
-        :param reclaim_request_id: The ID of the reclaim request
-        :return: True if successful, False otherwise
-        """
-        try:
-            result = await self.collateral_contract.finalize_reclaim(reclaim_request_id)
-            self.logger.info(f"✅ Successfully finalized reclaim request: {reclaim_request_id}")
-            self.logger.info(result)
-            return True
-        except Exception as e:
-            self.logger.error(_m(
-                "❌ Failed to finalize reclaim request",
-                extra={**self.default_extra, "error": collateral_error(e)}
-            ))
-            return False
 
     @require_executor_dao
     async def show_executors(self):
@@ -532,21 +306,12 @@ class CliService:
             if not executor:
                 self.logger.error("No executor at %s:%d", address, port)
                 return False
-            executor_uuid = str(executor.uuid)
-
-            versions = await versions_holding_collateral(executor_uuid)
-            if versions:
-                self.logger.error(
-                    "Executor %s holds collateral on contract version(s) %s; reclaim it first",
-                    executor_uuid, ", ".join(versions),
-                )
-                return False
 
             self.executor_dao.delete_by_address_port(address, port)
             self.logger.info("Removed an executor(%s:%d)", address, port)
             return True
         except Exception as e:
-            self.logger.error("Failed in removing an executor: %s", collateral_error(e))
+            self.logger.error("Failed in removing an executor: %s", str(e))
             return False
 
     @require_executor_dao

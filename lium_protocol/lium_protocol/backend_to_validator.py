@@ -326,6 +326,7 @@ class GetEstimateRequest(BackendMessage):
     gpu_splitting: bool = False
     gpu_splitting_min_count: int | None = None
     sysbox_runtime: bool = True
+    # deprecated and ignored: collateral was removed (DAH-4766); kept so an older backend still parses
     collateral_deposited: bool = True
 
 

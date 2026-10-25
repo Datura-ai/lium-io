@@ -353,9 +353,7 @@ async def test_tenant_enforcement_check(
         config=config,
         state=state,
         ssh=ssh_client,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
     # Run the check
@@ -436,9 +434,7 @@ async def test_tenant_enforcement_skips_pod_not_running_when_backend_says_inacti
         config=build_context_config(),
         state=state,
         ssh=DummySSHClient(pod_running=False),
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -474,9 +470,7 @@ async def test_tenant_enforcement_keeps_pod_not_running_when_backend_state_unkno
         config=build_context_config(),
         state=state,
         ssh=DummySSHClient(pod_running=False),
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -692,9 +686,7 @@ async def test_tenant_enforcement_emits_transport_unreachable_on_ssh_failure(
         config=build_context_config(),
         state=state,
         ssh=ssh_client,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -734,9 +726,7 @@ async def test_tenant_enforcement_keeps_pod_not_running_for_non_transport_errors
         config=build_context_config(),
         state=state,
         ssh=ssh_client,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -769,8 +759,6 @@ async def test_tenant_enforcement_marks_filler_only_as_not_rented_without_haltin
         services=services,
         state=state,
         ssh=ssh_client,
-        collateral_deposited=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -802,8 +790,6 @@ async def test_tenant_enforcement_keeps_filler_only_not_rented_for_unmapped_proc
         services=services,
         state=state,
         ssh=DummySSHClient(),
-        collateral_deposited=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -838,8 +824,6 @@ async def test_tenant_enforcement_allows_mapped_filler_with_customer_rental(cont
         services=services,
         state=state,
         ssh=DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."]),
-        collateral_deposited=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -881,8 +865,6 @@ async def test_tenant_enforcement_allows_every_filler_bundle_beside_customer_pod
         services=services,
         state=state,
         ssh=DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."]),
-        collateral_deposited=True,
-        contract_version="v1.0.0",
     )
 
     result = await TenantEnforcementCheck().run(ctx)
@@ -921,9 +903,7 @@ def build_recovery_context(
         ),
         ssh=ssh,
         executor_ssh_private_key=private_key,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
 
@@ -1181,9 +1161,7 @@ def _tenant_ctx(context_factory, ssh_client, rented_machine, *, backend=None, pr
         config=build_context_config(),
         state=state,
         ssh=ssh_client,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
 
@@ -1477,9 +1455,7 @@ def _unnamed_pod_ctx(context_factory, ssh_client, gpu_processes, backend=None, p
         config=build_context_config(),
         state=state,
         ssh=ssh_client,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
 
 

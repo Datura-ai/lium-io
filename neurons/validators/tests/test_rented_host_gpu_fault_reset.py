@@ -127,9 +127,7 @@ async def _cycle(
         ssh=DummySSHClient(pod_running=True),
         encrypt_key=ENCRYPT_KEY,
         verified=verified,
-        collateral_deposited=True,
         is_rental_succeed=True,
-        contract_version="v1.0.0",
     )
     with patch.object(machine_spec_scrape.settings, "RENTED_HOST_GPU_FAULT_RESET_ENABLED", enabled):
         ok, events, ctx = await Pipeline(

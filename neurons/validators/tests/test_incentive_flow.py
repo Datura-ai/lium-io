@@ -8,8 +8,6 @@ BASE_JOB_SCORE = 1.0
 BURNER_COUNT = 2
 MINING_ALLOCATION = 1 - TOTAL_BURN_EMISSION
 SYSBOX_PENALTY_PORTION = 0.1
-UPTIME_PENALTY_PORTION = 0.2
-UPTIME_REQUIRED_MINUTES = 120
 
 GPU_PORTION = {
     "H100": 0.3,
@@ -26,15 +24,10 @@ def expected_score(
     gpu_count: int,
     total_gpu_count: int,
     sysbox_runtime: bool = True,
-    collateral_deposited: bool = True,
-    uptime_minutes: int | None = None,
 ) -> float:
     score = BASE_JOB_SCORE * portion * gpu_count / total_gpu_count
     if not sysbox_runtime:
         score *= 1 - SYSBOX_PENALTY_PORTION
-    if not collateral_deposited:
-        uptime_ratio = min(1.0, (uptime_minutes or 0) / UPTIME_REQUIRED_MINUTES)
-        score *= 1 - UPTIME_PENALTY_PORTION + UPTIME_PENALTY_PORTION * uptime_ratio
     return score
 
 
@@ -144,13 +137,13 @@ async def test_scenario_dominant_miner_premium_gpus(
 
     all_job_results = {
         "dominant_miner": [
-            create_job_result(gpu_model="H100", gpu_count=8, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="H100", gpu_count=8, sysbox_runtime=True),
         ],
         "small_miner_1": [
-            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True),
         ],
         "small_miner_2": [
-            create_job_result(gpu_model="RTX4090", gpu_count=2, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="RTX4090", gpu_count=2, sysbox_runtime=True),
         ],
     }
 
@@ -209,193 +202,6 @@ async def test_scenario_dominant_miner_premium_gpus(
 
 
 @pytest.mark.asyncio
-async def test_scenario_mixed_collateral_strategies(
-    validator_with_mocks,
-    mock_subtensor_client,
-    mock_settings,
-    create_job_result,
-    create_neuron_info,
-):
-    """Miners with collateral should score slightly better than those relying on uptime."""
-    validator = validator_with_mocks
-    validator.miner_scores = {}
-
-    miners = [
-        create_neuron_info(uid=100, hotkey="burner1"),
-        create_neuron_info(uid=101, hotkey="burner2"),
-        create_neuron_info(uid=2, hotkey="collateral_miner"),
-        create_neuron_info(uid=3, hotkey="uptime_miner_high"),
-        create_neuron_info(uid=4, hotkey="uptime_miner_low"),
-    ]
-
-    async def get_uptime_side_effect(executor_info):
-        if "uptime_miner_high" in str(executor_info.uuid):
-            return 150
-        if "uptime_miner_low" in str(executor_info.uuid):
-            return 60
-        return 100
-
-    validator.redis_service.get_executor_uptime = AsyncMock(side_effect=get_uptime_side_effect)
-
-    all_job_results = {
-        "collateral_miner": [
-            create_job_result(gpu_model="H100", gpu_count=1, collateral_deposited=True),
-        ],
-        "uptime_miner_high": [
-            create_job_result(
-                gpu_model="H100",
-                gpu_count=1,
-                collateral_deposited=False,
-                executor_id="uptime_miner_high",
-            ),
-        ],
-        "uptime_miner_low": [
-            create_job_result(
-                gpu_model="H100",
-                gpu_count=1,
-                collateral_deposited=False,
-                executor_id="uptime_miner_low",
-            ),
-        ],
-    }
-
-    await _run_sync_with_jobs(validator, miners, all_job_results)
-
-    # Verify incentive logging
-    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
-
-    for hotkey, results in all_job_results.items():
-        for result in results:
-            if result.score > 0 and result.incentive_logs:
-                assert_incentive_log_present(result.full_log_text)
-                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
-                assert_log_contains_keys(result.full_log_text, [
-                    "mining_score",
-                    "total_mining_score",
-                    "incentive"
-                ])
-
-    base_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=1,
-        total_gpu_count=3,
-    )
-    high_uptime_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=1,
-        total_gpu_count=3,
-        collateral_deposited=False,
-        uptime_minutes=150,
-    )
-    low_uptime_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=1,
-        total_gpu_count=3,
-        collateral_deposited=False,
-        uptime_minutes=60,
-    )
-    total_score = base_score + high_uptime_score + low_uptime_score
-    expected_base_cycle = MINING_ALLOCATION * base_score / total_score
-    expected_high_cycle = MINING_ALLOCATION * high_uptime_score / total_score
-    expected_low_cycle = MINING_ALLOCATION * low_uptime_score / total_score
-
-    assert validator.miner_scores["collateral_miner"] == pytest.approx(expected_base_cycle)
-    assert validator.miner_scores["uptime_miner_high"] == pytest.approx(expected_high_cycle)
-    assert validator.miner_scores["uptime_miner_low"] == pytest.approx(expected_low_cycle)
-    assert validator.miner_scores["uptime_miner_low"] < validator.miner_scores["collateral_miner"]
-
-    captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
-    weights_by_uid = _weights_by_uid(captured)
-
-    assert weights_by_uid[2] == pytest.approx(expected_base_cycle)
-    assert weights_by_uid[3] == pytest.approx(expected_high_cycle)
-    assert weights_by_uid[4] == pytest.approx(expected_low_cycle)
-
-
-@pytest.mark.asyncio
-async def test_scenario_new_vs_established_miner(
-    validator_with_mocks,
-    mock_subtensor_client,
-    mock_settings,
-    create_job_result,
-    create_neuron_info,
-):
-    """New miner with low uptime should score lower than established miner."""
-    validator = validator_with_mocks
-    validator.miner_scores = {}
-
-    miners = [
-        create_neuron_info(uid=100, hotkey="burner1"),
-        create_neuron_info(uid=101, hotkey="burner2"),
-        create_neuron_info(uid=2, hotkey="established_miner"),
-        create_neuron_info(uid=3, hotkey="new_miner"),
-    ]
-
-    async def get_uptime_side_effect(executor_info):
-        if "new_miner" in str(executor_info.uuid):
-            return 10
-        return 100
-
-    validator.redis_service.get_executor_uptime = AsyncMock(side_effect=get_uptime_side_effect)
-
-    all_job_results = {
-        "established_miner": [
-            create_job_result(gpu_model="H100", gpu_count=4, collateral_deposited=True),
-        ],
-        "new_miner": [
-            create_job_result(
-                gpu_model="H100",
-                gpu_count=4,
-                collateral_deposited=False,
-                executor_id="new_miner",
-            ),
-        ],
-    }
-
-    await _run_sync_with_jobs(validator, miners, all_job_results)
-
-    # Verify incentive logging
-    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
-
-    for hotkey, results in all_job_results.items():
-        for result in results:
-            if result.score > 0 and result.incentive_logs:
-                assert_incentive_log_present(result.full_log_text)
-                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
-                assert_log_contains_keys(result.full_log_text, [
-                    "mining_score",
-                    "total_mining_score",
-                    "incentive"
-                ])
-
-    established_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=4,
-        total_gpu_count=8,
-    )
-    new_miner_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=4,
-        total_gpu_count=8,
-        collateral_deposited=False,
-        uptime_minutes=10,
-    )
-    total_score = established_score + new_miner_score
-    expected_established_cycle = MINING_ALLOCATION * established_score / total_score
-    expected_new_cycle = MINING_ALLOCATION * new_miner_score / total_score
-
-    assert validator.miner_scores["established_miner"] == pytest.approx(expected_established_cycle)
-    assert validator.miner_scores["new_miner"] == pytest.approx(expected_new_cycle)
-    assert validator.miner_scores["new_miner"] < validator.miner_scores["established_miner"]
-
-    captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
-    weights_by_uid = _weights_by_uid(captured)
-
-    assert weights_by_uid[2] == pytest.approx(expected_established_cycle)
-    assert weights_by_uid[3] == pytest.approx(expected_new_cycle)
-
-
-@pytest.mark.asyncio
 async def test_scenario_mixed_sysbox_usage(
     validator_with_mocks,
     mock_subtensor_client,
@@ -416,10 +222,10 @@ async def test_scenario_mixed_sysbox_usage(
 
     all_job_results = {
         "sysbox_miner": [
-            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True),
         ],
         "no_sysbox_miner": [
-            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=False, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=False),
         ],
     }
 
@@ -491,21 +297,18 @@ async def test_scenario_multiple_executors_per_miner(
                 gpu_model="H100",
                 gpu_count=2,
                 sysbox_runtime=True,
-                collateral_deposited=True,
             ),
             create_job_result(
                 executor_id="exec-2",
                 gpu_model="A100",
                 gpu_count=1,
                 sysbox_runtime=True,
-                collateral_deposited=True,
             ),
             create_job_result(
                 executor_id="exec-3",
                 gpu_model="RTX4090",
                 gpu_count=1,
                 sysbox_runtime=False,
-                collateral_deposited=False,
             ),
         ],
         "single_executor_miner": [
@@ -513,7 +316,6 @@ async def test_scenario_multiple_executors_per_miner(
                 gpu_model="H100",
                 gpu_count=2,
                 sysbox_runtime=True,
-                collateral_deposited=True,
             ),
         ],
     }
@@ -568,8 +370,6 @@ async def test_scenario_multiple_executors_per_miner(
         gpu_count=1,
         total_gpu_count=1,
         sysbox_runtime=False,
-        collateral_deposited=False,
-        uptime_minutes=60,
     )
     multi_executor_score = exec1_score + exec2_score + exec3_score
     single_executor_score = expected_score(
@@ -668,7 +468,7 @@ async def test_scenario_single_miner_monopoly(
 
     all_job_results = {
         "monopoly_miner": [
-            create_job_result(gpu_model="H100", gpu_count=4, collateral_deposited=True),
+            create_job_result(gpu_model="H100", gpu_count=4),
         ],
         "failed_miner": [
             create_job_result(score=0.0, gpu_model="A100", gpu_count=2),
@@ -712,10 +512,10 @@ async def test_scenario_gpu_type_scarcity(
 
     all_job_results = {
         "scarce_gpu_miner": [
-            create_job_result(gpu_model="H200", gpu_count=1, collateral_deposited=True),
+            create_job_result(gpu_model="H200", gpu_count=1),
         ],
         "abundant_gpu_miner": [
-            create_job_result(gpu_model="RTX4090", gpu_count=1, collateral_deposited=True),
+            create_job_result(gpu_model="RTX4090", gpu_count=1),
         ],
     }
 
@@ -768,13 +568,13 @@ async def test_scenario_equal_competition(
 
     all_job_results = {
         "equal_miner_1": [
-            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True),
         ],
         "equal_miner_2": [
-            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True),
         ],
         "equal_miner_3": [
-            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2, sysbox_runtime=True),
         ],
     }
 
@@ -847,29 +647,27 @@ async def test_scenario_mixed_fleet_diversity(
 
     all_job_results = {
         "enterprise_miner": [
-            create_job_result(gpu_model="H100", gpu_count=8, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="H100", gpu_count=8, sysbox_runtime=True),
         ],
         "hobbyist_miner": [
-            create_job_result(gpu_model="RTX4090", gpu_count=4, sysbox_runtime=False, collateral_deposited=True),
+            create_job_result(gpu_model="RTX4090", gpu_count=4, sysbox_runtime=False),
         ],
         "startup_miner": [
             create_job_result(
                 gpu_model="H200",
                 gpu_count=2,
                 sysbox_runtime=True,
-                collateral_deposited=False,
                 executor_id="startup_miner_h200",
             ),
             create_job_result(
                 gpu_model="A100",
                 gpu_count=2,
                 sysbox_runtime=True,
-                collateral_deposited=False,
                 executor_id="startup_miner_a100",
             ),
         ],
         "datacenter_miner": [
-            create_job_result(gpu_model="A100", gpu_count=16, sysbox_runtime=True, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=16, sysbox_runtime=True),
         ],
     }
 
@@ -906,15 +704,11 @@ async def test_scenario_mixed_fleet_diversity(
         portion=GPU_PORTION["H200"],
         gpu_count=2,
         total_gpu_count=2,
-        collateral_deposited=False,
-        uptime_minutes=30,
     )
     startup_a100_score = expected_score(
         portion=GPU_PORTION["A100"],
         gpu_count=2,
         total_gpu_count=18,
-        collateral_deposited=False,
-        uptime_minutes=30,
     )
     startup_score = startup_h200_score + startup_a100_score
     datacenter_score = expected_score(
@@ -1005,10 +799,10 @@ async def test_scenario_process_weights_normalization(
 
     all_job_results = {
         "miner1": [
-            create_job_result(gpu_model="H100", gpu_count=2, collateral_deposited=True),
+            create_job_result(gpu_model="H100", gpu_count=2),
         ],
         "miner2": [
-            create_job_result(gpu_model="A100", gpu_count=2, collateral_deposited=True),
+            create_job_result(gpu_model="A100", gpu_count=2),
         ],
     }
 
@@ -1024,96 +818,6 @@ async def test_scenario_process_weights_normalization(
     processed = captured.get("processed_weights")
     assert processed is not None
     assert processed.sum() == pytest.approx(1.0)
-
-
-@pytest.mark.asyncio
-async def test_scenario_extreme_uptime_penalty(
-    validator_with_mocks,
-    mock_subtensor_client,
-    mock_settings,
-    create_job_result,
-    create_neuron_info,
-):
-    """Miner with zero uptime and no collateral should receive minimum score."""
-    validator = validator_with_mocks
-    validator.miner_scores = {}
-
-    miners = [
-        create_neuron_info(uid=100, hotkey="burner1"),
-        create_neuron_info(uid=101, hotkey="burner2"),
-        create_neuron_info(uid=2, hotkey="zero_uptime_miner"),
-        create_neuron_info(uid=3, hotkey="normal_miner"),
-    ]
-
-    async def get_uptime_side_effect(executor_info):
-        if "zero_uptime_miner" in str(executor_info.uuid):
-            return 0
-        return 120
-
-    validator.redis_service.get_executor_uptime = AsyncMock(side_effect=get_uptime_side_effect)
-
-    all_job_results = {
-        "zero_uptime_miner": [
-            create_job_result(
-                gpu_model="H100",
-                gpu_count=2,
-                sysbox_runtime=False,
-                collateral_deposited=False,
-                executor_id="zero_uptime_miner",
-            ),
-        ],
-        "normal_miner": [
-            create_job_result(
-                gpu_model="H100",
-                gpu_count=2,
-                sysbox_runtime=True,
-                collateral_deposited=True,
-            ),
-        ],
-    }
-
-    await _run_sync_with_jobs(validator, miners, all_job_results)
-
-    # Verify incentive logging even with extreme uptime penalty
-    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
-
-    for hotkey, results in all_job_results.items():
-        for result in results:
-            if result.score > 0 and result.incentive_logs:
-                assert_incentive_log_present(result.full_log_text)
-                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
-                assert_log_contains_keys(result.full_log_text, [
-                    "mining_score",
-                    "total_mining_score",
-                    "incentive"
-                ])
-
-    zero_uptime_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=2,
-        total_gpu_count=4,
-        sysbox_runtime=False,
-        collateral_deposited=False,
-        uptime_minutes=0,
-    )
-    normal_score = expected_score(
-        portion=GPU_PORTION["H100"],
-        gpu_count=2,
-        total_gpu_count=4,
-    )
-    total_score = zero_uptime_score + normal_score
-    expected_zero_cycle = MINING_ALLOCATION * zero_uptime_score / total_score
-    expected_normal_cycle = MINING_ALLOCATION * normal_score / total_score
-
-    assert validator.miner_scores["zero_uptime_miner"] == pytest.approx(expected_zero_cycle)
-    assert validator.miner_scores["normal_miner"] == pytest.approx(expected_normal_cycle)
-    assert validator.miner_scores["zero_uptime_miner"] < validator.miner_scores["normal_miner"]
-
-    captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
-    weights_by_uid = _weights_by_uid(captured)
-
-    assert weights_by_uid[2] == pytest.approx(expected_zero_cycle)
-    assert weights_by_uid[3] == pytest.approx(expected_normal_cycle)
 
 
 @pytest.mark.asyncio
@@ -1137,10 +841,10 @@ async def test_scenario_weight_distribution_fairness(
 
     all_job_results = {
         "miner_high": [
-            create_job_result(gpu_model="H100", gpu_count=6, collateral_deposited=True),
+            create_job_result(gpu_model="H100", gpu_count=6),
         ],
         "miner_low": [
-            create_job_result(gpu_model="H100", gpu_count=2, collateral_deposited=True),
+            create_job_result(gpu_model="H100", gpu_count=2),
         ],
     }
 
@@ -1193,7 +897,7 @@ async def test_scenario_zero_gpu_count_edge_case(
 
     all_job_results = {
         "miner1": [
-            create_job_result(gpu_model="UNKNOWN_GPU", gpu_count=2, collateral_deposited=True, score=0.0, job_score=0.0),
+            create_job_result(gpu_model="UNKNOWN_GPU", gpu_count=2, score=0.0, job_score=0.0),
         ],
     }
 

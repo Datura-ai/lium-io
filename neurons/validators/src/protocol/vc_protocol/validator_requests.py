@@ -196,7 +196,6 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     node_state_at_cycle: str | None = None
     incentive_formula_version: str | None = None
     incentive_formula_inputs: dict[str, Any] | None = None
-    collateral_deposited: bool
     ssh_pub_keys: list[str] | None = None
     # CVM attestation provenance (minimal-G5: the connector must not drop these).
     # Optional so the backend, which ignores unknown fields until it adopts them,

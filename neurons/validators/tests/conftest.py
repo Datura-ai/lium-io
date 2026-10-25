@@ -79,7 +79,7 @@ def make_pcc_job() -> Callable[..., "JobResult"]:
             score=1.0, job_score=1.0, job_batch_id="pcc-batch",
             log_status="success", log_text="ok",
             gpu_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented,
-            collateral_deposited=True, sysbox_runtime=True,
+            sysbox_runtime=True,
             supports_gpu_splitting=supports_gpu_splitting,
             gpu_splitting_min_count=gpu_splitting_min_count,
         )
@@ -147,25 +147,6 @@ def setup_sql_logging():
     pool_logger.setLevel(logging.DEBUG)
 
     print("✅ SQL logging enabled for all tests")
-
-
-@pytest.fixture(autouse=True)
-def _no_collateral_rpc():
-    """CollateralStatusCheck never reaches a real RPC: no miner has an EVM address unless a test says so.
-
-    Not monkeypatch: an autouse fixture that requests it moves its undo after the event loop's teardown,
-    and a test that patched time.monotonic with a finite iterator then fails there."""
-    from services import collateral_status
-
-    async def _refuse(batch):
-        raise AssertionError("collateral RPC called in a unit test")
-
-    saved = collateral_status._reader
-    collateral_status._reader = collateral_status.CollateralStatusReader(
-        rpc=_refuse, evm_address_for_hotkey=lambda _hotkey: None
-    )
-    yield
-    collateral_status._reader = saved
 
 
 @pytest.fixture

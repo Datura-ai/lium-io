@@ -57,7 +57,6 @@ def _make_job(
         provider_discord_connected=provider_discord_connected,
         is_provider_email_held=is_provider_email_held,
         default_job_owner=default_job_owner,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
 

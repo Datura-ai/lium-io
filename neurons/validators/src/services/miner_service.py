@@ -899,7 +899,6 @@ class MinerService:
             ),
             score=0,
             job_score=0,
-            collateral_deposited=False,
             job_batch_id=payload.job_batch_id,
             log_status="error",
             log_text=log_text.to_full_string(),
@@ -993,7 +992,6 @@ class MinerService:
                     ),
                     score=0,
                     job_score=0,
-                    collateral_deposited=False,
                     job_batch_id=payload.job_batch_id,
                     log_status="error",
                     log_text=log_text.to_full_string(),
@@ -1027,7 +1025,6 @@ class MinerService:
             executor_info=executor_info,
             score=0,
             job_score=0,
-            collateral_deposited=False,
             job_batch_id=payload.job_batch_id,
             log_status="error",
             log_text=reason,
@@ -1125,7 +1122,6 @@ class MinerService:
                         "incentive_reasons": [
                             reason.model_dump(mode="json") for reason in result.zero_incentive_reasons
                         ],
-                        "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
                         "attestation_digest": result.attestation_digest,
                         "tee_type": result.tee_type,

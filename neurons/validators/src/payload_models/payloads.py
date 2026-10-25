@@ -847,4 +847,3 @@ class GetEstimateRequest(BaseModel):
     gpu_splitting: bool = False
     gpu_splitting_min_count: int | None = None
     sysbox_runtime: bool = True
-    collateral_deposited: bool = True

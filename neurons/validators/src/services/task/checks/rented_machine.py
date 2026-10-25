@@ -379,8 +379,6 @@ class TenantEnforcementCheck:
         actual_score, job_score, warning_message = score_calculator(ctx, True)
 
         what = {
-            "contract_version": ctx.contract_version,
-            "collateral": ctx.collateral_deposited,
             "actual_score": actual_score,
             "job_score": job_score,
         }

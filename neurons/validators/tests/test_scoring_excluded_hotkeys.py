@@ -105,7 +105,6 @@ def _job(**overrides) -> JobResult:
         log_text="ok",
         gpu_model="NVIDIA H200",
         gpu_count=8,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
     fields.update(overrides)

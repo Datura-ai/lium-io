@@ -99,7 +99,6 @@ def _make_job(executor_id: str, gpu_model: str, gpu_count: int, is_rented: bool,
         score=1.0, job_score=1.0, job_batch_id="test-batch",
         log_status="success", log_text="ok",
         gpu_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented,
-        collateral_deposited=True,
         sysbox_runtime=sysbox_runtime,
     )
 

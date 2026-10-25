@@ -51,7 +51,6 @@ def _idle_flagship(**overrides) -> JobResult:
         log_text="ok",
         gpu_model=H200,
         gpu_count=8,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
     fields.update(overrides)
@@ -323,10 +322,10 @@ def _passed_but_zero(event_reason: str, remediation: str, **overrides) -> JobRes
 
 
 PASSED_BUT_ZERO = [
-    (FinalizeMessages.COMPLETED.reason, "Address issues: WARNING: Collateral required but not deposited", {}),
+    (FinalizeMessages.COMPLETED.reason, "Address issues: WARNING: GPU price exceeds the limit", {}),
     (
         TenantEnforcementMessages.ALREADY_RENTED.reason,
-        "No action needed. WARNING: Collateral required but not deposited",
+        "No action needed. WARNING: GPU price exceeds the limit",
         {"is_rented": True},
     ),
 ]

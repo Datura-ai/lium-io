@@ -67,7 +67,6 @@
           "gpu_model": "H100",
           "gpu_count": 8
         },
-        "collateral_deposited": true,
         "ssh_pub_keys": [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 renter"
         ],
@@ -119,8 +118,7 @@
         "synthetic_job_score": null,
         "log_text": "SSH connection failed",
         "log_status": "error",
-        "job_batch_id": "2026-09-08T20:30:00+00:00",
-        "collateral_deposited": false
+        "job_batch_id": "2026-09-08T20:30:00+00:00"
       }
     },
     {
@@ -140,7 +138,6 @@
         "log_text": "Host SSH unreachable",
         "log_status": "error",
         "job_batch_id": "2026-09-25T10:15:00+00:00",
-        "collateral_deposited": true,
         "validation_event": {
           "event": "Host SSH unreachable",
           "reason_code": "EXECUTOR_SSH_UNREACHABLE",
@@ -190,7 +187,6 @@
         "log_text": "No result from the miner for this node",
         "log_status": "error",
         "job_batch_id": "2026-09-25T10:15:00+00:00",
-        "collateral_deposited": true,
         "validation_event": {
           "event": "No result from the miner for this node",
           "reason_code": "EXECUTOR_RESULT_MISSING",

@@ -314,7 +314,6 @@ class TaskService:
                 executor_info=executor_info,
                 score=0,
                 job_score=0,
-                collateral_deposited=False,
                 job_batch_id=miner_info.job_batch_id,
                 log_status="error",
                 log_text=log_text.to_full_string(),

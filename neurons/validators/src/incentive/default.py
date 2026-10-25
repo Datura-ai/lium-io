@@ -256,17 +256,8 @@ class DefaultIncentive(BaseIncentive):
             job_result.nvidia_driver_version, is_rented=job_result.is_rented
         )
 
-        # Uptime multiplier
-        if settings.SKIP_COLLATERAL_PENALTY or job_result.collateral_deposited:
-            job_result.uptime_multiplier = 1
-        else:
-            uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
-            job_result.uptime_multiplier = (
-                1
-                - settings.PORTION_FOR_UPTIME
-                + settings.PORTION_FOR_UPTIME
-                * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES)
-            )
+        # Uptime multiplier: always 1 (the collateral uptime penalty is gone, DAH-4766)
+        job_result.uptime_multiplier = 1
 
         # Apply multiplier
         spot_rental_factor: float = self._spot_rental_factor(job_result)

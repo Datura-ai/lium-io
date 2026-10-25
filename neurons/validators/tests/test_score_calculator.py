@@ -18,7 +18,6 @@ def _ctx_without_specs(specs, price_per_gpu=None):
         state=state,
         services=build_services(),
         config=build_context_config(),
-        collateral_deposited=True,
         is_rental_succeed=True,
     )
 
@@ -95,23 +94,6 @@ def test_none_specs_rented_does_not_penalise():
     """ctx.state.specs is None — rented should not zero."""
     ctx = _ctx_without_specs(None)
     actual_score, job_score, warning = calculate_scores(ctx, rented=True)
-    assert actual_score == 1.0
-    assert job_score == 1.0
-    assert warning == ""
-
-
-@pytest.mark.parametrize("gpu_model", ["NVIDIA RTX 4090", "NVIDIA B200"])
-def test_executor_without_deposit_scores_in_full(gpu_model):
-    """Provider collateral is optional: an executor with nothing deposited keeps a full score, no warning."""
-    ctx = make_context(
-        executor=default_executor().model_copy(update={"price_per_gpu": None}),
-        state=build_state(gpu_model=gpu_model, specs={"network": {"ema_verifyx_download_speed": 500.0}}),
-        services=build_services(),
-        config=build_context_config(),
-        collateral_deposited=False,
-        is_rental_succeed=True,
-    )
-    actual_score, job_score, warning = calculate_scores(ctx, rented=False)
     assert actual_score == 1.0
     assert job_score == 1.0
     assert warning == ""

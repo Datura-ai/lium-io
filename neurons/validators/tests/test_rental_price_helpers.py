@@ -15,8 +15,6 @@ def expected_executor_score(
     is_rented: bool,
     rental_incentive_gpu_types: list[str],
     sysbox_runtime: bool,
-    collateral_deposited: bool,
-    uptime_minutes: float,
 ) -> float:
     if not is_rented:
         return 0.0
@@ -28,11 +26,6 @@ def expected_executor_score(
 
     if not sysbox_runtime:
         score *= 1 - settings.PORTION_FOR_SYSBOX
-
-    if not collateral_deposited:
-        uptime_ratio = min(1.0, uptime_minutes / settings.UPTIME_REQUIRED_MINUTES)
-        penalty_reduction = settings.PORTION_FOR_UPTIME * uptime_ratio
-        score *= 1 - settings.PORTION_FOR_UPTIME + penalty_reduction
 
     return score
 

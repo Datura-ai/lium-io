@@ -118,7 +118,6 @@ def test_score_calculator_zeroes_outdated_executor(
             gpu_model="NVIDIA H200",
             executor_image_report=report,
         ),
-        collateral_deposited=True,
     )
 
     actual_score, job_score, warning = calculate_scores(context, rented)

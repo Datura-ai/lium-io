@@ -32,7 +32,6 @@ def _idle_b300_1x(executor_id: str) -> JobResult:
         log_text="Validation task completed",
         gpu_model=B300,
         gpu_count=1,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
 

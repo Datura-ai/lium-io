@@ -48,7 +48,6 @@ def _make_job(
         rented_gpu_count=rented_gpu_count,
         supports_gpu_splitting=supports_gpu_splitting,
         gpu_splitting_min_count=gpu_splitting_min_count,
-        collateral_deposited=True,
         sysbox_runtime=True,
     )
 

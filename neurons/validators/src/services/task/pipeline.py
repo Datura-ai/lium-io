@@ -244,8 +244,6 @@ class Context(BaseModel):
     # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
-    collateral_deposited: bool = False
-    contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
     renting_in_progress: bool = False

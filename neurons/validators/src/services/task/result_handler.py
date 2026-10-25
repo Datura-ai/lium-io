@@ -236,7 +236,6 @@ class ResultHandler:
             executor_info=executor_info,
             score=context.score,
             job_score=context.job_score,
-            collateral_deposited=context.collateral_deposited,
             job_batch_id=miner_info.job_batch_id,
             log_status=log_status,
             log_text=str(log_text),
