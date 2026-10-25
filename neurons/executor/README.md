@@ -234,6 +234,36 @@ Causes the installer names:
 
 Validator releases after this change also run the test in the machine scrape, on nodes whose Docker accepts `--storage-opt` (a node without it is rented without a disk limit and is not tested); a validator on an earlier release does not run it. The scrape checks the plugin, `Mountpoint`, and a volume mounted into a container under the runtime this node's rentals get (Sysbox when the scrape's Sysbox GPU test passes, Docker's default runtime otherwise). They only read the plugin, never install or change it, and remove their test container and volume (`lium_storage_check_*`) when the test ends.
 
+### Docker data-root on a loop image
+
+A data-root on a loop-mounted image file (`/dev/loopN` in `df /var/lib/docker`) must have direct I/O on. Buffered, every write in a rented pod is cached twice; one pod writing heavily can stall Docker for minutes and the node is delisted. The installer reports it as a `FIX`. Better: put the data-root on a real disk ([Docker Storage Setup](https://docs.lium.io/providers/nodes/docker-storage)).
+
+**Switch it on now** (no rental running; on a busy device the command waits until the writes stop):
+
+```shell
+sudo losetup --direct-io=on /dev/loopN
+losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
+```
+
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount and before Docker. With the image `/data/img.raw` mounted at `/data/dockerimg` (use `UUID=` for `/data` in `/etc/fstab`: a `/dev/nvmeX` name can change on reboot and Docker then starts on an empty directory):
+
+```shell
+echo '/data/img.raw /data/dockerimg ext4 loop,nofail,x-systemd.requires=/data 0 0' | sudo tee -a /etc/fstab
+sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
+[Unit]
+Description=Direct I/O on the Docker data-root loop device
+RequiresMountsFor=/data/dockerimg
+Before=docker.service containerd.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'losetup -j /data/img.raw -n -O NAME | xargs -r -n1 losetup --direct-io=on'
+[Install]
+WantedBy=multi-user.target docker.service
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
+```
+
 ## The executor image
 
 `Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: it turns sshd's `PerSourcePenalties` off through `/etc/ssh/sshd_config.d/lium.conf` when the base's OpenSSH knows the directive (9.8 and later), and fails the build when `sshd -T` rejects the rendered configuration. The same drop-in sets `LogLevel VERBOSE`, so every login records the key fingerprint that opened it. The container runs no syslog: `run.sh` starts `sshd_log_receiver.py` as `/dev/log`, which keeps the `Accepted` lines with sshd's time and pid in `/var/log/sshd-auth.log` (renamed to `.1` past 50 MB). Each cycle the validator logs the lines it has not read yet as `Executor sshd logins` and moves its cursor in `/var/log/sshd-auth.cursor` only after that.
