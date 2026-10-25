@@ -111,7 +111,14 @@ _CREATE_DEADLINE_SECONDS = 300
 _IDLENESS_REREAD_BUDGET_SECONDS = 30
 # the executor task is cancelled at JOB_TIME_OUT - 120 (miner_service), and a cancel there drops the
 # miner's whole result; a probe starts only while a stuck create plus a usual teardown still fit
-_MIN_TASK_SECONDS_LEFT = _CREATE_DEADLINE_SECONDS + 60
+_USUAL_TEARDOWN_SECONDS = 60
+_MIN_TASK_SECONDS_LEFT = _CREATE_DEADLINE_SECONDS + _USUAL_TEARDOWN_SECONDS
+# A node with a standing failure is probed on less time: only a passed probe clears the failure, and a
+# node whose other checks take longer than JOB_TIME_OUT allows for a full create reserve was never
+# probed again (8x B300, 25 Oct: ~470 s of checks, delisted after its fault was fixed). A probe that
+# runs out of this time fails as the standing failure already does, so the shorter budget costs
+# nothing. Passing probes took 155 s at most (Loki, 25 Oct; p95 66 s).
+_MIN_TASK_SECONDS_LEFT_STANDING = 180
 _TASK_TIMEOUT_MARGIN_SECONDS = 120
 # the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
 # outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
@@ -232,7 +239,11 @@ class RentalProbeCheck:
         image_ref = gate.image_ref
         try:
             outcome = await _probe(
-                ctx, image_ref, gate.create_lock, beside_fillers=bool(gate.fillers_beside)
+                ctx,
+                image_ref,
+                gate.create_lock,
+                beside_fillers=bool(gate.fillers_beside),
+                create_deadline=_create_deadline_seconds(ctx),
             )
         finally:
             await gate.create_lock.release(ctx)
@@ -304,7 +315,7 @@ class RentalProbeCheck:
         # Redis could not be read (then this cycle behaves as if there were none, and logs why)
         standing = await _standing_failure(ctx)
 
-        skip_reason, skip_what = await _skip_reason(ctx)
+        skip_reason, skip_what = await _skip_reason(ctx, standing)
         if skip_reason == "rented":
             return self._skipped(ctx, skip_reason, skip_what)
         if skip_reason:
@@ -488,15 +499,22 @@ class RentalProbeCheck:
         return CheckResult(passed=True, event=event)
 
 
-async def _skip_reason(ctx: Context) -> tuple[str | None, dict[str, Any]]:
+def _task_seconds_left(ctx: Context) -> float:
+    return settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
+
+
+def _create_deadline_seconds(ctx: Context) -> float:
+    """The create's deadline: the full one, or what is left after a usual teardown when the cycle is late."""
+    return min(_CREATE_DEADLINE_SECONDS, _task_seconds_left(ctx) - _USUAL_TEARDOWN_SECONDS)
+
+
+async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
-    task_seconds_left = (
-        settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
-    )
-    if task_seconds_left < _MIN_TASK_SECONDS_LEFT:
+    task_seconds_left = _task_seconds_left(ctx)
+    if task_seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
         return "too little cycle time left", {"task_seconds_left": int(task_seconds_left)}
 
     try:
@@ -838,7 +856,12 @@ def _probe_payload(
 
 
 async def _probe(
-    ctx: Context, image_ref: str, create_lock: _CreateLock, *, beside_fillers: bool = False
+    ctx: Context,
+    image_ref: str,
+    create_lock: _CreateLock,
+    *,
+    beside_fillers: bool = False,
+    create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> _ProbeOutcome:
     """Run the six steps in order; whatever happens, the node and this validator's Redis are left as found.
 
@@ -869,6 +892,7 @@ async def _probe(
             public_key=public_key,
             create_lock=create_lock,
             beside_fillers=beside_fillers,
+            create_deadline=create_deadline,
         )
         if created is None:
             return outcome
@@ -896,6 +920,7 @@ async def _step_container_start(
     public_key: str,
     create_lock: _CreateLock,
     beside_fillers: bool = False,
+    create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> ContainerCreated | None:
     """Step 1: start the container through create_container, the path a renter's pod takes.
 
@@ -919,7 +944,7 @@ async def _step_container_start(
                 ctx.executor_ssh_private_key_encrypted,
                 beside_fillers=beside_fillers,
             ),
-            timeout=_CREATE_DEADLINE_SECONDS,
+            timeout=create_deadline,
         )
     except TimeoutError:
         outcome.steps.append(
@@ -927,7 +952,7 @@ async def _step_container_start(
                 STEP_CONTAINER_START,
                 time.perf_counter() - started,
                 False,
-                f"create_container did not finish in {_CREATE_DEADLINE_SECONDS} s",
+                f"create_container did not finish in {int(create_deadline)} s",
             )
         )
         outcome.failed_step = STEP_CONTAINER_START

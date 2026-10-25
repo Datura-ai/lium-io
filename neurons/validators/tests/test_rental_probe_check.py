@@ -427,6 +427,41 @@ async def test_late_in_the_cycle_creates_nothing():
 
 
 @pytest.mark.asyncio
+async def test_a_standing_failure_is_probed_late_in_the_cycle_and_clears():
+    """Regression (8x B300, 25 Oct): its other checks took ~470 s, so every cycle skipped the probe for
+    "too little cycle time left" and carried the standing failure: fixed, it stayed delisted."""
+    redis = FakeRedis(failed_step=STEP_CONTAINER_START)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 471})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(late)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert len(docker.create_calls) == 1
+    assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_a_standing_failure_with_too_little_time_for_any_probe_is_carried():
+    redis = FakeRedis(failed_step=STEP_CONTAINER_START)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 650})
+    with probe_settings():
+        result = await RentalProbeCheck().run(late)
+    assert result.passed is False and result.event.what_we_saw["standing_failure"] is True
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: too little cycle time left"
+    assert docker.create_calls == []
+
+
+def test_a_late_probes_create_deadline_leaves_room_for_the_teardown():
+    ctx, _, _ = make_probe_context()
+    with probe_settings():
+        assert module._create_deadline_seconds(ctx) == module._CREATE_DEADLINE_SECONDS
+        late = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 471})
+        # 900 - 120 margin - 471 elapsed - 60 teardown
+        assert 248 <= module._create_deadline_seconds(late) <= 249
+
+
+@pytest.mark.asyncio
 async def test_first_pass_under_enforcement_probes():
     ctx, docker, _ = make_probe_context(first_pass=True)
     with probe_settings(), renter_path():
