@@ -182,8 +182,8 @@ def _removed_volume_names(rm_calls: list[str]) -> list[str]:
 async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
     """A filler create sweeps only filler-labelled volumes, so the reaper must take the `volume_<run id>` of a
     filler it removes, or the preallocated volume holds the disk."""
-    filler = "filler_run-1"
-    customer_pod = "pod_customer"
+    filler = "filler_00000000-0000-4000-8000-0000000000a1"
+    customer_pod = "pod_00000000-0000-4000-8000-0000000000c1"
     ssh, rm_calls = _make_ssh_mock(containers=[filler, customer_pod], ages_by_name={filler: 30, customer_pod: 30})
 
     _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
@@ -191,7 +191,7 @@ async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
     )
 
     assert removed_names == [filler]
-    assert _removed_volume_names(rm_calls) == ["volume_run-1"]
+    assert _removed_volume_names(rm_calls) == ["volume_00000000-0000-4000-8000-0000000000a1"]
 
 
 @pytest.mark.parametrize(
@@ -205,7 +205,7 @@ async def test_reaper_removes_a_stale_filler_and_only_its_own_volume():
 )
 @pytest.mark.asyncio
 async def test_a_failed_filler_volume_rm_is_logged_unless_the_volume_is_gone(caplog, stderr: str, warned: bool):
-    filler = "filler_run-1"
+    filler = "filler_00000000-0000-4000-8000-0000000000a1"
     ssh, _ = _make_ssh_mock(containers=[filler], ages_by_name={filler: 30})
     plain_handler = ssh.run.side_effect
 
@@ -375,7 +375,7 @@ async def test_cleanup_preserves_young_unknown_filler_container():
 
 @pytest.mark.asyncio
 async def test_cleanup_removes_stale_unknown_filler_container():
-    name = "filler_stale"
+    name = "filler_00000000-0000-4000-8000-0000000000a2"
     ssh, rm_calls = _make_ssh_mock(
         containers=[name],
         ages_by_name={name: 30},
@@ -685,10 +685,10 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
 # Only an empty or missing fleet snapshot means "don't know"; any listed name is protected on every host
 # ---------------------------------------------------------------------------
 
-LIVE_POD = "pod_live-0000-4000-8000-000000000001"
-LIVE_FILLER = "filler_live_bundle"
-STRAY_POD = "pod_stray-0000-4000-8000-000000000002"
-ELSEWHERE_POD = "pod_elsewhere-0000-4000-8000-000000000003"
+LIVE_POD = "pod_00000000-0000-4000-8000-000000000001"
+LIVE_FILLER = "filler_00000000-0000-4000-8000-0000000000f1"
+STRAY_POD = "pod_00000000-0000-4000-8000-000000000002"
+ELSEWHERE_POD = "pod_00000000-0000-4000-8000-000000000003"
 
 
 def _real_rented_data(executor_uuid: str, pods: list[str], fillers: list[str] | None = None, key: str | None = None):
@@ -767,8 +767,8 @@ async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_list
 
 @pytest.mark.asyncio
 async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
-    fleet_pods = [f"pod_fleet-{i:04d}" for i in range(500)]
-    stale = [f"pod_stale-{i:02d}" for i in range(5)]
+    fleet_pods = [f"pod_00000000-0000-4000-8000-{i:012d}" for i in range(500)]
+    stale = [f"pod_00000000-0000-4000-9000-{i:012d}" for i in range(5)]
     ssh, _ = _make_ssh_mock(containers=stale, ages_by_name={name: 60 for name in stale})
     rented_data = _real_rented_data("another-node", fleet_pods)
 
@@ -781,7 +781,7 @@ async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
     assert removed_count == len(stale) and len(cleanup_logs) == len(stale) + 1
     for msg in cleanup_logs:
         assert msg.extra["rented_container_count"] == len(listed_container_names(rented_data))
-        assert "pod_fleet-" not in msg.to_full_string()
+        assert "4000-8000" not in msg.to_full_string()
 
 
 @pytest.mark.parametrize("rented_data", [None, _listed(), _rented_data("twin-executor-id", ["pod_on_twin"])])
@@ -812,3 +812,45 @@ def test_listed_container_names_protects_the_pod_container_of_an_unnamed_pod():
 
     assert "pod_pod-0" in names and "pod_pod-0__prev" in names
     assert "" not in names and "__prev" not in names
+
+
+@pytest.mark.asyncio
+async def test_only_names_lium_gave_are_listed_for_removal():
+    """`docker ps --filter name=pod_*` is an unanchored regex; prod removed a provider's "podman" (25 Oct)."""
+    lium = [
+        "pod_00000000-0000-4000-8000-000000000001",
+        "pod_00000000-0000-4000-8000-000000000001__prev",
+        "filler_00000000-0000-4000-8000-000000000002",
+        "container_5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p_40016",
+        "health_check_1777040800",
+    ]
+    providers = ["podman", "mypod_x", "container_dindtest", "filler_1", "pod_customer", "my_pod_00000000-0000-4000-8000-000000000001"]
+    ssh = MagicMock()
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout="\n".join(providers + lium) + "\n", stderr=""))
+
+    assert await ContainerCleanup()._get_all_rental_containers(ssh) == lium
+
+
+@pytest.mark.asyncio
+async def test_the_check_hands_this_cycles_removals_to_the_gpu_usage_check():
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    from tests.helpers import build_services, build_state, make_context
+
+    removed = "filler_00000000-0000-4000-8000-0000000000a1"
+    cleanup = AsyncMock()
+    cleanup.cleanup.return_value = (1, [removed], [])
+    cleanup.sweep_abandoned_download_temporaries.return_value = 0
+    cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
+    redis = AsyncMock()
+    redis.sadd.return_value = 0  # seen before: no first-sight grace
+    redis.hgetall.return_value = {}
+    ctx = make_context(
+        services=build_services(container_cleanup=cleanup, redis=redis),
+        state=build_state(rented_data=_real_rented_data("another-node", [LIVE_POD])),
+    )
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["state"].reaped_containers == [removed]

@@ -133,7 +133,42 @@ async def test_gpu_usage_orphaned_container(context_factory):
     assert result.event.what_we_saw.get("orphaned_container") == container_name
     assert result.event.what_we_saw.get("rental_status") == "Lium has no rental for it"
     assert result.event.what_we_saw.get("container_status") == "still running"
-    assert "Provider Portal must show no active rental" in result.event.remediation
+    assert "Do not remove pod containers yourself" in result.event.remediation
+    assert "docker rm" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_container_the_cleanup_reaped_this_cycle_does_not_fail_the_node(context_factory):
+    """The processes are read before the stale cleanup runs; a container it removed is gone with them."""
+    container_name = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": container_name}],
+        reaped_containers=[container_name],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+    assert result.event.what_we_saw["reaped_this_cycle"] == [container_name]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_named_container_lium_never_issued_is_the_providers_to_stop(context_factory):
+    container_name = f"{POD_CONTAINER_PREFIX}mine"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": container_name}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "Lium never created it" in result.event.remediation
 
 
 # --- A rental that ends while the run is inside it is teardown, not an orphan ---
@@ -307,9 +342,9 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
         f"{TEARDOWN_POD} is named like a Lium pod container (pod {TEARDOWN_POD_ID}), and no live "
         "rental on this node uses it: its rental ended 20 minutes ago."
     )
-    assert "Provider Portal must show no active rental" in remediation
+    assert "removes a leftover pod container by itself" in remediation
     assert "docker stop" not in remediation
-    assert f"Only then remove it: docker rm -f {TEARDOWN_POD}" in remediation
+    assert "docker rm" not in remediation
 
 
 @pytest.mark.parametrize(

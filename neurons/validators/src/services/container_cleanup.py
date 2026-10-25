@@ -16,6 +16,7 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
+    LIUM_RENTAL_CONTAINER_NAME,
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
 )
@@ -564,12 +565,16 @@ class ContainerCleanup:
         try:
             patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
             result = await ssh_client.run(DockerCommand.ps_filter(*patterns))
-            if result.stdout and result.stdout.strip():
-                return result.stdout.strip().split('\n')
+            # the filter is a substring regex; keep only names Lium gave (it removed "podman", 25 Oct)
+            return [
+                name.strip()
+                for name in (result.stdout or "").splitlines()
+                if LIUM_RENTAL_CONTAINER_NAME.match(name.strip())
+            ]
         except Exception as e:
             logger.warning(
                 _m(
-                    f"Error getting rental containers",
+                    "Error getting rental containers",
                     extra={
                         "error": str(e)
                     }

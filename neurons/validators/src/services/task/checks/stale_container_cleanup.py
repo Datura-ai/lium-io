@@ -155,11 +155,12 @@ class StaleContainerCleanupCheck:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
-        if not unremovable_names and not reaped:
+        if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
+            reaped_containers=removed_names,
             pod_states=[*ctx.state.pod_states, *reaped],
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
