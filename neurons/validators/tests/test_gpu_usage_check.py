@@ -337,6 +337,21 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
     assert "docker rm" not in remediation
 
 
+@pytest.mark.asyncio
+async def test_an_ended_rental_with_no_owning_node_gets_no_removal_promise(context_factory):
+    # the stale cleanup keeps it: a record naming no node cannot prove the pod ran here
+    pod_rental = PodRentalActiveResponse(
+        active=False, executor_id=None, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+    )
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "removes a leftover pod container by itself" not in result.event.remediation
+    assert "Lium cannot confirm it as one of its containers" in result.event.remediation
+
+
 @pytest.mark.parametrize(
     "pod_rental,rental_status",
     [
