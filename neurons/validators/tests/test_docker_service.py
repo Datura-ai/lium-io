@@ -8044,3 +8044,40 @@ async def test_a_sigkill_whose_container_is_gone_still_goes_out_as_container_van
         container_missing=container_missing,
     )
     assert result.error_code == getattr(FailedContainerErrorCodes, error_code)
+
+
+_SYSBOX_OCI_PREFIX = (
+    "Docker SDK run container failed: 400 Client Error for http+docker://ssh/v1.56/containers/pod_x/start: "
+    'Bad Request ("failed to create task for container: failed to create shim task: OCI runtime create failed: '
+    "container_linux.go:439: starting container process caused: process_linux.go:608: container init caused: "
+    "process_linux.go:579: handleReqOp caused: rootfs_init_linux.go:410: setting up ID-mapped mount on path "
+)
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        # classic overlay2 store, Sysbox 0.7.1 (prod, 25 Oct 2026, lmsysorg/sglang:dev-muse-spark-open, 79 layers)
+        ("l/RK22RUSOMIWEQLFK45ZMFTQT2M", docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE),
+        # containerd store, Sysbox 0.6.6
+        ("206/fs", docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE),
+        # an absolute path is the data-root filesystem, not the layer count
+        ("/var/lib/docker/overlay2/abc/diff", None),
+    ],
+)
+def test_sysbox_many_layers_sentence(path, expected):
+    error = RuntimeError(
+        f"{_SYSBOX_OCI_PREFIX}{path} (likely means idmapped mounts are not supported on the filesystem at this "
+        'path ()) caused: Failed to eval symlink on : lstat l: no such file or directory")'
+    )
+    assert docker_service_module.sysbox_many_layers_sentence(error) == expected
+
+
+def test_sysbox_many_layers_sentence_reads_the_last_retry_attempt():
+    future = Future(attempt_number=1)
+    future.set_exception(RuntimeError(f"{_SYSBOX_OCI_PREFIX}l/QS7XCQKF3WO5WR6E7QMWSSPGKM (likely means ..."))
+    assert (
+        docker_service_module.sysbox_many_layers_sentence(RetryError(future))
+        == docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE
+    )
+    assert docker_service_module.sysbox_many_layers_sentence(RuntimeError("port is already allocated")) is None
