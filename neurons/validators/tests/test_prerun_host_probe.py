@@ -216,6 +216,20 @@ def test_a_b300_keeps_its_nvlink_switch_management_cards_out_of_the_pod(tmp_path
     assert _verbs_nodes_on(tmp_path, cards) == sorted(f"uverbs{n}" for n in range(4, 13))
 
 
+def test_a_rail_whose_sm_lid_number_a_management_port_holds_stays(tmp_path):
+    # LIDs repeat across subnets: the nvlsm subnet hands a management port 0x323, the rails' SM LID
+    cards = {f"mlx5_{i}": [(hex(0x320 + i), "0x320")] for i in range(4)}
+    cards |= {f"mlx5_{4 + i}": [(hex(0xAA07 + i), "0x323")] for i in range(8)}
+
+    assert _verbs_nodes_on(tmp_path, cards) == sorted(f"uverbs{n}" for n in range(4, 12))
+
+
+def test_a_card_with_a_roce_port_beside_a_host_local_infiniband_port_stays(tmp_path):
+    cards = {"mlx5_0": [("0x1", "0x1"), ("0x0", "0x0")], "mlx5_1": [("0xaa07", "0x323")]}
+
+    assert _verbs_nodes_on(tmp_path, cards) == ["uverbs0", "uverbs1"]
+
+
 def test_a_host_on_its_own_subnet_manager_only_keeps_every_card(tmp_path):
     cards = {f"mlx5_{i}": [(hex(0x1 + i), "0x1")] for i in range(4)}
 

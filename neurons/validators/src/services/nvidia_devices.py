@@ -588,24 +588,29 @@ async def _query_gpu_minor_map_from_nvidia_smi_xml(
     return _parse_nvidia_smi_xml_minor_map(res.stdout)
 
 
-# Succeeds for a verbs node whose card answers only to a subnet manager running on this host (its SM
-# LID is one of the host's own port LIDs) while another card here is on a shared one. An 8x B300 runs
-# nvlsm on its ConnectX-7 NVLink switch management cards next to the ConnectX-8 rails on the switch's
-# SM: those cards reach no other node, so a cluster job must not see them (NCCL would try them), and
-# a tenant has no business on the NVLink switch management subnet. A host whose every card is on its
-# own SM keeps them all: nothing shared is left to prefer.
+# Succeeds for a verbs node every port of which sits on a subnet whose manager runs on this host,
+# while some other port here is on a shared one. An 8x B300 runs nvlsm on its ConnectX-7 NVLink
+# switch management cards next to the ConnectX-8 rails on the switch's SM: those cards reach no other
+# node, so a cluster job must not see them (NCCL would try them), and a tenant has no business on the
+# NVLink switch management subnet. A subnet is host-local when one of ITS ports carries the manager's
+# own LID (lid == sm_lid on that port); LIDs repeat across subnets, so a host-wide comparison would
+# misjudge a rail whose SM LID number a management port happens to hold. A port with no subnet
+# manager (sm_lid 0x0: Ethernet/RoCE, or a link that is down) keeps its card, as does a host with no
+# shared subnet.
 HOST_LOCAL_SM_VERBS_FUNCTION = (
     "_host_local_sm_verbs() { "
-    'L=" $(echo $(cat /sys/class/infiniband/*/ports/*/lid 2>/dev/null)) "; shared=; '
+    "own=; shared=; "
+    "for q in /sys/class/infiniband/*/ports/*; do "
+    's=$(cat "$q/sm_lid" 2>/dev/null); [ -z "$s" ] || [ "$s" = 0x0 ] && continue; '
+    '[ "$(cat "$q/lid" 2>/dev/null)" = "$s" ] && own="$own $s "; done; '
     "for f in /sys/class/infiniband/*/ports/*/sm_lid; do "
     's=$(cat "$f" 2>/dev/null); [ -z "$s" ] || [ "$s" = 0x0 ] && continue; '
-    'case "$L" in *" $s "*) ;; *) shared=1 ;; esac; done; '
+    'case "$own" in *" $s "*) ;; *) shared=1 ;; esac; done; '
     '[ -n "$shared" ] || return 1; '
-    'd=$(cat "/sys/class/infiniband_verbs/${1##*/}/ibdev" 2>/dev/null) || return 1; local_sm=; '
+    'd=$(cat "/sys/class/infiniband_verbs/${1##*/}/ibdev" 2>/dev/null) || return 1; '
     'for f in "/sys/class/infiniband/$d"/ports/*/sm_lid; do '
-    's=$(cat "$f" 2>/dev/null); [ -z "$s" ] || [ "$s" = 0x0 ] && continue; '
-    'case "$L" in *" $s "*) local_sm=1 ;; *) return 1 ;; esac; done; '
-    '[ -n "$local_sm" ]; }'
+    's=$(cat "$f" 2>/dev/null); '
+    'case "$own" in *" $s "*) ;; *) return 1 ;; esac; done; }'
 )
 
 
