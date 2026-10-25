@@ -1027,14 +1027,14 @@ def is_host_fault_create_failure(current_step: str | None) -> bool:
     return current_step in _HOST_FAULT_CREATE_STEPS
 
 
-# DAH-5118: once an image has more layers than fit in one page of overlayfs mount options (about 70),
-# Docker passes them as relative paths, and Sysbox 0.7.1 cannot ID-map them: `l/<id>` on the classic
+# DAH-5118: once an image has more layers than fit in one page of overlayfs mount options (no fixed count:
+# it depends on the data-root path length, ~50 layers with a long root), Docker passes them as relative paths, and Sysbox 0.7.1 cannot ID-map them: `l/<id>` on the classic
 # overlay2 store (nestybox/sysbox#725, fixed in sysbox-runc main 90a493b, not in a release yet), `<n>/fs`
 # on the containerd store with Sysbox 0.6.6 and older. The same image starts on other nodes.
 _SYSBOX_RELATIVE_LAYER_RE = re.compile(r"setting up ID-mapped mount on path (?:l/[A-Z0-9]+|\d+/fs) ")
 SYSBOX_MANY_LAYERS_RENTER_SENTENCE = (
-    "this image has too many layers (about 70 or more) for this node's container runtime; "
-    "rent another node or use an image with fewer layers"
+    "this image has too many layers for this node's storage driver; "
+    "rent another node or flatten the image into fewer layers"
 )
 
 
