@@ -245,7 +245,7 @@ sudo losetup --direct-io=on /dev/loopN
 losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
 ```
 
-**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
 
 1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
 
@@ -260,6 +260,7 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    #!/bin/sh
    IMG=/data/img.raw MNT=/data/dockerimg
    root=$(sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/docker/daemon.json 2>/dev/null)
+   root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
    case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
    mountpoint -q "$MNT" || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
    dev=$(losetup -j "$IMG" -n -O NAME | head -n 1)
