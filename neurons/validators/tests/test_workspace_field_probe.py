@@ -39,5 +39,5 @@ def test_image_without_storage_package_is_an_old_image(tmp_path):
 
 def test_other_import_error_still_fails_the_probe(tmp_path):
     src = _models(tmp_path, "import not_a_real_module_xyz\n")
-    with pytest.raises(RuntimeError, match="exit 1"):
+    with pytest.raises(RuntimeError, match="not_a_real_module_xyz"):
         _probe(src)
