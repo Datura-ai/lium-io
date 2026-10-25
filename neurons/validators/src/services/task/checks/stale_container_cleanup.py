@@ -236,7 +236,8 @@ async def _lium_workload_ended_here(ctx: Context, container_name: str) -> bool:
     else:
         record = await ctx.services.backend.get_pod_rental_active(record_id)
         ended = record is not None and not record.active and record.rental_closed_at is not None
-    return ended and record.executor_id in (None, str(ctx.executor.uuid))
+    # a record with no owner never matches: it cannot prove the workload ran on this node
+    return ended and record.executor_id is not None and record.executor_id == str(ctx.executor.uuid)
 
 
 def pod_id_of_container(name: str) -> str | None:

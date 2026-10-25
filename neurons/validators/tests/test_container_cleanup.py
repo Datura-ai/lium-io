@@ -6,6 +6,7 @@ DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
 volumes left behind by historical `docker rm` without `-v`.
 """
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,6 +28,11 @@ def _ssh_mock_from_calls(call_handler):
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=call_handler)
     return ssh
+
+
+def _ps_line(name: str, label: str) -> str:
+    """One `docker ps` line as the listing's format prints it: a JSON [name, pod id label]."""
+    return json.dumps([name, label])
 
 
 def _label_of(name: str) -> str:
@@ -56,7 +62,7 @@ def _make_ssh_mock(
         # docker ps -a ... --filter name=... returns the container list
         if "docker ps -a" in cmd:
             lines = [
-                f"{name}|{'' if name in unlabelled else _label_of(name)}" for name in containers
+                _ps_line(name, "" if name in unlabelled else _label_of(name)) for name in containers
             ]
             return MagicMock(exit_status=0, stdout="\n".join(lines), stderr="")
         # current time on host
@@ -650,7 +656,7 @@ def _make_unkillable_ssh_mock(name: str, rm_failures: int, current_ts: int = 1_0
     async def handler(cmd, *args, **kwargs):
         calls.append(cmd)
         if "docker ps -a" in cmd:
-            return MagicMock(exit_status=0, stdout=f"{name}|{_label_of(name)}", stderr="")
+            return MagicMock(exit_status=0, stdout=_ps_line(name, _label_of(name)), stderr="")
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
         if "docker inspect" in cmd and "Created" in cmd:
@@ -932,7 +938,7 @@ async def test_an_inherited_label_naming_another_live_pod_does_not_keep_an_ended
 
     async def inherited_label(cmd, *args, **kwargs):
         if "docker ps -a" in cmd:
-            return MagicMock(exit_status=0, stdout=f"{name}|{LIVE_POD.removeprefix('pod_')}", stderr="")
+            return MagicMock(exit_status=0, stdout=_ps_line(name, LIVE_POD.removeprefix("pod_")), stderr="")
         return await handler(cmd, *args, **kwargs)
 
     ssh.run.side_effect = inherited_label
@@ -972,7 +978,8 @@ async def test_the_listing_reads_each_containers_pod_id_label():
 
     async def handler(cmd, *args, **kwargs):
         seen.append(cmd)
-        return MagicMock(exit_status=0, stdout="pod_a|a\npodman|\n", stderr="")
+        stdout = f'{_ps_line("pod_a", "a")}\n{_ps_line("podman", "")}\n'
+        return MagicMock(exit_status=0, stdout=stdout, stderr="")
 
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=handler)
@@ -980,7 +987,34 @@ async def test_the_listing_reads_each_containers_pod_id_label():
     listed = await ContainerCleanup()._get_all_rental_containers(ssh)
 
     assert listed == [("pod_a", "a"), ("podman", "")]
-    assert """--format '{{.Names}}|{{.Label "io.lium.pod_id"}}'""" in seen[0]
+    assert """--format '[{{json .Names}},{{json (.Label "io.lium.pod_id")}}]'""" in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_a_multiline_pod_id_label_cannot_forge_a_second_container_record():
+    forged = "ignored\nprovider_db|provider_db\n[\"provider_db\",\"provider_db\"]"
+
+    async def handler(cmd, *args, **kwargs):
+        return MagicMock(exit_status=0, stdout=_ps_line("pod_a", forged) + "\n", stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+
+    listed = await ContainerCleanup()._get_all_rental_containers(ssh)
+
+    assert listed == [("pod_a", forged)]  # one container, one record; the label stays inside it
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_listing_line_is_skipped():
+    async def handler(cmd, *args, **kwargs):
+        stdout = 'provider_db|provider_db\n["x"]\n' + _ps_line("pod_a", "a")
+        return MagicMock(exit_status=0, stdout=stdout, stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+
+    assert await ContainerCleanup()._get_all_rental_containers(ssh) == [("pod_a", "a")]
 
 
 def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=None):
@@ -1025,14 +1059,17 @@ ENDED = {"active": False, "rental_closed_at": CLOSED}
 @pytest.mark.parametrize(
     "name, pod_answer, filler_answer, ended",
     [
-        (LEGACY_POD, ENDED, None, True),
+        (LEGACY_POD, {**ENDED, "executor_id": "THIS"}, None, True),  # owner matches
         (f"{LEGACY_POD}__prev", {**ENDED, "executor_id": "THIS"}, None, True),
-        (LEGACY_POD, {**ENDED, "executor_id": "another-node"}, None, False),
-        (LEGACY_POD, {"active": False}, None, False),  # no close time: no proof Lium's rental ended
+        (LEGACY_POD, {**ENDED, "executor_id": "another-node"}, None, False),  # owner mismatches
+        (LEGACY_POD, ENDED, None, False),  # owner missing: never matches
+        # no close time: no proof Lium's rental ended
+        (LEGACY_POD, {"active": False, "executor_id": "THIS"}, None, False),
         (LEGACY_POD, {"active": True}, None, False),
         (LEGACY_POD, None, None, False),  # no record (404) or the backend did not answer
-        (LEGACY_FILLER, None, {"active": False, "status": "STOPPED"}, True),
+        (LEGACY_FILLER, None, {"active": False, "status": "STOPPED", "executor_id": "THIS"}, True),
         (LEGACY_FILLER, None, {"active": False, "status": "FAILED", "executor_id": "x"}, False),
+        (LEGACY_FILLER, None, {"active": False, "status": "STOPPED"}, False),  # owner missing
         (LEGACY_FILLER, None, {"active": False, "status": "STARTING"}, False),
         (LEGACY_FILLER, None, {"active": False}, False),  # no status: proves nothing
         (LEGACY_FILLER, None, None, False),

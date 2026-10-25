@@ -155,7 +155,8 @@ async def test_a_pod_named_container_lium_never_issued_is_left_to_the_provider(c
 
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
-    assert "Lium never removes a container it did not create" in result.event.remediation
+    assert "keeps a container whose rental it cannot confirm as ended" in result.event.remediation
+    assert "never removes" not in result.event.remediation
     assert "stop" not in result.event.remediation.lower()
 
 

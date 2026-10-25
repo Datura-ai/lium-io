@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import shlex
@@ -626,13 +627,21 @@ class ContainerCleanup:
         """
         try:
             patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
-            output_format = f'{{{{.Names}}}}|{{{{.Label "{LIUM_POD_ID_LABEL}"}}}}'
+            # one JSON array per container: a label with a newline cannot forge a second record
+            output_format = f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}}]'
             result = await ssh_client.run(
                 DockerCommand.ps_filter(*patterns, output_format=output_format)
             )
             # (name, pod id label or ""); the name filter is a substring regex that lists "podman" too
-            lines = (line.strip().partition("|") for line in (result.stdout or "").splitlines())
-            return [(name, pod_id.strip()) for name, _, pod_id in lines if name]
+            containers = []
+            for line in (result.stdout or "").splitlines():
+                try:
+                    name, pod_id = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(name, str) and isinstance(pod_id, str) and name:
+                    containers.append((name, pod_id.strip()))
+            return containers
         except Exception as e:
             logger.warning(
                 _m(

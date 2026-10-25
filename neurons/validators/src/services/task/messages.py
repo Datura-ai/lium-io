@@ -1275,8 +1275,9 @@ class GpuUsageMessages:
     # stale cleanup cannot confirm the container is Lium's and keeps it: promise no removal
     ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION = (
         "{orphaned_container} is named like a Lium pod container{pod}, but Lium cannot confirm it as "
-        "one of its containers: {rental_status}. Lium never removes a container it did not create, so "
-        "do not wait for the validator to remove this one. If it is your own workload, run it without "
+        "one of its containers: {rental_status}. The periodic cleanup keeps a container whose rental it "
+        "cannot confirm as ended, so do not wait for the validator to remove this one. If it is your "
+        "own workload, run it without "
         "Lium's pod_ name and io.lium.pod_id label, or free the GPU; otherwise leave it running and "
         "contact Lium support with the container name."
     )
