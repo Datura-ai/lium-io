@@ -499,8 +499,8 @@ async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_faile
     assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
     assert not redis.stamped()
     assert redis.standing_failure() == STEP_SSHD_LISTEN
-    # review: the failure has no lifetime; only a passed probe clears it
-    assert redis.expiries[f"rental_probe_failed:{EXECUTOR.uuid}"] is None
+    # a day from the last failed probe (DAH-5107 review): a node the probe never reaches is not held forever
+    assert redis.expiries[f"rental_probe_failed:{EXECUTOR.uuid}"] == 24 * 3600
 
     # next cycle: the node is probed again, not skipped
     ctx, docker, _ = make_probe_context(redis=redis)
@@ -605,18 +605,16 @@ async def test_a_standing_failure_ends_with_a_passed_probe():
 
 
 @pytest.mark.asyncio
-async def test_a_standing_failure_outlives_every_stamp_lifetime_until_a_probe_passes():
-    """Regression (review): the failure was written with the OK stamp's 30-day lifetime, so a node skipped
-    or inconclusive for longer than that (image never pulled, a filler always on it) was relisted without a
-    clean probe once the key expired. The failure now has no lifetime; only a passed probe clears it."""
+async def test_a_standing_failure_holds_through_cycles_without_a_verdict_then_lapses_after_a_day():
+    """The failure is carried by every cycle that reaches no verdict, and lasts a day from the last probe
+    that failed (DAH-5107 review, Pixel): with no lifetime, a node the probe could never reach (its other
+    checks left too little cycle time) stayed delisted forever after its fault was fixed."""
     redis = FakeRedis()
     ctx, docker, _ = make_probe_context(redis=redis)
     with probe_settings(deadline=1), renter_path(sshd_listens=False):
         assert (await RentalProbeCheck().run(ctx)).passed is False
     assert redis.standing_failure() == STEP_SSHD_LISTEN
 
-    # 31 days of cycles that reach no verdict: Redis drops every key that had a lifetime, the failure stays
-    redis.age_past_every_lifetime()
     for _ in range(3):
         ctx, docker, _ = make_probe_context(redis=redis, image_present=False)
         with probe_settings(deadline=1):
@@ -625,7 +623,15 @@ async def test_a_standing_failure_outlives_every_stamp_lifetime_until_a_probe_pa
         assert result.event.what_we_saw["standing_failure"] is True
         assert redis.standing_failure() == STEP_SSHD_LISTEN
 
-    # the first probe that passes clears it
+    # a day with no probe that failed again: the failure lapses and the cycle decides on its own
+    redis.age_past_every_lifetime()
+    assert redis.standing_failure() is None
+    ctx, docker, _ = make_probe_context(redis=redis, image_present=False)
+    with probe_settings(deadline=1):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.SKIPPED.reason
+
+    # the first probe that passes stamps the interval
     ctx, docker, _ = make_probe_context(redis=redis)
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
