@@ -1199,7 +1199,7 @@ async def test_out_of_memory_kill_is_not_a_host_kill():
 @pytest.mark.asyncio
 async def test_signal_stop_docker_could_not_restart_is_not_a_host_kill():
     """A VM reboot SIGTERMs the filler (143) and docker's restart then fails on a GPU device that is gone:
-    docker never restarts a container stopped on purpose, so this is not the host's choice (viren, 25 Oct)."""
+    docker never restarts a container stopped on purpose, so this is not the host's choice."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(
         running=False,
