@@ -148,6 +148,18 @@ def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -
     return None
 
 
+def _bound_pod_id_label(container_name: str, label: str) -> str:
+    """The LIUM_POD_ID_LABEL value when it is bound to the name Lium gave, else "" (unlabelled).
+
+    A renter's image can carry an inherited label naming another live pod, so the label counts only
+    when it matches the name: the id after pod_/filler_ (ignoring __prev), or a probe's own name.
+    """
+    base = container_name.removesuffix(EDIT_PARKED_SUFFIX)
+    if base.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
+        return label if label == base.partition("_")[2] else ""
+    return label if label == container_name else ""
+
+
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
@@ -213,7 +225,8 @@ class ContainerCleanup:
             extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
-            for stripped_name, pod_id in all_containers:
+            for stripped_name, label in all_containers:
+                pod_id = _bound_pod_id_label(stripped_name, label)
                 if stripped_name in rented_containers or (pod_id and pod_id in live_ids):
                     continue
                 legacy = not pod_id and LEGACY_LIUM_CONTAINER_NAME.match(stripped_name) is not None

@@ -327,7 +327,8 @@ class GpuUsageCheck:
             # This node's portal page shows no rental for a pod registered elsewhere, so the usual
             # "confirm, then remove" advice would clear the removal of a live rental's container.
             remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
-        elif orphan.pod_id is None:
+        elif orphan.pod_id is None or orphan.rental_closed_at is None:
+            # the stale cleanup removes only a container it can confirm is Lium's ended pod
             remediation_template = Msg.ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION
         else:
             remediation_template = Msg.ORPHANED_CONTAINER.remediation

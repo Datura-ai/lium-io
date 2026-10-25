@@ -133,8 +133,13 @@ async def test_gpu_usage_orphaned_container(context_factory):
     assert result.event.what_we_saw.get("orphaned_container") == container_name
     assert result.event.what_we_saw.get("rental_status") == "Lium has no rental for it"
     assert result.event.what_we_saw.get("container_status") == "still running"
-    assert "Do not remove pod containers yourself" in result.event.remediation
-    assert "docker rm" not in result.event.remediation
+    # DAH-5117: no record of the rental ending, so the stale cleanup keeps it: no removal promise
+    remediation = result.event.remediation
+    assert "within about 30 minutes" not in remediation
+    assert "the node passes again" not in remediation
+    assert "Lium cannot confirm it as one of its containers" in remediation
+    assert "contact Lium support" in remediation
+    assert "docker rm" not in remediation
 
 
 @pytest.mark.asyncio
@@ -326,6 +331,7 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
         "rental on this node uses it: its rental ended 20 minutes ago."
     )
     assert "removes a leftover pod container by itself" in remediation
+    assert "Do not remove pod containers yourself" in remediation
     assert "docker stop" not in remediation
     assert "docker rm" not in remediation
 
@@ -346,6 +352,8 @@ async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, p
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw["rental_status"] == rental_status
+    assert "within about 30 minutes" not in result.event.remediation
+    assert "Lium cannot confirm it as one of its containers" in result.event.remediation
 
 
 @pytest.mark.asyncio

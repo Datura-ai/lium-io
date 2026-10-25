@@ -924,6 +924,49 @@ async def test_a_labelled_container_whose_pod_is_live_stays_under_any_name():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name", [STRAY_POD, f"{STRAY_POD}__prev", LEGACY_FILLER])
+async def test_an_inherited_label_naming_another_live_pod_does_not_keep_an_ended_container(name):
+    """A renter's image can carry io.lium.pod_id=<another live pod>; only a label bound to the name counts."""
+    ssh, rm_calls = _make_ssh_mock([name], {name: 60})
+    handler = ssh.run.side_effect
+
+    async def inherited_label(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd:
+            return MagicMock(exit_status=0, stdout=f"{name}|{LIVE_POD.removeprefix('pod_')}", stderr="")
+        return await handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = inherited_label
+    ended = AsyncMock(return_value=True)
+
+    result = await ContainerCleanup().cleanup(
+        ssh, _real_rented_data(EXECUTOR_UUID, [LIVE_POD]), EXECUTOR_UUID, lium_workload_ended=ended
+    )
+
+    assert result == (1, [name], [])
+    ended.assert_awaited_once_with(name)  # treated as unlabelled: the legacy rule decides
+
+
+@pytest.mark.parametrize(
+    "name, label, bound",
+    [
+        ("pod_a", "a", True),
+        ("pod_a__prev", "a", True),
+        ("filler_r", "r", True),
+        ("pod_a", "b", False),
+        ("pod_a", "pod_a", False),
+        ("container_x_1", "container_x_1", True),
+        ("container_x_1", "x_1", False),
+        ("health_check_1777040800", "other", False),
+        ("pod_a", "", False),
+    ],
+)
+def test_a_pod_id_label_counts_only_when_bound_to_the_name(name, label, bound):
+    from services.container_cleanup import _bound_pod_id_label
+
+    assert _bound_pod_id_label(name, label) == (label if bound else "")
+
+
+@pytest.mark.asyncio
 async def test_the_listing_reads_each_containers_pod_id_label():
     seen: list[str] = []
 
