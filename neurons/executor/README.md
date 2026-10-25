@@ -273,6 +273,14 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
    ```
 
+3. When you later move the data-root off the image, remove both, or Docker will not start at the next reboot:
+
+   ```shell
+   sudo rm /etc/systemd/system/docker.service.d/loop-dio.conf
+   sudo systemctl disable loop-dio-docker.service && sudo rm /etc/systemd/system/loop-dio-docker.service
+   sudo systemctl daemon-reload
+   ```
+
 ## The executor image
 
 `Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: it turns sshd's `PerSourcePenalties` off through `/etc/ssh/sshd_config.d/lium.conf` when the base's OpenSSH knows the directive (9.8 and later), and fails the build when `sshd -T` rejects the rendered configuration. The same drop-in sets `LogLevel VERBOSE`, so every login records the key fingerprint that opened it. The container runs no syslog: `run.sh` starts `sshd_log_receiver.py` as `/dev/log`, which keeps the `Accepted` lines with sshd's time and pid in `/var/log/sshd-auth.log` (renamed to `.1` past 50 MB). Each cycle the validator logs the lines it has not read yet as `Executor sshd logins` and moves its cursor in `/var/log/sshd-auth.cursor` only after that.
