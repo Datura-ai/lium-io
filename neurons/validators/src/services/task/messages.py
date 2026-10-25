@@ -1271,15 +1271,13 @@ class GpuUsageMessages:
             "contact Lium support with the container name."
         ),
     )
-    # DAH-5117: no pod id Lium issued, or no backend record of the rental ending on this node, so the
-    # stale cleanup cannot confirm the container is Lium's and keeps it: promise no removal
+    # DAH-5117: no pod id Lium issued, or no backend record placing the ended rental on this node. Whether the
+    # stale cleanup removes it depends on its label, which this check does not see: promise neither way
     ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION = (
-        "{orphaned_container} is named like a Lium pod container{pod}, but Lium cannot confirm it as "
-        "one of its containers: {rental_status}. The periodic cleanup keeps a container whose rental it "
-        "cannot confirm as ended, so do not wait for the validator to remove this one. If it is your "
-        "own workload, run it without "
-        "Lium's pod_ name and io.lium.pod_id label, or free the GPU; otherwise leave it running and "
-        "contact Lium support with the container name."
+        "{orphaned_container} is named like a Lium pod container{pod}, but Lium cannot confirm a rental "
+        "of it on this node: {rental_status}. If it is your own workload, run it without Lium's pod_ "
+        "name and io.lium.pod_id label, or free the GPU; otherwise leave it running and contact Lium "
+        "support with the container name."
     )
     ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
         "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "

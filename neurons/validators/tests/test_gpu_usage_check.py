@@ -137,7 +137,7 @@ async def test_gpu_usage_orphaned_container(context_factory):
     remediation = result.event.remediation
     assert "within about 30 minutes" not in remediation
     assert "the node passes again" not in remediation
-    assert "Lium cannot confirm it as one of its containers" in remediation
+    assert "Lium cannot confirm a rental of it on this node" in remediation
     assert "contact Lium support" in remediation
     assert "docker rm" not in remediation
 
@@ -155,7 +155,7 @@ async def test_a_pod_named_container_lium_never_issued_is_left_to_the_provider(c
 
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
-    assert "keeps a container whose rental it cannot confirm as ended" in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
     assert "never removes" not in result.event.remediation
     assert "stop" not in result.event.remediation.lower()
 
@@ -349,7 +349,25 @@ async def test_an_ended_rental_with_no_owning_node_gets_no_removal_promise(conte
 
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert "removes a leftover pod container by itself" not in result.event.remediation
-    assert "Lium cannot confirm it as one of its containers" in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
+
+
+@pytest.mark.parametrize("owner", ["this", "none", "other"])
+@pytest.mark.asyncio
+async def test_the_orphan_remediation_promises_removal_only_when_the_rental_is_placed_here(context_factory, owner):
+    # cleanup removes an unlabelled leftover only with this node's record; a label it may follow is not visible
+    # here, so without that record the text promises neither removal nor retention
+    executor_id = {"this": default_executor().uuid, "none": None, "other": "00000000-0000-4000-8000-000000000001"}[owner]
+    pod_rental = PodRentalActiveResponse(
+        active=False, executor_id=executor_id, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+    )
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    remediation = (await GpuUsageCheck().run(ctx)).event.remediation
+
+    assert ("removes a leftover pod container by itself" in remediation) is (owner == "this")
+    assert "keeps" not in remediation
+    assert "do not wait" not in remediation.lower()
 
 
 @pytest.mark.parametrize(
@@ -369,7 +387,7 @@ async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, p
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw["rental_status"] == rental_status
     assert "within about 30 minutes" not in result.event.remediation
-    assert "Lium cannot confirm it as one of its containers" in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
 
 
 @pytest.mark.asyncio
