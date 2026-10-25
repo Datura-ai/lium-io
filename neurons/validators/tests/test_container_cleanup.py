@@ -1037,18 +1037,60 @@ def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=No
 
 
 @pytest.mark.asyncio
-async def test_the_check_drops_the_gpu_processes_of_this_cycles_removals():
-    """The processes were read before the cleanup; a reaped container's count in no later check."""
+@pytest.mark.parametrize(
+    "removed, owner, dropped",
+    [
+        ("filler_00000000-0000-4000-8000-0000000000a1", "THIS", True),
+        ("pod_00000000-0000-4000-8000-0000000000a1", "THIS", True),
+        # review 5644590326: removed by label alone, no backend record of it ending here
+        ("filler_00000000-0000-4000-8000-0000000000a1", None, False),
+        ("pod_00000000-0000-4000-8000-0000000000a1", "another-node", False),
+        ("health_check_1777040800", None, False),
+    ],
+)
+async def test_the_check_drops_the_gpu_processes_only_of_backend_confirmed_removals(
+    removed, owner, dropped
+):
+    """The processes were read before the cleanup; a reaped container's count in no later check,
+    but only when the backend confirms it was Lium's: a forged label recreated each cycle must not
+    exempt its GPU load from the gate every cycle."""
+    from protocol.vc_protocol.compute_requests import (
+        FillerRunActiveResponse,
+        PodRentalActiveResponse,
+    )
     from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
 
-    removed = "filler_00000000-0000-4000-8000-0000000000a1"
+    backend = AsyncMock()
+    reaped = {"pid": 1, "container_name": removed}
     foreign = {"pid": 2, "container_name": "my_miner"}
-    ctx = _cleanup_check_ctx([removed], [{"pid": 1, "container_name": removed}, foreign])
+    ctx = _cleanup_check_ctx([removed], [reaped, foreign], backend=backend)
+    executor_id = str(ctx.executor.uuid) if owner == "THIS" else owner
+    backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=False, status="STOPPED", executor_id=executor_id
+    )
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, rental_closed_at=CLOSED, executor_id=executor_id
+    )
 
     result = await StaleContainerCleanupCheck().run(ctx)
 
     assert result.passed is True
-    assert result.updates["state"].gpu_processes == [foreign]
+    assert result.updates["state"].gpu_processes == ([foreign] if dropped else [reaped, foreign])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_backend_read_keeps_the_removed_containers_gpu_processes():
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    backend = AsyncMock()
+    backend.get_pod_rental_active.side_effect = RuntimeError("backend down")
+    removed = "pod_00000000-0000-4000-8000-0000000000a1"
+    processes = [{"pid": 1, "container_name": removed}]
+    ctx = _cleanup_check_ctx([removed], processes, backend=backend)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
 
 
 CLOSED = "2026-10-25T00:00:00Z"

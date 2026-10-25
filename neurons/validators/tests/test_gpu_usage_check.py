@@ -710,8 +710,10 @@ async def test_ghost_still_latched_after_cure_fails_the_check(context_factory):
     assert result.event.what_we_saw["still_wedged"] == [WEDGED_UUID]
 
 
-async def _after_the_cleanup_removed(ctx, removed: list[str]):
-    """Run the stale cleanup check, its service reporting `removed`, and apply its state update."""
+async def _after_the_cleanup_removed(ctx, removed: list[str], confirmed: bool = True):
+    """Run the stale cleanup check, its service reporting `removed`, and apply its state update.
+
+    `confirmed`: the backend's record shows each removed workload ended on this node."""
     from neurons.validators.src.services.task.checks.stale_container_cleanup import (
         StaleContainerCleanupCheck,
     )
@@ -723,10 +725,17 @@ async def _after_the_cleanup_removed(ctx, removed: list[str]):
     redis = AsyncMock()
     redis.sadd.return_value = 0
     redis.hgetall.return_value = {}
+    cleanup_services = build_services(container_cleanup=cleanup, redis=redis)
+    if confirmed:
+        owner = str(ctx.executor.uuid)
+        cleanup_services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+            active=False, status="STOPPED", executor_id=owner
+        )
+        cleanup_services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+            active=False, rental_closed_at=datetime.now(timezone.utc), executor_id=owner
+        )
     services = ctx.services
-    ctx = ctx.model_copy(
-        update={"services": build_services(container_cleanup=cleanup, redis=redis)}
-    )
+    ctx = ctx.model_copy(update={"services": cleanup_services})
     result = await StaleContainerCleanupCheck().run(ctx)
     return ctx.model_copy(update={**result.updates, "services": services})
 
@@ -790,6 +799,24 @@ async def test_a_node_whose_only_gpu_load_was_a_reaped_container_passes(context_
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_removal_the_backend_does_not_confirm_still_counts_its_gpu_load(context_factory):
+    """Review 5644590326: a container removed by its label alone does not exempt its GPU load."""
+    reaped = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": reaped}],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped], confirmed=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
 
 
 @pytest.mark.asyncio

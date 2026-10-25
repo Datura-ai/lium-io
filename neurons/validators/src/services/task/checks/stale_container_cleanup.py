@@ -97,6 +97,14 @@ class StaleContainerCleanupCheck:
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
+        confirmed: set[str] = set()  # removals the backend's record shows were this node's Lium workload
+
+        async def lium_workload_ended(name: str) -> bool:
+            ended = await _lium_workload_ended_here(ctx, name)
+            if ended:
+                confirmed.add(name)
+            return ended
+
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
@@ -109,7 +117,7 @@ class StaleContainerCleanupCheck:
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 on_before_remove=queue.add,
-                lium_workload_ended=lambda name: _lium_workload_ended_here(ctx, name),
+                lium_workload_ended=lium_workload_ended,
             )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
@@ -164,8 +172,22 @@ class StaleContainerCleanupCheck:
         if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
         # The GPU processes were read before this cleanup; a reaped container's are gone with it, so
-        # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node.
-        removed = set(removed_names)
+        # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node. Only when
+        # the backend confirms it was Lium's: a label or a health_check_ name is the host's to forge,
+        # and a forged container recreated between cycles would otherwise pass the GPU gate each cycle.
+        for name in removed_names:
+            if name in confirmed or not name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
+                continue
+            try:
+                await lium_workload_ended(name)
+            except Exception as e:  # noqa: BLE001 - unconfirmed: its processes still count
+                logger.warning(
+                    _m(
+                        "Pod record check failed; the removed container's GPU processes still count",
+                        extra={"container_name": name, "error": str(e)},
+                    )
+                )
+        removed = confirmed
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
