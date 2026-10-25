@@ -8,6 +8,7 @@ volumes left behind by historical `docker rm` without `-v`.
 """
 import json
 import logging
+import random
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -869,7 +870,7 @@ async def test_an_unlabelled_container_is_never_removed_whatever_its_name():
     assert result == (0, [], [])
     assert not any("docker rm -f" in c for c in rm_calls)
     # only Lium's exact pod/filler names are worth asking the backend about
-    assert [call.args[0] for call in ended.await_args_list] == legacy
+    assert sorted(call.args[0] for call in ended.await_args_list) == sorted(legacy)
 
 
 @pytest.mark.asyncio
@@ -1149,6 +1150,36 @@ async def test_backend_lookups_are_capped_per_node_per_cycle(caplog):
     assert backend.get_pod_rental_active.await_count == CAP
     assert result.updates["state"].gpu_processes == processes[CAP:]
     assert "Backend lookup cap reached" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_lookup_order_rotates_so_forged_names_cannot_starve_a_real_leftover():
+    """With more unlabelled candidates than the lookup cap, each cycle asks about a fresh random
+    order, so a real leftover behind 10+ forged names is checked within a few cycles."""
+    from services.const import LIUM_WORKLOAD_LOOKUPS_PER_CYCLE as CAP
+
+    forged = [f"pod_00000000-0000-4000-8000-{i:012x}" for i in range(1, CAP + 6)]
+    real = "filler_00000000-0000-4000-8000-0000000000ff"
+    names = [*forged, real]  # docker lists the real one last
+    ssh, _ = _make_ssh_mock(names, {name: 60 for name in names}, unlabelled=tuple(names))
+
+    async def cycle(seed: int) -> list[str]:
+        asked: list[str] = []
+
+        async def ended(name: str) -> bool:
+            if len(asked) >= CAP:
+                return False  # the check's cap: no lookup made
+            asked.append(name)
+            return False
+
+        random.seed(seed)
+        await ContainerCleanup().cleanup(ssh, _listed(), EXECUTOR_UUID, lium_workload_ended=ended)
+        return asked
+
+    first, second = await cycle(1), await cycle(2)
+    assert len(first) == len(second) == CAP
+    assert first != second
+    assert any([real in await cycle(seed) for seed in range(20)])
 
 
 @pytest.mark.asyncio

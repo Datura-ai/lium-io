@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import shlex
 from typing import Awaitable, Callable, Optional
@@ -218,6 +219,9 @@ class ContainerCleanup:
         try:
             # Get all containers with rental prefixes.
             all_containers = await self._get_all_rental_containers(ssh_client)
+            # backend lookups are capped per cycle: a fresh order each cycle stops a host's forged
+            # pod_/filler_ names from using up the cap ahead of a real leftover every time
+            random.shuffle(all_containers)
             extra["total_containers"] = len(all_containers)
 
             # Get currently rented containers for this executor
