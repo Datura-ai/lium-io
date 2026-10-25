@@ -1078,6 +1078,79 @@ async def test_the_check_drops_the_gpu_processes_only_of_backend_confirmed_remov
     assert result.updates["state"].gpu_processes == ([foreign] if dropped else [reaped, foreign])
 
 
+def _ended_here_backend(ctx_holder: dict):
+    """A backend whose records show every pod and filler ended on the context's node."""
+    from protocol.vc_protocol.compute_requests import (
+        FillerRunActiveResponse,
+        PodRentalActiveResponse,
+    )
+
+    backend = AsyncMock()
+
+    async def pod(_id):
+        return PodRentalActiveResponse(
+            active=False, rental_closed_at=CLOSED, executor_id=str(ctx_holder["ctx"].executor.uuid)
+        )
+
+    async def filler(_id):
+        return FillerRunActiveResponse(
+            active=False, status="STOPPED", executor_id=str(ctx_holder["ctx"].executor.uuid)
+        )
+
+    backend.get_pod_rental_active.side_effect = pod
+    backend.get_filler_run_active.side_effect = filler
+    return backend
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_container_that_survives_docker_rm_keeps_its_gpu_processes():
+    """Review 4371963872: confirmed STOPPED and owned here, but docker rm failed: still running."""
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    name = "filler_00000000-0000-4000-8000-0000000000a1"
+    processes = [{"pid": 1, "container_name": name}]
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx([], processes, backend=_ended_here_backend(holder))
+
+    async def cleanup(**kwargs):
+        assert await kwargs["lium_workload_ended"](name) is True
+        return 0, [], [name]  # the rm failed
+
+    ctx.services.container_cleanup.cleanup.side_effect = cleanup
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
+    assert result.updates["state"].orphaned_containers == [name]
+
+
+@pytest.mark.asyncio
+async def test_backend_lookups_are_capped_per_node_per_cycle(caplog):
+    """Review 4371963877: thousands of unlabelled pod_/filler_ names must not each cost a backend
+    request; the excess is left alone (not removed, its GPU load still counts) and the cap is logged."""
+    from services.const import LIUM_WORKLOAD_LOOKUPS_PER_CYCLE as CAP
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    names = [f"pod_00000000-0000-4000-8000-{i:012x}" for i in range(CAP + 5)]
+    processes = [{"pid": i, "container_name": name} for i, name in enumerate(names)]
+    holder: dict = {}
+    backend = _ended_here_backend(holder)
+    ctx = holder["ctx"] = _cleanup_check_ctx([], processes, backend=backend)
+
+    async def cleanup(**kwargs):
+        removed = [name for name in names if await kwargs["lium_workload_ended"](name)]
+        return len(removed), removed, []
+
+    ctx.services.container_cleanup.cleanup.side_effect = cleanup
+
+    with caplog.at_level(logging.WARNING):
+        result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert backend.get_pod_rental_active.await_count == CAP
+    assert result.updates["state"].gpu_processes == processes[CAP:]
+    assert "Backend lookup cap reached" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_a_failed_backend_read_keeps_the_removed_containers_gpu_processes():
     from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck

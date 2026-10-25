@@ -18,7 +18,12 @@ from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, Contai
 from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
-from ...const import EDIT_PARKED_SUFFIX, FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
+from ...const import (
+    EDIT_PARKED_SUFFIX,
+    FILLER_CONTAINER_PREFIX,
+    LIUM_WORKLOAD_LOOKUPS_PER_CYCLE,
+    POD_CONTAINER_PREFIX,
+)
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -97,9 +102,14 @@ class StaleContainerCleanupCheck:
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
-        confirmed: set[str] = set()  # removals the backend's record shows were this node's Lium workload
+        confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
+        lookups = {"made": 0, "skipped": 0}
 
         async def lium_workload_ended(name: str) -> bool:
+            if lookups["made"] >= LIUM_WORKLOAD_LOOKUPS_PER_CYCLE:
+                lookups["skipped"] += 1  # unconfirmed: not removed, its GPU processes still count
+                return False
+            lookups["made"] += 1
             ended = await _lium_workload_ended_here(ctx, name)
             if ended:
                 confirmed.add(name)
@@ -159,18 +169,6 @@ class StaleContainerCleanupCheck:
                 "swept_download_temporaries": swept_download_temporaries,
             },
         )
-        # DAH-2991: an orphan that survived removal still holds its ports; PortCountCheck names it
-        # instead of reporting a bare count the provider has to diagnose by hand.
-        # DAH-3338: a reaped pod_* container is reported to the backend as `reaped`, so the rental
-        # it belonged to learns its container is confirmed gone without a route of its own. The
-        # report comes from the redis queue: this cycle's reaps plus every earlier one still inside
-        # the retention window, so a report lost on the pub/sub hop is sent again next cycle.
-        for name in unremovable_names:
-            # queued before the attempt (the hook runs first), still on the host: not reaped
-            await queue.drop(name)
-        reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
-        if not unremovable_names and not reaped and not removed_names:
-            return CheckResult(passed=True, event=event)
         # The GPU processes were read before this cleanup; a reaped container's are gone with it, so
         # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node. Only when
         # the backend confirms it was Lium's: a label or a health_check_ name is the host's to forge,
@@ -187,7 +185,31 @@ class StaleContainerCleanupCheck:
                         extra={"container_name": name, "error": str(e)},
                     )
                 )
-        removed = confirmed
+        if lookups["skipped"]:
+            logger.warning(
+                _m(
+                    "Backend lookup cap reached; the remaining containers wait for a later cycle",
+                    extra={
+                        "executor_uuid": ctx.executor.uuid,
+                        "cap": LIUM_WORKLOAD_LOOKUPS_PER_CYCLE,
+                        "skipped_lookups": lookups["skipped"],
+                    },
+                )
+            )
+        # DAH-2991: an orphan that survived removal still holds its ports; PortCountCheck names it
+        # instead of reporting a bare count the provider has to diagnose by hand.
+        # DAH-3338: a reaped pod_* container is reported to the backend as `reaped`, so the rental
+        # it belonged to learns its container is confirmed gone without a route of its own. The
+        # report comes from the redis queue: this cycle's reaps plus every earlier one still inside
+        # the retention window, so a report lost on the pub/sub hop is sent again next cycle.
+        for name in unremovable_names:
+            # queued before the attempt (the hook runs first), still on the host: not reaped
+            await queue.drop(name)
+        reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
+        if not unremovable_names and not reaped and not removed_names:
+            return CheckResult(passed=True, event=event)
+        # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
+        removed = confirmed.intersection(removed_names)
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,

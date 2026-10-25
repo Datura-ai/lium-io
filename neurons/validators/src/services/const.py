@@ -318,6 +318,9 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 # the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
 # labelled container whose pod is no longer live, so a provider's container is never touched.
 LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
+# the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.
+LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
 # A pod or filler container created before the label: reaped only when the backend's record of
 # that pod or filler run confirms it ended.
 LEGACY_LIUM_CONTAINER_NAME = re.compile(
