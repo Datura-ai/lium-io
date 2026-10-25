@@ -245,7 +245,7 @@ sudo losetup --direct-io=on /dev/loopN
 losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
 ```
 
-**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit: when the image does not mount, Docker stays stopped instead of starting on the empty directory. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
 
 1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
 
@@ -253,18 +253,29 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    /data/img.raw /data/dockerimg xfs loop,pquota,nofail,x-systemd.requires=/data 0 0
    ```
 
-2. The unit, and Docker requiring it:
+2. The script, the unit, and Docker requiring it:
 
    ```shell
+   sudo tee /usr/local/sbin/loop-dio-docker >/dev/null <<'EOF'
+   #!/bin/sh
+   IMG=/data/img.raw MNT=/data/dockerimg
+   root=$(sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/docker/daemon.json 2>/dev/null)
+   case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
+   mountpoint -q "$MNT" || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
+   dev=$(losetup -j "$IMG" -n -O NAME | head -n 1)
+   [ -n "$dev" ] && losetup --direct-io=on "$dev"
+   EOF
+   sudo chmod 755 /usr/local/sbin/loop-dio-docker
    sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
    [Unit]
    Description=Direct I/O on the Docker data-root loop device
-   RequiresMountsFor=/data/dockerimg
+   Wants=data-dockerimg.mount
+   After=data-dockerimg.mount
    Before=docker.service containerd.service
    [Service]
    Type=oneshot
    RemainAfterExit=yes
-   ExecStart=/bin/sh -c 'dev=$$(losetup -j /data/img.raw -n -O NAME | head -n 1); [ -n "$$dev" ] && losetup --direct-io=on "$$dev"'
+   ExecStart=/usr/local/sbin/loop-dio-docker
    [Install]
    WantedBy=multi-user.target
    EOF
@@ -273,13 +284,7 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
    ```
 
-3. When you later move the data-root off the image, remove both, or Docker will not start at the next reboot:
-
-   ```shell
-   sudo rm /etc/systemd/system/docker.service.d/loop-dio.conf
-   sudo systemctl disable loop-dio-docker.service && sudo rm /etc/systemd/system/loop-dio-docker.service
-   sudo systemctl daemon-reload
-   ```
+   `data-dockerimg.mount` is the mount unit systemd makes from the fstab line; for another mount point, `systemd-escape -p --suffix=mount <dir>` prints its name.
 
 ## The executor image
 
