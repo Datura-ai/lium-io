@@ -245,7 +245,7 @@ sudo losetup --direct-io=on /dev/loopN
 losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
 ```
 
-**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), or a real disk replaces the image at the same mount point, the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
 
 1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
 
@@ -258,13 +258,12 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    ```shell
    sudo tee /usr/local/sbin/loop-dio-docker >/dev/null <<'EOF'
    #!/bin/sh
-   IMG=/data/img.raw MNT=/data/dockerimg
+   MNT=/data/dockerimg
    root=$(tr -d '\n\r' 2>/dev/null </etc/docker/daemon.json | sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
    root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
    case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
-   mountpoint -q "$MNT" || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
-   dev=$(losetup -j "$IMG" -n -O NAME | head -n 1)
-   [ -n "$dev" ] && losetup --direct-io=on "$dev"
+   src=$(findmnt -n -o SOURCE --mountpoint "$MNT") || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
+   case "$src" in /dev/loop*) losetup --direct-io=on "$src" || echo "direct I/O not set on $src, Docker starts buffered" ;; esac   # a real disk needs nothing
    EOF
    sudo chmod 755 /usr/local/sbin/loop-dio-docker
    sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
