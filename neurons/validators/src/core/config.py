@@ -633,7 +633,8 @@ class Settings(BaseSettings):
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
     # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR); a spot node without a filler, or whose configuration
+    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
+    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
     # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
     # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
     # False: every spot node earns 0, as before.
