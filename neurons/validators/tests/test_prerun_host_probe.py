@@ -179,9 +179,47 @@ def test_shared_device_nodes_command_whole_host_only_is_the_tail_of_the_whole_ho
         "/dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm" in whole
         and "find /dev/nvidia-caps" in whole
     )
-    assert tail.startswith("for p in /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm; do")
+    assert "; for p in /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm; do" in tail
     assert "find /dev/nvidia-caps" in tail
     assert "/dev/nvidiactl" not in tail
+
+
+def _verbs_nodes_on(tmp_path, cards: dict[str, list[tuple[str, str]]]) -> list[str]:
+    """Run the whole-host-only command against a fake sysfs and /dev/infiniband: one card per
+    entry, one (lid, sm_lid) per port, uverbsN in the order given."""
+    for n, (card, ports) in enumerate(cards.items()):
+        (tmp_path / "dev").mkdir(exist_ok=True)
+        (tmp_path / "dev" / f"uverbs{n}").touch()
+        (tmp_path / "sys/infiniband_verbs" / f"uverbs{n}").mkdir(parents=True)
+        (tmp_path / "sys/infiniband_verbs" / f"uverbs{n}" / "ibdev").write_text(f"{card}\n")
+        for i, (lid, sm_lid) in enumerate(ports, start=1):
+            port = tmp_path / "sys/infiniband" / card / "ports" / str(i)
+            port.mkdir(parents=True)
+            (port / "lid").write_text(f"{lid}\n")
+            (port / "sm_lid").write_text(f"{sm_lid}\n")
+    command = (
+        shared_device_nodes_command(is_whole_host_rental=True, whole_host_only=True)
+        .replace("/sys/class", str(tmp_path / "sys"))
+        .replace("/dev/infiniband", str(tmp_path / "dev"))
+    )
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=True).stdout
+    return sorted(line.rsplit("/", 1)[1] for line in out.splitlines() if "/dev/" in line)
+
+
+def test_a_b300_keeps_its_nvlink_switch_management_cards_out_of_the_pod(tmp_path):
+    # nvlsm on the ConnectX-7 management cards (SM LID 0x1 = the first card's own LID), the
+    # ConnectX-8 rails on the switch's SM 0x323, and an Ethernet card (LID and SM LID 0x0)
+    cards = {f"mlx5_{i}": [(hex(0x1 + i), "0x1")] for i in range(4)}
+    cards |= {f"mlx5_{4 + i}": [(hex(0xAA07 + i), "0x323")] for i in range(8)}
+    cards["mlx5_12"] = [("0x0", "0x0")]
+
+    assert _verbs_nodes_on(tmp_path, cards) == sorted(f"uverbs{n}" for n in range(4, 13))
+
+
+def test_a_host_on_its_own_subnet_manager_only_keeps_every_card(tmp_path):
+    cards = {f"mlx5_{i}": [(hex(0x1 + i), "0x1")] for i in range(4)}
+
+    assert _verbs_nodes_on(tmp_path, cards) == [f"uverbs{n}" for n in range(4)]
 
 
 # ------------------------------------------------------------------
