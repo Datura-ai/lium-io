@@ -59,9 +59,15 @@ async def supports_storage_operation(
 # any other status is the probe itself failing (no python at that path = 127, an import error =
 # 1, …) and is reported as such, not read as an old image (review, taiberium).
 # DAH-2002: the same probe for `workspace.exclude_patterns`; an old image would back up what the excludes skip.
+# An image with no `storage` package at all predates every field, so it is an old image too (exit 3);
+# any other import error still fails the probe.
 _WORKSPACE_FIELD_PROBE = (
-    "import sys; sys.path.insert(0, '/root/app/src'); "
-    "from storage.models import WorkspaceSpec; "
+    "import sys\n"
+    "sys.path.insert(0, '/root/app/src')\n"
+    "try:\n"
+    "    from storage.models import WorkspaceSpec\n"
+    "except ModuleNotFoundError as e:\n"
+    "    sys.exit(3 if e.name in ('storage', 'storage.models') else 1)\n"
     "sys.exit(0 if sys.argv[1] in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
 _BOOTSTRAP_PROBE_FIELD_MISSING = 3
