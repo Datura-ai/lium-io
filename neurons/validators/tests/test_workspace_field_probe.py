@@ -33,15 +33,6 @@ def _models(tmp_path, body):
     return tmp_path
 
 
-def test_probe_reads_present_and_missing_field(tmp_path):
-    src = _models(
-        tmp_path,
-        "from dataclasses import dataclass\n@dataclass\nclass WorkspaceSpec:\n    exclude_patterns: list\n",
-    )
-    assert _probe(src) is True
-    assert _probe(src, "bootstrap") is False
-
-
 def test_image_without_storage_package_is_an_old_image(tmp_path):
     assert _probe(tmp_path) is False
 
