@@ -719,7 +719,12 @@ async def _after_the_cleanup_removed(ctx, removed: list[str], confirmed: bool = 
     )
 
     cleanup = AsyncMock()
-    cleanup.cleanup.return_value = (len(removed), removed, [])
+
+    async def remove(**kwargs):  # as the real cleanup: a labelled removal asks for its lookup slot first
+        gone = [name for name in removed if kwargs["reserve_removal"](name)]
+        return len(gone), gone, []
+
+    cleanup.cleanup.side_effect = remove
     cleanup.sweep_abandoned_download_temporaries.return_value = 0
     cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
     redis = AsyncMock()

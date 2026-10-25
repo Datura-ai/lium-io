@@ -104,9 +104,15 @@ class StaleContainerCleanupCheck:
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
         confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
         lookups = {"made": 0, "skipped": 0}
+        # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
+        reserved: set[str] = set()
+        gpu_container_names = {process.get("container_name") for process in ctx.state.gpu_processes}
+
+        def budget_left() -> bool:
+            return lookups["made"] + len(reserved) < LIUM_WORKLOAD_LOOKUPS_PER_CYCLE
 
         async def lium_workload_ended(name: str) -> bool:
-            if lookups["made"] >= LIUM_WORKLOAD_LOOKUPS_PER_CYCLE:
+            if not budget_left():
                 lookups["skipped"] += 1  # unconfirmed: not removed, its GPU processes still count
                 return False
             lookups["made"] += 1
@@ -114,6 +120,17 @@ class StaleContainerCleanupCheck:
             if ended:
                 confirmed.add(name)
             return ended
+
+        def reserve_removal(name: str) -> bool:
+            # a removal with no GPU process needs no exemption lookup; one with a process is removed
+            # only when its lookup fits the budget, so it is never gone yet still counted
+            if name not in gpu_container_names:
+                return True
+            if not budget_left():
+                lookups["skipped"] += 1
+                return False
+            reserved.add(name)
+            return True
 
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
@@ -128,6 +145,7 @@ class StaleContainerCleanupCheck:
                 executor_uuid=ctx.executor.uuid,
                 on_before_remove=queue.add,
                 lium_workload_ended=lium_workload_ended,
+                reserve_removal=reserve_removal,
             )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
@@ -174,10 +192,11 @@ class StaleContainerCleanupCheck:
         # the backend confirms it was Lium's: a label or a health_check_ name is the host's to forge,
         # and a forged container recreated between cycles would otherwise pass the GPU gate each cycle.
         for name in removed_names:
-            if name in confirmed or not name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
+            if name in confirmed or name not in reserved:
                 continue
             try:
-                await lium_workload_ended(name)
+                if await _lium_workload_ended_here(ctx, name):  # its slot was reserved before removal
+                    confirmed.add(name)
             except Exception as e:  # noqa: BLE001 - unconfirmed: its processes still count
                 logger.warning(
                     _m(

@@ -182,6 +182,7 @@ class ContainerCleanup:
         executor_uuid: str,
         on_before_remove: Callable[[str], Awaitable[None]] | None = None,
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None = None,
+        reserve_removal: Callable[[str], bool] | None = None,
     ) -> tuple[int, list[str], list[str]]:
         """Remove Lium's containers whose pod is no longer live and that are older than threshold.
 
@@ -193,6 +194,9 @@ class ContainerCleanup:
         ``on_before_remove(container_name)`` is awaited right before each removal (DAH-3338: the
         check queues the reap for the backend first, so a crash between the removal and the report
         does not lose it). It must not raise; an error inside it is the caller's to swallow.
+
+        ``reserve_removal(container_name)`` is asked before removing a labelled pod_/filler_
+        container; False defers it to a later cycle (the caller's per-cycle lookup budget is spent).
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -242,6 +246,13 @@ class ContainerCleanup:
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
                     if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
+                        continue
+                    if (
+                        not legacy
+                        and reserve_removal is not None
+                        and stripped_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+                        and not reserve_removal(stripped_name)
+                    ):
                         continue
                     if self.dry_run:
                         logger.info(

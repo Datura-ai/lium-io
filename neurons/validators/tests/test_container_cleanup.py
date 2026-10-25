@@ -1022,7 +1022,12 @@ def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=No
     from tests.helpers import build_services, build_state, make_context
 
     cleanup = AsyncMock()
-    cleanup.cleanup.return_value = (len(removed), removed, [])
+
+    async def remove(**kwargs):  # as the real cleanup: a labelled removal asks for its lookup slot first
+        gone = [name for name in removed if kwargs["reserve_removal"](name)]
+        return len(gone), gone, []
+
+    cleanup.cleanup.side_effect = remove
     cleanup.sweep_abandoned_download_temporaries.return_value = 0
     cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
     redis = AsyncMock()
@@ -1180,6 +1185,45 @@ async def test_the_lookup_order_rotates_so_forged_names_cannot_starve_a_real_lef
     assert len(first) == len(second) == CAP
     assert first != second
     assert any([real in await cycle(seed) for seed in range(20)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [9, 10, 11])
+async def test_no_container_is_removed_without_a_lookup_slot_for_its_gpu_exemption(count):
+    """Review 4372126117: past the lookup cap a GPU-holding pod is deferred, never removed and still
+    counted; every removal holding a GPU process drops it; a foreign process always counts."""
+    from services.const import LIUM_WORKLOAD_LOOKUPS_PER_CYCLE as CAP
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+    from tests.helpers import build_services
+
+    names = [
+        f"{'filler' if i % 3 == 2 else 'pod'}_00000000-0000-4000-8000-{i + 0xa0:012x}" for i in range(count)
+    ]
+    legacy = tuple(names[1::2])  # unlabelled: confirmed before removal; the rest carry their label
+    ssh, _ = _make_ssh_mock(names, {name: 60 for name in names}, unlabelled=legacy)
+    foreign = {"pid": 999, "container_name": "my_miner"}
+    processes = [*({"pid": i, "container_name": name} for i, name in enumerate(names)), foreign]
+    holder: dict = {}
+    backend = _ended_here_backend(holder)
+    ctx = holder["ctx"] = _cleanup_check_ctx([], processes, backend=backend)
+    ctx = holder["ctx"] = ctx.model_copy(
+        update={
+            "ssh": ssh,
+            "services": build_services(
+                container_cleanup=ContainerCleanup(), redis=ctx.services.redis, backend=backend
+            ),
+        }
+    )
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    removed = set(result.event.what_we_saw["removed_containers"])
+    left = result.updates["state"].gpu_processes
+    assert len(removed) == min(count, CAP)
+    assert foreign in left
+    assert {p["container_name"] for p in left} == {*(set(names) - removed), "my_miner"}
+    lookups = backend.get_pod_rental_active.await_count + backend.get_filler_run_active.await_count
+    assert lookups <= CAP
 
 
 @pytest.mark.asyncio
