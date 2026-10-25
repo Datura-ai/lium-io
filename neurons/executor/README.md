@@ -259,7 +259,7 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    sudo tee /usr/local/sbin/loop-dio-docker >/dev/null <<'EOF'
    #!/bin/sh
    IMG=/data/img.raw MNT=/data/dockerimg
-   root=$(sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/docker/daemon.json 2>/dev/null)
+   root=$(tr -d '\n\r' 2>/dev/null </etc/docker/daemon.json | sed -n 's/.*"data-root"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
    root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
    case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
    mountpoint -q "$MNT" || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
