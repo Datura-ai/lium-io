@@ -111,21 +111,6 @@ class GpuUsageCheck:
                     passed=True, event=render_message(Msg.GPU_RESET_IN_PROGRESS, ctx=ctx, check_id=self.check_id)
                 )
 
-        # The processes were read at the start of the run; a container the stale cleanup removed since
-        # is gone with them, so its load is a leftover Lium already collected, not the node's.
-        if reaped := set(ctx.state.reaped_containers):
-            gpu_processes = [process for process in gpu_processes if process.get("container_name") not in reaped]
-            if not gpu_processes:
-                return CheckResult(
-                    passed=True,
-                    event=render_message(
-                        Msg.USAGE_OK,
-                        ctx=ctx,
-                        check_id=self.check_id,
-                        what={"process_count": 0, "reaped_this_cycle": sorted(reaped)},
-                    ),
-                )
-
         ghost_result = await self._detect_and_cure_ghost_gpus(ctx, gpu_details, gpu_processes)
         if ghost_result is not None:
             return ghost_result

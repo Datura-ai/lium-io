@@ -16,7 +16,9 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
-    LIUM_RENTAL_CONTAINER_NAME,
+    LEGACY_LIUM_CONTAINER_NAME,
+    LIUM_HEALTH_CHECK_CONTAINER_NAME,
+    LIUM_POD_ID_LABEL,
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
 )
@@ -116,6 +118,21 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
     return names
 
 
+def live_pod_ids(rented_data: Optional[RentedExecutorsResponse]) -> set[str]:
+    """The pod ids (and filler run ids) the fleet snapshot lists: a container labelled with one is live."""
+    if not rented_data:
+        return set()
+    ids: set[str] = {
+        pod.pod_id for executor in rented_data.executors.values() for pod in executor.pods
+    }
+    ids.update(
+        name.removeprefix(FILLER_CONTAINER_PREFIX)
+        for name in listed_container_names(rented_data)
+        if name.startswith(FILLER_CONTAINER_PREFIX)
+    )
+    return ids
+
+
 def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -> Optional[str]:
     """Why the snapshot cannot be trusted to authorise a removal, or None.
 
@@ -150,8 +167,14 @@ class ContainerCleanup:
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
         on_before_remove: Callable[[str], Awaitable[None]] | None = None,
+        lium_workload_ended: Callable[[str], Awaitable[bool]] | None = None,
     ) -> tuple[int, list[str], list[str]]:
-        """Remove containers that are not in rented data and are older than threshold.
+        """Remove Lium's containers whose pod is no longer live and that are older than threshold.
+
+        DAH-5117: only a container labelled LIUM_POD_ID_LABEL at create, or one of the names Lium gave
+        before the label: the backend's health_check_ probe, and a pod_/filler_<uuid> for which
+        ``lium_workload_ended(container_name)`` confirms the backend's record ended (no callback:
+        never). Anything else is a provider's container and is never touched, whatever it is called.
 
         ``on_before_remove(container_name)`` is awaited right before each removal (DAH-3338: the
         check queues the reap for the backend first, so a crash between the removal and the report
@@ -186,16 +209,22 @@ class ContainerCleanup:
 
             # Get currently rented containers for this executor
             rented_containers = listed_container_names(rented_data)
+            live_ids = live_pod_ids(rented_data)
             extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
-            for container_name in all_containers:
-                stripped_name = container_name.strip()
-                if stripped_name in rented_containers:
+            for stripped_name, pod_id in all_containers:
+                if stripped_name in rented_containers or (pod_id and pod_id in live_ids):
+                    continue
+                legacy = not pod_id and LEGACY_LIUM_CONTAINER_NAME.match(stripped_name) is not None
+                health_check = LIUM_HEALTH_CHECK_CONTAINER_NAME.match(stripped_name) is not None
+                if not pod_id and not legacy and not health_check:
                     continue
 
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
+                    if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
+                        continue
                     if self.dry_run:
                         logger.info(
                             _m(
@@ -527,7 +556,9 @@ class ContainerCleanup:
         """
         try:
             result = await ssh_client.run(
-                "docker ps -q --filter 'name=^health_check_' | xargs -r docker rm -fv"
+                # only the backend's own probe names: a provider's health_check_mine is not ours
+                "docker ps --format '{{.Names}}' --filter 'name=^health_check_' "
+                "| grep -xE 'health_check_([0-9a-f]{32}|[0-9]{10})' | xargs -r docker rm -fv"
             )
             removed = [
                 line for line in (result.stdout or "").strip().split("\n")
@@ -554,7 +585,25 @@ class ContainerCleanup:
             )
             return 0
 
-    async def _get_all_rental_containers(self, ssh_client) -> list[str]:
+    @staticmethod
+    async def _legacy_ended(
+        lium_workload_ended: Callable[[str], Awaitable[bool]] | None, container_name: str
+    ) -> bool:
+        """A pre-label pod_/filler_<uuid> goes only when the backend's record says it ended."""
+        if lium_workload_ended is None:
+            return False
+        try:
+            return await lium_workload_ended(container_name)
+        except Exception as e:
+            logger.warning(
+                _m(
+                    "Pod record check failed; keeping the container",
+                    extra={"container_name": container_name, "error": str(e)},
+                )
+            )
+            return False
+
+    async def _get_all_rental_containers(self, ssh_client) -> list[tuple[str, str]]:
         """Get all containers with rental-related prefixes.
 
         Iterates RENTAL_CONTAINER_PREFIXES (services/const.py) so any short-lived
@@ -564,13 +613,13 @@ class ContainerCleanup:
         """
         try:
             patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
-            result = await ssh_client.run(DockerCommand.ps_filter(*patterns))
-            # the filter is a substring regex; keep only names Lium gave (it removed "podman", 25 Oct)
-            return [
-                name.strip()
-                for name in (result.stdout or "").splitlines()
-                if LIUM_RENTAL_CONTAINER_NAME.match(name.strip())
-            ]
+            output_format = f'{{{{.Names}}}}|{{{{.Label "{LIUM_POD_ID_LABEL}"}}}}'
+            result = await ssh_client.run(
+                DockerCommand.ps_filter(*patterns, output_format=output_format)
+            )
+            # (name, pod id label or ""); the name filter is a substring regex that lists "podman" too
+            lines = (line.strip().partition("|") for line in (result.stdout or "").splitlines())
+            return [(name, pod_id.strip()) for name, _, pod_id in lines if name]
         except Exception as e:
             logger.warning(
                 _m(

@@ -314,15 +314,18 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   container_*    — validator DinD/port-check probes (hotkey-scoped)
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
-# The full names Lium gives those containers. `docker ps --filter name=` is an unanchored regex
-# (`pod_*` matches "podman"), so the stale cleanup removes only a name that matches this whole:
-# pod_/filler_<uuid> (a pod parked by an edit adds __prev), container_<hotkey>_<port>, health_check_*.
-# A provider's own container never matches, whatever it is called.
-LIUM_RENTAL_CONTAINER_NAME = re.compile(
-    r"^(?:(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?"
-    r"|container_[1-9A-HJ-NP-Za-km-z]{46,48}_[0-9]+"
-    r"|health_check_[A-Za-z0-9_.-]*)$"
+# DAH-5117: set at create on every container Lium creates (pods, fillers, the validator's DinD probe);
+# the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
+# labelled container whose pod is no longer live, so a provider's container is never touched.
+LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# A pod or filler container created before the label: reaped only when the backend's record of
+# that pod or filler run confirms it ended.
+LEGACY_LIUM_CONTAINER_NAME = re.compile(
+    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?$"
 )
+# The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
+# the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
+LIUM_HEALTH_CHECK_CONTAINER_NAME = re.compile(r"^health_check_(?:[0-9a-f]{32}|[0-9]{10})$")
 
 # DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
 # without importing the probe service: that module reaches services.task.models, which pulls

@@ -162,9 +162,6 @@ class ContextState:
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
     # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.
     orphaned_containers: list[str] = field(default_factory=list)
-    # Rental containers the stale cleanup removed this cycle. The GPU process list was read before the
-    # cleanup ran, so GpuUsageCheck must not judge the node by a container that is already gone.
-    reaped_containers: list[str] = field(default_factory=list)
     # DAH-3436: the (internal, external) pairs PortConnectivityCheck proved reachable this cycle.
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.

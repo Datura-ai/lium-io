@@ -1273,8 +1273,10 @@ class GpuUsageMessages:
     )
     # a pod_* name that carries no pod id Lium issued is not ours, so the validator never removes it
     ORPHANED_CONTAINER_NOT_LIUMS_REMEDIATION = (
-        "{orphaned_container} is named like a Lium pod container, but Lium never created it: "
-        "{rental_status}. Stop it or rename it; Lium does not touch containers it did not create."
+        "{orphaned_container} is named like a Lium pod container, but its name carries no pod id "
+        "Lium issued: {rental_status}. Lium never removes a container it did not create. If it is "
+        "your own workload, rename it so it is not taken for a Lium pod; otherwise leave it running "
+        "and contact Lium support with the container name."
     )
     ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
         "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "

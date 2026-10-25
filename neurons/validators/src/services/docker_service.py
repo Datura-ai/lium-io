@@ -72,6 +72,7 @@ from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
     EDIT_PARKED_SUFFIX,
+    LIUM_POD_ID_LABEL,
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
@@ -2832,6 +2833,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            labels={LIUM_POD_ID_LABEL: payload.pod_id},
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(

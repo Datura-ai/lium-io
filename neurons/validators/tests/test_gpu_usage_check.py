@@ -138,25 +138,7 @@ async def test_gpu_usage_orphaned_container(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_a_container_the_cleanup_reaped_this_cycle_does_not_fail_the_node(context_factory):
-    """The processes are read before the stale cleanup runs; a container it removed is gone with them."""
-    container_name = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
-        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": container_name}],
-        reaped_containers=[container_name],
-    )
-    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, rented=False)
-
-    result = await GpuUsageCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.USAGE_OK.reason
-    assert result.event.what_we_saw["reaped_this_cycle"] == [container_name]
-
-
-@pytest.mark.asyncio
-async def test_a_pod_named_container_lium_never_issued_is_the_providers_to_stop(context_factory):
+async def test_a_pod_named_container_lium_never_issued_is_left_to_the_provider(context_factory):
     container_name = f"{POD_CONTAINER_PREFIX}mine"
     state = build_state(
         gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
@@ -168,7 +150,8 @@ async def test_a_pod_named_container_lium_never_issued_is_the_providers_to_stop(
 
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
-    assert "Lium never created it" in result.event.remediation
+    assert "Lium never removes a container it did not create" in result.event.remediation
+    assert "stop" not in result.event.remediation.lower()
 
 
 # --- A rental that ends while the run is inside it is teardown, not an orphan ---
@@ -683,6 +666,88 @@ async def test_ghost_still_latched_after_cure_fails_the_check(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_WEDGED.reason
     assert result.event.what_we_saw["still_wedged"] == [WEDGED_UUID]
+
+
+async def _after_the_cleanup_removed(ctx, removed: list[str]):
+    """Run the stale cleanup check, its service reporting `removed`, and apply its state update."""
+    from neurons.validators.src.services.task.checks.stale_container_cleanup import (
+        StaleContainerCleanupCheck,
+    )
+
+    cleanup = AsyncMock()
+    cleanup.cleanup.return_value = (len(removed), removed, [])
+    cleanup.sweep_abandoned_download_temporaries.return_value = 0
+    cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
+    redis = AsyncMock()
+    redis.sadd.return_value = 0
+    redis.hgetall.return_value = {}
+    services = ctx.services
+    ctx = ctx.model_copy(
+        update={"services": build_services(container_cleanup=cleanup, redis=redis)}
+    )
+    result = await StaleContainerCleanupCheck().run(ctx)
+    return ctx.model_copy(update={**result.updates, "services": services})
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_gpu_still_fails_after_the_cleanup_removed_an_unrelated_container(
+    context_factory,
+):
+    """Review 4371171963: a removal this cycle must not skip the wedge cure."""
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 100, 0\n")
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+    ctx = await _after_the_cleanup_removed(ctx, ["health_check_1777040800"])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WEDGED.reason
+    assert any(cmd.startswith(CURE_PREFIX) for cmd in _commands(runner))
+
+
+@pytest.mark.asyncio
+async def test_a_reaped_containers_process_no_longer_counts_but_a_surviving_one_does(
+    context_factory,
+):
+    reaped = f"{FILLER_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    survivor = f"{POD_CONTAINER_PREFIX}mine"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[
+            {"pid": 1, "info": "0::/x/init.scope", "container_name": reaped},
+            {"pid": 2, "info": "0::/x/init.scope", "container_name": survivor},
+        ],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw.get("orphaned_container") == survivor
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_only_gpu_load_was_a_reaped_container_passes(context_factory):
+    reaped = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 10, "memory_utilization": 10}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": reaped}],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
 
 
 @pytest.mark.asyncio

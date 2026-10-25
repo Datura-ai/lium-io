@@ -69,6 +69,13 @@ def test_run_spec_swap_off_follows_the_memory_limit(svc, memory_gb, expected):  
     assert (run_spec.memory_gb or None, run_spec.memory_swap_gb, run_spec.oom_score_adj) == expected
 
 
+def test_run_spec_labels_the_container_with_its_pod_id(svc):  # noqa: F811
+    """DAH-5117: the stale cleanup reaps only containers carrying this label."""
+    from services.const import LIUM_POD_ID_LABEL
+
+    assert _run_spec(svc, 30).labels == {LIUM_POD_ID_LABEL: "pod"}
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "1001"])
 def test_an_oom_score_outside_1_to_1000_fails_startup(monkeypatch: pytest.MonkeyPatch, value: str):
     monkeypatch.setenv("RENTAL_CONTAINER_OOM_SCORE_ADJ", value)

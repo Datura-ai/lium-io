@@ -9,11 +9,16 @@ from uuid import UUID
 
 from core.config import settings
 from core.utils import _m
+from protocol.vc_protocol.compute_requests import (
+    LIVE_FILLER_RUN_STATUSES,
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+)
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
 from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
-from ...const import POD_CONTAINER_PREFIX
+from ...const import EDIT_PARKED_SUFFIX, FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -104,6 +109,7 @@ class StaleContainerCleanupCheck:
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 on_before_remove=queue.add,
+                lium_workload_ended=lambda name: _lium_workload_ended_here(ctx, name),
             )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
@@ -157,10 +163,17 @@ class StaleContainerCleanupCheck:
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
         if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
+        # The GPU processes were read before this cleanup; a reaped container's are gone with it, so
+        # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node.
+        removed = set(removed_names)
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
-            reaped_containers=removed_names,
+            gpu_processes=[
+                process
+                for process in ctx.state.gpu_processes
+                if process.get("container_name") not in removed
+            ],
             pod_states=[*ctx.state.pod_states, *reaped],
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
@@ -206,6 +219,24 @@ class StaleContainerCleanupCheck:
                 )
             )
             return True
+
+
+async def _lium_workload_ended_here(ctx: Context, container_name: str) -> bool:
+    """DAH-5117: the backend's record shows a pre-label pod_/filler_<uuid> was this node's Lium
+    workload and has ended: a rental with a close time, or a filler run in a terminal state."""
+    record_id = container_name.removesuffix(EDIT_PARKED_SUFFIX).partition("_")[2]
+    record: PodRentalActiveResponse | FillerRunActiveResponse | None
+    if container_name.startswith(FILLER_CONTAINER_PREFIX):
+        record = await ctx.services.backend.get_filler_run_active(record_id)
+        ended = (
+            record is not None
+            and not record.active
+            and record.status not in (None, *LIVE_FILLER_RUN_STATUSES)
+        )
+    else:
+        record = await ctx.services.backend.get_pod_rental_active(record_id)
+        ended = record is not None and not record.active and record.rental_closed_at is not None
+    return ended and record.executor_id in (None, str(ctx.executor.uuid))
 
 
 def pod_id_of_container(name: str) -> str | None:
