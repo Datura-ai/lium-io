@@ -383,6 +383,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     anchor_broken=context.gpu_anchor_broken,
+                    reanchor=context.gpu_reanchor,
                 )
             else:
                 await self.redis_service.set_verified_job_info(
