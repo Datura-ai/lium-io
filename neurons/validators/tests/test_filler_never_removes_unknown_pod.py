@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 import services.docker_service as ds_module
 from payload_models.payloads import ContainerCreateRequest, FailedContainerErrorCodes, WorkloadKind
+from services.attestation_service import HostPolicyResult
 from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
 from services.rental_docker_sdk import (
     FILLER_VOLUME_LABELS,
@@ -84,7 +85,9 @@ def _removed_names(ssh_client) -> list[str]:
 
 @pytest.fixture
 def svc() -> ds_module.DockerService:
-    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    # an empty host policy (no pinned key): rental SSH fails closed without one (DAH-4906)
+    attestation_service = Mock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult()))
+    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=attestation_service)
 
 
 @pytest.mark.parametrize(

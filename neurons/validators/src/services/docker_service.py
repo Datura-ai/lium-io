@@ -3216,11 +3216,10 @@ class DockerService:
     ) -> asyncssh.SSHKnownHosts | None:
         """Single chokepoint for every rental-path SSH host-key policy.
 
-        N3 (CVM attestation gap remediation): with ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED
-        an unexpected error here fails closed — no host-key policy means no rental
-        SSH — instead of silently falling back to unpinned SSH. Rental-path
-        freshness rides the most recent validation-cycle attestation; no nonce is
-        minted here by design.
+        N3 (CVM attestation gap remediation): an unexpected error here fails closed — no
+        host-key policy means no rental SSH — instead of silently falling back to unpinned
+        SSH. Rental-path freshness rides the most recent validation-cycle attestation; no
+        nonce is minted here by design.
         """
         try:
             host_policy = await self.attestation_service.prepare_host_policy(
@@ -3230,24 +3229,16 @@ class DockerService:
         except AttestationError:
             raise
         except Exception as exc:
-            if settings.ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED:
-                logger.warning(
-                    _m(
-                        "Unable to prepare known_hosts policy — failing closed (no rental SSH)",
-                        extra=get_extra_info({**log_context, "error": str(exc)}),
-                    )
-                )
-                raise AttestationError(
-                    f"Unable to prepare host-key policy for executor "
-                    f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
-                ) from exc
             logger.warning(
                 _m(
-                    "Unable to prepare known_hosts policy",
+                    "Unable to prepare known_hosts policy — failing closed (no rental SSH)",
                     extra=get_extra_info({**log_context, "error": str(exc)}),
                 )
             )
-            return None
+            raise AttestationError(
+                f"Unable to prepare host-key policy for executor "
+                f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
+            ) from exc
 
     async def generate_portMappings(
         self,

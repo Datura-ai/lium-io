@@ -22,6 +22,7 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
+from services.attestation_service import AttestationError
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
 from services.rental_docker_sdk import (
     ContainerExecResult,
@@ -1161,3 +1162,12 @@ async def test_create_container_skips_the_pod_ssh_host_key_without_a_master_secr
     )
 
     assert _pod_host_key_commands(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_known_hosts_policy_error_fails_closed(docker_service, executor_info):
+    # an unexpected error building the host-key policy refuses rental SSH instead of going unpinned
+    docker_service.attestation_service.prepare_host_policy = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(AttestationError, match="refusing unpinned rental SSH"):
+        await docker_service._prepare_known_hosts_policy(executor_info, "miner-hotkey", {})

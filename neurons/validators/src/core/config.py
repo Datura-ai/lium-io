@@ -735,13 +735,6 @@ class Settings(BaseSettings):
     # Empty = no hwmodel constraint. Substring-prefix match per entry.
     GPU_ATTESTATION_ALLOWED_HWMODELS: str = Field(env="GPU_ATTESTATION_ALLOWED_HWMODELS", default="")
 
-    # N3 — rental host-key policy. Off preserves today's behavior (a non-attestation
-    # error while building the policy falls back to unpinned SSH). On = fail closed:
-    # no host-key policy ⇒ no rental SSH.
-    ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED: bool = Field(
-        env="ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED", default=False
-    )
-
     # G2 — monotonic version floor for the measured compose (runner) releases.
     # Whitelisted compose hashes carry a version; hashes below the floor are rejected
     # ("≥ approved version", newest-wins — never a rolling window). 0 accepts every
