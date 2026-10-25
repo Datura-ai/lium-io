@@ -245,24 +245,33 @@ sudo losetup --direct-io=on /dev/loopN
 losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
 ```
 
-**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount and before Docker. With the image `/data/img.raw` mounted at `/data/dockerimg` (use `UUID=` for `/data` in `/etc/fstab`: a `/dev/nvmeX` name can change on reboot and Docker then starts on an empty directory):
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit: when the image does not mount, Docker stays stopped instead of starting on the empty directory. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
 
-```shell
-echo '/data/img.raw /data/dockerimg ext4 loop,nofail,x-systemd.requires=/data 0 0' | sudo tee -a /etc/fstab
-sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
-[Unit]
-Description=Direct I/O on the Docker data-root loop device
-RequiresMountsFor=/data/dockerimg
-Before=docker.service containerd.service
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'losetup -j /data/img.raw -n -O NAME | xargs -r -n1 losetup --direct-io=on'
-[Install]
-WantedBy=multi-user.target docker.service
-EOF
-sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
-```
+1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
+
+   ```
+   /data/img.raw /data/dockerimg xfs loop,pquota,nofail,x-systemd.requires=/data 0 0
+   ```
+
+2. The unit, and Docker requiring it:
+
+   ```shell
+   sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
+   [Unit]
+   Description=Direct I/O on the Docker data-root loop device
+   RequiresMountsFor=/data/dockerimg
+   Before=docker.service containerd.service
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/bin/sh -c 'dev=$$(losetup -j /data/img.raw -n -O NAME | head -n 1); [ -n "$$dev" ] && losetup --direct-io=on "$$dev"'
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   printf '[Unit]\nRequires=loop-dio-docker.service\nAfter=loop-dio-docker.service\n' | sudo tee /etc/systemd/system/docker.service.d/loop-dio.conf >/dev/null
+   sudo systemctl daemon-reload && sudo systemctl enable loop-dio-docker.service
+   ```
 
 ## The executor image
 
