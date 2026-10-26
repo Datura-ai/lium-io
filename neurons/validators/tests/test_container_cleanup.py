@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from services.const import EDIT_PARKED_SUFFIX
 from services.container_cleanup import (
     RENTED_LIST_EMPTY,
     RENTED_LIST_UNAVAILABLE,
@@ -1018,7 +1019,7 @@ async def test_an_unparseable_listing_line_is_skipped():
     assert await ContainerCleanup()._get_all_rental_containers(ssh) == [("pod_a", "a")]
 
 
-def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=None):
+def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=None, redis=None):
     from tests.helpers import build_services, build_state, make_context
 
     cleanup = AsyncMock()
@@ -1030,9 +1031,10 @@ def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=No
     cleanup.cleanup.side_effect = remove
     cleanup.sweep_abandoned_download_temporaries.return_value = 0
     cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
-    redis = AsyncMock()
-    redis.sadd.return_value = 0  # seen before: no first-sight grace
-    redis.hgetall.return_value = {}
+    if redis is None:
+        redis = AsyncMock()
+        redis.sadd.return_value = 0  # seen before: no first-sight grace
+        redis.hgetall.return_value = {}
     overrides = {"backend": backend} if backend else {}
     return make_context(
         services=build_services(container_cleanup=cleanup, redis=redis, **overrides),
@@ -1106,6 +1108,72 @@ def _ended_here_backend(ctx_holder: dict):
     backend.get_pod_rental_active.side_effect = pod
     backend.get_filler_run_active.side_effect = filler
     return backend
+
+
+class _DictRedis:
+    """Just the hash calls the check makes, kept across runs like the real redis."""
+
+    def __init__(self):
+        self.hashes: dict[str, dict[str, str]] = {}
+
+    async def sadd(self, key, member):
+        return 0  # seen before: no first-sight grace
+
+    async def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    async def hset(self, key, field, value):
+        self.hashes.setdefault(key, {})[field] = value
+
+    async def hdel(self, key, *fields):
+        for field in fields:
+            self.hashes.get(key, {}).pop(field, None)
+
+    async def expire(self, key, seconds):
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        ("pod_00000000-0000-4000-8000-0000000000a1", "pod_00000000-0000-4000-8000-0000000000a1"),
+        ("filler_00000000-0000-4000-8000-0000000000a1", "filler_00000000-0000-4000-8000-0000000000a1"),
+        # an edit-parked copy is the same record
+        ("pod_00000000-0000-4000-8000-0000000000a1", f"pod_00000000-0000-4000-8000-0000000000a1{EDIT_PARKED_SUFFIX}"),
+    ],
+)
+async def test_a_container_recreated_under_an_ended_id_keeps_its_gpu_processes_the_second_time(first, second):
+    """Review 4373847343: the ended record replays, so the exemption is one-shot. Cycle 1 removes
+    the leftover and drops its processes; the provider recreates it, cycle 2 removes it again and
+    its processes count, so the GPU and tenant checks fail the node."""
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    redis = _DictRedis()
+    check = StaleContainerCleanupCheck()
+    results = []
+    for name in (first, second):
+        holder: dict = {}
+        processes = [{"pid": 1, "container_name": name}]
+        ctx = holder["ctx"] = _cleanup_check_ctx([name], processes, backend=_ended_here_backend(holder), redis=redis)
+        results.append((await check.run(ctx)).updates["state"].gpu_processes)
+
+    assert results == [[], [{"pid": 1, "container_name": second}]]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_exemption_record_keeps_the_removed_containers_gpu_processes():
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    processes = [{"pid": 1, "container_name": name}]
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx([name], processes, backend=_ended_here_backend(holder))
+    ctx.services.redis.hgetall.side_effect = RuntimeError("redis down")
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
 
 
 @pytest.mark.asyncio

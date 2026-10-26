@@ -52,6 +52,9 @@ DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 REAPED_POD_STATE_RETENTION_SECONDS = 24 * 60 * 60
 REAPED_POD_STATES_KEY_PREFIX = "reaped_pod_states:"
 REAPED_POD_STATES_FLOOR = 32
+# DAH-5117 review 4373847343: a removed container's GPU processes are dropped once per name. An ended
+# record stays ended, so a provider recreating pod_<old id> each cycle would otherwise be exempt forever.
+REAPED_GPU_EXEMPT_KEY_PREFIX = "reaped_gpu_exempt:"
 
 
 class StaleContainerCleanupCheck:
@@ -228,7 +231,7 @@ class StaleContainerCleanupCheck:
         if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
         # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
-        removed = confirmed.intersection(removed_names)
+        removed = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
@@ -374,6 +377,46 @@ class _ReapedPodStateQueue:
         self._key = f"{REAPED_POD_STATES_KEY_PREFIX}{ctx.executor.uuid}"
         self._extra = {"executor_uuid": ctx.executor.uuid}
         self._this_cycle: dict[str, _QueuedReap] = {}
+        self._exempt_key = f"{REAPED_GPU_EXEMPT_KEY_PREFIX}{ctx.executor.uuid}"
+
+    async def claim_gpu_exemptions(self, names: set[str]) -> set[str]:
+        """The names whose GPU processes may be dropped: those not exempted on this node inside the
+        retention window. A recreated container is removed again, but its processes now count.
+        A redis error exempts none (fail closed: the processes count for that cycle)."""
+        if not names or self._redis is None:
+            return set(names)
+        try:
+            stored = await self._redis.hgetall(self._exempt_key) or {}
+            cutoff = datetime.now(UTC).timestamp() - REAPED_POD_STATE_RETENTION_SECONDS
+            seen: set[str] = set()
+            for raw_name, raw_at in stored.items():
+                name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+                try:
+                    at = datetime.fromisoformat(raw_at.decode() if isinstance(raw_at, bytes) else str(raw_at))
+                except ValueError:
+                    at = datetime.now(UTC)  # unreadable stamp: still counts as exempted
+                if at.timestamp() >= cutoff:
+                    seen.add(name)
+                else:
+                    await self._redis.hdel(self._exempt_key, name)
+            fresh = {name for name in names if name.removesuffix(EDIT_PARKED_SUFFIX) not in seen}
+            now = datetime.now(UTC).isoformat()
+            for name in fresh:
+                await self._redis.hset(self._exempt_key, name.removesuffix(EDIT_PARKED_SUFFIX), now)
+            if fresh:
+                await self._redis.expire(self._exempt_key, REAPED_POD_STATE_RETENTION_SECONDS)
+        except Exception as e:  # noqa: BLE001 - one-shot unverifiable: the processes still count
+            logger.warning(
+                _m("GPU exemption record unavailable; removed containers' processes still count",
+                   extra={**self._extra, "error": str(e)})
+            )
+            return set()
+        if names - fresh:
+            logger.warning(
+                _m("Removed container was exempted before; its GPU processes count",
+                   extra={**self._extra, "container_names": sorted(names - fresh)})
+            )
+        return fresh
 
     async def add(self, container_name: str) -> None:
         pod_id = pod_id_of_container(container_name)
