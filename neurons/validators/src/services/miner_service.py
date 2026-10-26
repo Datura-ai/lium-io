@@ -293,6 +293,47 @@ EXPRESS_LANE = "express"
 CYCLE_DONE = "cycle-done"
 
 
+async def _gocryptfs_mount_is_live(ssh_client, container_name: str, plaintext_path: str) -> bool:
+    # same test as the executor's workspace.py: the rental PID's mountinfo has a fuse.gocryptfs at the path
+    container_q = shlex.quote(container_name)
+    result = await ssh_client.run(
+        f"cat /proc/$(docker inspect -f '{{{{.State.Pid}}}}' {container_q})/mountinfo", check=True
+    )
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if "-" not in fields or len(fields) < 10:
+            continue
+        separator = fields.index("-")
+        if fields[4] == plaintext_path and fields[separator + 1] == "fuse.gocryptfs":
+            return True
+    return False
+
+
+async def _remount_dropped_gocryptfs(ssh_client, payload: BackupContainerRequest, docker_service: DockerService) -> None:
+    # DAH-5047: a RUNNING pod's plaintext mount can drop; remount it (never init) so the backup reads real data.
+    # Best effort: any failure is logged and the backup launches anyway, the executor reports its usual error.
+    extra = {"pod_id": payload.pod_id, "container_name": payload.container_name}
+    try:
+        if await _gocryptfs_mount_is_live(ssh_client, payload.container_name, payload.source_volume_path):
+            return
+        logger.warning(_m("DAH-5047: gocryptfs mount down before backup, remounting", extra=get_extra_info(extra)))
+        # source_volume is the encrypted volume the executor checks at /lium-cipher
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name=payload.container_name,
+            plaintext_path=payload.source_volume_path,
+            volume_name=payload.source_volume,
+            pod_id=payload.pod_id,
+            log_tag=f"backup_container_{payload.pod_id}",
+            log_extra=extra,
+            allow_init=False,
+        )
+    except Exception as error:
+        logger.error(
+            _m("DAH-5047: pre-backup gocryptfs check/remount failed", extra=get_extra_info({**extra, "error": str(error)}))
+        )
+
+
 class MinerService:
     def __init__(
         self,
@@ -1401,6 +1442,8 @@ class MinerService:
                     # report the real reason first; the generic dispatch-failure report then finds the log terminal
                     await report_launch_failure(operation_id, self._restic_backup_operation_spec(payload), error)
                     raise error
+                if payload.volume_encrypted and payload.container_name:
+                    await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,
