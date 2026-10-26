@@ -175,6 +175,9 @@ class ContainerCreateRequest(ContainerRequest):
     ships_sshd: bool | None = None
     gpu_power_limits: list[GpuPowerLimit] | None = None
     cache_volumes: list[CacheVolume] | None = None
+    # 1.17.0: False when the backend rents the pod part of its host; the validator then withholds the host-wide
+    # devices whatever GPUs the host shows. None from an older backend: the validator's own count decides.
+    whole_host: bool | None = None
 
 
 @BACKEND_MESSAGES.register
