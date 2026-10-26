@@ -38,25 +38,38 @@ def snaps(
     during_rx: int = 0,
     during_sectors: int = 0,
     during_ios: int = 0,
+    cover: bool = False,
+    pod: bool = True,
 ) -> str:
     """The docker root on nvme0n1, then two host snapshots 2 s apart: bytes received and sent on the NICs and sectors
     moved on nvme0n1 in between. counters=False: the host's NIC counters were not readable. Then one after the disk
     container (10 s; the probe's own 256 MiB and 4096 requests plus during_sectors/during_ios) and one after the fetch
-    container (10 s; during_rx on top of the probe's own downloads)."""
+    container (10 s; during_rx on top of the probe's own downloads). The rented pod (pid 4242) moved the during_*
+    traffic itself in its own network namespace and cgroup; cover=True: the host moved it outside the pod (a
+    provider's cover traffic), so the pod's counters stay still. pod=False: no pod counters readable."""
 
     def net(rx: int, tx: int) -> str:
         return f"rx={1000 + rx} tx={1000 + tx} " if counters else ""
+
+    def p(rx: int = 0, moved: int = 0, ios: int = 0) -> str:
+        if not pod:
+            return ""
+        if cover:
+            rx = moved = ios = 0
+        return f" pod=4242:{1000 + rx}:1000:{moved}:{ios},"
 
     own_sectors, own_rx = 256 * 2048, 2 * 16 * 1024 * 1024
     s2 = 500 + sectors + own_sectors + during_sectors
     n2 = 9 + 4096 + during_ios
     rx3 = rx_bytes + own_rx + during_rx
+    in_disk = p(0, during_sectors * 512, during_ios)
     return (
         "lium_tp_device name=nvme0n1p2\nlium_tp_device name=nvme0n1\n"
-        f"lium_tp t=100.0 {net(0, 0)}io=nvme0n1:500:9,sda:7:1,\n"
-        f"lium_tp t=102.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{500 + sectors}:9,sda:7:1,\n"
-        f"lium_tp t=112.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,\n"
-        f"lium_tp t=122.0 {net(rx3, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,\n"
+        f"lium_tp t=100.0 {net(0, 0)}io=nvme0n1:500:9,sda:7:1,{p()}\n"
+        f"lium_tp t=102.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{500 + sectors}:9,sda:7:1,{p()}\n"
+        f"lium_tp t=112.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,{in_disk}\n"
+        f"lium_tp t=122.0 {net(rx3, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,"
+        f"{p(during_rx, during_sectors * 512, during_ios)}\n"
     )
 
 
@@ -134,8 +147,14 @@ def test_defaults_enforce_with_a_kill_switch():
 
 
 def test_command_samples_the_host_then_probes_disk_and_network_in_the_renter_runtime():
-    cmd = throughput_command(True)
+    cmd = throughput_command(True, ["pod_p1", "it's"])
     assert cmd.index("/proc/1/net/dev") < cmd.index("/usr/bin/docker run")
+    # the rented pods' pid and id first, quoted: their own counters are read in every snapshot
+    assert cmd.startswith(
+        "pp=$(for c in pod_p1 'it'\"'\"'s'; do /usr/bin/docker inspect -f '{{.State.Pid}}/{{.Id}}'"
+    )
+    assert "pod=$(pods)" in cmd
+    assert subprocess.run(["sh", "-n", "-c", cmd], capture_output=True).returncode == 0
     # host counters after the disk container and after the fetch container
     disk_run, fetch_run = cmd.split("/usr/bin/docker run")[1:]
     assert "dd if=/dev/zero" in disk_run and "; snap; " in disk_run and "wget" not in disk_run
@@ -168,21 +187,23 @@ def test_parse_disk_and_busy():
     assert parse_busy(snaps(sectors=2_000_000).replace(":9,", ",").replace(":1,", ","))[
         1
     ] == pytest.approx(512.0)
-    reading = parse_disk(disk())
-    endpoints = download_module.parse_download_speed(FAST)
-    assert parse_during(snaps(), endpoints, reading) == (0.0, (0.0, 0.0))
+    assert parse_during(snaps()) == (0.0, (0.0, 0.0))
     net, (mb, iops) = parse_during(
-        snaps(during_rx=50_000_000, during_sectors=200_000, during_ios=1000), endpoints, reading
+        snaps(during_rx=50_000_000, during_sectors=200_000, during_ios=1000)
     )
-    own_net = (
-        2 * 16 * 1024 * 1024 * 1.1 + 2 * 8 * 1024 * 1024
-    )  # FAST's downloads, overhead and in-flight slack
-    assert net == pytest.approx((50_000_000 + 2 * 16 * 1024 * 1024 - own_net) * 8 / 10 / 1e6)
-    assert mb == pytest.approx(
-        (200_000 * 512 - 32 * 1024 * 1024) / 10 / 1e6
-    ) and iops == pytest.approx(100.0)
+    # the pod's own counters only: no probe bytes to take out
+    assert (
+        net == pytest.approx(40.0) and mb == pytest.approx(10.24) and iops == pytest.approx(100.0)
+    )
+    # the same traffic made by the host outside the pod is not the renter's
+    assert parse_during(
+        snaps(during_rx=50_000_000, during_sectors=200_000, during_ios=1000, cover=True)
+    ) == (0.0, (0.0, 0.0))
     two = "".join(ln + "\n" for ln in snaps().splitlines()[:4])  # no counters after the probe
-    assert parse_during(two, endpoints, reading) == (None, (None, None))
+    assert parse_during(two) == (None, (None, None))
+    assert parse_during(snaps(pod=False)) == (None, (None, None))
+    restarted = snaps().rsplit("pod=4242", 1)  # the pod restarted (a new pid) during the fetch
+    assert parse_during("pod=4243".join(restarted))[0] is None
 
 
 async def test_good_reading_passes():
@@ -267,9 +288,8 @@ async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
         ),  # 100 MB/s of renter writes
         (snaps(during_ios=500) + disk(secs=30.0) + FAST, "disk"),  # 50 random requests/s, few bytes
         (snaps(during_rx=40_000_000) + disk() + SLOW, "net"),  # ~29 Mbps of renter downloads
-        ("".join(ln + "\n" for ln in snaps().splitlines()[:4]) + disk(secs=30.0) + SLOW, "both"),
     ],
-    ids=["disk_bytes", "disk_requests", "network", "no_counters_after"],
+    ids=["disk_bytes", "disk_requests", "network"],
 )
 async def test_renter_load_during_the_probe_is_no_verdict(answer, side):
     with flags():
@@ -289,6 +309,66 @@ async def test_renter_load_during_the_probe_is_no_verdict(answer, side):
         assert disk_side == "fail"
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(SLOW_NET)[0])
         assert net == "fail"
+
+
+# A provider's cover traffic (the same load made by the host outside the rented pod), or pod counters that cannot be
+# read, never excuse a slow side: the failure stands.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(during_sectors=2_000_000, cover=True) + disk(secs=30.0) + SLOW,
+        snaps(during_ios=500, cover=True) + disk(secs=30.0) + SLOW,
+        snaps(during_rx=40_000_000, cover=True) + disk(secs=30.0) + SLOW,
+        snaps(pod=False) + disk(secs=30.0) + SLOW,
+        "".join(ln + "\n" for ln in snaps().splitlines()[:4]) + disk(secs=30.0) + SLOW,
+    ],
+    ids=[
+        "host_disk_bytes",
+        "host_disk_requests",
+        "host_network",
+        "no_pod_counters",
+        "no_counters_after",
+    ],
+)
+async def test_cover_traffic_outside_the_pod_does_not_excuse_a_slow_node(answer):
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("fail", "fail")
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "dev").write_text(
+        "Inter-|   Receive\n face |bytes\n"
+        "    lo: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n"
+        "  eth0: 1000 0 0 0 0 0 0 0 60 0 0 0 0 0 0 0\n"
+    )
+    scope = tmp_path / "cg" / "system.slice" / "docker-abc.scope"
+    scope.mkdir(parents=True)
+    (scope / "io.stat").write_text(
+        "259:0 rbytes=100 wbytes=200 rios=3 wios=4 dbytes=0 dios=0\n8:0 rbytes=0 wbytes=0 rios=0 wios=0\n"
+    )
+    script = (
+        module._SNAPSHOT.replace("[ /proc/1/root/ -ef / ] && return; ", "")
+        .replace("[ /proc/$p/ns/net -ef /proc/1/ns/net ] || ", "")
+        .replace("/proc/$p/net/dev", f"{tmp_path}/net/dev")
+        .replace("/proc/1/root/sys/fs/cgroup", f"{tmp_path}/cg")
+        .split("snap() {")[0]
+    )
+    out = subprocess.run(
+        ["sh", "-c", f"pp='4242/abc 4343/gone'; {script} pods"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+    # the second pod's cgroup is gone: its disk counters are empty (unreadable), never zero
+    assert out.splitlines()[-1] == "4242:1000:60:300:7,4343:1000:60::,", out
 
 
 async def test_idle_foreign_or_stopped_rentals_are_left_alone():
