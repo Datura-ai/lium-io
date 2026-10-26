@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import suppress
 from contextvars import ContextVar
@@ -10,6 +11,8 @@ from uuid import uuid4
 import aiohttp
 import bittensor
 import pydantic
+import redis.asyncio as aioredis
+import redis.exceptions
 import tenacity
 import websockets
 from payload_models.payloads import (
@@ -106,6 +109,12 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
+# DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
+# pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
+# so the backend loses the validator for seconds, not the whole startup.
+CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
+CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
+CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
 
 
 command_responses: ContextVar[list[str] | None] = ContextVar("command_responses", default=None)
@@ -210,6 +219,7 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
+        await self.take_connector_lead()
 
         try:
             await self.fail_creates_cut_off_by_restart()
@@ -1021,6 +1031,37 @@ class ComputeClient:
                 extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "error": str(exc)}),
             )
         )
+
+    async def take_connector_lead(self) -> None:
+        """Wait until no other connector leads, then lead while this process lives (DAH-5177)."""
+        with open(CONNECTOR_READY_FILE, "w"):
+            pass
+        lock = aioredis.lock.Lock(
+            self.miner_service.redis_service.redis,
+            CONNECTOR_LEAD_LOCK_KEY,
+            timeout=CONNECTOR_LEAD_LOCK_TTL_SECONDS,
+            sleep=0.5,
+            thread_local=False,
+        )
+        extra = get_extra_info(self.logging_extra)
+        logger.info(_m("Waiting to lead the backend connection", extra=extra))
+        await lock.acquire()
+        logger.info(_m("Leading the backend connection", extra=extra))
+        self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
+
+    async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
+        extra = get_extra_info(self.logging_extra)
+        while True:
+            await asyncio.sleep(CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3)
+            try:
+                await lock.reacquire()
+            except redis.exceptions.LockNotOwnedError:
+                # expired in a Redis outage or a stalled loop: lead on if nobody took over, else stop
+                if not await lock.acquire(blocking=False):
+                    logger.error(_m("Another connector took the lead; exiting", extra=extra))
+                    os._exit(1)
+            except Exception as exc:
+                logger.warning(_m("Could not renew the connector lead", extra={**extra, "error": str(exc)}))
 
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
