@@ -139,6 +139,8 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
+# DAH-3698: window in which only the first failed port verification is forgiven
+PORT_VERIFY_FIRST_MISS_TTL_SECONDS = 3600
 # Declared ports are tallied per bucket of this width (by external port), so a wide range
 # forwarded only in part shows which part answered; at most 14 tallies over 1-65535
 # per event.

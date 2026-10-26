@@ -77,6 +77,7 @@ from pydantic import BaseModel, Field
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
+from services.const import MIN_PORT_COUNT
 
 if TYPE_CHECKING:
     from incentive.rental_price import (
@@ -486,20 +487,34 @@ class MinerLogLine(BaseModel):
     def no_payout_because_port_limited_remainder(
         result: JobResult, port_limited: PortLimitedRemainder
     ) -> MinerLogLine:
-        # `result` is the free portion: gpu_count is the number of free GPUs the message names.
+        # `result` is the free portion; the message names the GPUs the missing ports leave unpaid.
+        unpaid: int = port_limited.unpaid_gpu_count
+        if port_limited.paid_split_count:
+            lead = (
+                f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: "
+                f"it has {port_limited.available_port_count} free port(s) for "
+                f"{port_limited.free_split_count} free GPU split(s), and each split needs its own port "
+                f"for a renter, so {port_limited.paid_split_count} split(s) keep earning. "
+            )
+        else:
+            lead = (
+                f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: "
+                f"it has {port_limited.available_port_count} free port(s) and needs at least "
+                f"{MIN_PORT_COUNT} to list and rent them, so nobody can rent these GPUs right now. "
+            )
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
             message=(
-                f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
-                f"rented node: it has {port_limited.available_port_count} free port(s) and the "
-                f"marketplace needs at least {port_limited.required_port_count} to list and rent them, so nobody "
-                "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
-                "when the rental ends or the node gets more open ports."
+                lead + "The rented GPUs keep earning. Full idle pay resumes when the rental ends or the "
+                f"node has {port_limited.required_port_count} open free ports."
             ),
             extra_fields={
+                "gpu_count": unpaid,
                 "available_port_count": port_limited.available_port_count,
                 "required_port_count": port_limited.required_port_count,
+                "free_split_count": port_limited.free_split_count,
+                "paid_split_count": port_limited.paid_split_count,
             },
         )
 

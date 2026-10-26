@@ -52,6 +52,17 @@ class DummyRedis:
         self.cleared_misses.append((miner_hotkey, executor_id))
         self.dind_miss_on_record = False
 
+    # DAH-3698: first failed port verification inside the window
+    port_miss_on_record: bool = False
+
+    async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        first = not self.port_miss_on_record
+        self.port_miss_on_record = True
+        return first
+
+    async def clear_port_verify_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        self.port_miss_on_record = False
+
 
 # Mock backend service
 class DummyBackendService:
@@ -625,3 +636,39 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 
     assert result.passed is True
     assert result.updates["state"].sysbox_runtime is False
+
+
+# DAH-3698: one failed port verification must not zero a split remainder's idle pay.
+
+
+def _port_ctx(context_factory, redis_service, *, success: bool):
+    services = build_services(
+        redis=redis_service,
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(success=success, verified_port_count=8 if success else 0),
+    )
+    return context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_failed_port_verification_is_marked_for_grace(context_factory):
+    redis_service = DummyRedis()
+
+    first = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=False))
+    second = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=False))
+
+    assert first.updates["state"].specs.get("port_verify_first_miss") is True
+    assert "port_verify_first_miss" not in second.updates["state"].specs
+
+
+@pytest.mark.asyncio
+async def test_a_passing_port_verification_clears_the_miss(context_factory):
+    redis_service = DummyRedis()
+    redis_service.port_miss_on_record = True
+
+    ok = await PortConnectivityCheck().run(_port_ctx(context_factory, redis_service, success=True))
+
+    assert "port_verify_first_miss" not in ok.updates["state"].specs
+    assert redis_service.port_miss_on_record is False

@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import PORT_VERIFY_FIRST_MISS_TTL_SECONDS
 from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
@@ -114,6 +115,12 @@ class PortConnectivityCheck:
                 sysbox_runtime=True,
             )
 
+        if await self._is_first_port_verify_miss(ctx, ok=result.status == "ok"):
+            extra_info["port_verify_first_miss"] = True
+            updated_state = replace(
+                updated_state, specs={**updated_state.specs, "port_verify_first_miss": True}
+            )
+
         total = len(result.successful_ports) + len(result.failed_ports)
         pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
         dind_status = "ok" if result.dind_ok else "failed"
@@ -211,6 +218,24 @@ class PortConnectivityCheck:
                 "state": updated_state,
             },
         )
+
+    @staticmethod
+    async def _is_first_port_verify_miss(ctx: Context, *, ok: bool) -> bool:
+        """DAH-3698: the first failed verification inside the window is not a verdict on the
+        node's ports; the split-remainder port gate skips that cycle. A repeat inside the window
+        counts. Fails closed to the old behaviour (no grace) on a Redis error."""
+        try:
+            if ok:
+                await ctx.services.redis.clear_port_verify_miss(ctx.miner_hotkey, ctx.executor.uuid)
+                return False
+            return await ctx.services.redis.record_port_verify_miss(
+                ctx.miner_hotkey, ctx.executor.uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS
+            )
+        except Exception as e:  # noqa: BLE001 — never fail the port check over the grace
+            logger.warning(
+                _m("port verify miss record unavailable", extra=get_extra_info({**ctx.default_extra, "error": str(e)}))
+            )
+            return False
 
     @staticmethod
     async def _should_keep_last_known_sysbox(
