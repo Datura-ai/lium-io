@@ -71,6 +71,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_LOST,
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
         AvailabilityErrorCode.STORAGE_LIMIT_REQUIRED,
+        AvailabilityErrorCode.STORAGE_LIMIT_INCONCLUSIVE,
     }
 )
 

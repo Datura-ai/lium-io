@@ -9,8 +9,8 @@ Pure data, no SSH. While ``REQUIRE_STORAGE_LIMIT_SUPPORTED`` is off every node w
 non-fatal STORAGE_LIMIT_MISSING warning, score unchanged, so providers see it in their logs before enforcement.
 The limit counts only for overlay2 on xfs mounted with pquota whose ``--storage-opt size=`` container runs (the scrape).
 With the setting on, a node without the limit that is not rented and whose host could build it (the scrape's
-``storage_limit_capable``: 100 GiB+ free on the filesystem holding docker's data root, room for the xfs image file
-`lium gpu-splitting setup` builds) fails (score 0, STORAGE_LIMIT_REQUIRED) until the host passes the probe; a host
+``storage_limit_capable``: a local filesystem other than docker's own mount with 100 GiB left after the system's
+reserve, the room `lium gpu-splitting setup` needs for its xfs image file) fails (score 0, STORAGE_LIMIT_REQUIRED) until the host passes the probe; a host
 with less free keeps the warning only; a rented node only gets the warning, so this check never touches a running rental.
 It runs right after the scrape, before the rented short-circuit, like GpuThermalThrottleCheck.
 """
@@ -59,7 +59,7 @@ class StorageLimitCheck:
             else None
         )
         rented = bool(rented_executor and rented_executor.pods)
-        # DAH-1997: a host without 100 GiB free next to docker's data root keeps the warning; unknown (an older
+        # DAH-1997: a host without room for setup's image file keeps the warning; unknown (an older
         # scrape, a failed reading) counts as able
         capable = specs.get("storage_limit_capable") is not False
         detail = str(specs.get("storage_limit_scrape_error") or "")

@@ -17,25 +17,22 @@ import pytest
 from neurons.validators.tests.helpers import build_scrape_namespace
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-GIB = 1024**3
 
 HELPERS = {
     "HOST_MOUNTS_PATH",
     "COMMANDS",
-    "STORAGE_CAPABLE_MIN_BYTES",
     "PROJECT_QUOTA_MOUNT_OPTIONS",
     "MountLine",
     "covering_mount",
     "storage_limit_setup_gap",
     "check_storage_limit_ability",
-    "storage_limit_capable",
 }
 OVERLAY2 = {"Driver": "overlay2", "DockerRootDir": "/var/lib/docker"}
 ROOT = "/dev/sda1 / ext4 rw,relatime 0 0\n"
 DOCKER_XFS_PQUOTA = ROOT + "/dev/sdb /var/lib/docker xfs rw,relatime,prjquota 0 0\n"
 
 
-def namespace(tmp_path: Path, mounts: str, info: dict, run=None, free: int = 0) -> dict[str, Any]:
+def namespace(tmp_path: Path, mounts: str, info: dict, run=None) -> dict[str, Any]:
     scrape = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         HELPERS,
@@ -46,7 +43,6 @@ def namespace(tmp_path: Path, mounts: str, info: dict, run=None, free: int = 0) 
                 TimeoutExpired=subprocess.TimeoutExpired,
             ),
             "docker_api_get": lambda path: info,
-            "get_host_disk_usage": lambda: SimpleNamespace(free=free),
         },
     )
     scrape["HOST_MOUNTS_PATH"] = str(tmp_path / "mounts")
@@ -101,11 +97,3 @@ def test_a_timed_out_probe_gives_no_verdict(tmp_path):
     scrape = namespace(tmp_path, DOCKER_XFS_PQUOTA, OVERLAY2, run=timeout)
 
     assert scrape["check_storage_limit_ability"]() == (None, "Test command timed out.")
-
-
-@pytest.mark.parametrize("free_gib, capable", [(99, False), (100, True)])
-def test_capable_needs_100_gib_free_on_dockers_filesystem(tmp_path, free_gib, capable):
-    # the old rule (a blank whole disk, or docker already on xfs) no longer counts: only free space does
-    scrape = namespace(tmp_path, DOCKER_XFS_PQUOTA, OVERLAY2, free=free_gib * GIB)
-
-    assert scrape["storage_limit_capable"]() is capable

@@ -430,7 +430,7 @@ class StorageLimitMessages:
         severity="warning",
         category="env",
         impact="Proceed; score not changed while the requirement is not enforced (see enforced) or when the scrape "
-        "found less than 100 GiB free on Docker's filesystem to build the limit on (see capable). A renter who "
+        "found no local filesystem with 100 GiB to spare for the limit's image file (see capable). A renter who "
         "fills their disk fills the host's Docker storage and takes the host and every pod on it down",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
         "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check that `docker info` shows Storage Driver "

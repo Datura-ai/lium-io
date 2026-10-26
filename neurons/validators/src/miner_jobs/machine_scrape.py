@@ -1981,15 +1981,50 @@ def get_docker_root_disk_type() -> str:
     return disk_type_of(block_device_holding(mounts_text, docker_root_dir))
 
 
-# DAH-1997 (26 Oct plan): the storage limit is required only of hosts that can build it - at least this much
-# free on the filesystem that holds docker's data root, where `lium gpu-splitting setup` can put an xfs image file
+# DAH-1997 (26 Oct plan): the storage limit is required only of hosts that can build it - the rule
+# `lium gpu-splitting setup` (lium/cli/mine/storage.py plan_loop_file_target) uses for its xfs image file: a local
+# filesystem other than docker's own mount with this much left after a reserve of max(10%, 20 GiB) for the system
 # (or the manual steps at docs.lium.io/providers/nodes/docker-storage). Less than that keeps the warning only.
-STORAGE_CAPABLE_MIN_BYTES = 100 * 1024 ** 3
+STORAGE_CAPABLE_MIN_BYTES = 100 * 1024**3
+STORAGE_IMAGE_FILE_RESERVE_FRACTION = 0.10
+STORAGE_IMAGE_FILE_MIN_RESERVE_BYTES = 20 * 1024**3
+# setup's LOOP_FILE_HOST_FSTYPES: never btrfs or zfs, where fallocate reserves no blocks
+STORAGE_IMAGE_FILE_FSTYPES = ("ext2", "ext3", "ext4", "xfs", "f2fs")
+
+
+def image_file_room(size_bytes: int, avail_bytes: int) -> int:
+    """What setup's xfs image file would get on a filesystem: its free space minus the system's reserve."""
+    reserve = max(
+        int(size_bytes * STORAGE_IMAGE_FILE_RESERVE_FRACTION), STORAGE_IMAGE_FILE_MIN_RESERVE_BYTES
+    )
+    return avail_bytes - reserve
 
 
 def storage_limit_capable() -> bool:
-    """True when the filesystem holding docker's data root has STORAGE_CAPABLE_MIN_BYTES or more free."""
-    return get_host_disk_usage().free >= STORAGE_CAPABLE_MIN_BYTES
+    """True when `lium gpu-splitting setup` could place a STORAGE_CAPABLE_MIN_BYTES image file on this host."""
+    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    with open(HOST_MOUNTS_PATH) as mounts_file:
+        mounts_text = mounts_file.read()
+    # shortcut: setup also refuses removable / usb / iscsi disks, which the scrape does not read; a host whose only
+    # room is on one counts as capable and gets the REQUIRED message pointing at the manual steps
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if (
+            len(fields) < 3
+            or not fields[0].startswith("/dev/")
+            or fields[2] not in STORAGE_IMAGE_FILE_FSTYPES
+        ):
+            continue
+        if fields[1] == docker_root_dir:
+            continue
+        try:
+            stats = os.statvfs(f"{HOST_ROOT_PREFIX}{fields[1]}")
+        except OSError:
+            continue
+        room = image_file_room(stats.f_blocks * stats.f_frsize, stats.f_bavail * stats.f_frsize)
+        if room >= STORAGE_CAPABLE_MIN_BYTES:
+            return True
+    return False
 
 
 def write_probe_failure_reason(errno_value) -> str:
