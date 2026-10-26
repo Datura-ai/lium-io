@@ -201,3 +201,54 @@ async def test_a_missing_driver_is_logged_and_fails(context_factory, caplog):
     assert result.passed is False
     assert result.event.reason_code == Msg.DRIVER_MISSING.reason
     assert any("NVML_DRIVER_MISSING" in record.getMessage() for record in caplog.records)
+
+
+X86_580_95_05 = "abb3628879c4801b3e5f5e3351d01c96:9933cfe943ca96d9b3c352221154dd0afd5ed5406fcb9a3d15935ff4f2c380a9"
+AARCH64_580_95_05 = "2a216a28f68e552b436a334b4bb26c91:c99a74c7399c6ff8fd0b446d6d08dded76bc858d413f6beedd01212a4b4b2f6c"
+
+
+@pytest.mark.parametrize(
+    "arch,lib_digest,expected_pass,expected_reason",
+    [
+        # DAH-5053: a GB300 (Grace) host carries NVIDIA's aarch64 libnvidia-ml
+        ("aarch64", AARCH64_580_95_05, True, Msg.DIGEST_OK.reason),
+        ("aarch64", X86_580_95_05, False, Msg.DIGEST_MISMATCH.reason),
+        ("x86_64", X86_580_95_05, True, Msg.DIGEST_OK.reason),
+        ("x86_64", AARCH64_580_95_05, False, Msg.DIGEST_MISMATCH.reason),
+        # hosts on an older scrape report no arch and keep the x86_64 list
+        (None, X86_580_95_05, True, Msg.DIGEST_OK.reason),
+    ],
+)
+@pytest.mark.asyncio
+async def test_nvml_digest_check_uses_the_host_arch_list(
+    arch, lib_digest, expected_pass, expected_reason, context_factory
+):
+    specs = {
+        "gpu": {"driver": "580.95.05"},
+        "md5_checksums": {"libnvidia_ml": lib_digest},
+        "machine_arch": arch,
+    }
+    # the shared-config map is x86_64 only and must not apply to an aarch64 host
+    config = build_context_config(nvml_digest_map={"580.95.05": X86_580_95_05})
+    ctx = context_factory(config=config, state=build_state(specs=specs))
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_unknown_aarch64_driver_is_not_reported_to_the_x86_resolver(context_factory):
+    services = build_services()
+    specs = {
+        "gpu": {"driver": "999.99"},
+        "md5_checksums": {"libnvidia_ml": "abc"},
+        "machine_arch": "aarch64",
+    }
+    ctx = context_factory(services=services, state=build_state(specs=specs))
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
+    services.backend.report_unknown_driver.assert_not_awaited()

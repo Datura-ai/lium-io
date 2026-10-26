@@ -289,9 +289,7 @@ def make_probe_context(
     ctx = make_context(
         services=services,
         state=state,
-        config=build_context_config(
-            validator_keypair=object(), express_first_pass=first_pass
-        ),
+        config=build_context_config(validator_keypair=object(), first_pass=first_pass),
         ssh=ssh,
         executor_ssh_private_key_encrypted="gAAAAA-encrypted-executor-key",
         miner_hotkey=MINER,

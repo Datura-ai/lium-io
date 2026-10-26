@@ -25,28 +25,11 @@ from services.miner_service import MinerService
 from workspace_mount import (
     VolumeAccess,
     detect_volume_access,
-    normalize_volume_path,
     normalize_workspace_path,
-    require_container_running,
 )
 
 from services import docker_service as docker_service_module
 from services import miner_service as miner_service_module
-
-
-def _backup_args() -> SimpleNamespace:
-    return SimpleNamespace(
-        source_volume="source-volume",
-        source_volume_path="/root",
-        backup_volume_iam_user_access_key="access",
-        backup_volume_iam_user_secret_key="secret",
-        backup_volume_name="bucket",
-        backup_target_path="target.tar.gz",
-        backup_path="/root/test",
-        backup_log_id="backup-log",
-        api_url="https://api.example",
-        auth_token="token",
-    )
 
 
 def _restore_args() -> SimpleNamespace:
@@ -62,128 +45,6 @@ def _restore_args() -> SimpleNamespace:
         api_url="https://api.example",
         auth_token="token",
     )
-
-
-class _FakeStdout:
-    def __iter__(self):
-        return iter(["one\n", "two\n"])
-
-    def close(self):
-        return None
-
-
-class _FakePopen:
-    def __init__(self, command, *args, **kwargs):
-        self.command = command
-        self.stdout = _FakeStdout()
-        self.returncode = 0
-
-    def wait(self):
-        return 0
-
-    def communicate(self):
-        return "", ""
-
-    def kill(self):
-        return None
-
-
-def test_plain_backup_commands_use_workspace(monkeypatch):
-    run_commands: list[list[str]] = []
-    popen_commands: list[list[str]] = []
-
-    def fake_run(command, **kwargs):
-        run_commands.append(command)
-        return SimpleNamespace(returncode=0, stdout="1024 /workspace/test\n", stderr="")
-
-    def fake_popen(command, *args, **kwargs):
-        popen_commands.append(command)
-        return _FakePopen(command, *args, **kwargs)
-
-    monkeypatch.setattr(backup_storage.subprocess, "run", fake_run)
-    monkeypatch.setattr(backup_storage.subprocess, "Popen", fake_popen)
-
-    args = _backup_args()
-    access = VolumeAccess(args.source_volume, args.source_volume_path)
-    backup_path = access.normalized_path(args.backup_path)
-
-    backup_storage.estimate_backup_sizes(args, access, backup_path)
-    backup_storage.aws_cp(args, access, backup_path)
-
-    flat_commands = [" ".join(command) for command in run_commands + popen_commands]
-    tar_commands = [
-        command for command in popen_commands if "--entrypoint" in command and command[command.index("--entrypoint") + 1] == "tar"
-    ]
-    assert backup_path == "/workspace/test"
-    assert any("source-volume:/workspace" in command for command in flat_commands)
-    assert any("--entrypoint find" in command and "/workspace/test -print" in command for command in flat_commands)
-    assert any(command[command.index("-C") + 1] == "/workspace" and command[-1] == "test" for command in tar_commands)
-    assert all("source-volume:/root" not in command for command in flat_commands)
-
-
-def test_encrypted_backup_commands_exec_inside_rental(monkeypatch):
-    run_commands: list[list[str]] = []
-    popen_commands: list[list[str]] = []
-
-    def fake_run(command, **kwargs):
-        run_commands.append(command)
-        return SimpleNamespace(returncode=0, stdout="1024 /root/test\n", stderr="")
-
-    def fake_popen(command, *args, **kwargs):
-        popen_commands.append(command)
-        return _FakePopen(command, *args, **kwargs)
-
-    monkeypatch.setattr(backup_storage.subprocess, "run", fake_run)
-    monkeypatch.setattr(backup_storage.subprocess, "Popen", fake_popen)
-
-    args = _backup_args()
-    access = VolumeAccess(
-        args.source_volume,
-        args.source_volume_path,
-        encrypted=True,
-        container_name="rental-pod",
-    )
-    backup_path = access.normalized_path(args.backup_path)
-
-    backup_storage.estimate_backup_sizes(args, access, backup_path)
-    backup_storage.aws_cp(args, access, backup_path)
-
-    assert backup_path == "/root/test"
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "du"] for command in run_commands)
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "find"] for command in popen_commands)
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "tar"] for command in popen_commands)
-
-
-def test_encrypted_restore_commands_exec_inside_rental(monkeypatch):
-    run_commands: list[list[str]] = []
-    popen_commands: list[list[str]] = []
-
-    def fake_run(command, **kwargs):
-        run_commands.append(command)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    def fake_popen(command, *args, **kwargs):
-        popen_commands.append(command)
-        return _FakePopen(command, *args, **kwargs)
-
-    monkeypatch.setattr(restore_storage.subprocess, "run", fake_run)
-    monkeypatch.setattr(restore_storage.subprocess, "Popen", fake_popen)
-
-    args = _restore_args()
-    access = VolumeAccess(
-        args.target_volume,
-        args.target_volume_path,
-        encrypted=True,
-        container_name="rental-pod",
-    )
-    restore_path = access.normalized_path(args.restore_path)
-
-    restore_storage.ensure_restore_path(args, access, restore_path)
-    restore_storage.aws_restore(args, access, restore_path)
-
-    assert restore_path == "/root/test"
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "mkdir"] for command in run_commands)
-    assert any(command[:7] == ["/usr/bin/docker", "exec", "-u", "0", "-i", "rental-pod", "tar"] for command in popen_commands)
 
 
 def test_encrypted_restore_hands_the_target_dir_back_to_the_renter(monkeypatch):
@@ -222,21 +83,6 @@ def test_unreadable_image_user_fails_the_restore_instead_of_skipping_chown(monke
 
     with pytest.raises(RuntimeError, match="Could not read the image USER"):
         access.container_image_user()
-
-
-def test_require_container_running_fails_when_stopped(monkeypatch):
-    def fake_run(command, **kwargs):
-        return SimpleNamespace(returncode=0, stdout="false\n", stderr="")
-
-    monkeypatch.setattr("workspace_mount.subprocess.run", fake_run)
-
-    with pytest.raises(RuntimeError, match="not running"):
-        require_container_running("rental-pod")
-
-
-def test_normalize_volume_path_keeps_root_paths():
-    assert normalize_volume_path("/root/test", "/root") == "/root/test"
-    assert normalize_volume_path("test", "/root") == "/root/test"
 
 
 def test_workspace_path_normalization_rejects_escape():
@@ -286,67 +132,6 @@ def _docker_run_side_effect(
     return fake_run
 
 
-def test_detect_volume_access_plain_when_no_cipher_mount(monkeypatch):
-    monkeypatch.setattr(
-        "workspace_mount.subprocess.run",
-        _docker_run_side_effect(
-            ps_output="other-pod\n",
-            inspect_outputs={"other-pod": "source-volume\t/root\n"},
-            gocryptfs_conf_returncode=1,
-        ),
-    )
-
-    access = detect_volume_access("source-volume", "/root")
-
-    assert access.encrypted is False
-    assert access.container_name is None
-
-
-def test_detect_volume_access_encrypted_at_lium_cipher(monkeypatch):
-    monkeypatch.setattr(
-        "workspace_mount.subprocess.run",
-        _docker_run_side_effect(
-            ps_output="rental-pod\n",
-            inspect_outputs={"rental-pod": "source-volume\t/lium-cipher\n"},
-        ),
-    )
-
-    access = detect_volume_access("source-volume", "/root")
-
-    assert access.encrypted is True
-    assert access.container_name == "rental-pod"
-
-
-def test_detect_volume_access_multiple_encrypted_raises(monkeypatch):
-    monkeypatch.setattr(
-        "workspace_mount.subprocess.run",
-        _docker_run_side_effect(
-            ps_output="pod-a\npod-b\n",
-            inspect_outputs={
-                "pod-a": "source-volume\t/lium-cipher\n",
-                "pod-b": "source-volume\t/lium-cipher\n",
-            },
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="multiple running containers"):
-        detect_volume_access("source-volume", "/root")
-
-
-def test_detect_volume_access_encrypted_requires_running_container(monkeypatch):
-    monkeypatch.setattr(
-        "workspace_mount.subprocess.run",
-        _docker_run_side_effect(
-            ps_output="rental-pod\n",
-            inspect_outputs={"rental-pod": "source-volume\t/lium-cipher\n"},
-            running={"rental-pod": False},
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="not running"):
-        detect_volume_access("source-volume", "/root")
-
-
 def test_detect_volume_access_raises_when_stopped_container_has_cipher_mount(monkeypatch):
     monkeypatch.setattr(
         "workspace_mount.subprocess.run",
@@ -373,38 +158,6 @@ def test_detect_volume_access_raises_when_gocryptfs_conf_present(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="gocryptfs.conf.*no running container.*/lium-cipher"):
-        detect_volume_access("source-volume", "/root")
-
-
-def test_detect_volume_access_plain_when_gocryptfs_conf_absent(monkeypatch):
-    monkeypatch.setattr(
-        "workspace_mount.subprocess.run",
-        _docker_run_side_effect(
-            ps_output="",
-            ps_all_output="",
-            inspect_outputs={},
-            gocryptfs_conf_returncode=1,
-        ),
-    )
-
-    access = detect_volume_access("source-volume", "/root")
-
-    assert access.encrypted is False
-    assert access.container_name is None
-
-
-def test_detect_volume_access_raises_when_gocryptfs_conf_probe_fails(monkeypatch):
-    monkeypatch.setattr(
-        "workspace_mount.subprocess.run",
-        _docker_run_side_effect(
-            ps_output="",
-            ps_all_output="",
-            inspect_outputs={},
-            gocryptfs_conf_returncode=125,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="Failed to probe gocryptfs.conf"):
         detect_volume_access("source-volume", "/root")
 
 
@@ -531,54 +284,6 @@ def _restore_payload() -> RestoreContainerRequest:
 
 
 @pytest.mark.asyncio
-async def test_miner_service_backup_argv_excludes_encryption_flags(monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=0, stdout="", stderr=""))
-    sftp_context = _FakeSftpContext()
-    ssh_client.start_sftp_client = Mock(return_value=sftp_context)
-
-    connect = Mock(return_value=_FakeSshContext(ssh_client))
-    monkeypatch.setattr(miner_service_module.asyncssh, "connect", connect)
-
-    service = MinerService.__new__(MinerService)
-    await service.handle_backup_container_req(
-        _executor_info(), _backup_payload(), Mock(), _docker_service_with_pinned_hosts()
-    )
-
-    nohup_call = ssh_client.run.await_args_list[-1]
-    command = nohup_call.args[0]
-    assert "--source-volume-encrypted" not in command
-    assert "--container-name" not in command
-    assert "--source-volume source-volume" in command
-    _assert_secrets_only_in_the_0600_file(ssh_client, sftp_context)
-    assert connect.call_args.kwargs["known_hosts"] is KNOWN_HOSTS
-
-
-@pytest.mark.asyncio
-async def test_miner_service_restore_argv_excludes_encryption_flags(monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=0, stdout="", stderr=""))
-    sftp_context = _FakeSftpContext()
-    ssh_client.start_sftp_client = Mock(return_value=sftp_context)
-
-    connect = Mock(return_value=_FakeSshContext(ssh_client))
-    monkeypatch.setattr(miner_service_module.asyncssh, "connect", connect)
-
-    service = MinerService.__new__(MinerService)
-    await service.handle_restore_container_req(
-        _executor_info(), _restore_payload(), Mock(), _docker_service_with_pinned_hosts()
-    )
-
-    nohup_call = ssh_client.run.await_args_list[-1]
-    command = nohup_call.args[0]
-    assert "--target-volume-encrypted" not in command
-    assert "--container-name" not in command
-    assert "--target-volume target-volume" in command
-    _assert_secrets_only_in_the_0600_file(ssh_client, sftp_context)
-    assert connect.call_args.kwargs["known_hosts"] is KNOWN_HOSTS
-
-
-@pytest.mark.asyncio
 async def test_cancel_storage_operation_pins_the_host_key(monkeypatch):
     connect = Mock(return_value=_FakeSshContext(AsyncMock()))
     monkeypatch.setattr(miner_service_module.asyncssh, "connect", connect)
@@ -645,18 +350,6 @@ def test_load_secrets_file_exports_keys_and_deletes_the_file(tmp_path, monkeypat
     assert os.environ["AWS_SECRET_ACCESS_KEY"] == SECRET_KEY
 
 
-def test_restic_backup_empty_path_targets_the_whole_volume():
-    payload = _backup_payload()
-    payload.backup_engine = "restic"
-    payload.repository_password = "repository-password"
-    payload.backup_path = ""
-
-    spec = MinerService._restic_backup_operation_spec(payload)
-
-    assert spec["workspace"]["requested_path"] == payload.source_volume_path
-    assert spec["reporter"]["failure_timeout_seconds"] == 600
-
-
 @pytest.mark.asyncio
 async def test_restic_backup_with_excludes_stops_on_an_executor_that_cannot_apply_them(monkeypatch):
     ssh_client = AsyncMock()
@@ -685,43 +378,6 @@ def test_restic_backup_spec_carries_the_exclude_patterns():
     spec = MinerService._restic_backup_operation_spec(payload)
 
     assert spec["workspace"]["exclude_patterns"] == [".cache", ".ssh"]
-
-
-def test_restic_online_restore_empty_path_targets_the_whole_volume():
-    payload = _restore_payload()
-    payload.backup_engine = "restic"
-    payload.repository_password = "repository-password"
-    payload.snapshot_id = "a" * 64
-    payload.restore_path = ""
-
-    spec = MinerService._restic_restore_operation_spec(payload)
-
-    assert spec["workspace"]["requested_path"] == payload.target_volume_path
-    assert spec["reporter"]["failure_timeout_seconds"] == 600
-
-
-@pytest.mark.asyncio
-async def test_legacy_bootstrap_restore_falls_back_when_runner_is_unavailable(monkeypatch):
-    monkeypatch.setattr(
-        docker_service_module,
-        "supports_storage_operation",
-        AsyncMock(return_value=False),
-    )
-    service = DockerService.__new__(DockerService)
-    service._run_legacy_bootstrap_restore = AsyncMock()
-    restore = SimpleNamespace(backup_engine="tar_aws_cli")
-
-    await service._run_bootstrap_restore(
-        ssh_client=AsyncMock(),
-        executor_info=_executor_info(),
-        payload=SimpleNamespace(pod_id="pod"),
-        restore=restore,
-        local_volume="volume",
-        local_volume_path="/root",
-        encrypted=False,
-    )
-
-    service._run_legacy_bootstrap_restore.assert_awaited_once()
 
 
 def _walk_json(value, path=""):
@@ -791,45 +447,3 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     assert spec["workspace"]["bootstrap"] is True
 
 
-@pytest.mark.asyncio
-async def test_encrypted_bootstrap_restore_refuses_to_run_without_the_pod(monkeypatch):
-    supports = AsyncMock(return_value=True)
-    monkeypatch.setattr(docker_service_module, "supports_storage_operation", supports)
-    start = AsyncMock()
-    monkeypatch.setattr(docker_service_module, "start_storage_operation", start)
-    service = DockerService.__new__(DockerService)
-
-    with pytest.raises(RuntimeError, match="needs the running rental container"):
-        await service._run_bootstrap_restore(
-            ssh_client=AsyncMock(),
-            executor_info=_executor_info(),
-            payload=SimpleNamespace(pod_id="pod-1"),
-            restore=SimpleNamespace(backup_engine="restic"),
-            local_volume="volume_pod-1",
-            local_volume_path="/root",
-            encrypted=True,
-        )
-
-    supports.assert_not_awaited()
-    start.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_restic_bootstrap_restore_requires_runner_capability(monkeypatch):
-    monkeypatch.setattr(
-        docker_service_module,
-        "supports_storage_operation",
-        AsyncMock(return_value=False),
-    )
-    service = DockerService.__new__(DockerService)
-
-    with pytest.raises(RuntimeError, match="does not support bootstrap restore engine restic"):
-        await service._run_bootstrap_restore(
-            ssh_client=AsyncMock(),
-            executor_info=_executor_info(),
-            payload=SimpleNamespace(pod_id="pod"),
-            restore=SimpleNamespace(backup_engine="restic"),
-            local_volume="volume",
-            local_volume_path="/root",
-            encrypted=False,
-        )

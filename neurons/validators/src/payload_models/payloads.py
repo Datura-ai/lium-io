@@ -197,6 +197,7 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+    ResetPodGpuRequest = "ResetPodGpuRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -424,6 +425,19 @@ class InstallJupyterServerRequest(ContainerBaseRequest):
     local_volume_path: str = "/root"
 
 
+class ResetPodGpuRequest(ContainerBaseRequest):
+    """DAH-4658: reset the GPUs of a running pod; answered by PodGpuResetResult (lium_protocol 1.16.0)."""
+
+    message_type: ContainerRequestType = ContainerRequestType.ResetPodGpuRequest
+    container_name: str
+    # every GPU the backend holds for the pod; gpu_indices picks some of them by pod index, None for all
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    request_id: str
+    # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
+    local_volume_path: str | None = None
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -476,6 +490,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     failure_timeout_seconds: int = Field(default=600, gt=0)
+    recovery: bool = False  # reconnect re-dispatch: the restore may already be running, so never report it failed
 
 
 class CancelStorageOperationRequest(ContainerBaseRequest):
@@ -501,6 +516,7 @@ class ContainerResponseType(enum.Enum):
     SshPubKeyRemoved = "SshPubKeyRemoved"
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
+    PodGpuResetResult = "PodGpuResetResult"
 
 
 class DeliveryStamps(BaseModel):
@@ -793,6 +809,34 @@ class JupyterServerInstalled(ContainerBaseResponse):
 class JupyterInstallationFailed(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str
+
+
+class GpuResetErrorCode(enum.Enum):
+    MigEnabled = "MigEnabled"
+    NvlinkPeersOutsidePod = "NvlinkPeersOutsidePod"
+    GpuInUseOutsidePod = "GpuInUseOutsidePod"
+    ResetNotSupported = "ResetNotSupported"
+    GpuNotInContainer = "GpuNotInContainer"
+    ContainerNotFound = "ContainerNotFound"
+    OperationInProgress = "OperationInProgress"
+    ExecutorUnreachable = "ExecutorUnreachable"
+
+
+class GpuResetOutcome(BaseModel):
+    index: int
+    uuid: str
+    result: Literal["reset", "latch_cleared", "failed"]
+    detail: str | None = None
+
+
+class PodGpuResetResult(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodGpuResetResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    container_restarted: bool = False
+    gpus: list[GpuResetOutcome] = []
+    detail: str | None = None
 
 
 class GetEstimateRequest(BaseModel):

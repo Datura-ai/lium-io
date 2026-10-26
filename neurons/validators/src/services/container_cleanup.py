@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import shlex
@@ -10,7 +11,6 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_b
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
-    DPHN_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
     EDIT_PARKED_SUFFIX,
     FILLER_CACHE_VOLUME_PREFIXES,
@@ -54,6 +54,38 @@ DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 # The whole helper run is bounded: the walk itself takes hundreds of ms on a real cache, so anything
 # near a minute means a wedged docker daemon rather than work in progress.
 DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
+
+async def evict_cache_volumes_oldest_first(
+    ssh_client: asyncssh.SSHClientConnection,
+    volume_names: list[str],
+    run_removal: Callable[[str], Awaitable[object]],
+    has_room: Callable[[], Awaitable[bool]],
+) -> None:
+    """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
+
+    DAH-5014: an Engy checkpoint is up to ~1.6 TB and buys a fast restart, so a rental or the listing
+    floor takes only what it needs. The caller has already found there is not enough room, so the
+    first volume goes without a re-check. An order docker cannot report falls back to name order.
+    """
+    created_at: dict[str, str] = {}
+    try:
+        inspected = await ssh_client.run(
+            "/usr/bin/docker volume inspect --format '{{.Name}} {{.CreatedAt}}' "
+            + " ".join(shlex.quote(name) for name in volume_names)
+        )
+        for line in (inspected.stdout or "").splitlines():
+            name, _, created = line.strip().partition(" ")
+            created_at[name] = created
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    ordered: list[str] = sorted(volume_names, key=lambda name: (created_at.get(name, "~"), name))
+    for index, name in enumerate(ordered):
+        await run_removal(DockerCommand.volume_remove(name))
+        if index + 1 < len(ordered) and await has_room():
+            return
+
 
 RENTED_LIST_UNAVAILABLE = "rented_list_unavailable"
 RENTED_LIST_EMPTY = "rented_list_empty"
@@ -289,7 +321,8 @@ class ContainerCleanup:
             # nodes, miner-assigned nodes, nodes that never ran Dolphin — and this check runs on every
             # node every cycle. Measuring the disk before knowing there is anything to reclaim made all
             # of them start a throwaway container just to learn there was nothing to do.
-            cache_volumes = await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,))
+            # DAH-5014: the Engy checkpoint cache is reclaimed here too, oldest first.
+            cache_volumes = await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES)
             if not cache_volumes:
                 return 0
 
@@ -311,12 +344,16 @@ class ContainerCleanup:
                 )
                 return 0
 
-            await ssh_client.run(DockerCommand.volume_remove(*cache_volumes))
+            async def above_floor() -> bool:
+                free_now: float | None = await self._get_free_disk_gb(ssh_client)
+                return free_now is not None and free_now >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB
+
+            await evict_cache_volumes_oldest_first(ssh_client, cache_volumes, ssh_client.run, above_floor)
             # `volume_remove` ends in `|| true`, so its exit status cannot tell a removal from a
             # refusal — and dockerd refuses any volume a container still references, in ANY state.
             # Re-list instead: reporting a rescue that did not happen leaves the node delisted while
             # the check event says it was saved.
-            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,)))
+            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES))
             reclaimed: list[str] = [name for name in cache_volumes if name not in surviving]
             if not reclaimed:
                 logger.warning(
@@ -328,7 +365,7 @@ class ContainerCleanup:
                 return 0
             logger.info(
                 _m(
-                    f"Reclaimed {len(reclaimed)} DPHN cache volume(s) to get the node back over "
+                    f"Reclaimed {len(reclaimed)} filler cache volume(s) to get the node back over "
                     "the rental listing floor",
                     extra=extra | {"volumes": reclaimed, "kept_volumes": sorted(surviving), "free_gb": free_gb},
                 )

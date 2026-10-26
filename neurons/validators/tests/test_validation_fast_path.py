@@ -31,6 +31,7 @@ from neurons.validators.src.services.task.checks import (
     CapabilityCheck,
     ContainerDownloadSpeedCheck,
     GpuFaultProbeCheck,
+    NvlinkFaultCheck,
     PinnedMemoryProbeCheck,
     PortConnectivityCheck,
     PortCountCheck,
@@ -322,6 +323,7 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
             GpuFaultProbeCheck,
             PinnedMemoryProbeCheck,
             PostRentalGpuRecheckCheck,
+            NvlinkFaultCheck,
             CachedTemplateVerificationCheck,
         ],
     ]

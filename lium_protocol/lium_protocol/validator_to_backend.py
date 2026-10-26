@@ -18,7 +18,7 @@ from __future__ import annotations
 import enum
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import pydantic
 
@@ -56,6 +56,8 @@ class ValidatorMessageType(enum.Enum):
     FailedAddDebugSshKey = "FailedAddDebugSshKey"
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
+    # 1.16.0: the answer to ResetPodGpuRequest
+    PodGpuResetResult = "PodGpuResetResult"
 
 
 VALIDATOR_MESSAGES: Registry[ValidatorMessage] = Registry(ValidatorMessageType)
@@ -517,3 +519,38 @@ class JupyterServerInstalled(PodContainerResponse):
 class JupyterInstallationFailed(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.JupyterInstallationFailed
     msg: str
+
+
+class GpuResetErrorCode(enum.Enum):
+    """1.16.0: why a pod GPU reset did not run, or did not finish."""
+
+    MigEnabled = "MigEnabled"
+    NvlinkPeersOutsidePod = "NvlinkPeersOutsidePod"
+    GpuInUseOutsidePod = "GpuInUseOutsidePod"
+    ResetNotSupported = "ResetNotSupported"
+    GpuNotInContainer = "GpuNotInContainer"
+    ContainerNotFound = "ContainerNotFound"
+    OperationInProgress = "OperationInProgress"
+    ExecutorUnreachable = "ExecutorUnreachable"
+
+
+class GpuResetOutcome(pydantic.BaseModel):
+    index: int
+    uuid: str
+    result: Literal["reset", "latch_cleared", "failed"]
+    detail: str | None = None
+
+
+@VALIDATOR_MESSAGES.register
+class PodGpuResetResult(PodContainerResponse):
+    """1.16.0: the answer to `backend_to_validator.ResetPodGpuRequest`, same `request_id`. `gpus` is
+    one outcome per GPU the validator reset (possibly more than asked: NVLink peers inside the pod are
+    reset together); empty when a precheck refused before anything changed."""
+
+    message_type: ValidatorMessageType = ValidatorMessageType.PodGpuResetResult
+    request_id: str
+    ok: bool
+    error_code: GpuResetErrorCode | None = None
+    container_restarted: bool = False
+    gpus: list[GpuResetOutcome] = []
+    detail: str | None = None

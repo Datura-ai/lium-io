@@ -317,9 +317,7 @@ def test_two_nodes_with_their_own_host_keys_match_nothing(enforce):
 GPU_ALIAS_REASON = "EXECUTOR_GPU_ALIAS"
 
 
-@pytest.mark.parametrize("enforced", [False, True])
-def test_one_miners_executors_sharing_a_gpu_uuid_score_once(monkeypatch, enforced):
-    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", enforced)
+def test_one_miners_executors_sharing_a_gpu_uuid_score_once():
     kept = _result("uuid-a", gpu_uuids=("GPU-1", "GPU-2"))
     alias = _result("uuid-b", address="203.0.113.9", gpu_uuids=("GPU-2", "GPU-3"))
     other = _result("uuid-c", gpu_uuids=("GPU-9",))
@@ -329,16 +327,12 @@ def test_one_miners_executors_sharing_a_gpu_uuid_score_once(monkeypatch, enforce
     assert aliases == [(BOB, alias)]
     _assert_untouched(kept)
     _assert_untouched(other)
-    if enforced:
-        assert (alias.score, alias.job_score) == (0, 0)
-        assert alias.failure_reason_code == GPU_ALIAS_REASON
-        assert alias.validation_event.reason_code == GPU_ALIAS_REASON
-    else:
-        _assert_untouched(alias)
+    assert (alias.score, alias.job_score) == (0, 0)
+    assert alias.failure_reason_code == GPU_ALIAS_REASON
+    assert alias.validation_event.reason_code == GPU_ALIAS_REASON
 
 
-def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners(monkeypatch):
-    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", True)
+def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners():
     idle = _result("uuid-a", gpu_uuids=("GPU-1",))
     rented = _result("uuid-b", gpu_uuids=("GPU-1",), is_rented=True)
     # another miner reporting the same card is not this pass's business
@@ -352,8 +346,7 @@ def test_gpu_alias_keeps_the_rented_copy_and_ignores_other_miners(monkeypatch):
     _assert_untouched(foreign)
 
 
-def test_gpu_alias_ignores_one_executors_repeat_and_unscored_copies(monkeypatch):
-    monkeypatch.setattr(settings, "GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", True)
+def test_gpu_alias_ignores_one_executors_repeat_and_unscored_copies():
     first = _result("uuid-a", gpu_uuids=("GPU-1",))
     repeat = _result("UUID-A", gpu_uuids=("GPU-1",))
     failed = _result("uuid-b", gpu_uuids=("GPU-1",), score=0.0)

@@ -4,9 +4,8 @@ set -eux -o pipefail
 # disk reserve: validator-cycle writes must survive a 100%-full host disk
 bash setup_disk_reserve.sh || echo "[disk-reserve] setup failed; continuing without reserve"
 bash setup_disk_reserve.sh janitor &
-# dirty page cache cap: a container removal must not wait for a host-sized flush (DAH-4978)
-bash setup_dirty_cap.sh || echo "[dirty-cap] setup failed; the janitor retries every minute"
-bash setup_dirty_cap.sh janitor &
+# executor-v1.151 capped vm.dirty_bytes on every host; put the kernel defaults back (DAH-4978 revert)
+bash restore_dirty_defaults.sh || echo "[dirty-cap] restore failed; continuing with the host's current setting"
 # re-enter cwd through the overlay mount (the old dentry would bypass it)
 cd /root/app
 

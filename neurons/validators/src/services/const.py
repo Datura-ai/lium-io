@@ -1,5 +1,10 @@
 MIN_JOB_TAKEN_TIME = 20
 
+# the plugin alias new rental volumes are created on; the backend health check is told it
+LOOPBACK_PLUGIN_ALIAS = "vloopback:v2"
+# the old plugin (`vloopback:latest`): a new volume goes there only when v2 cannot be used
+LEGACY_LOOPBACK_PLUGIN_ALIAS = "vloopback"
+
 GPU_MODEL_RATES = {
     "NVIDIA B300 SXM6 AC": .05,
     "NVIDIA B200": .05,
@@ -53,6 +58,7 @@ GPU_MODEL_RATES = {
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.027, # 2.7x 6000 ada
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": 0.024, # 2.4x 6000 ada: proposed, Workstation 0.027 scaled to Max-Q 300 W throughput (~88%); DAH-3453, Mikhail to confirm
     "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": 0.0,
     "NVIDIA RTX 6000D": 0.0,
     "NVIDIA RTX A5000": 0.002,
@@ -234,6 +240,51 @@ LIB_NVIDIA_ML_DIGESTS = {
     "610.43.02": "5ad6c02411f730682597558ae8f3a9f8:2dc828b3f5027f98e05c7607c1d8129d11bd28de4c2091c5cd7e32dbc21ec172",
 }
 
+# DAH-5053: libnvidia-ml.so.<driver> from NVIDIA's official NVIDIA-Linux-aarch64-<driver>.run installers
+# (download.nvidia.com XFree86/Linux-aarch64 or tesla), for GB300 (Grace) hosts. Same md5:sha256 form.
+LIB_NVIDIA_ML_DIGESTS_AARCH64 = {
+    "570.86.15": "5220e9f1b8127ed72f2f5d24198bc930:3814e2f857a0c35d73eedefff07db83eb6165f5853fa894327885c1eb5b9d30b",
+    "570.124.06": "94b788b11a3d30e0f791bfd1a98afeda:9eed4f7e81f92bae4d819f9dec49644d739bd51583788f438e6a4226e19ebc6f",
+    "570.86.16": "5997bf64b2f8a967a6d3631e42dc2b80:0cc5f3095830979795e485956b1fc75cfb699b69ca8fa5df4c79ae469f9bbe57",
+    "570.133.20": "50f40649dbc2405ab0809cd9a64d11e3:2226c49fe254cde082ce04e3333718ff45a6a2b2bd478af8d591703b2c214324",
+    "570.144": "1b2a4966a2e325286c85680557cd655e:ffda137c2be9f2c8b315db15105f4e1d65965520ebd9848eb4556f6b2a259f6b",
+    "570.148.08": "5b64e124566395aafe0396d05059304a:5bef45a5ae530c6179e5c0f8789b950a99467f76c48293f38691d657acdfec86",
+    "570.153.02": "2cf92d3ad31f577a39440464d9ffd72c:9ffdafedebc4adeb55fb0a370c7b37d1f29c8ff90ef5cc7a008bd02716df0268",
+    "570.133.07": "926a4764e6607073b45bac57fe6b6da5:4d567eb51cf7063734d1da4c50f0da59b920ab43c01f2a5fd54133312d8e4ee5",
+    "570.158.01": "a207f60980f4c92f28610d7a27ed74cc:83d336dfa9a14a5614a37cdac14fabde43bfde5ba5df51ed2c83b9a13837b697",
+    "570.172.08": "6b4a065b46489079ecd89d11561a1566:2920170dadcd7f0663f4b34859a28ffca11c2486d657c742e9ace10660c4968d",
+    "570.169": "012eae16587c322e3a0d06d616d69ae5:8745cde6d257caf5c59eee70403e31220bc8563d5761d94a331c14433c001903",
+    "570.195.03": "d9c2c621c60d26a964b38c6586484c98:431b9ff3c381b912d955c892367be9b5fece609116aa734386d9555862028dac",
+    "570.211.01": "1742f24aefe801cb80254f23c8ff928c:f628c980ffd3773fe10d9eb1b219a37fb68b1a4674f7c2b7253aee19a1a9ac8f",
+    "575.57.08": "0b3de57a1526987e8628b28945f7a992:438c1bf9cc9f4a868430850fe933f0e399a592c77b732c6e72b3f93bfb56c359",
+    "575.64.03": "cff26db350731265dba7daf876f2e5e2:302eaeb4a79a652169a702f26b322e89f77bee2d1d759e54712152a0a4f21342",
+    "575.64.05": "e2747fce455542688880d4ec73ac1eeb:e75b2269b0b9f4c5494bd9e15a1f12924f89e38b0a49710c6567b41131d8e78f",
+    "580.65.06": "dc63de4db2100356aeadd79ae0129973:99e986f8c35fd6ee7749e04a5076a528c6837788754024800ee7624cd23d1f52",
+    "580.76.05": "98a24657db89fb2d6fa8d4fd2c8ef32e:fdad05e66a77473b44f988e156bbac9faf8302651a1431cb778197af4dfba9d9",
+    "580.82.07": "ee80562c63a6e93bb0253faa559e8246:cca0a11266f67604d6a0dc6ff4c81272f00b4d5e03309914a105606e20d7a274",
+    "580.82.09": "530e5fc1ba456a86daf215de1491407d:0702988d602dce302740786bae46971b8f4f751c5f8b71b8abb812530ccff10b",
+    "580.95.05": "2a216a28f68e552b436a334b4bb26c91:c99a74c7399c6ff8fd0b446d6d08dded76bc858d413f6beedd01212a4b4b2f6c",
+    "580.105.08": "a555972b903db99f9407049f221cd92c:00348d55d4e9e9eeade7bbd90e81dd481411098ecd10600ddac516fcf0a515f4",
+    "580.126.09": "1bea0388649382871b941312debc04de:dbb1d1dea794dd65848e88cd2126a460f2db35f3699a4af4e0686a00a467e2b7",
+    "580.119.02": "bf7fb47b0289abda296916939a9ff4da:2cb74a96115277d35185bddbbfc73480ee9084451a338fbbdc66c1a3c40df017",
+    "580.126.16": "6ffb3dbc1ccf8d3679c6ef1db7c5e48e:ede52f24d1b6bbc86a60c71e7a8428f36ab151ab30c445b098a053c9e4e0493c",
+    "580.126.18": "e4d049a5c80eda82fc39b40b40b86121:1b05bff93c3e67498d50aef3881268126cb3a58b2347f8ebcc7b466b23548b98",
+    "580.126.20": "b7d8e0f239186e1ca0a64496fd6634e5:253e06797b5f6c7896c02824f9b83f583c5bd4ff8a5ce2ab65ead929c6421b62",
+    "580.142": "f2e59d280c8949eede1159ae0adf159d:3fbcb276de20d1f6be8e23f44b5653d84984a3c67e2bd9c94ceec0bd92ae7aaa",
+    "580.159.03": "743e7ffae5e9cb9ce0c36d200be74cbd:66763ad0d2cf14c12eca195de0f8c1065390d0b0bbf66fb495f65762893cbbd3",
+    "580.159.04": "52b269721461d74fad2db612d2f112a6:23084a05aa12268e6e7967056e6926695f6cab8da783d5295cac4606fbf3dc69",
+    "580.167.08": "5082274a58f33b456adc2bc2ce733515:80f12980323491f9ce25ca0833f73dcc5b58c06f0fde9a0edca2ebb583d74f8a",
+    "580.173.02": "30a5e3d7adcee4c927f81d6832b2b2e7:8a1a9abc2c37e9080aa133216692a1616eb059e3ae5531156e4c357167cb19cd",
+    "590.44.01": "eb0b6919501c6894f02a2a0b753fddf2:8465fbce660ba69f7851ff8630c199216c2503025d3c756c66bacf3cc512d9c7",
+    "590.48.01": "20509d316b378be12590c61719eea001:d6f90985f9886521a942cff690aa04d64addf384026b66146ef0651bec90dcec",
+    "595.45.04": "a32c0e088ae28512e54e13a5b6fd7158:3380938dbbcce38067b626fceba38ae541c9cfba037292f7d3458975ed504edb",
+    "595.58.03": "f4e9e83a1dbd00df8baa29befd9b73a8:36fd2889bf8ae3bb402f4415a1c2f6d2921e9c7a135ad2f74e9f2aeeeea6d9a5",
+    "595.71.05": "2f4c1964369bbf03f44a2b1c3476503b:81a588bfd00dd1f1057e223ba31058986a2d6883b0ee17af3cfdfe143c5e817e",
+    "595.84": "8d90210dd076ed602f6138012db1bdb2:e8b24d320ffe8a81f6b3d3d28df65f1bc4784d63846018d6d4eefdd37b5b7add",
+    "595.91.07": "d9203a180539470dfa0ecbc1e5a542e3:010a3e72716ede40e7d9d5d4c1aac6281fb472a8e1dffa4d4e31b6597c7366b2",
+    "610.43.02": "70554053baa7aabad0ed9d1d6cf12ba5:93069270ffa587009eb1535d9b8ae31fa396c22da604f60e0215f310911c4454",
+}
+
 # VerifyX Validation Constants
 MEMORY_ALLOCATION_PERCENTAGE = 75
 MEMORY_MIN_TEST_GB = 8
@@ -269,6 +320,10 @@ FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREF
 DPHN_CACHE_SIZE_GB = 40
 DPHN_CACHE_LISTING_FLOOR_GB = 100
 DPHN_CACHE_FREE_MARGIN_GB = 50
+# DAH-5014: an Engy checkpoint (up to ~1.6 TB) is downloaded into a persistent cache only when it is at
+# most this share of the node's real free disk. The backend puts its size in the name
+# (engy_cache_hf_<N>gb_...): the wire CacheVolume has no size field.
+FILLER_CACHE_MAX_FREE_DISK_SHARE = 0.3
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle

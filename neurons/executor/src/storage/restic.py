@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import IO
@@ -30,6 +31,17 @@ TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
+# DAH-2002: bound the helper so a backup cannot OOM the rental. Measured restic 0.19.1 peak RSS: 0.41 GiB at
+# 2M files, ~125 B per extra file; bytes barely matter (20 GiB file: 0.17 GiB). 4g covers ~30M files.
+# restic sizes its worker pools from GOMAXPROCS (~7.5 MiB per CPU); unpinned, 192+ CPU hosts hit 4g in seconds.
+RESTIC_HELPER_GOMAXPROCS = "8"
+RESTIC_HELPER_MEMORY = "4g"
+# Highest OOM score: the kernel kills the helper before the rental.
+RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
+RESTIC_HELPER_GOGC = "50"
+SIGKILL_EXIT = 137
+HELPER_LABEL = "lium.backup-helper"
+STALE_HELPER_AGE = timedelta(minutes=10)
 # Without `|| exit`, a failed cd leaves sh in the helper's own directory and restic backs that up instead.
 # sh's own cd error is dropped: StorageEventReporter keeps the first diagnostic, which must be ours.
 # Runs the backup inside a helper (docker volume or encrypted namespace). A missing or empty path exits 66 before
@@ -180,6 +192,7 @@ class ResticStorageRunner:
         )
         self._environment = self._build_environment()
         self._snapshot_empty = False
+        self._helper_oom_killed = False
 
     def run(self) -> ResticResult:
         if self._operation.engine is StorageEngine.RESTIC:
@@ -399,6 +412,12 @@ class ResticStorageRunner:
             return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
         if exit_code == 3 and snapshot_id:
             return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
+        if exit_code == SIGKILL_EXIT:
+            raise ResticOperationError(
+                "backup ran out of memory"
+                if self._helper_oom_killed
+                else "backup helper was killed (often out of memory)"
+            )
         raise ResticOperationError(
             f"restic backup failed with exit {exit_code}"
             + (" without a snapshot ID" if not snapshot_id else "")
@@ -475,6 +494,11 @@ class ResticStorageRunner:
         restore_stats: RestoreStats | None = None,
     ) -> tuple[int, Mapping[str, object] | None]:
         started_at = time.monotonic()
+        # The helper runs without --rm so its OOMKilled state can be read after exit, then it is removed.
+        helper = not isinstance(self._workspace, LocalWorkspace)
+        if helper:
+            self._remove_stopped_helpers()
+            self._remove_helper_container()
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -551,12 +575,16 @@ class ResticStorageRunner:
             exit_code = process.wait()
             return exit_code, summary
         except StorageOperationCancelled:
+            if process.poll() is None:  # SIGTERM to the runner, not a cancel that already stopped it
+                self._terminate_process(process)
             raise
         except Exception:
             self._terminate_process(process)
             raise
         finally:
             output_reader.join(timeout=1)
+            if helper:
+                self._helper_oom_killed = self._remove_helper_container()
 
     def _raise_if_credentials_expired(self, error_text: str) -> None:
         # restic 0.19 retries an expired session for 15 minutes before failing; stop it now
@@ -579,6 +607,47 @@ class ResticStorageRunner:
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
+
+    def _remove_stopped_helpers(self) -> None:
+        # A runner killed before cleanup leaves its exited helper (and its credentials) behind. Only long-exited
+        # helpers are removed: a created or running one may belong to another operation that is starting now.
+        listed = subprocess.run(
+            [self._docker_binary, "ps", "--all", "--quiet", "--filter", f"label={HELPER_LABEL}",
+             "--filter", "status=exited"],
+            capture_output=True,
+            text=True,
+        )
+        container_ids = listed.stdout.split() if listed.returncode == 0 else []
+        if not container_ids:
+            return
+        inspected = subprocess.run(
+            [self._docker_binary, "inspect", "--format", "{{.Id}} {{.State.Status}} {{.State.FinishedAt}}",
+             *container_ids],
+            capture_output=True,
+            text=True,
+        )
+        cutoff = datetime.now(timezone.utc) - STALE_HELPER_AGE
+        for line in inspected.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3 or fields[1] != "exited":
+                continue
+            try:  # FinishedAt has nanoseconds; seconds are enough for a 10-minute cutoff
+                finished_at = datetime.strptime(fields[2][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if finished_at < cutoff:
+                subprocess.run([self._docker_binary, "rm", "--force", fields[0]], capture_output=True, text=True)
+
+    def _remove_helper_container(self) -> bool:
+        """Remove the helper container; return whether docker recorded it as OOM-killed."""
+        name = self._helper_container_name()
+        inspection = subprocess.run(
+            [self._docker_binary, "inspect", "--format", "{{.State.OOMKilled}}", name],
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run([self._docker_binary, "rm", "--force", name], capture_output=True, text=True)
+        return inspection.returncode == 0 and inspection.stdout.strip() == "true"
 
     def _stop_helper_container(self) -> None:
         subprocess.run(
@@ -720,11 +789,20 @@ class ResticStorageRunner:
         return [
             self._docker_binary,
             "run",
-            "--rm",
             "--name",
             self._helper_container_name(),
+            "--label",
+            f"{HELPER_LABEL}={self._operation.operation_id}",
             "--log-driver",
             "none",
+            "--memory",
+            RESTIC_HELPER_MEMORY,
+            "--oom-score-adj",
+            RESTIC_HELPER_OOM_SCORE_ADJ,
+            "-e",
+            f"GOGC={RESTIC_HELPER_GOGC}",
+            "-e",
+            f"GOMAXPROCS={RESTIC_HELPER_GOMAXPROCS}",
             "--read-only",
             "--tmpfs",
             f"/tmp:rw,nosuid,nodev,size={RESTIC_TMPFS_BYTES}",

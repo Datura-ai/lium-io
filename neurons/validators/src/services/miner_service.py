@@ -50,8 +50,11 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    GpuResetErrorCode,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
+    PodGpuResetResult,
+    ResetPodGpuRequest,
     WorkloadKind,
     now_ms,
 )
@@ -74,7 +77,12 @@ from services.task.availability import (
 )
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
-from services.storage_operations import cancel_storage_operation, start_storage_operation, supports_workspace_field
+from services.storage_operations import (
+    cancel_storage_operation,
+    report_launch_failure,
+    start_storage_operation,
+    supports_workspace_field,
+)
 from services.storage_operations import upload_secrets_file
 
 logger = logging.getLogger(__name__)
@@ -1276,6 +1284,20 @@ class MinerService:
                 workload_kind=payload.workload_kind,
                 msg=detail or headline,
             )
+        elif isinstance(payload, ResetPodGpuRequest):
+            # nothing on the host changed: the reset never reached the executor
+            return PodGpuResetResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=False,
+                error_code=GpuResetErrorCode.OperationInProgress
+                if error_code == FailedContainerErrorCodes.RentingInProgress
+                else GpuResetErrorCode.ExecutorUnreachable,
+                detail=headline,
+            )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -1294,9 +1316,25 @@ class MinerService:
         # DAH-2728: register the create BEFORE the miner handshake — a delete whose handshake is
         # quicker would otherwise reach the executor first and see a pod that does not exist yet.
         if not isinstance(payload, ContainerCreateRequest):
-            return await self._route_container(payload)
+            result = await self._route_container(payload)
+            await self._report_storage_dispatch_failure(payload, result)
+            return result
         with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
             return await self._route_container(payload)
+
+    async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:
+        """A Restic backup/restore that fails before its runner starts (executor unreachable, old image)
+        reports nothing itself, so the backend waited 20 min and logged "stopped reporting progress".
+        Report the failure now. The backend ignores a second report on a log that is already terminal."""
+        if not isinstance(result, FailedContainerRequest) or getattr(payload, "backup_engine", None) != "restic":
+            return
+        if isinstance(payload, BackupContainerRequest):
+            operation_id, spec = payload.backup_log_id, self._restic_backup_operation_spec(payload)
+        elif isinstance(payload, RestoreContainerRequest) and not payload.recovery:
+            operation_id, spec = payload.restore_log_id, self._restic_restore_operation_spec(payload)
+        else:
+            return
+        await report_launch_failure(UUID(operation_id), spec, RuntimeError(result.msg))
 
     async def _route_container(self, payload: ContainerBaseRequest):
         """Route a container request over the miner's REST API."""
@@ -1356,10 +1394,13 @@ class MinerService:
                 if payload.exclude_patterns and not await supports_workspace_field(
                     ssh_client, executor_info.python_path, "exclude_patterns"
                 ):
-                    raise RuntimeError(
+                    error = RuntimeError(
                         "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
                         "the provider must update the executor image"
                     )
+                    # report the real reason first; the generic dispatch-failure report then finds the log terminal
+                    await report_launch_failure(operation_id, self._restic_backup_operation_spec(payload), error)
+                    raise error
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,
@@ -2225,6 +2266,8 @@ class MinerService:
                     result = await docker_service.remove_ssh_keys(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, InstallJupyterServerRequest):
                     result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, ResetPodGpuRequest):
+                    result = await docker_service.reset_pod_gpus(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, BackupContainerRequest):
                     result = await self.handle_backup_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, RestoreContainerRequest):

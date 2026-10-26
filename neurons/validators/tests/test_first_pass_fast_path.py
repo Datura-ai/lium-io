@@ -81,8 +81,6 @@ async def test_context_first_pass_follows_the_caller(monkeypatch, first_pass, ex
     )
 
     assert ctx.config.first_pass is expected
-    # the raw express-lane flag reaches the context (DAH-4258)
-    assert ctx.config.express_first_pass is first_pass
 
 
 def test_context_config_default_is_not_a_first_pass():
