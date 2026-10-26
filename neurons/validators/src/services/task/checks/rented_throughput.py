@@ -216,23 +216,6 @@ def _pods_moved(a: _Snap, b: _Snap, side: int) -> tuple[float, float] | None:
     )
 
 
-def pods_stopped(stdout: str) -> tuple[bool, bool]:
-    """(network, disk): a rented pod readable when that side's measurement began went unreadable by its end (the
-    renter stopped or restarted it mid-probe), so what the renter moved then is unknown. A missing snapshot or a pod
-    never readable is not this: those leave the failure standing."""
-    snaps, _ = _parse_snaps(stdout)
-    if len(snaps) < 4:
-        return False, False
-
-    def stopped(a: _Snap, b: _Snap, side: int) -> bool:
-        return any(
-            c[side] is not None and b[3].get(pid, (None, None))[side] is None
-            for pid, c in a[3].items()
-        )
-
-    return stopped(snaps[2], snaps[3], 0), stopped(snaps[1], snaps[2], 1)
-
-
 def parse_busy(stdout: str) -> tuple[float | None, float | None]:
     """Other traffic in the window before the probe: (Mbps on the host NICs, the busier direction; MB/s on the busiest
     disk under the docker root). None = not measured; the disk side then has no verdict."""
@@ -311,8 +294,7 @@ class RentedThroughputCheck:
     no verdict (a link or disk doing that much is not the defect); so is the network side without host NIC counters.
     A failing side is also no verdict when the rented pods themselves moved DURING_* on that resource while the probe
     measured it (their own network namespace and container cgroup counters, not the host's, so traffic the host
-    generates elsewhere cannot excuse a slow node), or when a pod readable as that side began went unreadable by its
-    end (stopped or restarted mid-probe, its IO unknown): renter IO never fails a node.
+    generates elsewhere cannot excuse a slow node): renter IO never fails a node.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
     """
@@ -410,7 +392,6 @@ class RentedThroughputCheck:
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)
-        net_pod_stopped, disk_pod_stopped = pods_stopped(stdout)
         # no host counters: a slow download may be the renter's, so the network side is no verdict
         net_busy = net_mbps is None or net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS
         disk_is_busy = (
@@ -425,11 +406,8 @@ class RentedThroughputCheck:
         else:
             net = "fail" if judged.is_failing else "pass"
         # a failing side is only a verdict when the renter's own pods did not use that resource while it was measured;
-        # no pod's counters readable, the verdict stands (host-wide counters would let the host fake renter load); a pod
-        # the renter stopped or restarted mid-side left its IO unknown, so no verdict
-        if net == "fail" and (
-            net_pod_stopped or (during_net is not None and during_net >= DURING_NET_MBPS)
-        ):
+        # no pod's counters readable, the verdict stands (host-wide counters would let the host fake renter load)
+        if net == "fail" and during_net is not None and during_net >= DURING_NET_MBPS:
             net = "none"
         if disk_is_busy or disk.mb_per_s is None:
             disk_side = "none"
@@ -438,9 +416,7 @@ class RentedThroughputCheck:
                 "fail" if disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S else "pass"
             )
         if disk_side == "fail" and (
-            disk_pod_stopped
-            or (during_disk or 0) >= DURING_DISK_MB_PER_S
-            or (during_iops or 0) >= DURING_DISK_IOPS
+            (during_disk or 0) >= DURING_DISK_MB_PER_S or (during_iops or 0) >= DURING_DISK_IOPS
         ):
             disk_side = "none"
         reading = {
@@ -451,7 +427,6 @@ class RentedThroughputCheck:
             "during_net_mbps": during_net,
             "during_disk_mb_per_s": during_disk,
             "during_disk_iops": during_iops,
-            "during_pod_stopped": [net_pod_stopped, disk_pod_stopped],
             "network_verdict": net,
             "disk_verdict": disk_side,
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
