@@ -1052,6 +1052,12 @@ SYSBOX_MANY_LAYERS_RENTER_SENTENCE = (
 )
 
 
+def _flatten_reserved_bytes(storage_limit_gb: int | None, volume_limit_gb: int | None, sparse_volume: bool) -> int:
+    """Disk the pod's limits granted but have not taken yet: the writable layer, and a sparse (full-node)
+    volume; a preallocated volume already took its space."""
+    return ((storage_limit_gb or 0) + ((volume_limit_gb or 0) if sparse_volume else 0)) * 1024**3
+
+
 def sysbox_many_layers_sentence(exc: Exception) -> str | None:
     """The renter sentence when `docker run` died on Sysbox's ID-mapping of a many-layer image, else None."""
     if any(_SYSBOX_RELATIVE_LAYER_RE.search(text) for text in _exception_texts(exc)):
@@ -2549,8 +2555,15 @@ class DockerService:
         port_maps: list[tuple[int, int, int]] | None = None,
         spare_port_pairs: list[PayloadPortMapping] | None = None,
         remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
+        flatten_reserved_bytes: int | None = None,
+        before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
+
+        Sysbox many-layer failure: only when `flatten_reserved_bytes` is given (customer rentals), the
+        image is copied into one layer on the node, keeping free the disk the pod's limits already
+        granted (`flatten_reserved_bytes`), and the run is retried once after `before_flatten_retry`
+        (the delete-cancellation check, which raises when the pod was deleted meanwhile).
 
         Returns the container's ID, or None when the client gave none. A ContainerCreateRefused of
         the spec's `before_create` or `before_start` (checked on every attempt) is raised as is.
@@ -2613,12 +2626,18 @@ class DockerService:
                         )
                         continue
 
-                if not image_flattened and sysbox_many_layers_sentence(exc):
+                if flatten_reserved_bytes is not None and not image_flattened and sysbox_many_layers_sentence(exc):
                     # the renter picked this node: start a one-layer copy of the image here (owner, 26 Oct)
                     image_flattened = True
                     flat_image = await self._flatten_rental_image(
-                        ssh_client=ssh_client, image=run_spec.image, default_extra=default_extra, log_tag=log_tag
+                        ssh_client=ssh_client,
+                        image=run_spec.image,
+                        reserved_bytes=flatten_reserved_bytes,
+                        default_extra=default_extra,
+                        log_tag=log_tag,
                     )
+                    if before_flatten_retry is not None:
+                        await before_flatten_retry()
                     if flat_image is not None:
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
@@ -2725,7 +2744,13 @@ class DockerService:
                 raise
 
     async def _flatten_rental_image(
-        self, *, ssh_client: asyncssh.SSHClientConnection, image: str, default_extra: dict, log_tag: str
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        image: str,
+        reserved_bytes: int,
+        default_extra: dict,
+        log_tag: str,
     ) -> str | None:
         """The one-layer copy's tag, or None when the flatten failed (the create then fails with
         Sysbox's error). Raises ImageFlattenNoDisk when the node has no room for the copy."""
@@ -2737,7 +2762,7 @@ class DockerService:
         )
         started = time.monotonic()
         try:
-            flat_image = await flatten_image_on_host(ssh_client, image)
+            flat_image = await flatten_image_on_host(ssh_client, image, reserved_bytes=reserved_bytes)
         except ImageFlattenNoDisk:
             logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
             await self.stream_log(FLATTEN_NO_DISK_RENTER_SENTENCE, "error", log_tag)
@@ -9014,6 +9039,19 @@ class DockerService:
                                 private_key=private_key,
                                 ssh_client=ssh_client,
                             )
+                        ),
+                        # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
+                        flatten_reserved_bytes=(
+                            _flatten_reserved_bytes(
+                                effective_storage_limit_gb,
+                                effective_volume_limit_gb,
+                                payload.disk_share is not None and payload.disk_share >= 1.0,
+                            )
+                            if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                            else None
+                        ),
+                        before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
+                            ssh_client, payload, default_extra
                         ),
                     )
                     edit_swap.replacement_id = container_id

@@ -3,9 +3,10 @@
 Sysbox 0.7.1 on Docker's classic overlay2 store (and 0.6.6 and older on the containerd store) cannot
 ID-map the relative layer paths Docker uses once an image has more layers than fit in one page of
 overlay mount options (nestybox/sysbox#725, fixed upstream but not in a Sysbox release yet). A
-one-layer copy of the same files starts. `docker export | docker import` keeps only the root
-filesystem, so the image config is put back with `--change`; `docker import` cannot set
-HEALTHCHECK, STOPSIGNAL, SHELL or ONBUILD, which are lost.
+one-layer copy of the same files starts. Only on classic overlay2: the disk check measures Docker's
+data root, which the containerd store does not write its images to. `docker export | docker import`
+keeps only the root filesystem, so the image config is put back with `--change`; SHELL and ONBUILD
+(build-time only) are not carried over.
 """
 
 import json
@@ -38,6 +39,30 @@ def _dockerfile_word(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
 
 
+def _healthcheck_change(check: dict) -> str:
+    test = check.get("Test") or []
+    if test[:1] == ["NONE"]:
+        return "HEALTHCHECK NONE"
+    options = "".join(
+        f"--{flag}={check[key]}ns "  # inspect gives nanoseconds; 0 means Docker's default
+        for flag, key in (
+            ("interval", "Interval"),
+            ("timeout", "Timeout"),
+            ("start-period", "StartPeriod"),
+            ("start-interval", "StartInterval"),
+        )
+        if check.get(key)
+    )
+    if check.get("Retries"):
+        options += f"--retries={check['Retries']} "
+    if test[:1] == ["CMD-SHELL"] and len(test) == 2 and "\n" not in test[1] and "\r" not in test[1]:
+        return f"HEALTHCHECK {options}CMD {test[1]}"
+    if test[:1] == ["CMD"] and len(test) > 1:
+        return f"HEALTHCHECK {options}CMD {json.dumps(test[1:])}"
+    # one --change is one Dockerfile line; a health check that differs would change how the pod is judged
+    raise ValueError(f"health check {test[:1]} cannot be carried over")
+
+
 def image_flatten_changes(config: dict) -> list[str]:
     """`docker import --change` lines that restore what the flatten drops from the image `Config`."""
     changes: list[str] = []
@@ -60,6 +85,10 @@ def image_flatten_changes(config: dict) -> list[str]:
         changes.append(f"EXPOSE {port}")
     if config.get("Volumes"):
         changes.append(f"VOLUME {json.dumps(sorted(config['Volumes']))}")
+    if config.get("StopSignal"):
+        changes.append(f"STOPSIGNAL {config['StopSignal']}")
+    if config.get("Healthcheck"):
+        changes.append(_healthcheck_change(config["Healthcheck"]))
     for key, value in sorted((config.get("Labels") or {}).items()):
         if "\n" in key + value or "\r" in key + value:
             continue  # metadata only (e.g. a long description); nothing at run time reads it
@@ -97,12 +126,22 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
     )
 
 
-async def flatten_image_on_host(ssh_client: asyncssh.SSHClientConnection, image: str) -> str:
+async def flatten_image_on_host(
+    ssh_client: asyncssh.SSHClientConnection, image: str, *, reserved_bytes: int = 0
+) -> str:
     """The local tag of a one-layer copy of `image`, built on the node unless one exists already.
 
     Keyed by the image ID, so a retry or a later rental of the same image reuses the copy. Raises
-    ImageFlattenNoDisk when the Docker disk cannot hold the copy, any other error when it failed.
+    ImageFlattenNoDisk when the Docker disk cannot hold the copy and still keep `reserved_bytes`
+    (granted to the pod, not yet written) free, any other error when it failed or the node does not
+    use the classic overlay2 store.
     """
+    driver = await ssh_client.run(
+        "/usr/bin/docker info --format '{{.Driver}}'", check=True, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+    )
+    # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
+    if str(driver.stdout).strip() != "overlay2":
+        raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
     inspect = await ssh_client.run(
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",
         check=True,
@@ -123,7 +162,7 @@ async def flatten_image_on_host(ssh_client: asyncssh.SSHClientConnection, image:
         tag,
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
-        int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES,
+        int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
     )
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)

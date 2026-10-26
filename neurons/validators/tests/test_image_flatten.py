@@ -52,8 +52,10 @@ def test_changes_refuse_an_env_value_with_a_line_break():
         image_flatten_changes({"Env": ["A=1\n2"]})
 
 
-def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3):
+def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2"):
     async def run(command, check=False, timeout=None):
+        if command.startswith("/usr/bin/docker info --format '{{.Driver}}'"):
+            return Mock(exit_status=0, stdout=f"{driver}\n")
         if command.startswith("/usr/bin/docker image inspect --format"):
             return Mock(exit_status=0, stdout=json.dumps({"Id": _IMAGE_ID, "Size": size, "Config": _CONFIG}))
         if command.startswith(f"/usr/bin/docker image inspect {_TAG}"):
@@ -69,7 +71,7 @@ def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3):
 async def test_an_existing_copy_of_the_same_image_id_is_reused():
     ssh = _ssh(exists=True)
     assert await flatten_image_on_host(ssh, "lmsysorg/sglang:dev") == _TAG
-    assert ssh.run.await_count == 2
+    assert ssh.run.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -84,12 +86,49 @@ async def test_the_no_disk_exit_raises_the_renter_sentence_and_other_failures_ra
 @pytest.mark.asyncio
 async def test_the_copy_is_built_from_the_inspected_image_id_never_the_mutable_tag():
     ssh = _ssh(exists=False)
-    assert await flatten_image_on_host(ssh, "model:dev") == _TAG
+    assert await flatten_image_on_host(ssh, "model:dev", reserved_bytes=79 * 1024**3) == _TAG
     command = ssh.run.await_args_list[-1].args[0]
     create = command.split("docker create", 1)[1].split(")", 1)[0]
     assert create.endswith(f" {_IMAGE_ID}") and "model:dev" not in command
     assert "--change 'CMD [\"python3\"" in command and _TAG in command
-    assert f"-ge {24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES} ]" in command
+    # the disk the pod's limits already granted stays free after the copy
+    assert f"-ge {24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_off_the_classic_overlay2_store():
+    # the containerd store keeps images outside the data root the disk check measures
+    ssh = _ssh(exists=False, driver="overlayfs")
+    with pytest.raises(RuntimeError, match="storage driver"):
+        await flatten_image_on_host(ssh, "model:dev")
+    assert ssh.run.await_count == 1
+
+
+_HEALTH = {"Interval": 30 * 10**9, "Timeout": 5 * 10**9, "StartPeriod": 0, "Retries": 3}
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        ({"StopSignal": "SIGQUIT"}, ["STOPSIGNAL SIGQUIT"]),
+        ({"Healthcheck": {"Test": ["NONE"]}}, ["HEALTHCHECK NONE"]),
+        (
+            {"Healthcheck": {**_HEALTH, "Test": ["CMD-SHELL", "curl -f localhost:8000 || exit 1"]}},
+            ["HEALTHCHECK --interval=30000000000ns --timeout=5000000000ns --retries=3 CMD curl -f localhost:8000 || exit 1"],
+        ),
+        (
+            {"Healthcheck": {"Test": ["CMD", "/bin/check", "--fast"], "StartInterval": 10**9}},
+            ['HEALTHCHECK --start-interval=1000000000ns CMD ["/bin/check", "--fast"]'],
+        ),
+    ],
+)
+def test_changes_restore_stop_signal_and_health_check(config, expected):
+    assert image_flatten_changes(config) == expected
+
+
+def test_changes_refuse_a_health_check_they_cannot_carry():
+    with pytest.raises(ValueError):
+        image_flatten_changes({"Healthcheck": {"Test": ["CMD-SHELL", "a\nb"]}})
 
 
 def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:

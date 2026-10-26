@@ -8140,7 +8140,7 @@ class _SysboxFailingRentalClient:
         self.events.append(f"rm {container_name}")
 
 
-async def _create_with_flatten(docker_service, client, flatten):
+async def _create_with_flatten(docker_service, client, flatten, *, reserved_bytes=0, before_retry=None):
     docker_service.stream_log = AsyncMock()
     with patch.object(docker_service_module, "flatten_image_on_host", flatten):
         return await docker_service._run_rental_docker_create_with_port_retry(
@@ -8149,7 +8149,37 @@ async def _create_with_flatten(docker_service, client, flatten):
             run_spec=ContainerRunSpec(image="sglang", name="pod_x"),
             container_name="pod_x",
             default_extra={},
+            flatten_reserved_bytes=reserved_bytes,
+            before_flatten_retry=before_retry,
         )
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_without_a_reservation_so_fillers_keep_the_sysbox_error(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    with pytest.raises(Exception, match="ID-mapped mount"):
+        await _create_with_flatten(docker_service, client, flatten, reserved_bytes=None)
+    flatten.assert_not_awaited()
+    assert client.events == ["run sglang"]
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_the_flatten_stops_the_create_before_the_retry(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    cancelled = AsyncMock(side_effect=docker_service_module._CreateCancelledByDelete("deleted"))
+    with pytest.raises(docker_service_module._CreateCancelledByDelete):
+        await _create_with_flatten(docker_service, client, flatten, reserved_bytes=7, before_retry=cancelled)
+    assert flatten.await_args.kwargs["reserved_bytes"] == 7
+    assert client.events == ["run sglang"]  # no create or start after the delete
+
+
+def test_flatten_keeps_free_the_writable_layer_and_a_sparse_volume_only():
+    gib = 1024**3
+    assert docker_service_module._flatten_reserved_bytes(26, 53, True) == 79 * gib
+    assert docker_service_module._flatten_reserved_bytes(26, 53, False) == 26 * gib  # preallocated: already taken
+    assert docker_service_module._flatten_reserved_bytes(None, None, True) == 0
 
 
 @pytest.mark.asyncio
