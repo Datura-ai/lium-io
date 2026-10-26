@@ -67,7 +67,9 @@ RUN arch="${TARGETARCH:-amd64}" \
   && rm -f /tmp/gocryptfs.tgz \
   && gocryptfs --version
 
-RUN pip install -U pdm
+# pdm downloads Python 3.11.11 here (the base ships another 3.11 patch); pbs-installer 2026.10.25
+# moved that download to httpx2 and fails with "You must install httpx2 to use this function"
+RUN pip install -U pdm "pbs-installer<2026.10.25"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
