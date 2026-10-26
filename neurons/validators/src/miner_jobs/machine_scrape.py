@@ -1184,13 +1184,39 @@ def get_sysbox_version() -> str | None:
     return None
 
 
-def check_storage_limit_ability() -> tuple[bool, str]:
+# /proc/mounts spells xfs's `pquota` mount option `prjquota`; `pqnoenforce` only accounts, so it does not count
+PROJECT_QUOTA_MOUNT_OPTIONS = frozenset({"pquota", "prjquota"})
+
+
+def storage_limit_setup_gap(docker_info: dict, mounts_text: str) -> str:
+    """Why docker cannot enforce a per-container disk limit: '' only for the overlay2 storage driver on an xfs
+    data root mounted with project quota (DAH-1997, 26 Oct plan); otherwise the first thing missing."""
+    driver = docker_info.get("Driver") or ""
+    if driver != "overlay2":
+        return f"docker storage driver is {driver or 'unknown'}, not overlay2"
+    docker_root_dir = docker_info.get("DockerRootDir") or "/var/lib/docker"
+    covering = covering_mount(mounts_text, docker_root_dir)
+    if covering is None or covering.fstype != "xfs":
+        return f"{docker_root_dir} is on {covering.fstype if covering else 'an unknown filesystem'}, not xfs"
+    if not PROJECT_QUOTA_MOUNT_OPTIONS & set(covering.options):
+        return f"{covering.mount_point} (xfs) is not mounted with pquota"
+    return ""
+
+
+def check_storage_limit_ability() -> tuple[bool | None, str]:
     """
-    Checks if the system supports limiting the storage size of a container.
+    Checks if the system supports limiting the storage size of a container: overlay2 on xfs with pquota, and a
+    `--storage-opt size=` container that runs. None when the probe gave no verdict (timed out, crashed) - that is
+    not a finding that the limit is missing.
     """
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
+        with open(HOST_MOUNTS_PATH) as mounts_file:
+            gap = storage_limit_setup_gap(docker_api_get("/info") or {}, mounts_file.read())
+        if gap:
+            return False, f"Storage limit is not supported: {gap}."
+
         result = subprocess.run(
             test_command,
             stdout=subprocess.PIPE,
@@ -1205,10 +1231,10 @@ def check_storage_limit_ability() -> tuple[bool, str]:
             return False, "Storage limit is not supported."
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        return None, "Test command timed out."
 
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        return None, f"An unexpected error occurred: {e}"
 
 
 def run_checks_concurrently(checks):
@@ -1955,95 +1981,15 @@ def get_docker_root_disk_type() -> str:
     return disk_type_of(block_device_holding(mounts_text, docker_root_dir))
 
 
-# DAH-1997 (Fish 21 Oct): the storage limit is required only of hosts that can build it - docker's data
-# root already on xfs (only `pquota` missing), or a blank whole disk that passes `lium gpu-splitting setup`'s target checks
-# (setup itself runs only on docker's default /var/lib/docker; with another data root, the manual steps at docs.lium.io/providers/nodes/docker-storage). A host
-# with one disk, all of it in use, cannot, and keeps the warning only.
+# DAH-1997 (26 Oct plan): the storage limit is required only of hosts that can build it - at least this much
+# free on the filesystem that holds docker's data root, where `lium gpu-splitting setup` can put an xfs image file
+# (or the manual steps at docs.lium.io/providers/nodes/docker-storage). Less than that keeps the warning only.
 STORAGE_CAPABLE_MIN_BYTES = 100 * 1024 ** 3
-SYSFS_SECTOR_BYTES = 512
-PROC_SWAPS_PATH = "/proc/swaps"
-NOT_A_SPARE_DISK_PREFIXES = ("loop", "ram", "zram", "sr", "fd", "nbd", "dm-", "md")
-# sysfs path parts of the transports `lium gpu-splitting setup` refuses (usb, mmc, iscsi, fc)
-NON_LOCAL_SYSFS_PARTS = ("/usb", "/mmc_host/", "/session", "/rport-")
-# every signature wipefs finds (filesystem, partition table, LVM, RAID, swap, ZFS) sits in a disk's first
-# or last MiB
-SIGNATURE_SPAN_BYTES = 1024 * 1024
-
-
-def carries_signature(node_path: str, size_bytes: int) -> bool:
-    """True unless the first and last SIGNATURE_SPAN_BYTES of the device are all zero - the CLI refuses a
-    target that carries any signature, so an unreadable device counts as carrying one."""
-    try:
-        with open(node_path, "rb") as device_file:
-            head = device_file.read(SIGNATURE_SPAN_BYTES)
-            device_file.seek(max(size_bytes - SIGNATURE_SPAN_BYTES, 0))
-            tail = device_file.read(SIGNATURE_SPAN_BYTES)
-    except OSError:
-        return True
-    return not head or head.count(0) != len(head) or tail.count(0) != len(tail)
-
-
-def spare_block_device(mounts_text: str) -> str | None:
-    """The kernel name of a blank whole disk that passes `lium gpu-splitting setup`'s target checks (its blank_whole_disk;
-    with a non-default docker data root setup refuses and the manual steps at docs.lium.io/providers/nodes/docker-storage apply):
-    STORAGE_CAPABLE_MIN_BYTES or more, not partitioned, not mounted, not swap, no holders (LVM / RAID /
-    dm-crypt), not read-only, not removable or attached over usb / mmc / iscsi / fc, and no signature.
-    None when there is none. Partitions and free space after the last partition are not counted: setup
-    decides those with parted and a read-only mount, which the validator does not run on a host, so a
-    host whose only option is one of them is exempt rather than required to do what setup may refuse."""
-    in_use = set()
-    for line in mounts_text.splitlines():
-        fields = line.split()
-        if fields and fields[0].startswith("/dev/"):
-            in_use.add(
-                kernel_name_of_device_node(f"{HOST_ROOT_PREFIX}{fields[0]}") or os.path.basename(fields[0])
-            )
-    try:
-        with open(PROC_SWAPS_PATH) as swaps_file:
-            in_use.update(os.path.basename(line.split()[0]) for line in swaps_file.read().splitlines()[1:] if line.split())
-    except OSError:
-        pass
-    try:
-        names = sorted(os.listdir(SYS_CLASS_BLOCK_PATH))
-    except OSError:
-        return None
-    for name in names:
-        device_path = f"{SYS_CLASS_BLOCK_PATH}/{name}"
-        if name.startswith(NOT_A_SPARE_DISK_PREFIXES) or name in in_use or os.path.exists(f"{device_path}/partition"):
-            continue
-        try:
-            size_bytes = int(read_sysfs_text(f"{device_path}/size") or 0) * SYSFS_SECTOR_BYTES
-            holders = os.listdir(f"{device_path}/holders") if os.path.isdir(f"{device_path}/holders") else []
-            partitioned = any(os.path.exists(f"{device_path}/{child}/partition") for child in os.listdir(device_path))
-        except (OSError, ValueError):
-            continue
-        if size_bytes < STORAGE_CAPABLE_MIN_BYTES or holders or partitioned:
-            continue
-        if read_sysfs_text(f"{device_path}/ro") == "1":
-            continue
-        real_path = os.path.realpath(device_path)
-        if read_sysfs_text(f"{real_path}/removable") == "1":
-            continue
-        if any(part in real_path for part in NON_LOCAL_SYSFS_PARTS):
-            continue
-        if carries_signature(f"{HOST_ROOT_PREFIX}/dev/{name}", size_bytes):
-            continue
-        return name
-    return None
 
 
 def storage_limit_capable() -> bool:
-    """True when this host could give docker a per-container storage limit (see STORAGE_CAPABLE_MIN_BYTES)."""
-    try:
-        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
-    except Exception:
-        docker_root_dir = "/var/lib/docker"
-    with open(HOST_MOUNTS_PATH) as mounts_file:
-        mounts_text = mounts_file.read()
-    covering = covering_mount(mounts_text, docker_root_dir)
-    if covering is not None and covering.fstype == "xfs":
-        return True
-    return spare_block_device(mounts_text) is not None
+    """True when the filesystem holding docker's data root has STORAGE_CAPABLE_MIN_BYTES or more free."""
+    return get_host_disk_usage().free >= STORAGE_CAPABLE_MIN_BYTES
 
 
 def write_probe_failure_reason(errno_value) -> str:

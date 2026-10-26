@@ -7,10 +7,11 @@ renter who fills the container's disk fills the host's ``/var/lib/docker``: the 
 
 Pure data, no SSH. While ``REQUIRE_STORAGE_LIMIT_SUPPORTED`` is off every node without the limit gets the
 non-fatal STORAGE_LIMIT_MISSING warning, score unchanged, so providers see it in their logs before enforcement.
+The limit counts only for overlay2 on xfs mounted with pquota whose ``--storage-opt size=`` container runs (the scrape).
 With the setting on, a node without the limit that is not rented and whose host could build it (the scrape's
-``storage_limit_capable``: docker's root already on xfs, or a blank whole disk of 100 GiB+ that passes `lium gpu-splitting setup`'s target checks; setup needs docker's default
-/var/lib/docker, otherwise the manual steps at docs.lium.io/providers/nodes/docker-storage) fails (score 0,
-STORAGE_LIMIT_REQUIRED) until the host passes the probe; a single-disk host keeps the warning only; a rented node only gets the warning, so this check never touches a running rental.
+``storage_limit_capable``: 100 GiB+ free on the filesystem holding docker's data root, room for the xfs image file
+`lium gpu-splitting setup` builds) fails (score 0, STORAGE_LIMIT_REQUIRED) until the host passes the probe; a host
+with less free keeps the warning only; a rented node only gets the warning, so this check never touches a running rental.
 It runs right after the scrape, before the rented short-circuit, like GpuThermalThrottleCheck.
 """
 
@@ -58,8 +59,8 @@ class StorageLimitCheck:
             else None
         )
         rented = bool(rented_executor and rented_executor.pods)
-        # DAH-1997: a host the scrape saw no way to build the limit on (one disk, all in use) keeps the
-        # warning; unknown (an older scrape, a failed reading) counts as able
+        # DAH-1997: a host without 100 GiB free next to docker's data root keeps the warning; unknown (an older
+        # scrape, a failed reading) counts as able
         capable = specs.get("storage_limit_capable") is not False
         detail = str(specs.get("storage_limit_scrape_error") or "")
         # a probe that timed out or crashed (slow image pull, busy host) says nothing about the limit: the node keeps
@@ -78,8 +79,11 @@ class StorageLimitCheck:
                     what={"reused_last_pass": True, "detail": detail[:300]},
                 ),
             )
+        else:
+            # no verdict and no recent pass: the published specs say unknown, never "no limit"
+            ctx.state.specs["storage_limit_supported"] = None
         what = {
-            "storage_limit_supported": False,
+            "storage_limit_supported": False if conclusive else None,
             "capable": capable,
             "conclusive": conclusive,
             "detail": detail[:300] or None,

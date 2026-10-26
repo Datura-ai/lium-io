@@ -163,18 +163,36 @@ async def test_a_probe_without_a_verdict_reuses_a_recent_pass_and_publishes_it(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", INCONCLUSIVE)
+@pytest.mark.parametrize("scraped", [None, False])  # the scrape sends None; an older one sent False
 async def test_a_probe_without_a_verdict_and_no_recent_pass_holds_the_node(
-    context_factory, enforced, error
+    context_factory, enforced, error, scraped
 ):
-    result = await run(
-        context_factory, {"storage_limit_supported": False, "storage_limit_scrape_error": error}
+    ctx = context_factory(state=build_state(specs={}))
+    result = await run_with(
+        ctx, {"storage_limit_supported": scraped, "storage_limit_scrape_error": error}
     )
 
     assert result.passed is False
     assert result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert result.event.what_we_saw["conclusive"] is False
+    assert result.event.what_we_saw["storage_limit_supported"] is None
     assert result.updates["score"] == 0.0
     assert availability_errors([result.event])
+    # published as unknown, never as "no limit"
+    assert ctx.state.specs["storage_limit_supported"] is None
+
+
+@pytest.mark.asyncio
+async def test_unenforced_a_probe_without_a_verdict_is_published_as_unknown(context_factory):
+    ctx = context_factory(state=build_state(specs={}))
+    result = await run_with(
+        ctx,
+        {"storage_limit_supported": None, "storage_limit_scrape_error": "Test command timed out."},
+    )
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.MISSING.reason
+    assert ctx.state.specs["storage_limit_supported"] is None
 
 
 @pytest.mark.asyncio
