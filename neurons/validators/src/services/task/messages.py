@@ -906,9 +906,9 @@ class PidHostRequiredMessages:
         impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
         remediation=(
             "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
-            "restores cannot run. Standard stack: cd ~/compute-subnet/neurons/executor && docker compose up -d "
-            "--force-recreate executor-runner. Custom stack: docker compose -f docker-compose.app.yml up -d "
-            "--force-recreate."
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
         ),
     )
     RENTED_WARNING = MessageTemplate(
@@ -919,9 +919,9 @@ class PidHostRequiredMessages:
         impact="Warning only while the node is rented: score and incentive unchanged",
         remediation=(
             "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
-            "restores cannot run. Standard stack: cd ~/compute-subnet/neurons/executor && docker compose up -d "
-            "--force-recreate executor-runner. Custom stack: docker compose -f docker-compose.app.yml up -d "
-            "--force-recreate."
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
         ),
     )
     OK = MessageTemplate(
