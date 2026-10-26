@@ -214,6 +214,7 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
         non_200_log_level: int = logging.ERROR,
+        raise_on_4xx: bool = False,
     ) -> T | None:
         return await self._request(
             "POST",
@@ -224,6 +225,7 @@ class BackendClient:
             timeout=timeout,
             extra_headers=extra_headers,
             non_200_log_level=non_200_log_level,
+            raise_on_4xx=raise_on_4xx,
         )
 
     async def _request(

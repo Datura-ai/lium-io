@@ -170,3 +170,30 @@ async def test_an_older_backend_404_is_tolerated():
 
     assert [p["state"] for p in backend.posts] == ["unreachable"] * 3
     assert watch._route_missing_logged
+
+
+@pytest.mark.asyncio
+async def test_the_real_client_posts_the_report_and_asks_for_the_404_raise(monkeypatch):
+    # the fakes above stand in for BackendClient, so this pins the real call path to _request
+    from clients.backend_client import BackendClient
+
+    seen = {}
+
+    async def fake_request(self, method, path, response_model, **kwargs):
+        seen.update(method=method, path=path, **kwargs)
+        return response_model(recorded=True)
+
+    monkeypatch.setattr(BackendClient, "_request", fake_request)
+    client = object.__new__(BackendClient)
+
+    answer = await client.report_pod_ssh_reachability(
+        "pod-1", state="unreachable", since="2026-10-26T17:56:00+00:00", result="timeout", errno=None
+    )
+
+    assert answer == PodSshReachabilityResponse(recorded=True)
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/internal/pods/pod-1/ssh-reachability"
+    assert seen["raise_on_4xx"] is True
+    assert seen["json_data"] == {
+        "state": "unreachable", "since": "2026-10-26T17:56:00+00:00", "result": "timeout", "errno": None
+    }
