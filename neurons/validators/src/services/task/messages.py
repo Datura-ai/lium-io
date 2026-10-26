@@ -518,7 +518,8 @@ class GpuLossHoldMessages:
         remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
         "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
         "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
-        "window.",
+        "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
+        "a node keeps the cards it was first verified with.",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -709,7 +710,9 @@ class GpuFingerprintMessages:
         severity="warning",
         category="env",
         impact="Verification reset; score set to 0",
-        remediation="Ensure the same physical GPUs remain attached and stable.",
+        remediation="Ensure the same physical GPUs remain attached and stable. If you replaced the cards on "
+        "purpose, remove the node in the portal and add it again: a node keeps the cards it was first "
+        "verified with.",
     )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
@@ -2421,7 +2424,8 @@ class GpuAttestationIdentityMessages:
     )
     # The fallback for cards that cannot attest: the same card under a new UUID (serial or slots kept).
     SWAPPED = MessageTemplate(
-        event="GPU UUIDs were swapped: the same cards are reported under new UUIDs",
+        # Neutral on purpose: "every UUID new in the same slots" is also what replacing every card looks like.
+        event="GPU UUIDs changed: new UUIDs in the same slots, or a known card under a new UUID",
         reason="GPU_UUID_SWAPPED",
         severity="warning",
         category="policy",

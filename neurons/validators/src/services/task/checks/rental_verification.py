@@ -18,7 +18,12 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
 )
 
-from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
+from ...const import (
+    FILLER_CONTAINER_PREFIX,
+    FILLER_LIVENESS_GRACE_MINUTES,
+    LEGACY_LOOPBACK_PLUGIN_ALIAS,
+    LOOPBACK_PLUGIN_ALIAS,
+)
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
@@ -203,6 +208,7 @@ class RentalVerificationCheck:
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
                 cpu_count=cpu_count,
+                loopback_plugin=LOOPBACK_PLUGIN_ALIAS if settings.LOOPBACK_PLUGIN_V2_ENABLED else LEGACY_LOOPBACK_PLUGIN_ALIAS,
             )
 
             # Handle API failure (None response) - fail this executor

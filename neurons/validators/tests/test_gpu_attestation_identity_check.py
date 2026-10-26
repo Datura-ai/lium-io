@@ -324,6 +324,8 @@ async def test_every_uuid_new_in_the_same_slots_is_a_swap(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.SWAPPED.reason
     assert result.event.what_we_saw["findings"] == ["uuids_changed_same_slots"]
+    # different physical cards in the same slots look identical here, so the message must not claim "same cards"
+    assert "same cards" not in result.event.event
 
 
 @pytest.mark.asyncio

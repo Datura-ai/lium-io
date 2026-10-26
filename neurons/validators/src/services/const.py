@@ -1,5 +1,10 @@
 MIN_JOB_TAKEN_TIME = 20
 
+# the plugin alias new rental volumes are created on; the backend health check is told it
+LOOPBACK_PLUGIN_ALIAS = "vloopback:v2"
+# the old plugin (`vloopback:latest`): a new volume goes there only when v2 cannot be used
+LEGACY_LOOPBACK_PLUGIN_ALIAS = "vloopback"
+
 GPU_MODEL_RATES = {
     "NVIDIA B300 SXM6 AC": .05,
     "NVIDIA B200": .05,
