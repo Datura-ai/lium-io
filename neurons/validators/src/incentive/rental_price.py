@@ -648,8 +648,10 @@ class RentalPriceIncentive(DefaultIncentive):
     @staticmethod
     def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
         """Free-GPU count when the result is a partially rented split node, else None."""
+        # score 0 = a gate zeroed the node (job_score stays 1 on rentals for health reporting): no idle pay for its rest
         if not (
             result.is_rented
+            and result.score > 0
             and result.supports_gpu_splitting
             and result.gpu_splitting_min_count
             and result.rented_gpu_count
