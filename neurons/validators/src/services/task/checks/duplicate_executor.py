@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import DUPLICATED_MACHINE_SET
 

@@ -13,7 +13,6 @@ import logging
 
 import pytest
 from core import validator as validator_module
-from core.config import settings
 from core.validator import settle_cycle_results, specs_to_publish
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine
