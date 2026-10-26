@@ -1089,9 +1089,12 @@ class _FillerRefusedBesideUnlistedPod(_FillerRefusedForCustomerCreate):
 class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
-    def __init__(self, message: str, *, state: ContainerStateSnapshot | None = None) -> None:
+    def __init__(
+        self, message: str, *, state: ContainerStateSnapshot | None = None, log_tail: str = ""
+    ) -> None:
         super().__init__(message)
         self.state = state
+        self.log_tail = log_tail
 
 
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
@@ -1258,6 +1261,39 @@ class AuthorizedKeysWriteFailed(RuntimeError):
     """The volume setup exec mounted the encrypted volume but could not write the renter's keys."""
 
 
+# DAH-5037: a default job's own last output rides as `container_logs_tail` in the failure detail, so a
+# provider whose image exits at start sees why; the backend's GPU-fault check skips that field. Filler
+# (default-job) containers only: a renter's container output is never read.
+CONTAINER_LOG_TAIL_LINES = 20
+CONTAINER_LOG_TAIL_MAX_CHARS = 1500
+
+
+async def _container_log_tail_or_empty(
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    environment: dict[str, str] | None,
+    log_extra: dict,
+) -> str:
+    try:
+        tail = await docker_client.container_log_tail(
+            container_name=container_name, lines=CONTAINER_LOG_TAIL_LINES
+        )
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "Could not read the log of a container that exited at start",
+                extra=get_extra_info({**log_extra, "container_name": container_name, "error": str(exc)}),
+            )
+        )
+        return ""
+    tail = tail.strip()
+    # a printed env value (e.g. an API key) must not reach the provider; redact before the cut so no half survives
+    for value in sorted({v for v in (environment or {}).values() if v}, key=len, reverse=True):
+        tail = tail.replace(value, "***")
+    return tail[-CONTAINER_LOG_TAIL_MAX_CHARS:]
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -1265,7 +1301,8 @@ async def _explain_add_public_keys_failure(
     image: str,
     cause: Exception,
     log_extra: dict,
-    capture_log_tail: bool = False,
+    workload_kind: WorkloadKind,
+    environment: dict[str, str] | None = None,
 ) -> Exception:
     """The exception to raise for a failed `add_public_keys` step: the DAH-2624 explanation when the
     container has exited or restarted since `docker run`, otherwise `cause` unchanged.
@@ -1326,44 +1363,18 @@ async def _explain_add_public_keys_failure(
     else:
         situation = f"the container is not running ({state.describe()})"
     log_tail = ""
-    if capture_log_tail:
+    if workload_kind == WorkloadKind.FILLER:
         log_tail = await _container_log_tail_or_empty(
-            docker_client, container_name=container_name, log_extra=log_extra
+            docker_client, container_name=container_name, environment=environment, log_extra=log_extra
         )
     return ImageExitedDuringKeyInjection(
         f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
         f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
         "SSH keys were being installed; a pod needs a long-running process, for example a start "
-        f"command such as `sleep infinity`. Exec error: {cause}"
-        + (f"{CONTAINER_LOG_TAIL_MARKER}{log_tail}" if log_tail else ""),
+        f"command such as `sleep infinity`. Exec error: {cause}",
         state=state,
+        log_tail=log_tail,
     )
-
-
-# DAH-5037: lium-platform's portal shows a default job's own output after this marker, so a
-# provider whose image exits at start sees why. Filler (default-job) containers only: a renter's
-# container output is never copied into failure text.
-CONTAINER_LOG_TAIL_MARKER = " Container log (last lines): "
-CONTAINER_LOG_TAIL_LINES = 20
-CONTAINER_LOG_TAIL_MAX_CHARS = 1500
-
-
-async def _container_log_tail_or_empty(
-    docker_client: RentalDockerSdkClient, *, container_name: str, log_extra: dict
-) -> str:
-    try:
-        tail = await docker_client.container_log_tail(
-            container_name=container_name, lines=CONTAINER_LOG_TAIL_LINES
-        )
-    except Exception as exc:
-        logger.warning(
-            _m(
-                "Could not read the log of a container that exited at start",
-                extra=get_extra_info({**log_extra, "container_name": container_name, "error": str(exc)}),
-            )
-        )
-        return ""
-    return tail.strip()[-CONTAINER_LOG_TAIL_MAX_CHARS:]
 
 
 # after `docker kill`, park() re-reads the container state every _PARK_KILL_SETTLE_SECONDS for up to
@@ -9080,7 +9091,8 @@ class DockerService:
                             image=payload.docker_image,
                             cause=keys_exc,
                             log_extra=default_extra,
-                            capture_log_tail=payload.workload_kind == WorkloadKind.FILLER,
+                            workload_kind=payload.workload_kind,
+                            environment=custom_options.environment,
                         )
                         if explained is keys_exc:
                             raise
@@ -9396,6 +9408,9 @@ class DockerService:
             # `error_class` (e.g. `port_collision`: dockerd could not bind the pod's host port)
             # rides in the event's detail next to the stage so the backend can count the class
             error_class = rental_docker_error_class(e) or port_collision_error_class(e)
+            # DAH-5037: its own field, never in `error`, which the backend's GPU-fault check reads
+            last_exc = _last_attempt_exception(e)
+            log_tail = last_exc.log_tail if isinstance(last_exc, ImageExitedDuringKeyInjection) else ""
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
@@ -9404,6 +9419,7 @@ class DockerService:
                     "error": "; ".join(_exception_texts(e)),
                     "failure_step": current_step,
                     **({"error_class": error_class} if error_class else {}),
+                    **({"container_logs_tail": log_tail} if log_tail else {}),
                 }),
             )
             # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
@@ -9477,7 +9493,6 @@ class DockerService:
             ):
                 failure_detail = f"{failure_detail}: {e}"
 
-            last_exc = _last_attempt_exception(e)
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
