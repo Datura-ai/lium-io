@@ -16,6 +16,13 @@ DECISION_GPU_MISSING = "GPU_MISSING"
 DECISION_ANCHOR_BROKEN = "ANCHOR_BROKEN"
 
 
+def whole_set_replaced(anchor: list[str], current: list[str], rented: bool) -> bool:
+    """An idle node lists as many cards as it was anchored with and none of the anchored ones: the cards were replaced
+    (a VM host can get other physical GPUs on a reboot). It is re-anchored, as removing and re-adding the node would
+    do; a rented node, a missing card and a partly changed set are not."""
+    return not rented and bool(anchor) and len(current) == len(anchor) and not set(anchor) & set(current)
+
+
 def split_uuids(csv: str) -> list[str]:
     """The distinct UUIDs of a comma-joined list, sorted.
 
@@ -100,11 +107,15 @@ class GpuFingerprintCheck:
             }
 
             if not hard:
+                from .gpu_loss_hold import rented_pods  # gpu_loss_hold imports this module
+
+                # still a reset (score 0 this cycle); the next cycle anchors the new cards
+                reanchor = whole_set_replaced(anchor, current, rented=bool(rented_pods(ctx)))
                 event = render_message(
                     Msg.UUID_CHANGED,
                     ctx=ctx,
                     check_id=self.check_id,
-                    what={**what, "anchor_hard_would_be": decision},
+                    what={**what, "anchor_hard_would_be": decision, **({"reanchored": True} if reanchor else {})},
                 )
                 return CheckResult(
                     passed=False,
@@ -113,6 +124,7 @@ class GpuFingerprintCheck:
                         "clear_verified_job_info": True,
                         # tells a missing card (a renter's GPU reset can cause it) from a swap
                         "clear_verified_job_evidence": {"anchor_hard_would_be": decision},
+                        "gpu_reanchor": reanchor,
                     },
                 )
 

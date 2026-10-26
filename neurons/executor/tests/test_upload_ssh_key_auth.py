@@ -11,7 +11,7 @@ production keys are needed and every test run uses fresh cryptographic material.
 
 from unittest.mock import AsyncMock, MagicMock
 
-import bittensor
+from bittensor_wallet import Keypair
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -43,7 +43,7 @@ def validator_keypair():
     Created from a deterministic test URI so the ss58 address is stable
     within a test session without touching the file-system or a real wallet.
     """
-    return bittensor.Keypair.create_from_uri("//LiumTestValidator")
+    return Keypair.create_from_uri("//LiumTestValidator")
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +54,7 @@ def miner_keypair():
     Used to generate valid miner signatures and to configure the executor's
     MINER_HOTKEY_SS58_ADDRESS setting in the test app.
     """
-    return bittensor.Keypair.create_from_uri("//LiumTestMiner")
+    return Keypair.create_from_uri("//LiumTestMiner")
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ def test_miner_signature_from_wrong_keypair_rejected(endpoint, client, validator
     Simulates a request that does not come from the registered miner.
     """
     # Arrange — sign with a completely different keypair
-    unknown_miner = bittensor.Keypair.create_from_uri("//UnknownMiner")
+    unknown_miner = Keypair.create_from_uri("//UnknownMiner")
     payload = _build_payload(_SSH_KEY, unknown_miner, validator_keypair)
 
     # Act
@@ -175,7 +175,7 @@ def test_validator_signature_from_wrong_keypair_rejected(endpoint, client, miner
     was not produced by the trusted validator.
     """
     # Arrange — miner is valid; attacker signs as validator
-    attacker = bittensor.Keypair.create_from_uri("//Attacker")
+    attacker = Keypair.create_from_uri("//Attacker")
     payload = _build_payload(_SSH_KEY, miner_keypair, attacker)
 
     # Act
