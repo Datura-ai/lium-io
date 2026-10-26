@@ -84,6 +84,28 @@ class DockerCommand:
         )
 
     @staticmethod
+    def stop_container_init(name: str, grace_seconds: int, kill_wait_seconds: int) -> str:
+        """SIGTERM a container's init, wait `grace_seconds`, SIGKILL it, wait `kill_wait_seconds` (DAH-5101).
+
+        `docker stop` does the same signalling but only answers once dockerd has unmounted the
+        container's rootfs, and that unmount syncs the whole Docker filesystem: with a dirty page
+        cache full of the tenant's unwritten volume data it takes minutes on a slow disk. Signalling
+        the host pid directly (the executor runs `pid: host`) returns as soon as the processes are
+        gone, so the caller can drop that cache before dockerd gets to the unmount. Prints the pid
+        and whether it exited; exit 0 always, even when the container is already absent.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"pid=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {quoted} 2>/dev/null); "
+            "if [ -z \"$pid\" ] || [ \"$pid\" = 0 ]; then echo \"pid=none\"; exit 0; fi; "
+            "kill -TERM $pid 2>/dev/null; waited=0; "
+            f"while [ -d /proc/$pid ] && [ $waited -lt {int(grace_seconds)} ]; do sleep 1; waited=$((waited+1)); done; "
+            "if [ -d /proc/$pid ]; then kill -9 $pid 2>/dev/null; waited=0; "
+            f"while [ -d /proc/$pid ] && [ $waited -lt {int(kill_wait_seconds)} ]; do sleep 1; waited=$((waited+1)); done; fi; "
+            "if [ -d /proc/$pid ]; then echo \"pid=$pid exited=no\"; else echo \"pid=$pid exited=yes\"; fi"
+        )
+
+    @staticmethod
     def ps_filter(*name_patterns: str) -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
