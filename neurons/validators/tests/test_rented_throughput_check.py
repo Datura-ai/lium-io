@@ -16,6 +16,7 @@ from services.task.checks.rented_throughput import (
     RentedThroughputCheck,
     parse_busy,
     parse_disk,
+    parse_during,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
@@ -29,15 +30,33 @@ EXECUTOR = default_executor()
 pytestmark = pytest.mark.asyncio
 
 
-def snaps(rx_bytes: int = 0, sectors: int = 0, tx_bytes: int = 0, counters: bool = True) -> str:
+def snaps(
+    rx_bytes: int = 0,
+    sectors: int = 0,
+    tx_bytes: int = 0,
+    counters: bool = True,
+    during_rx: int = 0,
+    during_sectors: int = 0,
+    during_ios: int = 0,
+) -> str:
     """The docker root on nvme0n1, then two host snapshots 2 s apart: bytes received and sent on the NICs and sectors
-    moved on nvme0n1 in between. counters=False: the host's NIC counters were not readable."""
-    net0 = "rx=1000 tx=1000 " if counters else ""
-    net1 = f"rx={1000 + rx_bytes} tx={1000 + tx_bytes} " if counters else ""
+    moved on nvme0n1 in between. counters=False: the host's NIC counters were not readable. Then one after the disk
+    container (10 s; the probe's own 256 MiB and 4096 requests plus during_sectors/during_ios) and one after the fetch
+    container (10 s; during_rx on top of the probe's own downloads)."""
+
+    def net(rx: int, tx: int) -> str:
+        return f"rx={1000 + rx} tx={1000 + tx} " if counters else ""
+
+    own_sectors, own_rx = 256 * 2048, 2 * 16 * 1024 * 1024
+    s2 = 500 + sectors + own_sectors + during_sectors
+    n2 = 9 + 4096 + during_ios
+    rx3 = rx_bytes + own_rx + during_rx
     return (
         "lium_tp_device name=nvme0n1p2\nlium_tp_device name=nvme0n1\n"
-        f"lium_tp t=100.0 {net0}io=nvme0n1:500,sda:7,\n"
-        f"lium_tp t=102.0 {net1}io=nvme0n1:{500 + sectors},sda:7,\n"
+        f"lium_tp t=100.0 {net(0, 0)}io=nvme0n1:500:9,sda:7:1,\n"
+        f"lium_tp t=102.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{500 + sectors}:9,sda:7:1,\n"
+        f"lium_tp t=112.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,\n"
+        f"lium_tp t=122.0 {net(rx3, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,\n"
     )
 
 
@@ -117,6 +136,10 @@ def test_defaults_enforce_with_a_kill_switch():
 def test_command_samples_the_host_then_probes_disk_and_network_in_the_renter_runtime():
     cmd = throughput_command(True)
     assert cmd.index("/proc/1/net/dev") < cmd.index("/usr/bin/docker run")
+    # host counters after the disk container and after the fetch container
+    disk_run, fetch_run = cmd.split("/usr/bin/docker run")[1:]
+    assert "dd if=/dev/zero" in disk_run and "; snap; " in disk_run and "wget" not in disk_run
+    assert "wget" in fetch_run and fetch_run.endswith("; snap")
     assert cmd.index("DockerRootDir") < cmd.index("/proc/1/mountinfo") < cmd.index("lium_tp_device")
     assert "--runtime=sysbox-runc" in cmd and '--network "$net"' in cmd
     assert (
@@ -141,6 +164,25 @@ def test_parse_disk_and_busy():
     assert parse_busy(snaps(counters=False, sectors=2_000_000)) == (None, pytest.approx(512.0))
     assert parse_busy(snaps().replace("lium_tp_device name=nvme0n1\n", ""))[1] is None
     assert parse_busy("") == (None, None)
+    # the old two-field io format still parses
+    assert parse_busy(snaps(sectors=2_000_000).replace(":9,", ",").replace(":1,", ","))[
+        1
+    ] == pytest.approx(512.0)
+    reading = parse_disk(disk())
+    endpoints = download_module.parse_download_speed(FAST)
+    assert parse_during(snaps(), endpoints, reading) == (0.0, (0.0, 0.0))
+    net, (mb, iops) = parse_during(
+        snaps(during_rx=50_000_000, during_sectors=200_000, during_ios=1000), endpoints, reading
+    )
+    own_net = (
+        2 * 16 * 1024 * 1024 * 1.1 + 2 * 8 * 1024 * 1024
+    )  # FAST's downloads, overhead and in-flight slack
+    assert net == pytest.approx((50_000_000 + 2 * 16 * 1024 * 1024 - own_net) * 8 / 10 / 1e6)
+    assert mb == pytest.approx(
+        (200_000 * 512 - 32 * 1024 * 1024) / 10 / 1e6
+    ) and iops == pytest.approx(100.0)
+    two = "".join(ln + "\n" for ln in snaps().splitlines()[:4])  # no counters after the probe
+    assert parse_during(two, endpoints, reading) == (None, (None, None))
 
 
 async def test_good_reading_passes():
@@ -155,12 +197,13 @@ async def test_good_reading_passes():
 @pytest.mark.parametrize("relevant", [0, 2_000_000])
 @pytest.mark.parametrize("unrelated", [0, 2_000_000])
 async def test_only_the_docker_root_disk_excuses_the_disk(resolved, seconds, relevant, unrelated):
+    after = f"io=sda:{7 + relevant + 256 * 2048},nvme0n1:{500 + unrelated},\n"
     output = (
         ("lium_tp_device name=sda\n" if resolved else "")
         + "lium_tp t=100 rx=1000 tx=1000 io=sda:7,nvme0n1:500,\n"
         f"lium_tp t=102 rx=1000 tx=1000 io=sda:{7 + relevant},nvme0n1:{500 + unrelated},\n"
-        + disk(secs=seconds)
-        + FAST
+        f"lium_tp t=140 rx=1000 tx=1000 {after}"
+        f"lium_tp t=150 rx=1000 tx=1000 {after}" + disk(secs=seconds) + FAST
     )
     with flags():
         ctx, _ = make_ctx(output)
@@ -211,6 +254,41 @@ async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
         assert busy.passed and busy.event.reason_code == Msg.SLOW_ONCE.reason
         clock.now += 31 * 60
         assert (await check.run(ctx)).passed is False
+
+
+# The renter starts loading the disk or the link only after the 2 s window, while the probe measures it: no verdict,
+# never a strike. Idle during the probe, the same slow reading fails.
+@pytest.mark.parametrize(
+    "answer, side",
+    [
+        (
+            snaps(during_sectors=2_000_000) + disk(secs=30.0) + FAST,
+            "disk",
+        ),  # 100 MB/s of renter writes
+        (snaps(during_ios=500) + disk(secs=30.0) + FAST, "disk"),  # 50 random requests/s, few bytes
+        (snaps(during_rx=40_000_000) + disk() + SLOW, "net"),  # ~29 Mbps of renter downloads
+        ("".join(ln + "\n" for ln in snaps().splitlines()[:4]) + disk(secs=30.0) + SLOW, "both"),
+    ],
+    ids=["disk_bytes", "disk_requests", "network", "no_counters_after"],
+)
+async def test_renter_load_during_the_probe_is_no_verdict(answer, side):
+    with flags():
+        ctx, _ = make_ctx(answer)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert (net == "none") is (side in ("net", "both"))
+    assert (disk_side == "none") is (side in ("disk", "both"))
+    assert "during_disk_iops" in reading
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        for _ in range(2):
+            assert (await check.run(ctx)).passed
+            clock.now += 31 * 60
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(SLOW_DISK)[0])
+        assert disk_side == "fail"
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(SLOW_NET)[0])
+        assert net == "fail"
 
 
 async def test_idle_foreign_or_stopped_rentals_are_left_alone():
