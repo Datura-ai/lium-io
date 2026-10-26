@@ -245,7 +245,7 @@ sudo losetup --direct-io=on /dev/loopN
 losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
 ```
 
-**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. It also stays stopped when direct I/O cannot be set (`losetup` fails with `Invalid argument`, e.g. an image whose sector size is smaller than its disk's); move the data-root to a real disk then. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), or a real disk replaces the image at the same mount point, the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
+**Keep it across reboots.** `mount -o loop` cannot set direct I/O, so a unit sets it after the mount, and Docker requires that unit. While Docker's data-root (`"data-root"` in `/etc/docker/daemon.json`, else `/var/lib/docker`) is on the image and the image does not mount, Docker stays stopped instead of starting on the empty directory. When direct I/O cannot be set (`losetup` fails with `Invalid argument`, e.g. an image whose sector size is smaller than its disk's), Docker still starts so the node stays up, the journal shows a warning and the installer's `--check` reports `FIX`; move the data-root to a real disk then. Once the data-root is elsewhere (moved by hand, by `lium mine` or by `lium gpu-splitting setup`), or a real disk replaces the image at the same mount point, the unit does nothing and Docker starts. The example uses the image `/data/img.raw` mounted at `/data/dockerimg`.
 
 1. In your existing `/etc/fstab` line for the image, add `nofail,x-systemd.requires=/data`. Keep its filesystem type and its quota option (`pquota` / `prjquota`): Docker's `--storage-opt` needs them. Name the disk under `/data` by `UUID=`: a `/dev/nvmeX` name can change on reboot.
 
@@ -263,7 +263,7 @@ losetup -l -O NAME,BACK-FILE,DIO   # DIO is 1
    root=${root:-/var/lib/docker}   # no "data-root" key: Docker's default
    case "$root" in "$MNT" | "$MNT"/*) ;; *) exit 0 ;; esac   # data-root not on the image: nothing to do
    src=$(findmnt -n -o SOURCE --mountpoint "$MNT") || { echo "$MNT is not mounted, Docker stays stopped"; exit 1; }
-   case "$src" in /dev/loop*) losetup --direct-io=on "$src" || { echo "direct I/O failed on $src, Docker stays stopped"; exit 1; } ;; esac   # a real disk needs nothing
+   case "$src" in /dev/loop*) losetup --direct-io=on "$src" || echo "<4>direct I/O failed on $src, Docker starts buffered: move the data-root to a real disk" ;; esac   # a real disk needs nothing
    EOF
    sudo chmod 755 /usr/local/sbin/loop-dio-docker
    sudo tee /etc/systemd/system/loop-dio-docker.service >/dev/null <<'EOF'
