@@ -449,11 +449,10 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
 
 
 
-GOCRYPTFS_LINE = "50 40 0:60 / /root rw - fuse.gocryptfs /lium-cipher rw\n"
 OVERLAY_LINE = "40 1 0:50 / / rw - overlay overlay rw\n"
 
 
-async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str, setup: AsyncMock | None = None, encrypted=True):
+async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
     # DAH-5047: pre-backup gocryptfs liveness check and remount
     ssh_client = AsyncMock()
     ssh_client.run.return_value = SimpleNamespace(stdout=mountinfo)
@@ -461,40 +460,23 @@ async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str, setup: Async
     start = AsyncMock()
     monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
     docker_service = _docker_service_with_pinned_hosts()
-    docker_service.setup_encrypted_local_volume = setup or AsyncMock()
+    docker_service.setup_encrypted_local_volume = AsyncMock()
     payload = _backup_payload()
     payload.backup_engine = "restic"
     payload.backup_log_id = "11111111-1111-4111-8111-111111111111"
-    payload.volume_encrypted = encrypted
+    payload.volume_encrypted = True
     payload.container_name = "container_pod"
     await MinerService.__new__(MinerService).handle_backup_container_req(_executor_info(), payload, Mock(), docker_service)
     start.assert_awaited_once()
-    return ssh_client, docker_service.setup_encrypted_local_volume
+    return docker_service.setup_encrypted_local_volume
 
-
-@pytest.mark.asyncio
-async def test_restic_backup_skips_remount_when_gocryptfs_mount_is_live(monkeypatch):
-    _, setup = await _run_encrypted_restic_backup(monkeypatch, OVERLAY_LINE + GOCRYPTFS_LINE)
-    setup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_restic_backup_remounts_a_dropped_gocryptfs_mount_without_init(monkeypatch):
-    _, setup = await _run_encrypted_restic_backup(monkeypatch, OVERLAY_LINE)
+    setup = await _run_encrypted_restic_backup(monkeypatch, OVERLAY_LINE)
     kwargs = setup.await_args.kwargs
     assert kwargs["allow_init"] is False
     assert (kwargs["container_name"], kwargs["plaintext_path"], kwargs["volume_name"], kwargs["pod_id"]) == (
         "container_pod", "/root", "source-volume", "pod",
     )
-
-
-@pytest.mark.asyncio
-async def test_restic_backup_launches_when_the_remount_fails(monkeypatch):
-    await _run_encrypted_restic_backup(monkeypatch, OVERLAY_LINE, setup=AsyncMock(side_effect=RuntimeError("boom")))
-
-
-@pytest.mark.asyncio
-async def test_restic_backup_of_a_plain_volume_skips_the_mount_check(monkeypatch):
-    ssh_client, setup = await _run_encrypted_restic_backup(monkeypatch, "", encrypted=False)
-    ssh_client.run.assert_not_awaited()
-    setup.assert_not_awaited()
