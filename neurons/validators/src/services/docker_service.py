@@ -2551,6 +2551,7 @@ class DockerService:
         attempt = 0
         vloopback_mount_repair_attempted = False
         remapped = False
+        own_leftover_removed = False
         while True:
             try:
                 container_id = await run_logged_rental_docker_sdk_operation(
@@ -2564,6 +2565,19 @@ class DockerService:
             except ContainerCreateRefused:
                 raise
             except Exception as exc:
+                # A re-sent create for this pod meets its earlier attempt's container under the
+                # pod's own (unique) name: 409 "The container name "/pod_<id>" is already in use".
+                # Only that exact name is removed, once; any other name conflict fails as before.
+                if not own_leftover_removed and f'"/{container_name}" is already in use' in str(exc):
+                    own_leftover_removed = True
+                    attempt += 1
+                    await self._remove_failed_rental_container_for_retry(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                        warning_event="OWN_LEFTOVER_CONTAINER_RM_FAILED",
+                    )
+                    continue
                 if _should_repair_stale_mountpoint(
                     exc,
                     local_volume,

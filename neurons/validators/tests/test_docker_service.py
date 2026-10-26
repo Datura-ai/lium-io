@@ -4684,6 +4684,49 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "conflict_name, expected_events",
+    [
+        # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
+        ("pod_test", ["run", "rm pod_test", "run"]),
+        ("pod_other", ["run"]),
+    ],
+)
+async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
+    docker_service, monkeypatch, conflict_name, expected_events,
+):
+    events: list[str] = []
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if events.count("run") == 1:
+                raise Exception(
+                    f'409 Client Error: Conflict ("Conflict. The container name "/{conflict_name}" '
+                    'is already in use by container "25b3b093".")'
+                )
+            return "cid"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    run = docker_service._run_rental_docker_create_with_port_retry(
+        docker_client=FakeRentalClient(),
+        ssh_client=Mock(),
+        run_spec=ContainerRunSpec(image="img", name="pod_test"),
+        container_name="pod_test",
+        default_extra={},
+    )
+    if conflict_name == "pod_test":
+        assert await run == "cid"
+    else:
+        with pytest.raises(Exception, match="already in use"):
+            await run
+    assert events == expected_events
+
+
+@pytest.mark.asyncio
 async def test_create_container_does_not_repair_vloopback_mountpoint_twice(
     docker_service, monkeypatch,
 ):
