@@ -56,7 +56,7 @@ class VerifyXCheck:
 
     The check blocks on the probe's success. It always runs (DAH-4328 removed the
     ENABLE_VERIFYX setting, on everywhere since Sep 2025); only an idle filler-only node
-    skips it, keeping its last known EMA.
+    with a stored EMA skips it, keeping that EMA.
     """
 
     check_id = "gpu.validate.verifyx"
@@ -80,7 +80,10 @@ class VerifyXCheck:
             return CheckResult(passed=False, event=event)
 
         filler_container = _get_filler_only_container(ctx)
-        if filler_container:
+        stored_ema = _stored_network_ema(ctx)
+        # A never-measured node is probed even under a filler: with no EMA to reuse it would
+        # score 0 every cycle and stay hidden for as long as the filler runs.
+        if filler_container and stored_ema and stored_ema.ema_verifyx_download_speed is not None:
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,

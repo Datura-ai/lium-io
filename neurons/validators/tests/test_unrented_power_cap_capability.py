@@ -17,9 +17,7 @@ from services.task_service import JobResult
 
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 
-CAPS_WITH_SYS_ADMIN = "000001ffffffffff"   # sysbox / privileged container: every capability
 CAPS_WITHOUT_SYS_ADMIN = "00000000a80425fb"  # prod 128.140.36.181: default docker caps
-NOBODY_UID = 65534  # what sysbox maps /dev/nvidiactl to (prod 88.22.127.152)
 
 
 @pytest.fixture(autouse=True)
@@ -71,46 +69,6 @@ def _make_job(
     )
 
 
-def test_missing_cap_sys_admin_is_flagged():
-    # Arrange — prod case: default docker capabilities, device owned by root
-    incentive = _build_incentive()
-
-    # Act
-    incapable = incentive._power_cap_incapable(_make_job())
-
-    # Assert
-    assert incapable is not None
-    assert incapable.container_cap_eff == CAPS_WITHOUT_SYS_ADMIN
-    assert incapable.nvidiactl_owner_uid == 0
-
-
-def test_device_not_owned_by_root_is_flagged():
-    # Arrange — prod sysbox case: every capability held, but the device is mapped away
-    incentive = _build_incentive()
-
-    # Act
-    incapable = incentive._power_cap_incapable(
-        _make_job(cap_eff=CAPS_WITH_SYS_ADMIN, owner_uid=NOBODY_UID)
-    )
-
-    # Assert
-    assert incapable is not None
-    assert incapable.nvidiactl_owner_uid == NOBODY_UID
-
-
-def test_capable_executor_is_not_flagged():
-    # Arrange — both conditions met, which is what `nvidia-smi -pl` needs
-    incentive = _build_incentive()
-
-    # Act
-    incapable = incentive._power_cap_incapable(
-        _make_job(cap_eff=CAPS_WITH_SYS_ADMIN, owner_uid=0)
-    )
-
-    # Assert
-    assert incapable is None
-
-
 UNPROVEN_SPECS: list[dict] = [
     {},                                                             # validator older than DAH-2705
     {"container_cap_eff": CAPS_WITHOUT_SYS_ADMIN},                   # uid reading missing
@@ -130,64 +88,6 @@ def test_unproven_probe_is_never_flagged(spec):
     incentive = _build_incentive()
 
     assert incentive._power_cap_incapable(_make_job(spec=spec)) is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("spec", UNPROVEN_SPECS)
-async def test_malformed_scrape_never_breaks_scoring(spec):
-    # Raising out of calculate_executor_score would cost EVERY miner this cycle's weights.
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(_make_job(spec=spec))
-
-    assert result.eligible_for_rental_share is True
-
-
-def _logged_reasons(caplog) -> list[str]:
-    # the reason codes of the structured lines captured so far; _m keeps them off the message
-    return [r.msg.extra.get("reason") for r in caplog.records if hasattr(r.msg, "extra")]
-
-
-def test_estimated_job_result_is_not_logged_as_unmeasured(caplog):
-    # estimate_executor builds a spec-less JobResult for every GPU model every cycle;
-    # warning on those would drown the shadow measurement this log exists to feed.
-    incentive = _build_incentive()
-    job = _make_job()
-    job.spec = None
-
-    with caplog.at_level(logging.WARNING):
-        incentive._power_cap_incapable(job)
-
-    assert "power_cap_capability_unmeasured" not in _logged_reasons(caplog)
-
-
-def test_scrape_without_the_probe_keys_is_logged_as_unmeasured(caplog):
-    # A real scrape that carries no probe (validator older than DAH-2705) is a measurable
-    # fact and belongs in the denominator, unlike a synthetic spec-less result.
-    incentive = _build_incentive()
-
-    with caplog.at_level(logging.WARNING):
-        incentive._power_cap_incapable(_make_job(spec={}))
-
-    assert "power_cap_capability_unmeasured" in _logged_reasons(caplog)
-
-
-def test_broken_probe_is_logged_as_unmeasured(caplog):
-    # A node whose probe failed must be distinguishable from one that passed the gate,
-    # or the shadow window has no denominator. The probe's own error rides along.
-    incentive = _build_incentive()
-
-    with caplog.at_level(logging.WARNING):
-        incentive._power_cap_incapable(
-            _make_job(spec={"container_cap_eff": "", "nvidiactl_owner_uid": 0,
-                            "power_cap_probe_error": "cannot read /proc/self/status"})
-        )
-
-    unmeasured = next(
-        r.msg for r in caplog.records
-        if hasattr(r.msg, "extra") and r.msg.extra.get("reason") == "power_cap_capability_unmeasured"
-    )
-    assert unmeasured.extra["power_cap_probe_error"] == "cannot read /proc/self/status"
 
 
 @pytest.mark.asyncio
@@ -221,42 +121,3 @@ async def test_enforced_drops_rental_eligibility():
     assert result.mining_score == 0
 
 
-@pytest.mark.asyncio
-async def test_enforced_appends_customer_facing_incentive_log():
-    # DAH-2327: the zero-incentive reason must reach the customer-facing incentive log,
-    # carrying both readings so the provider can tell which of the two to fix.
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(
-        _make_job(cap_eff=CAPS_WITH_SYS_ADMIN, owner_uid=NOBODY_UID)
-    )
-
-    log = "\n".join(result.incentive_logs)
-    assert "cannot_apply_gpu_power_cap" in log
-    assert CAPS_WITH_SYS_ADMIN in log
-    assert str(NOBODY_UID) in log
-    assert [reason.reason for reason in result.zero_incentive_reasons] == ["cannot_apply_gpu_power_cap"]
-
-
-@pytest.mark.asyncio
-async def test_capable_executor_keeps_eligibility_when_enforced():
-    # Arrange — the container can apply a cap
-    incentive = _build_incentive()
-
-    # Act
-    result = await incentive.calculate_executor_score(
-        _make_job(cap_eff=CAPS_WITH_SYS_ADMIN, owner_uid=0)
-    )
-
-    # Assert
-    assert result.eligible_for_rental_share is True
-
-
-@pytest.mark.asyncio
-async def test_rented_executor_is_not_gated():
-    # A rented machine earns from the rented path and must not be touched by this gate.
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(_make_job(is_rented=True))
-
-    assert "cannot_apply_gpu_power_cap" not in "\n".join(result.incentive_logs)

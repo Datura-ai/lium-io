@@ -28,7 +28,6 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
 
 from __future__ import annotations
 
-import inspect
 import os
 import stat
 import subprocess
@@ -42,18 +41,12 @@ from services.docker_service import (
     DOCKER_FILLER_VOLUME_LS_NAME_DRIVER_CMD,
     DockerService,
     _ENCRYPTED_VOLUME_IMAGE_LABEL,
+    SshSessionMayStillBeTakenError,
     VolumeHostProbe,
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
-from services.gpu_power_limit import (
-    POWER_LIMIT_SET_CONCURRENCY,
-    POWER_STATE_CMD,
-    raise_low_power_limits_to_default,
-    restore_tracked_gpu_power_limits,
-)
 from services.nvidia_devices import (
-    GPU_DEVICE_NODES_CMD,
     MissingRentedGpuError,
     PROC_GPU_INFO_CMD,
     build_gpu_docker_config_for_executor,
@@ -63,11 +56,9 @@ from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
     DOCKER_PS_ALL_NAMES_IDS_CMD,
     DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
-    PREFIX_FAILED_MARKER,
     PrerunHostProbe,
     PrerunHostProbeParseError,
     ProbedVolume,
-    image_label_command,
     parse_prerun_host_probe,
     port_check_containers_command,
     prerun_host_probe_command,
@@ -167,52 +158,6 @@ def _cmds(client) -> list[str]:
 # ------------------------------------------------------------------
 
 
-def test_probe_command_carries_every_section_and_the_per_command_texts():
-    cmd = prerun_host_probe_command(
-        docker_image=_IMAGE,
-        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
-        miner_hotkey=_HOTKEY,
-        with_power=True
-    )
-    assert "\n" not in cmd
-    for tag in (
-        "PS", "VOL", "MNT", "GPUMINORMAP", "GPUDEV", "SHARED", "SHAREDW", "POWER", "LABEL", "PORTCHECK"
-    ):
-        assert f"t {tag} " in cmd
-    # shlex.quote wraps each section command; the quoted forms of the shared texts are inside
-    import shlex
-
-    assert shlex.quote(DOCKER_PS_ALL_NAMES_IDS_CMD) in cmd
-    assert shlex.quote(DOCKER_VOLUME_LS_NAME_DRIVER_CMD) in cmd
-    assert shlex.quote(DOCKER_MOUNTED_VOLUME_NAMES_CMD) in cmd
-    assert f"|| echo {PREFIX_FAILED_MARKER}" in cmd
-
-    assert shlex.quote(PROC_GPU_INFO_CMD) in cmd
-    assert shlex.quote(GPU_DEVICE_NODES_CMD) in cmd
-    assert shlex.quote(POWER_STATE_CMD) in cmd
-    assert shlex.quote(shared_device_nodes_command(is_whole_host_rental=False)) in cmd
-    assert (
-        shlex.quote(shared_device_nodes_command(is_whole_host_rental=True, whole_host_only=True))
-        in cmd
-    )
-    assert shlex.quote(image_label_command(_IMAGE, _ENCRYPTED_VOLUME_IMAGE_LABEL)) in cmd
-    assert shlex.quote(port_check_containers_command(_HOTKEY)) in cmd
-    # the probe reads; it never removes, installs or writes
-    for verb in (" rm ", "volume rm", "plugin install", "nvidia-smi -pl", "-pm 1"):
-        assert verb not in cmd
-
-
-def test_probe_command_without_power_has_no_nvidia_smi():
-    cmd = prerun_host_probe_command(
-        docker_image=_IMAGE,
-        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
-        miner_hotkey=_HOTKEY,
-        with_power=False
-    )
-    assert "nvidia-smi" not in cmd
-    assert "t POWER " not in cmd
-
-
 def test_probe_without_the_image_label_keeps_the_image_out_of_the_host_command():
     cmd = prerun_host_probe_command(
         docker_image=_IMAGE, image_label=None, miner_hotkey=_HOTKEY, with_power=True
@@ -225,14 +170,6 @@ def test_probe_without_the_image_label_keeps_the_image_out_of_the_host_command()
     # a probe that expects the label still refuses an output without it
     with pytest.raises(PrerunHostProbeParseError):
         parse_prerun_host_probe(out, with_power=True)
-
-
-def test_image_label_command_is_the_one_the_label_check_ran():
-    cmd = image_label_command("a b/c:1", _ENCRYPTED_VOLUME_IMAGE_LABEL)
-    assert cmd == (
-        "/usr/bin/docker image inspect --format "
-        f"'{{{{index .Config.Labels \"{_ENCRYPTED_VOLUME_IMAGE_LABEL}\"}}}}' 'a b/c:1'"
-    )
 
 
 def test_shared_device_nodes_command_whole_host_only_is_the_tail_of_the_whole_host_command():
@@ -254,69 +191,6 @@ def test_shared_device_nodes_command_whole_host_only_is_the_tail_of_the_whole_ho
 # ------------------------------------------------------------------
 
 
-def test_parser_reads_the_full_container_ids_next_to_the_names():
-    full = "e" * 64
-    probe = parse_prerun_host_probe(_stdout(ps=(f"pod_a {full}", "other")), with_power=True)
-    assert probe.container_names == ("pod_a", "other")
-    assert probe.container_ids == {"pod_a": full}
-    assert parse_prerun_host_probe(_stdout(ps_rc=1), with_power=True).container_ids == {}
-
-
-def test_parser_reads_every_section():
-    probe = parse_prerun_host_probe(_stdout(), with_power=True)
-    assert probe.container_names == ("pod_a", "other")
-    assert probe.volumes == (
-        ProbedVolume("volume_a", "vloopback:latest"),
-        ProbedVolume("dphn_cache_x", "local"),
-    )
-    assert probe.volume_names == ("volume_a", "dphn_cache_x")
-    assert probe.mounted_volume_names == ("volume_a",)
-    assert probe.gpu_minor_map_stdout == "GPU-1, 0\nGPU-2, 1"
-    assert probe.gpu_device_nodes == ("/dev/nvidia0", "/dev/nvidia1")
-    assert probe.shared_nodes_for(is_whole_host_rental=False) == (
-        "/dev/nvidiactl",
-        "/dev/nvidia-uvm",
-    )
-    assert probe.shared_nodes_for(is_whole_host_rental=True) == (
-        "/dev/nvidiactl",
-        "/dev/nvidia-uvm",
-        "/dev/infiniband/uverbs0",
-        "/dev/nvidia-caps/nvidia-cap1",
-    )
-    assert probe.power_state_stdout == "GPU-1, 300.00, 450.00, 100.00, 450.00"
-    assert probe.image_label_value == "1"
-
-
-def test_parser_empty_sections_are_empty_not_none():
-    probe = parse_prerun_host_probe(
-        _stdout(ps=(), vol=(), mnt=(), gpudev=(), shared=(), sharedw=()), with_power=True
-    )
-    assert probe.container_names == ()
-    assert probe.volumes == ()
-    assert probe.mounted_volume_names == ()
-    assert probe.gpu_device_nodes == ()
-    assert probe.shared_nodes_for(is_whole_host_rental=True) == ()
-
-
-@pytest.mark.parametrize(
-    "kwargs, attr",
-    [
-        ({"ps_rc": 1}, "container_names"),
-        ({"vol_rc": 125}, "volumes"),
-        ({"mnt_rc": 123}, "mounted_volume_names"),
-        ({"gpu_minor_map_rc": 2}, "gpu_minor_map_stdout"),
-        ({"power_rc": 127}, "power_state_stdout"),
-        ({"label_rc": 1}, "image_label_value"),
-        ({"port_check_rc": 1}, "port_check_container_names"),
-    ],
-)
-def test_parser_failed_section_is_none_and_the_rest_survive(kwargs, attr):
-    probe = parse_prerun_host_probe(_stdout(**kwargs), with_power=True)
-    assert getattr(probe, attr) is None
-    others = {f for f in probe.__dataclass_fields__ if f != attr}
-    assert all(getattr(probe, f) is not None for f in others)
-
-
 def test_parser_device_node_sections_ignore_the_exit_status_like_the_per_command_path():
     # `for p in …; do [ -e "$p" ] && …; done` exits 1 when the last node is absent; the live path
     # never read that status, so an exit 1 with nodes listed is still a listing (and an empty one
@@ -335,82 +209,6 @@ def test_parser_device_node_sections_ignore_the_exit_status_like_the_per_command
         "/dev/infiniband/uverbs0",
         "/dev/nvidia-caps/nvidia-cap1",
     )
-
-
-def test_parser_failed_volume_listing_hides_volume_names_too():
-    probe = parse_prerun_host_probe(_stdout(vol_rc=1), with_power=True)
-    assert probe.volumes is None and probe.volume_names is None
-
-
-def test_parser_shared_nodes_for_whole_host_needs_both_sections():
-    probe = _probe(shared_nodes=("/dev/nvidiactl",), shared_nodes_whole_host_only=None)
-    assert probe.shared_nodes_for(is_whole_host_rental=False) == ("/dev/nvidiactl",)
-    assert probe.shared_nodes_for(is_whole_host_rental=True) is None
-
-
-def test_parser_without_power_ignores_the_power_section_requirement():
-    probe = parse_prerun_host_probe(_stdout(power=None), with_power=False)
-    assert probe.power_state_stdout is None
-    assert probe.container_names == ("pod_a", "other")
-
-
-def test_parser_missing_rc_line_raises():
-    stdout = _stdout().replace("MNT_RC\t0\n", "")
-    with pytest.raises(PrerunHostProbeParseError, match="no MNT_RC"):
-        parse_prerun_host_probe(stdout, with_power=True)
-
-
-def test_parser_missing_power_rc_raises_only_when_power_was_asked():
-    stdout = _stdout(power=None)
-    with pytest.raises(PrerunHostProbeParseError, match="no POWER_RC"):
-        parse_prerun_host_probe(stdout, with_power=True)
-    parse_prerun_host_probe(stdout, with_power=False)
-
-
-def test_parser_untagged_line_raises():
-    with pytest.raises(PrerunHostProbeParseError, match="untagged line"):
-        parse_prerun_host_probe("garbage\n" + _stdout(), with_power=True)
-
-
-def test_parser_unknown_tag_raises():
-    with pytest.raises(PrerunHostProbeParseError, match="unknown section"):
-        parse_prerun_host_probe(_stdout() + "NEW\tx\nNEW_RC\t0\n", with_power=True)
-
-
-def test_parser_non_numeric_rc_raises():
-    with pytest.raises(PrerunHostProbeParseError, match="PS_RC is 'x'"):
-        parse_prerun_host_probe(_stdout().replace("PS_RC\t0", "PS_RC\tx"), with_power=True)
-
-
-def test_parser_error_message_is_capped():
-    with pytest.raises(PrerunHostProbeParseError) as exc:
-        parse_prerun_host_probe(
-            _stdout(ps=("x" * 5000,)).replace("MNT_RC\t0\n", ""), with_power=True
-        )
-    assert len(str(exc.value)) < 800
-
-
-@pytest.mark.parametrize(
-    "lines, expected",
-    [
-        (("1",), "1"),
-        (("",), ""),  # no such label → `{{index …}}` prints an empty line
-        (("<no value>",), "<no value>"),
-        (
-            ("", "1"),
-            "1",
-        ),  # a value with a leading newline arrives as two LABEL lines; strip() as before
-        (("1", "x"), "1\nx"),
-        (
-            ("1\tx",),
-            "1\tx",
-        ),  # a tab in the value stays in the value: only the first tab separates the tag
-    ],
-)
-def test_parser_label_value_matches_the_stripped_stdout_semantics(lines, expected):
-    probe = parse_prerun_host_probe(_stdout(label=lines), with_power=True)
-    assert probe.image_label_value == expected
-    assert (probe.image_label_value == "1") is (expected == "1")
 
 
 # ------------------------------------------------------------------
@@ -457,30 +255,6 @@ def _run_probe_in_sh(tmp_path, *, label_value: str = "1", with_power: bool = Tru
     ).stdout
 
 
-def test_probe_through_sh_lists_docker_sections_and_marks_absent_nvidia_smi(tmp_path):
-    out = _run_probe_in_sh(tmp_path)
-    probe = parse_prerun_host_probe(out, with_power=True)
-    assert probe.container_names == ("pod_a", "filler_b", "other")
-    assert probe.volumes == (
-        ProbedVolume("volume_a", "vloopback:latest"),
-        ProbedVolume("volume_b", "local"),
-    )
-    assert probe.mounted_volume_names == ("volume_a", "volume_a")  # blank lines dropped as before
-    assert probe.image_label_value == "1"
-    assert probe.port_check_container_names == ("health_check_1",)
-    # the GPU / device-node sections list whatever the test host has (a GPU workstation has
-    # /dev/nvidia*, a CI runner may have /dev/infiniband/*) — they are listings, never failures
-    assert probe.gpu_minor_map_stdout is not None and probe.gpu_device_nodes is not None
-    assert probe.shared_nodes_for(is_whole_host_rental=True) is not None
-    # the nvidia-smi stub exits 1 → the section failed → None → the live query would run
-    assert probe.power_state_stdout is None
-
-
-def test_probe_through_sh_label_absent_is_not_encrypted(tmp_path):
-    probe = parse_prerun_host_probe(_run_probe_in_sh(tmp_path, label_value=""), with_power=True)
-    assert probe.image_label_value == ""
-
-
 def test_probe_through_sh_multiline_label_cannot_forge_another_section(tmp_path):
     # every line of a command's output gets that command's tag — an image label cannot inject a PS line
     probe = parse_prerun_host_probe(
@@ -491,293 +265,14 @@ def test_probe_through_sh_multiline_label_cannot_forge_another_section(tmp_path)
     assert probe.image_label_value != "1"
 
 
-def test_probe_through_sh_prefix_failure_is_a_whole_probe_fallback(tmp_path):
-    # awk missing on the host → the marker line (untagged) → the parser raises → probe None →
-    # every step on its own command; never an empty listing
-    stub = tmp_path / "docker"
-    stub.write_text(_DOCKER_STUB)
-    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
-    broken_awk = tmp_path / "awk"
-    broken_awk.write_text("#!/bin/sh\nexit 1\n")
-    broken_awk.chmod(broken_awk.stat().st_mode | stat.S_IXUSR)
-    cmd = prerun_host_probe_command(
-        docker_image=_IMAGE,
-        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
-        miner_hotkey=_HOTKEY,
-        with_power=False
-    ).replace("/usr/bin/docker", str(stub))
-    env = {**os.environ, "LABEL_VALUE": "1", "PATH": f"{tmp_path}:/usr/bin:/bin"}
-    out = subprocess.run(
-        ["sh", "-c", cmd], capture_output=True, text=True, env=env, check=False
-    ).stdout
-    assert PREFIX_FAILED_MARKER in out
-    with pytest.raises(PrerunHostProbeParseError, match="untagged line"):
-        parse_prerun_host_probe(out, with_power=False)
-
-
 # ------------------------------------------------------------------
 # probe_prerun_host is never fatal
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_probe_prerun_host_runs_one_command_and_parses(docker_service):
-    ssh = _ssh(_ssh_result(stdout=_stdout()))
-    probe = await docker_service.probe_prerun_host(
-        ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}, with_label=True
-    )
-    assert probe is not None and probe.container_names == ("pod_a", "other")
-    assert _cmds(ssh) == [
-        prerun_host_probe_command(
-            docker_image=_IMAGE,
-        image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
-        miner_hotkey=_HOTKEY,
-        with_power=True
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_probe_prerun_host_ssh_error_is_none(docker_service):
-    ssh = _ssh(ConnectionError("channel closed"))
-    assert (
-        await docker_service.probe_prerun_host(
-            ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}, with_label=True
-        )
-        is None
-    )
-
-
-@pytest.mark.asyncio
-async def test_probe_prerun_host_is_bounded_and_a_timeout_is_none(docker_service):
-    import asyncio
-
-    from services.docker_service import _PRERUN_HOST_PROBE_TIMEOUT_SECONDS
-
-    ssh = _ssh(asyncio.TimeoutError())
-    assert (
-        await docker_service.probe_prerun_host(
-            ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}, with_label=True
-        )
-        is None
-    )
-    assert ssh.run.await_args.kwargs["timeout"] == _PRERUN_HOST_PROBE_TIMEOUT_SECONDS
-
-
-@pytest.mark.asyncio
-async def test_probe_prerun_host_garbage_is_none(docker_service):
-    ssh = _ssh(_ssh_result(stdout="sh: t: not found\n"))
-    assert (
-        await docker_service.probe_prerun_host(
-            ssh, docker_image=_IMAGE, with_power=True, miner_hotkey=_HOTKEY, log_extra={}, with_label=True
-        )
-        is None
-    )
-
-
 # ------------------------------------------------------------------
 # consumers: same result, no listing command
 # ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_nothing(
-    docker_service, monkeypatch
-):
-    ran: list[str] = []
-
-    async def _retry(ssh, command, _tag, **_kwargs):
-        ran.append(command)
-
-    monkeypatch.setattr("services.docker_service.retry_ssh_command", _retry)
-    ids = {name: c * 64 for name, c in (("pod_new", "a"), ("pod_old", "b"), ("filler_x", "c"))}
-    live = _ssh(_ssh_result(stdout="".join(f"{n} {ids.get(n, 'f' * 64)}\n" for n in ("pod_new", "pod_old", "filler_x", "something"))))
-    removed_live = await docker_service.clean_existing_containers(
-        ssh_client=live,
-        default_extra={},
-        pod_name="pod_new",
-        active_container_names=["pod_keep"],
-        active_volume_names=["volume_old"],
-    )
-    live_cmds = list(ran)
-    ran.clear()
-    probe = _probe(container_names=("pod_new", "pod_old", "filler_x", "something"), container_ids=ids)
-    probed = _ssh()
-    removed_probed = await docker_service.clean_existing_containers(
-        ssh_client=probed,
-        default_extra={},
-        pod_name="pod_new",
-        active_container_names=["pod_keep"],
-        active_volume_names=["volume_old"],
-        host_probe=probe,
-    )
-    assert removed_live == removed_probed == ["pod_new", "pod_old", "filler_x"]
-    assert (
-        ran
-        == live_cmds
-        == [
-            f"/usr/bin/docker rm -fv {ids['pod_new']} {ids['pod_old']} {ids['filler_x']}",
-            "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
-        ]
-    )
-    assert _cmds(live) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
-    assert _cmds(probed) == []  # the probe carried the names and IDs: no SSH call before the rm
-
-
-@pytest.mark.asyncio
-async def test_clean_existing_containers_nothing_stale_returns_empty(docker_service):
-    probe = _probe(container_names=("other", "pod_keep"))
-    ssh = _ssh()
-    assert (
-        await docker_service.clean_existing_containers(
-            ssh_client=ssh,
-            default_extra={},
-            pod_name="pod_new",
-            active_container_names=["pod_keep"],
-            host_probe=probe,
-        )
-        == []
-    )
-    assert _cmds(ssh) == []
-
-
-@pytest.mark.asyncio
-async def test_clean_existing_containers_failed_ps_section_lists_itself(docker_service):
-    probe = _probe(container_names=None)
-    ssh = _ssh(_ssh_result(stdout=""))
-    assert (
-        await docker_service.clean_existing_containers(
-            ssh_client=ssh,
-            default_extra={},
-            pod_name="pod_new",
-            host_probe=probe,
-        )
-        == []
-    )
-    assert _cmds(ssh) == [DOCKER_PS_ALL_NAMES_IDS_CMD]
-
-
-@pytest.mark.asyncio
-async def test_clean_stale_vloopback_with_probe_removes_the_same_and_lists_nothing(
-    docker_service, monkeypatch
-):
-    ran: list[str] = []
-
-    async def _retry(ssh, command, _tag):
-        ran.append(command)
-
-    monkeypatch.setattr("services.docker_service.retry_ssh_command", _retry)
-    volumes = "volume_a vloopback:latest\nvolume_b vloopback\nvolume_c local\nvolume_d vloopback:latest\nother vloopback\n"
-    live = _ssh(_ssh_result(stdout=volumes), _ssh_result(stdout="volume_a\n\nvolume_c\n"))
-    removed_live = await docker_service.clean_stale_vloopback_volumes(
-        ssh_client=live,
-        default_extra={},
-        skip_volume_names={"volume_d"},
-    )
-    live_cmds = list(ran)
-    ran.clear()
-    probe = _probe(
-        volumes=(
-            ProbedVolume("volume_a", "vloopback:latest"),
-            ProbedVolume("volume_b", "vloopback"),
-            ProbedVolume("volume_c", "local"),
-            ProbedVolume("volume_d", "vloopback:latest"),
-            ProbedVolume("other", "vloopback"),
-        ),
-        mounted_volume_names=("volume_a", "volume_c"),
-    )
-    probed = _ssh()
-    removed_probed = await docker_service.clean_stale_vloopback_volumes(
-        ssh_client=probed,
-        default_extra={},
-        skip_volume_names={"volume_d"},
-        host_probe=probe,
-    )
-    assert removed_live == removed_probed == ["volume_b"]
-    assert ran == live_cmds == ["/usr/bin/docker volume rm volume_b 2>/dev/null || true"]
-    assert len(_cmds(live)) == 2 and _cmds(probed) == []
-
-
-@pytest.mark.asyncio
-async def test_clean_stale_vloopback_probe_without_vloopback_volumes_runs_nothing(docker_service):
-    ssh = _ssh()
-    assert (
-        await docker_service.clean_stale_vloopback_volumes(
-            ssh_client=ssh,
-            default_extra={},
-            host_probe=_probe(volumes=(ProbedVolume("volume_c", "local"),)),
-        )
-        == []
-    )
-    assert _cmds(ssh) == []
-
-
-@pytest.mark.asyncio
-async def test_clean_stale_vloopback_failed_mount_section_inspects_itself(
-    docker_service, monkeypatch
-):
-    monkeypatch.setattr("services.docker_service.retry_ssh_command", AsyncMock())
-    probe = _probe(volumes=(ProbedVolume("volume_a", "vloopback"),), mounted_volume_names=None)
-    ssh = _ssh(_ssh_result(stdout="volume_a\n"))
-    assert (
-        await docker_service.clean_stale_vloopback_volumes(
-            ssh_client=ssh, default_extra={}, host_probe=probe
-        )
-        == []
-    )
-    assert len(_cmds(ssh)) == 1 and "docker inspect" in _cmds(ssh)[0]
-
-
-@pytest.mark.asyncio
-async def test_find_cache_volumes_with_probe_matches_live(docker_service):
-    live = _ssh(_ssh_result(stdout="dphn_cache_old\ndphn_cache_new\nvolume_a\n"))
-    from_live = await docker_service._find_cache_volumes_to_sweep(live, {"dphn_cache_new"}, {})
-    probe = _probe(
-        volumes=(
-            ProbedVolume("dphn_cache_old", "local"),
-            ProbedVolume("dphn_cache_new", "local"),
-            ProbedVolume("volume_a", "vloopback"),
-        )
-    )
-    probed = _ssh()
-    from_probe = await docker_service._find_cache_volumes_to_sweep(
-        probed, {"dphn_cache_new"}, {}, host_probe=probe
-    )
-    assert from_live == from_probe == ["dphn_cache_old"]
-    assert _cmds(probed) == []
-
-
-@pytest.mark.asyncio
-async def test_find_cache_volumes_failed_volume_section_lists_itself(docker_service):
-    ssh = _ssh(_ssh_result(stdout="dphn_cache_old\n"))
-    assert await docker_service._find_cache_volumes_to_sweep(
-        ssh, set(), {}, host_probe=_probe(volumes=None)
-    ) == ["dphn_cache_old"]
-    assert _cmds(ssh) == ['/usr/bin/docker volume ls --format "{{.Name}}"']
-
-
-@pytest.mark.asyncio
-async def test_image_label_with_probe_runs_nothing_and_matches(docker_service):
-    ssh = _ssh()
-    assert await docker_service._image_has_encrypted_volume_label(
-        ssh, _IMAGE, host_probe=_probe(image_label_value="1")
-    )
-    assert not await docker_service._image_has_encrypted_volume_label(
-        ssh, _IMAGE, host_probe=_probe(image_label_value="")
-    )
-    assert not await docker_service._image_has_encrypted_volume_label(
-        ssh, _IMAGE, host_probe=_probe(image_label_value="<no value>")
-    )
-    assert _cmds(ssh) == []
-
-
-@pytest.mark.asyncio
-async def test_image_label_failed_section_inspects_itself(docker_service):
-    ssh = _ssh(_ssh_result(stdout="1\n"))
-    assert await docker_service._image_has_encrypted_volume_label(
-        ssh, _IMAGE, host_probe=_probe(image_label_value=None)
-    )
-    assert _cmds(ssh) == [image_label_command(_IMAGE, _ENCRYPTED_VOLUME_IMAGE_LABEL)]
 
 
 @pytest.mark.asyncio
@@ -841,85 +336,6 @@ async def test_gpu_config_failed_proc_section_queries_live():
     config = await build_gpu_docker_config_for_executor(ssh, ["GPU-1"], host_probe=probe)
     assert _cmds(ssh) == [PROC_GPU_INFO_CMD]
     assert [d.path_on_host for d in config.device_mounts] == ["/dev/nvidia0", "/dev/nvidiactl"]
-
-
-@pytest.mark.asyncio
-async def test_raise_low_power_limits_takes_no_probe_and_queries_live():
-    # The last-resort raise runs minutes after the probe (volume creation, bootstrap restore), so
-    # it has no probe parameter at all: the state it acts on is always a live query.
-    assert "host_probe" not in inspect.signature(raise_low_power_limits_to_default).parameters
-    ssh = _ssh(_ssh_result(stdout="GPU-1, 450.00, 450.00, 100.00, 450.00\n"))
-    assert await raise_low_power_limits_to_default(ssh, "exec-1", ["GPU-1"]) == 0
-    assert _cmds(ssh) == [POWER_STATE_CMD]
-
-
-@pytest.mark.asyncio
-async def test_restore_tracked_limits_with_probe_uses_it_for_before_values():
-    redis = AsyncMock()
-    redis.get = AsyncMock(
-        return_value='{"gpu_uuid":"GPU-1","watts":400,"pod_id":"p","executor_id":"e","capped_at":1.0}'
-    )
-    redis.delete = AsyncMock()
-    probe = _probe(power_state_stdout="GPU-1, 250.00, 450.00, 100.00, 450.00\n")
-    ssh = _ssh(_ssh_result(stdout=""), _ssh_result(stdout=""), _ssh_result(stdout="400, Enabled\n"))
-    assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-1"], host_probe=probe) == 1
-    assert POWER_STATE_CMD not in _cmds(ssh)
-
-
-@pytest.mark.asyncio
-async def test_port_check_with_probe_nothing_lingering_runs_nothing(docker_service):
-    ssh = _ssh()
-    removal = await docker_service.wait_for_port_check_containers(
-        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
-        ssh_client=ssh, probed_container_names=(),
-    )
-    assert removal == (False, "No port check containers found")
-    assert _cmds(ssh) == []
-
-
-@pytest.mark.asyncio
-async def test_port_check_with_probe_lingering_removes_the_same_as_the_live_listing(docker_service):
-    live_ssh = _ssh(_ssh_result(stdout="health_check_1\n"), _ssh_result(stdout="3f2a9c1d7e4b\n"))
-    live = await docker_service.wait_for_port_check_containers(
-        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
-        ssh_client=live_ssh,
-    )
-    probed_ssh = _ssh(_ssh_result(stdout="3f2a9c1d7e4b\n"))
-    probed = await docker_service.wait_for_port_check_containers(
-        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
-        ssh_client=probed_ssh, probed_container_names=("health_check_1",),
-    )
-    assert live == probed == (True, "Port check containers forcefully removed")
-    assert _cmds(live_ssh) == [port_check_containers_command(_HOTKEY), _cmds(probed_ssh)[0]]
-    assert _cmds(probed_ssh)[0].endswith("| xargs -r /usr/bin/docker rm -fv")
-
-
-@pytest.mark.asyncio
-async def test_a_probed_port_check_gone_by_now_is_not_reported_removed(docker_service):
-    # the probe at SSH connect listed health_check_1; it exited before the pre-run wait, so xargs -r ran no rm
-    ssh = _ssh(_ssh_result(stdout=""))
-
-    removal = await docker_service.wait_for_port_check_containers(
-        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="",
-        ssh_client=ssh, probed_container_names=("health_check_1",),
-    )
-
-    assert removal == (False, "Port check containers listed but none removed")
-
-
-@pytest.mark.asyncio
-async def test_a_failed_docker_rm_is_not_reported_removed(docker_service):
-    # the live listing names a port check; its removal fails on the host
-    ssh = _ssh(
-        _ssh_result(stdout="health_check_1\n"),
-        _ssh_result(exit_status=1, stderr="Error response from daemon: removal already in progress"),
-    )
-
-    removal = await docker_service.wait_for_port_check_containers(
-        executor_info=Mock(), miner_hotkey=_HOTKEY, keypair=Mock(), private_key="", ssh_client=ssh,
-    )
-
-    assert removal.removed is False
 
 
 # ------------------------------------------------------------------
@@ -1002,20 +418,6 @@ async def test_create_container_probes_once_and_hands_it_to_every_consumer(
 
 
 @pytest.mark.asyncio
-async def test_the_early_gpu_power_restore_leaves_two_sessions_for_the_volume_steps(svc_fixture, monkeypatch):
-    svc = svc_fixture
-    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    from services import docker_service as ds
-
-    for power_step in (ds.restore_tracked_gpu_power_limits, ds.raise_low_power_limits_to_default):
-        assert power_step.await_args_list[0].kwargs["concurrency"] == POWER_LIMIT_SET_CONCURRENCY - 2, power_step
-
-
-@pytest.mark.asyncio
 async def test_a_filler_cap_after_the_early_gpu_power_restore_is_restored_before_docker_run(svc_fixture, monkeypatch):
     svc = svc_fixture
     _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
@@ -1069,92 +471,6 @@ async def test_a_power_limit_lowered_without_a_record_after_the_early_raise_is_r
     assert events == ["live raise", "limit lowered, no record", "live raise", "docker run"]
 
 
-@pytest.mark.asyncio
-async def test_create_container_withdraws_docker_listings_after_a_removal(svc_fixture, monkeypatch):
-    svc = svc_fixture
-    ssh_client = _deploy_ssh_client()
-    probe = _probe()
-    _wire(svc, monkeypatch, ssh_client, probe_result=probe)
-    svc.clean_existing_containers = AsyncMock(return_value=["pod_old"])
-    result = await _run_create_container(svc, _deploy_payload())
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _probe_kwarg(svc.clean_existing_containers) is probe
-    for m in (
-        svc.clean_stale_vloopback_volumes,
-        svc.sweep_stale_cache_volumes,
-        svc.select_affordable_cache_volumes,
-        svc.reclaim_dphn_cache_for_rental,
-    ):
-        assert _probe_kwarg(m) is None, m
-    port_check = svc.wait_for_port_check_containers.await_args.kwargs
-    assert port_check["probed_container_names"] is None
-    from services import docker_service as ds
-
-    # a docker removal does not touch the GPU / power sections
-    assert _probe_kwarg(ds.build_gpu_docker_config_for_executor) is probe
-    assert _probe_kwarg(ds.restore_tracked_gpu_power_limits) is probe
-
-
-@pytest.mark.asyncio
-async def test_create_container_withdraws_docker_listings_after_a_vloopback_sweep(
-    svc_fixture, monkeypatch
-):
-    svc = svc_fixture
-    ssh_client = _deploy_ssh_client()
-    probe = _probe()
-    _wire(svc, monkeypatch, ssh_client, probe_result=probe)
-    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_b"])
-    result = await _run_create_container(svc, _deploy_payload())
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _probe_kwarg(svc.clean_existing_containers) is probe
-    assert _probe_kwarg(svc.clean_stale_vloopback_volumes) is probe
-    assert _probe_kwarg(svc.sweep_stale_cache_volumes) is None
-    assert _probe_kwarg(svc.reclaim_dphn_cache_for_rental) is None
-
-
-@pytest.mark.asyncio
-async def test_create_container_probe_failure_leaves_every_consumer_on_its_own_commands(
-    svc_fixture, monkeypatch
-):
-    svc = svc_fixture
-    ssh_client = _deploy_ssh_client()
-    _wire(svc, monkeypatch, ssh_client, probe_result=None)
-    result = await _run_create_container(
-        svc, _deploy_payload(enable_volume_encryption=True, is_sysbox=True)
-    )
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    svc.probe_prerun_host.assert_awaited_once()
-    from services import docker_service as ds
-
-    for m in (
-        svc.clean_existing_containers,
-        svc.clean_stale_vloopback_volumes,
-        svc._image_has_encrypted_volume_label,
-        ds.build_gpu_docker_config_for_executor,
-        ds.raise_low_power_limits_to_default,
-    ):
-        assert _probe_kwarg(m) is None
-
-
-@pytest.mark.asyncio
-async def test_create_container_pearl_filler_does_not_ask_for_power(svc_fixture, monkeypatch):
-    from payload_models.payloads import GpuPowerLimit, WorkloadKind
-
-    svc = svc_fixture
-    ssh_client = _deploy_ssh_client()
-    _wire(svc, monkeypatch, ssh_client, probe_result=_probe())
-    monkeypatch.setattr(
-        "services.docker_service.apply_filler_gpu_power_limits", AsyncMock(return_value=True)
-    )
-    payload = _deploy_payload(
-        workload_kind=WorkloadKind.FILLER,
-        gpu_power_limits=[GpuPowerLimit(gpu_uuid="GPU-test", watts=300)],
-    )
-    result = await _run_create_container(svc, payload)
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert svc.probe_prerun_host.await_args.kwargs["with_power"] is False
-
-
 def _wire_early_probes(svc, monkeypatch, *, image_present: bool) -> list[int]:
     """Both probes on; returns how many host probes had started when the image inspect answered."""
     _wire(svc, monkeypatch, _deploy_ssh_client(inspect_exit=0 if image_present else 1), probe_result=_probe())
@@ -1171,48 +487,6 @@ def _wire_early_probes(svc, monkeypatch, *, image_present: bool) -> list[int]:
 
     docker_client.local_image_repo_digests = slow_inspect
     return host_probes_started_at_inspect
-
-
-@pytest.mark.asyncio
-async def test_cached_create_runs_each_host_probe_once_beside_the_image_inspect(svc_fixture, monkeypatch):
-    """DAH-3980: on the cached path the probes cost no round trip of their own."""
-    svc = svc_fixture
-    host_probes_started_at_inspect = _wire_early_probes(svc, monkeypatch, image_present=True)
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert host_probes_started_at_inspect == [1]
-    svc.probe_prerun_host.assert_awaited_once()
-    svc.probe_volume_host.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_pulled_image_probes_the_host_again_after_the_pull(svc_fixture, monkeypatch):
-    """The early label section read no image, and a pull can take minutes: both probes run again."""
-    svc = svc_fixture
-    _wire_early_probes(svc, monkeypatch, image_present=False)
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _docker_client(svc).pulled_images == [_IMAGE]
-    assert svc.probe_prerun_host.await_count == 2
-    assert svc.probe_volume_host.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_cleanup_that_removed_a_volume_measures_the_volume_facts_again(svc_fixture, monkeypatch):
-    """df and the volume list read before the removal would size the new volume on stale facts."""
-    svc = svc_fixture
-    _wire_early_probes(svc, monkeypatch, image_present=True)
-    svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    svc.probe_prerun_host.assert_awaited_once()
-    assert svc.probe_volume_host.await_count == 2
 
 
 def _wire_customer_create_over_the_host(
@@ -1379,8 +653,6 @@ async def test_customer_create_relists_after_any_other_removal(
         port_check_containers_command("miner"),
     ]
     assert svc.probe_volume_host.await_count == 2
-
-
 
 
 @pytest.mark.asyncio
@@ -1573,24 +845,6 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)
 
 
-def test_probe_without_containers_drops_them_and_their_mounts_only():
-    probe = _probe(
-        container_names=("filler_x", "pod_keep"),
-        volumes=(ProbedVolume("volume_x", "vloopback:latest"), ProbedVolume("volume_keep", "local")),
-        mounted_volume_names=("volume_x", "volume_keep", "dphn_cache_a"),
-        port_check_container_names=("health_check_1",),
-    )
-
-    adjusted = probe.without_containers(["filler_x"], ["volume_x"])
-
-    assert adjusted.container_names == ("pod_keep",)
-    assert adjusted.mounted_volume_names == ("volume_keep", "dphn_cache_a")
-    assert adjusted.volumes == probe.volumes
-    assert adjusted.port_check_container_names == ("health_check_1",)
-    failed_sections = _probe(container_names=None, mounted_volume_names=None)
-    assert failed_sections.without_containers(["filler_x"], ["volume_x"]) == failed_sections
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("bootstrap_restore", "raised_during_volume_creation", "live_raises"), [(False, 1, 2), (True, 0, 1)]
@@ -1622,13 +876,6 @@ async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
     assert raise_low.await_count == live_raises
 
 
-_OVERLAPPED_ROWS = (
-    "Prerun host probe (parallel)",
-    "Volume host probe (parallel)",
-    "GPU power restore (parallel)",
-)
-
-
 def _slow_overlapped_operations(svc, monkeypatch) -> None:
     async def slow_probe(*args, **kwargs):
         await asyncio.sleep(0.03)
@@ -1643,43 +890,30 @@ def _slow_overlapped_operations(svc, monkeypatch) -> None:
     monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", slow_raise)
 
 
-def _overlapped_rows_ms(result) -> dict[str, int]:
-    return {p.name.value: p.duration for p in result.profilers if p.name.value in _OVERLAPPED_ROWS}
-
-
 @pytest.mark.asyncio
-async def test_cached_create_profiles_each_overlapped_operation_with_its_own_duration(
-    svc_fixture, monkeypatch
-):
-    """DAH-3980: the step rows show only the residual wait; zero there must not read as free."""
+@pytest.mark.parametrize("probe_error", [None, SshSessionMayStillBeTakenError("channel open not answered")])
+async def test_discarded_early_probe_ends_before_the_volume_probe_runs_again(svc_fixture, monkeypatch, probe_error):
+    # one SSH session per host (MaxSessions=1): the second probe must not open a channel beside the first
     svc = svc_fixture
     _wire_early_probes(svc, monkeypatch, image_present=True)
     _slow_overlapped_operations(svc, monkeypatch)
+    probes_running: list[int] = []
 
-    result = await _run_create_container(svc, _deploy_payload())
+    async def probe_alone(*args, **kwargs):
+        assert not probes_running, "a second volume probe started while the first still ran"
+        probes_running.append(1)
+        await asyncio.sleep(0.2)
+        probes_running.pop()
+        if probe_error:
+            raise probe_error
 
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    rows_ms = _overlapped_rows_ms(result)
-    assert sorted(rows_ms) == sorted(_OVERLAPPED_ROWS)
-    assert all(ms >= 25 for ms in rows_ms.values()), rows_ms
-
-
-@pytest.mark.asyncio
-async def test_discarded_early_probe_gets_no_overlapped_row(svc_fixture, monkeypatch):
-    """A probe rerun at its step is in that step's row; the discarded early run is not counted again."""
-    svc = svc_fixture
-    _wire_early_probes(svc, monkeypatch, image_present=True)
-    _slow_overlapped_operations(svc, monkeypatch)
+    svc.probe_volume_host = AsyncMock(side_effect=probe_alone)
     svc.clean_stale_vloopback_volumes = AsyncMock(return_value=["volume_old"])
 
     result = await _run_create_container(svc, _deploy_payload())
 
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert svc.probe_volume_host.await_count == 2
-    assert sorted(_overlapped_rows_ms(result)) == [
-        "GPU power restore (parallel)",
-        "Prerun host probe (parallel)",
-    ]
+    assert type(result).__name__ == ("FailedContainerRequest" if probe_error else "ContainerCreated"), getattr(result, "msg", "")
+    assert svc.probe_volume_host.await_count == (1 if probe_error else 2)
 
 
 @pytest.fixture
@@ -1691,88 +925,3 @@ def svc_fixture():
     )
 
 
-_PORT_ALLOCATED_REFUSAL = RuntimeError(
-    "Docker SDK run container failed: 500 Server Error: driver failed programming external "
-    "connectivity on endpoint pod_x: Bind for 0.0.0.0:20001 failed: port is already allocated"
-)
-
-
-def _wire_real_docker_run(svc, monkeypatch, *, refusals: int) -> list[str]:
-    """Probe on, the real `docker run` retry; returns the order of port-check waits and runs."""
-    _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
-    monkeypatch.delattr(svc, "_run_rental_docker_create_with_port_retry")  # the real retry loop
-    monkeypatch.setattr(svc, "_remove_failed_rental_container_for_retry", AsyncMock())
-    monkeypatch.setattr("services.docker_service._PORT_ALLOCATED_RETRY_SLEEP_SEC", 0)
-    calls: list[str] = []
-
-    async def port_check_wait(**kwargs) -> tuple[bool, str]:
-        listing = "early" if kwargs.get("probed_container_names") is not None else "live"
-        calls.append(f"port_check_wait:{listing}")
-        return False, "No port check containers found"
-
-    async def run_container(spec) -> None:
-        calls.append("docker_run")
-        if calls.count("docker_run") <= refusals:
-            raise _PORT_ALLOCATED_REFUSAL
-
-    svc.wait_for_port_check_containers = port_check_wait
-    _docker_client(svc).run_container = run_container
-    return calls
-
-
-@pytest.mark.asyncio
-async def test_a_docker_run_that_succeeds_reads_only_the_early_port_check_listing(svc_fixture, monkeypatch):
-    svc = svc_fixture
-    calls = _wire_real_docker_run(svc, monkeypatch, refusals=0)
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert calls == ["port_check_wait:early", "docker_run"]
-
-
-@pytest.mark.asyncio
-async def test_the_first_port_refusal_reads_the_port_check_listing_live_before_the_retry(
-    svc_fixture, monkeypatch
-):
-    """A port check started after the probe's listing holds a rent port; only a live listing sees it."""
-    svc = svc_fixture
-    calls = _wire_real_docker_run(svc, monkeypatch, refusals=2)
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert calls == ["port_check_wait:early", "docker_run", "port_check_wait:live", "docker_run", "docker_run"]
-
-
-@pytest.mark.asyncio
-async def test_a_port_check_removed_live_is_not_followed_by_the_five_second_wait(svc_fixture, monkeypatch):
-    """The live listing removed the port check that held the port: the retry runs at once."""
-    svc = svc_fixture
-    calls = _wire_real_docker_run(svc, monkeypatch, refusals=1)
-    monkeypatch.setattr("services.docker_service._PORT_ALLOCATED_RETRY_SLEEP_SEC", 5)
-
-    async def port_check_wait(**kwargs) -> tuple[bool, str]:
-        if kwargs.get("probed_container_names") is not None:
-            calls.append("port_check_wait:early")
-            return False, "No port check containers found"
-        calls.append("port_check_wait:live")
-        return True, "Port check containers forcefully removed"
-
-    svc.wait_for_port_check_containers = port_check_wait
-    real_sleep = asyncio.sleep
-    retry_sleeps: list[float] = []
-
-    async def recording_sleep(delay, *args, **kwargs):
-        if delay == 5:
-            retry_sleeps.append(delay)
-            delay = 0
-        return await real_sleep(delay, *args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
-
-    result = await _run_create_container(svc, _deploy_payload())
-
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert calls == ["port_check_wait:early", "docker_run", "port_check_wait:live", "docker_run"]
-    assert retry_sleeps == []

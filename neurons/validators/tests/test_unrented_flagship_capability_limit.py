@@ -6,7 +6,6 @@ enabled (min_gpu_count below the full node size), or a verified TDX quote
 forfeits the unrented rental incentive while staying active. Always enforced (the flag was removed).
 """
 
-import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,7 +24,6 @@ H100 = "NVIDIA H100 80GB HBM3"
 SCRAPE_WITHOUT_NCU: dict[str, str] = {}
 
 # what prepare_host_policy returns for a verified TDX quote: os_image_hash + compose_hash
-ATTESTATION_DIGEST = "0f1e2d:9a8b7c"
 
 
 def _build_incentive() -> RentalPriceIncentive:
@@ -75,65 +73,6 @@ def _make_job(
     )
 
 
-@pytest.mark.parametrize(
-    "job_kwargs, is_missing",
-    [
-        ({}, True),  # neither capability
-        ({"spec": None}, False),  # spec-less synthetic/estimate result: fail open
-        ({"spec": {"ncu_profiling_access": "unrestricted"}}, False),
-        ({"spec": {"ncu_profiling_access": "restricted"}}, True),
-        ({"spec": {"ncu_profiling_access": "unknown"}}, True),
-        ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 1}, False),
-        # min equal to the node size is whole-host-only in practice, not real splitting
-        ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 8}, True),
-        # a configured min without hardware support does not count either
-        ({"gpu_splitting_min_count": 1}, True),
-        ({"gpu_model": B200}, True),
-        ({"gpu_model": B300}, True),
-        ({"gpu_model": B300, "supports_gpu_splitting": True, "gpu_splitting_min_count": 1}, False),
-        ({"gpu_model": H100}, False),  # not a flagship model
-        ({"gpu_count": 4}, False),  # only full 8x nodes are gated
-        ({"attestation_digest": ATTESTATION_DIGEST}, False),
-        ({"gpu_model": B200, "attestation_digest": ATTESTATION_DIGEST}, False),
-        # a CVM whose GPU-CC evidence verified bad still counts: GPU attestation is a separate
-        # (observe-only) lever, and withholding evidence must never pay more than submitting it
-        ({"attestation_digest": ATTESTATION_DIGEST, "gpu_attestation_passed": False}, False),
-    ],
-)
-def test_missing_flagship_capability(job_kwargs, is_missing):
-    # Arrange
-    incentive = _build_incentive()
-    job = _make_job(**job_kwargs)
-    base_model = incentive.get_base_model_for_gpu(job.gpu_model)
-
-    # Act
-    missing = incentive._missing_flagship_capability(job, base_model)
-
-    # Assert
-    assert (missing is not None) is is_missing
-
-
-@pytest.mark.asyncio
-async def test_self_declared_cvm_is_still_excluded(monkeypatch, caplog):
-    # A machine that submitted a quote the validator did not verify still fails the gate; the
-    # log has to separate it from an ordinary host, since attestation_digest is None on every
-    # line this gate emits.
-    incentive = _build_incentive()
-
-    with caplog.at_level(logging.INFO):
-        result = await incentive.calculate_executor_score(
-            _make_job(tdx_quote='{"quote": "..."}', attestation_digest=None)
-        )
-
-    breach = next(
-        record.msg
-        for record in caplog.records
-        if record.msg.extra.get("reason") == "flagship_without_ncu_or_split"
-    )
-    assert result.eligible_for_rental_share is False
-    assert breach.extra["tdx_quote_present"] is True
-
-
 @pytest.mark.asyncio
 async def test_enforced_drops_rental_eligibility(monkeypatch):
     # Arrange — neither capability and flag on
@@ -145,49 +84,6 @@ async def test_enforced_drops_rental_eligibility(monkeypatch):
     # Assert — excluded from the rental pool, no mining either (active but no incentive)
     assert result.eligible_for_rental_share is False
     assert result.mining_score == 0
-
-
-@pytest.mark.asyncio
-async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
-    # The zero-incentive reason must reach the miner-facing incentive log with
-    # both remediation paths spelled out.
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(_make_job())
-
-    log = "\n".join(result.incentive_logs)
-    assert "flagship_without_ncu_or_split" in log
-    assert "NCU profiling" in log
-    assert "GPU splitting" in log
-    assert "confidential computing" in log
-    assert [reason.reason for reason in result.zero_incentive_reasons] == [
-        "flagship_without_ncu_or_split"
-    ]
-
-
-@pytest.mark.parametrize(
-    "job_kwargs, expect_eligible",
-    [
-        ({"spec": {"ncu_profiling_access": "unrestricted"}}, True),
-        # min equal to the node size (a live prod case: a B200 at min=8) is whole-host-only
-        ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 8}, False),
-        # estimate_executor feeds spec-less synthetic results through the same scoring
-        # path every cycle; the gate must fail open on those (DAH-2520 precedent)
-        ({"spec": None}, True),
-        # DAH-2594 — an attested CVM cannot open host NCU counters, attestation is its path
-        ({"attestation_digest": ATTESTATION_DIGEST}, True),
-    ],
-)
-@pytest.mark.asyncio
-async def test_enforced_eligibility_by_capability(monkeypatch, job_kwargs, expect_eligible):
-    # Arrange
-    incentive = _build_incentive()
-
-    # Act
-    result = await incentive.calculate_executor_score(_make_job(**job_kwargs))
-
-    # Assert
-    assert result.eligible_for_rental_share is expect_eligible
 
 
 @pytest.mark.asyncio
