@@ -11,8 +11,8 @@ digest-pinned, and only if
 
 * the node is idle — no ``pod_*`` container exists (in any state), no validator docker-over-ssh
   session is open (that is how a rental's own pull and ``docker run`` reach this host) and the
-  validator's VerifyX bandwidth sample is not running; a pull already running is cancelled
-  within 10 s when any of them appears (2 s for the bandwidth sample);
+  validator's VerifyX bandwidth sample and container download probe are not running; a pull
+  already running is cancelled within 10 s when any of them appears (2 s for the two samples);
 * the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — pre-pulled images that left
   the current top-N are evicted, least recently used first, to make room; nothing else is ever
   removed, and a pull that would not fit without evicting a served image is skipped;
@@ -69,6 +69,10 @@ DOCKER_OVER_SSH_MARKER = "dial-stdio"
 # `python …/verifyx_executor.py --seed …`, over SSH or as the `/verify` subprocess
 # (local_verify_service). A pull sharing the link would lower that sample.
 BANDWIDTH_TEST_MARKER = "verifyx_executor.py"
+# The validator's idle-node download probe (container_download_speed): one SSH shell command
+# whose script echoes `lium_dl …` lines, so the marker is in the shell's and `docker run`'s
+# cmdline for the whole scored fetch. A pull sharing the link would lower that sample too.
+DOWNLOAD_TEST_MARKER = "lium_dl"
 # How often a running pull re-checks for the probe alone (a process scan, no docker call): a
 # sample lasts tens of seconds, so the full idle check's cadence would share too much of it.
 BANDWIDTH_TEST_CHECK_SECONDS = 2
@@ -106,6 +110,8 @@ def host_activity() -> str | None:
             return "docker-over-ssh session"
         if any(part.endswith(BANDWIDTH_TEST_MARKER) for part in cmdline):
             return "validator bandwidth test"
+        if any(DOWNLOAD_TEST_MARKER in part for part in cmdline):
+            return "validator download test"
     return None
 
 
