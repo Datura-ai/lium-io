@@ -433,8 +433,9 @@ class StorageLimitMessages:
         "found less than 100 GiB free on Docker's filesystem to build the limit on (see capable). A renter who "
         "fills their disk fills the host's Docker storage and takes the host and every pod on it down",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
-        "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check with `sudo docker run --rm "
-        "--storage-opt size=1g --gpus all daturaai/compute-subnet-executor:latest nvidia-smi`.",
+        "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check that `docker info` shows Storage Driver "
+        "overlay2 and that `sudo docker run --rm --storage-opt size=1g --gpus all "
+        "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
     )
     REQUIRED = MessageTemplate(
         event="Node rejected: Docker cannot limit a container's disk",
@@ -447,7 +448,7 @@ class StorageLimitMessages:
         "per-container storage limit",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
         "pquota): https://docs.lium.io/providers/nodes/docker-storage . The node passes again on the next "
-        "validation once `sudo docker run --rm --storage-opt size=1g --gpus all "
+        "validation once `docker info` shows Storage Driver overlay2 and `sudo docker run --rm --storage-opt size=1g --gpus all "
         "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
     )
     INCONCLUSIVE = MessageTemplate(
@@ -600,8 +601,7 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 90% of the default limit reported by NVML."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -932,6 +932,7 @@ class DuplicateExecutorMessages:
         impact="Score set to 0 for this cycle; the other executor keeps it",
         remediation="Each physical GPU earns under one executor. Register every machine once.",
     )
+
 
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(
@@ -1369,9 +1370,7 @@ class PortCountMessages:
     )
 
 
-NO_OUTBOUND_INTERNET_REMEDIATION = (
-    "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
-)
+NO_OUTBOUND_INTERNET_REMEDIATION = "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
 
 
 class OutboundInternetMessages:
@@ -2440,7 +2439,7 @@ class GpuAttestationIdentityMessages:
 SSHD_BOOTSTRAP_REMEDIATION = (
     "sshd does not start inside containers on this node, so renters cannot SSH in. Common cause: the host's "
     "container runtime leaves /run/sshd not owned by root or group/world-writable (sshd refuses to start: "
-    "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
+    '"/run/sshd must be owned by root and not group or world-writable"). Fix the runtime/image setup so '
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
     "succeeds. The node is validated again once a new container on it starts sshd."
