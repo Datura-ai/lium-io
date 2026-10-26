@@ -96,3 +96,34 @@ async def test_batch_late_bind_with_enforced_outside_prober_is_not_externally_bl
 
     assert result.external_blocked is False
     assert sorted(result.successful, key=lambda p: p.internal) == ports
+
+
+@pytest.mark.asyncio
+async def test_batch_reprobes_two_of_three_below_the_port_floor(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
+    calls = []
+
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return (probed[:2], probed[2:]) if len(calls) == 1 else (probed, [])
+
+    verifier, _ = _batch_verifier(mocker, late_listeners)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert calls == [ports, ports[2:]]
+    assert sorted(result.successful, key=lambda p: p.internal) == ports
+
+
+@pytest.mark.asyncio
+async def test_batch_reprobe_gives_up_after_its_budget(mocker):
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    # each of the 2 attempts: one probe plus REPROBE_ROUNDS re-probes, then the attempt fails
+    assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.REPROBE_ROUNDS)
+    assert result.successful == [] and result.failed == ports

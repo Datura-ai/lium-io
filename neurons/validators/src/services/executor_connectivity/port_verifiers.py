@@ -8,6 +8,7 @@ from asyncssh import SSHClientConnection
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.external_probe import ExternalPortProbe
 from services.executor_connectivity.models import BatchResult, PortPair
@@ -27,6 +28,7 @@ class BatchVerifier:
     """Verifies ports using --network=host in batches."""
 
     REPROBE_DELAY_SEC = 3
+    REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -133,11 +135,17 @@ class BatchVerifier:
                     await self.port_tester.test_many(session, host, remaining, token, log_ctx) if remaining else ([], [])
                 )
                 first_round = successful
-                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so probe it once more
-                if failed and len(successful) * 2 < len(remaining):
+                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
+                # re-probe the refused ports while the count is below PortCountCheck's floor (the failure condition)
+                for round_no in range(1, self.REPROBE_ROUNDS + 1):
+                    if not failed or len(reached or []) + len(successful) >= MIN_PORT_COUNT:
+                        break
                     await asyncio.sleep(self.REPROBE_DELAY_SEC)
                     late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
                     successful = successful + late
+                    logger.debug(
+                        _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
+                    )
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
