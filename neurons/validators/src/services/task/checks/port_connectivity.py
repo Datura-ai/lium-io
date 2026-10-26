@@ -226,10 +226,10 @@ class PortConnectivityCheck:
     async def _is_first_port_verify_miss(ctx: Context, *, ok: bool) -> bool:
         """DAH-3698: the first failed verification inside the window is not a verdict on the
         node's ports; the split-remainder port gate skips that cycle. A repeat inside the window
-        counts. Fails closed to the old behaviour (no grace) on a Redis error."""
+        counts, even with passes in between: a pass never clears the record, or alternating a
+        pass and a failure would earn grace every time. Fails closed (no grace) on a Redis error."""
         try:
             if ok:
-                await ctx.services.redis.clear_port_verify_miss(ctx.miner_hotkey, ctx.executor.uuid)
                 return False
             return await ctx.services.redis.record_port_verify_miss(
                 ctx.miner_hotkey, ctx.executor.uuid, PORT_VERIFY_FIRST_MISS_TTL_SECONDS

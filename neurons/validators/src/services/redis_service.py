@@ -380,17 +380,14 @@ class RedisService:
 
     async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
         """Record a failed port verification; True when none was on record (the first inside the window).
-        A repeat restarts the window, so a miss that persists earns no fresh grace when it would have expired;
-        only a passing verification (clear_port_verify_miss) does."""
+        A repeat restarts the window, so a miss that persists earns no fresh grace when it would have expired.
+        A passing verification does not clear it: only the window running out does."""
         key = f"{PORT_VERIFY_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
         async with self.lock:
             if await self.redis.set(key, "1", ex=ttl_seconds, nx=True):
                 return True
             await self.redis.expire(key, ttl_seconds)
             return False
-
-    async def clear_port_verify_miss(self, miner_hotkey: str, executor_id: str) -> None:
-        await self.delete(f"{PORT_VERIFY_MISS_PREFIX}:{miner_hotkey}:{executor_id}")
 
     @staticmethod
     def _sysbox_verified_key(miner_hotkey: str, executor_id: str) -> str:
