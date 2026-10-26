@@ -282,6 +282,35 @@ async def test_verifyx_skips_active_filler_and_reuses_prev_ema(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_verifyx_probes_never_measured_node_under_active_filler(context_factory):
+    """A filler that starts before the first stored EMA must not leave the node unmeasured."""
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"network": {"download_speed": 510.0, "upload_speed": 100.0}},
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config()
+    state = build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+            network_ema={},
+        ),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code != Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is not None
+    network = result.updates["state"].specs["network"]
+    assert network["ema_verifyx_download_speed"] == pytest.approx(510.0)
+
+
+@pytest.mark.asyncio
 async def test_verifyx_failure_without_prev_ema_leaves_specs_empty(context_factory):
     """No prior EMA anywhere — failure branch must not fabricate a state update."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
