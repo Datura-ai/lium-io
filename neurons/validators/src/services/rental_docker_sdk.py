@@ -310,7 +310,7 @@ class ContainerRunSpec:
     # --memory-swap; equal to memory_gb means the container gets no swap
     memory_swap_gb: int | None = None
     oom_score_adj: int | None = None
-    storage_limit_gb: int | None = None
+    storage_limit_gb: float | None = None  # fractional when a sysbox pod shares it with DinD
     # cgroup pids.max for the container. Caps total tasks (processes + threads) so a tenant fork
     # bomb cannot exhaust the host's global PID space and starve the executor/sshd of forks. None
     # keeps the daemon default (unlimited); the memory cgroup is no ceiling here because on a
@@ -1763,7 +1763,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "oom_score_adj": spec.oom_score_adj,
         "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
-            {"size": f"{spec.storage_limit_gb}g"}
+            {"size": f"{spec.storage_limit_gb:.10g}g"}
             if spec.storage_limit_gb
             else None
         ),

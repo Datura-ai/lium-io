@@ -52,8 +52,9 @@ def test_sysbox_pod_mounts_a_capped_sparse_loopback_volume_at_var_lib_docker(svc
     "path,storage,dind,writable",
     [
         ("/root", 40, "20g", 20),  # DinD and the writable layer split the one allowance
-        ("/root", 41, "20g", 21),
-        ("/root", 1, None, 1),  # nothing left to split
+        ("/root", 41, "20.5g", 20.5),
+        ("/root", 2, "1g", 1),
+        ("/root", 1, "0.5g", 0.5),  # a 1 GiB allowance still caps DinD, not drops its mount
         ("/root", 32766, "16383g", 16383),
         ("/root", 40946, "16383g", 24563),  # DinD held at the ext4 16 TiB file limit
         ("/root", None, None, None),  # storage-opt unsupported: no cap to share
@@ -69,6 +70,7 @@ def test_dind_mount(svc, path, storage, dind, writable):  # noqa: F811
     else:
         [mount] = kwargs["mounts"]
         assert mount["VolumeOptions"]["DriverConfig"]["Options"]["size"] == dind
+        assert kwargs["storage_opt"] == {"size": f"{writable}g"}
 
 
 _DIND = "a1" * 32

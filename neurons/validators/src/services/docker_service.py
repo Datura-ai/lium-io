@@ -2858,11 +2858,13 @@ class DockerService:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
         # takes half the pod's storage allowance, the writable layer the rest, so the two together
-        # stay inside it; the sparse file is held under the ext4 16 TiB file limit. A template whose
+        # stay inside it; halves are fractional GiB so a 1 GiB allowance still caps both (0.5g each,
+        # an integer split floored DinD to 0 and dropped the mount). The sparse file is held under
+        # the ext4 16 TiB file limit. A template whose
         # workspace is /var/lib/docker already caps inner Docker (and a second mount there is a
         # duplicate mount point Docker refuses at create).
         docker_data_volume_gb = (
-            min(effective_storage_limit_gb // 2, _FRESH_SIZING_MAX_VOLUME_GB)
+            min(effective_storage_limit_gb / 2, _FRESH_SIZING_MAX_VOLUME_GB)
             if payload.is_sysbox
             and effective_storage_limit_gb
             and docker_data_volume_driver
@@ -2927,7 +2929,7 @@ class DockerService:
                     DriverVolumeMount(
                         target=_DEFAULT_DOCKER_ROOT_DIR,
                         driver=docker_data_volume_driver,
-                        driver_opts={"size": f"{docker_data_volume_gb}g", "sparse": "true"},
+                        driver_opts={"size": f"{docker_data_volume_gb:.10g}g", "sparse": "true"},
                     ),
                 )
                 if docker_data_volume_gb
