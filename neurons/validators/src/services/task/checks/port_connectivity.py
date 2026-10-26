@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import replace
-
-from services.const import DEFAULT_JOB_OWNER_LIUM
-from services.executor_connectivity.models import PortVerificationResult
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
@@ -19,9 +16,6 @@ logger = logging.getLogger(__name__)
 # machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
 # out: a busy host, not a verdict on Sysbox
 SYSBOX_TEST_TIMED_OUT = "Test command timed out."
-# an unrented node reuses its pass on a timed-out scrape test only while the pass is this fresh: the timeout string is
-# provider-reported, so a host that disabled Sysbox and stalls the test gets at most this long on the old pass
-SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS = 3600
 
 
 class PortConnectivityCheck:
@@ -54,12 +48,18 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # 26 Oct: an unrented node's scrape sysbox test timed out under load, so the probe ran without sysbox-runc,
+        # failed, and the node scored 0 with Sysbox working. The timeout is provider-reported, so it is neither a
+        # pass nor a miss: the validator's own probe measures Sysbox with sysbox-runc instead.
+        scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+        probe_sysbox = ctx.state.sysbox_runtime or (rented_executor is None and scrape_error == SYSBOX_TEST_TIMED_OUT)
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
             ctx.miner_hotkey,
             ctx.executor,
-            ctx.state.sysbox_runtime,
+            probe_sysbox,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
             filler_ports=filler_ports,
@@ -273,11 +273,6 @@ class PortConnectivityCheck:
         executor whose probe never reached its container reads that memory. A probe that reached
         its container and found no sysbox stays a verdict. Fails open to the current behaviour on a
         Redis error.
-
-        An unrented node reads it too when the scrape's sysbox test timed out (26 Oct, a B300 whose
-        own Lium filler was loading: two cycles of SYSBOX_REQUIRED_MISSING with Sysbox working), but only
-        while the backend lists an active Lium filler on it and the pass is under SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS old; only a fresh validator-side probe
-        pass extends it.
         """
         redis = ctx.services.redis
         try:
@@ -287,33 +282,16 @@ class PortConnectivityCheck:
                 )
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            if sysbox_now or result.sysbox_measured is not None:
-                return False
-            # nothing was measured about sysbox this cycle. Rented: the probe never reached its container.
-            # Unrented: the scrape's own sysbox test timed out, so the probe ran without sysbox-runc and either
-            # never came up or came up under runc; a scrape test that ran and failed stays a verdict.
-            scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
-            unknown = not result.dind_ok if rented else scrape_error == SYSBOX_TEST_TIMED_OUT
-            if not unknown:
-                # only a scrape sysbox test that ran and said no supersedes the last pass; a probe miss
-                # after a passing scrape test measured nothing and keeps it
-                if not rented and scrape_error:
+            if not rented:
+                # a scrape sysbox test that ran and said no supersedes the last pass; an unrented node never reads
+                # it (only a validator probe counts there), but a later rented cycle would
+                scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+                if result.sysbox_measured is None and scrape_error and scrape_error != SYSBOX_TEST_TIMED_OUT:
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
                 return False
-            if rented:
-                return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            # the timeout string is provider-reported: reuse the pass only while the backend confirms an active
-            # Lium-owned filler on the node (the load that stalls the test), never on the provider's word alone;
-            # a provider's own default job is provider-controlled load, so it does not count
-            rented_data = ctx.state.rented_data
-            if not (
-                rented_data
-                and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
-                and rented_data.get_filler_containers(ctx.executor.uuid)
-            ):
+            if sysbox_now or result.dind_ok:
                 return False
-            verified_at = await redis.sysbox_verified_at(ctx.miner_hotkey, ctx.executor.uuid)
-            return verified_at is not None and time.time() - verified_at < SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS
+            return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
             logger.warning(
                 _m(
