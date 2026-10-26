@@ -198,7 +198,6 @@ def _patch_filler_touching_steps(svc, monkeypatch) -> dict[str, AsyncMock]:
             )
         ),
         "_restore_gpu_power_for_uncapped_pod": AsyncMock(),
-        "reclaim_dphn_cache_for_rental": AsyncMock(return_value=[]),
     }
     for name, mock in steps.items():
         monkeypatch.setattr(svc, name, mock)

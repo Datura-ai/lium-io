@@ -37,7 +37,6 @@ DISK_HELPERS = {
     "get_docker_disk_usage",
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
-    "FILLER_CACHE_VOLUME_PREFIXES",
     "FILLER_VOLUME_LABEL_KEY",
     "FILLER_VOLUME_LABEL_VALUE",
     "release_filler_cache",
@@ -444,8 +443,9 @@ def test_disk_usage_survives_a_silent_docker_socket(scrape: dict, monkeypatch) -
     assert asked == ["/proc/1/root/var/lib/docker"]
 
 
-def test_filler_cache_volumes_are_reported_as_free_disk(scrape: dict) -> None:
-    # Arrange — DAH-5014: an engy checkpoint and a dolphin cache next to a renter's volume
+def test_filler_cache_volumes_stay_used_disk(scrape: dict) -> None:
+    # Arrange — an engy checkpoint and a dolphin cache next to a renter's volume. Kept across rentals
+    # (Fish 26 Oct), so a renter is listed the free disk beside them, not the disk they hold.
     _stub_docker_api(
         scrape,
         {
@@ -473,15 +473,15 @@ def test_filler_cache_volumes_are_reported_as_free_disk(scrape: dict) -> None:
     hard_disk.update(scrape["get_docker_disk_usage"]())
     scrape["release_filler_cache"](hard_disk)
 
-    # Assert — the cache moved from used to free and out of the volumes breakdown
+    # Assert — used/free untouched, the caches counted in the volumes breakdown
     assert hard_disk == {
         "hard_disk_total": 4000 * 1024**2,
-        "hard_disk_used": 60 * 1024**2,
-        "hard_disk_free": 3940 * 1024**2,
-        "hard_disk_utilization": 1.5,
+        "hard_disk_used": 1600 * 1024**2,
+        "hard_disk_free": 2400 * 1024**2,
+        "hard_disk_utilization": 40.0,
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
-        "hard_disk_volumes": 10 * 1024**2,
+        "hard_disk_volumes": 1550 * 1024**2,
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
     }

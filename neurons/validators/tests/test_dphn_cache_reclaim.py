@@ -109,6 +109,18 @@ async def test_the_engy_checkpoint_is_reclaimed_oldest_first_and_only_as_far_as_
     assert _removed(ssh_client) == ["dphn_cache_hf_x"]
 
 
+@pytest.mark.asyncio
+async def test_a_live_customer_pod_keeps_the_cache_even_under_the_floor(cleanup):
+    # Fish 26 Oct: the cache is kept across rentals and listed as used, so a renter who took the
+    # listed free disk leaves the node under the floor by design
+    ssh_client = FakeSshClient(["pod_abc"], ["engy_cache_hf_kimi-k3"], free_gb=10)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
+    assert _removed(ssh_client) == []
+    (guard,) = [c for c in ssh_client.commands if "docker ps" in c]
+    assert 'name=filler_' in guard and 'name=pod_' in guard
+
+
 class CreatedSweepSshClient(FakeSshClient):
     """A sweep `docker run` killed between create and start: `lium_cache_sweep` sits in Created, never
     auto-removed, and dockerd refuses `volume rm` on the cache volume it mounts until it is gone."""

@@ -226,9 +226,9 @@ class VerifyXCheck:
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
             # measures only its own df-derived fields, so overwriting the dict wholesale would drop
             # the scrape's docker usage breakdown on every node where VerifyX runs.
-            # The scrape's own total/used/free win: they count the filler model caches as free
-            # (DAH-5014), and VerifyX's raw df put them back as used, so an idle node listed
-            # terabytes less free disk until the next cycle without VerifyX.
+            # The scrape's own total/used/free win: they count the filler's preallocated run volume
+            # as free (a rental removes it), and VerifyX's raw df put it back as used, so an idle
+            # node listed terabytes less free disk until the next cycle without VerifyX.
             if "hard_disk" in sanitized:
                 verifyx_hard_disk = sanitized.get("hard_disk")
                 scraped_hard_disk = updated_specs.get("hard_disk")

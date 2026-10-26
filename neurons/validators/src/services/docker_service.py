@@ -88,11 +88,7 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.container_cleanup import (
-    REMOVE_CACHE_SWEEP_CONTAINER,
-    REMOVE_IDLE_FILLER_IMAGES,
-    evict_cache_volumes_oldest_first,
-)
+from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
@@ -469,9 +465,6 @@ _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 # when that lookup fails (DAH-3217).
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-# DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
-# has to go. Covers the image layers and scratch the pod needs beyond its own volume.
-RENTAL_DISK_HEADROOM_GB = 20
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
@@ -4671,88 +4664,6 @@ class DockerService:
                 exc_info=True,
             )
 
-    async def reclaim_dphn_cache_for_rental(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        payload: ContainerCreateRequest,
-        default_extra: dict,
-        host_probe: PrerunHostProbe | None = None,
-    ) -> bool:
-        """Free the DPHN filler cache when a customer rental needs the disk it occupies; True when
-        volumes may have been removed.
-
-        DAH-2475: the cache is filler property worth ~37 GB. Once a customer rents the node the disk
-        belongs to the renter, so if what they asked for does not fit next to the cache, the cache
-        goes — reclaiming here rather than at filler-stop is what stops the node re-downloading it
-        every cycle (see sweep_stale_cache_volumes). Runs before volume sizing so the freed space is
-        already visible when the pod's volume is measured and created.
-
-        Only for CUSTOMER_RENTAL, only when the rental actually needs the room, and best-effort — a
-        failure here must never break the rent.
-        """
-        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
-            return False
-        requested_gb: int | None = payload.volume_limit_gb
-        try:
-            # DAH-5014: the Engy checkpoint cache gives way to the renter too.
-            cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
-                ssh_client, set(), default_extra, FILLER_CACHE_VOLUME_PREFIXES, host_probe=host_probe
-            )
-            if not cache_volumes:
-                return False
-
-            # The backend sends volume_limit_gb=None for every executor whose docker lacks
-            # --storage-opt support (calc_volume_storage_limit), so "no limit" does NOT mean "no disk
-            # needed" — it means the renter may use the whole disk and no fit check is possible. Err on
-            # the renter's side and give the cache back unconditionally; the filler re-downloads it
-            # after the rental, which is the filler's cost to pay, not the customer's.
-            if requested_gb:
-                docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-                free_gb = free_bytes / (1024**3)
-                if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
-                    return False
-
-            logger.info(
-                _m(
-                    "Reclaiming filler cache volumes for the customer rental",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "volumes": cache_volumes,
-                        "free_gb": round(free_gb, 1) if requested_gb else None,
-                        "requested_gb": requested_gb,
-                    }),
-                )
-            )
-            async def remove(command: str) -> object:
-                return await retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental")
-
-            if not requested_gb:
-                await remove(
-                    f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*cache_volumes)}; "
-                    f"{REMOVE_IDLE_FILLER_IMAGES}"
-                )
-                return True
-
-            async def rental_fits() -> bool:
-                free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB
-
-            # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
-            await evict_cache_volumes_oldest_first(ssh_client, cache_volumes, remove, rental_fits)
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "DPHN cache reclaim for rental failed; continuing with the rent",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
-            )
-            return True  # the removal may have run before the failure
-
     async def select_affordable_cache_volumes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -8453,7 +8364,7 @@ class DockerService:
                 # wait_for_port_check_containers just before `docker run`, and the
                 # 90s _run_docker_create_with_port_retry budget), so we no longer
                 # block the critical path for ~10s. (sleep defaults to 0.)
-                # DAH-3980: everything after the cleanup (power restore, cache reclaim, docker run) still
+                # DAH-3980: everything after the cleanup (power restore, docker run) still
                 # waits for the fillers' removal and its confirming listing; an error fails the create here.
                 fillers_removed_at_ssh_connect = FillerRemovalAtSshConnect(
                     listed_id_by_filler_name={}, removed_cleanly_without_volume_rm=False
@@ -8545,22 +8456,14 @@ class DockerService:
                 )
                 payload.volume_limit_gb = _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes)
 
-                reclaimed_cache_volumes = (
-                    []
-                    if beside_fillers
-                    else await self.reclaim_dphn_cache_for_rental(
-                        ssh_client=ssh_client,
-                        payload=payload,
-                        default_extra=default_extra,
-                        host_probe=docker_listing_probe,
-                    )
-                )
+                # Fish 26 Oct: a rental never evicts the filler caches (the Engy checkpoint is kept for the next
+                # idle run); the scrape lists them as used disk, so a renter is only offered the disk left
+                # beside them. An opt-out (provider wants the cache space back) would evict them here.
                 cleanup_changed_host = bool(
                     removal_at_ssh_connect_lost_its_channel
                     or removed_containers
                     or removed_vloopback_volumes
                     or swept_cache_volumes
-                    or reclaimed_cache_volumes
                 )
                 # DAH-3980: a pod without its own power cap gets its GPUs' power back while its volume
                 # is sized and created. Only after the cleanup (a PEARL filler must be gone before its

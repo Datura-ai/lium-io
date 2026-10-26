@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
@@ -168,36 +168,6 @@ async def test_an_engy_checkpoint_of_unknown_size_is_never_downloaded_into_a_cac
     )
 
     assert await docker_service.select_affordable_cache_volumes(ssh_client, payload, {}) == []
-
-
-@pytest.mark.asyncio
-async def test_rental_evicts_the_oldest_cache_first_and_keeps_the_rest_once_it_fits(docker_service, monkeypatch):
-    # DAH-5014: the Engy checkpoint (~1.5 TB) gives way to a renter too, but only as far as the rental
-    # needs: the older cache goes first and the free-disk re-check stops the eviction there.
-    class InspectingSshClient(FakeSshClient):
-        async def run(self, command: str, *args, **kwargs):
-            if "volume inspect" in command:
-                self.commands.append(command)
-                body = "engy_cache_hf_new 2026-10-22T10:00:00Z\nengy_cache_hf_old 2026-10-01T10:00:00Z"
-                return SimpleNamespace(exit_status=0, stdout=body, stderr="")
-            return await super().run(command, *args, **kwargs)
-
-    ssh_client = InspectingSshClient(["engy_cache_hf_new", "engy_cache_hf_old", "volume_pod"])
-    monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
-    monkeypatch.setattr(
-        docker_service,
-        "_get_fs_available_bytes",
-        AsyncMock(side_effect=[50 * 1024**3, 50 * 1024**3, 900 * 1024**3]),
-    )
-    payload = _make_payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL, cache_volumes=None)
-    payload.volume_limit_gb = 500
-
-    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, payload, {})
-
-    assert _removed_volumes(ssh_client) == ["engy_cache_hf_old"]
-    # DAH-5192: the idle filler images went first, without -f so an image a container uses stays
-    (image_rm,) = [c for c in ssh_client.commands if "image rm" in c]
-    assert "engy-golden-serve" in image_rm and "image rm -f" not in image_rm
 
 
 @pytest.mark.asyncio
