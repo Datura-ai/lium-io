@@ -210,6 +210,10 @@ class FakeRedis:
         self.store.pop(key, None)
         self.expiries.pop(key, None)
 
+    async def expire(self, key, seconds, nx=False):
+        if key in self.store and not (nx and self.expiries.get(key) is not None):
+            self.expiries[key] = seconds
+
     def age_past_every_lifetime(self) -> None:
         # what Redis does once every `ex` has run out: a key written with a lifetime is gone
         for key, ex in list(self.expiries.items()):
@@ -450,6 +454,35 @@ async def test_a_standing_failure_with_too_little_time_for_any_probe_is_carried(
     assert result.passed is False and result.event.what_we_saw["standing_failure"] is True
     assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: too little cycle time left"
     assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_standing_failure_written_without_a_lifetime_gets_one_when_read():
+    """Review: keys written before the TTL existed would stay forever; the next read gives them the day."""
+    redis = FakeRedis(failed_step=STEP_CONTAINER_START)
+    ctx, _, _ = make_probe_context(redis=redis, image_present=False)
+    with probe_settings():
+        await RentalProbeCheck().run(ctx)
+    key = f"rental_probe_failed:{EXECUTOR.uuid}"
+    assert redis.expiries[key] == module.RENTAL_PROBE_FAILED_TTL_SECONDS
+    redis.age_past_every_lifetime()
+    assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_a_standing_failure_with_too_little_create_time_after_the_gate_is_carried(monkeypatch):
+    """Review: slow gate reads must not leave a create deadline our own budget fails the node on."""
+    redis = FakeRedis(failed_step=STEP_CONTAINER_START)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    monkeypatch.setattr(module, "_create_deadline_seconds", lambda _ctx: 5.0)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.what_we_saw["standing_failure"] is True
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == (
+        "inconclusive: too little cycle time left for the create"
+    )
+    assert docker.create_calls == []
+    assert redis.create_lock_events[-1] == "released"
 
 
 def test_a_late_probes_create_deadline_leaves_room_for_the_teardown():
@@ -1308,7 +1341,12 @@ async def test_a_create_that_hangs_is_cut_off_and_its_container_removed_by_name(
             return created()
 
     ctx, docker, redis = make_probe_context(docker=HangingDocker())
-    with probe_settings(), renter_path(), patch.object(module, "_CREATE_DEADLINE_SECONDS", 0.05):
+    with (
+        probe_settings(),
+        renter_path(),
+        patch.object(module, "_CREATE_DEADLINE_SECONDS", 0.05),
+        patch.object(module, "_MIN_CREATE_DEADLINE_SECONDS", 0),
+    ):
         result = await RentalProbeCheck().run(ctx)
 
     assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason

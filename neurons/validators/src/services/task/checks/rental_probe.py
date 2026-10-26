@@ -121,8 +121,12 @@ _MIN_TASK_SECONDS_LEFT = _CREATE_DEADLINE_SECONDS + _USUAL_TEARDOWN_SECONDS
 # node whose other checks take longer than JOB_TIME_OUT allows for a full create reserve was never
 # probed again (8x B300, 25 Oct: ~470 s of checks, delisted after its fault was fixed). A probe that
 # runs out of this time fails as the standing failure already does, so the shorter budget costs
-# nothing. Passing probes took 155 s at most (Loki, 25 Oct; p95 66 s).
-_MIN_TASK_SECONDS_LEFT_STANDING = 180
+# nothing. Passing probes took 155 s at most (Loki, 25 Oct; p95 66 s). 270 s still fits a create plus
+# the 90 s sshd wait before the task cancel (review).
+_MIN_TASK_SECONDS_LEFT_STANDING = 270
+# the gate's reads can eat into the create's share; below this the probe would fail on our own budget
+# and renew the hold, so the cycle reaches no verdict instead (review)
+_MIN_CREATE_DEADLINE_SECONDS = 60
 _TASK_TIMEOUT_MARGIN_SECONDS = 120
 # the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
 # outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
@@ -241,13 +245,23 @@ class RentalProbeCheck:
             return gate
         standing = gate.standing
         image_ref = gate.image_ref
+        create_deadline = _create_deadline_seconds(ctx)
+        if create_deadline < _MIN_CREATE_DEADLINE_SECONDS:
+            await gate.create_lock.release(ctx)
+            return self._inconclusive(
+                ctx,
+                "too little cycle time left for the create",
+                steps=[],
+                what={"create_deadline_seconds": int(create_deadline)},
+                standing=standing,
+            )
         try:
             outcome = await _probe(
                 ctx,
                 image_ref,
                 gate.create_lock,
                 beside_fillers=bool(gate.fillers_beside),
-                create_deadline=_create_deadline_seconds(ctx),
+                create_deadline=create_deadline,
             )
         finally:
             await gate.create_lock.release(ctx)
@@ -712,6 +726,13 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
         return None
     if raw is None:
         return None
+    try:
+        # a key written before the TTL existed lives forever; NX gives it the TTL once (Redis >= 7)
+        await ctx.services.redis.expire(
+            f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}", RENTAL_PROBE_FAILED_TTL_SECONDS, nx=True
+        )
+    except Exception:
+        _read_failed(ctx, "the lifetime of its standing failure in Redis")
     text = raw.decode() if isinstance(raw, bytes) else str(raw)
     step, _, create_step = text.partition(":")
     if step == STEP_EGRESS and not settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:

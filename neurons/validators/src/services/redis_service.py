@@ -428,10 +428,10 @@ class RedisService:
         async with self.lock:
             await self.redis.delete(key)
 
-    async def expire(self, key: str, seconds: int):
-        """Set (or refresh) a key's time to live."""
+    async def expire(self, key: str, seconds: int, nx: bool = False):
+        """Set (or refresh) a key's time to live; `nx` sets it only on a key that has none."""
         async with self.lock:
-            await self.redis.expire(key, seconds)
+            await self.redis.expire(key, seconds, nx=nx)
 
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
