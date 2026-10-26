@@ -423,3 +423,9 @@ def test_install_mode_loads_the_iptables_modules_itself(tmp_path):
 # ── failure diagnostics (the block printed when the verify container does not start) ─────────
 
 
+
+
+def test_aarch64_host_passes_the_arch_check(tmp_path):
+    # GB300 / Grace: nestybox ships an arm64 .deb, so aarch64 is no longer a blocking FIX
+    proc = run_script(tmp_path, "--check", env={"STUB_ARCH": "aarch64"})
+    assert "PASS Architecture aarch64." in proc.stdout
