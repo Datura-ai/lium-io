@@ -331,7 +331,9 @@ class RentedThroughputCheck:
     is no outright excuse below the floors. When the 2 s before the probe already moved RENTED_THROUGHPUT_BUSY_MBPS on
     the host NICs (either direction), or RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S on a disk under the docker root, a slow
     side is inconclusive (the provider can make that load itself), and so is a slow network side without host NIC
-    counters or off lium-rentals (bridge fallback) and a slow disk whose docker root devices are unresolved. A failing
+    counters or off lium-rentals (bridge fallback) and a slow disk whose docker root devices are unresolved; a fetch
+    container that never reports and a disk write that fails or reports nothing are inconclusive too. Only an HTTP
+    error or an endpoint the validator cannot reach either stays no verdict, uncapped (not the node's doing). A failing
     side is also inconclusive (no strike, no pass, re-probed after RETRY_SECONDS) when the rented pods themselves moved
     DURING_* on that resource while the probe measured it (their own network namespace and container cgroup counters,
     not the host's), or when those pod counters are incomplete (a pod stopped, restarted or unreadable): one
@@ -452,10 +454,14 @@ class RentedThroughputCheck:
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
         off_rentals = not endpoints or any(r.network != RENTAL_NETWORK_NAME for r in endpoints)
         net_unsure = net_busy or net_mbps is None or off_rentals
-        if judged.has_no_verdict:
-            net = "none"
-        elif judged.is_failing:
+        if judged.is_failing:
             net = "fail"
+        elif any(r.error == "no_output" for r in endpoints):
+            # the fetch container did not start or died before reporting: the provider can cause that, so capped
+            net = "inconclusive"
+        elif judged.has_no_verdict:
+            # the validator cannot reach that endpoint either, or it answered with an HTTP error: not the node's doing
+            net = "none"
         else:
             net = "none" if net_unsure else "pass"
         # a failing side is inconclusive when the renter's own pods used that resource while it was measured, or their
@@ -468,7 +474,8 @@ class RentedThroughputCheck:
             net = "inconclusive"
         disk_unsure = disk_is_busy or disk_busy is None
         if disk.mb_per_s is None:
-            disk_side = "none"
+            # the disk write failed or reported nothing: the provider can cause either, so capped like a slow write
+            disk_side = "inconclusive"
         elif disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S:
             disk_side = "fail"
         else:

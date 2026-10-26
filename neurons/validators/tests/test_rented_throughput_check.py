@@ -14,6 +14,7 @@ import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.task.checks import container_download_speed as download_module
 from services.task.checks import rented_throughput as module
+from services.task.checks.container_download_speed import CAP_BYTES
 from services.task.checks.rented_throughput import (
     RentedThroughputCheck,
     parse_busy,
@@ -26,7 +27,15 @@ from services.task.messages import RentedThroughputMessages as Msg
 from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_services, build_state, default_executor, make_context
-from tests.test_container_download_speed_check import FAST, SLOW, Clock, FakeRedis, FakeRunner
+from tests.test_container_download_speed_check import (
+    FAST,
+    RENTALS,
+    SLOW,
+    Clock,
+    FakeRedis,
+    FakeRunner,
+    line,
+)
 from tests.test_partial_rental_split_scoring import _build_incentive, _make_job
 
 EXECUTOR = default_executor()
@@ -390,8 +399,8 @@ async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
 
 # Host state the provider controls (load on the host NICs or the docker-root disk in the 2 s before the probe, host NIC
 # counters it hides, a docker root it hides the devices of, lium-rentals not inspectable so the probe falls back to the
-# default bridge) cannot excuse a slow side forever: one such reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row
-# are, and the next zeroes the score.
+# default bridge, a fetch container that never reports, a disk write that fails or reports nothing) cannot excuse a slow
+# side forever: one such reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
 @pytest.mark.parametrize(
     "answer",
     [
@@ -404,8 +413,20 @@ async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
         SLOW_NET.replace(
             "lium_dl_net name=lium-rentals", "lium_dl_net name=bridge"
         ),  # bridge fallback
+        snaps() + disk() + RENTALS,  # the fetch container did not start: no endpoint line
+        snaps() + disk(rc=1) + FAST,  # the disk write failed
+        snaps() + FAST,  # the disk container reported nothing
     ],
-    ids=["busy_nics", "busy_disk", "no_host_counters", "docker_root_unresolved", "bridge_fallback"],
+    ids=[
+        "busy_nics",
+        "busy_disk",
+        "no_host_counters",
+        "docker_root_unresolved",
+        "bridge_fallback",
+        "fetch_container_not_started",
+        "disk_write_failed",
+        "disk_no_output",
+    ],
 )
 async def test_provider_made_host_load_cannot_excuse_a_slow_node_forever(answer):
     n = module.INCONCLUSIVE_BEFORE_STRIKE
@@ -420,6 +441,17 @@ async def test_provider_made_host_load_cannot_excuse_a_slow_node_forever(answer)
         assert stored(ctx)["failures_in_a_row"] == 1
         clock.now += 31 * 60
         assert (await check.run(ctx)).passed is False
+
+
+# What the validator cannot tell apart from the endpoint's own fault stays no verdict, uncapped: an HTTP error, or an
+# endpoint the validator cannot reach either.
+async def test_validator_side_fetch_errors_stay_no_verdict():
+    http_error = RENTALS + line("pypi", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 503")
+    http_error += line("hf", CAP_BYTES, 1.0, 0)
+    with flags():
+        ctx = make_ctx(snaps() + disk() + http_error)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == "none"
 
 
 def stopped_pod(answer_tail: str) -> str:
