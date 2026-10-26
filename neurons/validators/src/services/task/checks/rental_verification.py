@@ -279,8 +279,10 @@ class RentalVerificationCheck:
                 )
             else:
                 # Verification failed - this is fatal
+                error = response.error or ""
                 event = render_message(
-                    Msg.FAILED,
+                    # an empty kernel list means the container's /proc view is stale, not that the cards changed
+                    Msg.GPU_LIST_EMPTY if error.endswith("visible: []") else Msg.FAILED,
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
