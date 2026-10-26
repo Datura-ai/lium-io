@@ -454,9 +454,10 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
-# DAH-5101: the pod's volume files are unlinked before the stop, so the unmount at the stop has no
-# unwritten data to flush to a slow disk. A filler's wipe fits the backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS
-# budget next to FILLER_CONTAINER_STOP_GRACE_SECONDS.
+# DAH-5101: the pod's volume files are unlinked before the stop, so the unmount at the stop flushes
+# only what the pod wrote after the wipe. A filler's wipe is short so the usual stop (the host ends
+# the wipe at this many seconds, then FILLER_CONTAINER_STOP_GRACE_SECONDS) still answers inside the
+# backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS; a host that does not even answer adds the usual margin.
 _VOLUME_WIPE_TIMEOUT_SEC = 120
 _FILLER_VOLUME_WIPE_TIMEOUT_SEC = 10
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
@@ -6198,11 +6199,17 @@ class DockerService:
     ) -> str:
         """An older plugin for one new volume when the current one cannot be used, only if it is
         already enabled: the previous version first (its volumes behave as today), then the legacy
-        one, so a node the current install does not reach keeps renting. Returns the driver to
-        create on, else raises NoUsableLoopbackPluginError; never installs or enables either.
-        The only place a plugin command may name the old plugins; it goes away with them."""
+        one, so a node the current install does not reach keeps renting. With the flag off only the
+        legacy plugin, the one RentalVerificationCheck then names to the backend's health check.
+        Returns the driver to create on, else raises NoUsableLoopbackPluginError; never installs or
+        enables either. The only place a plugin command may name the old plugins; it goes away with them."""
+        old_plugin_aliases = (
+            (PREVIOUS_LOOPBACK_PLUGIN_ALIAS, LEGACY_LOOPBACK_PLUGIN_ALIAS)
+            if settings.LOOPBACK_PLUGIN_V2_ENABLED
+            else (LEGACY_LOOPBACK_PLUGIN_ALIAS,)
+        )
         old_plugin_states: dict[str, str] = {}
-        for old_plugin_alias in (PREVIOUS_LOOPBACK_PLUGIN_ALIAS, LEGACY_LOOPBACK_PLUGIN_ALIAS):
+        for old_plugin_alias in old_plugin_aliases:
             try:
                 state_result = await _run_with_host_timeout(
                     ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout

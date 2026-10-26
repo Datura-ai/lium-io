@@ -304,6 +304,32 @@ async def test_create_local_volume_falls_back_to_the_enabled_previous_plugin_bef
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_state, outcome",
+    [("true", "vloopback"), ("absent", NoUsableLoopbackPluginError)],
+    ids=["legacy-enabled", "only-v2-enabled"],
+)
+async def test_v2_switch_off_never_creates_on_the_previous_plugin(docker_service, monkeypatch, old_state, outcome):
+    # the switch off makes RentalVerificationCheck name the legacy plugin to the backend's health
+    # check, so a volume on v2 would be one the check never probes
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V2_ENABLED", False)
+    monkeypatch.setattr(docker_service_module.logger, "warning", Mock())
+    ssh_client = _plugin_host(previous_state="true", old_state=old_state)
+
+    if outcome is NoUsableLoopbackPluginError:
+        with pytest.raises(NoUsableLoopbackPluginError) as exc_info:
+            await _create_volume(docker_service, ssh_client, None)
+        assert "vloopback:v2" not in str(exc_info.value)
+        created = []
+    else:
+        created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ([outcome] if created else [])
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("vloopback:v2" in command for command in commands)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("old_state", ["absent", "false"])
 async def test_create_local_volume_fails_naming_both_and_never_installs_or_enables_the_old_plugin(
     docker_service, old_state

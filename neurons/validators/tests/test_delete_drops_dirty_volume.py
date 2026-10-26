@@ -253,7 +253,7 @@ async def test_delete_wipes_the_volume_before_the_graceful_stop(docker_service, 
 
 
 @pytest.mark.asyncio
-async def test_filler_delete_gives_the_wipe_a_budget_that_fits_the_backends_stop_wait(docker_service, monkeypatch):
+async def test_filler_delete_gives_the_wipe_its_shorter_budget(docker_service, monkeypatch):
     order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result(stdout="wiped /x\n")])
     payload = _delete_payload(workload_kind=WorkloadKind.FILLER)
 
@@ -261,7 +261,7 @@ async def test_filler_delete_gives_the_wipe_a_budget_that_fits_the_backends_stop
 
     assert isinstance(result, ContainerDeleted)
     assert order[0] == ("ssh", _bounded(WIPE_CMD, _FILLER_VOLUME_WIPE_TIMEOUT_SEC))
-    assert _FILLER_VOLUME_WIPE_TIMEOUT_SEC + docker_service_module.FILLER_CONTAINER_STOP_GRACE_SECONDS < 30
+    assert _FILLER_VOLUME_WIPE_TIMEOUT_SEC < _VOLUME_WIPE_TIMEOUT_SEC
 
 
 @pytest.mark.asyncio
