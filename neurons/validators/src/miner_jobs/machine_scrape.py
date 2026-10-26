@@ -680,8 +680,12 @@ DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
 VLOOPBACK_DRIVER_PREFIX = "vloopback"
+# the v2 plugin's DATA_DIR on the host, under DockerRootDir: loopback_plugin_setup.py uses the same name
+VLOOPBACK_V2_DATA_DIR_NAME = "vloopback-v2"
 # DAH-5014: the persistent filler model caches (services/const.py FILLER_CACHE_VOLUME_PREFIXES). The
 # validator evicts them before a rental or the listing floor needs the room, so they read as free disk.
+ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+# literal: the obfuscator does not rename names inside this tuple
 FILLER_CACHE_VOLUME_PREFIXES = ("dphn_cache_", "engy_cache_")
 
 
@@ -712,6 +716,17 @@ def docker_api_get(path):
         conn.close()
 
 
+def get_executor_pid_mode():
+    # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
+    # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
+    inspection = docker_api_get(f"/containers/{socket.gethostname()}/json")
+    host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
+    pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
+    if not isinstance(pid_mode, str):
+        raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
+    return pid_mode
+
+
 def get_vloopback_volume_bytes(docker_root_dir):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
@@ -731,6 +746,10 @@ def get_vloopback_volume_bytes(docker_root_dir):
     data_dirs = glob.glob(
         f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
     )
+    # the v2 plugin writes its DATA_DIR on the host itself, outside any plugin rootfs
+    v2_data_dir = f"/proc/1/root{docker_root_dir}/{VLOOPBACK_V2_DATA_DIR_NAME}"
+    if os.path.isdir(v2_data_dir):
+        data_dirs.append(v2_data_dir)
     if not data_dirs:
         # every volume would be counted as 0 and the breakdown would silently under-report by
         # terabytes; fail like the rest of the docker half so the miss lands in an error key
@@ -781,6 +800,15 @@ def get_host_disk_usage():
     return shutil.disk_usage("/")
 
 
+def cache_volume_bytes(df, prefixes):
+    # local-driver volumes: /system/df walks each one's _data, so this is what the files really hold
+    return sum(
+        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+        if str(volume.get("Name") or "").startswith(prefixes)
+    )
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
@@ -791,11 +819,7 @@ def get_docker_disk_usage():
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
     )
-    filler_cache = sum(
-        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
-        for volume in df.get("Volumes") or []
-        if str(volume.get("Name") or "").startswith(FILLER_CACHE_VOLUME_PREFIXES)
-    )
+    filler_cache = cache_volume_bytes(df, FILLER_CACHE_VOLUME_PREFIXES)
     volumes -= filler_cache
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     volumes += get_vloopback_volume_bytes(docker_root_dir)
@@ -812,6 +836,8 @@ def get_docker_disk_usage():
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
         "filler_cache_kb": filler_cache // 1024,
+        # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
+        "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
     }
 
 
@@ -2043,37 +2069,12 @@ def get_disk_health() -> DiskHealthObservation:
     return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
 
 
-def get_machine_specs():
-    """Get Specs of miner machine."""
-    data = {}
-
-    if os.environ.get('LD_PRELOAD'):
-        return data
-
-    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
-    gpu_process_ids = set()
-
-    libnvidia_path = get_libnvidia_ml_path()
-    if not libnvidia_path:
-        return data
-
-    nvmlLib_content = get_file_content(libnvidia_path)
-    docker_content = get_file_content("/usr/bin/docker")
-    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
-
-    try:
-        nvmlInit(nvmlLib_content)
-
-        device_count = nvmlDeviceGetCount()
-
-        data["data_gpu"] = {
-            "gpu_count": device_count,
-            "gpu_driver": nvmlSystemGetDriverVersion(),
-            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
-            "gpu_details": []
-        }
-
-        for i in range(device_count):
+def read_gpu_details(device_count, gpu_process_ids):
+    """The detail rows of every card NVML can read, and the first per-card error (repr) or None."""
+    gpu_details = []
+    first_error = None
+    for i in range(device_count):
+        try:
             handle = nvmlDeviceGetHandleByIndex(i)
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
@@ -2083,7 +2084,7 @@ def get_machine_specs():
             utilization = nvmlDeviceGetUtilizationRates(handle)
             memory_info = nvmlDeviceGetMemoryInfo(handle)
 
-            data["data_gpu"]["gpu_details"].append(
+            gpu_details.append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
@@ -2129,6 +2130,47 @@ def get_machine_specs():
             # Collect process IDs
             for proc in processes:
                 gpu_process_ids.add(proc.c_nvmlProcessInfo_v2_t_pid)
+        except Exception as exc:
+            # one hung card (e.g. NVML 999) must not hide the cards after it: skip it, read the rest
+            first_error = first_error or repr(exc)
+    return gpu_details, first_error
+
+
+def get_machine_specs():
+    """Get Specs of miner machine."""
+    data = {}
+
+    if os.environ.get('LD_PRELOAD'):
+        return data
+
+    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
+    gpu_process_ids = set()
+
+    libnvidia_path = get_libnvidia_ml_path()
+    if not libnvidia_path:
+        return data
+
+    nvmlLib_content = get_file_content(libnvidia_path)
+    docker_content = get_file_content("/usr/bin/docker")
+    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
+
+    try:
+        nvmlInit(nvmlLib_content)
+
+        device_count = nvmlDeviceGetCount()
+
+        data["data_gpu"] = {
+            "gpu_count": device_count,
+            "gpu_driver": nvmlSystemGetDriverVersion(),
+            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
+            "gpu_details": []
+        }
+
+        gpu_details, gpu_error = read_gpu_details(device_count, gpu_process_ids)
+        data["data_gpu"]["gpu_details"] = gpu_details
+        if gpu_error:
+            # same field and repr as a whole-scrape NVML failure, so the checks read the NVML code alike
+            data["gpu_scrape_error"] = gpu_error
 
         nvmlShutdown()
     except Exception as exc:
@@ -2260,6 +2302,13 @@ def get_machine_specs():
     except Exception as exc:
         data["data_disk_health_scrape_error"] = repr(exc)
 
+    # DAH: the executor's PID namespace mode, read from its own container (hostname = container id).
+    # "host" is required: backups read /proc/<rental pid> of the host. Missing key = unknown, never fails.
+    try:
+        data["data_executor_pid_mode"] = get_executor_pid_mode()
+    except Exception as exc:
+        data["data_executor_pid_mode_scrape_error"] = repr(exc)
+
     data["data_os"] = ""
     try:
         data["data_os"] = run_cmd('lsb_release -d | grep -Po "Description:\\s*\\K.*"').strip()
@@ -2275,6 +2324,10 @@ def get_machine_specs():
         data["kernel_scrape_error"] = repr(exc)
 
     
+    # aarch64 (GB300 Grace) ships a different libnvidia-ml; the validator picks its digest list by this
+    # os.uname(), not platform.machine(): the obfuscator renames the bare name `platform` (never its import)
+    data["data_machine_arch"] = os.uname().machine
+
     data["data_network"] = {}
 
     data["data_md5_checksums"] = {

@@ -24,6 +24,7 @@ from ...const import (
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
+from services.gpu_reset import renter_gpu_reset_in_progress
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
@@ -248,6 +249,12 @@ class TenantEnforcementCheck:
                 # its container may still be being created. Judged next cycle, not penalised.
                 state_by_pod_id[pod_id] = ContainerState.UNKNOWN
                 extra.setdefault("pods_awaiting_container", []).append(pod_id)
+                ssh_pub_keys = []
+                continue
+            elif await renter_gpu_reset_in_progress(ctx.services.redis, ctx.miner_hotkey, ctx.executor.uuid, pod_id):
+                # DAH-4658: the renter's own GPU reset stops the pod for a moment. Judged next cycle, not penalised.
+                state_by_pod_id[pod_id] = ContainerState.UNKNOWN
+                extra.setdefault("pods_resetting_gpus", []).append(pod_id)
                 ssh_pub_keys = []
                 continue
             else:

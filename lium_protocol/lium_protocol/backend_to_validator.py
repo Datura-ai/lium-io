@@ -39,6 +39,8 @@ class BackendMessageType(enum.Enum):
     ForcedValidationCycleRequest = "ForcedValidationCycleRequest"
     # ask the validator for an exact rental estimate; it answers with EstimateResponse
     GetEstimateRequest = "GetEstimateRequest"
+    # 1.16.0: reset a running pod's GPUs; the validator answers with PodGpuResetResult
+    ResetPodGpuRequest = "ResetPodGpuRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -290,6 +292,22 @@ class InstallJupyterServerRequest(ContainerRequest):
     container_name: str
     jupyter_port_map: tuple[int, int]
     local_volume: str | None = None
+    local_volume_path: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class ResetPodGpuRequest(ContainerRequest):
+    """1.16.0: the renter asked to reset the GPUs of their running pod. `gpu_uuids` is every GPU
+    the backend holds for the pod; `gpu_indices` picks some of them by pod index (the pod's GPUs sorted by
+    host PCI bus id, the 0..n-1 order `nvidia-smi` shows inside the pod), None for all of them. Answered by
+    `validator_to_backend.PodGpuResetResult` with the same `request_id`."""
+
+    message_type: BackendMessageType = BackendMessageType.ResetPodGpuRequest
+    container_name: str
+    gpu_uuids: list[str]
+    gpu_indices: list[int] | None = None
+    request_id: str
+    # the plaintext path of an encrypted pod volume: the restart remounts it; without it such a pod is refused
     local_volume_path: str | None = None
 
 

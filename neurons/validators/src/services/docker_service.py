@@ -52,13 +52,16 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
+    GpuResetErrorCode,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
     JupyterServerInstalled,
     PayloadPortMapping,
+    PodGpuResetResult,
     ProfilerStep,
     ProfilerStepName,
     RemoveSshPublicKeysRequest,
+    ResetPodGpuRequest,
     SshPubKeyAdded,
     SshPubKeyRemoved,
     VolumeEncryptionStatus,
@@ -69,6 +72,8 @@ from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
     EDIT_PARKED_SUFFIX,
+    LEGACY_LOOPBACK_PLUGIN_ALIAS,
+    LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
@@ -108,10 +113,13 @@ from services.prerun_host_probe import (
     port_check_containers_command,
     prerun_host_probe_command,
 )
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
+    GPU_RESET_PENDING_KIND,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
@@ -639,26 +647,36 @@ class VolumeSizingResult:
     existing_volumes_bytes: int | None = None
 
 
-_LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
-_LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
+# New volumes go to a second plugin installed beside the old one under the same name with a tag:
+# `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
+# whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
+_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
+# how much longer than the host's `timeout` the validator waits: for a connection that stops answering
+_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS = 10
 _PROBE_OUTPUT_LOG_CAP = 512
+# the volume host probe (with its df helper container) ends on the host by then; a probe that
+# does not answer returns None and the create takes the per-command path
+_VOLUME_HOST_PROBE_TIMEOUT_SECONDS = 30
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
-_LOOPBACK_PLUGIN_STATE_COMMAND = (
-    "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
-    f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1"
-)
+def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
+    return (
+        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+        f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null || echo absent) | tail -n 1"
+    )
 
 
-class LoopbackPluginDisabledError(Exception):
-    """The vloopback plugin is installed but disabled and `docker plugin enable` did not fix it.
-    The message keeps "plugin vloopback" and "disabled" so the platform classifier still files
-    it as volume.plugin_disabled."""
+_LOOPBACK_PLUGIN_STATE_COMMAND = _loopback_plugin_state_command(LOOPBACK_PLUGIN_ALIAS)
 
-    def __init__(self, detail: str):
+
+class NoUsableLoopbackPluginError(Exception):
+    """v2 cannot be used and the old plugin is not enabled: the validator never installs or
+    enables the old plugin, so the rent fails naming both."""
+
+    def __init__(self, v2_unusable_reason: str, old_plugin_state: str):
         super().__init__(
-            "vloopback plugin disabled on host and could not be enabled "
-            f"(plugin {_LOOPBACK_PLUGIN_ALIAS}: {detail})"
+            f"no usable vloopback plugin on host (v2: {v2_unusable_reason}; "
+            f"old plugin {LEGACY_LOOPBACK_PLUGIN_ALIAS} state {old_plugin_state})"
         )
 
 
@@ -2063,6 +2081,71 @@ async def _with_own_duration(
     started_ms = now_ms()
     answer = await operation
     return AnswerWithOwnDuration(answer, ProfilerStep.since(step_name, started_ms))
+
+
+class SshSessionMayStillBeTakenError(Exception):
+    """A timed-out channel whose open or close was not confirmed in time may still hold the host's
+    only SSH session (MaxSessions=1): no further command goes on this connection, the rent fails."""
+
+
+def _close_process_opened_late(opening: asyncio.Future) -> None:
+    if not opening.cancelled() and opening.exception() is None:
+        opening.result().close()
+
+
+async def _close_channel_within(process: asyncssh.SSHClientProcess, timeout: float | None) -> None:
+    # sshd keeps a closed channel's session while its command still runs (MaxSessions=1)
+    process.close()
+    try:
+        async with asyncio.timeout(timeout):
+            await process.wait_closed()
+    except TimeoutError:
+        raise SshSessionMayStillBeTakenError(f"channel close not confirmed within {timeout} s") from None
+
+
+async def _run_closing_channel_on_timeout(
+    ssh_client: asyncssh.SSHClientConnection, command: str, timeout: float | None
+) -> asyncssh.SSHCompletedProcess:
+    # asyncssh's timeout= bounds neither the channel open nor frees the channel when it fires;
+    # closing it lets a host with MaxSessions=1 run the next command. The command's own timeout
+    # starts once its channel is open, as a host-side `timeout` does. Raises TimeoutError once the
+    # channel is closed, SshSessionMayStillBeTakenError when that could not be confirmed.
+    opening = asyncio.ensure_future(ssh_client.create_process(command))
+    try:
+        async with asyncio.timeout(timeout):
+            process = await asyncio.shield(opening)
+    except TimeoutError:
+        # a cancelled open whose answer comes late leaves its session taken: never cancel it;
+        # give it one more timeout to answer and close, else close it whenever it answers
+        done, _ = await asyncio.wait({opening}, timeout=timeout)
+        if not done:
+            opening.add_done_callback(_close_process_opened_late)
+            raise SshSessionMayStillBeTakenError(
+                f"channel open not answered within {2 * timeout} s"
+            ) from None
+        if opening.exception() is None:
+            await _close_channel_within(opening.result(), timeout)
+        raise
+    try:
+        async with asyncio.timeout(timeout):
+            return await process.wait()
+    except TimeoutError:
+        await _close_channel_within(process, timeout)
+        raise
+
+
+async def _run_with_host_timeout(
+    ssh_client: asyncssh.SSHClientConnection, command: str, host_timeout: float | None
+) -> asyncssh.SSHCompletedProcess:
+    # the host ends the command itself (exit 124), so sshd frees its session before the next
+    # command opens one (MaxSessions=1); without a timeout the command runs unbounded, as before
+    if not host_timeout:
+        return await _run_closing_channel_on_timeout(ssh_client, command, None)
+    return await _run_closing_channel_on_timeout(
+        ssh_client,
+        f"timeout -k 5 {host_timeout} sh -c {shlex.quote(command)}",
+        host_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
+    )
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -4450,7 +4533,7 @@ class DockerService:
             for name, driver in volume_rows:
                 if not (
                     name.startswith("volume_")
-                    and (driver == "vloopback" or driver.startswith("vloopback:"))
+                    and _is_vloopback_driver(driver)
                 ):
                     continue
                 vloopback_volumes.add(name)
@@ -6077,50 +6160,83 @@ class DockerService:
         )
         return max(requested_timeout, min(scaled_timeout, _LOCAL_VOLUME_TIMEOUT_MAX_SEC))
 
-    async def _enable_loopback_plugin(
+    async def _fall_back_to_old_loopback_plugin(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         timeout: int,
         log_extra: dict,
-    ) -> None:
-        """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
-        again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
-        at volume creation with a clear reason instead of Docker's create error."""
-        run_kwargs = {"timeout": timeout} if timeout else {}
-        extra = {**log_extra, "loopback_plugin": _LOOPBACK_PLUGIN_ALIAS}
+        v2_unusable_reason: str,
+    ) -> str:
+        """The old plugin for one new volume when v2 cannot be used, only if it is already enabled:
+        until it is retired a node without v2 keeps renting. Returns the driver to create on, else
+        raises NoUsableLoopbackPluginError; never installs or enables the old plugin.
+        The only place a plugin command may name the old plugin; it goes away with it."""
+        old_plugin_alias = LEGACY_LOOPBACK_PLUGIN_ALIAS
         try:
-            result = await ssh_client.run(
-                f"/usr/bin/docker plugin enable {shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}", **run_kwargs
+            state_result = await _run_with_host_timeout(
+                ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout
             )
-            state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # typed fields only: an asyncssh error's text can carry the host's banner
-            error_type = exc.__class__.__name__
-            logger.warning(
-                _m(
-                    "Loopback plugin enable failed",
-                    extra=get_extra_info({**extra, "error_type": error_type}),
-                )
-            )
-            raise LoopbackPluginDisabledError(f"enable error: {error_type}") from exc
-        state = (state_result.stdout or "").strip()
+            state = (state_result.stdout or "").strip() or "unknown"
+        except TimeoutError:
+            state = "unknown"
         if state != "true":
-            detail = (result.stderr or result.stdout or "").strip()[:_PROBE_OUTPUT_LOG_CAP]
-            logger.warning(
-                _m(
-                    "Loopback plugin still disabled after enable",
-                    extra=get_extra_info(
-                        {**extra, "enable_exit_status": result.exit_status, "state": state, "error": detail}
-                    ),
+            raise NoUsableLoopbackPluginError(v2_unusable_reason, state)
+        logger.warning(
+            _m(
+                "Loopback plugin v2 unusable; creating this volume on the old plugin",
+                extra=get_extra_info(
+                    {**log_extra, "loopback_plugin": old_plugin_alias, "reason": v2_unusable_reason}
+                ),
+            )
+        )
+        return old_plugin_alias
+
+    @staticmethod
+    async def _get_loopback_v2_state(ssh_client: asyncssh.SSHClientConnection, requested_timeout: int) -> str:
+        # `plugin inspect` output of v2 ("true", "false", empty when absent), "unknown" when the read timed out
+        try:
+            state_result = await _run_with_host_timeout(ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout)
+        except TimeoutError:
+            return "unknown"
+        return (state_result.stdout or "").strip()
+
+    async def _pick_loopback_driver_for_new_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        timeout: int,
+        log_extra: dict,
+        host_probe: VolumeHostProbe | None,
+    ) -> str:
+        if not settings.LOOPBACK_PLUGIN_V2_ENABLED:
+            return await self._fall_back_to_old_loopback_plugin(
+                ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED"
+            )
+        if host_probe is not None and host_probe.loopback_plugin_enabled:
+            return LOOPBACK_PLUGIN_ALIAS
+        root = host_probe.docker_root_dir if host_probe else await self.get_docker_root_dir(ssh_client)
+        if not root.startswith("/"):
+            # An existing enabled v2 remains usable even when DockerRootDir could not be read.
+            if await self._get_loopback_v2_state(ssh_client, timeout) == "true":
+                return LOOPBACK_PLUGIN_ALIAS
+            reason = "Docker data root unknown"
+        else:
+            try:
+                result = await _run_with_host_timeout(
+                    ssh_client,
+                    loopback_plugin_setup_command(root, LOOPBACK_PLUGIN_ALIAS),
+                    _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS,
                 )
-            )
-            raise LoopbackPluginDisabledError(
-                f"enable exit {result.exit_status}, state {state or 'unknown'}"
-                + (f": {detail}" if detail else "")
-            )
-        logger.info(_m("Loopback plugin was disabled; enabled it", extra=get_extra_info(extra)))
+                if result.exit_status == 0:
+                    return LOOPBACK_PLUGIN_ALIAS
+                reason = f"v2 setup exit {result.exit_status}: {(result.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
+            except (SshSessionMayStillBeTakenError, asyncssh.Error):
+                raise
+            except TimeoutError:
+                reason = "v2 setup timed out"
+            except Exception as exc:
+                # SSH errors can contain provider banners or credentials. Log only the type.
+                reason = f"v2 setup error: {type(exc).__name__}"
+        return await self._fall_back_to_old_loopback_plugin(ssh_client, timeout, log_extra, reason)
 
     async def create_local_volume(
         self,
@@ -6142,40 +6258,9 @@ class DockerService:
             field_name="local_volume",
         )
         if limit:
-            # install loopback plugin
-            loopback_plugin_name = _LOOPBACK_PLUGIN_ALIAS
-
-            if host_probe is not None:
-                docker_root_dir = host_probe.docker_root_dir
-            else:
-                docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
-
-            if host_probe is not None and host_probe.loopback_plugin_enabled:
-                # The probe saw the plugin installed and enabled: `docker plugin install` would
-                # only ask Docker Hub for the plugin's privileges and then fail with "already
-                # exists" (~0.9 s measured on a 4090 node, every rent). Nothing to do.
-                logger.info(
-                    _m(
-                        "Loopback plugin already enabled; skipping plugin install",
-                        extra=get_extra_info({**log_extra, "loopback_plugin": loopback_plugin_name}),
-                    )
-                )
-            elif host_probe is not None and host_probe.loopback_plugin_installed:
-                # Installed but disabled: `docker plugin install` would fail with "already exists"
-                # and the volume create with "plugin vloopback found but disabled".
-                await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
-            else:
-                loopback_plugin_arg = shlex.quote(loopback_plugin_name)
-                data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
-                command = (
-                    f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
-                    f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
-                )
-                # TODO: migrate Docker plugin management if/when plugin setup becomes
-                # part of the SDK migration scope. The user-controlled volume name is
-                # not used in this shell command; volume creation below is SDK-backed.
-                await ssh_client.run(command)
+            loopback_plugin_name = await self._pick_loopback_driver_for_new_volume(
+                ssh_client, requested_timeout, log_extra, host_probe
+            )
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
             # by default (creation time scales with size). `sparse=true` writes a sparse
@@ -6320,14 +6405,19 @@ class DockerService:
         Replaces `docker info` + the df helper container + `docker volume ls` (fresh sizing) and the
         second `docker info` + the unconditional `docker plugin install` (create) — five serial
         commands, one of them a Docker Hub round trip — with one command and, when vloopback
-        volumes exist, the same `docker volume inspect` as before. Never fatal: on any failure it
-        returns None and the callers take the per-command path.
+        volumes exist, the same `docker volume inspect` as before. On any failure it returns None
+        and the callers take the per-command path, except when its channel may still hold the
+        host's only SSH session: SshSessionMayStillBeTakenError stops the create.
         """
         started = now_ms()
         try:
-            result = await ssh_client.run(_volume_host_probe_command(with_df=with_df))
+            result = await _run_with_host_timeout(
+                ssh_client,
+                _volume_host_probe_command(with_df=with_df),
+                _VOLUME_HOST_PROBE_TIMEOUT_SECONDS,
+            )
             probe = _parse_volume_host_probe(result.stdout or "", with_df=with_df)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
             raise
         except Exception as exc:
             logger.warning(
@@ -8558,6 +8648,10 @@ class DockerService:
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
                         else:
+                            # a discarded early probe ends (it is bounded) before the next one opens a
+                            # channel (MaxSessions=1), and stops the create as the probe itself would
+                            if early_volume_probe is not None and not early_volume_probe.cancelled():
+                                await early_volume_probe
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
                                 with_df=measures_host,
@@ -10825,6 +10919,132 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=str(log_text),
             )
+
+    async def reset_pod_gpus(
+        self,
+        payload: ResetPodGpuRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ) -> PodGpuResetResult:
+        """DAH-4658: a renter's reset of their pod's GPUs (services/gpu_reset.py does the work). The
+        pending-pod mark (kind gpu_reset) is held throughout, so the rented GPU checks skip the node
+        and no verified-job reset is sent for it: a renter's reset is never a provider fault. A short
+        recent-reset mark then covers the scrape that ends just after it."""
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
+            "request_id": payload.request_id,
+            "container_name": payload.container_name,
+            "executor_ip_address": executor_info.address,
+            "executor_ssh_port": executor_info.ssh_port,
+        }
+        logger.info(_m("Reset pod GPUs", extra=get_extra_info({**default_extra, "payload": str(payload)})))
+
+        def result(report: GpuResetReport) -> PodGpuResetResult:
+            return PodGpuResetResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=report.ok,
+                error_code=report.error_code,
+                container_restarted=report.container_restarted,
+                gpus=report.gpus,
+                detail=report.detail,
+            )
+
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info, payload.miner_hotkey, default_extra
+            )
+            require_rental_docker_ssh_host_key(executor_info)
+        except (AttestationError, RentalDockerConnectionError) as exc:
+            logger.error(_m("Reset pod GPUs: executor not trusted", extra=get_extra_info({**default_extra, "error": str(exc)})))
+            return result(GpuResetReport(ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=str(exc)))
+
+        async def start_container() -> None:
+            await self.start_existing_container(
+                executor_info=executor_info,
+                private_key=private_key,
+                known_hosts_policy=known_hosts_policy,
+                container_name=payload.container_name,
+                local_volume_path=payload.local_volume_path,
+                pod_id=payload.pod_id,
+                default_extra=default_extra,
+            )
+
+        await self.redis_service.add_pending_pod(
+            payload.miner_hotkey,
+            payload.executor_id,
+            payload.pod_id,
+            kind=GPU_RESET_PENDING_KIND,
+            gpu_uuids=payload.gpu_uuids,
+        )
+        report: GpuResetReport | None = None
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=known_hosts_policy,
+            ) as ssh_client:
+                report = await reset_pod_gpus(
+                    SSHCommandRunner(ssh_client, max_retries=0),
+                    container_name=payload.container_name,
+                    pod_gpu_uuids=payload.gpu_uuids,
+                    gpu_indices=payload.gpu_indices,
+                    start_container=start_container,
+                    in_tee=bool(executor_info.tdx_quote),
+                    encrypted_volume_mount=_LIUM_CIPHER_MOUNT,
+                    local_volume_path=payload.local_volume_path,
+                )
+        except Exception as exc:
+            logger.error(_m("Reset pod GPUs failed", extra=get_extra_info({**default_extra, "error": str(exc)})), exc_info=True)
+            report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=str(exc))
+        finally:
+            # a scrape that ends just after the reset can still miss cards: keep a short mark past the pending one;
+            # a reset refused before the pod stopped never took the cards out (None: cancelled mid-reset)
+            try:
+                if report is None or report.pod_stopped:
+                    await self.redis_service.mark_gpu_reset_recent(
+                        payload.miner_hotkey,
+                        payload.executor_id,
+                        payload.pod_id,
+                        payload.gpu_uuids,
+                        RECENT_RENTER_GPU_RESET_SECONDS,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    _m("Reset pod GPUs: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+            try:
+                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+            except Exception as exc:
+                logger.warning(
+                    _m("Reset pod GPUs: pending reset mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+
+        logger.info(
+            _m(
+                "Reset pod GPUs done",
+                extra=get_extra_info({
+                    **default_extra,
+                    "ok": report.ok,
+                    "error_code": report.error_code.value if report.error_code else None,
+                    "container_restarted": report.container_restarted,
+                    "gpus": [gpu.model_dump() for gpu in report.gpus],
+                    "detail": report.detail,
+                }),
+            )
+        )
+        return result(report)
 
     async def remove_ssh_keys(
         self,

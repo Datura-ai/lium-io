@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from aiohttp import web
+from core.config import settings
 from services.executor_connectivity.external_probe import ExternalPortProbe
 from services.executor_connectivity.models import (
     BatchResult,
@@ -32,11 +33,25 @@ def _verifier(mocker, reached):
 
 @pytest.mark.asyncio
 async def test_batch_flags_ports_that_answer_only_the_validator(mocker):
+    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
     verifier, _ = _verifier(mocker, lambda sample: [])
 
     result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
 
     assert result.external_blocked is True
+
+
+@pytest.mark.asyncio
+async def test_batch_only_logs_ports_that_answer_only_the_validator_until_enforced(mocker, caplog):
+    mocker.patch.object(settings, "EXTERNAL_PORT_PROBE_ENFORCE", False)
+    verifier, _ = _verifier(mocker, lambda sample: [])
+
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify(PORTS, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.external_blocked is False
+    assert result.successful == PORTS
+    assert "not the outside prober (log-only)" in caplog.text
 
 
 @pytest.mark.asyncio

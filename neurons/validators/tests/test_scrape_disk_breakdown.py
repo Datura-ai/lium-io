@@ -17,6 +17,7 @@ import shutil
 import socket
 from collections import namedtuple
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from neurons.validators.tests.helpers import build_scrape_namespace
@@ -27,12 +28,15 @@ DISK_HELPERS = {
     "DOCKER_SOCKET_PATH",
     "DOCKER_API_TIMEOUT_SECONDS",
     "VLOOPBACK_DRIVER_PREFIX",
+    "VLOOPBACK_V2_DATA_DIR_NAME",
     "UnixSocketHTTPConnection",
     "docker_api_get",
     "get_vloopback_volume_bytes",
     "get_container_log_bytes",
     "get_host_disk_usage",
     "get_docker_disk_usage",
+    "cache_volume_bytes",
+    "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_CACHE_VOLUME_PREFIXES",
     "release_filler_cache",
 }
@@ -78,6 +82,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
         "filler_cache_kb": 0,
+        "hard_disk_engy_cache_used_gb": 0,
     }
 
 
@@ -105,6 +110,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_containers": 0,
         "hard_disk_volumes": 0,
         "filler_cache_kb": 0,
+        "hard_disk_engy_cache_used_gb": 0,
     }
 
 
@@ -197,6 +203,30 @@ def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, 
     # Act / Assert
     with pytest.raises(RuntimeError):
         scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
+
+
+@pytest.mark.parametrize("old_blocks, total_blocks", [(1953136, 1953136 + 7488), (None, 7488)])
+def test_vloopback_volume_bytes_counts_the_v2_host_data_dir_beside_the_old_plugin_rootfs(
+    scrape: dict, monkeypatch, old_blocks, total_blocks
+) -> None:
+    # the old plugin's files sit in its rootfs (found by the glob), v2's in a host dir under DockerRootDir;
+    # a node with v2 only is a fresh one, not a structural miss
+    old_dir = "/proc/1/root/var/lib/docker/plugins/abc/rootfs/var/lib/docker/loopback"
+    v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
+    blocks = {f"{v2_dir}/volume_v2": 7488} | ({f"{old_dir}/volume_old": old_blocks} if old_blocks else {})
+
+    def stat(path):
+        if path not in blocks:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_blocks=blocks[path])
+
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [old_dir] if old_blocks else []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
+    volumes = [{"Name": "volume_old", "Driver": "vloopback:latest"}, {"Name": "volume_v2", "Driver": "vloopback:v2"}]
+    _stub_docker_api(scrape, {"/volumes": {"Volumes": volumes}})
+
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == total_blocks * 512
 
 
 def _obfuscation_tables() -> tuple[set[str], set[str]]:
@@ -450,6 +480,8 @@ def test_filler_cache_volumes_are_reported_as_free_disk(scrape: dict) -> None:
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
         "hard_disk_volumes": 10 * 1024**2,
+        # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
+        "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
     }
 
 

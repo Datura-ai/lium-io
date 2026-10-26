@@ -256,12 +256,6 @@ class Settings(BaseSettings):
     INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
         env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
     )
-    # DAH-4548: on, the sensor's rental-interference verdict of a host write into a rented pod fails
-    # the Inspector check and zeroes the score. Off: unchanged, logged as INSPECTOR_HOST_WRITE with
-    # enforced=false. A read is only logged either way.
-    INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -275,6 +269,8 @@ class Settings(BaseSettings):
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
+    # Emergency switch for new volumes only; existing recorded drivers remain usable.
+    LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
@@ -285,6 +281,9 @@ class Settings(BaseSettings):
     # validator reaches them, the node gets no verified ports. Unset URL: no outside probe.
     EXTERNAL_PORT_PROBE_URL: str = Field(env="EXTERNAL_PORT_PROBE_URL", default="")
     EXTERNAL_PORT_PROBE_TOKEN: str = Field(env="EXTERNAL_PORT_PROBE_TOKEN", default="")
+    # Off: a node whose ports answer only the validator is logged ("log-only"), not failed, so prod can count
+    # those nodes before enforcing.
+    EXTERNAL_PORT_PROBE_ENFORCE: bool = Field(env="EXTERNAL_PORT_PROBE_ENFORCE", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -302,9 +301,9 @@ class Settings(BaseSettings):
     # A filler-only node skips the matmul while the filler runs. With N > 0, every Nth such cycle
     # runs the challenge on a small VRAM budget beside the filler and records the answer
     # (FILLER_MATMUL_SAMPLE); the check result never depends on it. Each sample is pinned to the
-    # next claimed card in rotation. 0 = never, the default.
+    # next claimed card in rotation. 0 = never. Default 96 = about once a day per node (Mikhail, DAH-4278).
     FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES: int = Field(
-        env="FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", default=0, ge=0
+        env="FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", default=96, ge=0
     )
     # Above the 2048 MB the matmul keeps in reserve, or no matrix fits.
     FILLER_MATMUL_SAMPLE_VRAM_MB: int = Field(env="FILLER_MATMUL_SAMPLE_VRAM_MB", default=4096, ge=4096)
@@ -482,6 +481,9 @@ class Settings(BaseSettings):
     # sequential matmul. It always runs and logs the verdict (DAH-4257 shadow, flag removed);
     # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # DAH-5048 — the NVLink multicast probe always runs on all-NVLink boards and logs NVLINK_FAULT; ENFORCEMENT
+    # lets a fault fail the node. Shadow first: the false-fail count on healthy boards is unknown yet.
+    NVLINK_FAULT_ENFORCEMENT_ENABLED: bool = Field(env="NVLINK_FAULT_ENFORCEMENT_ENABLED", default=False)
     # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
     # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
     # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
@@ -544,6 +546,17 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
+    # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
+    # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
+    # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
+    # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
+    # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
+    # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
+    RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
+    RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
+    RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
+    RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and
@@ -575,13 +588,6 @@ class Settings(BaseSettings):
     # idle moved to the burner, never an older vector.
     SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
-    # Two executors of ONE miner hotkey that report the same GPU UUID in one cycle are one set of
-    # cards listed twice. Always logged (GPU_ALIAS_SAME_MINER); with this on, every copy but one
-    # scores 0 for the cycle. Only the miner's own executors are compared, so another miner
-    # reporting the same UUIDs cannot cost it anything.
-    GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED: bool = Field(
-        env="GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", default=False
-    )
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
@@ -621,7 +627,8 @@ class Settings(BaseSettings):
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
     # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR); a spot node without a filler, or whose configuration
+    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
+    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
     # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
     # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
     # False: every spot node earns 0, as before.
@@ -895,8 +902,8 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
-        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=1.0, ge=0, lt=100,
-        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB.",
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
+        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,

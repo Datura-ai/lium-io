@@ -24,6 +24,10 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
+    remember_rented_scored_results,
+    withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -123,8 +127,13 @@ def settle_cycle_results(
 
 
 def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
-    """All but a zeroed duplicate under the keeper's own executor UUID: that backend row hears the keeper."""
-    return [result for result in results if not result.duplicate_shares_kept_row]
+    """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
+    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    return [
+        result
+        for result in results
+        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+    ]
 
 
 class Validator:
@@ -600,6 +609,8 @@ class Validator:
                             )
                             task.cancel()
 
+                    # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
+                    await self.carry_scores_over_renter_gpu_resets(all_job_results, rented_executors, miner_coldkeys)
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -632,6 +643,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window
                     )
+                    await remember_rented_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -1474,6 +1486,22 @@ class Validator:
                 grace_cycles=0,
             )
 
+    async def carry_scores_over_renter_gpu_resets(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        rented_executors: RentedExecutorsResponse | None,
+        miner_coldkeys: dict[str, str | None],
+    ) -> None:
+        """DAH-4658: only a node the backend still lists as rented carries its score: right now, or in this
+        cycle's snapshot when the backend does not answer."""
+        if not has_renter_gpu_reset_holds(all_job_results):
+            return
+        rented = await self.backend_client.get_rented_executors_now() or rented_executors
+        rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
+        await carry_renter_gpu_reset_results(
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+        )
+
     async def withhold_verdicts_for_rollout(
         self,
         all_job_results: dict[str, list[JobResult]],
@@ -1492,7 +1520,8 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        return standing, withheld_results
+        standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
+        return standing, withheld_results + held_for_gpu_reset
 
     async def record_withheld_verdicts(
         self,

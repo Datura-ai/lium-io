@@ -17,7 +17,7 @@ from core.utils import _m, get_extra_info
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
 from .gpu_loss_hold import GpuLossHoldCheck
-from .rented_gpu_drop import RentedGpuDropCheck
+from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -476,6 +476,15 @@ class MachineSpecScrapeCheck:
 
         if not scrape_run.success or not scrape_run.stdout.strip():
             failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            # DAH-4658: every card is missing; held only when each one is a GPU the renter resets
+            if failure.scrape_error == "no_gpu_details" and await missing_gpus_under_reset(ctx, []):
+                event = render_message(
+                    Msg.SCRAPE_GPU_RESET_IN_PROGRESS,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={**what, "held_reason_code": failure.template.reason, **failure.cause_event_fields()},
+                )
+                return CheckResult(passed=False, event=event)
             if failure.scrape_error == "no_gpu_details":
                 await _report_rented_gpu_loss(
                     ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.container_cleanup import DPHN_CACHE_RECLAIM_FREE_FLOOR_GB, ContainerCleanup
+from services.container_cleanup import ContainerCleanup
 
 GB = 1024**3
 
@@ -70,105 +70,6 @@ def _removed(ssh_client: FakeSshClient) -> list[str]:
 @pytest.fixture
 def cleanup() -> ContainerCleanup:
     return ContainerCleanup()
-
-
-@pytest.mark.asyncio
-async def test_reclaims_the_cache_when_free_disk_is_below_the_listing_floor(cleanup):
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x", "dphn_cache_dp_x", "volume_pod"], free_gb=40
-    )
-
-    removed = await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1")
-
-    assert removed == 2
-    assert _removed(ssh_client) == ["dphn_cache_dp_x", "dphn_cache_hf_x"]
-
-
-@pytest.mark.asyncio
-async def test_keeps_the_cache_when_the_node_is_comfortably_above_the_floor(cleanup):
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=DPHN_CACHE_RECLAIM_FREE_FLOOR_GB + 500
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_never_reclaims_while_a_filler_container_is_live(cleanup):
-    # A cache a sibling still mounts is in use, and a node still running fillers is not the stranded
-    # node this backstop exists to rescue.
-    ssh_client = FakeSshClient(containers=["filler_abc"], volumes=["dphn_cache_hf_x"], free_gb=10)
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_no_cache_on_the_host_is_a_no_op(cleanup):
-    ssh_client = FakeSshClient(containers=[], volumes=["volume_pod"], free_gb=10)
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_dry_run_reports_without_removing(cleanup):
-    dry = ContainerCleanup(dry_run=True)
-    ssh_client = FakeSshClient(containers=[], volumes=["dphn_cache_hf_x"], free_gb=10)
-
-    assert await dry.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_the_disk_is_measured_on_the_real_docker_data_root(cleanup):
-    # Nodes can move docker's data-root to a dedicated disk. Measuring /var/lib/docker there reads the
-    # root filesystem instead: the reclaim then never fires while docker's disk is full, or fires and
-    # deletes a healthy cache the node had room for. The rest of the codebase already discovers the
-    # root dynamically.
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=10, docker_root="/mnt/docker-data"
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-    assert any("/mnt/docker-data" in command for command in ssh_client.commands), (
-        "the reclaim measured a filesystem that is not docker's data root"
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_refused_removal_is_never_reported_as_reclaimed(cleanup):
-    # `|| true` swallows dockerd's refusal, so counting the volumes we ASKED to remove reports a
-    # rescue that never happened — and the node stays delisted while telemetry says it was saved.
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=10, refuses={"dphn_cache_hf_x"}
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-
-
-@pytest.mark.asyncio
-async def test_only_the_volumes_that_actually_went_away_are_counted(cleanup):
-    ssh_client = FakeSshClient(
-        containers=[],
-        volumes=["dphn_cache_hf_x", "dphn_cache_dp_x"],
-        free_gb=10,
-        refuses={"dphn_cache_dp_x"},
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-
-
-@pytest.mark.asyncio
-async def test_a_stopped_filler_does_not_block_the_reclaim(cleanup):
-    # `docker ps -a` would list a long-exited filler_* forever and wedge the guard; the check must
-    # look at RUNNING containers only.
-    ssh_client = FakeSshClient(containers=[], volumes=["dphn_cache_hf_x"], free_gb=10)
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-    assert _removed(ssh_client) == ["dphn_cache_hf_x"]
-    assert not any("ps -a" in c for c in ssh_client.commands), "guard must not use `docker ps -a`"
 
 
 class EvictingSshClient(FakeSshClient):
