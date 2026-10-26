@@ -28,10 +28,10 @@ state["calls"].append(sys.argv[1:])
 plugin_id = "a" * 64
 
 def plugin():
-    data_dir = "/srv" + str(root) + "/vloopback-v2"
+    data_dir = "/srv" + str(root) + "/vloopback-v3"
     if state.get("root_mismatch"):
         data_dir += "-wrong"
-    env = ["DATA_DIR=" + data_dir, "STATE_DIR=/srv/run/docker-volume-loopback-v2"]
+    env = ["DATA_DIR=" + data_dir, "STATE_DIR=/srv/run/docker-volume-loopback-v3"]
     if state.get("duplicate_env"):
         env.append("DATA_DIR=/wrong")
     identity = "b" * 64 if state.get("enable_switch_id") and state.get("enabled") else plugin_id
@@ -53,7 +53,7 @@ if action == "inspect":
         print("permission denied", file=sys.stderr)
         sys.exit(1)
     if not state.get("installed"):
-        print("Error response from daemon: No such plugin: vloopback:v2", file=sys.stderr)
+        print("Error response from daemon: No such plugin: vloopback:v3", file=sys.stderr)
         sys.exit(1)
     print(json.dumps([plugin()]))
 sys.exit(state.get(action + "_exit", 0))
@@ -72,8 +72,8 @@ def _setup_arguments(tmp_path: Path, overrides: dict) -> list[str]:
     docker.write_text(f"#!{sys.executable}\n" + _FAKE_DOCKER)
     docker.chmod(0o700)
     return [
-        sys.executable, "-c", _SETUP_SCRIPT, str(docker), "vloopback:v2",
-        "daturaai/docker-volume-loopback:1.0.0-lium1", LOOPBACK_PLUGIN_DIGEST,
+        sys.executable, "-c", _SETUP_SCRIPT, str(docker), "vloopback:v3",
+        "daturaai/docker-volume-loopback:1.0.0-lium2", LOOPBACK_PLUGIN_DIGEST,
         str(tmp_path), "", str(tmp_path / "setup.lock"),
     ]
 
@@ -148,11 +148,11 @@ async def test_setup_command_quotes_the_root_and_never_installs_a_digest() -> No
     root = "/data/docker space'$(touch /tmp/unwanted)"
 
     # Act
-    args = shlex.split(loopback_plugin_setup_command(root, "vloopback:v2"))
+    args = shlex.split(loopback_plugin_setup_command(root, "vloopback:v3"))
 
     # Assert: the shell sees one literal path, with the expected digest passed separately.
     assert args[-3] == root
     assert args[-2] == "/proc/1/root"
-    assert args[-1] == "/run/lock/lium-loopback-v2.lock"
+    assert args[-1] == "/run/lock/lium-loopback-v3.lock"
     assert args[2] == _SETUP_SCRIPT
     assert args[-4] == LOOPBACK_PLUGIN_DIGEST

@@ -121,7 +121,7 @@ async def test_v2_switch_uses_enabled_v1_even_when_the_probe_saw_enabled_v2(dock
     assert created[0]["driver"] == "vloopback"
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
     assert len(commands) == 1
-    assert "vloopback:v2" not in commands[0]
+    assert "vloopback:v3" not in commands[0]
     assert "python3" not in commands[0]
 
 
@@ -228,14 +228,14 @@ def _plugin_host(
         command = shlex.split(command)[-1] if command.startswith("timeout -k 5 ") else command
         if command.startswith("python3 "):
             if v2_state == "true" or (v2_state == "false" and enable_succeeds):
-                return Mock(stdout="verified v2 ready\n", stderr="", exit_status=0)
+                return Mock(stdout="verified plugin ready\n", stderr="", exit_status=0)
             if install == "hangs":
                 await asyncio.Event().wait()
-            return Mock(stdout="", stderr="v2 installation did not produce a plugin", exit_status=1)
+            return Mock(stdout="", stderr="installation did not produce a plugin", exit_status=1)
         if "docker info" in command:
             return Mock(stdout=f"{docker_root}\n", stderr="", exit_status=0)
         if "plugin inspect" in command:
-            state = v2_state if "vloopback:v2" in command else old_state
+            state = v2_state if "vloopback:v3" in command else old_state
             if state == "unreadable":
                 raise TimeoutError
             return Mock(stdout=f"{state}\n", stderr="", exit_status=0)
@@ -299,13 +299,13 @@ async def test_create_local_volume_fails_naming_both_and_never_installs_or_enabl
     assert message.startswith("no usable vloopback plugin on host (v2: v2 setup exit 1:")
     assert message.endswith(f"; old plugin vloopback state {old_state})")
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert all("vloopback:v2" in command for command in commands if "plugin install" in command)
+    assert all("vloopback:v3" in command for command in commands if "plugin install" in command)
     assert not any("plugin enable" in command for command in commands)
     assert docker_service.rental_docker_client_factory.client.created_volumes == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("v2_state, old_state, driver", [("true", "absent", "vloopback:v2"), ("absent", "true", "vloopback")])
+@pytest.mark.parametrize("v2_state, old_state, driver", [("true", "absent", "vloopback:v3"), ("absent", "true", "vloopback")])
 async def test_create_local_volume_without_a_docker_data_root_never_installs_v2(
     docker_service, v2_state, old_state, driver
 ):
@@ -328,10 +328,10 @@ async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_
     # Act
     created = await _create_volume(docker_service, ssh_client, None)
     # Assert: recover disabled v2 before considering any legacy plugin, whatever its state.
-    assert [volume["driver"] for volume in created] == ["vloopback:v2"]
+    assert [volume["driver"] for volume in created] == ["vloopback:v3"]
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert commands[-1] == _bounded(loopback_plugin_setup_command("/var/lib/docker", "vloopback:v2"), 60)
-    assert all("vloopback:v2" in command for command in commands if "plugin" in command)
+    assert commands[-1] == _bounded(loopback_plugin_setup_command("/var/lib/docker", "vloopback:v3"), 60)
+    assert all("vloopback:v3" in command for command in commands if "plugin" in command)
 
 
 @pytest.mark.asyncio

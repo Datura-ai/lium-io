@@ -1,9 +1,10 @@
 """DAH-5101 — a delete does not wait for the pod's unwritten volume data to reach a slow disk.
 
 Kosta85's node (executor 8c7d58d6-2ac4-4d77-a9b0-d86f5559782b): a tenant writing faster than the
-disk left gigabytes of dirty pages in the vloopback image; dockerd's unmount synced the whole
-Docker filesystem and the delete hung until the disk had absorbed them. The rental is over and
-the volume is removed anyway, so the validator drops that data before dockerd gets to the unmount.
+disk left gigabytes of unwritten data in its volume; dockerd unmounts the volume when the container
+stops and the unmount flushes it, so the delete hung until the disk had absorbed it all. The rental
+is over and the volume is removed anyway: a throwaway container holds the volume mounted across the
+stop, then unlinks its files, which drops the unwritten pages instead of writing them.
 """
 
 # ruff: noqa: F811 — the docker_service fixture is imported from test_docker_service
@@ -16,13 +17,11 @@ import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import ContainerDeleted, ContainerDeleteRequest, WorkloadKind
 
-from core.docker_utils import DockerCommand
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
-    FILLER_CONTAINER_STOP_GRACE_SECONDS,
-    _BoundLog,
-    _vloopback_backing_file_host_path,
-    _vloopback_drop_dirty_volume_cmd,
+    _remove_volume_holder_cmd,
+    _start_volume_holder_cmd,
+    _wipe_held_volume_cmd,
 )
 from tests.test_docker_service import (  # noqa: F401
     FAKE_SSH_HOST_KEY,
@@ -32,15 +31,22 @@ from tests.test_docker_service import (  # noqa: F401
     mock_dependencies,
 )
 
+HOLDER_CMD = (
+    "/usr/bin/docker run -d --rm --name wipe_volume_dirty -v volume_dirty:/mnt "
+    "docker.io/library/alpine:3.19 sleep 600"
+)
+WIPE_CMD = "/usr/bin/docker exec wipe_volume_dirty sh -c 'find /mnt -mindepth 1 -maxdepth 1 -exec rm -rf {} +'"
+REMOVE_HOLDER_CMD = "/usr/bin/docker rm -f wipe_volume_dirty"
 
-def _delete_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerDeleteRequest:
+
+def _delete_payload(local_volume: str | None = "volume_dirty") -> ContainerDeleteRequest:
     return ContainerDeleteRequest(
         miner_hotkey="miner",
         executor_id=str(uuid4()),
         pod_id=str(uuid4()),
-        workload_kind=workload_kind,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
         container_name="pod_dirty",
-        local_volume="volume_dirty",
+        local_volume=local_volume,
     )
 
 
@@ -57,21 +63,21 @@ def _executor_info(payload: ContainerDeleteRequest) -> ExecutorSSHInfo:
     )
 
 
-V2_PLUGIN_MOUNTS = '[{"Source":"/dev","Destination":"/dev"},{"Source":"/","Destination":"/srv"}]'
+def _wire_delete(docker_service, monkeypatch, ssh_answers) -> tuple[AsyncMock, list]:
+    """Returns the ssh client and one ordered log shared with the fake docker client, so the test
+    sees the ssh commands and the SDK calls in the order they ran."""
+    client = docker_service.rental_docker_client_factory.client
+    order = client.container_call_order
+    answers = iter(ssh_answers) if isinstance(ssh_answers, list) else None
 
+    async def run(command, **kwargs):
+        order.append(("ssh", command))
+        if answers is None:
+            raise ssh_answers
+        return next(answers)
 
-def _ssh_answers_for_vloopback_volume() -> list:
-    return [
-        _make_ssh_command_result(stdout="vloopback:v2\n"),  # docker volume inspect
-        _make_ssh_command_result(stdout=f"plugin123 {V2_PLUGIN_MOUNTS}\n"),  # docker plugin inspect
-        _make_ssh_command_result(stdout="/var/lib/docker\n"),  # docker info
-        _make_ssh_command_result(stdout="/srv/var/lib/docker/vloopback-v2/volume_dirty\n"),  # loop backing file
-        _make_ssh_command_result(stdout="pid=4242 exited=yes\n"),  # stop_container_init
-        _make_ssh_command_result(stdout="wiped=yes truncated=yes\n"),  # helper
-    ]
-
-
-def _wire_delete(docker_service, monkeypatch, ssh_client: AsyncMock) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
     monkeypatch.setattr(
         "services.docker_service.asyncssh.connect",
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
@@ -80,153 +86,104 @@ def _wire_delete(docker_service, monkeypatch, ssh_client: AsyncMock) -> None:
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
+    return ssh_client, order
 
 
-def test_stop_command_signals_term_then_kill_and_waits_on_proc():
-    cmd = DockerCommand.stop_container_init("pod_dirty", 30, 20)
-
-    assert "docker inspect -f '{{.State.Pid}}' pod_dirty" in cmd
-    assert "kill -TERM $pid" in cmd and "kill -9 $pid" in cmd
-    assert "-lt 30" in cmd and "-lt 20" in cmd
-    assert "/proc/$pid" in cmd
-    assert "docker stop" not in cmd  # docker stop waits for the unmount, which waits for the disk
-
-
-def test_drop_command_unlinks_the_volume_files_and_truncates_its_image():
-    cmd = _vloopback_drop_dirty_volume_cmd(
-        "/var/lib/docker/plugins/plugin123/propagated-mount",
-        "volume_dirty",
-        "/var/lib/docker/vloopback-v2/volume_dirty",
+async def _delete(docker_service, payload):
+    return await docker_service.delete_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
     )
 
-    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in cmd
-    assert "--mount type=bind,src=/var/lib/docker/vloopback-v2,dst=/img" in cmd
-    assert "docker.io/library/alpine:3.19" in cmd
-    assert "find /mnt/volume_dirty -mindepth 1 -maxdepth 1 -exec rm -rf {} +" in cmd  # the files, never the mountpoint
-    assert "truncate -s 0 /img/volume_dirty" in cmd
-    assert "losetup" not in cmd  # detaching flushes first; truncate is the only step that does not
+
+def test_holder_command_takes_a_lease_on_the_volume_and_frees_it_by_itself():
+    assert _start_volume_holder_cmd("volume_dirty") == HOLDER_CMD
 
 
-def test_drop_command_without_an_image_only_unlinks_the_files():
-    cmd = _vloopback_drop_dirty_volume_cmd("/var/lib/docker/plugins/p/propagated-mount", "volume_dirty", None)
-
-    assert "truncate -s 0" not in cmd and "/img" not in cmd
-    assert "rm -rf" in cmd
-
-
-def test_drop_command_quotes_the_volume_name():
-    cmd = _vloopback_drop_dirty_volume_cmd("/var/lib/docker/plugins/p/propagated-mount", "vol; rm -rf /", None)
-
-    # shlex-quoted inside the helper script, which is shlex-quoted again for `sh -c`
-    assert """'"'"'vol; rm -rf /'"'"'""" in cmd
-
-
-def test_backing_file_under_a_plugin_mount_maps_to_the_host_source():
-    # vloopback:v2 binds the host's / at /srv and keeps DATA_DIR there
-    host_path = _vloopback_backing_file_host_path(
-        "/srv/var/lib/docker/vloopback-v2/volume_dirty",
-        [{"Source": "/dev", "Destination": "/dev"}, {"Source": "/", "Destination": "/srv"}],
-        "/var/lib/docker/plugins/plugin123/rootfs",
-    )
-
-    assert host_path == "/var/lib/docker/vloopback-v2/volume_dirty"
-
-
-def test_backing_file_outside_the_plugin_mounts_lives_in_its_rootfs():
-    # the v1 plugin keeps DATA_DIR inside its own rootfs
-    host_path = _vloopback_backing_file_host_path(
-        "/var/lib/docker/loopback/volume_dirty",
-        [{"Source": "/dev", "Destination": "/dev"}],
-        "/var/lib/docker/plugins/plugin123/rootfs",
-    )
-
-    assert host_path == "/var/lib/docker/plugins/plugin123/rootfs/var/lib/docker/loopback/volume_dirty"
+def test_wipe_command_unlinks_the_files_but_not_the_mountpoint():
+    assert _wipe_held_volume_cmd("volume_dirty") == WIPE_CMD
+    assert _remove_volume_holder_cmd("volume_dirty") == REMOVE_HOLDER_CMD
 
 
 @pytest.mark.asyncio
-async def test_delete_drops_dirty_volume_instead_of_the_graceful_stop(docker_service, monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=_ssh_answers_for_vloopback_volume())
-    _wire_delete(docker_service, monkeypatch, ssh_client)
+async def test_delete_with_an_unsafe_volume_name_does_not_start_a_holder(docker_service, monkeypatch):
+    # the volume name is the only payload field in the holder's shell commands
+    _, order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()] * 3)
+    payload = _delete_payload(local_volume="vol; rm -rf /")
+
+    await _delete(docker_service, payload)
+
+    assert not any("wipe_" in command for kind, command in order if kind == "ssh")
+
+
+@pytest.mark.asyncio
+async def test_delete_holds_the_volume_across_the_stop_and_wipes_it_before_the_removal(docker_service, monkeypatch):
+    _, order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()] * 3)
     payload = _delete_payload()
 
-    result = await docker_service.delete_container(
-        payload=payload, executor_info=_executor_info(payload),
-        keypair=Mock(ss58_address="validator-hotkey"), private_key="encrypted",
-    )
+    result = await _delete(docker_service, payload)
 
     assert isinstance(result, ContainerDeleted)
-    commands = [call.args[0] for call in ssh_client.run.await_args_list]
-    assert commands[0] == "/usr/bin/docker volume inspect volume_dirty --format '{{.Driver}}'"
-    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:v2 --format '{{.Id}} {{json .Settings.Mounts}}'"
-    assert "/sys/block/loop*/loop/backing_file" in commands[3] and "*/volume_dirty)" in commands[3]
-    assert ".State.Pid" in commands[4] and f"-lt {CONTAINER_STOP_GRACE_SECONDS}" in commands[4]
-    assert "src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in commands[5]
-    assert "src=/var/lib/docker/vloopback-v2,dst=/img" in commands[5]
-    assert "truncate -s 0 /img/volume_dirty" in commands[5]
+    assert order[:5] == [
+        ("ssh", HOLDER_CMD),
+        ("stop", payload.container_name),
+        ("ssh", WIPE_CMD),
+        ("ssh", REMOVE_HOLDER_CMD),
+        ("remove", payload.container_name),
+    ]
     client = docker_service.rental_docker_client_factory.client
-    assert client.container_call_order == [("remove", payload.container_name)]  # no docker stop
-    assert client.stop_grace_seconds_calls == []
+    assert client.stop_grace_seconds_calls == [CONTAINER_STOP_GRACE_SECONDS]
 
 
 @pytest.mark.asyncio
-async def test_delete_of_a_filler_uses_the_filler_grace(docker_service, monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=_ssh_answers_for_vloopback_volume())
-    _wire_delete(docker_service, monkeypatch, ssh_client)
-    payload = _delete_payload(WorkloadKind.FILLER)
+async def test_delete_without_a_volume_does_not_start_a_holder(docker_service, monkeypatch):
+    _, order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()] * 3)
+    payload = _delete_payload(local_volume=None)
 
-    await docker_service.delete_container(
-        payload=payload, executor_info=_executor_info(payload),
-        keypair=Mock(ss58_address="validator-hotkey"), private_key="encrypted",
-    )
+    result = await _delete(docker_service, payload)
 
-    stop_cmd = ssh_client.run.await_args_list[4].args[0]
-    assert f"-lt {FILLER_CONTAINER_STOP_GRACE_SECONDS}" in stop_cmd
+    assert isinstance(result, ContainerDeleted)
+    assert not any("wipe_" in command for kind, command in order if kind == "ssh")
+    assert [entry for entry in order if entry[0] != "ssh"][:2] == [
+        ("stop", payload.container_name),
+        ("remove", payload.container_name),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_delete_keeps_the_graceful_stop_for_a_non_vloopback_volume(docker_service, monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="local\n"))
-    _wire_delete(docker_service, monkeypatch, ssh_client)
+async def test_delete_proceeds_as_before_when_the_holder_does_not_start(docker_service, monkeypatch):
+    failed = _make_ssh_command_result(exit_status=125, stderr="docker: Error response from daemon")
+    _, order = _wire_delete(docker_service, monkeypatch, [failed, _make_ssh_command_result()])
     payload = _delete_payload()
 
-    result = await docker_service.delete_container(
-        payload=payload, executor_info=_executor_info(payload),
-        keypair=Mock(ss58_address="validator-hotkey"), private_key="encrypted",
-    )
+    result = await _delete(docker_service, payload)
 
     assert isinstance(result, ContainerDeleted)
-    client = docker_service.rental_docker_client_factory.client
-    assert client.container_call_order == [("stop", payload.container_name), ("remove", payload.container_name)]
-    assert not any("truncate" in call.args[0] for call in ssh_client.run.await_args_list)
+    assert order[:3] == [("ssh", HOLDER_CMD), ("stop", payload.container_name), ("remove", payload.container_name)]
 
 
 @pytest.mark.asyncio
-async def test_delete_falls_back_to_the_graceful_stop_when_the_drop_step_raises(docker_service, monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=OSError("ssh transport closed"))
-    _wire_delete(docker_service, monkeypatch, ssh_client)
+async def test_delete_proceeds_as_before_when_ssh_raises_on_the_holder(docker_service, monkeypatch):
+    _, order = _wire_delete(docker_service, monkeypatch, OSError("ssh transport closed"))
     payload = _delete_payload()
 
-    result = await docker_service.delete_container(
-        payload=payload, executor_info=_executor_info(payload),
-        keypair=Mock(ss58_address="validator-hotkey"), private_key="encrypted",
-    )
+    result = await _delete(docker_service, payload)
 
     assert isinstance(result, ContainerDeleted)
-    client = docker_service.rental_docker_client_factory.client
-    assert client.container_call_order[0] == ("stop", payload.container_name)
+    assert order[:3] == [("ssh", HOLDER_CMD), ("stop", payload.container_name), ("remove", payload.container_name)]
 
 
 @pytest.mark.asyncio
-async def test_drop_step_logs_a_failed_helper_and_still_reports_the_processes_stopped(docker_service):
-    answers = _ssh_answers_for_vloopback_volume()
-    answers[5] = _make_ssh_command_result(exit_status=125, stderr="docker: Error response from daemon")
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=answers)
+async def test_failed_wipe_still_releases_the_holder(docker_service, monkeypatch):
+    failed_wipe = _make_ssh_command_result(exit_status=1, stderr="find: /mnt: Input/output error")
+    _, order = _wire_delete(
+        docker_service, monkeypatch, [_make_ssh_command_result(), failed_wipe, _make_ssh_command_result()]
+    )
+    payload = _delete_payload()
 
-    stopped = await docker_service._stop_and_drop_dirty_volume(ssh_client, _delete_payload(), _BoundLog({}))
+    result = await _delete(docker_service, payload)
 
-    assert stopped is True  # the processes are gone either way; a second docker stop buys nothing
+    assert isinstance(result, ContainerDeleted)
+    assert order[2:5] == [("ssh", WIPE_CMD), ("ssh", REMOVE_HOLDER_CMD), ("remove", payload.container_name)]

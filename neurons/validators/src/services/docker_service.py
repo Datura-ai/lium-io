@@ -453,10 +453,10 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
-# DAH-5101: after the container's processes are gone, the volume's unwritten data is dropped
-# (files unlinked, image truncated) so the removal does not wait for it to reach a slow disk.
-_DROP_DIRTY_VOLUME_KILL_WAIT_SEC = 20
-_DROP_DIRTY_VOLUME_HELPER_TIMEOUT_SEC = 120
+# DAH-5101: a throwaway container keeps the pod's volume mounted across the stop and its files are
+# unlinked afterwards, so neither the stop nor the removal waits for unwritten data to reach the disk.
+_VOLUME_HOLDER_LIFETIME_SEC = 600
+_VOLUME_WIPE_TIMEOUT_SEC = 120
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
 # when that lookup fails (DAH-3217).
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
@@ -2168,54 +2168,32 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _vloopback_backing_file_host_path(
-    backing_file: str, plugin_mounts: list[dict], plugin_rootfs: str
-) -> str:
-    # the loop's backing file (sysfs) is a path inside the plugin's mount namespace: under one of
-    # the plugin's bind mounts (vloopback:v2 binds the host's / at /srv) or, with no mount above
-    # it, inside the plugin rootfs (the v1 plugin keeps its DATA_DIR there)
-    deepest_destination = ""
-    host_source = ""
-    for mount in plugin_mounts:
-        destination = (mount.get("Destination") or "").rstrip("/")
-        source = mount.get("Source") or ""
-        under_mount = backing_file == destination or backing_file.startswith(f"{destination}/")
-        if destination and source and under_mount and len(destination) > len(deepest_destination):
-            deepest_destination, host_source = destination, source
-    if not deepest_destination:
-        return f"{plugin_rootfs}{backing_file}"
-    return f"{host_source.rstrip('/')}{backing_file[len(deepest_destination):]}"
+def _volume_holder_name(local_volume: str) -> str:
+    # named after the volume, which _is_safe_docker_volume_name has checked: the container name is
+    # backend data and never enters a host shell
+    return f"wipe_{local_volume}"
 
 
-def _vloopback_backing_file_cmd(local_volume: str) -> str:
-    # the loop devices are host-global, so the executor's /sys lists every attached backing file;
-    # the volume's image is named after the volume by both plugins. Prints the path or nothing.
+def _start_volume_holder_cmd(local_volume: str) -> str:
+    # `docker run -v` takes a second lease on the volume from its plugin: dockerd's cleanup of the
+    # stopped pod releases only the pod's lease and the volume stays mounted. `--rm` and the bounded
+    # sleep free it by themselves when the delete dies half-way.
     return (
-        "for f in /sys/block/loop*/loop/backing_file; do b=$(cat \"$f\" 2>/dev/null); "
-        f"case \"$b\" in */{shlex.quote(local_volume)}) echo \"$b\"; break;; esac; done; true"
+        f"/usr/bin/docker run -d --rm --name {_volume_holder_name(local_volume)} "
+        f"-v {local_volume}:/mnt {ALPINE_HELPER_IMAGE} sleep {_VOLUME_HOLDER_LIFETIME_SEC}"
     )
 
 
-def _vloopback_drop_dirty_volume_cmd(
-    propagated_mount_dir: str, local_volume: str, image_host_path: str | None
-) -> str:
-    # one throwaway helper (the stale-mountpoint repair's pattern): the volume's mounted filesystem
-    # at /mnt/<volume>, where unlinking the files drops their unwritten pages, and the image's
-    # directory at /img, where truncating the image drops the pages the loop worker already copied
-    # there. Both only destroy what `docker volume rm` destroys a moment later. Exit 0 always.
-    volume = shlex.quote(local_volume)
-    mounts = f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
-    script = (
-        f"wiped=no; truncated=no; "
-        f"if [ -d /mnt/{volume} ]; then "
-        f"find /mnt/{volume} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null; wiped=yes; fi; "
+def _wipe_held_volume_cmd(local_volume: str) -> str:
+    # unlinking the files drops their unwritten pages; the mountpoint itself stays for the unmount
+    return (
+        f"/usr/bin/docker exec {_volume_holder_name(local_volume)} "
+        "sh -c 'find /mnt -mindepth 1 -maxdepth 1 -exec rm -rf {} +'"
     )
-    if image_host_path:
-        image_dir, _, image_name = image_host_path.rpartition("/")
-        mounts += f"--mount {shlex.quote(f'type=bind,src={image_dir},dst=/img')} "
-        script += f"if [ -f /img/{shlex.quote(image_name)} ]; then truncate -s 0 /img/{shlex.quote(image_name)} && truncated=yes; fi; "
-    script += 'echo "wiped=$wiped truncated=$truncated"'
-    return f"/usr/bin/docker run --rm {mounts}{_VLOOPBACK_REPAIR_IMAGE} sh -c {shlex.quote(script)}"
+
+
+def _remove_volume_holder_cmd(local_volume: str) -> str:
+    return f"/usr/bin/docker rm -f {_volume_holder_name(local_volume)}"
 
 
 def _should_repair_stale_mountpoint(
@@ -10422,102 +10400,89 @@ class DockerService:
                 return status
             await asyncio.sleep(min(REMOVE_CONFIRM_POLL_SECONDS, remaining))
 
-    async def _stop_and_drop_dirty_volume(
+    async def _start_volume_holder(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
     ) -> bool:
-        # DAH-5101: a pod whose vloopback volume holds gigabytes of unwritten data stalls its
-        # delete for as long as a slow disk needs to absorb them: dockerd's unmount syncs the Docker
-        # filesystem, and `docker stop` / `docker rm -f` wait for that sync. The rental is over and
-        # the volume is removed below, so the data is dropped instead: signal the processes
-        # directly (same SIGTERM grace as the graceful stop), then unlink the volume's files and
-        # truncate its image before dockerd reaches the unmount. True when the processes were
-        # signalled here, so the graceful stop is not repeated; False leaves the old path untouched.
+        # DAH-5101: a pod whose volume holds gigabytes of unwritten data stalls its delete for as
+        # long as a slow disk needs to absorb them: dockerd unmounts the volume when the container
+        # stops, and the unmount flushes it. The rental is over and the volume is removed below, so
+        # a throwaway container keeps the volume mounted across the stop and the files are unlinked
+        # afterwards (_wipe_held_volume). Never fatal: False leaves the delete as it always was.
         local_volume = payload.local_volume
         if not local_volume or not _is_safe_docker_volume_name(local_volume):
             return False
-        volume = shlex.quote(local_volume)
-        inspect_result = await ssh_client.run(
-            f"/usr/bin/docker volume inspect {volume} --format '{{{{.Driver}}}}'",
-            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-        )
-        driver = (inspect_result.stdout or "").strip()
-        if getattr(inspect_result, "exit_status", 0) != 0 or not _is_vloopback_driver(driver):
-            return False
-        plugin_result = await ssh_client.run(
-            f"/usr/bin/docker plugin inspect {shlex.quote(driver)} "
-            "--format '{{.Id}} {{json .Settings.Mounts}}'",
-            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-        )
-        plugin_id, _, plugin_mounts_json = (plugin_result.stdout or "").strip().partition(" ")
-        if getattr(plugin_result, "exit_status", 0) != 0 or not plugin_id:
-            return False
+        fields = dict(container_name=payload.container_name, local_volume=local_volume)
+        started = time.monotonic()
         try:
-            plugin_mounts = json.loads(plugin_mounts_json or "null") or []
-        except ValueError:
-            plugin_mounts = []
-        docker_root_dir = await self._docker_root_dir_or_default(
-            ssh_client, {**log.base_extra, "local_volume": local_volume}
-        )
-        plugin_dir = f"{docker_root_dir}/plugins/{plugin_id}"
-        # read while the volume is still attached; empty when no loop carries this volume's image
-        backing_result = await ssh_client.run(
-            _vloopback_backing_file_cmd(local_volume), timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
-        )
-        backing_file = (backing_result.stdout or "").strip().splitlines()[-1:] or [""]
-        image_host_path = (
-            _vloopback_backing_file_host_path(backing_file[0], plugin_mounts, f"{plugin_dir}/rootfs")
-            if backing_file[0].startswith("/")
-            else None
-        )
-
-        stop_grace_seconds = (
-            FILLER_CONTAINER_STOP_GRACE_SECONDS
-            if payload.workload_kind == WorkloadKind.FILLER
-            else CONTAINER_STOP_GRACE_SECONDS
-        )
-        stop_started = time.monotonic()
-        stop_result = await ssh_client.run(
-            DockerCommand.stop_container_init(
-                payload.container_name, stop_grace_seconds, _DROP_DIRTY_VOLUME_KILL_WAIT_SEC
-            ),
-            timeout=stop_grace_seconds + _DROP_DIRTY_VOLUME_KILL_WAIT_SEC + _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-        )
-        log.info(
-            "Stopped the container's processes before dropping its unwritten volume data",
-            container_name=payload.container_name,
-            local_volume=local_volume,
-            result=(stop_result.stdout or "").strip(),
-            stop_grace_seconds=stop_grace_seconds,
-            duration_ms=int((time.monotonic() - stop_started) * 1000),
-        )
-
-        drop_started = time.monotonic()
-        drop_result = await ssh_client.run(
-            _vloopback_drop_dirty_volume_cmd(
-                f"{plugin_dir}/propagated-mount", local_volume, image_host_path
-            ),
-            timeout=_DROP_DIRTY_VOLUME_HELPER_TIMEOUT_SEC,
-        )
-        drop_fields = dict(
-            container_name=payload.container_name,
-            local_volume=local_volume,
-            image_host_path=image_host_path,
-            result=(drop_result.stdout or "").strip(),
-            duration_ms=int((time.monotonic() - drop_started) * 1000),
-        )
-        if getattr(drop_result, "exit_status", 0) != 0:
-            log.warning(
-                "Dropping the volume's unwritten data failed; the removal will wait for the disk",
-                exit_status=getattr(drop_result, "exit_status", None),
-                stderr=(drop_result.stderr or "").strip(),
-                **drop_fields,
+            result = await ssh_client.run(
+                _start_volume_holder_cmd(local_volume), timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
             )
-        else:
-            log.info("Dropped the volume's unwritten data before the removal", **drop_fields)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Volume holder could not be started; the delete will wait for the disk",
+                error=f"{type(exc).__name__}: {exc}",
+                **fields,
+            )
+            return False
+        fields["duration_ms"] = int((time.monotonic() - started) * 1000)
+        if getattr(result, "exit_status", 0) != 0:
+            log.warning(
+                "Volume holder could not be started; the delete will wait for the disk",
+                exit_status=getattr(result, "exit_status", None),
+                stderr=(result.stderr or "").strip(),
+                **fields,
+            )
+            return False
+        log.info("Volume holder started before the graceful stop", **fields)
         return True
+
+    async def _wipe_held_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> None:
+        # unlink the stopped pod's volume files through the holder, then release the holder's lease
+        local_volume = payload.local_volume
+        fields = dict(container_name=payload.container_name, local_volume=local_volume)
+        started = time.monotonic()
+        try:
+            result = await ssh_client.run(_wipe_held_volume_cmd(local_volume), timeout=_VOLUME_WIPE_TIMEOUT_SEC)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if getattr(result, "exit_status", 0) != 0:
+                log.warning(
+                    "Wiping the volume failed; the removal will wait for the disk",
+                    exit_status=getattr(result, "exit_status", None),
+                    stderr=(result.stderr or "").strip(),
+                    duration_ms=duration_ms,
+                    **fields,
+                )
+            else:
+                log.info("Wiped the volume's unwritten data before the removal", duration_ms=duration_ms, **fields)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Wiping the volume failed; the removal will wait for the disk",
+                error=f"{type(exc).__name__}: {exc}",
+                **fields,
+            )
+        try:
+            await ssh_client.run(_remove_volume_holder_cmd(local_volume), timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Volume holder could not be removed; it exits by itself",
+                error=f"{type(exc).__name__}: {exc}",
+                lifetime_seconds=_VOLUME_HOLDER_LIFETIME_SEC,
+                **fields,
+            )
 
     async def _stop_container_gracefully(
         self,
@@ -10825,20 +10790,10 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
-                # DAH-5101: never fatal, like the graceful stop it replaces for vloopback pods
-                processes_stopped = False
-                try:
-                    processes_stopped = await self._stop_and_drop_dirty_volume(ssh_client, payload, log)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning(
-                        "Dropping the volume's unwritten data failed; proceeding to the graceful stop",
-                        container_name=payload.container_name,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                if not processes_stopped:
-                    await self._stop_container_gracefully(docker_client, payload, log)
+                holder_started = await self._start_volume_holder(ssh_client, payload, log)
+                await self._stop_container_gracefully(docker_client, payload, log)
+                if holder_started:
+                    await self._wipe_held_volume(ssh_client, payload, log)
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.

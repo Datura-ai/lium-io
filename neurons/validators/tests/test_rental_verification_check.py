@@ -68,7 +68,7 @@ class DummyBackendClient:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled, alias", [(True, "vloopback:v2"), (False, "vloopback")])
+@pytest.mark.parametrize("enabled, alias", [(True, "vloopback:v3"), (False, "vloopback")])
 async def test_rental_verification_selects_loopback_alias_from_v2_switch(context_factory, enabled, alias):
     # Arrange
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
@@ -161,7 +161,7 @@ async def test_rental_verification_success():
         "rental_in_progress": False,  # no customer rental in this state
         "gpu_uuids": [],  # this state carries no scraped gpu details
         "cpu_count": None,  # this state carries no scraped cpu count
-        "loopback_plugin": "vloopback:v2",  # the plugin alias new rental volumes are created on
+        "loopback_plugin": "vloopback:v3",  # the plugin alias new rental volumes are created on
     }
 
 

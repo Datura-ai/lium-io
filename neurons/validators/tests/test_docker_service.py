@@ -4339,7 +4339,7 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback:v2",
+            "driver": "vloopback:v3",
             "driver_opts": {"size": "1024g"},
             "timeout": 133,
         }
@@ -4379,7 +4379,7 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback:v2",
+            "driver": "vloopback:v3",
             "driver_opts": {"size": "200g", "sparse": "true"},
             "timeout": 50,
         }
@@ -4413,7 +4413,7 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
     assert docker_client.created_volumes == [
         {
             "volume_name": "volume_test",
-            "driver": "vloopback:v2",
+            "driver": "vloopback:v3",
             "driver_opts": {"size": "200g"},
             "timeout": 50,
         }
