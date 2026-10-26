@@ -4797,7 +4797,12 @@ class DockerService:
         # DAH-5014: free_gb is real disk, every cache on it counted as used. The pod's own volume is
         # created (preallocated) after this check, so the floor must hold with both on disk.
         free_after_gb: float = free_gb - download_gb - (payload.volume_limit_gb or 0)
-        if download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE or free_after_gb <= floor_gb:
+        # A download the run's own volume could hold is not refused for its share: refused, it lands in that
+        # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
+        over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and download_gb > (
+            payload.volume_limit_gb or 0
+        )
+        if over_share or free_after_gb <= floor_gb:
             logger.info(
                 _m(
                     "Node cannot afford the filler cache download; keeping only the volumes it already has",

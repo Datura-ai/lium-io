@@ -687,6 +687,9 @@ VLOOPBACK_V2_DATA_DIR_NAME = "vloopback-v2"
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 # literal: the obfuscator does not rename names inside this tuple
 FILLER_CACHE_VOLUME_PREFIXES = ("dphn_cache_", "engy_cache_")
+# the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
+FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
+FILLER_VOLUME_LABEL_VALUE = "filler"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -716,9 +719,11 @@ def docker_api_get(path):
         conn.close()
 
 
-def get_vloopback_volume_bytes(docker_root_dir):
+def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
+    # filler_only: just the volumes a filler create labelled as its own (pass it positionally: the
+    # obfuscator renames arguments, not call keywords).
     volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
     names = [
         volume.get("Name")
@@ -726,6 +731,7 @@ def get_vloopback_volume_bytes(docker_root_dir):
         if (volume.get("Driver") or "").startswith(VLOOPBACK_DRIVER_PREFIX)
         and volume.get("Name")
         and "/" not in volume.get("Name")
+        and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
     if not names:
         return 0
@@ -811,7 +817,12 @@ def get_docker_disk_usage():
     filler_cache = cache_volume_bytes(df, FILLER_CACHE_VOLUME_PREFIXES)
     volumes -= filler_cache
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
-    volumes += get_vloopback_volume_bytes(docker_root_dir)
+    # A filler's own run volume is preallocated to its full size, but any rental removes the filler
+    # and its volume first (a paying pod never shares the node with one), so it reads as free disk
+    # like the caches above: renters were shown half of an idle node's disk.
+    filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
+    volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes
+    filler_cache += filler_run_volumes
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.

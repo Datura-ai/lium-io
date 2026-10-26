@@ -100,6 +100,25 @@ async def test_an_engy_checkpoint_is_cached_only_when_it_is_at_most_30pct_of_fre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("volume_limit_gb", "granted"), [(1500, False), (1900, True)])
+async def test_an_engy_checkpoint_over_30pct_is_cached_when_the_runs_own_volume_could_hold_it(
+    docker_service, volume_limit_gb, granted
+):
+    # 1561 GB is 41% of 3800 GB free. Refused, it would download into a 1900 GB run volume anyway, on every
+    # launch; 3800 - 1561 - 1900 = 339 still clears the floor. A 1500 GB volume could not hold it: refused.
+    ssh_client = HostSshClient(["volume_pod"], free_gb=3800)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="engy_cache_hf_1561gb_kimi-k3-1a2b3c4d", target="/root/models")],
+    )
+    payload.volume_limit_gb = volume_limit_gb
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
+
+    assert bool(affordable) is granted
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("free_gb", "granted"), [(220, False), (230, True)])
 async def test_an_engy_checkpoint_and_the_pod_volume_must_leave_the_listing_floor_and_margin(
     docker_service, free_gb, granted

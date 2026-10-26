@@ -38,6 +38,8 @@ DISK_HELPERS = {
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_CACHE_VOLUME_PREFIXES",
+    "FILLER_VOLUME_LABEL_KEY",
+    "FILLER_VOLUME_LABEL_VALUE",
     "release_filler_cache",
 }
 
@@ -483,6 +485,44 @@ def test_filler_cache_volumes_are_reported_as_free_disk(scrape: dict) -> None:
         # DAH-5045: the engy checkpoint's real used size, without the dolphin cache or the renter's volume
         "hard_disk_engy_cache_used_gb": 1500 * 1024**3 // 10**9,
     }
+
+
+def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeypatch) -> None:
+    # Arrange — an idle node running our filler: its preallocated 1900 GB run volume (labelled by the
+    # filler create) and a renter-style volume without the label
+    v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
+    blocks = {f"{v2_dir}/volume_filler": 1900 * 1024**3 // 512, f"{v2_dir}/volume_other": 10 * 1024**3 // 512}
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=lambda p: SimpleNamespace(st_blocks=blocks[p])))
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {"LayersSize": 0, "Containers": [], "Volumes": []},
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {
+                "Volumes": [
+                    {"Name": "volume_filler", "Driver": "vloopback:v2", "Labels": {"io.lium.workload": "filler"}},
+                    {"Name": "volume_other", "Driver": "vloopback:v2", "Labels": None},
+                ]
+            },
+        },
+    )
+    hard_disk = {
+        "hard_disk_total": 4000 * 1024**2,
+        "hard_disk_used": 1950 * 1024**2,
+        "hard_disk_free": 2050 * 1024**2,
+        "hard_disk_utilization": 48.75,
+    }
+
+    # Act
+    hard_disk.update(scrape["get_docker_disk_usage"]())
+    scrape["release_filler_cache"](hard_disk)
+
+    # Assert — only the filler's volume moved from used to free
+    assert hard_disk["hard_disk_free"] == 3950 * 1024**2
+    assert hard_disk["hard_disk_used"] == 50 * 1024**2
+    assert hard_disk["hard_disk_volumes"] == 10 * 1024**2
 
 
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
