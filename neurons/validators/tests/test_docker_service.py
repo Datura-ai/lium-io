@@ -6335,6 +6335,60 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_withou
 
 
 @pytest.mark.asyncio
+async def test_recreated_sysbox_pod_on_existing_volume_still_caps_var_lib_docker(
+    docker_service,
+    monkeypatch,
+):
+    # restart/edit: the workspace volume is reused, so no create_local_volume returns its driver
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    driver_of = AsyncMock(return_value="vloopback:v2")
+    monkeypatch.setattr(docker_service, "_vloopback_driver_of_volume", driver_of)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dind:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=80,
+        storage_limit_gb=40,
+        is_sysbox=True,
+        local_volume="volume_existing",
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
+    [dind] = run_spec.driver_volumes
+    assert (dind.target, dind.driver) == ("/var/lib/docker", "vloopback:v2")
+    assert dind.driver_opts["size"] == "20g"
+    assert run_spec.storage_limit_gb == 20
+    assert driver_of.await_args.args[1] == "volume_existing"
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_local_volume_docker_run_flags(
     docker_service,
     monkeypatch,

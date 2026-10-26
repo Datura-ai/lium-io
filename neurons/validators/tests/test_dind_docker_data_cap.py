@@ -10,7 +10,7 @@ from services.rental_docker_sdk import GpuDockerConfig, _build_host_config_kwarg
 from tests.test_deploy_optimizations import svc  # noqa: F401  (pytest fixture)
 
 
-def _run_spec(docker_service, docker_data_volume_gb, local_volume_path="/root"):
+def _run_spec(docker_service, storage_limit_gb, local_volume_path="/root"):
     payload = ContainerCreateRequest(
         miner_hotkey="hk",
         executor_id="ex",
@@ -29,9 +29,8 @@ def _run_spec(docker_service, docker_data_volume_gb, local_volume_path="/root"):
         encrypted_local_volume=False,
         external_volume_name=None,
         gpu_devices=GpuDockerConfig(),
-        effective_storage_limit_gb=40,
+        effective_storage_limit_gb=storage_limit_gb,
         cpu_count=None,
-        docker_data_volume_gb=docker_data_volume_gb,
         docker_data_volume_driver="vloopback:v2",
     )
 
@@ -45,27 +44,31 @@ def test_sysbox_pod_mounts_a_capped_sparse_loopback_volume_at_var_lib_docker(svc
     )
     assert mount["VolumeOptions"]["DriverConfig"] == {
         "Name": "vloopback:v2",
-        "Options": {"size": "40g", "sparse": "true"},
+        "Options": {"size": "20g", "sparse": "true"},
     }
 
 
 @pytest.mark.parametrize(
-    "path,size,expected",
+    "path,storage,dind,writable",
     [
-        ("/root", 40, "40g"),
-        ("/root", 16383, "16383g"),
-        ("/root", 20473, "16383g"),  # above the ext4 16 TiB file limit
-        ("/root", None, None),
-        ("/var/lib/docker/", 40, None),  # the workspace already sits there: no duplicate mount
+        ("/root", 40, "20g", 20),  # DinD and the writable layer split the one allowance
+        ("/root", 41, "20g", 21),
+        ("/root", 1, None, 1),  # nothing left to split
+        ("/root", 32766, "16383g", 16383),
+        ("/root", 40946, "16383g", 24563),  # DinD held at the ext4 16 TiB file limit
+        ("/root", None, None, None),  # storage-opt unsupported: no cap to share
+        ("/var/lib/docker/", 40, None, 40),  # the workspace already sits there: no duplicate mount
     ],
 )
-def test_dind_mount(svc, path, size, expected):  # noqa: F811
-    kwargs = _build_host_config_kwargs(_run_spec(svc, size, path))
-    if expected is None:
+def test_dind_mount(svc, path, storage, dind, writable):  # noqa: F811
+    spec = _run_spec(svc, storage, path)
+    kwargs = _build_host_config_kwargs(spec)
+    assert spec.storage_limit_gb == writable
+    if dind is None:
         assert "mounts" not in kwargs
     else:
         [mount] = kwargs["mounts"]
-        assert mount["VolumeOptions"]["DriverConfig"]["Options"]["size"] == expected
+        assert mount["VolumeOptions"]["DriverConfig"]["Options"]["size"] == dind
 
 
 _DIND = "a1" * 32
@@ -94,3 +97,19 @@ def test_sizing_ignores_anonymous_vloopback_volumes():
     )
 
     assert _parse_volume_host_probe(stdout, with_df=True).vloopback_volume_names == ["volume_abc"]
+
+
+@pytest.mark.parametrize(
+    "exit_status,stdout,expected",
+    [
+        (0, "vloopback:v2\n", "vloopback:v2"),
+        (0, "vloopback\n", "vloopback"),
+        (0, "local\n", None),  # an unlimited workspace: nothing to put inner Docker on
+        (1, "", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reused_volume_driver(svc, exit_status, stdout, expected):  # noqa: F811
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=exit_status, stdout=stdout))
+    assert await svc._vloopback_driver_of_volume(ssh, "volume_pod", {}) == expected

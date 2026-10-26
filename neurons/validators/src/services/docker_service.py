@@ -2853,9 +2853,22 @@ class DockerService:
         gpu_share: float = 1.0,
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
-        docker_data_volume_gb: int | None = None,
         docker_data_volume_driver: str | None = None,
     ) -> ContainerRunSpec:
+        # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
+        # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
+        # takes half the pod's storage allowance, the writable layer the rest, so the two together
+        # stay inside it; the sparse file is held under the ext4 16 TiB file limit. A template whose
+        # workspace is /var/lib/docker already caps inner Docker (and a second mount there is a
+        # duplicate mount point Docker refuses at create).
+        docker_data_volume_gb = (
+            min(effective_storage_limit_gb // 2, _FRESH_SIZING_MAX_VOLUME_GB)
+            if payload.is_sysbox
+            and effective_storage_limit_gb
+            and docker_data_volume_driver
+            and posixpath.normpath(local_volume_path) != _DEFAULT_DOCKER_ROOT_DIR
+            else 0
+        )
         memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
         # Swap off and the renter-first OOM score need a memory limit to hang on (Docker refuses
         # --memory-swap without --memory).
@@ -2909,25 +2922,15 @@ class DockerService:
             environment=environment,
             ports=_published_ports(port_maps, cluster_udp_ports),
             volumes=tuple(volumes),
-            # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
-            # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk.
             driver_volumes=(
                 (
                     DriverVolumeMount(
                         target=_DEFAULT_DOCKER_ROOT_DIR,
                         driver=docker_data_volume_driver,
-                        # the backing sparse file is held under the ext4 16 TiB file limit
-                        driver_opts={
-                            "size": f"{min(docker_data_volume_gb, _FRESH_SIZING_MAX_VOLUME_GB)}g",
-                            "sparse": "true",
-                        },
+                        driver_opts={"size": f"{docker_data_volume_gb}g", "sparse": "true"},
                     ),
                 )
-                # a template whose workspace is /var/lib/docker already caps inner Docker; a second
-                # mount there is a duplicate mount point Docker refuses at create
                 if docker_data_volume_gb
-                and docker_data_volume_driver
-                and posixpath.normpath(local_volume_path) != _DEFAULT_DOCKER_ROOT_DIR
                 else ()
             ),
             restart_policy="unless-stopped",
@@ -2941,7 +2944,11 @@ class DockerService:
             memory_gb=memory_gb,
             memory_swap_gb=memory_gb if swap_off else None,
             oom_score_adj=settings.RENTAL_CONTAINER_OOM_SCORE_ADJ if swap_off else None,
-            storage_limit_gb=effective_storage_limit_gb,
+            storage_limit_gb=(
+                effective_storage_limit_gb - docker_data_volume_gb
+                if docker_data_volume_gb
+                else effective_storage_limit_gb
+            ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
@@ -3184,6 +3191,30 @@ class DockerService:
                     }),
                 )
             )
+
+    async def _vloopback_driver_of_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        local_volume: str,
+        log_extra: dict,
+    ) -> str | None:
+        if not _is_safe_docker_volume_name(local_volume):
+            return None
+        volume = shlex.quote(local_volume)
+        result = await ssh_client.run(
+            f"/usr/bin/docker volume inspect {volume} --format '{{{{.Driver}}}}'",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        driver = (result.stdout or "").strip() if getattr(result, "exit_status", 0) == 0 else ""
+        if _is_vloopback_driver(driver):
+            return driver
+        logger.warning(
+            _m(
+                "Reused volume is not on a loopback plugin; sysbox /var/lib/docker stays uncapped",
+                extra=get_extra_info({**log_extra, "local_volume": local_volume, "driver": driver}),
+            )
+        )
+        return None
 
     async def repair_stale_vloopback_mountpoint(
         self,
@@ -8880,6 +8911,13 @@ class DockerService:
                                 extra=get_extra_info(default_extra),
                             )
                         )
+                if payload.is_sysbox and effective_storage_limit_gb and not created_local_volume:
+                    # restart/edit reuses the workspace volume: inner Docker goes on the same
+                    # loopback plugin, read from the volume itself
+                    current_step = "docker_data_volume_driver"
+                    local_volume_driver = await self._vloopback_driver_of_volume(
+                        ssh_client, local_volume, default_extra
+                    )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
                 run_spec = self._build_rental_container_run_spec(
@@ -8899,9 +8937,6 @@ class DockerService:
                     gpu_share=rental_gpu_share,
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
-                    # capped like the container's own writable layer, on the loopback plugin (v2 or
-                    # the old one) the capped local volume was created on
-                    docker_data_volume_gb=effective_storage_limit_gb if payload.is_sysbox else None,
                     docker_data_volume_driver=local_volume_driver,
                 )
 
