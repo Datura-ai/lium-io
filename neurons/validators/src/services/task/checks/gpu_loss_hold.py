@@ -38,7 +38,7 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .gpu_fingerprint import split_uuids
+from .gpu_fingerprint import split_uuids, whole_set_replaced
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -96,9 +96,12 @@ def judge_scrape(ctx: Context, pods: list) -> GpuDrop | None:
     nvml_count = ctx.state.gpu_count
     if nvml_count is None:
         nvml_count = (specs.get("gpu") or {}).get("count", 0) or 0
+    anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+    if whole_set_replaced(anchor, sorted(set(_listed_uuids(gpu_details))), rented=bool(pods)):
+        anchor = []  # replaced cards, not lost ones: GpuFingerprintCheck re-anchors them
     return judge_rented_gpus(
         rented_gpu_count=_rented_gpu_count(pods),
-        anchor_uuids=split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""),
+        anchor_uuids=anchor,
         nvml_count=nvml_count,
         listed_uuids=_listed_uuids(gpu_details),
         listed_count=len(gpu_details),

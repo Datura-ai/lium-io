@@ -518,7 +518,8 @@ class GpuLossHoldMessages:
         remediation="A card fell out of NVML (see faults, missing_uuids, nvml_error_code). Run `nvidia-smi` and "
         "`dmesg | grep -i xid` on the host; 'Unknown Error' or Xid 79 ('fallen off the bus') means the card must "
         "be reseated, reset or replaced. The node is listed again once every card has read clean for the hold "
-        "window.",
+        "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
+        "a node keeps the cards it was first verified with.",
     )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
@@ -709,7 +710,9 @@ class GpuFingerprintMessages:
         severity="warning",
         category="env",
         impact="Verification reset; score set to 0",
-        remediation="Ensure the same physical GPUs remain attached and stable.",
+        remediation="Ensure the same physical GPUs remain attached and stable. If you replaced the cards on "
+        "purpose, remove the node in the portal and add it again: a node keeps the cards it was first "
+        "verified with.",
     )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
@@ -1547,6 +1550,56 @@ class ContainerDownloadSpeedMessages:
     SKIPPED = MessageTemplate(
         event="Container download speed check skipped",
         reason="CONTAINER_DOWNLOAD_SPEED_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
+class RentedThroughputMessages:
+    """A renter on a node listed at ~3 Gbps downloaded at 0.7-2 MB/s and the disk crawled."""
+
+    SLOW = MessageTemplate(
+        event="A rented pod on this node gets far too little network or disk throughput",
+        reason="RENTED_THROUGHPUT_SLOW",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=(
+            "repeated readings found a container on this rented node downloading from PyPI or Hugging Face below "
+            "10 Mbps, or writing to its disk below 50 MB/s, while the node's own traffic on that resource stayed "
+            "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
+            "traffic shaping or I/O "
+            "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "
+            "(`ip link`), and check the disk under the docker root (`docker info -f '{{.DockerRootDir}}'`) "
+            "for a failing or full drive"
+        ),
+    )
+    SLOW_ONCE = MessageTemplate(
+        event="A rented pod's network or disk throughput was slow once; the next reading decides",
+        reason="RENTED_THROUGHPUT_SLOW_ONCE",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Rented pod network and disk throughput verified",
+        reason="RENTED_THROUGHPUT_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    # the renter kept the link or the disk busy, an endpoint the validator cannot reach either, or no container
+    UNMEASURED = MessageTemplate(
+        event="Rented pod throughput reached no verdict",
+        reason="RENTED_THROUGHPUT_UNMEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Rented pod throughput check skipped",
+        reason="RENTED_THROUGHPUT_SKIPPED",
         severity="info",
         category="runtime",
         impact="Proceed",
@@ -2457,7 +2510,8 @@ class GpuAttestationIdentityMessages:
     )
     # The fallback for cards that cannot attest: the same card under a new UUID (serial or slots kept).
     SWAPPED = MessageTemplate(
-        event="GPU UUIDs were swapped: the same cards are reported under new UUIDs",
+        # Neutral on purpose: "every UUID new in the same slots" is also what replacing every card looks like.
+        event="GPU UUIDs changed: new UUIDs in the same slots, or a known card under a new UUID",
         reason="GPU_UUID_SWAPPED",
         severity="warning",
         category="policy",

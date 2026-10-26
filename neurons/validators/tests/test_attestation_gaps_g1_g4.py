@@ -527,6 +527,7 @@ def _score_ctx(tdx_quote, attestation_passed):
         provider_side_load_passed=True,
         inspector_blind_streak_passed=True,
         rented_pod_resources_passed=True,
+        rented_throughput_passed=True,
         gpu_attestation_identity_passed=True,
         inspector_host_write_passed=True,
     )
