@@ -284,12 +284,12 @@ class PortConnectivityCheck:
             # nothing was measured about sysbox this cycle. Rented: the probe never reached its container.
             # Unrented: the scrape's own sysbox test timed out, so the probe ran without sysbox-runc and either
             # never came up or came up under runc; a scrape test that ran and failed stays a verdict.
-            if rented:
-                unknown = not result.dind_ok
-            else:
-                unknown = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error") == SYSBOX_TEST_TIMED_OUT
+            scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+            unknown = not result.dind_ok if rented else scrape_error == SYSBOX_TEST_TIMED_OUT
             if not unknown:
-                if not rented:  # the scrape's sysbox test ran and failed: a verdict that supersedes the last pass
+                # only a scrape sysbox test that ran and said no supersedes the last pass; a probe miss
+                # after a passing scrape test measured nothing and keeps it
+                if not rented and scrape_error:
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)

@@ -665,6 +665,29 @@ async def test_definitive_scrape_failure_forgets_the_pass_a_later_timeout_would_
 
 
 @pytest.mark.asyncio
+async def test_probe_miss_after_a_passing_scrape_sysbox_test_keeps_the_pass(context_factory):
+    """The scrape's sysbox test passed but the probe never reached its container: nothing was measured, so
+    the stored pass survives for a later timed-out cycle (unrented) and the rented grace."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    await PortConnectivityCheck().run(
+        _verified_ctx(
+            context_factory, redis_service=redis_service, state=build_state(sysbox_runtime=True), dind_ok=False,
+            sysbox_measured=None,
+        )
+    )
+    assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+    result = await PortConnectivityCheck().run(
+        _verified_ctx(context_factory, redis_service=redis_service, state=timed_out, dind_ok=False, sysbox_measured=None)
+    )
+
+    assert result.updates["state"].sysbox_runtime is True
+    assert result.updates["default_extra"]["sysbox_from_last_verified"] is True
+
+
+@pytest.mark.asyncio
 async def test_probe_that_verifies_sysbox_is_remembered_with_the_ttl(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "SYSBOX_VERIFIED_TTL_SECONDS", 4321)
     redis_service = DummyRedis()
