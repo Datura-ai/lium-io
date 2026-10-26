@@ -4813,8 +4813,10 @@ class DockerService:
         # A download the run's own volume could hold is not refused for its share: refused, it lands in that
         # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
         # Granted for that reason only while renters are still listed ENGY_CACHE_MIN_FREE_BESIDE_GB beside it.
+        # No volume limit (no --storage-opt): the run writes the weights to the same disk anyway.
         over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and (
-            download_gb > (payload.volume_limit_gb or 0) or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
+            (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
+            or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
         )
         if over_share or free_after_gb <= floor_gb:
             logger.info(

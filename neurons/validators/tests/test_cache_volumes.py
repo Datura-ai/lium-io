@@ -86,6 +86,7 @@ async def test_an_engy_checkpoint_is_cached_only_when_it_is_at_most_30pct_of_fre
     docker_service, free_gb, granted
 ):
     # DAH-5014: the size comes from the name, not DPHN's 40 GB. 1561 GB is 31% of 5000 GB, 29% of 5300 GB.
+    # A 1500 GB run volume could not hold it, so the share rule alone decides.
     ssh_client = HostSshClient(["volume_pod"], free_gb=free_gb)
     payload = _make_payload(
         workload_kind=WorkloadKind.FILLER,
@@ -93,6 +94,7 @@ async def test_an_engy_checkpoint_is_cached_only_when_it_is_at_most_30pct_of_fre
             CacheVolume(name="engy_cache_hf_1561gb_kimi-k3-1a2b3c4d", target="/root/.cache/huggingface")
         ],
     )
+    payload.volume_limit_gb = 1500
 
     affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
 
@@ -249,13 +251,19 @@ async def test_an_unmeasurable_cache_is_mounted_as_before(docker_service, du_std
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_gb", "granted"), [(2500, False), (2600, True)])
-async def test_a_big_checkpoint_is_cached_only_with_a_terabyte_left_beside_it(docker_service, free_gb, granted):
+@pytest.mark.parametrize("volume_limit_gb", [1900, None])
+@pytest.mark.parametrize(("free_gb", "granted"), [(2500, False), (2600, True), (3700, True), (5100, True)])
+async def test_a_big_checkpoint_is_cached_only_with_a_terabyte_left_beside_it(
+    docker_service, free_gb, granted, volume_limit_gb
+):
     # The cache stays through rentals: 2500 - 1561 = 939 GB would be all a renter is listed, so the run downloads
-    # into its own volume instead (removed by a rental); 2600 leaves 1039 GB.
+    # into its own volume instead (removed by a rental); 2600 leaves 1039 GB. 3700-5100 GB B300s were refused by
+    # the 30% share in prod (26 Oct) and re-downloaded on every run. No volume limit: same rule.
     ssh_client = HostSshClient(["volume_pod"], free_gb=free_gb)
 
-    assert bool(await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {})) is granted
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(volume_limit_gb), {})
+
+    assert bool(affordable) is granted
 
 
 def _rental(volume_limit_gb: int | None) -> ContainerCreateRequest:
