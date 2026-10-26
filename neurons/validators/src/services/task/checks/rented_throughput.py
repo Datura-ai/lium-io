@@ -199,18 +199,21 @@ def _moved(a: _Snap, b: _Snap, devices: set[str]) -> tuple[float | None, float |
 def _pods_moved(a: _Snap, b: _Snap, side: int) -> tuple[float, float] | None:
     """What the rented pods themselves moved between two snapshots, summed per second: (received, sent)
     for side 0 (their network namespaces' bytes), (bytes, requests) per second for side 1 (their cgroups' disk
-    IO). None = not measured: no pod resolved, a pod's counter unreadable, or a pod restarted in between."""
+    IO). Only pods readable in both snapshots count: one that restarted (a new pid) or whose counter went unreadable
+    adds nothing but does not void the others. None = not measured: no pod readable in both."""
     (t0, *_, pods0), (t1, *_, pods1) = a, b
-    if not pods0 or pods0.keys() != pods1.keys():
+    both = [
+        (c[side], pods1[pid][side])
+        for pid, c in pods0.items()
+        if pid in pods1 and c[side] is not None and pods1[pid][side] is not None
+    ]
+    if not both:
         return None
-    x = y = 0
-    for pid, counters in pods0.items():
-        c0, c1 = counters[side], pods1[pid][side]
-        if c0 is None or c1 is None:
-            return None
-        x, y = x + max(0, c1[0] - c0[0]), y + max(0, c1[1] - c0[1])
     dt = max(t1 - t0, 0.01)
-    return x / dt, y / dt
+    return (
+        sum(max(0, c1[0] - c0[0]) for c0, c1 in both) / dt,
+        sum(max(0, c1[1] - c0[1]) for c0, c1 in both) / dt,
+    )
 
 
 def parse_busy(stdout: str) -> tuple[float | None, float | None]:
@@ -403,7 +406,7 @@ class RentedThroughputCheck:
         else:
             net = "fail" if judged.is_failing else "pass"
         # a failing side is only a verdict when the renter's own pods did not use that resource while it was measured;
-        # their counters unreadable, the verdict stands (host-wide counters would let the host fake renter load)
+        # no pod's counters readable, the verdict stands (host-wide counters would let the host fake renter load)
         if net == "fail" and during_net is not None and during_net >= DURING_NET_MBPS:
             net = "none"
         if disk_is_busy or disk.mb_per_s is None:

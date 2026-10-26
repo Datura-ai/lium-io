@@ -342,6 +342,22 @@ async def test_cover_traffic_outside_the_pod_does_not_excuse_a_slow_node(answer)
         assert (await check.run(ctx)).passed is False
 
 
+# Pod A moves renter traffic on both sides while pod B's cgroup goes unreadable and B then restarts (a new pid): A's
+# readings still count, so neither slow side is a verdict.
+async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
+    lines = snaps(during_rx=40_000_000, during_sectors=2_000_000).splitlines()
+    b = ["5151:1:1:1:1,", "5151:1:1:1:1,", "5151:1:1::,", "5152:1:1:1:1,"]
+    answer = (
+        "\n".join(lines[:2] + [ln.replace(" pod=", f" pod={x}") for ln, x in zip(lines[2:], b)])
+        + "\n"
+    )
+    answer += disk(secs=30.0) + SLOW
+    assert parse_during(answer)[0] == pytest.approx(32.0)
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("none", "none")
+
+
 def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
     (tmp_path / "net").mkdir()
     (tmp_path / "net" / "dev").write_text(
