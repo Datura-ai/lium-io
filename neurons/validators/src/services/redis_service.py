@@ -379,13 +379,15 @@ class RedisService:
         await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
 
     async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
-        """Record a failed port verification; True when none was on record (the first inside the window)."""
+        """Record a failed port verification; True when none was on record (the first inside the window).
+        A repeat restarts the window, so a miss that persists earns no fresh grace when it would have expired;
+        only a passing verification (clear_port_verify_miss) does."""
+        key = f"{PORT_VERIFY_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
         async with self.lock:
-            return bool(
-                await self.redis.set(
-                    f"{PORT_VERIFY_MISS_PREFIX}:{miner_hotkey}:{executor_id}", "1", ex=ttl_seconds, nx=True
-                )
-            )
+            if await self.redis.set(key, "1", ex=ttl_seconds, nx=True):
+                return True
+            await self.redis.expire(key, ttl_seconds)
+            return False
 
     async def clear_port_verify_miss(self, miner_hotkey: str, executor_id: str) -> None:
         await self.delete(f"{PORT_VERIFY_MISS_PREFIX}:{miner_hotkey}:{executor_id}")

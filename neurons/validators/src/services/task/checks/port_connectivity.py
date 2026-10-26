@@ -82,7 +82,8 @@ class PortConnectivityCheck:
         updated_state = replace(
             ctx.state,
             specs={
-                **ctx.state.specs,
+                # DAH-3698: the grace marker is the validator's alone; one the provider's specs carry never survives
+                **{key: value for key, value in ctx.state.specs.items() if key != "port_verify_first_miss"},
                 "sysbox_runtime": result.sysbox_runtime,
                 "verified_ports": [p.external for p in result.successful_ports],
             },
@@ -115,7 +116,9 @@ class PortConnectivityCheck:
                 sysbox_runtime=True,
             )
 
-        if await self._is_first_port_verify_miss(ctx, ok=result.status == "ok"):
+        # status "ok" means at least one port answered; a partial loss is a miss too, or one transient probe
+        # failure would cut a split remainder's idle pay at once
+        if await self._is_first_port_verify_miss(ctx, ok=result.status == "ok" and not result.failed_ports):
             extra_info["port_verify_first_miss"] = True
             updated_state = replace(
                 updated_state, specs={**updated_state.specs, "port_verify_first_miss": True}

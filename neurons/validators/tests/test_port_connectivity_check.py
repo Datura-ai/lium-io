@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 from core.config import settings
 
@@ -641,15 +643,89 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 # DAH-3698: one failed port verification must not zero a split remainder's idle pay.
 
 
-def _port_ctx(context_factory, redis_service, *, success: bool):
+def _port_ctx(context_factory, redis_service, *, success: bool, connectivity=None, specs=None):
     services = build_services(
         redis=redis_service,
         backend=DummyBackendService(),
-        connectivity=DummyConnectivityService(success=success, verified_port_count=8 if success else 0),
+        connectivity=connectivity
+        or DummyConnectivityService(success=success, verified_port_count=8 if success else 0),
     )
     return context_factory(
-        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(specs=specs or {}),
+        rented=False,
     )
+
+
+class PartialConnectivityService(DummyConnectivityService):
+    """`ok` of 8 probed ports answered; the rest failed. Status is "ok" from one answering port up."""
+
+    def __init__(self, ok: int):
+        super().__init__(success=ok > 0, verified_port_count=ok)
+        self.ok = ok
+
+    async def verify_ports(self, *args, **kwargs) -> PortVerificationResult:
+        result = await super().verify_ports(*args, **kwargs)
+        failed = tuple(PortPair(9000 + i, 9000 + i) for i in range(8 - self.ok))
+        return dataclasses.replace(result, failed_ports=failed, selected_ports=result.successful_ports + failed)
+
+
+class BrokenPortMissRedis(DummyRedis):
+    async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        raise ConnectionError("redis down")
+
+    async def clear_port_verify_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        raise ConnectionError("redis down")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok", [0, 1, 2, 7])
+async def test_a_partial_port_loss_is_a_miss_first_forgiven_then_counted(context_factory, ok):
+    redis_service = DummyRedis()
+
+    first = await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=False, connectivity=PartialConnectivityService(ok))
+    )
+    second = await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=False, connectivity=PartialConnectivityService(ok))
+    )
+
+    assert first.updates["state"].specs.get("port_verify_first_miss") is True
+    assert "port_verify_first_miss" not in second.updates["state"].specs
+    assert len(second.updates["state"].specs["verified_ports"]) == ok
+
+
+@pytest.mark.asyncio
+async def test_every_probed_port_answering_clears_the_miss(context_factory):
+    redis_service = DummyRedis()
+    redis_service.port_miss_on_record = True
+
+    await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=True, connectivity=PartialConnectivityService(8))
+    )
+
+    assert redis_service.port_miss_on_record is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("redis_service", "success"),
+    [
+        pytest.param(DummyRedis(), False, id="repeated_failure"),
+        pytest.param(DummyRedis(), True, id="ok"),
+        pytest.param(BrokenPortMissRedis(), False, id="redis_error_on_failure"),
+        pytest.param(BrokenPortMissRedis(), True, id="redis_error_on_ok"),
+    ],
+)
+async def test_a_grace_marker_in_the_providers_specs_never_survives(context_factory, redis_service, success):
+    redis_service.port_miss_on_record = True  # a repeat, so this cycle earns no grace of its own
+
+    result = await PortConnectivityCheck().run(
+        _port_ctx(context_factory, redis_service, success=success, specs={"port_verify_first_miss": True})
+    )
+
+    assert "port_verify_first_miss" not in result.updates["state"].specs
 
 
 @pytest.mark.asyncio
@@ -672,3 +748,23 @@ async def test_a_passing_port_verification_clears_the_miss(context_factory):
 
     assert "port_verify_first_miss" not in ok.updates["state"].specs
     assert redis_service.port_miss_on_record is False
+
+
+@pytest.mark.asyncio
+async def test_a_persisting_port_miss_restarts_the_window_instead_of_earning_fresh_grace():
+    import asyncio
+
+    from fakeredis.aioredis import FakeRedis
+    from services.redis_service import RedisService
+
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis()
+    service.lock = asyncio.Lock()
+    key = "port_verify_miss:hk:ex"
+
+    assert await service.record_port_verify_miss("hk", "ex", 3600) is True
+    await service.redis.expire(key, 5)  # the window nearly over
+    assert await service.record_port_verify_miss("hk", "ex", 3600) is False
+    assert await service.redis.ttl(key) > 3000
+    await service.clear_port_verify_miss("hk", "ex")
+    assert await service.record_port_verify_miss("hk", "ex", 3600) is True
