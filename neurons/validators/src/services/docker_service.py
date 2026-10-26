@@ -441,8 +441,21 @@ def _cache_download_gb(volume_name: str) -> float:
     return int(match.group(1)) if match else math.inf
 
 
-# An existing Engy cache this full counts as complete; the name's GB and the du GiB differ by ~7%.
+# An existing Engy cache this full counts as complete (du and the name's size are both GB, but not exact).
 ENGY_CACHE_COMPLETE_SHARE = 0.9
+
+
+def _engy_cache_gb_left_to_download(volume_name: str, existing: set[str], used_gb: dict[str, float]) -> float:
+    # GB this launch still downloads for the volume: all of it when absent, the rest of a sized Engy
+    # cache that is far from full, 0 when it is present and (near) complete.
+    expected_gb: float = _cache_download_gb(volume_name)
+    if volume_name not in existing:
+        return expected_gb
+    if _ENGY_CACHE_SIZE_IN_NAME.match(volume_name):
+        held_gb: float = used_gb.get(volume_name, 0.0)
+        if held_gb < expected_gb * ENGY_CACHE_COMPLETE_SHARE:
+            return expected_gb - held_gb
+    return 0.0
 
 
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
@@ -4703,13 +4716,9 @@ class DockerService:
         )
         missing_gb: dict[str, float] = {}
         for volume in payload.cache_volumes:
-            expected_gb: float = _cache_download_gb(volume.name)
-            if volume.name not in existing:
-                missing_gb[volume.name] = expected_gb
-            elif _ENGY_CACHE_SIZE_IN_NAME.match(volume.name):
-                held_gb: float = used_gb.get(volume.name, 0.0)
-                if held_gb < expected_gb * ENGY_CACHE_COMPLETE_SHARE:
-                    missing_gb[volume.name] = expected_gb - held_gb
+            left_gb: float = _engy_cache_gb_left_to_download(volume.name, existing, used_gb)
+            if left_gb:
+                missing_gb[volume.name] = left_gb
         present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name not in missing_gb]
         if len(present) == len(payload.cache_volumes):
             return list(payload.cache_volumes)
@@ -4754,25 +4763,39 @@ class DockerService:
     async def _cache_volume_used_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]
     ) -> dict[str, float]:
-        # GiB each volume holds, measured by mounting it by name in the helper (the SSH session is inside
+        # GB each volume holds, measured by mounting it by name in the helper (the SSH session is inside
         # the executor container). A volume missing from the result counts as empty: charge the full download.
         if not volume_names:
             return {}
         roots: dict[str, str] = {f"/cache{index}": name for index, name in enumerate(volume_names)}
         mounts: str = " ".join(f"-v {shlex.quote(name)}:{root}:ro" for root, name in roots.items())
         try:
-            result = await ssh_client.run(
-                f"timeout 60 /usr/bin/docker run --rm {mounts} {ALPINE_HELPER_IMAGE} du -sk {' '.join(roots)}"
+            du_result: asyncssh.SSHCompletedProcess | None = await ssh_client.run(
+                f"timeout -k 5 60 /usr/bin/docker run --rm {mounts} {ALPINE_HELPER_IMAGE} du -sk {' '.join(roots)}"
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return {}
+        except Exception as exc:
+            du_result = None
+            error: str = str(exc)
+        if du_result is None or du_result.exit_status:
+            # An unmeasured volume is charged its full download, which can drop a near-full cache on a tight node.
+            logger.warning(
+                _m(
+                    "Could not measure the existing Engy cache volumes; charging their full download",
+                    extra=get_extra_info({
+                        "volumes": volume_names,
+                        "error": error if du_result is None else (du_result.stderr or "").strip()[-300:],
+                    }),
+                )
+            )
+            if du_result is None:
+                return {}
         used_gb: dict[str, float] = {}
-        for line in (result.stdout or "").splitlines():
+        for line in (du_result.stdout or "").splitlines():
             size_kb, _, root = line.strip().partition("\t")
             if size_kb.isdigit() and root in roots:
-                used_gb[roots[root]] = int(size_kb) / (1024**2)
+                used_gb[roots[root]] = int(size_kb) * 1024 / 1e9
         return used_gb
 
     @staticmethod

@@ -620,11 +620,11 @@ async def test_rental_evicts_the_oldest_cache_first_and_keeps_the_rest_once_it_f
 
 
 class MeasuringSshClient(HostSshClient):
-    """HostSshClient that also answers the helper `du -sk` with how many GiB each cache volume holds."""
+    """HostSshClient that also answers the helper `du -sk` with how many GB each cache volume holds."""
 
     def __init__(self, listed_volumes: list[str], free_gb: float, held_gb: float):
         super().__init__(listed_volumes, free_gb)
-        self._held_kb = int(held_gb * 1024**2)
+        self._held_kb = int(held_gb * 1e9 / 1024)
 
     async def run(self, command: str, *args, **kwargs):
         if "du -sk" in command:
