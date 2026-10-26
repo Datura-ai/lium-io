@@ -353,3 +353,16 @@ async def test_a_card_missing_while_the_renter_resets_it_holds_the_cycle_without
     # a card of the other pod missing during the reset is still a loss
     other = _ctx(context_factory, redis, listed=UUIDS[1:], count=3, pods=(2, 2))
     assert (await GpuLossHoldCheck().run(other)).event.reason_code != Msg.MISSING_GPUS_UNDER_RESET.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("pods", "held"), [((), False), ((4,), True)])
+async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_not_held(context_factory, pods, held):
+    """Replaced cards are not lost ones on an idle node (GpuFingerprintCheck re-anchors them);
+    under a rental they are."""
+    redis = FakeRedis()
+    replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+
+    result = await _cycle(context_factory, redis, listed=replaced, pods=pods)
+
+    assert _hidden(result) is held
