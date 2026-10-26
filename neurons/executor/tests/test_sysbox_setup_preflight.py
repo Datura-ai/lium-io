@@ -420,6 +420,20 @@ def test_install_mode_loads_the_iptables_modules_itself(tmp_path):
     assert conf.read_text() == "ip_tables\niptable_nat\niptable_filter\n"
 
 
+@pytest.mark.parametrize(
+    ("error", "hinted"),
+    [
+        ('docker: Error response from daemon: OCI runtime create failed: namespace {"time" ""} does not exist', True),
+        ("nvidia-container-cli: initialization error: load library failed: libnvidia-ml.so.1: cannot open", False),
+    ],
+)
+def test_the_docker_28_hint_shows_only_for_the_time_namespace_error(tmp_path, error, hinted):
+    _, out, _ = run_check(
+        tmp_path, 'time_namespace_hint "$VERIFY_OUT"', env={"STUB_DOCKER_VERSION": "29.9.2", "VERIFY_OUT": error}
+    )
+    assert ("downgrade the daemon to Docker 28.x" in out) is hinted
+
+
 # ── failure diagnostics (the block printed when the verify container does not start) ─────────
 
 

@@ -142,6 +142,14 @@ daemon_feature_state() {
         || echo "unreadable (invalid JSON, or jq missing)"
 }
 
+# only for that error: a host without its NVIDIA driver on Docker 29.9 was told to downgrade Docker (24 Oct 2026)
+time_namespace_hint() {
+    docker_version_ge 29 5 && [[ "$1" == *'namespace {"time"'* ]] || return 0
+    fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
+    fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
+    fail "  if the error is still there, downgrade the daemon to Docker 28.x."
+}
+
 failure_diagnostics() {
     # what a provider pastes into a ticket when the verify container did not start
     echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
@@ -1110,11 +1118,7 @@ else
     echo ""
     failure_diagnostics
     echo ""
-    if docker_version_ge 29 5; then
-        fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
-        fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
-        fail "  if the error is still there, downgrade the daemon to Docker 28.x."
-    fi
+    time_namespace_hint "$VERIFY_OUT"
     fail "Check: journalctl -u docker.service --no-pager -n 20"
     fail "Check: journalctl -u sysbox-mgr.service --no-pager -n 20"
     exit 1
