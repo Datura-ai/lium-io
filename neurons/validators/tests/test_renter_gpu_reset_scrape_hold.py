@@ -391,6 +391,7 @@ async def test_a_carried_score_takes_the_pay_flags_of_this_cycle_and_a_fresh_ban
     assert (carried.is_new_rentals_paused, carried.default_job_owner, carried.has_lium_filler) == (True, "lium", True)
     # this cycle's filler average for the carried configuration (8x H100), not the held scrape's
     assert carried.filler_revenue_per_gpu_hour == 2.5
+    assert carried.filler_revenue_usd_per_hour == 2.5 * 10_000 / 24
 
 
 @pytest.mark.asyncio

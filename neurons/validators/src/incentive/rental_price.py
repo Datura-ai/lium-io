@@ -243,6 +243,8 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unbucketed_share = 0.0
         self.unbucketed_share_raw = 0.0
         self.unbucketed_paid_fraction = 1.0
+        # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
+        self._spot_pay_candidates: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -646,8 +648,10 @@ class RentalPriceIncentive(DefaultIncentive):
     @staticmethod
     def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
         """Free-GPU count when the result is a partially rented split node, else None."""
+        # score 0 = a gate zeroed the node (job_score stays 1 on rentals for health reporting): no idle pay for its rest
         if not (
             result.is_rented
+            and result.score > 0
             and result.supports_gpu_splitting
             and result.gpu_splitting_min_count
             and result.rented_gpu_count
@@ -841,6 +845,7 @@ class RentalPriceIncentive(DefaultIncentive):
         for key, weighted_sum in self._weighted_rate_sum_by_bucket.items():
             cap_mult = self.cap_multiplier_by_bucket.get(key, 0.0)
             self.total_rental_cost += cap_mult * weighted_sum
+        self._unbucketed_rental_cost += self._spot_pay_within_filler_earnings()
         self._unbucketed_rental_cost += self._secure_floor_top_up()
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
@@ -1143,7 +1148,26 @@ class RentalPriceIncentive(DefaultIncentive):
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
-        self._unbucketed_rental_cost += result.gpu_count * result.effective_rate
+        self._spot_pay_candidates.append((base_model, result))
+
+    def _spot_pay_within_filler_earnings(self) -> float:
+        """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
+        they are not each paid an expected rate. When their spot rates add up to more, every one is
+        scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
+        Returns the USD/hour they are paid in all."""
+        rate_sum_by_model: dict[str, float] = {}
+        pool_by_model: dict[str, float] = {}
+        for base_model, result in self._spot_pay_candidates:
+            rate_sum_by_model[base_model] = rate_sum_by_model.get(base_model, 0.0) + result.gpu_count * result.effective_rate
+            pool_by_model[base_model] = result.filler_revenue_usd_per_hour or 0.0
+        total: float = 0.0
+        for base_model, result in self._spot_pay_candidates:
+            rate_sum: float = rate_sum_by_model[base_model]
+            multiplier: float = min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            result.spot_pool_multiplier = multiplier
+            result.effective_rate *= multiplier
+            total += result.gpu_count * result.effective_rate
+        return total
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:
