@@ -1057,10 +1057,15 @@ SYSBOX_MANY_LAYERS_RENTER_SENTENCE = (
 )
 
 
-def _flatten_reserved_bytes(storage_limit_gb: int | None, volume_limit_gb: int | None, sparse_volume: bool) -> int:
-    """Disk the pod's limits granted but have not taken yet: the writable layer, and a sparse (full-node)
-    volume; a preallocated volume already took its space."""
-    return ((storage_limit_gb or 0) + ((volume_limit_gb or 0) if sparse_volume else 0)) * 1024**3
+def _flatten_reserved_bytes(
+    storage_limit_gb: int | None, volume_limit_gb: int | None, disk_share: float | None
+) -> int | None:
+    """Disk a full-node pod's limits granted but have not taken yet (its writable layer and sparse volume),
+    or None (no flatten) for a split or legacy rental: a sibling rental sized now or later can be granted
+    the disk the copy takes, and the node cannot see a grant before its container exists."""
+    if disk_share is None or disk_share < 1.0:
+        return None
+    return ((storage_limit_gb or 0) + (volume_limit_gb or 0)) * 1024**3
 
 
 # name, --storage-opt size (empty without one) and bytes written, for every container on the node
@@ -2643,7 +2648,7 @@ class DockerService:
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
-        Sysbox many-layer failure: only when `flatten_reserved_bytes` is given (customer rentals), the
+        Sysbox many-layer failure: only when `flatten_reserved_bytes` is given (full-node customer rentals), the
         image is copied into one layer on the node, keeping free the disk the pod's limits already
         granted (`flatten_reserved_bytes`), and the run is retried once after `before_flatten_retry`
         (the delete-cancellation check, which raises when the pod was deleted meanwhile). The copy also
@@ -9144,9 +9149,7 @@ class DockerService:
                         # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
                         flatten_reserved_bytes=(
                             _flatten_reserved_bytes(
-                                effective_storage_limit_gb,
-                                effective_volume_limit_gb,
-                                payload.disk_share is not None and payload.disk_share >= 1.0,
+                                effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
                             )
                             if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
                             else None

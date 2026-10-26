@@ -8209,23 +8209,25 @@ def _flatten_on_disk(avail_bytes, image_bytes):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "storage_gb, volume_gb, full_node, avail_gb, writable_layers, beside_other_create, flattens",
+    "storage_gb, volume_gb, disk_share, avail_gb, writable_layers, beside_other_create, outcome",
     [
         # review: 100 GiB free, two disk_share=0.5 rentals of 26 GiB preallocated volume + 13 GiB layer each;
-        # 48 GiB left, a 24 GiB copy: 24 + 10 + 13 (own) + 13 (neighbour's unwritten layer) > 48
-        (13, 26, False, 48, "/pod_a 13g 0\n/pod_x 13g 0\n", False, False),
-        # the neighbour already wrote 12 of its 13 GiB: 24 + 10 + 13 + 1 = 48 fits
-        (13, 26, False, 48, "/pod_a 13g 12884901888\n/pod_x 13g 0\n", False, True),
-        # a second split still sizing on the node: its grant is not on disk yet
-        (13, 26, False, 100, "/pod_x 13g 0\n", True, False),
-        # full node: own layer + sparse volume, no neighbour; 24 + 10 + 26 + 53 = 113
-        (26, 53, True, 113, "/pod_x 26g 0\n", False, True),
-        (26, 53, True, 112, "/pod_x 26g 0\n", False, False),
+        # 48 GiB left and a 24 GiB copy would pass 24 + 10 + 13 = 47: a split rental never flattens
+        (13, 26, 0.5, 48, "/pod_a 13g 0\n/pod_x 13g 0\n", False, "sysbox_error"),
+        (13, 26, None, 100, "/pod_x 13g 0\n", False, "sysbox_error"),  # legacy contract: split unknown
+        # full node: own layer + sparse volume; 24 + 10 + 26 + 53 = 113
+        (26, 53, 1.0, 113, "/pod_x 26g 0\n", False, "flattened"),
+        (26, 53, 1.0, 112, "/pod_x 26g 0\n", False, "no_disk"),
+        # a container left on the node keeps its unwritten layer: 113 + 5
+        (26, 53, 1.0, 117, "/pod_old 5g 0\n/pod_x 26g 0\n", False, "no_disk"),
+        (26, 53, 1.0, 118, "/pod_old 5g 0\n/pod_x 26g 0\n", False, "flattened"),
+        # another customer create still sizing on the node: its grant is not on disk yet
+        (26, 53, 1.0, 1000, "/pod_x 26g 0\n", True, "no_disk"),
     ],
-    ids=["review_split_neighbour", "split_neighbour_wrote", "split_in_flight", "full_node_fits", "full_node_short"],
+    ids=["review_split", "legacy", "full_node_fits", "full_node_short", "leftover_short", "leftover_fits", "in_flight"],
 )
 async def test_the_flatten_keeps_every_granted_allowance_free(
-    docker_service, storage_gb, volume_gb, full_node, avail_gb, writable_layers, beside_other_create, flattens
+    docker_service, storage_gb, volume_gb, disk_share, avail_gb, writable_layers, beside_other_create, outcome
 ):
     client = _SysboxFailingRentalClient({"sglang"})
     flatten = _flatten_on_disk(avail_gb * _GIB, 24 * _GIB)
@@ -8233,17 +8235,22 @@ async def test_the_flatten_keeps_every_granted_allowance_free(
         docker_service,
         client,
         flatten,
-        reserved_bytes=docker_service_module._flatten_reserved_bytes(storage_gb, volume_gb, full_node),
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(storage_gb, volume_gb, disk_share),
         ssh=_node_ssh(writable_layers),
         beside_other_create=lambda: beside_other_create,
     )
-    if flattens:
+    if outcome == "flattened":
         assert await create == "cid"
         assert client.events[-1] == "run lium-flattened:abc"
-    else:
+        return
+    if outcome == "no_disk":
         with pytest.raises(ImageFlattenNoDisk):
             await create
-        assert client.events == ["run sglang"]
+    else:
+        with pytest.raises(Exception, match="ID-mapped mount"):
+            await create
+        flatten.assert_not_awaited()
+    assert client.events == ["run sglang"]
 
 
 def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
@@ -8256,11 +8263,12 @@ def test_others_running_counts_only_the_other_customer_creates_on_the_executor()
         assert not registry.others_running(own)
 
 
-def test_flatten_keeps_free_the_writable_layer_and_a_sparse_volume_only():
+def test_flatten_only_on_a_full_node_keeping_free_its_layer_and_sparse_volume():
     gib = 1024**3
-    assert docker_service_module._flatten_reserved_bytes(26, 53, True) == 79 * gib
-    assert docker_service_module._flatten_reserved_bytes(26, 53, False) == 26 * gib  # preallocated: already taken
-    assert docker_service_module._flatten_reserved_bytes(None, None, True) == 0
+    assert docker_service_module._flatten_reserved_bytes(26, 53, 1.0) == 79 * gib
+    assert docker_service_module._flatten_reserved_bytes(26, 53, 0.5) is None  # split: no flatten
+    assert docker_service_module._flatten_reserved_bytes(26, 53, None) is None
+    assert docker_service_module._flatten_reserved_bytes(None, None, 1.0) == 0
 
 
 @pytest.mark.asyncio
