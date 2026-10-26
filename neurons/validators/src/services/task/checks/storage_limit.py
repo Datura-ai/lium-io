@@ -24,6 +24,10 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 
+# check_storage_limit_ability's (machine_scrape.py) answers when the probe gave no verdict
+INCONCLUSIVE_PROBE_ERRORS = ("Test command timed out", "An unexpected error occurred")
+
+
 class StorageLimitCheck:
     """Warn about, and with REQUIRE_STORAGE_LIMIT_SUPPORTED fail, a node that cannot cap a container's disk."""
 
@@ -46,14 +50,18 @@ class StorageLimitCheck:
         # DAH-1997: a host the scrape saw no way to build the limit on (one disk, all in use) keeps the
         # warning; unknown (an older scrape, a failed reading) counts as able
         capable = specs.get("storage_limit_capable") is not False
+        detail = str(specs.get("storage_limit_scrape_error") or "")
+        # a probe that timed out or crashed (slow image pull, busy host) says nothing about the limit: warn only
+        conclusive = not detail.startswith(INCONCLUSIVE_PROBE_ERRORS)
         what = {
             "storage_limit_supported": False,
             "capable": capable,
-            "detail": str(specs.get("storage_limit_scrape_error") or "")[:300] or None,
+            "conclusive": conclusive,
+            "detail": detail[:300] or None,
             "enforced": settings.REQUIRE_STORAGE_LIMIT_SUPPORTED,
             "rented": rented,
         }
-        if settings.REQUIRE_STORAGE_LIMIT_SUPPORTED and not rented and capable:
+        if settings.REQUIRE_STORAGE_LIMIT_SUPPORTED and not rented and capable and conclusive:
             what["reach_source"] = str(ReachSource.VALIDATOR)
             what["reach_target"] = str(ReachTarget.DOCKER_STORAGE)
             return CheckResult(

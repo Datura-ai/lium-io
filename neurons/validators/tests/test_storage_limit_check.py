@@ -129,3 +129,14 @@ async def test_enforced_a_single_disk_host_only_warns(context_factory, enforced)
     assert result.passed is True
     assert result.event.reason_code == Msg.MISSING.reason
     assert "score" not in result.updates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["Test command timed out.", "An unexpected error occurred: boom"])
+async def test_a_probe_without_a_verdict_only_warns_even_when_enforced(context_factory, enforced, error):
+    result = await run(context_factory, {"storage_limit_supported": False, "storage_limit_scrape_error": error})
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.MISSING.reason
+    assert result.event.what_we_saw["conclusive"] is False
+    assert not result.updates
