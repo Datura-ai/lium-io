@@ -26,6 +26,8 @@ EXTERNAL_PROBE_SAMPLE = 3
 class BatchVerifier:
     """Verifies ports using --network=host in batches."""
 
+    REPROBE_DELAY_SEC = 3
+
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
     ):
@@ -130,6 +132,11 @@ class BatchVerifier:
                 successful, failed = (
                     await self.port_tester.test_many(session, host, remaining, token, log_ctx) if remaining else ([], [])
                 )
+                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so probe it once more
+                if failed and len(successful) * 2 < len(remaining):
+                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                    late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
+                    successful += late
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
