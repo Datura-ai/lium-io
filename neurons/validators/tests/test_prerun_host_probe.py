@@ -23,7 +23,7 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
   removal that times out fails the create at the cleanup step;
 - a customer create removes its fillers as soon as the SSH session is up, beside the image
   inspect and the probes; the cleanup step awaits that removal, never removes those fillers again,
-  and everything after it (power restore, docker run) still waits for it.
+  and everything after it (power restore, cache reclaim, docker run) still waits for it.
 """
 
 from __future__ import annotations
@@ -360,6 +360,7 @@ def _wire(svc, monkeypatch, ssh_client, *, probe_result):
     monkeypatch.setattr(svc, "clean_stale_vloopback_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "sweep_stale_cache_volumes", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "select_affordable_cache_volumes", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock())
     monkeypatch.setattr(svc, "_image_has_encrypted_volume_label", AsyncMock(return_value=False))
     monkeypatch.setattr(
         "services.docker_service.restore_tracked_gpu_power_limits", AsyncMock(return_value=0)
@@ -401,6 +402,7 @@ async def test_create_container_probes_once_and_hands_it_to_every_consumer(
         svc.clean_stale_vloopback_volumes,
         svc.sweep_stale_cache_volumes,
         svc.select_affordable_cache_volumes,
+        svc.reclaim_dphn_cache_for_rental,
         svc._image_has_encrypted_volume_label,
     ):
         assert _probe_kwarg(m) is probe, m
@@ -472,6 +474,7 @@ def _wire_early_probes(svc, monkeypatch, *, image_present: bool) -> list[int]:
     """Both probes on; returns how many host probes had started when the image inspect answered."""
     _wire(svc, monkeypatch, _deploy_ssh_client(inspect_exit=0 if image_present else 1), probe_result=_probe())
     monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", AsyncMock(return_value=False))
     docker_client = _docker_client(svc)
     inspect_image = docker_client.local_image_repo_digests
     host_probes_started_at_inspect: list[int] = []
@@ -531,6 +534,7 @@ def _wire_customer_create_over_the_host(
     for real in (
         "clean_existing_containers",
         "clean_stale_vloopback_volumes",
+        "reclaim_dphn_cache_for_rental",
         "wait_for_port_check_containers",
     ):
         monkeypatch.delattr(svc, real)
@@ -644,6 +648,7 @@ async def test_customer_create_relists_after_any_other_removal(
     # the stub host lists no volume, so the vloopback sweep stops before its mounted-volume listing
     assert _relisting_commands(ssh_client) == [
         DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
+        '/usr/bin/docker volume ls --format "{{.Name}}"',
         port_check_containers_command("miner"),
     ]
     assert svc.probe_volume_host.await_count == 2
@@ -690,11 +695,11 @@ _RECREATED_ID = "b" * 64
         # the kill is issued at SSH connect: confirmed before the image inspect and the probes finish
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["host probed", "image inspected"]),
         # safety order: a PEARL filler is gone before its cap is lifted (beside the volume create, and again
-        # right before docker run)
-        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["docker run", "power restore", "power restore"]),
+        # right before docker run), and the Dolphin cache is reclaimed only once the filler that mounts it is gone
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["cache reclaim", "docker run", "power restore", "power restore"]),
     ],
     ids=["same_instance", "cleanup_listing_without_ids", "before_the_image_inspect_and_the_probes_finish",
-         "before_power_restore_and_docker_run"],
+         "before_power_restore_cache_reclaim_and_docker_run"],
 )
 async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
     svc_fixture, monkeypatch, id_in_cleanup_listing, removed_ids, docker_rm_seconds, probes_seconds, after_the_first_removal
@@ -734,6 +739,7 @@ async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
     )
     svc.probe_prerun_host = AsyncMock(side_effect=recorded("host probed", svc.probe_prerun_host, probes_seconds))
     svc._restore_gpu_power_for_uncapped_pod = recorded("power restore", AsyncMock())
+    svc.reclaim_dphn_cache_for_rental = recorded("cache reclaim", AsyncMock(return_value=False))
     svc._run_rental_docker_create_with_port_retry = recorded("docker run", AsyncMock())
 
     result = await _run_create_container(svc, _deploy_payload(active_volume_names=["volume_x"]))

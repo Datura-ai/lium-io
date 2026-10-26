@@ -328,6 +328,14 @@ FILLER_CACHE_MAX_FREE_DISK_SHARE = 0.3
 # (/root/models): the weights are not in it, so it needs room only for kernels, logs and scratch. The
 # backend's size (1900 GB for kimi-k3) still applies when the cache is refused. Tune here.
 FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE = 100
+# DAH-5192: an Engy checkpoint over FILLER_CACHE_MAX_FREE_DISK_SHARE of free disk is cached only when the node
+# still has this much free beside it: the cache is kept through rentals, so this is the least disk a renter
+# is listed. Below it the run re-downloads into its own volume, which a rental removes. Tune here.
+ENGY_CACHE_MIN_FREE_BESIDE_GB = 1000
+# DAH-5192: an Engy cache volume holding less than this share of its checkpoint (size in its name) is a
+# partial download, e.g. one a rental interrupted. It is kept and remounted, so the next run resumes it file
+# by file, but what is still missing is charged like a download.
+ENGY_CACHE_COMPLETE_SHARE = 0.98
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle
