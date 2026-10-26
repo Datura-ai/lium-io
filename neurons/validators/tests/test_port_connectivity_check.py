@@ -645,6 +645,26 @@ async def test_unrented_node_whose_scrape_sysbox_test_ran_and_failed_is_a_verdic
 
 
 @pytest.mark.asyncio
+async def test_definitive_scrape_failure_forgets_the_pass_a_later_timeout_would_reuse(context_factory):
+    """A pass, then the scrape's sysbox test ran and failed, then it timed out: the failure supersedes the pass."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    failed = build_state(specs={"sysbox_runtime_scrape_error": "Sysbox runtime does not support GPU access."})
+    await PortConnectivityCheck().run(
+        _verified_ctx(context_factory, redis_service=redis_service, state=failed, dind_ok=False, sysbox_measured=None)
+    )
+    assert ("miner-hotkey", "executor-123") not in redis_service.sysbox_verified
+
+    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+    result = await PortConnectivityCheck().run(
+        _verified_ctx(context_factory, redis_service=redis_service, state=timed_out, dind_ok=False, sysbox_measured=None)
+    )
+
+    assert result.updates["state"].sysbox_runtime is False
+    assert "sysbox_from_last_verified" not in result.updates["default_extra"]
+
+
+@pytest.mark.asyncio
 async def test_probe_that_verifies_sysbox_is_remembered_with_the_ttl(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "SYSBOX_VERIFIED_TTL_SECONDS", 4321)
     redis_service = DummyRedis()

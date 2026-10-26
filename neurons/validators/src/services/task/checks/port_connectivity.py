@@ -289,6 +289,8 @@ class PortConnectivityCheck:
             else:
                 unknown = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error") == SYSBOX_TEST_TIMED_OUT
             if not unknown:
+                if not rented:  # the scrape's sysbox test ran and failed: a verdict that supersedes the last pass
+                    await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
