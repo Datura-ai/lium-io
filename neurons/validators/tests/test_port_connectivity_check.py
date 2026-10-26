@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from neurons.validators.src.services.executor_connectivity.models import (
     PortRangeResult,
     PortVerificationResult,
 )
+from services.redis_service import RedisService
 from neurons.validators.src.services.task.checks import port_connectivity
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
@@ -529,6 +531,18 @@ def _rented_state(*, scrape_sysbox: bool = False):
     )
 
 
+def _filler_timed_out_state(**overrides):
+    """Unrented, the backend lists an active Lium filler, and the scrape's sysbox test timed out."""
+    base = dict(
+        sysbox_runtime=False,
+        specs={"sysbox_runtime_scrape_error": "Test command timed out."},
+        rented_data=RentedExecutorsResponse(
+            executors={}, all_filler_containers_by_executor={"executor-123": ["filler_run-1"]}
+        ),
+    )
+    return build_state(**{**base, **overrides})
+
+
 def _verified_ctx(context_factory, *, redis_service, state, dind_ok: bool, sysbox_measured: bool | None):
     services = build_services(
         redis=redis_service,
@@ -622,7 +636,7 @@ async def test_unrented_node_keeps_verified_sysbox_while_the_scrape_sysbox_test_
     await PortConnectivityCheck().run(passed)
     assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified  # the 07:09 pass
 
-    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+    timed_out = _filler_timed_out_state()
     for dind_ok in (False, False, True):
         ctx = _verified_ctx(
             context_factory, redis_service=redis_service, state=timed_out, dind_ok=dind_ok, sysbox_measured=None
@@ -665,7 +679,7 @@ async def test_definitive_scrape_failure_forgets_the_pass_a_later_timeout_would_
     )
     assert ("miner-hotkey", "executor-123") not in redis_service.sysbox_verified
 
-    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+    timed_out = _filler_timed_out_state()
     result = await PortConnectivityCheck().run(
         _verified_ctx(context_factory, redis_service=redis_service, state=timed_out, dind_ok=False, sysbox_measured=None)
     )
@@ -688,7 +702,7 @@ async def test_probe_miss_after_a_passing_scrape_sysbox_test_keeps_the_pass(cont
     )
     assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
 
-    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+    timed_out = _filler_timed_out_state()
     result = await PortConnectivityCheck().run(
         _verified_ctx(context_factory, redis_service=redis_service, state=timed_out, dind_ok=False, sysbox_measured=None)
     )
@@ -738,7 +752,7 @@ async def test_unrented_timeouts_stop_reusing_the_pass_once_it_is_an_hour_old(co
         )
     )
     passed_at = redis_service.sysbox_verified_epoch[("miner-hotkey", "executor-123")]
-    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+    timed_out = _filler_timed_out_state()
 
     seen = []
     for minutes in (15, 30, 45, 61, 75):
@@ -751,3 +765,65 @@ async def test_unrented_timeouts_stop_reusing_the_pass_once_it_is_an_hour_old(co
         seen.append(result.updates["state"].sysbox_runtime)
 
     assert seen == [True, True, True, False, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rented_data",
+    [
+        None,
+        RentedExecutorsResponse(executors={}),
+        RentedExecutorsResponse(executors={}, all_filler_containers_by_executor={"other": ["f"]}),
+    ],
+    ids=["no_rented_data", "no_fillers", "filler_elsewhere"],
+)
+async def test_unrented_timeout_without_a_backend_confirmed_filler_does_not_reuse_the_pass(context_factory, rented_data):
+    """The timeout string is provider-reported: a host that passed, disabled Sysbox and stalls the test gets
+    nothing from the cached pass unless the backend says a Lium filler is running on it."""
+    redis_service = DummyRedis()
+    await PortConnectivityCheck().run(
+        _verified_ctx(
+            context_factory, redis_service=redis_service, state=build_state(sysbox_runtime=True), dind_ok=True,
+            sysbox_measured=True,
+        )
+    )
+    result = await PortConnectivityCheck().run(
+        _verified_ctx(
+            context_factory, redis_service=redis_service, state=_filler_timed_out_state(rented_data=rented_data),
+            dind_ok=False, sysbox_measured=None,
+        )
+    )
+
+    assert result.updates["state"].sysbox_runtime is False
+    assert "sysbox_from_last_verified" not in result.updates["default_extra"]
+
+
+class _TtlRedis:
+    def __init__(self, value, ttl):
+        self.value, self.remaining = value, ttl
+
+    async def get(self, key):
+        return self.value
+
+    async def ttl(self, key):
+        return self.remaining
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "ttl", "age"),
+    [(None, -2, None), (b"1", 86400 - 600, 600), (b"1", 600, 86400 - 600)],
+    ids=["missing", "legacy_fresh", "legacy_old"],
+)
+async def test_sysbox_verified_at_dates_a_pre_release_pass_from_its_ttl(monkeypatch, value, ttl, age):
+    """A pass stored as "1" before the timestamp release is aged by the TTL it has used, not read as epoch 1."""
+    monkeypatch.setattr(settings, "SYSBOX_VERIFIED_TTL_SECONDS", 86400)
+    service = RedisService.__new__(RedisService)
+    service.redis, service.lock = _TtlRedis(value, ttl), asyncio.Lock()
+
+    verified_at = await service.sysbox_verified_at("hk", "ex")
+
+    if age is None:
+        assert verified_at is None
+    else:
+        assert abs(time.time() - verified_at - age) < 5

@@ -274,7 +274,7 @@ class PortConnectivityCheck:
 
         An unrented node reads it too when the scrape's sysbox test timed out (26 Oct, a B300 whose
         own Lium filler was loading: two cycles of SYSBOX_REQUIRED_MISSING with Sysbox working), but only
-        while the pass is under SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS old; only a fresh validator-side probe
+        while the backend lists an active Lium filler on it and the pass is under SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS old; only a fresh validator-side probe
         pass extends it.
         """
         redis = ctx.services.redis
@@ -300,6 +300,11 @@ class PortConnectivityCheck:
                 return False
             if rented:
                 return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+            # the timeout string is provider-reported: reuse the pass only while the backend confirms an active
+            # Lium filler on the node (the load that stalls the test), never on the provider's word alone
+            rented_data = ctx.state.rented_data
+            if not (rented_data and rented_data.get_filler_containers(ctx.executor.uuid)):
+                return False
             verified_at = await redis.sysbox_verified_at(ctx.miner_hotkey, ctx.executor.uuid)
             return verified_at is not None and time.time() - verified_at < SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it

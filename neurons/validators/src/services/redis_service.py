@@ -393,9 +393,17 @@ class RedisService:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
 
     async def sysbox_verified_at(self, miner_hotkey: str, executor_id: str) -> float | None:
-        """Epoch of the stored pass, None without one (a pre-timestamp "1" reads as long ago)."""
-        value = await self.get(self._sysbox_verified_key(miner_hotkey, executor_id))
-        return None if value is None else float(value)
+        """Epoch of the stored pass, None without one."""
+        key = self._sysbox_verified_key(miner_hotkey, executor_id)
+        value = await self.get(key)
+        if value is None:
+            return None
+        if float(value) != 1:
+            return float(value)
+        # a pre-timestamp "1" was stored with ex=SYSBOX_VERIFIED_TTL_SECONDS: its age is what the TTL has used up
+        async with self.lock:
+            remaining = await self.redis.ttl(key)
+        return time.time() - max(0, settings.SYSBOX_VERIFIED_TTL_SECONDS - max(remaining, 0))
 
     async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
         """When this validator first found the executor without its recommended image (epoch s).
