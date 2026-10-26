@@ -1,21 +1,24 @@
 """DAH-5088: an unknown NVIDIA model passes validation and is scored as its reference model.
 
-The reference is the cheapest known model whose nominal VRAM is within 0.90-1.10x of the card's
-reported VRAM, else the cheapest with the largest size below it, else none (still unsupported).
+The reference is the cheapest model in services/gpu_reference_table.py whose nominal VRAM is
+within 0.90-1.10x of the card's reported VRAM, else the cheapest with the largest size below it,
+else none (still unsupported).
 """
 
-import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import services.gpu_reference_table as gpu_reference_table
 from neurons.validators.src.services.task.checks.gpu_model_valid import GpuModelValidCheck
 from neurons.validators.src.services.task.messages import GpuModelMessages as Msg
 from neurons.validators.src.services.task.result_handler import ResultHandler
 from neurons.validators.src.services.task.score_calculator import calculate_scores
 from services.const import GPU_MODEL_RATES
 from services.gpu_precheck import UnsupportedGpuModelError, precheck_gpu_spec
+from services.gpu_reference_table import GPU_REFERENCE_TABLE
 from services.gpu_spec_table import (
     GPU_VRAM_SIZES_MB,
     VRAM_FLOOR_RATIO,
@@ -29,22 +32,27 @@ from tests.test_idle_slot_caps_by_tier import _run_with_production_config
 from tests.test_rental_price_incentive_flow import _make_pcc_job
 
 UNKNOWN = "NVIDIA RTX Future 9000"
-# the backend's served MACHINE_PRICES (lium.io/api/v1/shared-config, 24 Oct 2026): the validator ranks by it in
-# prod, and the pinned lium-core defaults lack many older models
-PRICES = json.loads((Path(__file__).parent / "fixtures" / "served_machine_prices_20261024.json").read_text())
-
-
-@pytest.fixture(autouse=True)
-def _served_prices(monkeypatch):
-    monkeypatch.setattr(
-        shared_client, "_config", shared_client.config.model_copy(update={"machine_prices": PRICES})
-    )
-
-CANDIDATES = [m for m in GPU_VRAM_SIZES_MB if m in GPU_MODEL_RATES and m in PRICES]
+# lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
+# and pins the same hash
+GPU_REFERENCE_TABLE_SHA256 = "5a0f7cdc0f3988052d57394113f38c7dc63910037bd45bd2bf5e0a33a653f829"
+PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
+CANDIDATES = list(GPU_REFERENCE_TABLE)
 
 
 def _in_band(model: str, vram_mb: int) -> bool:
     return any(0.90 * vram_mb <= size <= 1.10 * vram_mb for size in GPU_VRAM_SIZES_MB[model])
+
+
+def test_the_reference_table_is_the_one_lium_platform_pins():
+    table = Path(gpu_reference_table.__file__).read_bytes()
+    assert hashlib.sha256(table).hexdigest() == GPU_REFERENCE_TABLE_SHA256
+
+
+def test_every_candidate_is_a_scored_model_with_the_registry_sizes():
+    for model, (_, sizes_gb) in GPU_REFERENCE_TABLE.items():
+        assert model in GPU_MODEL_RATES
+        assert sorted(size * 1024 for size in sizes_gb) == sorted(GPU_VRAM_SIZES_MB[model])
+    assert set(GPU_MODEL_RATES) <= set(GPU_REFERENCE_TABLE)
 
 
 @pytest.mark.parametrize("vram_mb", [8000, 15352, 23028, 46068, 81559, 140000, 183359, 275040])
@@ -57,18 +65,26 @@ def test_an_unknown_card_gets_the_cheapest_known_model_of_its_memory(vram_mb):
     assert reference == min(m for m in in_band if PRICES[m] == cheapest)
 
 
-# the same cases as lium-platform's src/test/test_unknown_gpu_reference_model.py: the backend lists and the
-# validator pays an unknown card as one model
-@pytest.mark.parametrize(
-    ("vram_mb", "reference"),
-    [
-        (16303, "NVIDIA Quadro RTX 5000"),
-        (24564, "NVIDIA Tesla P40"),
-        (49140, "NVIDIA Quadro RTX 8000"),
-        (81559, "NVIDIA A800 80GB PCIe"),
-        (409600, "NVIDIA B300 SXM6 AC"),
-    ],
-)
+# the same cases as lium-platform's src/test/test_unknown_gpu_reference_model.py (MiB, as
+# nvidia-smi reports): the backend lists and the validator pays an unknown card as one model
+PARITY_CASES = [
+    (6144, "NVIDIA GeForce RTX 2060"),
+    (11264, "NVIDIA GeForce GTX 1080 Ti"),
+    (16303, "NVIDIA Quadro RTX 5000"),
+    (20000, "NVIDIA RTX A4500"),
+    (24564, "NVIDIA Tesla P40"),
+    (30000, "NVIDIA GeForce RTX 5090 D"),
+    (40960, "NVIDIA CMP 170HX"),
+    (49140, "NVIDIA Quadro RTX 8000"),
+    (81559, "NVIDIA A800 80GB PCIe"),
+    (97871, "NVIDIA H800 NVL"),
+    (143771, "NVIDIA H200 NVL"),
+    (183359, "NVIDIA B200"),
+    (409600, "NVIDIA B300 SXM6 AC"),
+]
+
+
+@pytest.mark.parametrize(("vram_mb", "reference"), PARITY_CASES)
 def test_the_reference_matches_the_backends(vram_mb, reference):
     assert reference_gpu_model(UNKNOWN, vram_mb) == reference
 
@@ -188,8 +204,7 @@ def test_an_unknown_card_has_no_hard_price_limit(context_factory):
     # the reference (the cheapest same-memory model) is a payout floor, not a fair price (the backend skips it too)
     details = [{"name": UNKNOWN, "capacity": 23028}]
     reference_limit = (
-        shared_client.config.machine_prices[reference_gpu_model(UNKNOWN, 23028)]
-        * shared_client.config.machine_max_price_rate
+        PRICES[reference_gpu_model(UNKNOWN, 23028)] * shared_client.config.machine_max_price_rate
     )
     executor = default_executor().model_copy(update={"price_per_gpu": reference_limit * 10})
     state = build_state(
