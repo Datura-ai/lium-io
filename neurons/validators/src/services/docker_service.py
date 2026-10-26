@@ -2868,7 +2868,11 @@ class DockerService:
             if payload.is_sysbox
             and effective_storage_limit_gb
             and docker_data_volume_driver
-            and posixpath.normpath(local_volume_path) != _DEFAULT_DOCKER_ROOT_DIR
+            # an encrypted workspace sits at the cipher mount, so /var/lib/docker is still free
+            and (
+                encrypted_local_volume
+                or posixpath.normpath(local_volume_path) != _DEFAULT_DOCKER_ROOT_DIR
+            )
             else 0
         )
         memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
@@ -3207,7 +3211,12 @@ class DockerService:
             f"/usr/bin/docker volume inspect {volume} --format '{{{{.Driver}}}}'",
             timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
         )
-        driver = (result.stdout or "").strip() if getattr(result, "exit_status", 0) == 0 else ""
+        if getattr(result, "exit_status", 0) != 0:
+            # the recorded workspace is gone: Docker would recreate it as an uncapped local volume
+            raise RuntimeError(
+                f"workspace volume {local_volume} could not be inspected; refusing an uncapped recreate"
+            )
+        driver = (result.stdout or "").strip()
         if _is_vloopback_driver(driver):
             return driver
         logger.warning(

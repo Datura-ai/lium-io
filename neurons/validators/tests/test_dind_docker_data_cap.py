@@ -10,7 +10,7 @@ from services.rental_docker_sdk import GpuDockerConfig, _build_host_config_kwarg
 from tests.test_deploy_optimizations import svc  # noqa: F401  (pytest fixture)
 
 
-def _run_spec(docker_service, storage_limit_gb, local_volume_path="/root"):
+def _run_spec(docker_service, storage_limit_gb, local_volume_path="/root", encrypted=False):
     payload = ContainerCreateRequest(
         miner_hotkey="hk",
         executor_id="ex",
@@ -26,7 +26,7 @@ def _run_spec(docker_service, storage_limit_gb, local_volume_path="/root"):
         port_maps=[(22, 30022, 40022)],
         local_volume="volume_pod",
         local_volume_path=local_volume_path,
-        encrypted_local_volume=False,
+        encrypted_local_volume=encrypted,
         external_volume_name=None,
         gpu_devices=GpuDockerConfig(),
         effective_storage_limit_gb=storage_limit_gb,
@@ -107,7 +107,6 @@ def test_sizing_ignores_anonymous_vloopback_volumes():
         (0, "vloopback:v2\n", "vloopback:v2"),
         (0, "vloopback\n", "vloopback"),
         (0, "local\n", None),  # an unlimited workspace: nothing to put inner Docker on
-        (1, "", None),
     ],
 )
 @pytest.mark.asyncio
@@ -115,3 +114,19 @@ async def test_reused_volume_driver(svc, exit_status, stdout, expected):  # noqa
     ssh = AsyncMock()
     ssh.run = AsyncMock(return_value=AsyncMock(exit_status=exit_status, stdout=stdout))
     assert await svc._vloopback_driver_of_volume(ssh, "volume_pod", {}) == expected
+
+
+@pytest.mark.asyncio
+async def test_missing_reused_volume_fails_the_create(svc):  # noqa: F811
+    # a vanished workspace would be recreated by Docker as an uncapped local volume
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=1, stdout=""))
+    with pytest.raises(RuntimeError, match="could not be inspected"):
+        await svc._vloopback_driver_of_volume(ssh, "volume_pod", {})
+
+
+def test_encrypted_workspace_at_var_lib_docker_still_caps_inner_docker(svc):  # noqa: F811
+    # the encrypted workspace mounts at the cipher path, so /var/lib/docker gets the capped volume
+    kwargs = _build_host_config_kwargs(_run_spec(svc, 40, "/var/lib/docker", encrypted=True))
+    dind = [m for m in kwargs["mounts"] if m["Target"] == "/var/lib/docker"]
+    assert [m["VolumeOptions"]["DriverConfig"]["Options"]["size"] for m in dind] == ["20g"]
