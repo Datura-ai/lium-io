@@ -132,18 +132,20 @@ class BatchVerifier:
                 successful, failed = (
                     await self.port_tester.test_many(session, host, remaining, token, log_ctx) if remaining else ([], [])
                 )
+                first_round = successful
                 # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so probe it once more
                 if failed and len(successful) * 2 < len(remaining):
                     await asyncio.sleep(self.REPROBE_DELAY_SEC)
                     late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
-                    successful += late
+                    successful = successful + late
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        external_blocked = reached == [] and all(p in successful for p in sample)
+        # only first-round answers count against the outside prober: it ran before them, so a late bind refuses it too
+        external_blocked = reached == [] and all(p in first_round for p in sample)
         if external_blocked:
             logger.warning(
                 _m(
