@@ -80,6 +80,7 @@ from services.const import (
     DPHN_CACHE_SIZE_GB,
     ENGY_CACHE_VOLUME_PREFIX,
     FILLER_CACHE_MAX_FREE_DISK_SHARE,
+    FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
@@ -446,6 +447,13 @@ def _cache_download_gb(volume_name: str) -> float:
         return DPHN_CACHE_SIZE_GB
     match: re.Match[str] | None = _ENGY_CACHE_SIZE_IN_NAME.match(volume_name)
     return int(match.group(1)) if match else math.inf
+
+
+def _filler_run_volume_gb(volume_limit_gb: int | None, cache_volumes: list[CacheVolume] | None) -> int | None:
+    # DAH-5192: with the Engy checkpoint in its mounted cache, the run volume would only hold it a second time.
+    if volume_limit_gb is None or not any(v.name.startswith(ENGY_CACHE_VOLUME_PREFIX) for v in cache_volumes or []):
+        return volume_limit_gb
+    return min(volume_limit_gb, FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE)
 
 
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
@@ -4803,7 +4811,10 @@ class DockerService:
         )
         # DAH-5014: free_gb is real disk, every cache on it counted as used. The pod's own volume is
         # created (preallocated) after this check, so the floor must hold with both on disk.
-        free_after_gb: float = free_gb - download_gb - (payload.volume_limit_gb or 0)
+        # Granted, the cache shrinks the run volume (_filler_run_volume_gb), so the floor is held with that size.
+        free_after_gb: float = free_gb - download_gb - (
+            _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes) or 0
+        )
         # A download the run's own volume could hold is not refused for its share: refused, it lands in that
         # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
         over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and download_gb > (
@@ -8532,6 +8543,7 @@ class DockerService:
                     default_extra=default_extra,
                     host_probe=docker_listing_probe,
                 )
+                payload.volume_limit_gb = _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes)
 
                 reclaimed_cache_volumes = (
                     []

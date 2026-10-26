@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
-from services.docker_service import DockerService
+from services.docker_service import DockerService, _filler_run_volume_gb
 
 
 @pytest.fixture
@@ -137,6 +137,24 @@ async def test_an_engy_checkpoint_and_the_pod_volume_must_leave_the_listing_floo
     affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
 
     assert bool(affordable) is granted
+
+
+@pytest.mark.parametrize(
+    ("volume_limit_gb", "cache_names", "expected_gb"),
+    [
+        (1900, ["engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"], 100),  # checkpoint in the cache: no second copy
+        (1900, [], 1900),  # cache refused: the run volume still has to hold the checkpoint
+        (40, ["engy_cache_hf_31gb_qwen3-8-27b-1a2b3c4d"], 40),  # never grows a smaller request
+        (80, ["dphn_cache_hf_x"], 80),  # Dolphin keeps its size
+        (None, ["engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"], None),  # no storage limit: nothing to size
+    ],
+)
+def test_the_filler_run_volume_drops_the_checkpoint_once_the_engy_cache_holds_it(
+    volume_limit_gb, cache_names, expected_gb
+):
+    caches = [CacheVolume(name=name, target="/root/models") for name in cache_names]
+
+    assert _filler_run_volume_gb(volume_limit_gb, caches) == expected_gb
 
 
 @pytest.mark.asyncio

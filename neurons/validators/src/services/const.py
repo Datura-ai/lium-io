@@ -324,6 +324,10 @@ DPHN_CACHE_FREE_MARGIN_GB = 50
 # most this share of the node's real free disk. The backend puts its size in the name
 # (engy_cache_hf_<N>gb_...): the wire CacheVolume has no size field.
 FILLER_CACHE_MAX_FREE_DISK_SHARE = 0.3
+# DAH-5192: a FILLER's run volume (/root, preallocated) when its Engy checkpoint is in the mounted cache
+# (/root/models): the weights are not in it, so it needs room only for kernels, logs and scratch. The
+# backend's size (1900 GB for kimi-k3) still applies when the cache is refused. Tune here.
+FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE = 100
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle
