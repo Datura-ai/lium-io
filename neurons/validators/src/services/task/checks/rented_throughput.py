@@ -56,7 +56,7 @@ INCONCLUSIVE_BEFORE_STRIKE = 3
 _UNSAVED: dict[str, _State] = {}
 
 # The executor shares the host PID namespace but not its network (bridge, `pid: host`), so the NIC counters are
-# init's (/proc/1/net/dev), read only when /proc/1 is the host's; else no rx/tx and the network side is no verdict.
+# init's (/proc/1/net/dev), read only when /proc/1 is the host's; else no rx/tx and a slow network side is inconclusive.
 # The devices under the docker root (the probe's writable layer) come from init's mountinfo through sysfs: the
 # device, its dm/md slaves and a partition's disk. Then bytes received and sent on the physical NICs and sectors
 # moved (and requests completed) per whole disk (/proc/diskstats is not namespaced), twice BUSY_WINDOW_SECONDS apart
@@ -244,7 +244,7 @@ def pods_incomplete(stdout: str, pods: int) -> tuple[bool, bool]:
 
 def parse_busy(stdout: str) -> tuple[float | None, float | None]:
     """Other traffic in the window before the probe: (Mbps on the host NICs, the busier direction; MB/s on the busiest
-    disk under the docker root). None = not measured; the disk side then has no verdict."""
+    disk under the docker root). None = not measured; a slow side is then inconclusive."""
     snaps, devices = _parse_snaps(stdout)
     if len(snaps) < 2:
         return None, None
@@ -330,11 +330,12 @@ class RentedThroughputCheck:
     the validator reaches it) or the write runs under RENTED_THROUGHPUT_DISK_MIN_MB_PER_S. The renter's own traffic
     is no outright excuse below the floors. When the 2 s before the probe already moved RENTED_THROUGHPUT_BUSY_MBPS on
     the host NICs (either direction), or RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S on a disk under the docker root, a slow
-    side is inconclusive (the provider can make that load itself); the network side without host NIC counters is no
-    verdict. A failing side is also inconclusive (no strike, no pass, re-probed after RETRY_SECONDS) when the rented
-    pods themselves moved DURING_* on that resource while the probe measured it (their own network namespace and
-    container cgroup counters, not the host's), or when those pod counters are incomplete (a pod stopped, restarted or
-    unreadable): one renter-induced slow reading never fails a node. The host can feed or hide those counters, so
+    side is inconclusive (the provider can make that load itself), and so is a slow network side without host NIC
+    counters or off lium-rentals (bridge fallback) and a slow disk whose docker root devices are unresolved. A failing
+    side is also inconclusive (no strike, no pass, re-probed after RETRY_SECONDS) when the rented pods themselves moved
+    DURING_* on that resource while the probe measured it (their own network namespace and container cgroup counters,
+    not the host's), or when those pod counters are incomplete (a pod stopped, restarted or unreadable): one
+    renter-induced slow reading never fails a node. The host can feed or hide those counters, so
     INCONCLUSIVE_BEFORE_STRIKE inconclusive readings of one side in a row count as a failing reading.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
@@ -417,7 +418,8 @@ class RentedThroughputCheck:
         return self._verdict(ctx, state, probed=True)
 
     async def _measure_and_judge(self, ctx: Context) -> tuple[dict[str, Any], str, str]:
-        """The reading and each side's verdict: "fail", "pass" or "none" (no verdict)."""
+        """The reading and each side's verdict: "fail", "pass", "none" (no verdict) or "inconclusive"
+        (a slow side that may not be the host's fault; capped by INCONCLUSIVE_BEFORE_STRIKE)."""
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         pods = [
@@ -439,8 +441,8 @@ class RentedThroughputCheck:
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)
         net_incomplete, disk_incomplete = pods_incomplete(stdout, len(pods))
-        # A busy host before the probe makes a slow side inconclusive, never an outright excuse: the provider can make
-        # that load itself. No host counters (or docker root devices unresolved): the side is no verdict.
+        # A busy host before the probe, no host counters, docker root devices unresolved or a bridge fallback make a
+        # slow side inconclusive, never an outright excuse: the provider controls all of them. A fast side stays none.
         net_busy = net_mbps is not None and net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS
         disk_is_busy = (
             disk_busy is not None and disk_busy >= settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S
@@ -449,26 +451,30 @@ class RentedThroughputCheck:
         judged = await ContainerDownloadSpeedCheck()._judge(endpoints)
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
         off_rentals = not endpoints or any(r.network != RENTAL_NETWORK_NAME for r in endpoints)
-        if net_mbps is None or off_rentals or judged.has_no_verdict:
+        net_unsure = net_busy or net_mbps is None or off_rentals
+        if judged.has_no_verdict:
             net = "none"
         elif judged.is_failing:
             net = "fail"
         else:
-            net = "none" if net_busy else "pass"
+            net = "none" if net_unsure else "pass"
         # a failing side is inconclusive when the renter's own pods used that resource while it was measured, or their
         # counters are incomplete; never an outright excuse, the host can feed or hide those counters
         if net == "fail" and (
-            net_busy or net_incomplete or (during_net is not None and during_net >= DURING_NET_MBPS)
+            net_unsure
+            or net_incomplete
+            or (during_net is not None and during_net >= DURING_NET_MBPS)
         ):
             net = "inconclusive"
-        if disk_busy is None or disk.mb_per_s is None:
+        disk_unsure = disk_is_busy or disk_busy is None
+        if disk.mb_per_s is None:
             disk_side = "none"
         elif disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S:
             disk_side = "fail"
         else:
-            disk_side = "none" if disk_is_busy else "pass"
+            disk_side = "none" if disk_unsure else "pass"
         if disk_side == "fail" and (
-            disk_is_busy
+            disk_unsure
             or disk_incomplete
             or (during_disk or 0) >= DURING_DISK_MB_PER_S
             or (during_iops or 0) >= DURING_DISK_IOPS

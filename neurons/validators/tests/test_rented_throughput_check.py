@@ -234,12 +234,10 @@ async def test_only_the_docker_root_disk_excuses_the_disk(resolved, seconds, rel
         ctx, _ = make_ctx(output)
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "pass"
-    # an unresolved docker root is never judged on another disk's traffic; a busy docker-root disk makes a slow write
-    # inconclusive (capped by INCONCLUSIVE_BEFORE_STRIKE), never an outright excuse
+    # an unresolved docker root is never judged on another disk's traffic, and neither it nor a busy docker-root disk
+    # is an outright excuse: a slow write is inconclusive (capped by INCONCLUSIVE_BEFORE_STRIKE)
     slow = seconds == 30
-    if not resolved:
-        assert disk_side == "none"
-    elif relevant:
+    if not resolved or relevant:
         assert disk_side == ("inconclusive" if slow else "none")
     else:
         assert disk_side == ("fail" if slow else "pass")
@@ -390,15 +388,24 @@ async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
         assert (await check.run(ctx)).passed is False
 
 
-# Load the provider makes on the host NICs or the docker-root disk in the 2 s before the probe cannot excuse a slow
-# side forever: one busy reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
+# Host state the provider controls (load on the host NICs or the docker-root disk in the 2 s before the probe, host NIC
+# counters it hides, a docker root it hides the devices of, lium-rentals not inspectable so the probe falls back to the
+# default bridge) cannot excuse a slow side forever: one such reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row
+# are, and the next zeroes the score.
 @pytest.mark.parametrize(
     "answer",
     [
         snaps(rx_bytes=100_000_000) + disk() + SLOW,  # 400 Mbps on the host NICs
         snaps(sectors=2_000_000) + disk(secs=30.0) + FAST,  # 512 MB/s on the docker-root disk
+        snaps(counters=False) + disk() + SLOW,  # host NIC counters unreadable
+        snaps().replace("lium_tp_device name=nvme0n1p2\nlium_tp_device name=nvme0n1\n", "")
+        + disk(secs=30.0)
+        + FAST,  # docker root devices unresolved
+        SLOW_NET.replace(
+            "lium_dl_net name=lium-rentals", "lium_dl_net name=bridge"
+        ),  # bridge fallback
     ],
-    ids=["busy_nics", "busy_disk"],
+    ids=["busy_nics", "busy_disk", "no_host_counters", "docker_root_unresolved", "bridge_fallback"],
 )
 async def test_provider_made_host_load_cannot_excuse_a_slow_node_forever(answer):
     n = module.INCONCLUSIVE_BEFORE_STRIKE
@@ -549,8 +556,9 @@ async def test_idle_foreign_or_stopped_rentals_are_left_alone():
         assert res.passed and not runner.commands and res.event.reason_code == Msg.SKIPPED.reason
 
 
-# A download over the default bridge (lium-rentals not inspectable) did not measure the renter's path: no network verdict,
-# so it neither strikes nor clears a failure established on lium-rentals; only a fast lium-rentals reading recovers.
+# A download over the default bridge (lium-rentals not inspectable) did not measure the renter's path: a slow one is
+# inconclusive, a fast one no verdict, so it neither strikes at once nor clears a failure established on lium-rentals;
+# only a fast lium-rentals reading recovers.
 @pytest.mark.parametrize("network", ["lium-rentals", "bridge"])
 @pytest.mark.parametrize("fast", [True, False])
 async def test_only_a_reading_on_the_rentals_network_judges_the_network(network, fast):
@@ -561,7 +569,9 @@ async def test_only_a_reading_on_the_rentals_network_judges_the_network(network,
     with flags():
         ctx, _ = make_ctx(answer)
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
-    assert net == (("pass" if fast else "fail") if on_rentals else "none")
+    assert net == (
+        ("pass" if fast else "fail") if on_rentals else ("none" if fast else "inconclusive")
+    )
     with flags() as clock:
         ctx, _ = make_ctx(SLOW_NET, SLOW_NET, answer)
         check = RentedThroughputCheck()
