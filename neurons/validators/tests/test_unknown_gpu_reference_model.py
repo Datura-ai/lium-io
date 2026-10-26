@@ -154,6 +154,10 @@ def _model_ctx(context_factory, details: list[dict]):
             ],
             Msg.MODEL_MIXED.reason,
         ),
+        (
+            [{"name": UNKNOWN, "capacity": 23028}, {"name": UNKNOWN, "capacity": 81559}],
+            Msg.MODEL_MIXED.reason,
+        ),
     ],
 )
 async def test_gpu_validate_model_passes_an_unknown_nvidia_card(context_factory, details, reason):

@@ -128,7 +128,13 @@ class GpuModelValidCheck:
         if unsupported:
             return self._unsupported_model_result(ctx, unsupported[0], gpu_count, fatal=fatal)
 
-        model_counts = dict(Counter(card_models))
+        # DAH-5088: one unknown name with different memory gets different references, so key by both
+        model_counts = dict(
+            Counter(
+                model if model == reference else f"{model} (as {reference})"
+                for model, reference in zip(card_models, card_references)
+            )
+        )
         if len(model_counts) == 1:
             return None
         models_found = ", ".join(f"{count}x {model}" for model, count in model_counts.items())
