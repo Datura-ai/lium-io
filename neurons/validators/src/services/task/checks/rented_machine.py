@@ -29,7 +29,9 @@ from services.gpu_reset import renter_gpu_reset_in_progress
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
+# the old name, for lium-io#1804, so the two PRs merge in either order
+from .rental_owner import rental_of_validated_miner as _rental_of_validated_miner  # noqa: F401
 from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 
 logger = logging.getLogger(__name__)
@@ -147,7 +149,7 @@ class TenantEnforcementCheck:
 
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
-        rented_executor = validated_rental(ctx)
+        rented_executor = rental_of_this_node(ctx, log_mismatch=True)
         # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
         # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
         # makes its siblings' GPU processes read as usage outside the tenant.

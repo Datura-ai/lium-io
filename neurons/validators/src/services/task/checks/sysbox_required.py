@@ -6,7 +6,7 @@ from ..messages import MessageTemplate, render_message
 from ..messages import SysboxRequiredMessages as Msg
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 # DAH-3634: probe causes that get their own reason code instead of SYSBOX_REQUIRED_MISSING, keyed
 # by `ContextState.dind_probe_error.code`, written by dind_probe.diagnose_docker_run_error.
@@ -30,7 +30,7 @@ class SysboxRequiredCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         # Determine rental status the same way as port_count.py / rented_machine.py.
-        rented_executor = validated_rental(ctx)
+        rented_executor = rental_of_this_node(ctx)
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         if not ctx.state.sysbox_runtime and not is_rented:

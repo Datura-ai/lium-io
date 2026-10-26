@@ -14,7 +14,7 @@ from services.executor_image_policy import (
 from ..messages import ExecutorImageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 _EXECUTOR_NAME = re.compile(r"(?:^|-)executor-\d+$")
 
@@ -98,7 +98,7 @@ class ExecutorImageCheck:
                 },
             )
         else:
-            rented_executor = validated_rental(ctx)
+            rented_executor = rental_of_this_node(ctx)
             is_rented = rented_executor is not None and len(rented_executor.pods) > 0
             passed = is_rented
             event = render_message(

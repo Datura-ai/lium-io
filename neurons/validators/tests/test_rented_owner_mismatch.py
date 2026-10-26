@@ -8,7 +8,8 @@ import logging
 
 import pytest
 
-from neurons.validators.src.services.task.checks import rental_owner
+from neurons.validators.src.services.task.checks import registry_pull, rental_owner
+from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
@@ -94,3 +95,21 @@ async def test_another_miners_rental_on_same_endpoint_stays_rented(context_facto
 
     assert result.event.reason_code != Msg.NOT_RENTED.reason
     assert len(_mismatch_logs(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_port_count_floor_applies_beside_another_miners_rental(context_factory, caplog):
+    ctx = _ctx(context_factory, rental_miner_hotkey="other-miner-hotkey", rental_port="2222")
+
+    with caplog.at_level(logging.WARNING, logger=rental_owner.logger.name):
+        result = await PortCountCheck().run(ctx)
+
+    # not rented, so the empty port range fails the floor; only TenantEnforcementCheck logs the mismatch
+    assert result.passed is False
+    assert _mismatch_logs(caplog) == []
+
+
+def test_registry_pull_runs_beside_another_miners_rental(context_factory):
+    # RegistryPullCheck skips a rented node; another miner's rental on another endpoint is not this node's
+    assert registry_pull._is_rented(_ctx(context_factory, rental_miner_hotkey="miner-hotkey")) is True
+    assert registry_pull._is_rented(_ctx(context_factory, "other-miner-hotkey", rental_port="2222")) is False

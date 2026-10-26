@@ -20,7 +20,7 @@ from ...const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
 from ..messages import SshdBootstrapMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ class SshdBootstrapCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
-        rented_executor = validated_rental(ctx)
+        rented_executor = rental_of_this_node(ctx)
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
         sshd_bootstrap_failed = False if is_rented else await self._sshd_bootstrap_failed(ctx)
         what = {"sshd_bootstrap_failed": sshd_bootstrap_failed, "is_rented": is_rented}

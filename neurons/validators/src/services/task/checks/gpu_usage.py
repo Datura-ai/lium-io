@@ -40,7 +40,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -451,7 +451,7 @@ def lium_workload_containers(ctx: Context) -> set[str]:
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
-    rented_executor = validated_rental(ctx)
+    rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(pod.docker_container_name for pod in rented_executor.pods)
     containers.discard("")
@@ -642,7 +642,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
 
-    rented_executor = validated_rental(ctx)
+    rented_executor = rental_of_this_node(ctx)
     rented_at_run_start: bool = rented_executor is not None and any(
         pod.pod_id == pod_id for pod in rented_executor.pods
     )

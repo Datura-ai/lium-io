@@ -19,7 +19,7 @@ from core.config import settings
 from ..messages import StorageLimitMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 
 class StorageLimitCheck:
@@ -35,7 +35,7 @@ class StorageLimitCheck:
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
             )
 
-        rented_executor = validated_rental(ctx)
+        rented_executor = rental_of_this_node(ctx)
         rented = bool(rented_executor and rented_executor.pods)
         what = {
             "storage_limit_supported": False,

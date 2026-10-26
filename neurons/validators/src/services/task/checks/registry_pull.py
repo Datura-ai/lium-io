@@ -19,7 +19,7 @@ from core.utils import _m, get_extra_info
 from ..messages import RegistryPullMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
@@ -586,5 +586,5 @@ class RegistryPullCheck:
 
 
 def _is_rented(ctx: Context) -> bool:
-    rented_executor = validated_rental(ctx)
+    rented_executor = rental_of_this_node(ctx)
     return rented_executor is not None and len(rented_executor.pods) > 0

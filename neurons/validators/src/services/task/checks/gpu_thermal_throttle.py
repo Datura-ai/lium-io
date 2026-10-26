@@ -32,7 +32,7 @@ from typing import Any
 from ..messages import GpuThermalThrottleMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_owner import validated_rental
+from .rental_owner import rental_of_this_node
 
 # nvmlClocksEventReasons bits (nvml.h; the same values as the older nvmlClocksThrottleReasons).
 CLOCKS_EVENT_REASON_SW_POWER_CAP = 0x4
@@ -116,7 +116,7 @@ class GpuThermalThrottleCheck:
             )
             if finding is not None
         ]
-        rented_executor = validated_rental(ctx)
+        rented_executor = rental_of_this_node(ctx)
         rented = bool(rented_executor and rented_executor.pods)
         collapsed = [finding for finding in throttled if finding["collapsed"]]
         if collapsed and not rented:
