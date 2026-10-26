@@ -235,6 +235,31 @@ def test_cleanup_keeps_a_copy_a_rental_still_waits_to_create_from(tmp_path):
     assert rmi == ["rmi lium-flattened:stale", "rmi lium-flattened:unleased"]
 
 
+def test_a_lease_that_cannot_be_written_stops_before_any_cleanup_or_copy(tmp_path):
+    # e.g. the lease disk is full: without a lease nothing protects the copy, so none is made or removed
+    (tmp_path / "copies").write_text("lium-flattened:unleased\n")
+    (tmp_path / "leases").write_text("")  # a file where the dir should be: mkdir and touch fail
+    argv = _flatten_script(tmp_path)
+    result = subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]})
+    assert result.returncode == image_flatten.FLATTEN_LEASE_EXIT and b"cannot write the lease" in result.stderr
+    assert not [c for c in _calls(tmp_path) if c.split()[0] in ("rmi", "create")]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_an_unreadable_lease_dir_deletes_nothing(tmp_path):
+    (tmp_path / "copies").write_text("lium-flattened:unleased\n")
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    (leases / "x").touch()  # this run's own lease is written; reading the dir back fails
+    leases.chmod(0o300)
+    try:
+        result = subprocess.run(_flatten_script(tmp_path), capture_output=True, env={"PATH": os.environ["PATH"]})
+    finally:
+        leases.chmod(0o700)
+    assert result.returncode == 0 and b"cleanup skipped" in result.stderr
+    assert not [c for c in _calls(tmp_path) if c.startswith("rmi")]
+
+
 def test_reusing_a_copy_leases_it_under_the_cleanup_lock(tmp_path):
     (tmp_path / "tagged").touch()
     argv = _flatten_script(tmp_path)

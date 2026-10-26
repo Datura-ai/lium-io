@@ -25,9 +25,12 @@ _DOCKER_READ_TIMEOUT_SECONDS = 120
 FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"
 # short lock over "mark a copy as in use" and "remove copies not in use", so a removal never races a reuse
 FLATTEN_USE_LOCK_PATH = "/tmp/lium-flatten-use.lock"
-# a copy flattened or reused this recently may still be waiting for its rental's create: never removed
-FLATTEN_LEASE_DIR = "/tmp/lium-flatten-leases"
-FLATTEN_LEASE_MINUTES = 60
+# a copy leased this recently may still be waiting for its rental's create: never removed. Beside the
+# validator's other node state, not on /tmp, which a renter's or provider's files can fill.
+FLATTEN_LEASE_DIR = "/root/app/flatten-leases"
+FLATTEN_LEASE_EXIT = 93
+# the lease is written before the copy, so it covers the copy (bounded by the timeout) and the create after it
+FLATTEN_LEASE_MINUTES = FLATTEN_TIMEOUT_SECONDS // 60 + 60
 FLATTEN_NO_DISK_EXIT = 95
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
@@ -108,7 +111,8 @@ def _lease_command(tag: str) -> str:
 
 
 def _reuse_command(tag: str) -> str:
-    """Exit 0 and lease the copy when it exists; under the use lock so a cleanup cannot remove it in between."""
+    """Exit 0 and lease the copy when it exists; under the use lock so a cleanup cannot remove it in between.
+    A copy whose lease cannot be written is not handed out: nothing would stop a cleanup removing it."""
     return (
         f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
         f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && {_lease_command(tag)}"
@@ -132,10 +136,16 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
         f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
         f"({_reuse_command(tag)}) && exit 0; "
         f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
-        # rmi without -f refuses a copy a container (running or stopped) still uses
+        # leased before the copy: a disk that fills during the copy cannot leave the copy unleased
+        f"{_lease_command(tag)} || {{ echo 'flatten failed: cannot write the lease' >&2; exit {FLATTEN_LEASE_EXIT}; }}; "
+        # any doubt about a lease keeps the copy: an unlistable lease dir skips the cleanup, an unreadable
+        # lease file keeps its copy; rmi without -f refuses a copy a container (running or stopped) uses
+        f"if ls {FLATTEN_LEASE_DIR} >/dev/null 2>&1 && [ -x {FLATTEN_LEASE_DIR} ]; then "
         f"for old in $(/usr/bin/docker image ls --format '{{{{.Repository}}}}:{{{{.Tag}}}}' {FLATTENED_IMAGE_REPO}); "
-        f'do [ -n "$(find {FLATTEN_LEASE_DIR}/"${{old#*:}}" -mmin -{FLATTEN_LEASE_MINUTES} 2>/dev/null)" ] '
-        '|| /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; flock -u 8; '
+        f'do lease={FLATTEN_LEASE_DIR}/"${{old#*:}}"; '
+        f'if [ -e "$lease" ] || [ -L "$lease" ]; then [ -n "$(find "$lease" -mmin +{FLATTEN_LEASE_MINUTES} 2>/dev/null)" ]; fi '
+        '&& /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
+        "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
         f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
@@ -146,7 +156,7 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
         f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
         'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
         # a left-over container or volume fails the flatten untagged, so the next rental retries the cleanup
-        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag)}; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
+        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag)} 2>/dev/null; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
         'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
         'echo "flatten failed: export=$erc import=$irc rm=$rrc" >&2; exit 98; fi'
     )
