@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 
 from core.config import settings
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 # machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
 # out: a busy host, not a verdict on Sysbox
 SYSBOX_TEST_TIMED_OUT = "Test command timed out."
+# an unrented node reuses its pass on a timed-out scrape test only while the pass is this fresh: the timeout string is
+# provider-reported, so a host that disabled Sysbox and stalls the test gets at most this long on the old pass
+SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS = 3600
 
 
 class PortConnectivityCheck:
@@ -269,7 +273,9 @@ class PortConnectivityCheck:
         Redis error.
 
         An unrented node reads it too when the scrape's sysbox test timed out (26 Oct, a B300 whose
-        own Lium filler was loading: two cycles of SYSBOX_REQUIRED_MISSING with Sysbox working).
+        own Lium filler was loading: two cycles of SYSBOX_REQUIRED_MISSING with Sysbox working), but only
+        while the pass is under SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS old; only a fresh validator-side probe
+        pass extends it.
         """
         redis = ctx.services.redis
         try:
@@ -292,7 +298,10 @@ class PortConnectivityCheck:
                 if not rented and scrape_error:
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
                 return False
-            return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+            if rented:
+                return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+            verified_at = await redis.sysbox_verified_at(ctx.miner_hotkey, ctx.executor.uuid)
+            return verified_at is not None and time.time() - verified_at < SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
             logger.warning(
                 _m(

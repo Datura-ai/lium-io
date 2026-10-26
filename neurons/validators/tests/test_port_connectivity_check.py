@@ -1,3 +1,6 @@
+import time
+from types import SimpleNamespace
+
 import pytest
 from core.config import settings
 
@@ -12,6 +15,7 @@ from neurons.validators.src.services.executor_connectivity.models import (
     PortRangeResult,
     PortVerificationResult,
 )
+from neurons.validators.src.services.task.checks import port_connectivity
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
@@ -29,15 +33,21 @@ class DummyRedis:
         self.cleared_misses: list[tuple[str, str]] = []
         # ticket-0494: executors whose last DinD probe that reached the container found sysbox
         self.sysbox_verified: dict[tuple[str, str], int] = {}
+        self.sysbox_verified_epoch: dict[tuple[str, str], float] = {}
 
     async def record_sysbox_verified(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> None:
         self.sysbox_verified[(miner_hotkey, executor_id)] = ttl_seconds
+        self.sysbox_verified_epoch[(miner_hotkey, executor_id)] = time.time()
 
     async def clear_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> None:
         self.sysbox_verified.pop((miner_hotkey, executor_id), None)
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return (miner_hotkey, executor_id) in self.sysbox_verified
+
+    async def sysbox_verified_at(self, miner_hotkey: str, executor_id: str) -> float | None:
+        key = (miner_hotkey, executor_id)
+        return self.sysbox_verified_epoch.get(key, time.time()) if key in self.sysbox_verified else None
 
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str) -> bool:
         return self.renting_in_progress_value
@@ -714,3 +724,30 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 
     assert result.passed is True
     assert result.updates["state"].sysbox_runtime is False
+
+
+@pytest.mark.asyncio
+async def test_unrented_timeouts_stop_reusing_the_pass_once_it_is_an_hour_old(context_factory, monkeypatch):
+    """The timeout string comes from the provider's own scrape: a host that passed once, then disabled Sysbox and
+    stalls the test past 30 s, keeps the pass only while it is fresh, not for the 24 h TTL."""
+    redis_service = DummyRedis()
+    await PortConnectivityCheck().run(
+        _verified_ctx(
+            context_factory, redis_service=redis_service, state=build_state(sysbox_runtime=True), dind_ok=True,
+            sysbox_measured=True,
+        )
+    )
+    passed_at = redis_service.sysbox_verified_epoch[("miner-hotkey", "executor-123")]
+    timed_out = build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": "Test command timed out."})
+
+    seen = []
+    for minutes in (15, 30, 45, 61, 75):
+        monkeypatch.setattr(port_connectivity, "time", SimpleNamespace(time=lambda m=minutes: passed_at + m * 60))
+        result = await PortConnectivityCheck().run(
+            _verified_ctx(
+                context_factory, redis_service=redis_service, state=timed_out, dind_ok=True, sysbox_measured=None
+            )
+        )
+        seen.append(result.updates["state"].sysbox_runtime)
+
+    assert seen == [True, True, True, False, False]

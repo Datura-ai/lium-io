@@ -383,7 +383,7 @@ class RedisService:
     async def record_sysbox_verified(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> None:
         """A DinD probe reached its container and sysbox worked; remembered for ttl_seconds."""
         async with self.lock:
-            await self.redis.set(self._sysbox_verified_key(miner_hotkey, executor_id), "1", ex=ttl_seconds)
+            await self.redis.set(self._sysbox_verified_key(miner_hotkey, executor_id), str(time.time()), ex=ttl_seconds)
 
     async def clear_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> None:
         """A DinD probe reached its container and sysbox did not work: forget the earlier pass."""
@@ -391,6 +391,11 @@ class RedisService:
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
+
+    async def sysbox_verified_at(self, miner_hotkey: str, executor_id: str) -> float | None:
+        """Epoch of the stored pass, None without one (a pre-timestamp "1" reads as long ago)."""
+        value = await self.get(self._sysbox_verified_key(miner_hotkey, executor_id))
+        return None if value is None else float(value)
 
     async def first_uncached_at(self, executor_id: str, now: float, ttl_seconds: int) -> float:
         """When this validator first found the executor without its recommended image (epoch s).
