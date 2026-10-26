@@ -92,7 +92,7 @@ async def test_the_copy_is_built_from_the_inspected_image_id_never_the_mutable_t
     assert f"-ge {24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES} ]" in command
 
 
-def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
+def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
     fake = tmp_path / "docker"
@@ -106,6 +106,7 @@ def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, avail=10**12, import_
         "  create) echo cid1 ;;\n"
         f"  export) echo tar; exit {export_rc} ;;\n"
         f"  import) cat >/dev/null; sleep {import_sleep}; echo sha256:new; exit {import_rc} ;;\n"
+        f"  rm) exit {rm_rc} ;;\n"
         f"  tag) touch {tmp_path}/tagged ;;\n"
         "esac\n"
     )
@@ -119,20 +120,22 @@ def _calls(tmp_path) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    "export_rc, import_rc, avail, expected_rc, expected_calls",
+    "export_rc, import_rc, rm_rc, avail, expected_rc, expected_calls",
     [
-        (0, 0, 100, 0, ["image", "info", "run", "create", "export", "import", "rm", "tag"]),
+        (0, 0, 0, 100, 0, ["image", "info", "run", "create", "export", "import", "rm", "tag"]),
         # a truncated export must never be tagged: the import of it is removed
-        (1, 0, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
-        (0, 1, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        (1, 0, 0, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        (0, 1, 0, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        # the container or its volumes were not removed: no cached tag, so a later rental retries
+        (0, 0, 1, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
         # too little disk: nothing is created
-        (0, 0, 99, FLATTEN_NO_DISK_EXIT, ["image", "info", "run"]),
+        (0, 0, 0, 99, FLATTEN_NO_DISK_EXIT, ["image", "info", "run"]),
     ],
 )
 def test_flatten_script_tags_only_a_complete_copy_and_always_removes_the_container(
-    tmp_path, export_rc, import_rc, avail, expected_rc, expected_calls
+    tmp_path, export_rc, import_rc, rm_rc, avail, expected_rc, expected_calls
 ):
-    argv = _flatten_script(tmp_path, export_rc=export_rc, import_rc=import_rc, avail=avail)
+    argv = _flatten_script(tmp_path, export_rc=export_rc, import_rc=import_rc, rm_rc=rm_rc, avail=avail)
     assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == expected_rc
     calls = _calls(tmp_path)
     assert sorted(c.split()[0] for c in calls) == sorted(expected_calls)  # export and import run concurrently

@@ -89,10 +89,11 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
         'st=$(mktemp); '
         f'iid=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") '
         f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
-        'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; '
-        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ]; then /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
+        'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
+        # a left-over container or volume fails the flatten untagged, so the next rental retries the cleanup
+        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
         'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
-        'echo "flatten failed: export=$erc import=$irc" >&2; exit 98; fi'
+        'echo "flatten failed: export=$erc import=$irc rm=$rrc" >&2; exit 98; fi'
     )
 
 
