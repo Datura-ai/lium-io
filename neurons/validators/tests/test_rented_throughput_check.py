@@ -52,13 +52,16 @@ def snaps(
     during_ios: int = 0,
     cover: bool = False,
     pod: bool = True,
+    prov: str | None = None,
 ) -> str:
     """The docker root on nvme0n1, then two host snapshots 2 s apart: bytes received and sent on the NICs and sectors
     moved on nvme0n1 in between. counters=False: the host's NIC counters were not readable. Then one after the disk
     container (10 s; the probe's own 256 MiB and 4096 requests plus during_sectors/during_ios) and one after the fetch
     container (10 s; during_rx on top of the probe's own downloads). The rented pod (pid 4242) moved the during_*
     traffic itself in its own network namespace and cgroup; cover=True: the host moved it outside the pod (a
-    provider's cover traffic), so the pod's counters stay still. pod=False: no pod counters readable."""
+    provider's cover traffic), so the pod's counters stay still. pod=False: no pod counters readable. prov="cg:nt":
+    the provenance of the processes in the pod's cgroup and netns (1 = all the container's, 0 = a foreign one,
+    empty = unreadable); None: the older five-field format (provenance unreadable)."""
 
     def net(rx: int, tx: int) -> str:
         return f"rx={1000 + rx} tx={1000 + tx} " if counters else ""
@@ -68,7 +71,8 @@ def snaps(
             return ""
         if cover:
             rx = moved = ios = 0
-        return f" pod=4242:{1000 + rx}:1000:{moved}:{ios},"
+        tail = "" if prov is None else f":{prov}"
+        return f" pod=4242:{1000 + rx}:1000:{moved}:{ios}{tail},"
 
     own_sectors, own_rx = 256 * 2048, 2 * 16 * 1024 * 1024
     s2 = 500 + sectors + own_sectors + during_sectors
@@ -370,8 +374,8 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     assert (net, disk_side) == ("inconclusive", "inconclusive")
 
 
-# A host helper attached to the pod's cgroup (or netns) issuing tiny IO looks exactly like renter load: one such excused
-# slow probe is no strike, but INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next one zeroes the score.
+# Pod IO whose provenance cannot be read (who was in the pod's cgroup or netns) may be a host helper issuing tiny IO:
+# one such excused slow probe is no strike, but INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
 @pytest.mark.parametrize(
     "answer",
     [
@@ -379,8 +383,10 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
         + disk(secs=30.0)
         + FAST,  # 20 tiny requests/s charged to the pod cgroup
         snaps(during_rx=7_000_000) + disk() + SLOW,  # ~5.6 Mbps charged to the pod netns
+        snaps(during_ios=200, prov=":") + disk(secs=30.0) + FAST,  # provenance fields empty
+        snaps(during_rx=7_000_000, prov=":") + disk() + SLOW,
     ],
-    ids=["cgroup_helper", "netns_helper"],
+    ids=["cgroup_io", "netns_io", "cgroup_provenance_unreadable", "netns_provenance_unreadable"],
 )
 async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
     n = module.INCONCLUSIVE_BEFORE_STRIKE
@@ -452,6 +458,47 @@ async def test_validator_side_fetch_errors_stay_no_verdict():
         ctx = make_ctx(snaps() + disk() + http_error)[0]
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "none"
+
+
+# Owner decision (#lium-io, 26 Oct 16:23Z): a renter keeping the disk or link busy gets no verdict, never SLOW. Pod IO
+# from only the container's own processes is renter load: no verdict, uncapped, however many probes in a row.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(during_ios=500, prov="1:1") + disk(secs=30.0) + FAST,
+        snaps(during_rx=40_000_000, prov="1:1") + disk() + SLOW,
+    ],
+    ids=["disk", "network"],
+)
+async def test_renter_io_from_the_containers_own_processes_never_strikes(answer):
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * 4)
+        check = RentedThroughputCheck()
+        for _ in range(4):
+            assert (await check.run(ctx)).passed
+            assert stored(ctx)["failures_in_a_row"] == 0
+            clock.now += 3 * 3600 + 60
+
+
+# A host process attached to the pod's cgroup or netns makes the pod IO the provider's: no excuse, the slow side fails.
+@pytest.mark.parametrize(
+    "answer, side",
+    [
+        (snaps(during_ios=500, prov="0:1") + disk(secs=30.0) + FAST, "disk"),
+        (snaps(during_rx=40_000_000, prov="1:0") + disk() + SLOW, "net"),
+    ],
+    ids=["cgroup_helper", "netns_helper"],
+)
+async def test_a_host_helper_in_the_pods_cgroup_or_netns_is_a_failure(answer, side):
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert {"net": net, "disk": disk_side}[side] == "fail"
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
 
 
 def stopped_pod(answer_tail: str) -> str:
@@ -559,6 +606,7 @@ def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
     (scope / "io.stat").write_text(
         "259:0 rbytes=100 wbytes=200 rios=3 wios=4 dbytes=0 dios=0\n8:0 rbytes=0 wbytes=0 rios=0 wios=0\n"
     )
+    (scope / "cgroup.procs").write_text("")  # no process left in it: nothing foreign
     script = (
         module._SNAPSHOT.replace("[ /proc/1/root/ -ef / ] && return; ", "")
         .replace("[ /proc/$p/ns/net -ef /proc/1/ns/net ] || ", "")
@@ -572,8 +620,26 @@ def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
         text=True,
         timeout=30,
     ).stdout
-    # the second pod's cgroup is gone: its disk counters are empty (unreadable), never zero
-    assert out.splitlines()[-1] == "4242:1000:60:300:7,4343:1000:60::,", out
+    # the second pod's cgroup is gone: its disk counters and provenance are empty (unreadable), never zero; no netns
+    # here, so no network provenance either
+    assert out.splitlines()[-1] == "4242:1000:60:300:7:1:,4343:1000:60::::,", out
+
+
+# own(): a process is the container's when it shares the init's PID namespace or descends from the init (nested
+# namespaces); a host process attached to the cgroup is neither. Here the PID-namespace test is switched off (the test
+# runs in one namespace), so only the ancestry decides: this shell plays the container init.
+def test_provenance_tells_the_containers_processes_from_a_host_helper(tmp_path):
+    script = module._SNAPSHOT.replace(
+        "[ /proc/$1/ns/pid -ef /proc/$p/ns/pid ] && return 0; ", ""
+    ).split("pods() {")[0]
+    cmd = (
+        f"{script} p=$$; sleep 30 & child=$!; "
+        'echo "$child" | prov; printf "%s\n%s\n" "$child" 1 | prov; echo 999999999 | prov; '
+        "own 1; echo $?; kill $child"
+    )
+    out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=30).stdout
+    # the child is the container's; pid 1 (a host process) is foreign; a PID gone mid-read is not counted against it
+    assert out.split()[-4:] == ["1", "0", "1", "1"], out
 
 
 async def test_idle_foreign_or_stopped_rentals_are_left_alone():
