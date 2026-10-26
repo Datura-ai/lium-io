@@ -1727,3 +1727,13 @@ def test_an_older_backend_without_the_field_protects_nothing_as_before():
     ctx, _, _ = make_probe_context(rented=rented)
     payload = module._probe_payload(ctx, pod_id="probe", image_ref="img", public_key="key")
     assert payload.active_volume_names == []
+
+
+@pytest.mark.asyncio
+async def test_the_probe_create_protects_a_volume_paused_after_the_cycle_snapshot():
+    """A pod rented and paused after the cycle's snapshot is only in the fresh read under the lock."""
+    ctx, docker, _ = make_probe_context(rented=rented_data(), rented_now=_paused_only())
+    with probe_settings(), renter_path():
+        await RentalProbeCheck().run(ctx)
+
+    assert docker.create_calls[0][0].active_volume_names == ["volume_paused"]

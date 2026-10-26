@@ -178,6 +178,8 @@ class _ProbeGate:
     standing: _Failure | None
     # the fillers the backend listed under the lock, which the probe runs beside and leaves alone
     fillers_beside: frozenset[str] = frozenset()
+    # the paused pods' volumes the backend listed under the lock, which the probe's create keeps
+    kept_volume_names: tuple[str, ...] = ()
 
 
 class RentalProbeCheck:
@@ -232,7 +234,11 @@ class RentalProbeCheck:
         image_ref = gate.image_ref
         try:
             outcome = await _probe(
-                ctx, image_ref, gate.create_lock, beside_fillers=bool(gate.fillers_beside)
+                ctx,
+                image_ref,
+                gate.create_lock,
+                beside_fillers=bool(gate.fillers_beside),
+                kept_volume_names=gate.kept_volume_names,
             )
         finally:
             await gate.create_lock.release(ctx)
@@ -357,25 +363,27 @@ class RentalProbeCheck:
             return self._skipped(ctx, _RENT_IN_PROGRESS)
 
         try:
-            stop_result_or_fillers_beside = await self._idle_under_lock(ctx, standing)
+            stop_result_or_idle = await self._idle_under_lock(ctx, standing)
         except BaseException:
             await create_lock.release(ctx)
             raise
-        if isinstance(stop_result_or_fillers_beside, CheckResult):
+        if isinstance(stop_result_or_idle, CheckResult):
             await create_lock.release(ctx)
-            return stop_result_or_fillers_beside
+            return stop_result_or_idle
         return _ProbeGate(
             image_ref=image_ref,
             create_lock=create_lock,
             standing=standing,
-            fillers_beside=stop_result_or_fillers_beside,
+            fillers_beside=stop_result_or_idle.fillers_beside,
+            kept_volume_names=stop_result_or_idle.kept_volume_names,
         )
 
     async def _idle_under_lock(
         self, ctx: Context, standing: _Failure | None
-    ) -> CheckResult | frozenset[str]:
+    ) -> CheckResult | _BusyNow:
         """Re-read the node's idleness under the create lock; the result that stops the cycle,
-        or the fillers the probe may run beside (empty on a node without a filler).
+        or the fresh read: the fillers the probe may run beside (empty on a node without a filler)
+        and the paused pods' volumes its create keeps.
 
         ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last check
         in the pipeline. create_container sweeps every pod_* container it is not told about, so the
@@ -398,7 +406,7 @@ class RentalProbeCheck:
             return self._inconclusive(
                 ctx, "the idleness re-read overran its budget", steps=[], standing=standing
             )
-        return now.fillers_beside
+        return now
 
     def _failed(
         self, ctx: Context, failure: _Failure, *, what: dict[str, Any], ssh_port: int | None
@@ -534,6 +542,8 @@ class _BusyNow:
     busy: str | None
     # the fillers on it the probe runs beside
     fillers_beside: frozenset[str] = frozenset()
+    # the paused pods' volumes on it, as listed by this fresh read
+    kept_volume_names: tuple[str, ...] = ()
 
 
 async def _busy_now(ctx: Context) -> _BusyNow:
@@ -555,7 +565,7 @@ async def _busy_now(ctx: Context) -> _BusyNow:
     except Exception:
         _read_failed(ctx, "its pending-pod marks in Redis")
         return _BusyNow(None)
-    return _BusyNow("", fillers)
+    return _BusyNow("", fillers, tuple(rented.get_kept_volume_names(ctx.executor.uuid)))
 
 
 def _missing_inputs(ctx: Context) -> str | None:
@@ -808,8 +818,17 @@ def _probe_memory_gb(ctx: Context) -> int | None:
 
 
 def _probe_payload(
-    ctx: Context, *, pod_id: str, image_ref: str, public_key: str
+    ctx: Context,
+    *,
+    pod_id: str,
+    image_ref: str,
+    public_key: str,
+    kept_volume_names: tuple[str, ...] = (),
 ) -> ContainerCreateRequest:
+    # the cycle's snapshot and the fresh read under the lock: a pod paused since the snapshot is only in the
+    # fresh read, and its volume must survive the create's sweep too
+    rented_data = ctx.state.rented_data
+    snapshot = rented_data.get_kept_volume_names(ctx.executor.uuid) if rented_data else []
     return ContainerCreateRequest(
         miner_hotkey=ctx.miner_hotkey,
         miner_address=ctx.miner_address,
@@ -832,17 +851,19 @@ def _probe_payload(
         pod_mapping=[],
         # no container to protect: the backend lists no pod here, and create_container's `beside_fillers`
         # keeps every filler_* on the node, not only the ones listed at this moment. A paused pod's
-        # volume stays (DAH-2348); the probe only runs when the cycle's snapshot lists no live pod, so
-        # a pod paused since then is still in that snapshot's pods and the probe skips the node.
+        # volume stays (DAH-2348).
         active_container_names=[],
-        active_volume_names=(
-            ctx.state.rented_data.get_kept_volume_names(ctx.executor.uuid) if ctx.state.rented_data else []
-        ),
+        active_volume_names=list(dict.fromkeys([*snapshot, *kept_volume_names])),
     )
 
 
 async def _probe(
-    ctx: Context, image_ref: str, create_lock: _CreateLock, *, beside_fillers: bool = False
+    ctx: Context,
+    image_ref: str,
+    create_lock: _CreateLock,
+    *,
+    beside_fillers: bool = False,
+    kept_volume_names: tuple[str, ...] = (),
 ) -> _ProbeOutcome:
     """Run the six steps in order; whatever happens, the node and this validator's Redis are left as found.
 
@@ -873,6 +894,7 @@ async def _probe(
             public_key=public_key,
             create_lock=create_lock,
             beside_fillers=beside_fillers,
+            kept_volume_names=kept_volume_names,
         )
         if created is None:
             return outcome
@@ -900,6 +922,7 @@ async def _step_container_start(
     public_key: str,
     create_lock: _CreateLock,
     beside_fillers: bool = False,
+    kept_volume_names: tuple[str, ...] = (),
 ) -> ContainerCreated | None:
     """Step 1: start the container through create_container, the path a renter's pod takes.
 
@@ -917,7 +940,13 @@ async def _step_container_start(
     try:
         result = await asyncio.wait_for(
             docker.create_container(
-                _probe_payload(ctx, pod_id=pod_id, image_ref=image_ref, public_key=public_key),
+                _probe_payload(
+                    ctx,
+                    pod_id=pod_id,
+                    image_ref=image_ref,
+                    public_key=public_key,
+                    kept_volume_names=kept_volume_names,
+                ),
                 ctx.executor,
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
