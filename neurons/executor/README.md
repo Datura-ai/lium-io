@@ -234,7 +234,7 @@ Causes the installer names:
 
 Validator releases after this change also run the test in the machine scrape, on nodes whose Docker accepts `--storage-opt` (a node without it is rented without a disk limit and is not tested); a validator on an earlier release does not run it. The scrape checks the plugin, `Mountpoint`, and a volume mounted into a container under the runtime this node's rentals get (Sysbox when the scrape's Sysbox GPU test passes, Docker's default runtime otherwise). They only read the plugin, never install or change it, and remove their test container and volume (`lium_storage_check_*`) when the test ends.
 
-The validator also reports the node's Docker image store as `docker_image_store` (`docker info --format '{{.Driver}}'`: `overlayfs` is the containerd store, `overlay2` the classic one). A rental whose image has too many layers for Sysbox on the classic store (`setting up ID-mapped mount on path l/<ID>` when the rental starts) is moved by the platform to a free node with the containerd store. No change is needed on your side.
+The validator also reports the node's Docker image store in its specs as `docker_image_store` (`docker info --format '{{.Driver}}'`: `overlayfs` is the containerd store, `overlay2` the classic one). It only reports the store and changes nothing on the node.
 
 ## The executor image
 

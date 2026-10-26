@@ -413,14 +413,17 @@ class RegistryPullCheck:
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.REGISTRY_PULL_CHECK_ENABLED:
             return self._skipped(ctx, "REGISTRY_PULL_CHECK_ENABLED is off")
-        if _is_rented(ctx):
-            return self._skipped(ctx, "rented")
         try:
             last_state = await self._load(ctx)
         except _RedisUnreadable:
             # without the last reading the interval cannot be honoured; pulling every cycle would spend
             # the node's Docker Hub quota, so this cycle has no verdict
             return self._skipped(ctx, "last pull reading unreadable in Redis")
+        if _is_rented(ctx):
+            # no pull beside a renter's pod, but a split node with free GPUs is still a move target, so the
+            # last reading's store is published
+            result = self._skipped(ctx, "rented")
+            return _with_image_store(ctx, last_state, result) if last_state else result
 
         now = time.time()
         if last_state is None:

@@ -9,6 +9,7 @@ node passed every one.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -76,10 +77,16 @@ async def test_an_unknown_store_publishes_no_key():
 
 
 @pytest.mark.asyncio
-async def test_a_cycle_between_pulls_publishes_the_last_reading():
+@pytest.mark.parametrize("rented", [False, True])
+async def test_a_cycle_between_pulls_publishes_the_last_reading(rented):
     ctx = _ctx(_pull_output("overlayfs"))
     await _pull_now(ctx)
     ctx.runner.run.reset_mock()
+    if rented:  # a split node with a pod on it is still a move target
+        rented_data = SimpleNamespace(
+            executors={ctx.executor.uuid: SimpleNamespace(pods=[object()])}
+        )
+        ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data)})
 
     result = await module.RegistryPullCheck().run(ctx)
 
