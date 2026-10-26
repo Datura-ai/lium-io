@@ -21,7 +21,7 @@ from neurons.validators.src.services.task.checks import (
 )
 from neurons.validators.src.services.task.messages import GpuLossHoldMessages as Msg
 from neurons.validators.src.services.task.models import JobResult
-from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
+from neurons.validators.src.services.task.pipeline import CheckResult, Context, Pipeline, ValidationEvent
 from neurons.validators.src.services.task.runner import SSHCommandResult
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
@@ -298,7 +298,7 @@ class _ListSink:
     def __init__(self):
         self.events = []
 
-    async def emit(self, event) -> None:
+    async def emit(self, event: ValidationEvent) -> None:
         self.events.append(event)
 
 
@@ -316,14 +316,14 @@ async def test_a_driver_crash_scrape_hides_the_node_through_the_run_it_ends(cont
         started_at=now, finished_at=now, success=False,
     )
 
-    class _Scrape:
+    class _ScrapeCheckStub:
         check_id = MachineSpecScrapeCheck.check_id
         fatal = True
 
-        async def run(self, run_ctx) -> CheckResult:
+        async def run(self, run_ctx: Context) -> CheckResult:
             return await MachineSpecScrapeCheck()._check_result_from_scrape_run(run_ctx, scrape_run, delivery="stdin")
 
-    ok, events, _ = await Pipeline([_Scrape()], _ListSink()).run(ctx)
+    ok, events, _ = await Pipeline([_ScrapeCheckStub()], _ListSink()).run(ctx)
 
     assert not ok
     assert [e.reason_code for e in events] == [AvailabilityErrorCode.GPU_LOST, "SCRAPE_FAILED_DRIVER"]

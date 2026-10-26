@@ -271,8 +271,8 @@ async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> list[V
         # DAH-4457: the hold starts here too, so the next clean scrape does not list the node again at once.
         # This failed scrape ends the run before GpuLossHoldCheck, so its GPU_LOST entry rides on the scrape's
         # result: without it a node whose driver died stayed listed for as long as the scrape kept failing.
-        held = await GpuLossHoldCheck().run(lost_ctx)
-        return [held.event] if held.event.is_availability_error else []
+        hold_result = await GpuLossHoldCheck().run(lost_ctx)
+        return [hold_result.event] if hold_result.event.is_availability_error else []
     except Exception:
         logger.warning(
             _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),
