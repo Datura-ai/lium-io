@@ -3,6 +3,7 @@ download check never looks at a rented node."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from services.task.checks.rented_throughput import (
     parse_busy,
     parse_disk,
     parse_during,
+    pods_stopped,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
@@ -358,18 +360,84 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     assert (net, disk_side) == ("none", "none")
 
 
-# A pod stopped or restarted mid-probe (its counters unreadable at the side's end) is no evidence of renter IO: the
-# provider can restart it, so the slow sides still fail; only the IO actually measured in both snapshots excuses.
-async def test_a_pod_stopped_mid_probe_does_not_excuse_a_slow_node():
+def stopped_pod(answer_tail: str) -> str:
+    """A second pod (5151) readable when each side began, unreadable at its end (stopped or restarted mid-probe)."""
     lines = snaps().splitlines()
     b = ["5151:1:1:1:1,", "5151:1:1:1:1,", "5151:1:1::,", "5151::::,"]
     answer = "\n".join(
         lines[:2] + [ln.replace(" pod=", f" pod={x}") for ln, x in zip(lines[2:], b)]
     )
-    answer += "\n" + disk(secs=30.0) + SLOW
+    return answer + "\n" + answer_tail
+
+
+STOPPED = stopped_pod(disk(secs=30.0) + SLOW)
+
+
+def stored(ctx) -> dict:
+    return json.loads(ctx.services.redis.store[f"rented_throughput:{EXECUTOR.uuid}"])
+
+
+# A pod stopped or restarted mid-probe is no evidence of renter IO (the provider can restart it) and no proof of a
+# slow node: the slow sides are inconclusive, neither excused nor failed.
+async def test_a_pod_stopped_mid_probe_is_inconclusive():
+    assert pods_stopped(STOPPED) == (True, True)
+    assert pods_stopped(snaps()) == (False, False)
+    assert pods_stopped(snaps(pod=False)) == (False, False)  # never readable: the failure stands
     with flags():
-        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
-    assert (net, disk_side) == ("fail", "fail")
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(STOPPED)[0])
+        assert (net, disk_side) == ("inconclusive", "inconclusive")
+        # a stopped pod does not turn a passing side inconclusive
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(
+            make_ctx(stopped_pod(disk() + FAST))[0]
+        )
+        assert (net, disk_side) == ("pass", "pass")
+
+
+async def test_one_inconclusive_reading_is_no_strike_and_is_reprobed_soon():
+    with flags() as clock:
+        ctx, _ = make_ctx(STOPPED)
+        result = await RentedThroughputCheck().run(ctx)
+        assert result.passed
+        state = stored(ctx)
+        assert state["failures_in_a_row"] == 0 and state["net_inconclusive"] == 1
+        assert state["disk_inconclusive"] == 1 and state["measured"] is False
+        clock.now += 31 * 60  # re-probed after RETRY_SECONDS, not the 3 h interval
+        await RentedThroughputCheck().run(ctx)
+        assert stored(ctx)["at"] == clock.now
+
+
+# A provider restarting the pod on every probe: the INCONCLUSIVE_BEFORE_STRIKE-th inconclusive reading in a row is a
+# strike, the next one a second strike, and the node is slow.
+async def test_consecutive_inconclusive_readings_strike():
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    with flags() as clock:
+        ctx, _ = make_ctx(*[STOPPED] * (n + 1))
+        check = RentedThroughputCheck()
+        for i in range(1, n):
+            assert (await check.run(ctx)).passed
+            assert stored(ctx)["failures_in_a_row"] == 0 and stored(ctx)["net_inconclusive"] == i
+            clock.now += 31 * 60
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 1
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+async def test_a_clean_reading_resets_the_inconclusive_run():
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    answers = [STOPPED] * (n - 1) + [GOOD] + [STOPPED] * (n - 1)
+    with flags() as clock:
+        ctx, _ = make_ctx(*answers)
+        check = RentedThroughputCheck()
+        for _ in range(n - 1):
+            await check.run(ctx)
+            clock.now += 31 * 60
+        await check.run(ctx)
+        assert stored(ctx)["net_inconclusive"] == 0 and stored(ctx)["disk_inconclusive"] == 0
+        for _ in range(n - 1):
+            clock.now += 3 * 3600 + 60
+            assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 0
 
 
 def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
