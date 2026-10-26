@@ -16,7 +16,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import bittensor
+from bittensor_wallet import Keypair
 import pytest
 from datura.requests import validator_requests
 from datura.requests.validator_requests import fresh_upload_nonce, ssh_pubkey_signing_blob
@@ -41,12 +41,12 @@ _NONCE = "ab" * 32
 
 @pytest.fixture(scope="module")
 def validator_keypair():
-    return bittensor.Keypair.create_from_uri("//LiumTestValidator")
+    return Keypair.create_from_uri("//LiumTestValidator")
 
 
 @pytest.fixture(scope="module")
 def miner_keypair():
-    return bittensor.Keypair.create_from_uri("//LiumTestMiner")
+    return Keypair.create_from_uri("//LiumTestMiner")
 
 
 @pytest.fixture()

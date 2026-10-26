@@ -18,7 +18,12 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
 )
 
-from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
+from ...const import (
+    FILLER_CONTAINER_PREFIX,
+    FILLER_LIVENESS_GRACE_MINUTES,
+    LEGACY_LOOPBACK_PLUGIN_ALIAS,
+    LOOPBACK_PLUGIN_ALIAS,
+)
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
@@ -70,9 +75,11 @@ def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics
     Fillers run with `restart: unless-stopped`, so anything that merely killed the process would be
     back up by the next probe; a container still sitting in `exited` after an external signal was
     stopped on purpose. An out-of-memory kill carries the same exit code but is the kernel
-    reclaiming memory, not a choice the host made, so it is excluded.
+    reclaiming memory, not a choice the host made, so it is excluded. So is a container docker tried to
+    restart and could not (State.Error set, e.g. a GPU device gone after a VM reboot): docker never
+    restarts one stopped on purpose.
     """
-    if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL:
+    if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL or diagnostics.error:
         return False
     return not diagnostics.oom_killed
 
@@ -203,6 +210,7 @@ class RentalVerificationCheck:
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
                 cpu_count=cpu_count,
+                loopback_plugin=LOOPBACK_PLUGIN_ALIAS if settings.LOOPBACK_PLUGIN_V2_ENABLED else LEGACY_LOOPBACK_PLUGIN_ALIAS,
             )
 
             # Handle API failure (None response) - fail this executor
