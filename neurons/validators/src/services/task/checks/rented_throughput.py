@@ -41,14 +41,15 @@ _REDIS_TTL_SECONDS = 7 * 24 * 3600
 # The rented pods' own traffic while the probe measured a side (their network namespace's interfaces around the fetch
 # container, their container cgroup's io.stat around the disk container) at or above these turns a failing side into
 # no verdict: the renter was using what the probe measured. Only the pods' own counters count, so traffic the host
-# makes anywhere else cannot excuse a slow node; unreadable pod counters leave the verdict as it is.
+# makes anywhere else cannot excuse a slow node; incomplete pod counters excuse nothing (see INCONCLUSIVE_BEFORE_STRIKE).
 DURING_NET_MBPS = 5.0
 DURING_DISK_MB_PER_S = 2.0
 DURING_DISK_IOPS = 20.0
-# A failing side during which a rented pod stopped or restarted (its counters readable at the side's start, not at its
-# end) is inconclusive: its IO is unknown, so no strike and no pass, and the node is probed again after RETRY_SECONDS.
-# The provider can restart the pod too, so this many inconclusive readings of one side in a row (no pass or fail in
-# between) count as a failing reading, and every further one in that run does too.
+# A failing side whose pod counters are incomplete (any rented pod not readable both when that side began and when it
+# ended: stopped or restarted mid-probe, never readable, or no snapshot) is inconclusive: the renter's IO is unknown,
+# so no strike and no pass, and the node is probed again after RETRY_SECONDS. The provider can make counters
+# incomplete too (restart the pod on every probe), so this many inconclusive readings of one side in a row (no pass or
+# fail in between) count as a failing reading, and every further one in that run does too.
 INCONCLUSIVE_BEFORE_STRIKE = 3
 # executor uuid -> a reading Redis refused to record; keeps the cadence (no probe per cycle) until a save succeeds
 _UNSAVED: dict[str, _State] = {}
@@ -221,20 +222,23 @@ def _pods_moved(a: _Snap, b: _Snap, side: int) -> tuple[float, float] | None:
     )
 
 
-def pods_stopped(stdout: str) -> tuple[bool, bool]:
-    """(network, disk): a rented pod readable when that side's measurement began went unreadable by its end (stopped
-    or restarted mid-probe). A missing snapshot or a pod never readable is not this."""
+def pods_incomplete(stdout: str, pods: int) -> tuple[bool, bool]:
+    """(network, disk): fewer than `pods` rented pods were readable both when that side's measurement began and when
+    it ended (a pod stopped or restarted mid-probe, was never readable, or a snapshot is missing), so what the renter
+    moved while that side was measured is not fully known."""
     snaps, _ = _parse_snaps(stdout)
     if len(snaps) < 4:
-        return False, False
+        return pods > 0, pods > 0
 
-    def stopped(a: _Snap, b: _Snap, side: int) -> bool:
-        return any(
-            c[side] is not None and b[3].get(pid, (None, None))[side] is None
+    def incomplete(a: _Snap, b: _Snap, side: int) -> bool:
+        both = [
+            pid
             for pid, c in a[3].items()
-        )
+            if c[side] is not None and b[3].get(pid, (None, None))[side] is not None
+        ]
+        return len(both) < pods
 
-    return stopped(snaps[2], snaps[3], 0), stopped(snaps[1], snaps[2], 1)
+    return incomplete(snaps[2], snaps[3], 0), incomplete(snaps[1], snaps[2], 1)
 
 
 def parse_busy(stdout: str) -> tuple[float | None, float | None]:
@@ -328,9 +332,10 @@ class RentedThroughputCheck:
     no verdict (a link or disk doing that much is not the defect); so is the network side without host NIC counters.
     A failing side is also no verdict when the rented pods themselves moved DURING_* on that resource while the probe
     measured it (their own network namespace and container cgroup counters, not the host's, so traffic the host
-    generates elsewhere cannot excuse a slow node): renter IO never fails a node. A failing side during which a rented
-    pod stopped or restarted is inconclusive (re-probed after RETRY_SECONDS); INCONCLUSIVE_BEFORE_STRIKE of them in a
-    row count as a failing reading, so restarting the pod on every probe does not hide a slow node.
+    generates elsewhere cannot excuse a slow node): renter IO never fails a node. A failing side with incomplete pod
+    counters (a pod stopped, restarted or unreadable) is inconclusive (re-probed after RETRY_SECONDS);
+    INCONCLUSIVE_BEFORE_STRIKE of them in a row count as a failing reading, so making the counters incomplete on every
+    probe does not hide a slow node.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
     """
@@ -433,7 +438,7 @@ class RentedThroughputCheck:
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)
-        net_pod_stopped, disk_pod_stopped = pods_stopped(stdout)
+        net_incomplete, disk_incomplete = pods_incomplete(stdout, len(pods))
         # no host counters: a slow download may be the renter's, so the network side is no verdict
         net_busy = net_mbps is None or net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS
         disk_is_busy = (
@@ -448,10 +453,10 @@ class RentedThroughputCheck:
         else:
             net = "fail" if judged.is_failing else "pass"
         # a failing side is only a verdict when the renter's own pods did not use that resource while it was measured;
-        # no pod's counters readable, the verdict stands (host-wide counters would let the host fake renter load)
+        # pod counters incomplete, it is inconclusive (host-wide counters would let the host fake renter load)
         if net == "fail" and during_net is not None and during_net >= DURING_NET_MBPS:
             net = "none"
-        elif net == "fail" and net_pod_stopped:
+        elif net == "fail" and net_incomplete:
             net = "inconclusive"
         if disk_is_busy or disk.mb_per_s is None:
             disk_side = "none"
@@ -463,7 +468,7 @@ class RentedThroughputCheck:
             (during_disk or 0) >= DURING_DISK_MB_PER_S or (during_iops or 0) >= DURING_DISK_IOPS
         ):
             disk_side = "none"
-        elif disk_side == "fail" and disk_pod_stopped:
+        elif disk_side == "fail" and disk_incomplete:
             disk_side = "inconclusive"
         reading = {
             "endpoints": [asdict(r) for r in endpoints],

@@ -4,6 +4,7 @@ download check never looks at a rented node."""
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from services.task.checks.rented_throughput import (
     parse_busy,
     parse_disk,
     parse_during,
-    pods_stopped,
+    pods_incomplete,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
@@ -220,11 +221,12 @@ async def test_good_reading_passes():
 @pytest.mark.parametrize("relevant", [0, 2_000_000])
 @pytest.mark.parametrize("unrelated", [0, 2_000_000])
 async def test_only_the_docker_root_disk_excuses_the_disk(resolved, seconds, relevant, unrelated):
-    after = f"io=sda:{7 + relevant + 256 * 2048},nvme0n1:{500 + unrelated},\n"
+    pod = " pod=4242:1000:1000:0:0,"  # the rented pod idle and readable throughout
+    after = f"io=sda:{7 + relevant + 256 * 2048},nvme0n1:{500 + unrelated},{pod}\n"
     output = (
         ("lium_tp_device name=sda\n" if resolved else "")
-        + "lium_tp t=100 rx=1000 tx=1000 io=sda:7,nvme0n1:500,\n"
-        f"lium_tp t=102 rx=1000 tx=1000 io=sda:{7 + relevant},nvme0n1:{500 + unrelated},\n"
+        + f"lium_tp t=100 rx=1000 tx=1000 io=sda:7,nvme0n1:500,{pod}\n"
+        f"lium_tp t=102 rx=1000 tx=1000 io=sda:{7 + relevant},nvme0n1:{500 + unrelated},{pod}\n"
         f"lium_tp t=140 rx=1000 tx=1000 {after}"
         f"lium_tp t=150 rx=1000 tx=1000 {after}" + disk(secs=seconds) + FAST
     )
@@ -313,23 +315,19 @@ async def test_renter_load_during_the_probe_is_no_verdict(answer, side):
         assert net == "fail"
 
 
-# A provider's cover traffic (the same load made by the host outside the rented pod), or pod counters that cannot be
-# read, never excuse a slow side: the failure stands.
+# A provider's cover traffic (the same load made by the host outside the rented pod) never excuses a slow side: the
+# failure stands.
 @pytest.mark.parametrize(
     "answer",
     [
         snaps(during_sectors=2_000_000, cover=True) + disk(secs=30.0) + SLOW,
         snaps(during_ios=500, cover=True) + disk(secs=30.0) + SLOW,
         snaps(during_rx=40_000_000, cover=True) + disk(secs=30.0) + SLOW,
-        snaps(pod=False) + disk(secs=30.0) + SLOW,
-        "".join(ln + "\n" for ln in snaps().splitlines()[:4]) + disk(secs=30.0) + SLOW,
     ],
     ids=[
         "host_disk_bytes",
         "host_disk_requests",
         "host_network",
-        "no_pod_counters",
-        "no_counters_after",
     ],
 )
 async def test_cover_traffic_outside_the_pod_does_not_excuse_a_slow_node(answer):
@@ -361,13 +359,11 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
 
 
 def stopped_pod(answer_tail: str) -> str:
-    """A second pod (5151) readable when each side began, unreadable at its end (stopped or restarted mid-probe)."""
+    """The rented pod (4242) readable when each side began, unreadable at its end (stopped or restarted mid-probe)."""
     lines = snaps().splitlines()
-    b = ["5151:1:1:1:1,", "5151:1:1:1:1,", "5151:1:1::,", "5151::::,"]
-    answer = "\n".join(
-        lines[:2] + [ln.replace(" pod=", f" pod={x}") for ln, x in zip(lines[2:], b)]
-    )
-    return answer + "\n" + answer_tail
+    lines[4] = re.sub(r" pod=4242:(\d+):(\d+):\d*:\d*,", r" pod=4242:\1:\2::,", lines[4])
+    lines[5] = re.sub(r" pod=4242:[^,]*,", " pod=4242::::,", lines[5])
+    return "\n".join(lines) + "\n" + answer_tail
 
 
 STOPPED = stopped_pod(disk(secs=30.0) + SLOW)
@@ -377,16 +373,31 @@ def stored(ctx) -> dict:
     return json.loads(ctx.services.redis.store[f"rented_throughput:{EXECUTOR.uuid}"])
 
 
-# A pod stopped or restarted mid-probe is no evidence of renter IO (the provider can restart it) and no proof of a
-# slow node: the slow sides are inconclusive, neither excused nor failed.
-async def test_a_pod_stopped_mid_probe_is_inconclusive():
-    assert pods_stopped(STOPPED) == (True, True)
-    assert pods_stopped(snaps()) == (False, False)
-    assert pods_stopped(snaps(pod=False)) == (False, False)  # never readable: the failure stands
+# Incomplete pod counters are no evidence of renter IO (the provider can make them incomplete) and no proof of a slow
+# node: the slow sides are inconclusive, neither excused nor failed.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        STOPPED,
+        snaps(pod=False) + disk(secs=30.0) + SLOW,
+        "".join(ln + "\n" for ln in snaps().splitlines()[:4]) + disk(secs=30.0) + SLOW,
+    ],
+    ids=["stopped_mid_probe", "never_readable", "no_snapshot_after"],
+)
+async def test_incomplete_pod_counters_are_inconclusive(answer):
     with flags():
-        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(STOPPED)[0])
-        assert (net, disk_side) == ("inconclusive", "inconclusive")
-        # a stopped pod does not turn a passing side inconclusive
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("inconclusive", "inconclusive")
+
+
+async def test_pods_incomplete():
+    assert pods_incomplete(STOPPED, 1) == (True, True)
+    assert pods_incomplete(snaps(), 1) == (False, False)
+    assert pods_incomplete(snaps(pod=False), 1) == (True, True)
+    # a second rented pod never readable while the first is readable and idle: still incomplete
+    assert pods_incomplete(snaps(), 2) == (True, True)
+    with flags():
+        # incomplete counters do not turn a passing side inconclusive
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(
             make_ctx(stopped_pod(disk() + FAST))[0]
         )
