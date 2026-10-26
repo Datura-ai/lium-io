@@ -3,8 +3,8 @@
 Kosta85's node (executor 8c7d58d6-2ac4-4d77-a9b0-d86f5559782b): a tenant writing faster than the
 disk left gigabytes of unwritten data in its volume; dockerd unmounts the volume when the container
 stops and the unmount flushes it, so the delete hung until the disk had absorbed it all. The rental
-is over and the volume is removed anyway: a throwaway container holds the volume mounted across the
-stop, then unlinks its files, which drops the unwritten pages instead of writing them.
+is over and the volume is removed anyway: its files are unlinked on the host before the stop, and
+the kernel drops an unlinked file's unwritten pages at the last close instead of writing them.
 """
 
 # ruff: noqa: F811 — the docker_service fixture is imported from test_docker_service
@@ -17,12 +17,7 @@ import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import ContainerDeleted, ContainerDeleteRequest, WorkloadKind
 
-from services.docker_service import (
-    CONTAINER_STOP_GRACE_SECONDS,
-    _remove_volume_holder_cmd,
-    _start_volume_holder_cmd,
-    _wipe_held_volume_cmd,
-)
+from services.docker_service import CONTAINER_STOP_GRACE_SECONDS, _wipe_volume_cmd
 from tests.test_docker_service import (  # noqa: F401
     FAKE_SSH_HOST_KEY,
     DummySSHConnectionManager,
@@ -31,12 +26,7 @@ from tests.test_docker_service import (  # noqa: F401
     mock_dependencies,
 )
 
-HOLDER_CMD = (
-    "/usr/bin/docker run -d --rm --name wipe_volume_dirty -v volume_dirty:/mnt "
-    "docker.io/library/alpine:3.19 sleep 600"
-)
-WIPE_CMD = "/usr/bin/docker exec wipe_volume_dirty sh -c 'find /mnt -mindepth 1 -maxdepth 1 -exec rm -rf {} +'"
-REMOVE_HOLDER_CMD = "/usr/bin/docker rm -f wipe_volume_dirty"
+WIPE_CMD = _wipe_volume_cmd("volume_dirty")
 
 
 def _delete_payload(local_volume: str | None = "volume_dirty") -> ContainerDeleteRequest:
@@ -63,9 +53,9 @@ def _executor_info(payload: ContainerDeleteRequest) -> ExecutorSSHInfo:
     )
 
 
-def _wire_delete(docker_service, monkeypatch, ssh_answers) -> tuple[AsyncMock, list]:
-    """Returns the ssh client and one ordered log shared with the fake docker client, so the test
-    sees the ssh commands and the SDK calls in the order they ran."""
+def _wire_delete(docker_service, monkeypatch, ssh_answers) -> list:
+    """Returns one ordered log shared with the fake docker client, so the test sees the ssh
+    commands and the SDK calls in the order they ran."""
     client = docker_service.rental_docker_client_factory.client
     order = client.container_call_order
     answers = iter(ssh_answers) if isinstance(ssh_answers, list) else None
@@ -86,7 +76,7 @@ def _wire_delete(docker_service, monkeypatch, ssh_answers) -> tuple[AsyncMock, l
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
-    return ssh_client, order
+    return order
 
 
 async def _delete(docker_service, payload):
@@ -98,92 +88,53 @@ async def _delete(docker_service, payload):
     )
 
 
-def test_holder_command_takes_a_lease_on_the_volume_and_frees_it_by_itself():
-    assert _start_volume_holder_cmd("volume_dirty") == HOLDER_CMD
-
-
-def test_wipe_command_unlinks_the_files_but_not_the_mountpoint():
-    assert _wipe_held_volume_cmd("volume_dirty") == WIPE_CMD
-    assert _remove_volume_holder_cmd("volume_dirty") == REMOVE_HOLDER_CMD
-
-
-@pytest.mark.asyncio
-async def test_delete_with_an_unsafe_volume_name_does_not_start_a_holder(docker_service, monkeypatch):
-    # the volume name is the only payload field in the holder's shell commands
-    _, order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()] * 3)
-    payload = _delete_payload(local_volume="vol; rm -rf /")
-
-    await _delete(docker_service, payload)
-
-    assert not any("wipe_" in command for kind, command in order if kind == "ssh")
+def test_wipe_command_unlinks_the_files_on_the_host_without_a_container():
+    assert WIPE_CMD.startswith("v=volume_dirty; d=$(/usr/bin/docker volume inspect -f '{{.Driver}}' $v)")
+    assert "p=$root/plugins/$id/propagated-mount/$(basename \"$m\")" in WIPE_CMD
+    assert 'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} +' in WIPE_CMD
+    assert "docker run" not in WIPE_CMD and "docker exec" not in WIPE_CMD
 
 
 @pytest.mark.asyncio
-async def test_delete_holds_the_volume_across_the_stop_and_wipes_it_before_the_removal(docker_service, monkeypatch):
-    _, order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()] * 3)
+async def test_delete_wipes_the_volume_before_the_graceful_stop(docker_service, monkeypatch):
+    order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result(stdout="wiped /x\n")])
     payload = _delete_payload()
 
     result = await _delete(docker_service, payload)
 
     assert isinstance(result, ContainerDeleted)
-    assert order[:5] == [
-        ("ssh", HOLDER_CMD),
-        ("stop", payload.container_name),
-        ("ssh", WIPE_CMD),
-        ("ssh", REMOVE_HOLDER_CMD),
-        ("remove", payload.container_name),
-    ]
+    assert order[:3] == [("ssh", WIPE_CMD), ("stop", payload.container_name), ("remove", payload.container_name)]
     client = docker_service.rental_docker_client_factory.client
     assert client.stop_grace_seconds_calls == [CONTAINER_STOP_GRACE_SECONDS]
 
 
 @pytest.mark.asyncio
-async def test_delete_without_a_volume_does_not_start_a_holder(docker_service, monkeypatch):
-    _, order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()] * 3)
+async def test_delete_without_a_volume_does_not_wipe(docker_service, monkeypatch):
+    # an unsafe volume name never reaches the wipe: delete_container refuses it first
+    order = _wire_delete(docker_service, monkeypatch, [_make_ssh_command_result()])
     payload = _delete_payload(local_volume=None)
 
     result = await _delete(docker_service, payload)
 
     assert isinstance(result, ContainerDeleted)
-    assert not any("wipe_" in command for kind, command in order if kind == "ssh")
-    assert [entry for entry in order if entry[0] != "ssh"][:2] == [
-        ("stop", payload.container_name),
-        ("remove", payload.container_name),
-    ]
+    assert not any("propagated-mount" in command for kind, command in order if kind == "ssh")
+    assert order[:2] == [("stop", payload.container_name), ("remove", payload.container_name)]
 
 
+@pytest.mark.parametrize(
+    "ssh_answers",
+    [
+        [_make_ssh_command_result(exit_status=4, stdout="no dir /x")],
+        OSError("ssh transport closed"),
+    ],
+    ids=["wipe-fails", "ssh-raises"],
+)
 @pytest.mark.asyncio
-async def test_delete_proceeds_as_before_when_the_holder_does_not_start(docker_service, monkeypatch):
-    failed = _make_ssh_command_result(exit_status=125, stderr="docker: Error response from daemon")
-    _, order = _wire_delete(docker_service, monkeypatch, [failed, _make_ssh_command_result()])
+async def test_delete_proceeds_as_before_when_the_wipe_fails(docker_service, monkeypatch, ssh_answers):
+    order = _wire_delete(docker_service, monkeypatch, ssh_answers)
     payload = _delete_payload()
 
     result = await _delete(docker_service, payload)
 
     assert isinstance(result, ContainerDeleted)
-    assert order[:3] == [("ssh", HOLDER_CMD), ("stop", payload.container_name), ("remove", payload.container_name)]
-
-
-@pytest.mark.asyncio
-async def test_delete_proceeds_as_before_when_ssh_raises_on_the_holder(docker_service, monkeypatch):
-    _, order = _wire_delete(docker_service, monkeypatch, OSError("ssh transport closed"))
-    payload = _delete_payload()
-
-    result = await _delete(docker_service, payload)
-
-    assert isinstance(result, ContainerDeleted)
-    assert order[:3] == [("ssh", HOLDER_CMD), ("stop", payload.container_name), ("remove", payload.container_name)]
-
-
-@pytest.mark.asyncio
-async def test_failed_wipe_still_releases_the_holder(docker_service, monkeypatch):
-    failed_wipe = _make_ssh_command_result(exit_status=1, stderr="find: /mnt: Input/output error")
-    _, order = _wire_delete(
-        docker_service, monkeypatch, [_make_ssh_command_result(), failed_wipe, _make_ssh_command_result()]
-    )
-    payload = _delete_payload()
-
-    result = await _delete(docker_service, payload)
-
-    assert isinstance(result, ContainerDeleted)
-    assert order[2:5] == [("ssh", WIPE_CMD), ("ssh", REMOVE_HOLDER_CMD), ("remove", payload.container_name)]
+    assert order[:3] == [("ssh", WIPE_CMD), ("stop", payload.container_name), ("remove", payload.container_name)]
