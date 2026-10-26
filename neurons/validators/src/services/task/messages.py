@@ -1894,8 +1894,8 @@ class PinnedMemoryProbeMessages:
 
 
 class NvlinkFaultMessages:
-    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED is the
-    enforced form; with NVLINK_FAULT_ENFORCEMENT_ENABLED off it renders as a warning that changes no score."""
+    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
+    the node until a probe passes again."""
 
     PROBE_OK = MessageTemplate(
         event="NVLink multicast probe passed",
@@ -1916,7 +1916,7 @@ class NvlinkFaultMessages:
         reason="NVLINK_SKIPPED_ACTIVE_FILLER",
         severity="info",
         category="policy",
-        impact="Active filler runtime preserved; the probe would compete with it on every GPU.",
+        impact="Proceed; the filler keeps running until the node owes a new probe.",
     )
     PROBE_FAILED = MessageTemplate(
         event="NVLink is faulted: multicast memory cannot be bound across the GPUs",

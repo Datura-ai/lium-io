@@ -83,6 +83,10 @@ SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
 # One key per (miner hotkey, executor): what the rented GPU health read flagged and when (DAH-4482).
 POST_RENTAL_GPU_RECHECK_PREFIX = "post_rental_gpu_recheck"
+# DAH-5048: one key per (miner hotkey, executor) while an NVLink fault is on record, and one while a recent
+# probe found none; together they decide whether a filler is removed to probe the node.
+NVLINK_FAULT_PREFIX = "nvlink_fault"
+NVLINK_CHECKED_PREFIX = "nvlink_checked"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60

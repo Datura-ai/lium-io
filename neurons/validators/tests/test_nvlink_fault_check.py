@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -48,15 +49,37 @@ def report(**fields) -> str:
     return "noise\n" + PROBE_JSON_MARKER + " " + json.dumps(fields) + "\n"
 
 
-async def run_check(context_factory, specs, stdout="", rented_data=None):
+async def run_check(context_factory, specs, stdout="", rented_data=None, services=None, ssh=None):
     runner = FakeRunner(stdout)
     ctx = context_factory(
-        services=build_services(),
+        services=services or build_services(),
         config=build_context_config(),
         state=build_state(specs=specs, rented_data=rented_data),
         runner=runner,
+        ssh=ssh,
     )
     return await NvlinkFaultCheck().run(ctx), runner
+
+
+FAULT_KEY = nvlink_fault.fault_key("miner-hotkey", default_executor().uuid)
+CHECKED_KEY = nvlink_fault.checked_key("miner-hotkey", default_executor().uuid)
+FILLER = f"{FILLER_CONTAINER_PREFIX}active"
+
+
+def filler_node(owner: str = "lium") -> RentedExecutorsResponse:
+    uuid = default_executor().uuid
+    return RentedExecutorsResponse(
+        executors={},
+        banned_guids=[],
+        all_filler_containers_by_executor={uuid: [FILLER]},
+        default_job_owner_by_executor={uuid: owner},
+    )
+
+
+def removing_ssh() -> AsyncMock:
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    return ssh
 
 
 @pytest.mark.asyncio
@@ -72,31 +95,60 @@ FAULT = report(status="fault", error="gpu 0: cuMulticastBindMem -> CUresult 401"
 
 
 @pytest.mark.asyncio
-async def test_a_board_whose_nvlink_multicast_cannot_bind_fails_when_enforced(context_factory):
-    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", True):
-        result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
+async def test_a_board_whose_nvlink_multicast_cannot_bind_fails(context_factory):
+    services = build_services()
+    services.redis.store[CHECKED_KEY] = "1"
+
+    result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT, services=services)
 
     assert result.passed is False
     assert NvlinkFaultCheck.fatal is True
     assert result.event.reason_code == "NVLINK_FAULT"
     assert result.event.severity == "error"
     assert "401" in result.event.what_we_saw["probe"]["error"]
+    assert services.redis.ttl[FAULT_KEY] == nvlink_fault.FAULT_TTL_SECONDS
+    assert CHECKED_KEY not in services.redis.store
 
 
 @pytest.mark.asyncio
-async def test_shadow_mode_logs_the_fault_and_the_node_passes(context_factory):
-    # shadow first (taiberium, 23 Oct): ~100 all-NVLink nodes, false-fail count unknown until the logs show it
-    assert (
-        type(nvlink_fault.settings).model_fields["NVLINK_FAULT_ENFORCEMENT_ENABLED"].default
-        is False
+async def test_a_pass_records_a_fresh_check_and_forgets_an_old_fault(context_factory):
+    services = build_services()
+    services.redis.store[FAULT_KEY] = "1"
+
+    result, _ = await run_check(
+        context_factory, NVLINK_BOARD, report(status="ok", gpus=8), services=services
     )
-    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", False):
-        result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT)
 
     assert result.passed is True
+    assert services.redis.ttl[CHECKED_KEY] == nvlink_fault.CHECKED_TTL_SECONDS
+    assert FAULT_KEY not in services.redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_probe_without_a_verdict_still_counts_as_a_fresh_check(context_factory):
+    # a board that cannot be measured must not lose its filler on every cycle
+    services = build_services()
+    services.redis.store[FAULT_KEY] = "1"
+
+    result, _ = await run_check(
+        context_factory, NVLINK_BOARD, report(status="unsupported"), services=services
+    )
+
+    assert result.passed is True
+    assert services.redis.ttl[CHECKED_KEY] == nvlink_fault.CHECKED_TTL_SECONDS
+    # only a pass clears a fault: a host can make the probe report nothing at will
+    assert FAULT_KEY in services.redis.store
+
+
+@pytest.mark.asyncio
+async def test_redis_down_does_not_change_the_verdict_on_an_idle_node(context_factory):
+    services = build_services()
+    services.redis.failing = True
+
+    result, _ = await run_check(context_factory, NVLINK_BOARD, FAULT, services=services)
+
+    assert result.passed is False
     assert result.event.reason_code == "NVLINK_FAULT"
-    assert result.event.severity == "warning"
-    assert "NOT changed" in result.event.impact
 
 
 @pytest.mark.asyncio
@@ -211,15 +263,78 @@ def test_probe_reports_any_other_error_as_could_not_measure():
 
 
 @pytest.mark.asyncio
-async def test_active_filler_skips_the_probe(context_factory):
-    rented_data = RentedExecutorsResponse(
-        executors={},
-        banned_guids=[],
-        filler_containers_by_executor={default_executor().uuid: f"{FILLER_CONTAINER_PREFIX}active"},
-    )
+async def test_a_filler_on_a_node_with_a_fresh_check_skips_the_probe(context_factory):
+    services = build_services()
+    services.redis.store[CHECKED_KEY] = "1"
+    ssh = removing_ssh()
 
-    result, runner = await run_check(context_factory, NVLINK_BOARD, FAULT, rented_data=rented_data)
+    result, runner = await run_check(
+        context_factory, NVLINK_BOARD, FAULT, rented_data=filler_node(), services=services, ssh=ssh
+    )
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
     assert runner.calls == []
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_does_not_hide_a_faulted_node(context_factory):
+    # no fresh check on record: remove our filler and probe, so a filler never keeps a broken node listed
+    ssh = removing_ssh()
+
+    result, runner = await run_check(
+        context_factory, NVLINK_BOARD, FAULT, rented_data=filler_node(), ssh=ssh
+    )
+
+    assert ssh.run.await_args.args[0] == f"/usr/bin/docker rm -fv {FILLER}"
+    assert result.event.what_we_saw["removed_fillers"] == [FILLER]
+    assert len(runner.calls) == 1
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+
+
+@pytest.mark.asyncio
+async def test_a_remembered_fault_fails_a_node_whose_filler_cannot_be_removed(context_factory):
+    services = build_services()
+    services.redis.store[FAULT_KEY] = "1"
+
+    result, runner = await run_check(
+        context_factory,
+        NVLINK_BOARD,
+        report(status="ok"),
+        rented_data=filler_node(owner="miner"),
+        services=services,
+    )
+
+    assert runner.calls == []
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert result.event.what_we_saw["remembered_fault"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_filler_that_cannot_be_removed_and_no_fault_on_record_skips(context_factory):
+    result, runner = await run_check(
+        context_factory, NVLINK_BOARD, FAULT, rented_data=filler_node(owner="miner")
+    )
+
+    assert runner.calls == []
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+
+
+@pytest.mark.asyncio
+async def test_redis_down_keeps_the_filler_and_skips(context_factory):
+    services = build_services()
+    services.redis.failing = True
+    ssh = removing_ssh()
+
+    result, runner = await run_check(
+        context_factory, NVLINK_BOARD, FAULT, rented_data=filler_node(), services=services, ssh=ssh
+    )
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert runner.calls == []
+    ssh.run.assert_not_awaited()
