@@ -5339,7 +5339,7 @@ class DockerService:
             await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}"),
         ]
 
-    async def _drop_refused_create_volumes(
+    async def _remove_host_volumes_of_refused_create(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
@@ -7974,6 +7974,8 @@ class DockerService:
                         local_volume_path=local_volume_path,
                         encrypted=False,
                     )
+                # a fresh rental fails before its container exists rather than start without what it asked for
+                is_fresh_create = not payload.local_volume
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None
@@ -7994,11 +7996,9 @@ class DockerService:
                         prev_timestamp = now_ms()
                         external_volume_name = external_volume_info.name
                         if payload.is_sysbox and sysbox_subuid_base is None:
-                            if not payload.local_volume:
+                            if is_fresh_create:
                                 current_step = "external_volume_sysbox_owner"
-                                # A fresh rental asked for sysbox; it fails here, before the
-                                # container exists, instead of starting on runc without it.
-                                await self._drop_refused_create_volumes(
+                                await self._remove_host_volumes_of_refused_create(
                                     ssh_client,
                                     default_extra,
                                     local_volume=local_volume if created_local_volume else None,
@@ -8016,10 +8016,8 @@ class DockerService:
                                 "warning",
                                 log_tag,
                             )
-                    elif not payload.local_volume:
-                        # A fresh rental asked for the Volume; it fails here, before the container
-                        # exists, instead of starting without /mnt.
-                        await self._drop_refused_create_volumes(
+                    elif is_fresh_create:
+                        await self._remove_host_volumes_of_refused_create(
                             ssh_client,
                             default_extra,
                             local_volume=local_volume if created_local_volume else None,

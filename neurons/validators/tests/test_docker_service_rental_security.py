@@ -512,6 +512,7 @@ async def test_fresh_create_fails_when_sysbox_cannot_align_the_volume_owner(
     assert result.failure_step == "external_volume_sysbox_owner"
     assert "rent another node" in result.msg
     assert docker_service.rental_docker_client_factory.client.run_specs == []
+    assert "/usr/bin/docker volume rm volume_00000000-0000-0000-0000-0000000000aa 2>/dev/null || true" in ssh_client.commands
     plugin_spy.assert_awaited_once_with(ssh_client, "celium-volume-safe")
 
 
