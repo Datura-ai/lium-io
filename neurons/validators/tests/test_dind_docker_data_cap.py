@@ -8,7 +8,6 @@ from services.docker_service import _parse_volume_host_probe
 from services.rental_docker_sdk import GpuDockerConfig, _build_host_config_kwargs
 
 from tests.test_deploy_optimizations import svc  # noqa: F401  (pytest fixture)
-from tests.test_volume_fast_path import _probe_stdout
 
 
 def _run_spec(docker_service, docker_data_volume_gb, local_volume_path="/root"):
@@ -33,6 +32,7 @@ def _run_spec(docker_service, docker_data_volume_gb, local_volume_path="/root"):
         effective_storage_limit_gb=40,
         cpu_count=None,
         docker_data_volume_gb=docker_data_volume_gb,
+        docker_data_volume_driver="vloopback:v2",
     )
 
 
@@ -44,7 +44,7 @@ def test_sysbox_pod_mounts_a_capped_sparse_loopback_volume_at_var_lib_docker(svc
         mount["Target"] == "/var/lib/docker" and mount["Type"] == "volume" and not mount["Source"]
     )
     assert mount["VolumeOptions"]["DriverConfig"] == {
-        "Name": "vloopback",
+        "Name": "vloopback:v2",
         "Options": {"size": "40g", "sparse": "true"},
     }
 
@@ -87,6 +87,10 @@ async def test_stale_mount_repair_visits_every_volume_on_every_beat(svc, order):
 
 
 def test_sizing_ignores_anonymous_vloopback_volumes():
-    stdout = _probe_stdout(volumes=f"VOL\tvolume_abc\tvloopback\nVOL\t{'a1' * 32}\tvloopback\n")
+    df = "Filesystem 1-blocks Used Available Capacity Mounted on\r/dev/vda1 1000 500 966367641600 80% /hostfs\r"
+    stdout = (
+        f"ROOT\t/var/lib/docker\nDF\t{df}\n"
+        f"VOL\tvolume_abc\tvloopback\nVOL\t{'a1' * 32}\tvloopback\nVOLS\t0\nPLUGIN\ttrue\n"
+    )
 
     assert _parse_volume_host_probe(stdout, with_df=True).vloopback_volume_names == ["volume_abc"]

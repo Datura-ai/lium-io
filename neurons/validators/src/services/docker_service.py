@@ -2854,6 +2854,7 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_gb: int | None = None,
+        docker_data_volume_driver: str | None = None,
     ) -> ContainerRunSpec:
         memory_gb = self._rental_memory_gb(payload.memory_gb, host_ram_kib, gpu_share)
         # Swap off and the renter-first OOM score need a memory limit to hang on (Docker refuses
@@ -2914,7 +2915,7 @@ class DockerService:
                 (
                     DriverVolumeMount(
                         target=_DEFAULT_DOCKER_ROOT_DIR,
-                        driver=_LOOPBACK_PLUGIN_ALIAS,
+                        driver=docker_data_volume_driver,
                         # the backing sparse file is held under the ext4 16 TiB file limit
                         driver_opts={
                             "size": f"{min(docker_data_volume_gb, _FRESH_SIZING_MAX_VOLUME_GB)}g",
@@ -2925,6 +2926,7 @@ class DockerService:
                 # a template whose workspace is /var/lib/docker already caps inner Docker; a second
                 # mount there is a duplicate mount point Docker refuses at create
                 if docker_data_volume_gb
+                and docker_data_volume_driver
                 and posixpath.normpath(local_volume_path) != _DEFAULT_DOCKER_ROOT_DIR
                 else ()
             ),
@@ -6344,6 +6346,7 @@ class DockerService:
             volume_driver_opts=volume_driver_opts,
             timeout_seconds=timeout,
         )
+        return volume_driver
 
     async def _get_fs_available_bytes(
         self,
@@ -8599,6 +8602,7 @@ class DockerService:
                 # restart-edit path); the fresh-sizing path overrides them below.
                 effective_volume_limit_gb = payload.volume_limit_gb
                 effective_storage_limit_gb = payload.storage_limit_gb
+                local_volume_driver = None
 
                 # Decided before the volume exists so a refusal below leaves nothing behind.
                 use_encrypted_volume = _should_encrypt_local_volume(
@@ -8714,7 +8718,7 @@ class DockerService:
                     full_node_rental = (
                         payload.disk_share is not None and payload.disk_share >= 1.0
                     )
-                    await self.create_local_volume(
+                    local_volume_driver = await self.create_local_volume(
                         ssh_client=ssh_client,
                         docker_client=docker_client,
                         local_volume=local_volume,
@@ -8895,13 +8899,10 @@ class DockerService:
                     gpu_share=rental_gpu_share,
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
-                    # capped like the container's own writable layer; needs the loopback plugin the
-                    # capped local volume installed
-                    docker_data_volume_gb=(
-                        effective_storage_limit_gb
-                        if payload.is_sysbox and effective_volume_limit_gb
-                        else None
-                    ),
+                    # capped like the container's own writable layer, on the loopback plugin (v2 or
+                    # the old one) the capped local volume was created on
+                    docker_data_volume_gb=effective_storage_limit_gb if payload.is_sysbox else None,
+                    docker_data_volume_driver=local_volume_driver,
                 )
 
                 logger.info(
