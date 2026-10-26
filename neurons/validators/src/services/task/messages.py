@@ -900,6 +900,42 @@ class SysboxRequiredMessages:
     )
 
 
+class PidHostRequiredMessages:
+    MISSING = MessageTemplate(
+        event="Executor not in the host PID namespace",
+        reason="EXECUTOR_PID_HOST_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+        ),
+    )
+    RENTED_WARNING = MessageTemplate(
+        event="Executor not in the host PID namespace",
+        reason="EXECUTOR_PID_HOST_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Warning only while the node is rented: score and incentive unchanged",
+        remediation=(
+            "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+        ),
+    )
+    OK = MessageTemplate(
+        event="Executor PID namespace check passed",
+        reason="EXECUTOR_PID_HOST_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class DuplicateExecutorMessages:
     DUPLICATE = MessageTemplate(
         event="Duplicate executor registration",
