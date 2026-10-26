@@ -1,0 +1,1238 @@
+"""DAH-2977 — idle-time pre-pull of the top-N official templates.
+
+On by default since DAH-3604 (off restores the pre-DAH-2977 behaviour byte-for-byte); on, at most one digest-pinned pull per
+sweep, never while a rental exists or is starting, never below the disk floor (LRU
+pre-pulled images are evicted first), its budget cut at the per-image timeout and short of
+the loop's refresh deadline; the loop starts it as a task and never waits for it.
+"""
+
+import asyncio
+import json
+import logging
+import socket
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import aiohttp
+import docker
+import pytest
+import urllib3
+
+# conftest replaces the docker module with a MagicMock; except-clauses in the
+# services need a real exception class to catch, and the pull helper unpacks
+# docker.auth's registry resolution.
+docker.errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
+docker.auth.resolve_repository_name = lambda repo: ("docker.io", repo)
+docker.auth.get_config_header = lambda api, registry: None
+
+from services import cache_template_service, pre_pull_service  # noqa: E402
+from services.pre_pull_service import PrePuller, PrePullState, _pull_pinned, rental_activity  # noqa: E402
+
+REPO = "daturaai/pytorch"
+DEFAULT_TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"
+CU128_TAG = "2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind"
+CU128_REF = f"{REPO}:{CU128_TAG}"
+CLUSTER_REF = "daturaai/lium-cluster:0.0.7"
+DIGEST_DEFAULT = "sha256:70bd5fa697877594b753a146e207ca4de66d9b875d606ae09e6ee7bac8f4f423"
+DIGEST_CU128 = "sha256:2d19c94ce8a37c6fa364f8a6211d8b6dc1a44ece574c4c22ab5579925ce7a4c8"
+DIGEST_CLUSTER = "sha256:9f1f8b0c5e5d9c3a7b6e4d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1"
+GIB = pre_pull_service.GIB
+
+
+def _entry(repo: str, tag: str, digest: str | None, size: int = 4_300_000_000, pre_pull: bool = True) -> dict:
+    data = {"docker_image": repo, "docker_image_tag": tag, "docker_image_size": size, "pre_pull": pre_pull}
+    if digest:
+        data["docker_image_digest"] = digest
+    return data
+
+
+def _client(present_digests: set[str] = frozenset(), containers: list = ()) -> MagicMock:
+    client = MagicMock()
+
+    def images_get(ref: str):
+        if any(ref.endswith(f"@{digest}") for digest in present_digests):
+            return MagicMock()
+        raise docker.errors.ImageNotFound(ref)
+
+    client.images.get.side_effect = images_get
+    client.containers.list.return_value = list(containers)
+    return client
+
+
+def _container(name: str, image: str = CU128_REF, status: str = "running") -> MagicMock:
+    container = MagicMock()
+    container.name = name
+    container.status = status
+    container.attrs = {"Config": {"Image": image}}
+    return container
+
+
+def _proc(cmdline: list[str]) -> MagicMock:
+    proc = MagicMock()
+    proc.info = {"cmdline": cmdline}
+    return proc
+
+
+@pytest.fixture(autouse=True)
+def quiet_node(monkeypatch):
+    """Idle host with plenty of disk, no start jitter, and an instant fake pull."""
+    monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: [])
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=1000 * GIB))
+    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_START_JITTER_SECONDS", 0)
+    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_MIN_FREE_GB", 200)
+    pulls: list[tuple] = []
+
+    def fake_pull(client, repo, tag, digest, timeout_seconds):
+        pulls.append((repo, tag, digest, timeout_seconds))
+        return "pull_ok", None
+
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", fake_pull)
+    return pulls
+
+
+def _sweep(puller: PrePuller, entries: list[dict]) -> None:
+    asyncio.run(puller.sweep(entries))
+
+
+# --- flag off = today's behaviour -------------------------------------------------------
+
+
+def _one_loop_iteration(
+    monkeypatch, templates: list[dict], puller: type | None = None, iterations: int = 1
+) -> dict:
+    """Run run_cache_template_prefetch through ``iterations`` refreshes and record what it did.
+
+    The loop is stopped inside its sleep after the last refresh. The sweep is a task the loop
+    does not await, so the fake sleep yields once before stopping to let it run."""
+    seen: dict = {"params": None, "ensured": [], "swept": [], "protected": [], "pullers": 0, "sleeps": []}
+    seen["protected_at_ensure"] = []  # what the puller's `protected` was while the mandatory pass ran
+    real_sleep = asyncio.sleep
+    pullers: list = []
+
+    async def fetch(session, url, params):
+        seen["params"] = dict(params)
+        return templates, 200, None
+
+    async def ensure(client, data, state, keep_tags=frozenset()):
+        seen["ensured"].append((data["docker_image_tag"], set(keep_tags)))
+        seen["protected_at_ensure"].append(getattr(pullers[0], "protected", None) if pullers else None)
+
+    class FakePuller:
+        def __init__(self, client, state_path=None):
+            seen["pullers"] += 1
+            pullers.append(self)
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            seen["swept"].append([e["docker_image_tag"] for e in entries])
+            seen["protected"].append(set(protected))
+            seen["deadline"] = deadline
+
+    async def stop(seconds):
+        seen["slept"] = seconds
+        seen["sleeps"].append(seconds)
+        await real_sleep(0)
+        if len(seen["sleeps"]) >= iterations:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(cache_template_service, "_fetch_templates", fetch)
+    monkeypatch.setattr(cache_template_service, "_ensure_template", ensure)
+    if puller is not None:
+        real_init = puller.__init__
+
+        def init(self, client, state_path=None):
+            pullers.append(self)
+            real_init(self, client, state_path)
+
+        puller.__init__ = init
+    monkeypatch.setattr(cache_template_service, "PrePuller", puller or FakePuller)
+    monkeypatch.setattr(cache_template_service, "_get_gpu_info", lambda: ("NVIDIA H100 80GB HBM3", "580.65.06", None))
+    monkeypatch.setattr(cache_template_service.asyncio, "sleep", stop)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(cache_template_service.run_cache_template_prefetch(state_path=None))
+    return seen
+
+
+def test_pre_pull_is_on_by_default():
+    # DAH-3604, rollout step 3: a node whose .env does not mention the flag pre-pulls;
+    # PRE_PULL_TEMPLATES_ENABLED=false is the opt-out.
+    from core.config import Settings
+
+    assert Settings.model_fields["PRE_PULL_TEMPLATES_ENABLED"].default is True
+
+
+# --- on by default (DAH-3604): a node whose .env has no PRE_PULL_* line -----------------
+
+# Prod's answer for an H100 on driver 580 (GET /executors/default-docker-image?include_pre_pull=true,
+# 23 Sep 2026, backend PRE_PULL_TEMPLATES_TOP_N=2): the node's default image, then the top-2.
+LIUM1_DEFAULT_TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind-lium1"
+LIUM1_CU128_TAG = "2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1"
+CUDA_REPO, CUDA_TAG = "nvidia/cuda", "13.0.3-devel-ubuntu22.04"
+DIGEST_LIUM1_DEFAULT = "sha256:efcbc04991511200e4763069434aeb1daf7baf40a0376e3c3296aef929828d89"
+DIGEST_LIUM1_CU128 = "sha256:b3aa9c485c5e91c051a3ef21c45a1b0f68dd1e101495cd8ade57d12eef861eb4"
+DIGEST_CUDA = "sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8"
+PROD_H100_ANSWER = [
+    _entry(REPO, LIUM1_DEFAULT_TAG, DIGEST_LIUM1_DEFAULT, size=9_133_782_473, pre_pull=False),
+    _entry(REPO, LIUM1_CU128_TAG, DIGEST_LIUM1_CU128, size=6_491_891_139),
+    _entry(CUDA_REPO, CUDA_TAG, DIGEST_CUDA, size=3_961_262_240),
+]
+PRE_PULL_ENV = (
+    "PRE_PULL_TEMPLATES_ENABLED",
+    "PRE_PULL_MIN_FREE_GB",
+    "PRE_PULL_TIMEOUT_SECONDS",
+    "PRE_PULL_START_JITTER_SECONDS",
+    "CACHE_TEMPLATE_REFRESH_SECONDS",
+)
+
+
+def _node_settings(monkeypatch, **env: str):
+    """Settings the way a node builds them, with no PRE_PULL_* in its environment unless given."""
+    from core.config import Settings
+
+    for name in PRE_PULL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return Settings(_env_file=None)
+
+
+def test_a_node_without_the_flag_in_its_env_pre_pulls_and_false_opts_it_out(monkeypatch):
+    assert _node_settings(monkeypatch).PRE_PULL_TEMPLATES_ENABLED is True
+    for off in ("false", "False", "0"):
+        node = _node_settings(monkeypatch, PRE_PULL_TEMPLATES_ENABLED=off)
+        assert node.PRE_PULL_TEMPLATES_ENABLED is False
+
+
+def test_the_fleet_wide_guards_keep_the_defaults_the_rollout_was_sized_for(monkeypatch):
+    # 200 GiB disk floor, 30-min pull cap, 15-min start spread, one refresh (and so one pull) per 15 min
+    node = _node_settings(monkeypatch)
+
+    assert (
+        node.PRE_PULL_MIN_FREE_GB,
+        node.PRE_PULL_TIMEOUT_SECONDS,
+        node.PRE_PULL_START_JITTER_SECONDS,
+        node.CACHE_TEMPLATE_REFRESH_SECONDS,
+    ) == (200, 1800, 900, 900)
+
+
+def test_by_default_the_loop_asks_for_the_top_n_and_hands_only_those_to_the_puller(monkeypatch):
+    monkeypatch.setattr(cache_template_service, "settings", _node_settings(monkeypatch))
+
+    seen = _one_loop_iteration(monkeypatch, PROD_H100_ANSWER)
+
+    assert seen["params"] == {
+        "gpu_model": "NVIDIA H100 80GB HBM3",
+        "driver_version": "580.65.06",
+        "include_pre_pull": "true",
+    }
+    # the default image stays on the mandatory path (validator-checked), its old-tag cleanup
+    # shielding the pre-pull tags; the puller gets the two top-N entries and nothing else
+    assert seen["ensured"] == [(LIUM1_DEFAULT_TAG, {LIUM1_CU128_TAG, CUDA_TAG})]
+    assert seen["swept"] == [[LIUM1_CU128_TAG, CUDA_TAG]]
+    assert seen["protected"] == [{f"{REPO}:{LIUM1_DEFAULT_TAG}"}]
+
+
+def test_by_default_an_idle_node_warms_the_top_n_one_image_per_sweep_then_stops(monkeypatch):
+    present: set[str] = set()
+    pulls: list[str] = []
+
+    def pull(client, repo, tag, digest, timeout_seconds):
+        pulls.append(f"{repo}:{tag}")
+        present.add(digest)
+        return "pull_ok", None
+
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", pull)
+    puller = PrePuller(_client(present_digests=present), state_path=None)
+    entries = [data for data in PROD_H100_ANSWER if data["pre_pull"]]
+
+    for _ in range(3):
+        _sweep(puller, entries)
+
+    assert pulls == [f"{REPO}:{LIUM1_CU128_TAG}", f"{CUDA_REPO}:{CUDA_TAG}"]
+    assert set(puller.state.images) == {f"{REPO}:{LIUM1_CU128_TAG}", f"{CUDA_REPO}:{CUDA_TAG}"}
+
+
+def test_by_default_the_first_pull_waits_a_random_delay_within_15_minutes(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "settings", _node_settings(monkeypatch))
+    drawn: list[tuple] = []
+    order: list[str] = []
+
+    def uniform(lo, hi):
+        drawn.append((lo, hi))
+        return hi
+
+    async def sleep(seconds):
+        order.append(f"sleep {seconds:.0f}")
+
+    def pull(client, repo, tag, digest, timeout_seconds):
+        order.append(f"pull {timeout_seconds:.0f}")
+        return "pull_ok", None
+
+    monkeypatch.setattr(pre_pull_service.random, "uniform", uniform)
+    monkeypatch.setattr(pre_pull_service.asyncio, "sleep", sleep)
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", pull)
+
+    _sweep(PrePuller(_client(), state_path=None), [PROD_H100_ANSWER[1]])
+
+    assert drawn == [(0, 900)]
+    assert order == ["sleep 900", "pull 1800"]
+
+
+@pytest.mark.parametrize("headroom_bytes, pulled", [(-1, False), (0, True)])
+def test_by_default_a_pull_must_leave_200_gib_free_after_three_times_its_size(
+    quiet_node, monkeypatch, headroom_bytes, pulled
+):
+    monkeypatch.setattr(pre_pull_service, "settings", _node_settings(monkeypatch))
+    monkeypatch.setattr(pre_pull_service.random, "uniform", lambda lo, hi: 0.0)
+    entry = PROD_H100_ANSWER[1]
+    need = int(entry["docker_image_size"] * pre_pull_service.ON_DISK_MULTIPLIER)
+    free = 200 * GIB + need + headroom_bytes
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=free))
+    client = _client()
+
+    _sweep(PrePuller(client, state_path=None), [entry])
+
+    assert bool(quiet_node) is pulled
+    # nothing tracked yet, so nothing to evict: the default image and rental images never are
+    client.images.remove.assert_not_called()
+
+
+def test_by_default_a_sweep_that_raises_never_stops_the_default_image_refresh(monkeypatch, caplog):
+    monkeypatch.setattr(cache_template_service, "settings", _node_settings(monkeypatch))
+    sweeps: list[int] = []
+    outcomes: list[str] = []
+    real_record = cache_template_service.CachePrefetchState.record_loop_outcome
+
+    class BrokenPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            sweeps.append(len(entries))
+            raise RuntimeError("registry unreachable")
+
+    def record(self, outcome, error=None):
+        outcomes.append(outcome)
+        real_record(self, outcome, error=error)
+
+    monkeypatch.setattr(cache_template_service.CachePrefetchState, "record_loop_outcome", record)
+    with caplog.at_level(logging.WARNING):
+        seen = _one_loop_iteration(monkeypatch, PROD_H100_ANSWER, puller=BrokenPuller, iterations=2)
+
+    assert [tag for tag, _ in seen["ensured"]] == [LIUM1_DEFAULT_TAG, LIUM1_DEFAULT_TAG]
+    assert sweeps == [2, 2]  # the failed sweep is over, so the next refresh starts a new one
+    assert outcomes == [cache_template_service.Outcome.SWEEP_OK] * 2
+    failures = [r for r in caplog.records if "sweep failed: registry unreachable" in r.getMessage()]
+    assert len(failures) == 2
+
+
+@pytest.fixture
+def executor_app():
+    """The app module. Its import chain (bittensor) re-levels and re-handles every logger that
+    already exists, which would silence caplog in the tests that run after this one; put them back."""
+    loggers = [logging.root] + [
+        lg for lg in logging.root.manager.loggerDict.values() if isinstance(lg, logging.Logger)
+    ]
+    saved = [(lg, lg.level, list(lg.handlers), lg.propagate, lg.disabled) for lg in loggers]
+    import executor
+
+    for lg, level, handlers, propagate, disabled in saved:
+        lg.handlers[:] = handlers
+        lg.setLevel(level)
+        lg.propagate, lg.disabled = propagate, disabled
+    return executor
+
+
+@pytest.mark.parametrize("failure", ["still warming", "crashed"])
+def test_the_executor_serves_whatever_the_prefetch_loop_does(monkeypatch, executor_app, failure):
+    executor = executor_app
+
+    async def prefetch():
+        if failure == "crashed":
+            raise RuntimeError("docker socket gone")
+        await asyncio.Event().wait()
+
+    async def purge():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(executor, "run_cache_template_prefetch", prefetch)
+    monkeypatch.setattr(executor, "run_uploaded_key_purge", purge)
+    served: list[bool] = []
+
+    async def main():
+        async with executor.lifespan(executor.app):
+            await asyncio.sleep(0)
+            served.append(True)
+
+    asyncio.run(asyncio.wait_for(main(), timeout=5))
+
+    assert served == [True]
+
+
+def test_flag_off_does_not_ask_for_or_touch_pre_pull_entries(monkeypatch):
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", False)
+    default = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False)
+
+    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
+
+    seen = _one_loop_iteration(monkeypatch, [default])
+
+    assert "include_pre_pull" not in seen["params"]
+    assert seen["ensured"] == [(DEFAULT_TAG, set())]
+    assert seen["pullers"] == 0 and seen["swept"] == []
+    assert seen["slept"] == 900  # the full interval after the work, as today
+
+
+def test_flag_on_asks_backend_and_routes_pre_pull_entries_to_the_puller(monkeypatch):
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    default = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False)
+    extra = _entry(REPO, CU128_TAG, DIGEST_CU128)
+
+    seen = _one_loop_iteration(monkeypatch, [default, extra])
+
+    assert seen["params"]["include_pre_pull"] == "true"
+    # the mandatory path still handles only the default image, now shielding the extra's tag
+    assert seen["ensured"] == [(DEFAULT_TAG, {CU128_TAG})]
+    assert seen["swept"] == [[CU128_TAG]]
+
+
+def test_the_sweep_gets_the_refresh_deadline_and_the_loop_sleeps_only_up_to_it(monkeypatch):
+    # review (14 Sep): the sweep used to be awaited with no cap and the loop then slept a full
+    # interval, so a 15-minute jitter plus a 30-minute pull postponed the default image's
+    # refresh by 45 minutes while the validator checked its digest. The deadline is one
+    # interval after the refresh began; the sleep is what is left of it.
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
+    clock = iter([1000.0, 1600.0])  # deadline computed at 1000; the mandatory pass took until 1600
+    # the module name only: asyncio keeps the real clock
+    monkeypatch.setattr(cache_template_service, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+
+    seen = _one_loop_iteration(
+        monkeypatch,
+        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
+    )
+
+    # the sweep's budget ends a read timeout plus slack before the refresh (second 14 Sep round):
+    # the pull lock is free again when the default image is re-checked
+    assert seen["deadline"] == 1900.0 - cache_template_service.SWEEP_DEADLINE_MARGIN_SECONDS == 1810.0
+    assert seen["slept"] == 300.0
+
+
+def test_a_sweep_that_never_returns_does_not_delay_the_next_refresh(monkeypatch, caplog):
+    # review (14 Sep): the sweep was awaited, so a pull stream that goes silent (read timeout past
+    # the deadline) or an untimed eviction still moved the default image's refresh. The loop now
+    # starts the sweep as a task and refreshes on time; a second refresh finding that task still
+    # running does not start another sweep.
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
+    started: list[str] = []
+    pullers: list = []
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pullers.append(self)
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            started.append("sweep")
+            await asyncio.Event().wait()  # never set: the sweep never yields control back
+
+    caplog.set_level(logging.INFO)
+    real_run = asyncio.run
+    # the old code hangs here forever; the cap turns that into a failure
+    monkeypatch.setattr(asyncio, "run", lambda coro: real_run(asyncio.wait_for(coro, timeout=5)))
+    seen = _one_loop_iteration(
+        monkeypatch,
+        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
+        puller=HangingPuller,
+        iterations=2,
+    )
+
+    assert [tag for tag, _ in seen["ensured"]] == [DEFAULT_TAG, DEFAULT_TAG]  # both refreshes ran
+    assert started == ["sweep"]  # one sweep in flight, the second refresh did not start another
+    assert len(seen["sleeps"]) == 2 and all(0 < s <= 900 for s in seen["sleeps"])
+    assert any("previous sweep is still running" in r.message for r in caplog.records)
+    # the mandatory refs are published on the puller every refresh, before the mandatory pass runs,
+    # so a sweep still evicting cannot remove a ref that just became the default (round 2, 14 Sep)
+    default_ref = frozenset({f"{REPO}:{DEFAULT_TAG}"})
+    assert pullers[0].protected == default_ref
+    assert seen["protected_at_ensure"] == [default_ref, default_ref]
+
+
+def test_cancelling_the_loop_cancels_a_running_sweep(monkeypatch):
+    # the loop is cancelled at app shutdown; the sweep task it started must not outlive it
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    sweep_saw: list[str] = []
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sweep_saw.append("cancelled")
+                raise
+
+    real_sleep = asyncio.sleep
+
+    async def main(loop_coro):
+        task = asyncio.create_task(loop_coro)
+        for _ in range(20):  # let the loop refresh a few times, the sweep started and hanging
+            await real_sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await real_sleep(0)  # one step for the sweep task to see its cancel
+        assert sweep_saw == ["cancelled"]  # before asyncio.run's own shutdown cleanup
+        raise asyncio.CancelledError  # what the harness expects out of the run
+
+    real_run = asyncio.run
+    monkeypatch.setattr(asyncio, "run", lambda coro: real_run(main(coro)))
+    _one_loop_iteration(
+        monkeypatch,
+        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
+        puller=HangingPuller,
+        iterations=10**6,  # never stops on its own
+    )
+
+
+def test_a_cancel_that_lands_in_the_error_backoff_sleep_still_cancels_the_sweep(monkeypatch):
+    # The cancel used to live only in the loop's CancelledError handler. A cancel that arrives
+    # while the loop sleeps out an error backoff is raised inside a sibling except clause, so
+    # that handler never ran and the sweep started by the previous refresh kept running with
+    # nothing left to read its outcome. The finally covers it.
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    sweep_saw: list[str] = []
+    in_backoff = asyncio.Event()
+    templates = [
+        _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False),
+        _entry(REPO, CU128_TAG, DIGEST_CU128),
+    ]
+    fetches = 0
+
+    async def fetch(session, url, params):
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            return templates, 200, None
+        raise aiohttp.ClientError("backend down")  # the second refresh ends in the error backoff
+
+    async def ensure(client, data, state, keep_tags=frozenset()):
+        pass
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sweep_saw.append("cancelled")
+                raise
+
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds):
+        if fetches == 2:  # the sleep after the failed fetch is the error backoff
+            in_backoff.set()
+            await asyncio.Event().wait()  # the cancel lands here
+        await real_sleep(0)  # the refresh sleep: yield once, so the sweep task starts
+
+    async def main():
+        task = asyncio.create_task(
+            cache_template_service.run_cache_template_prefetch(state_path=None)
+        )
+        await asyncio.wait_for(in_backoff.wait(), timeout=5)
+        assert fetches == 2 and sweep_saw == []  # the sweep from refresh 1 is still hanging
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await real_sleep(0)  # one step for the sweep task to see its cancel
+        assert sweep_saw == ["cancelled"]
+
+    monkeypatch.setattr(cache_template_service, "_fetch_templates", fetch)
+    monkeypatch.setattr(cache_template_service, "_ensure_template", ensure)
+    monkeypatch.setattr(cache_template_service, "PrePuller", HangingPuller)
+    monkeypatch.setattr(
+        cache_template_service, "_get_gpu_info", lambda: ("NVIDIA H100 80GB HBM3", "580.65.06", None)
+    )
+    monkeypatch.setattr(cache_template_service.asyncio, "sleep", sleep)
+    asyncio.run(main())
+
+
+def test_a_pre_pull_entry_that_is_the_default_image_never_reaches_the_puller(monkeypatch):
+    # the backend's top-N is global; when it repeats this node's default image, the default must not
+    # become a tracked (evictable) pre-pull
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    default = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False)
+    default_again = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=True)
+    extra = _entry(REPO, CU128_TAG, DIGEST_CU128)
+
+    seen = _one_loop_iteration(monkeypatch, [default, default_again, extra])
+
+    assert seen["ensured"] == [(DEFAULT_TAG, {CU128_TAG})]
+    assert seen["swept"] == [[CU128_TAG]]
+    # and the puller is told which ref is mandatory, so one it tracked earlier is untracked
+    assert seen["protected"] == [{f"{REPO}:{DEFAULT_TAG}"}]
+
+
+def test_state_is_published_before_the_sweep_can_block(monkeypatch):
+    # the DAH-2470 document carries the default image's outcome; a sweep may wait out the start
+    # jitter and one pull, so the flush must not wait for it
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    order: list[str] = []
+    real_flush = cache_template_service.CachePrefetchState.flush
+
+    def flush(self):
+        order.append("flush")
+        return real_flush(self)
+
+    class Puller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            order.append("sweep")
+
+    monkeypatch.setattr(cache_template_service.CachePrefetchState, "flush", flush)
+    _one_loop_iteration(
+        monkeypatch,
+        [
+            _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False),
+            _entry(REPO, CU128_TAG, DIGEST_CU128),
+        ],
+        puller=Puller,
+    )
+
+    assert "sweep" in order and "flush" in order[: order.index("sweep")], order
+
+
+def test_cleanup_old_tags_keeps_pre_pull_tags_of_the_same_repository():
+    client = MagicMock()
+    image = MagicMock()
+    image.tags = [f"{REPO}:{DEFAULT_TAG}", CU128_REF, f"{REPO}:2.4.0-old"]
+    client.images.list.return_value = [image]
+
+    asyncio.run(cache_template_service._cleanup_old_tags(client, REPO, DEFAULT_TAG, frozenset({CU128_TAG})))
+
+    client.images.remove.assert_called_once_with(f"{REPO}:2.4.0-old")
+
+
+# --- idle guard -------------------------------------------------------------------------
+
+
+def test_sweep_pulls_one_missing_image_per_sweep_when_idle(quiet_node, caplog):
+    client = _client(present_digests={DIGEST_DEFAULT})
+    puller = PrePuller(client, state_path=None)
+
+    with caplog.at_level(logging.INFO):
+        _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128), _entry(*CLUSTER_REF.split(":"), DIGEST_CLUSTER)])
+
+    assert quiet_node == [(REPO, CU128_TAG, DIGEST_CU128, pre_pull_service.settings.PRE_PULL_TIMEOUT_SECONDS)]
+    assert puller.state.images[CU128_REF]["digest"] == DIGEST_CU128
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image="))
+    assert f"image={CU128_REF}" in line and "outcome=pull_ok" in line and "seconds=" in line
+
+
+def test_sweep_pulls_nothing_when_everything_is_present(quiet_node):
+    client = _client(present_digests={DIGEST_CU128})
+
+    _sweep(PrePuller(client, state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []
+
+
+def test_sweep_ignores_entries_without_a_digest(quiet_node):
+    _sweep(PrePuller(_client(), state_path=None), [_entry(REPO, CU128_TAG, digest=None)])
+
+    assert quiet_node == []
+
+
+def test_no_pull_while_a_rental_container_exists(quiet_node, caplog):
+    client = _client(containers=[_container("pod_1f2e3d", image=f"{REPO}:{DEFAULT_TAG}")])
+
+    with caplog.at_level(logging.INFO):
+        _sweep(PrePuller(client, state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []
+    assert any("node busy (rental container pod_1f2e3d)" in r.getMessage() for r in caplog.records)
+
+
+def test_no_pull_while_the_validator_drives_docker_over_ssh(quiet_node, monkeypatch):
+    # a rental's own `docker pull` / `docker run` arrive through this process on the host
+    procs = [_proc(["sshd: root"]), _proc(["docker", "system", "dial-stdio"])]
+    monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: procs)
+
+    _sweep(PrePuller(_client(), state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []
+
+
+def test_a_rental_container_still_being_created_counts_as_starting():
+    assert rental_activity(_client(containers=[_container("pod_new", status="created")])) == "rental container pod_new"
+
+
+def test_filler_and_infra_containers_do_not_count():
+    client = _client(
+        containers=[
+            _container("filler_abc"),
+            _container("executor-1"),
+            _container("autoheal"),
+        ]
+    )
+
+    assert rental_activity(client) is None
+
+
+@pytest.mark.parametrize("status", ["exited", "dead"])
+def test_a_stopped_rental_counts_until_its_container_is_removed(quiet_node, status):
+    # a stopped rental's container is `exited` and can start again
+    client = _client(containers=[_container("pod_stopped", status=status)])
+
+    assert rental_activity(client) == "rental container pod_stopped"
+    _sweep(PrePuller(client, state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+    assert quiet_node == []
+
+
+def _verifyx_ssh_cmdline() -> list[str]:
+    # the validator's SSH command (verifyx_validation_service), as the host's process table splits it
+    python, script = "/root/app/.venv/bin/python", "/root/app/src/verifyx_executor.py"
+    return f"{python} {script} --seed 42 --cipher_text abc".split()
+
+
+def _verifyx_local_cmdline() -> list[str]:
+    from services import local_verify_service
+
+    script = str(local_verify_service.VERIFYX_SCRIPT)
+    return ["/usr/bin/python3", script, "--seed", "42", "--cipher_text", "abc"]
+
+
+@pytest.mark.parametrize(
+    "cmdline", [_verifyx_ssh_cmdline, _verifyx_local_cmdline], ids=["ssh", "local-verify"]
+)
+def test_no_pull_while_the_validator_measures_bandwidth(quiet_node, monkeypatch, caplog, cmdline):
+    # fresh read of 941e5ace: its download sample feeds the 100 Mbps EMA gate; a pull sharing the link lowers it
+    procs = [_proc(["sshd: root"]), _proc(cmdline())]
+    monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: procs)
+
+    assert rental_activity(_client()) == "validator bandwidth test"
+    with caplog.at_level(logging.INFO):
+        _sweep(PrePuller(_client(), state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+    assert quiet_node == []
+    assert any("node busy (validator bandwidth test)" in r.getMessage() for r in caplog.records)
+
+
+def test_other_python_processes_are_not_the_bandwidth_test(monkeypatch):
+    procs = [
+        _proc(["python", "/root/app/src/decrypt_challenge.py", "--seed", "1"]),
+        _proc(["python", "-m", "verifyx"]),
+    ]
+    monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: procs)
+
+    assert rental_activity(_client()) is None
+
+
+def test_rental_container_image_counts_as_used_for_lru(quiet_node):
+    client = _client(present_digests={DIGEST_CU128}, containers=[_container("pod_1", image=CU128_REF)])
+    puller = PrePuller(client, state_path=None)
+    puller.state.record_present(CU128_REF, DIGEST_CU128, 1)
+    puller.state.images[CU128_REF]["pulled_at"] = 1.0
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert puller.state.images[CU128_REF]["last_used_at"] > 1.0
+
+
+# --- the pull itself: timeout, preemption, retag ----------------------------------------
+
+
+def _pull_client(events: list[dict]) -> tuple[MagicMock, MagicMock]:
+    client = MagicMock()
+    response = MagicMock()
+    client.api._post.return_value = response
+    client.api._stream_helper.return_value = iter(events)
+    return client, response
+
+
+def test_pull_ok_pulls_by_digest_and_retags(monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    client, response = _pull_client([{"status": "Downloading"}, {"status": "Pull complete"}])
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=60)
+
+    assert (outcome, detail) == ("pull_ok", None)
+    assert client.api._post.call_args.kwargs["params"] == {"fromImage": REPO, "tag": DIGEST_CU128}
+    assert client.api._post.call_args.kwargs["timeout"] == (30, 60)  # connect, read: the stream bound
+    client.images.get.assert_called_once_with(f"{REPO}@{DIGEST_CU128}")
+    client.images.get.return_value.tag.assert_called_once_with(REPO, CU128_TAG)
+    response.close.assert_called_once()
+
+
+def _stalling_client(events: list[dict], stall_seconds: float = 3.0) -> tuple[MagicMock, MagicMock]:
+    """A pull whose stream sends `events`, then goes silent until its socket is shut down (or
+    `stall_seconds` pass, when it raises what the socket read timeout raises). A close() of the
+    response does not end it: on a real socket it does not wake a blocked read."""
+    client = MagicMock()
+    response = MagicMock()
+    closed = threading.Event()
+    sock = client.api._get_raw_response_socket.return_value = MagicMock(spec=["shutdown"])
+    sock.shutdown.side_effect = lambda how: closed.set()
+    client.api._post.return_value = response
+
+    def stream(*_args, **_kwargs):
+        yield from events
+        if not closed.wait(stall_seconds):
+            raise urllib3.exceptions.ReadTimeoutError(None, None, "Read timed out.")
+        raise urllib3.exceptions.ProtocolError("connection closed")
+
+    client.api._stream_helper.side_effect = stream
+    return client, response
+
+
+@pytest.fixture
+def fast_checks(monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "BANDWIDTH_TEST_CHECK_SECONDS", 0.01)
+
+
+def test_pull_is_cancelled_when_a_rental_starts_mid_pull(monkeypatch, fast_checks):
+    activity = iter([None, "rental container pod_9"])
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: next(activity))
+    monkeypatch.setattr(pre_pull_service, "ACTIVITY_CHECK_SECONDS", 0)
+    client, response = _stalling_client([{"status": "Downloading"}] * 5)
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=60)
+
+    assert (outcome, detail) == ("preempted", "rental container pod_9")
+    response.close.assert_called_once()  # closing the stream is what aborts the daemon-side pull
+    client.images.get.assert_not_called()
+
+
+def test_a_bandwidth_test_starting_mid_pull_stops_it_within_seconds(monkeypatch, fast_checks):
+    # the full idle check (a docker call) runs every 10 s; the probe check alone every 2 s
+    too_early = lambda _: pytest.fail("full check before 10 s")  # noqa: E731
+    monkeypatch.setattr(pre_pull_service, "rental_activity", too_early)
+    probe = iter([None, "validator bandwidth test"])
+    monkeypatch.setattr(pre_pull_service, "host_activity", lambda: next(probe))
+    client, response = _stalling_client([{"status": "Downloading"}] * 3)
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=60)
+
+    assert (outcome, detail) == ("preempted", "validator bandwidth test")
+    response.close.assert_called_once()
+    client.images.get.assert_not_called()
+
+
+def test_a_bandwidth_test_stops_a_pull_whose_stream_has_gone_quiet(monkeypatch, fast_checks):
+    # review (12 Oct): the probe check ran only when a stream event arrived, so a quiet stream
+    # (a big layer extracting) kept pulling beside the bandwidth sample until the 60 s read
+    # timeout. The check now runs on its own timer and closes the stream itself.
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    monkeypatch.setattr(pre_pull_service, "host_activity", lambda: "validator bandwidth test")
+    client, response = _stalling_client([], stall_seconds=3.0)
+
+    started = time.monotonic()
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=60)
+
+    assert (outcome, detail) == ("preempted", "validator bandwidth test")
+    assert time.monotonic() - started < 1.0  # not the stall's (read timeout's) length
+    response.close.assert_called_once()
+    client.images.get.assert_not_called()
+
+
+def test_pull_stops_at_the_per_image_timeout(monkeypatch, fast_checks):
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    monkeypatch.setattr(pre_pull_service, "host_activity", lambda: None)
+    client, response = _stalling_client([{"status": "Downloading"}] * 3)
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=0.05)
+
+    assert (outcome, detail) == ("timeout", "exceeded 0s")
+    response.close.assert_called_once()
+    client.images.get.assert_not_called()
+
+
+def test_a_silent_stream_ends_the_pull_at_the_read_timeout(monkeypatch):
+    # review (14 Sep): the deadline is checked per event, so a stream that stops sending is
+    # what the socket read timeout must end; otherwise the thread (and the pull lock) would
+    # outlive the caller's refresh deadline by the whole budget.
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    client, response = _pull_client([])
+    # what urllib3 raises off `response.raw` when the socket read timeout fires mid-stream
+    client.api._stream_helper.side_effect = urllib3.exceptions.ReadTimeoutError(None, None, "Read timed out.")
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=1800)
+
+    assert (outcome, detail) == ("timeout", "no stream event for 60s")
+    assert client.api._post.call_args.kwargs["timeout"] == (30, 60)
+    response.close.assert_called_once()
+    client.images.get.assert_not_called()
+
+
+def test_registry_error_event_is_a_failed_pull(monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    client, _ = _pull_client([{"error": "toomanyrequests: rate limit"}])
+
+    assert _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, 60) == ("pull_failed", "toomanyrequests: rate limit")
+
+
+def test_pull_exception_is_logged_as_one_failed_line_and_not_recorded(quiet_node, monkeypatch, caplog):
+    def boom(*_):
+        raise RuntimeError("daemon gone")
+
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", boom)
+    puller = PrePuller(_client(), state_path=None)
+
+    with caplog.at_level(logging.INFO):
+        _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image=")]
+    assert len(lines) == 1 and "outcome=pull_failed" in lines[0] and "daemon gone" in lines[0]
+    assert CU128_REF not in puller.state.images
+
+
+# --- disk guard -------------------------------------------------------------------------
+
+
+def test_disk_guard_evicts_least_recently_used_pre_pulled_image_first(quiet_node, monkeypatch, caplog):
+    free = iter([205 * GIB, 215 * GIB])  # need 3 × 4.3 GB ≈ 12 GiB on top of the 200 GiB floor
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=next(free)))
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    puller.state.images = {
+        "daturaai/a:1": {"digest": "sha256:aaa", "pulled_at": 1.0, "last_used_at": 100.0},  # used recently
+        "daturaai/b:1": {"digest": "sha256:bbb", "pulled_at": 50.0},  # never used since its pull → LRU
+    }
+
+    with caplog.at_level(logging.INFO):
+        _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    removed = [call.args[0] for call in client.images.remove.call_args_list]
+    assert removed == ["daturaai/b:1", "daturaai/b@sha256:bbb"]
+    assert set(puller.state.images) == {"daturaai/a:1", CU128_REF}
+    assert len(quiet_node) == 1
+    assert any("evicted daturaai/b:1" in r.getMessage() for r in caplog.records)
+
+
+def test_disk_guard_never_evicts_a_tracked_image_that_became_the_default(quiet_node, monkeypatch):
+    # pre-pulled on an earlier sweep, then the backend made it this node's default: the mandatory
+    # path owns it now, so the disk guard must not untag it to make room for another pre-pull
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=150 * GIB))
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    default_ref = f"{REPO}:{DEFAULT_TAG}"
+    puller.state.images = {default_ref: {"digest": DIGEST_DEFAULT, "pulled_at": 50.0}}
+
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], protected=frozenset({default_ref})))
+
+    client.images.remove.assert_not_called()
+    assert quiet_node == []  # insufficient disk: nothing evictable, so nothing pulled
+    assert default_ref not in puller.state.images
+
+
+def test_disk_guard_reads_the_refs_that_became_mandatory_while_the_sweep_was_running(quiet_node, monkeypatch):
+    # second 14 Sep round: the sweep is a task the loop does not wait for, so a refresh can make a
+    # tracked pre-pull the node's default while an earlier sweep is still choosing a victim. The
+    # loop publishes the mandatory refs on the puller; the disk guard reads them per victim.
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    default_ref = f"{REPO}:{DEFAULT_TAG}"
+    puller.state.images = {default_ref: {"digest": DIGEST_DEFAULT, "pulled_at": 50.0}}
+
+    def disk_usage(_):
+        puller.protected = frozenset({default_ref})  # the loop's next refresh, mid-sweep
+        return MagicMock(free=150 * GIB)
+
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", disk_usage)
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], protected=frozenset()))
+
+    client.images.remove.assert_not_called()
+    assert quiet_node == []  # insufficient disk: nothing evictable, so nothing pulled
+    assert default_ref in puller.state.images  # forgotten by the next sweep, not evicted by this one
+
+
+def test_disk_guard_skips_the_pull_when_nothing_can_be_evicted(quiet_node, monkeypatch, caplog):
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=150 * GIB))
+    client = _client()
+
+    with caplog.at_level(logging.INFO):
+        _sweep(PrePuller(client, state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []
+    client.images.remove.assert_not_called()
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image="))
+    assert "outcome=insufficient_disk" in line and "floor 200 GiB" in line
+
+
+def test_disk_guard_never_evicts_what_docker_refuses_to_remove(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=150 * GIB))
+    client = _client()
+    client.images.remove.side_effect = RuntimeError("conflict: image is being used by running container")
+    puller = PrePuller(client, state_path=None)
+    puller.state.images = {"daturaai/b:1": {"digest": "sha256:bbb", "pulled_at": 50.0}}
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []
+    assert "daturaai/b:1" in puller.state.images  # still there, still tracked
+
+
+class _Disk:
+    """A node whose free space moves with what is pulled and removed (on disk = 3 × compressed)."""
+
+    def __init__(self, monkeypatch, free_gib: float):
+        self.free = free_gib * GIB
+        self.present: dict[str, int] = {}  # digest -> bytes on disk
+        self.sizes: dict[str, int] = {}
+        self.pulls: list[str] = []
+        self.client = _client()
+        self.client.images.get.side_effect = self._get
+        self.client.images.remove.side_effect = self._remove
+        free = lambda _: MagicMock(free=self.free)  # noqa: E731
+        monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", free)
+        monkeypatch.setattr(pre_pull_service, "_pull_pinned", self._pull)
+
+    def entry(self, repo, tag, digest, size):
+        self.sizes[digest] = int(size * pre_pull_service.ON_DISK_MULTIPLIER)
+        return _entry(repo, tag, digest, size=size)
+
+    def _get(self, ref):
+        if ref.rpartition("@")[2] in self.present:
+            return MagicMock()
+        raise docker.errors.ImageNotFound(ref)
+
+    def _remove(self, ref):
+        if "@" in ref and ref.rpartition("@")[2] in self.present:
+            self.free += self.present.pop(ref.rpartition("@")[2])
+
+    def _pull(self, client, repo, tag, digest, timeout_seconds):
+        self.pulls.append(f"{repo}:{tag}")
+        self.present[digest] = self.sizes[digest]
+        self.free -= self.sizes[digest]
+        return "pull_ok", None
+
+
+def test_disk_guard_never_evicts_a_served_image_to_pull_another(quiet_node, monkeypatch, caplog):
+    # fresh read of 941e5ace: with today's top-N (6.5 GB + 4.0 GB compressed) a node at 222 GiB free
+    # fits either image above the 200 GiB floor but not both; evicting one served image to pull the
+    # other re-pulled the pair alternately every sweep (8 sweeps -> 8 pulls). The node keeps the
+    # first one and logs insufficient_disk for the second instead.
+    disk = _Disk(monkeypatch, free_gib=222)
+    served = [
+        disk.entry(REPO, LIUM1_CU128_TAG, DIGEST_LIUM1_CU128, 6_491_891_139),
+        disk.entry(CUDA_REPO, CUDA_TAG, DIGEST_CUDA, 3_961_262_240),
+    ]
+    puller = PrePuller(disk.client, state_path=None)
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(8):
+            _sweep(puller, served)
+
+    assert disk.pulls == [f"{REPO}:{LIUM1_CU128_TAG}"]
+    disk.client.images.remove.assert_not_called()
+    assert set(puller.state.images) == {f"{REPO}:{LIUM1_CU128_TAG}"}
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image=")]
+    assert len(lines) == 8 and all("outcome=insufficient_disk" in line for line in lines[1:])
+
+
+def test_disk_guard_still_evicts_an_image_that_left_the_served_set(quiet_node, monkeypatch):
+    # the same node once the backend's top-N moved on: the old image is fair game again
+    disk = _Disk(monkeypatch, free_gib=222)
+    cu128 = disk.entry(REPO, LIUM1_CU128_TAG, DIGEST_LIUM1_CU128, 6_491_891_139)
+    cuda = disk.entry(CUDA_REPO, CUDA_TAG, DIGEST_CUDA, 3_961_262_240)
+    puller = PrePuller(disk.client, state_path=None)
+    _sweep(puller, [cu128, cuda])
+
+    _sweep(puller, [cuda])
+
+    assert disk.pulls == [f"{REPO}:{LIUM1_CU128_TAG}", f"{CUDA_REPO}:{CUDA_TAG}"]
+    assert set(puller.state.images) == {f"{CUDA_REPO}:{CUDA_TAG}"}
+    assert disk.free >= 200 * GIB
+
+
+def test_a_refreshed_tag_retires_its_superseded_digest_reference(quiet_node):
+    # the re-tag moves repo:tag to the new pull and leaves repo@<old digest> behind — neither
+    # dangling nor a tag, so nothing else would ever reclaim its layers
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    puller.state.images = {CU128_REF: {"digest": "sha256:old", "pulled_at": 1.0, "size": 1}}
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert len(quiet_node) == 1
+    client.images.remove.assert_called_once_with(f"{REPO}@sha256:old")
+    assert puller.state.images[CU128_REF]["digest"] == DIGEST_CU128
+
+
+def test_an_already_present_refreshed_tag_retires_the_old_digest_too(quiet_node):
+    client = _client(present_digests={DIGEST_CU128})
+    puller = PrePuller(client, state_path=None)
+    puller.state.images = {CU128_REF: {"digest": "sha256:old", "pulled_at": 1.0, "size": 1}}
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []  # nothing to pull
+    client.images.remove.assert_called_once_with(f"{REPO}@sha256:old")
+
+
+def test_an_unchanged_digest_removes_nothing(quiet_node):
+    client = _client(present_digests={DIGEST_CU128})
+    puller = PrePuller(client, state_path=None)
+    puller.state.record_present(CU128_REF, DIGEST_CU128, 1)
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    client.images.remove.assert_not_called()
+
+
+# --- rate limiting and state ------------------------------------------------------------
+
+
+def test_first_sweep_waits_a_random_jitter_then_never_again(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_START_JITTER_SECONDS", 900)
+    monkeypatch.setattr(pre_pull_service.random, "uniform", lambda lo, hi: 123.0)
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(pre_pull_service.asyncio, "sleep", fake_sleep)
+    puller = PrePuller(_client(), state_path=None)
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert slept == [123.0]
+
+
+def test_pull_budget_is_cut_at_the_refresh_deadline(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_TIMEOUT_SECONDS", 1800)
+    monkeypatch.setattr(pre_pull_service, "time", SimpleNamespace(monotonic=lambda: 1000.0, time=time.time))
+    puller = PrePuller(_client(), state_path=None)
+
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1120.0))
+
+    assert [pull[3] for pull in quiet_node] == [120.0]
+
+
+def test_pull_waits_for_the_next_sweep_when_the_deadline_is_too_close(quiet_node, monkeypatch, caplog):
+    monkeypatch.setattr(pre_pull_service, "time", SimpleNamespace(monotonic=lambda: 1000.0, time=time.time))
+    # 150 GiB free with one 4.3 GiB tracked image: `_make_room` would evict it for a new pull,
+    # so an eviction here means the deferral ran after it
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=150 * GIB))
+    puller = PrePuller(_client(), state_path=None)
+    puller.state.images = {"daturaai/old:1": {"digest": "sha256:" + "0" * 64, "pulled_at": 1.0}}
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1030.0))
+
+    assert quiet_node == []
+    assert any("30s left before the refresh deadline" in r.message for r in caplog.records)
+    puller.client.images.remove.assert_not_called()  # deferred before eviction: nothing removed
+    assert "daturaai/old:1" in puller.state.images
+
+
+def test_pull_waits_when_a_slow_eviction_eats_the_budget(quiet_node, monkeypatch, caplog):
+    # the pre-eviction check passes (300 s left), then the eviction itself takes 250 s: the
+    # pull would have 50 s, under MIN_PULL_BUDGET_SECONDS, so it waits instead of timing out
+    now = {"t": 1000.0}
+    monkeypatch.setattr(pre_pull_service, "time", SimpleNamespace(monotonic=lambda: now["t"], time=time.time))
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=150 * GIB))
+    puller = PrePuller(_client(), state_path=None)
+    puller.state.images = {"daturaai/old:1": {"digest": "sha256:" + "0" * 64, "pulled_at": 1.0}}
+    real_make_room = puller._make_room
+
+    async def slow_make_room(*args, **kwargs):
+        now["t"] = 1250.0  # the eviction took 250 s
+        return await real_make_room(*args, **kwargs)
+
+    monkeypatch.setattr(puller, "_make_room", slow_make_room)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1300.0))
+
+    assert quiet_node == []
+    assert any("eviction left 50s before the refresh deadline" in r.message for r in caplog.records)
+
+
+def test_pull_budget_stays_the_per_image_timeout_when_the_deadline_is_far(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_TIMEOUT_SECONDS", 1800)
+    monkeypatch.setattr(pre_pull_service, "time", SimpleNamespace(monotonic=lambda: 1000.0, time=time.time))
+    puller = PrePuller(_client(), state_path=None)
+
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1000.0 + 3600.0))
+
+    assert [pull[3] for pull in quiet_node] == [1800.0]
+
+
+def test_start_jitter_never_runs_past_the_refresh_deadline(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_START_JITTER_SECONDS", 900)
+    monkeypatch.setattr(pre_pull_service.random, "uniform", lambda lo, hi: 800.0)
+    monkeypatch.setattr(pre_pull_service, "time", SimpleNamespace(monotonic=lambda: 1000.0, time=time.time))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(pre_pull_service.asyncio, "sleep", fake_sleep)
+    puller = PrePuller(_client(), state_path=None)
+
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1100.0))
+
+    assert slept == [100.0]
+    assert puller._first_sweep is True  # the drawn delay was not slept: draw again next sweep
+    assert quiet_node[0][-1] == 100.0  # the fake sleep does not move the clock; budget is cut to fit
+
+
+def test_state_lives_on_the_reserve_volume_not_the_writable_layer():
+    # review (14 Sep): /var/lib/lium is gone after a force-recreate of the executor container,
+    # and every image the lost file tracked stays on the host outside the eviction inventory.
+    # /var/lium-reserve is the `reserve_data` named volume the compose files mount.
+    assert pre_pull_service.STATE_PATH.startswith("/var/lium-reserve/")
+    compose = (Path(__file__).resolve().parents[1] / "docker-compose.app.yml").read_text()
+    assert "reserve_data:/var/lium-reserve" in compose
+
+
+def test_state_survives_a_restart(tmp_path):
+    path = tmp_path / "pre_pull_state.json"
+    state = PrePullState(str(path))
+    state.record_present(CU128_REF, DIGEST_CU128, 4_300_000_000)
+    state.flush()
+
+    reloaded = PrePullState(str(path))
+
+    assert reloaded.images[CU128_REF]["digest"] == DIGEST_CU128
+    assert json.loads(path.read_text())["schema"] == 1
+
+
+def test_corrupt_state_file_starts_empty(tmp_path):
+    path = tmp_path / "pre_pull_state.json"
+    path.write_text("{not json")
+
+    assert PrePullState(str(path)).images == {}
+
+
+def test_the_watcher_wakes_a_read_blocked_on_a_real_socket(monkeypatch, fast_checks):
+    # close() from the watcher would leave this read (and the watcher) blocked until the read
+    # timeout; the socket shutdown ends it at once
+    monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
+    monkeypatch.setattr(pre_pull_service, "host_activity", lambda: "validator bandwidth test")
+    near_end, daemon_end = socket.socketpair()
+    near_end.settimeout(3)  # only so a regression fails instead of hanging
+    reader = near_end.makefile("rb")
+    client, response = _pull_client([])
+    client.api._get_raw_response_socket.return_value = reader.raw  # the SocketIO, as docker-py
+    client.api._stream_helper.side_effect = lambda *a, **k: iter(lambda: reader.read1(1024), b"")
+
+    started = time.monotonic()
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=60)
+
+    assert (outcome, detail) == ("preempted", "validator bandwidth test")
+    assert time.monotonic() - started < 1.0
+    response.close.assert_called_once()
+    reader.close()
+    near_end.close()
+    daemon_end.close()
