@@ -8175,6 +8175,17 @@ async def test_a_delete_during_the_flatten_stops_the_create_before_the_retry(doc
     assert client.events == ["run sglang"]  # no create or start after the delete
 
 
+@pytest.mark.asyncio
+async def test_a_delete_during_the_flatten_retry_rm_stops_the_create_before_the_run(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    # first check passes; the delete lands while the failed container is removed
+    cancelled = AsyncMock(side_effect=[None, docker_service_module._CreateCancelledByDelete("deleted")])
+    with pytest.raises(docker_service_module._CreateCancelledByDelete):
+        await _create_with_flatten(docker_service, client, flatten, before_retry=cancelled)
+    assert client.events == ["run sglang", "rm pod_x"]  # no run from the flattened copy
+
+
 def test_flatten_keeps_free_the_writable_layer_and_a_sparse_volume_only():
     gib = 1024**3
     assert docker_service_module._flatten_reserved_bytes(26, 53, True) == 79 * gib

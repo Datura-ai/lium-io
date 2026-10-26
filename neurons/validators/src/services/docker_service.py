@@ -2696,6 +2696,9 @@ class DockerService:
                             default_extra=default_extra,
                             warning_event="FLATTEN_RETRY_RM_FAILED",
                         )
+                        if before_flatten_retry is not None:
+                            # a delete can land during the awaited rm: check again right before the run
+                            await before_flatten_retry()
                         run_spec = dataclasses.replace(run_spec, image=flat_image)
                         attempt += 1
                         continue
