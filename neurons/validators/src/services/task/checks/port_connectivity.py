@@ -4,9 +4,11 @@ import logging
 import time
 from dataclasses import replace
 
+from services.const import DEFAULT_JOB_OWNER_LIUM
+from services.executor_connectivity.models import PortVerificationResult
+
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.executor_connectivity.models import PortVerificationResult
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
@@ -301,9 +303,14 @@ class PortConnectivityCheck:
             if rented:
                 return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
             # the timeout string is provider-reported: reuse the pass only while the backend confirms an active
-            # Lium filler on the node (the load that stalls the test), never on the provider's word alone
+            # Lium-owned filler on the node (the load that stalls the test), never on the provider's word alone;
+            # a provider's own default job is provider-controlled load, so it does not count
             rented_data = ctx.state.rented_data
-            if not (rented_data and rented_data.get_filler_containers(ctx.executor.uuid)):
+            if not (
+                rented_data
+                and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
+                and rented_data.get_filler_containers(ctx.executor.uuid)
+            ):
                 return False
             verified_at = await redis.sysbox_verified_at(ctx.miner_hotkey, ctx.executor.uuid)
             return verified_at is not None and time.time() - verified_at < SYSBOX_TIMEOUT_REUSE_MAX_AGE_SECONDS

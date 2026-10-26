@@ -537,7 +537,9 @@ def _filler_timed_out_state(**overrides):
         sysbox_runtime=False,
         specs={"sysbox_runtime_scrape_error": "Test command timed out."},
         rented_data=RentedExecutorsResponse(
-            executors={}, all_filler_containers_by_executor={"executor-123": ["filler_run-1"]}
+            executors={},
+            all_filler_containers_by_executor={"executor-123": ["filler_run-1"]},
+            default_job_owner_by_executor={"executor-123": "lium"},
         ),
     )
     return build_state(**{**base, **overrides})
@@ -774,8 +776,13 @@ async def test_unrented_timeouts_stop_reusing_the_pass_once_it_is_an_hour_old(co
         None,
         RentedExecutorsResponse(executors={}),
         RentedExecutorsResponse(executors={}, all_filler_containers_by_executor={"other": ["f"]}),
+        RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": ["f"]},
+            default_job_owner_by_executor={"executor-123": "miner"},
+        ),
     ],
-    ids=["no_rented_data", "no_fillers", "filler_elsewhere"],
+    ids=["no_rented_data", "no_fillers", "filler_elsewhere", "provider_default_job"],
 )
 async def test_unrented_timeout_without_a_backend_confirmed_filler_does_not_reuse_the_pass(context_factory, rented_data):
     """The timeout string is provider-reported: a host that passed, disabled Sysbox and stalls the test gets
