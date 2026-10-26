@@ -114,7 +114,15 @@ _HEALTH = {"Interval": 30 * 10**9, "Timeout": 5 * 10**9, "StartPeriod": 0, "Retr
         ({"Healthcheck": {"Test": ["NONE"]}}, ["HEALTHCHECK NONE"]),
         (
             {"Healthcheck": {**_HEALTH, "Test": ["CMD-SHELL", "curl -f localhost:8000 || exit 1"]}},
-            ["HEALTHCHECK --interval=30000000000ns --timeout=5000000000ns --retries=3 CMD curl -f localhost:8000 || exit 1"],
+            [
+                "HEALTHCHECK --interval=30000000000ns --timeout=5000000000ns --retries=3 "
+                'CMD ["/bin/sh", "-c", "curl -f localhost:8000 || exit 1"]'
+            ],
+        ),
+        # the image's SHELL decides the shell-form verdict; the copy has no SHELL, so it is written out
+        (
+            {"Shell": ["/bin/bash", "-c"], "Healthcheck": {"Test": ["CMD-SHELL", "[[ -f /ok ]]\nexit 0"]}},
+            ['HEALTHCHECK CMD ["/bin/bash", "-c", "[[ -f /ok ]]\\nexit 0"]'],
         ),
         (
             {"Healthcheck": {"Test": ["CMD", "/bin/check", "--fast"], "StartInterval": 10**9}},
@@ -128,7 +136,7 @@ def test_changes_restore_stop_signal_and_health_check(config, expected):
 
 def test_changes_refuse_a_health_check_they_cannot_carry():
     with pytest.raises(ValueError):
-        image_flatten_changes({"Healthcheck": {"Test": ["CMD-SHELL", "a\nb"]}})
+        image_flatten_changes({"Healthcheck": {"Test": ["CMD-SHELL"]}})
 
 
 def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
@@ -141,7 +149,7 @@ def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12
         'case "$1" in\n'
         "  info) echo /var/lib/docker ;;\n"
         f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 {avail} 1%% /hostfs\\n' ;;\n"
-        f"  image) [ -e {tmp_path}/tagged ] ;;\n"
+        f'  image) if [ "$2" = ls ]; then cat {tmp_path}/copies 2>/dev/null; else [ -e {tmp_path}/tagged ]; fi ;;\n'
         "  create) echo cid1 ;;\n"
         f"  export) echo tar; exit {export_rc} ;;\n"
         f"  import) cat >/dev/null; sleep {import_sleep}; echo sha256:new; exit {import_rc} ;;\n"
@@ -161,14 +169,14 @@ def _calls(tmp_path) -> list[str]:
 @pytest.mark.parametrize(
     "export_rc, import_rc, rm_rc, avail, expected_rc, expected_calls",
     [
-        (0, 0, 0, 100, 0, ["image", "info", "run", "create", "export", "import", "rm", "tag"]),
+        (0, 0, 0, 100, 0, ["image", "image", "info", "run", "create", "export", "import", "rm", "tag"]),
         # a truncated export must never be tagged: the import of it is removed
-        (1, 0, 0, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
-        (0, 1, 0, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        (1, 0, 0, 100, 98, ["image", "image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        (0, 1, 0, 100, 98, ["image", "image", "info", "run", "create", "export", "import", "rm", "rmi"]),
         # the container or its volumes were not removed: no cached tag, so a later rental retries
-        (0, 0, 1, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        (0, 0, 1, 100, 98, ["image", "image", "info", "run", "create", "export", "import", "rm", "rmi"]),
         # too little disk: nothing is created
-        (0, 0, 0, 99, FLATTEN_NO_DISK_EXIT, ["image", "info", "run"]),
+        (0, 0, 0, 99, FLATTEN_NO_DISK_EXIT, ["image", "image", "info", "run"]),
     ],
 )
 def test_flatten_script_tags_only_a_complete_copy_and_always_removes_the_container(
@@ -187,6 +195,18 @@ def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(t
     assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
     create = next(c for c in _calls(tmp_path) if c.startswith("create"))
     assert create == "create --entrypoint /lium-flatten-noop --mount type=volume,dst=/models,volume-nocopy sha256:id"
+
+
+def test_each_new_flatten_first_removes_earlier_copies_no_container_uses(tmp_path):
+    # renters renting one unique image after another: the earlier pods are gone, their copies go too
+    (tmp_path / "copies").write_text("lium-flattened:old1\nlium-flattened:old2\n")
+    argv = _flatten_script(tmp_path)
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
+    calls = _calls(tmp_path)
+    assert "image ls --format {{.Repository}}:{{.Tag}} lium-flattened" in calls
+    # without -f: dockerd refuses a copy a pod still uses; before the disk check, so the space counts
+    first = [c.split()[0] for c in calls]
+    assert calls.index("rmi lium-flattened:old1") < calls.index("rmi lium-flattened:old2") < first.index("info")
 
 
 def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):

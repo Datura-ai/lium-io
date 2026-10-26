@@ -5,8 +5,8 @@ ID-map the relative layer paths Docker uses once an image has more layers than f
 overlay mount options (nestybox/sysbox#725, fixed upstream but not in a Sysbox release yet). A
 one-layer copy of the same files starts. Only on classic overlay2: the disk check measures Docker's
 data root, which the containerd store does not write its images to. `docker export | docker import`
-keeps only the root filesystem, so the image config is put back with `--change`; SHELL and ONBUILD
-(build-time only) are not carried over.
+keeps only the root filesystem, so the image config is put back with `--change`; SHELL (written into a
+shell-form health check instead) and ONBUILD (build-time only) are not carried over.
 """
 
 import json
@@ -39,7 +39,7 @@ def _dockerfile_word(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
 
 
-def _healthcheck_change(check: dict) -> str:
+def _healthcheck_change(check: dict, shell: list[str]) -> str:
     test = check.get("Test") or []
     if test[:1] == ["NONE"]:
         return "HEALTHCHECK NONE"
@@ -55,8 +55,9 @@ def _healthcheck_change(check: dict) -> str:
     )
     if check.get("Retries"):
         options += f"--retries={check['Retries']} "
-    if test[:1] == ["CMD-SHELL"] and len(test) == 2 and "\n" not in test[1] and "\r" not in test[1]:
-        return f"HEALTHCHECK {options}CMD {test[1]}"
+    if test[:1] == ["CMD-SHELL"] and len(test) == 2:
+        # Docker runs CMD-SHELL through the image's SHELL, which import cannot restore: spell the shell out
+        return f"HEALTHCHECK {options}CMD {json.dumps([*shell, test[1]])}"
     if test[:1] == ["CMD"] and len(test) > 1:
         return f"HEALTHCHECK {options}CMD {json.dumps(test[1:])}"
     # one --change is one Dockerfile line; a health check that differs would change how the pod is judged
@@ -88,7 +89,7 @@ def image_flatten_changes(config: dict) -> list[str]:
     if config.get("StopSignal"):
         changes.append(f"STOPSIGNAL {config['StopSignal']}")
     if config.get("Healthcheck"):
-        changes.append(_healthcheck_change(config["Healthcheck"]))
+        changes.append(_healthcheck_change(config["Healthcheck"], config.get("Shell") or ["/bin/sh", "-c"]))
     for key, value in sorted((config.get("Labels") or {}).items()):
         if "\n" in key + value or "\r" in key + value:
             continue  # metadata only (e.g. a long description); nothing at run time reads it
@@ -97,7 +98,8 @@ def image_flatten_changes(config: dict) -> list[str]:
 
 
 def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int) -> str:
-    """Under a node-wide lock: reuse a copy another flatten finished meanwhile, check the Docker disk
+    """Under a node-wide lock: reuse a copy another flatten finished meanwhile, remove every earlier copy
+    no container uses (so renters cannot fill the disk with copies), check the Docker disk
     holds `need_bytes`, create (never start) a container from the image ID, pipe its export into an
     import, tag the result only when both sides succeeded, and always remove the container and its
     volumes. Plain sh: no pipefail."""
@@ -110,6 +112,9 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
         # one flatten per node: concurrent rentals would each pass the disk check and copy at once
         f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
         f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && exit 0; "
+        # rmi without -f refuses a copy a container (running or stopped) still uses
+        f"for old in $(/usr/bin/docker image ls --format '{{{{.Repository}}}}:{{{{.Tag}}}}' {FLATTENED_IMAGE_REPO}); "
+        'do /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
         f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
