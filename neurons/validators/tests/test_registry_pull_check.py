@@ -94,6 +94,29 @@ async def test_a_cycle_between_pulls_publishes_the_last_reading(rented):
     assert result.updates["state"].specs["docker_image_store"] == "containerd"
 
 
+@pytest.mark.asyncio
+async def test_a_pull_that_read_no_driver_keeps_the_last_store():
+    """Review of #1864: a pull that did not run saved a record with no driver over the last one, so the node
+    published no store for 3-9 h."""
+    ctx = _ctx("")
+    ctx.runner.run.return_value = SimpleNamespace(
+        error_type="TimeoutError", error_message="ssh", stdout=""
+    )
+    last = module._ProbeState(
+        at=time.time() - 10 * 24 * 3600,
+        outcome="ok",
+        reading={"driver": "overlayfs", "image_store": "containerd"},
+    )
+    await ctx.services.redis.set(f"{module._REDIS_PREFIX}:{ctx.executor.uuid}", last.as_json())
+
+    result = await module.RegistryPullCheck().run(ctx)
+
+    ctx.runner.run.assert_called_once()
+    assert result.updates["state"].specs["docker_image_store"] == "containerd"
+    saved = await module.RegistryPullCheck()._load(ctx)
+    assert (saved.outcome, saved.reading["image_store"]) == ("not_run", "containerd")
+
+
 # ------------------------------------------------------------------ the Docker Hub control
 
 

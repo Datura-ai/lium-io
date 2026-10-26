@@ -434,6 +434,10 @@ class RegistryPullCheck:
             return _with_image_store(ctx, last_state, self._verdict(ctx, last_state, probed=False))
 
         reading = await self._pull(ctx)
+        if reading.driver is None and last_state.reading.get("driver"):
+            # a pull whose `docker info` said nothing (not run, daemon unreadable) keeps the last read store, so
+            # one bad cycle does not take the node off the many-layers move targets until the next pull
+            reading = replace(reading, driver=last_state.reading["driver"])
         failures = last_state.failures_in_a_row
         no_verdict: NoVerdict | None = None
         hub_control: DockerHubControl | None = None
