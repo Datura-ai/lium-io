@@ -22,10 +22,9 @@ SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_V
 SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
-# the validators' _LOOPBACK_PLUGIN_ALIAS / _LOOPBACK_PLUGIN_IMAGE (neurons/validators/src/services/docker_service.py):
+# the validators' old plugin, LEGACY_LOOPBACK_PLUGIN_ALIAS (neurons/validators/src/services/const.py):
 # a rental with a disk limit gets a volume from this plugin, mounted into its sysbox container. The plugin runs
-# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13),
-# the image the validators' rental path installs by tag today.
+# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13).
 VLOOPBACK_PLUGIN="vloopback"
 VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
 VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"

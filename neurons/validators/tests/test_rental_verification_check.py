@@ -50,6 +50,7 @@ class DummyBackendClient:
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
+        loopback_plugin: str | None = None,
     ):
         self.called_with = {
             "miner_address": miner_address,
@@ -60,8 +61,27 @@ class DummyBackendClient:
             "rental_in_progress": rental_in_progress,
             "gpu_uuids": gpu_uuids,
             "cpu_count": cpu_count,
+            "loopback_plugin": loopback_plugin,
         }
         return self.response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled, alias", [(True, "vloopback:v2"), (False, "vloopback")])
+async def test_rental_verification_selects_loopback_alias_from_v2_switch(context_factory, enabled, alias):
+    # Arrange
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+
+    # Act
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as config:
+        config.LOOPBACK_PLUGIN_V2_ENABLED = enabled
+        result = await RentalVerificationCheck().run(ctx)
+
+    # Assert: the backend probes the plugin selected for new rental volumes by this validator.
+    assert result.passed is True
+    assert backend.called_with["loopback_plugin"] == alias
 
 
 @pytest.mark.asyncio
@@ -140,6 +160,7 @@ async def test_rental_verification_success():
         "rental_in_progress": False,  # no customer rental in this state
         "gpu_uuids": [],  # this state carries no scraped gpu details
         "cpu_count": None,  # this state carries no scraped cpu count
+        "loopback_plugin": "vloopback:v2",  # the plugin alias new rental volumes are created on
     }
 
 

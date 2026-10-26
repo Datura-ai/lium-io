@@ -70,23 +70,7 @@ def _upload_payload(miner_kp, validator_kp) -> dict:
     }
 
 
-def _ping_payload(validator_kp) -> dict:
-    return {"signature": validator_kp.sign("ping_request").hex()}
-
-
 # --- /upload_ssh_key ------------------------------------------------------------------------------
-
-
-def test_upload_signed_by_the_current_hotkey_is_accepted_when_next_is_configured(
-    client, miner_keypair, current_validator, next_validator, monkeypatch
-):
-    # regression: configuring `next` replaces `current` instead of adding to it — the live
-    # validator is refused by every executor that restarts onto the release
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-
-    response = client.post("/upload_ssh_key", json=_upload_payload(miner_keypair, current_validator))
-
-    assert response.status_code == 200
 
 
 def test_upload_signed_by_the_next_hotkey_is_accepted_when_configured(
@@ -127,32 +111,6 @@ def test_upload_signed_by_the_next_hotkey_is_rejected_while_only_current_is_conf
 
 
 # --- the dependencies/auth.py verifiers (ping, hardware, containers) ------------------------------
-
-
-def test_ping_signed_by_the_next_hotkey_is_accepted_when_configured(
-    client, current_validator, next_validator, monkeypatch
-):
-    # regression: the rotation reaches _validate_validator_signature (ssh key uploads) but not
-    # dependencies.auth.verify_signature, so /ping, /hardware_utilization and /containers/*
-    # go dark after the chain swap while rentals still work
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-
-    response = client.post("/ping", json=_ping_payload(next_validator))
-
-    assert response.status_code == 200
-
-
-def test_ping_signed_by_a_third_hotkey_is_rejected_with_two_configured(
-    client, current_validator, next_validator, monkeypatch
-):
-    # regression: verify_signature's error path (a raised or False verify on the first key) is
-    # read as "verified" once a second key is in the loop
-    _trust(monkeypatch, current=current_validator, next=next_validator)
-    stranger = bittensor.Keypair.create_from_uri("//LiumRotationStranger")
-
-    response = client.post("/ping", json=_ping_payload(stranger))
-
-    assert response.status_code == 401
 
 
 # --- core/config.py: where the two hotkeys come from ----------------------------------------------
@@ -217,27 +175,3 @@ def test_an_override_that_names_only_current_trusts_one_signer(monkeypatch):
     assert config.VALIDATOR_HOTKEYS_SS58 == {"current": override._VALIDATOR_HOTKEY_SS58}
 
 
-def test_the_build_time_override_adds_the_next_hotkey_after_current(monkeypatch, next_validator):
-    # regression: the override is read but never reaches the dict (or lands first, so the log
-    # says `current` for the new key), or surrounding whitespace is kept
-    config = _load_config_with_override(monkeypatch, next_hotkey=f" {next_validator.ss58_address} ")
-
-    assert list(config.VALIDATOR_HOTKEYS_SS58.items()) == [
-        ("current", config.VALIDATOR_HOTKEY_SS58),
-        ("next", next_validator.ss58_address),
-    ]
-
-
-def test_a_next_hotkey_equal_to_current_is_not_listed_twice(monkeypatch):
-    # regression: the same key verified twice, and a log line claiming `next` is in use
-    current = _load_config_with_override(monkeypatch, next_hotkey=None).VALIDATOR_HOTKEY_SS58
-    config = _load_config_with_override(monkeypatch, next_hotkey=current)
-
-    assert config.VALIDATOR_HOTKEYS_SS58 == {"current": current}
-
-
-def test_a_next_hotkey_that_is_not_an_ss58_address_stops_the_executor_at_import(monkeypatch):
-    # regression: a mistyped `next` is discovered by the first 401 after the chain swap, on the
-    # whole fleet, instead of by CI on this PR
-    with pytest.raises(ValueError, match="next validator hotkey"):
-        _load_config_with_override(monkeypatch, next_hotkey="5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13q")

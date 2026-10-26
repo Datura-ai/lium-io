@@ -111,6 +111,9 @@ class JobResult(BaseModel):
     # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
     # and the row hears only the copy that kept the score.
     duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
+    # from; scored like the cycle it came from, never published
+    carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic

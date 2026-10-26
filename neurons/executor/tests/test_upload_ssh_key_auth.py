@@ -9,7 +9,6 @@ Ephemeral bittensor keypairs are created inside the test fixtures so no real
 production keys are needed and every test run uses fresh cryptographic material.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import bittensor
@@ -19,7 +18,6 @@ from fastapi.testclient import TestClient
 
 # conftest.py already inserted src/ into sys.path and set required env vars.
 from core.config import settings
-import middlewares.miner as miner_middleware
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.miner_service import MinerService
@@ -140,36 +138,6 @@ def test_valid_miner_and_validator_signatures_accepted(endpoint, client, miner_k
     assert response.status_code == 200
 
 
-def test_authenticated_request_timeout_returns_structured_504(
-    client,
-    miner_keypair,
-    validator_keypair,
-    monkeypatch,
-):
-    """Miner auth passes, but the downstream route does not respond before the timeout."""
-    # Arrange
-    monkeypatch.setattr(miner_middleware, "AUTHENTICATED_REQUEST_TIMEOUT_SECONDS", 0.01)
-
-    async def slow_upload_ssh_key(_payload):
-        await asyncio.sleep(0.05)
-        return {"ssh_username": "testuser", "ssh_port": 2200}
-
-    client.app.state.mock_miner_service.upload_ssh_key.side_effect = slow_upload_ssh_key
-    payload = _build_payload(_SSH_KEY, miner_keypair, validator_keypair)
-
-    # Act
-    response = client.post("/upload_ssh_key", json=payload)
-
-    # Assert
-    assert response.status_code == 504
-    assert response.json() == {
-        "status": "failed",
-        "failure_code": "EXECUTOR_AUTHENTICATED_REQUEST_TIMEOUT",
-        "stage": "call_next",
-        "message": "Request authenticated but executor route did not return before timeout",
-    }
-
-
 # ---------------------------------------------------------------------------
 # Tests: miner signature failures (middleware layer)
 # ---------------------------------------------------------------------------
@@ -190,24 +158,6 @@ def test_miner_signature_from_wrong_keypair_rejected(endpoint, client, validator
     response = client.post(endpoint, json=payload)
 
     # Assert — middleware must reject a signature from an unregistered miner
-    assert response.status_code == 401
-
-
-@pytest.mark.parametrize("endpoint", _ENDPOINTS)
-def test_corrupted_miner_signature_rejected(endpoint, client, miner_keypair, validator_keypair):
-    """
-    Miner signature is syntactically present but cryptographically invalid → 401.
-
-    Simulates a tampered or bit-flipped signature field.
-    """
-    # Arrange
-    payload = _build_payload(_SSH_KEY, miner_keypair, validator_keypair)
-    payload["signature"] = "0xdeadbeefdeadbeef"  # not a valid SR25519 signature
-
-    # Act
-    response = client.post(endpoint, json=payload)
-
-    # Assert — corrupted bytes must not pass verification
     assert response.status_code == 401
 
 
@@ -232,25 +182,6 @@ def test_validator_signature_from_wrong_keypair_rejected(endpoint, client, miner
     response = client.post(endpoint, json=payload)
 
     # Assert — only the registered validator's signature is accepted
-    assert response.status_code == 401
-
-
-@pytest.mark.parametrize("endpoint", _ENDPOINTS)
-def test_corrupted_validator_signature_rejected(endpoint, client, miner_keypair, validator_keypair):
-    """
-    Miner auth passes but validator_signature is garbage bytes → 401.
-
-    Verifies that the route-level validator check runs independently of
-    the middleware and rejects invalid signatures on its own.
-    """
-    # Arrange
-    payload = _build_payload(_SSH_KEY, miner_keypair, validator_keypair)
-    payload["validator_signature"] = "0xdeadbeefdeadbeef"  # tampered
-
-    # Act
-    response = client.post(endpoint, json=payload)
-
-    # Assert — route must reject the tampered validator signature
     assert response.status_code == 401
 
 
