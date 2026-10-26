@@ -21,6 +21,7 @@ from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     _BoundLog,
+    _vloopback_backing_file_host_path,
     _vloopback_drop_dirty_volume_cmd,
 )
 from tests.test_docker_service import (  # noqa: F401
@@ -56,13 +57,17 @@ def _executor_info(payload: ContainerDeleteRequest) -> ExecutorSSHInfo:
     )
 
 
+V2_PLUGIN_MOUNTS = '[{"Source":"/dev","Destination":"/dev"},{"Source":"/","Destination":"/srv"}]'
+
+
 def _ssh_answers_for_vloopback_volume() -> list:
     return [
-        _make_ssh_command_result(stdout="vloopback:latest\n"),  # docker volume inspect
-        _make_ssh_command_result(stdout="plugin123\n"),  # docker plugin inspect
+        _make_ssh_command_result(stdout="vloopback:v2\n"),  # docker volume inspect
+        _make_ssh_command_result(stdout=f"plugin123 {V2_PLUGIN_MOUNTS}\n"),  # docker plugin inspect
         _make_ssh_command_result(stdout="/var/lib/docker\n"),  # docker info
+        _make_ssh_command_result(stdout="/srv/var/lib/docker/vloopback-v2/volume_dirty\n"),  # loop backing file
         _make_ssh_command_result(stdout="pid=4242 exited=yes\n"),  # stop_container_init
-        _make_ssh_command_result(stdout="wiped=yes truncated=yes dev=/dev/loop3 img=/mnt/rootfs/var/lib/docker/loopback/volume_dirty\n"),
+        _make_ssh_command_result(stdout="wiped=yes truncated=yes\n"),  # helper
     ]
 
 
@@ -88,21 +93,54 @@ def test_stop_command_signals_term_then_kill_and_waits_on_proc():
 
 
 def test_drop_command_unlinks_the_volume_files_and_truncates_its_image():
-    cmd = _vloopback_drop_dirty_volume_cmd("/var/lib/docker/plugins/plugin123", "volume_dirty")
+    cmd = _vloopback_drop_dirty_volume_cmd(
+        "/var/lib/docker/plugins/plugin123/propagated-mount",
+        "volume_dirty",
+        "/var/lib/docker/vloopback-v2/volume_dirty",
+    )
 
-    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123,dst=/mnt" in cmd
+    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in cmd
+    assert "--mount type=bind,src=/var/lib/docker/vloopback-v2,dst=/img" in cmd
     assert "docker.io/library/alpine:3.19" in cmd
-    assert "/mnt/propagated-mount/volume_dirty" in cmd
-    assert "-mindepth 1 -maxdepth 1 -exec rm -rf {} +" in cmd  # the files, never the mountpoint
-    assert "loop/backing_file" in cmd and "truncate -s 0" in cmd
+    assert "find /mnt/volume_dirty -mindepth 1 -maxdepth 1 -exec rm -rf {} +" in cmd  # the files, never the mountpoint
+    assert "truncate -s 0 /img/volume_dirty" in cmd
     assert "losetup" not in cmd  # detaching flushes first; truncate is the only step that does not
 
 
+def test_drop_command_without_an_image_only_unlinks_the_files():
+    cmd = _vloopback_drop_dirty_volume_cmd("/var/lib/docker/plugins/p/propagated-mount", "volume_dirty", None)
+
+    assert "truncate -s 0" not in cmd and "/img" not in cmd
+    assert "rm -rf" in cmd
+
+
 def test_drop_command_quotes_the_volume_name():
-    cmd = _vloopback_drop_dirty_volume_cmd("/var/lib/docker/plugins/p", "vol; rm -rf /")
+    cmd = _vloopback_drop_dirty_volume_cmd("/var/lib/docker/plugins/p/propagated-mount", "vol; rm -rf /", None)
 
     # shlex-quoted inside the helper script, which is shlex-quoted again for `sh -c`
     assert """'"'"'vol; rm -rf /'"'"'""" in cmd
+
+
+def test_backing_file_under_a_plugin_mount_maps_to_the_host_source():
+    # vloopback:v2 binds the host's / at /srv and keeps DATA_DIR there
+    host_path = _vloopback_backing_file_host_path(
+        "/srv/var/lib/docker/vloopback-v2/volume_dirty",
+        [{"Source": "/dev", "Destination": "/dev"}, {"Source": "/", "Destination": "/srv"}],
+        "/var/lib/docker/plugins/plugin123/rootfs",
+    )
+
+    assert host_path == "/var/lib/docker/vloopback-v2/volume_dirty"
+
+
+def test_backing_file_outside_the_plugin_mounts_lives_in_its_rootfs():
+    # the v1 plugin keeps DATA_DIR inside its own rootfs
+    host_path = _vloopback_backing_file_host_path(
+        "/var/lib/docker/loopback/volume_dirty",
+        [{"Source": "/dev", "Destination": "/dev"}],
+        "/var/lib/docker/plugins/plugin123/rootfs",
+    )
+
+    assert host_path == "/var/lib/docker/plugins/plugin123/rootfs/var/lib/docker/loopback/volume_dirty"
 
 
 @pytest.mark.asyncio
@@ -120,10 +158,12 @@ async def test_delete_drops_dirty_volume_instead_of_the_graceful_stop(docker_ser
     assert isinstance(result, ContainerDeleted)
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
     assert commands[0] == "/usr/bin/docker volume inspect volume_dirty --format '{{.Driver}}'"
-    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:latest --format '{{.Id}}'"
-    assert ".State.Pid" in commands[3] and f"-lt {CONTAINER_STOP_GRACE_SECONDS}" in commands[3]
-    assert "truncate -s 0" in commands[4]
-    assert "src=/var/lib/docker/plugins/plugin123,dst=/mnt" in commands[4]
+    assert commands[1] == "/usr/bin/docker plugin inspect vloopback:v2 --format '{{.Id}} {{json .Settings.Mounts}}'"
+    assert "/sys/block/loop*/loop/backing_file" in commands[3] and "*/volume_dirty)" in commands[3]
+    assert ".State.Pid" in commands[4] and f"-lt {CONTAINER_STOP_GRACE_SECONDS}" in commands[4]
+    assert "src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in commands[5]
+    assert "src=/var/lib/docker/vloopback-v2,dst=/img" in commands[5]
+    assert "truncate -s 0 /img/volume_dirty" in commands[5]
     client = docker_service.rental_docker_client_factory.client
     assert client.container_call_order == [("remove", payload.container_name)]  # no docker stop
     assert client.stop_grace_seconds_calls == []
@@ -141,7 +181,7 @@ async def test_delete_of_a_filler_uses_the_filler_grace(docker_service, monkeypa
         keypair=Mock(ss58_address="validator-hotkey"), private_key="encrypted",
     )
 
-    stop_cmd = ssh_client.run.await_args_list[3].args[0]
+    stop_cmd = ssh_client.run.await_args_list[4].args[0]
     assert f"-lt {FILLER_CONTAINER_STOP_GRACE_SECONDS}" in stop_cmd
 
 
@@ -183,7 +223,7 @@ async def test_delete_falls_back_to_the_graceful_stop_when_the_drop_step_raises(
 @pytest.mark.asyncio
 async def test_drop_step_logs_a_failed_helper_and_still_reports_the_processes_stopped(docker_service):
     answers = _ssh_answers_for_vloopback_volume()
-    answers[4] = _make_ssh_command_result(exit_status=125, stderr="docker: Error response from daemon")
+    answers[5] = _make_ssh_command_result(exit_status=125, stderr="docker: Error response from daemon")
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(side_effect=answers)
 

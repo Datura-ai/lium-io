@@ -2168,25 +2168,54 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _vloopback_drop_dirty_volume_cmd(plugin_dir: str, local_volume: str) -> str:
-    # the helper sees the plugin dir at /mnt: `propagated-mount/<volume>` is the volume's mounted
-    # filesystem (unlinking its files drops their unwritten pages), `rootfs/<backing file>` is the
-    # loop image behind it (truncating drops the pages the loop worker already copied there; the
-    # path comes from sysfs because the plugin reports it inside its own rootfs). Both steps only
-    # destroy what `docker volume rm` destroys a moment later. Prints what happened; exit 0 always.
-    volume = shlex.quote(local_volume)
-    script = (
-        f"vol=/mnt/propagated-mount/{volume}; "
-        "dev=$(awk -v mp=\"$vol\" '$2==mp{d=$1} END{print d}' /proc/mounts); "
-        "wiped=no; truncated=no; img=; "
-        "if [ -n \"$dev\" ]; then "
-        "find \"$vol\" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; wiped=yes; "
-        "case \"$dev\" in /dev/loop*) img=/mnt/rootfs$(cat /sys/block/${dev#/dev/}/loop/backing_file 2>/dev/null);; esac; "
-        "fi; "
-        "if [ -n \"$img\" ] && [ -f \"$img\" ]; then truncate -s 0 \"$img\" && truncated=yes; fi; "
-        "echo \"wiped=$wiped truncated=$truncated dev=${dev:-none} img=${img:-none}\""
+def _vloopback_backing_file_host_path(
+    backing_file: str, plugin_mounts: list[dict], plugin_rootfs: str
+) -> str:
+    # the loop's backing file (sysfs) is a path inside the plugin's mount namespace: under one of
+    # the plugin's bind mounts (vloopback:v2 binds the host's / at /srv) or, with no mount above
+    # it, inside the plugin rootfs (the v1 plugin keeps its DATA_DIR there)
+    deepest_destination = ""
+    host_source = ""
+    for mount in plugin_mounts:
+        destination = (mount.get("Destination") or "").rstrip("/")
+        source = mount.get("Source") or ""
+        under_mount = backing_file == destination or backing_file.startswith(f"{destination}/")
+        if destination and source and under_mount and len(destination) > len(deepest_destination):
+            deepest_destination, host_source = destination, source
+    if not deepest_destination:
+        return f"{plugin_rootfs}{backing_file}"
+    return f"{host_source.rstrip('/')}{backing_file[len(deepest_destination):]}"
+
+
+def _vloopback_backing_file_cmd(local_volume: str) -> str:
+    # the loop devices are host-global, so the executor's /sys lists every attached backing file;
+    # the volume's image is named after the volume by both plugins. Prints the path or nothing.
+    return (
+        "for f in /sys/block/loop*/loop/backing_file; do b=$(cat \"$f\" 2>/dev/null); "
+        f"case \"$b\" in */{shlex.quote(local_volume)}) echo \"$b\"; break;; esac; done; true"
     )
-    return _vloopback_repair_helper_cmd(plugin_dir, f"sh -c {shlex.quote(script)}")
+
+
+def _vloopback_drop_dirty_volume_cmd(
+    propagated_mount_dir: str, local_volume: str, image_host_path: str | None
+) -> str:
+    # one throwaway helper (the stale-mountpoint repair's pattern): the volume's mounted filesystem
+    # at /mnt/<volume>, where unlinking the files drops their unwritten pages, and the image's
+    # directory at /img, where truncating the image drops the pages the loop worker already copied
+    # there. Both only destroy what `docker volume rm` destroys a moment later. Exit 0 always.
+    volume = shlex.quote(local_volume)
+    mounts = f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
+    script = (
+        f"wiped=no; truncated=no; "
+        f"if [ -d /mnt/{volume} ]; then "
+        f"find /mnt/{volume} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null; wiped=yes; fi; "
+    )
+    if image_host_path:
+        image_dir, _, image_name = image_host_path.rpartition("/")
+        mounts += f"--mount {shlex.quote(f'type=bind,src={image_dir},dst=/img')} "
+        script += f"if [ -f /img/{shlex.quote(image_name)} ]; then truncate -s 0 /img/{shlex.quote(image_name)} && truncated=yes; fi; "
+    script += 'echo "wiped=$wiped truncated=$truncated"'
+    return f"/usr/bin/docker run --rm {mounts}{_VLOOPBACK_REPAIR_IMAGE} sh -c {shlex.quote(script)}"
 
 
 def _should_repair_stale_mountpoint(
@@ -10418,16 +10447,31 @@ class DockerService:
         if getattr(inspect_result, "exit_status", 0) != 0 or not _is_vloopback_driver(driver):
             return False
         plugin_result = await ssh_client.run(
-            f"/usr/bin/docker plugin inspect {shlex.quote(driver)} --format '{{{{.Id}}}}'",
+            f"/usr/bin/docker plugin inspect {shlex.quote(driver)} "
+            "--format '{{.Id}} {{json .Settings.Mounts}}'",
             timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
         )
-        plugin_id = (plugin_result.stdout or "").strip()
+        plugin_id, _, plugin_mounts_json = (plugin_result.stdout or "").strip().partition(" ")
         if getattr(plugin_result, "exit_status", 0) != 0 or not plugin_id:
             return False
+        try:
+            plugin_mounts = json.loads(plugin_mounts_json or "null") or []
+        except ValueError:
+            plugin_mounts = []
         docker_root_dir = await self._docker_root_dir_or_default(
             ssh_client, {**log.base_extra, "local_volume": local_volume}
         )
         plugin_dir = f"{docker_root_dir}/plugins/{plugin_id}"
+        # read while the volume is still attached; empty when no loop carries this volume's image
+        backing_result = await ssh_client.run(
+            _vloopback_backing_file_cmd(local_volume), timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
+        )
+        backing_file = (backing_result.stdout or "").strip().splitlines()[-1:] or [""]
+        image_host_path = (
+            _vloopback_backing_file_host_path(backing_file[0], plugin_mounts, f"{plugin_dir}/rootfs")
+            if backing_file[0].startswith("/")
+            else None
+        )
 
         stop_grace_seconds = (
             FILLER_CONTAINER_STOP_GRACE_SECONDS
@@ -10452,13 +10496,15 @@ class DockerService:
 
         drop_started = time.monotonic()
         drop_result = await ssh_client.run(
-            _vloopback_drop_dirty_volume_cmd(plugin_dir, local_volume),
+            _vloopback_drop_dirty_volume_cmd(
+                f"{plugin_dir}/propagated-mount", local_volume, image_host_path
+            ),
             timeout=_DROP_DIRTY_VOLUME_HELPER_TIMEOUT_SEC,
         )
         drop_fields = dict(
             container_name=payload.container_name,
             local_volume=local_volume,
-            plugin_dir=plugin_dir,
+            image_host_path=image_host_path,
             result=(drop_result.stdout or "").strip(),
             duration_ms=int((time.monotonic() - drop_started) * 1000),
         )
