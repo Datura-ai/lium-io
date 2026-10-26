@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis.asyncio as aioredis
+import redis.exceptions
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
@@ -24,7 +25,9 @@ async def test_a_new_connector_waits_until_the_old_one_stops_leading(tmp_path, m
     monkeypatch.setattr(compute_client, "CONNECTOR_LEAD_LOCK_TTL_SECONDS", 1)
     # shortcut: fakeredis runs no Lua without lupa (not a dependency); renew with a plain PEXPIRE here
     monkeypatch.setattr(
-        aioredis.lock.Lock, "reacquire", lambda self: self.redis.pexpire(self.name, int(self.timeout * 1000))
+        aioredis.lock.Lock,
+        "reacquire",
+        lambda self: self.redis.pexpire(self.name, int(self.timeout * 1000)),
     )
     server = FakeServer()
     old, new = _client(server), _client(server)
@@ -38,3 +41,45 @@ async def test_a_new_connector_waits_until_the_old_one_stops_leading(tmp_path, m
     old._lead_task.cancel()  # the old pod is gone; its lead expires
     await asyncio.wait_for(taking, 3)
     new._lead_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_redis_error_while_taking_the_lead_unreadies_the_pod_and_retries(
+    tmp_path, monkeypatch
+) -> None:
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(ready))
+    ready_while_failed = []
+    real_unready = compute_client.mark_connector_unready
+
+    def unready() -> None:
+        real_unready()
+        ready_while_failed.append(ready.exists())
+
+    monkeypatch.setattr(compute_client, "mark_connector_unready", unready)
+    attempts = []
+
+    async def acquire(self, *args, **kwargs):
+        attempts.append(ready.exists())
+        if len(attempts) == 1:
+            raise redis.exceptions.ConnectionError("failover")
+        return True
+
+    monkeypatch.setattr(aioredis.lock.Lock, "acquire", acquire)
+    client = _client(FakeServer())
+
+    await asyncio.wait_for(client.take_connector_lead(), 5)
+    client._lead_task.cancel()
+
+    assert attempts == [True, True]  # ready only while actually waiting on the lock
+    assert ready_while_failed == [False]  # and not while the error is retried
+    assert ready.exists()
+
+
+def test_an_unready_connector_has_no_ready_file(tmp_path, monkeypatch) -> None:
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(ready))
+    ready.touch()
+    compute_client.mark_connector_unready()
+    assert not ready.exists()
+    compute_client.mark_connector_unready()  # already gone: no error

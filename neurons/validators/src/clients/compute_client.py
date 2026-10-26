@@ -117,6 +117,11 @@ CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
 
 
+def mark_connector_unready() -> None:
+    with suppress(FileNotFoundError):
+        os.remove(CONNECTOR_READY_FILE)
+
+
 command_responses: ContextVar[list[str] | None] = ContextVar("command_responses", default=None)
 
 
@@ -1033,9 +1038,10 @@ class ComputeClient:
         )
 
     async def take_connector_lead(self) -> None:
-        """Wait until no other connector leads, then lead while this process lives (DAH-5177)."""
-        with open(CONNECTOR_READY_FILE, "w"):
-            pass
+        """Wait until no other connector leads, then lead while this process lives (DAH-5177).
+
+        Ready (the deployment lets the old pod go) only while waiting on the lock or leading: a Redis error retries
+        here, unready, instead of unwinding into start_process's full restart with the probe still passing."""
         lock = aioredis.lock.Lock(
             self.miner_service.redis_service.redis,
             CONNECTOR_LEAD_LOCK_KEY,
@@ -1044,8 +1050,17 @@ class ComputeClient:
             thread_local=False,
         )
         extra = get_extra_info(self.logging_extra)
-        logger.info(_m("Waiting to lead the backend connection", extra=extra))
-        await lock.acquire()
+        while True:
+            with open(CONNECTOR_READY_FILE, "w"):
+                pass
+            logger.info(_m("Waiting to lead the backend connection", extra=extra))
+            try:
+                await lock.acquire()
+                break
+            except redis.exceptions.RedisError as exc:
+                mark_connector_unready()
+                logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
+                await asyncio.sleep(1)
         logger.info(_m("Leading the backend connection", extra=extra))
         self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
 
