@@ -13,6 +13,10 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
+# machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
+# out: a busy host, not a verdict on Sysbox
+SYSBOX_TEST_TIMED_OUT = "Test command timed out."
+
 
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
@@ -263,6 +267,9 @@ class PortConnectivityCheck:
         executor whose probe never reached its container reads that memory. A probe that reached
         its container and found no sysbox stays a verdict. Fails open to the current behaviour on a
         Redis error.
+
+        An unrented node reads it too when the scrape's sysbox test timed out (26 Oct, a B300 whose
+        own Lium filler was loading: two cycles of SYSBOX_REQUIRED_MISSING with Sysbox working).
         """
         redis = ctx.services.redis
         try:
@@ -272,7 +279,16 @@ class PortConnectivityCheck:
                 )
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            if not rented or sysbox_now or result.dind_ok:
+            if sysbox_now or result.sysbox_measured is not None:
+                return False
+            # nothing was measured about sysbox this cycle. Rented: the probe never reached its container.
+            # Unrented: the scrape's own sysbox test timed out, so the probe ran without sysbox-runc and either
+            # never came up or came up under runc; a scrape test that ran and failed stays a verdict.
+            if rented:
+                unknown = not result.dind_ok
+            else:
+                unknown = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error") == SYSBOX_TEST_TIMED_OUT
+            if not unknown:
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it
