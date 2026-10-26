@@ -81,11 +81,11 @@ _SNAPSHOT = (
     'awk -v b="${f##*/}" \'/^Slave Interface:/{printf " %s:%s", $3, b}\' "$f"; done 2>/dev/null); '
     # Provenance: own PID is the container's (init $p): in its PID namespace, or a descendant of its init (nested
     # namespaces); 0 = yes, 1 = not (a host process attached to its cgroup or netns), 2 = gone mid-read. prov prints
-    # 0 when any listed PID is not the container's, else 1.
+    # 0 when any listed PID is not the container's, nothing when one could not be read (never counted as own), else 1.
     'own() { [ /proc/$1/ns/pid -ef /proc/$p/ns/pid ] && return 0; q=$1; while [ "$q" != "$p" ]; do '
     "q=$(awk '/^PPid:/{print $2}' /proc/$q/status 2>/dev/null); [ -n \"$q\" ] || return 2; "
     '[ "$q" -gt 0 ] || return 1; done; return 0; }; '
-    "prov() { r=1; while read i; do own $i; [ $? = 1 ] && r=0 && break; done; echo $r; }; "
+    "prov() { r=1; while read i; do own $i; case $? in 1) r=0; break;; 2) r=;; esac; done; echo $r; }; "
     # Per rented pod ($pp: pid/container id, set by throughput_command): rx:tx of its own network namespace (not
     # the host's), bytes:requests of its container cgroup (systemd or cgroupfs driver), then the provenance of the
     # processes in that cgroup (its subtree) and in that network namespace; a field left empty is not readable.

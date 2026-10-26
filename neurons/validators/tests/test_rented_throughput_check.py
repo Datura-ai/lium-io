@@ -638,8 +638,9 @@ def test_provenance_tells_the_containers_processes_from_a_host_helper(tmp_path):
         "own 1; echo $?; kill $child"
     )
     out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=30).stdout
-    # the child is the container's; pid 1 (a host process) is foreign; a PID gone mid-read is not counted against it
-    assert out.split()[-4:] == ["1", "0", "1", "1"], out
+    # the child is the container's; pid 1 (a host process) is foreign; a PID gone mid-read is unreadable (empty),
+    # never the container's own
+    assert out.splitlines()[-4:] == ["1", "0", "", "1"], out
 
 
 async def test_idle_foreign_or_stopped_rentals_are_left_alone():
