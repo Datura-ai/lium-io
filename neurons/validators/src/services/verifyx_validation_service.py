@@ -12,7 +12,16 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
 from core.config import FeatureFlag, settings
 from core.utils import _m, get_extra_info
-from core.checksums import sha256_from_executor, sha256_from_path
+from core.checksums import (
+    ARM_VERIFIER_NOT_AVAILABLE,
+    ARM_VERIFIER_NOT_AVAILABLE_ERROR,
+    EXECUTOR_ARCH_UNKNOWN,
+    EXECUTOR_ARCH_UNKNOWN_ERROR,
+    aarch64_lib_path,
+    executor_arch,
+    sha256_from_executor,
+    sha256_from_path,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -306,8 +315,16 @@ class VerifyXValidationService:
             cipher_text=cipher_text,
             challenge_input=challenge_input,
             log_extra=log_extra,
-            expected_lib_sha256=self.lib_sha256(lib_name),
+            expected_lib_sha256=self.lib_sha256(self._executor_lib_path(lib_name, machine_spec)),
         )
+
+    @staticmethod
+    def _executor_lib_path(lib_name: str, machine_spec: dict) -> str:
+        """The library the executor holds: the aarch64 build on an ARM host (when this validator has it),
+        so `/verify` and the SSH checksum gate accept the same file for one architecture."""
+        if machine_spec.get("machine_arch") == "aarch64":
+            return aarch64_lib_path(lib_name) or lib_name
+        return lib_name
 
     def evaluate_verifyx_capture(
         self,
@@ -373,10 +390,27 @@ class VerifyXValidationService:
         try:
             # Verify checksum before proceeding with validation
             lib_name = self.gated_lib_name()
-            local_checksum = self.lib_sha256(lib_name)
+            source = lib_name
+            # the CPU first: an ARM host holding the x86 build matches the native digest and must not pass as current
+            arch = await executor_arch(shell)
+            if arch == "aarch64":
+                # an ARM executor holds the aarch64 build: check it against (and send) the validator's copy of that
+                source = aarch64_lib_path(lib_name)
+                if source is None:
+                    logger.warning(_m(ARM_VERIFIER_NOT_AVAILABLE, extra=get_extra_info(default_extra)))
+                    return VerifyXResponse(
+                        error=ARM_VERIFIER_NOT_AVAILABLE_ERROR,
+                        diagnostics={"event": ARM_VERIFIER_NOT_AVAILABLE, "executor_arch": "aarch64"},
+                    )
+            local_checksum = self.lib_sha256(source)
             executor_checksum = await sha256_from_executor(shell, lib_name)
 
             if local_checksum != executor_checksum:
+                if arch is None:
+                    logger.warning(_m(EXECUTOR_ARCH_UNKNOWN, extra=get_extra_info(default_extra)))
+                    return VerifyXResponse(
+                        error=EXECUTOR_ARCH_UNKNOWN_ERROR, diagnostics={"event": EXECUTOR_ARCH_UNKNOWN}
+                    )
                 mismatch_extra = {
                     **default_extra,
                     "local_sha256": local_checksum,
@@ -408,7 +442,7 @@ class VerifyXValidationService:
                         diagnostics={"event": "VERIFYX_LIBRARY_WRITE_DENIED"},
                     )
                 refreshed = await self._refresh_executor_library(
-                    shell, local_checksum, default_extra
+                    shell, local_checksum, default_extra, source=source
                 )
                 if not refreshed:
                     return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
@@ -472,7 +506,7 @@ class VerifyXValidationService:
         )
 
     async def _refresh_executor_library(
-        self, shell, expected_sha256: str, default_extra: dict
+        self, shell, expected_sha256: str, default_extra: dict, source: str = LIB_PATH
     ) -> bool:
         """One attempt to put the validator's libverifyx.so on the executor.
 
@@ -481,7 +515,8 @@ class VerifyXValidationService:
         upload the validator's own file (the source of truth). Log every outcome,
         including the fetch error. Returns True when the executor hash matches.
         """
-        url = settings.verifyx.LIBRARY_FETCH_URL
+        # the aarch64 build is published next to the x86 one under its own file name
+        url = settings.verifyx.LIBRARY_FETCH_URL.replace(os.path.basename(LIB_PATH), os.path.basename(source))
         tmp = "/tmp/libverifyx.so.fetch"
         curl_cmd = (
             f"curl -fsSL --max-time 60 -o {shlex.quote(tmp)} {shlex.quote(url)}; "
@@ -535,7 +570,7 @@ class VerifyXValidationService:
                 ),
             )
         )
-        put_error = await self._put_validator_library(shell)
+        put_error = await self._put_validator_library(shell, source)
         if put_error:
             logger.warning(
                 _m(
@@ -555,18 +590,18 @@ class VerifyXValidationService:
         )
         return True
 
-    async def _put_validator_library(self, shell) -> str | None:
+    async def _put_validator_library(self, shell, source: str = LIB_PATH) -> str | None:
         """SFTP the validator's libverifyx.so onto the executor. Returns an error string or None."""
         start = getattr(getattr(shell, "ssh_client", None), "start_sftp_client", None)
         if start is None:
             return "no SFTP client"
         try:
             async with start() as sftp:
-                await sftp.put(LIB_PATH, LIB_PATH)
+                await sftp.put(source, LIB_PATH)
         except TypeError:
             try:
                 sftp = start()
-                await sftp.put(LIB_PATH, LIB_PATH)
+                await sftp.put(source, LIB_PATH)
             except Exception as e:
                 return f"{type(e).__name__}: {e}"
         except Exception as e:

@@ -291,10 +291,9 @@ def keep_one_executor_per_gpu(
 
     Scored executors of one hotkey that report a shared GPU UUID are one set of cards listed
     more than once. The rented copy keeps the score, else the lowest executor UUID; a rented copy
-    is never zeroed. The others are logged and, with GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED,
-    score 0. Returns the (hotkey, result) pairs that lost the score or would have.
+    is never zeroed. The others are logged and score 0. Returns the (hotkey, result) pairs that
+    lost the score.
     """
-    enforce = settings.GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED
     aliases: list[tuple[str, JobResult]] = []
     for hotkey in sorted(job_results):
         by_gpu: dict[str, list[JobResult]] = defaultdict(list)
@@ -320,23 +319,20 @@ def keep_one_executor_per_gpu(
                 }
                 logger.warning(
                     _m(
-                        "One miner reported the same GPU under two executors this cycle"
-                        + ("; one executor keeps the score" if enforce else " (logged only)"),
+                        "One miner reported the same GPU under two executors this cycle; one executor keeps the score",
                         extra=get_extra_info(
                             {
                                 **(default_extra or {}),
                                 "outcome": GPU_ALIAS_OUTCOME,
-                                "enforced": enforce,
                                 **what,
                             }
                         ),
                     )
                 )
-                if enforce:
-                    result.score = 0
-                    result.job_score = 0
-                    result.failure_reason_code = Msg.GPU_ALIAS.reason
-                    result.validation_event = render_message(
-                        Msg.GPU_ALIAS, ctx=None, check_id=GPU_ALIAS_CHECK_ID, what=what
-                    )
+                result.score = 0
+                result.job_score = 0
+                result.failure_reason_code = Msg.GPU_ALIAS.reason
+                result.validation_event = render_message(
+                    Msg.GPU_ALIAS, ctx=None, check_id=GPU_ALIAS_CHECK_ID, what=what
+                )
     return aliases
