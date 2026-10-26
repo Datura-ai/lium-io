@@ -328,13 +328,13 @@ class RentedThroughputCheck:
     renter's runtime) writes DISK_PROBE_BYTES with fsync and reads the two pinned files of ContainerDownloadSpeedCheck.
     A reading fails when a download fails that check's test (CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or unreachable while
     the validator reaches it) or the write runs under RENTED_THROUGHPUT_DISK_MIN_MB_PER_S. The renter's own traffic
-    is no excuse below the floors: only when the 2 s before the probe already moved RENTED_THROUGHPUT_BUSY_MBPS on the
-    host NICs (either direction), or RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S on a disk under the docker root, is that side
-    no verdict (a link or disk doing that much is not the defect); so is the network side without host NIC counters.
-    A failing side is inconclusive (no strike, no pass, re-probed after RETRY_SECONDS) when the rented pods themselves
-    moved DURING_* on that resource while the probe measured it (their own network namespace and container cgroup
-    counters, not the host's), or when those pod counters are incomplete (a pod stopped, restarted or unreadable): one
-    renter-induced slow reading never fails a node. The host can feed or hide those counters, so
+    is no outright excuse below the floors. When the 2 s before the probe already moved RENTED_THROUGHPUT_BUSY_MBPS on
+    the host NICs (either direction), or RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S on a disk under the docker root, a slow
+    side is inconclusive (the provider can make that load itself); the network side without host NIC counters is no
+    verdict. A failing side is also inconclusive (no strike, no pass, re-probed after RETRY_SECONDS) when the rented
+    pods themselves moved DURING_* on that resource while the probe measured it (their own network namespace and
+    container cgroup counters, not the host's), or when those pod counters are incomplete (a pod stopped, restarted or
+    unreadable): one renter-induced slow reading never fails a node. The host can feed or hide those counters, so
     INCONCLUSIVE_BEFORE_STRIKE inconclusive readings of one side in a row count as a failing reading.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading. Non-fatal: the rental keeps running.
@@ -439,33 +439,37 @@ class RentedThroughputCheck:
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)
         net_incomplete, disk_incomplete = pods_incomplete(stdout, len(pods))
-        # no host counters: a slow download may be the renter's, so the network side is no verdict
-        net_busy = net_mbps is None or net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS
+        # A busy host before the probe makes a slow side inconclusive, never an outright excuse: the provider can make
+        # that load itself. No host counters (or docker root devices unresolved): the side is no verdict.
+        net_busy = net_mbps is not None and net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS
         disk_is_busy = (
-            disk_busy is None or disk_busy >= settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S
+            disk_busy is not None and disk_busy >= settings.RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S
         )
 
         judged = await ContainerDownloadSpeedCheck()._judge(endpoints)
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
         off_rentals = not endpoints or any(r.network != RENTAL_NETWORK_NAME for r in endpoints)
-        if net_busy or off_rentals or judged.has_no_verdict:
+        if net_mbps is None or off_rentals or judged.has_no_verdict:
             net = "none"
+        elif judged.is_failing:
+            net = "fail"
         else:
-            net = "fail" if judged.is_failing else "pass"
+            net = "none" if net_busy else "pass"
         # a failing side is inconclusive when the renter's own pods used that resource while it was measured, or their
         # counters are incomplete; never an outright excuse, the host can feed or hide those counters
         if net == "fail" and (
-            net_incomplete or (during_net is not None and during_net >= DURING_NET_MBPS)
+            net_busy or net_incomplete or (during_net is not None and during_net >= DURING_NET_MBPS)
         ):
             net = "inconclusive"
-        if disk_is_busy or disk.mb_per_s is None:
+        if disk_busy is None or disk.mb_per_s is None:
             disk_side = "none"
+        elif disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S:
+            disk_side = "fail"
         else:
-            disk_side = (
-                "fail" if disk.mb_per_s < settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S else "pass"
-            )
+            disk_side = "none" if disk_is_busy else "pass"
         if disk_side == "fail" and (
-            disk_incomplete
+            disk_is_busy
+            or disk_incomplete
             or (during_disk or 0) >= DURING_DISK_MB_PER_S
             or (during_iops or 0) >= DURING_DISK_IOPS
         ):

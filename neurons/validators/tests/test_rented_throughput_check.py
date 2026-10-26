@@ -234,10 +234,15 @@ async def test_only_the_docker_root_disk_excuses_the_disk(resolved, seconds, rel
         ctx, _ = make_ctx(output)
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "pass"
-    # an unresolved docker root is never judged on another disk's traffic
-    assert disk_side == (
-        "none" if relevant or not resolved else "fail" if seconds == 30 else "pass"
-    )
+    # an unresolved docker root is never judged on another disk's traffic; a busy docker-root disk makes a slow write
+    # inconclusive (capped by INCONCLUSIVE_BEFORE_STRIKE), never an outright excuse
+    slow = seconds == 30
+    if not resolved:
+        assert disk_side == "none"
+    elif relevant:
+        assert disk_side == ("inconclusive" if slow else "none")
+    else:
+        assert disk_side == ("fail" if slow else "pass")
 
 
 @pytest.mark.parametrize(
@@ -267,7 +272,7 @@ async def test_two_slow_readings_zero_the_score_until_that_side_passes(answer, r
         assert (await check.run(ctx)).passed is True
 
 
-# the host's NICs busy either way, or their counters unreadable: a slow download is no verdict
+# the host NICs busy either way (inconclusive), or their counters unreadable (no verdict): no strike, the streak stays
 @pytest.mark.parametrize("busy", [BUSY_NET, BUSY_UPLOAD, NO_COUNTERS])
 async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
     with flags() as clock:
@@ -381,6 +386,31 @@ async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
             clock.now += 31 * 60
             assert (await check.run(ctx)).passed
         assert stored(ctx)["failures_in_a_row"] == 1  # the n-th excused probe in a row: a strike
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+# Load the provider makes on the host NICs or the docker-root disk in the 2 s before the probe cannot excuse a slow
+# side forever: one busy reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(rx_bytes=100_000_000) + disk() + SLOW,  # 400 Mbps on the host NICs
+        snaps(sectors=2_000_000) + disk(secs=30.0) + FAST,  # 512 MB/s on the docker-root disk
+    ],
+    ids=["busy_nics", "busy_disk"],
+)
+async def test_provider_made_host_load_cannot_excuse_a_slow_node_forever(answer):
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * (n + 1))
+        check = RentedThroughputCheck()
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 0
+        for _ in range(n - 1):
+            clock.now += 31 * 60
+            assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 1
         clock.now += 31 * 60
         assert (await check.run(ctx)).passed is False
 
