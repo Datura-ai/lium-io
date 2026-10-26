@@ -387,6 +387,7 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
     assert command[command.index("--log-driver") + 1] == "none"
     assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
     assert command[command.index("--memory") + 1] == "4g"
+    assert "GOMAXPROCS=8" in command
     assert command[command.index("--oom-score-adj") + 1] == "1000"
     assert "GOGC=50" in command
     assert command[command.index("--label") + 1] == f"lium.backup-helper={OPERATION_ID}"
