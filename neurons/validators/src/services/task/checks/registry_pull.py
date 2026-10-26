@@ -421,9 +421,13 @@ class RegistryPullCheck:
             return self._skipped(ctx, "last pull reading unreadable in Redis")
         if _is_rented(ctx):
             # no pull beside a renter's pod, but a split node with free GPUs is still a move target, so the
-            # last reading's store is published
+            # last reading's store is published. Saving the same record again renews its TTL, so a rental past
+            # _REDIS_TTL_SECONDS keeps it; `at` is unchanged, so the pull schedule is too
             result = self._skipped(ctx, "rented")
-            return _with_image_store(ctx, last_state, result) if last_state else result
+            if last_state is None:
+                return result
+            await self._save(ctx, last_state)
+            return _with_image_store(ctx, last_state, result)
 
         now = time.time()
         if last_state is None:

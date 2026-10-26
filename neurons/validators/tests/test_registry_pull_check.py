@@ -95,6 +95,27 @@ async def test_a_cycle_between_pulls_publishes_the_last_reading(rented):
 
 
 @pytest.mark.asyncio
+async def test_a_rented_cycle_renews_the_records_ttl_without_a_pull():
+    """Review of #1864: rented cycles never re-saved the record, so a rental past 7 days lost the store."""
+    ctx = _ctx(_pull_output("overlayfs"))
+    await _pull_now(ctx)
+    key = f"{module._REDIS_PREFIX}:{ctx.executor.uuid}"
+    redis = ctx.services.redis
+    before = redis.store[key]
+    redis.ttl[key] = 60  # nearly expired
+    ctx.runner.run.reset_mock()
+    rented_data = SimpleNamespace(executors={ctx.executor.uuid: SimpleNamespace(pods=[object()])})
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data)})
+
+    result = await module.RegistryPullCheck().run(ctx)
+
+    ctx.runner.run.assert_not_called()
+    assert redis.ttl[key] == module._REDIS_TTL_SECONDS
+    assert redis.store[key] == before
+    assert result.updates["state"].specs["docker_image_store"] == "containerd"
+
+
+@pytest.mark.asyncio
 async def test_a_pull_that_read_no_driver_keeps_the_last_store():
     """Review of #1864: a pull that did not run saved a record with no driver over the last one, so the node
     published no store for 3-9 h."""
