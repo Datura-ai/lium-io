@@ -256,12 +256,6 @@ class Settings(BaseSettings):
     INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
         env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
     )
-    # DAH-4548: on, the sensor's rental-interference verdict of a host write into a rented pod fails
-    # the Inspector check and zeroes the score. Off: unchanged, logged as INSPECTOR_HOST_WRITE with
-    # enforced=false. A read is only logged either way.
-    INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -275,6 +269,8 @@ class Settings(BaseSettings):
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
+    # Emergency switch for new volumes only; existing recorded drivers remain usable.
+    LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
@@ -580,13 +576,6 @@ class Settings(BaseSettings):
     # nodes' idle shares moved to the verified burner); with none to serve, submit this tempo's vector with its
     # idle moved to the burner, never an older vector.
     SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
-    # Two executors of ONE miner hotkey that report the same GPU UUID in one cycle are one set of
-    # cards listed twice. Always logged (GPU_ALIAS_SAME_MINER); with this on, every copy but one
-    # scores 0 for the cycle. Only the miner's own executors are compared, so another miner
-    # reporting the same UUIDs cannot cost it anything.
-    GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED: bool = Field(
-        env="GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", default=False
-    )
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
