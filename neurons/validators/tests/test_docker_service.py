@@ -18,6 +18,7 @@ from tenacity import Future, RetryError
 
 import services.docker_service as docker_service_module
 from services.attestation_service import AttestationError
+from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
@@ -8119,6 +8120,73 @@ def test_sysbox_many_layers_sentence_reads_the_last_retry_attempt():
         == docker_service_module.SYSBOX_MANY_LAYERS_RENTER_SENTENCE
     )
     assert docker_service_module.sysbox_many_layers_sentence(RuntimeError("port is already allocated")) is None
+
+
+_SYSBOX_MANY_LAYERS_ERR = f"{_SYSBOX_OCI_PREFIX}l/RK22RUSOMIWEQLFK45ZMFTQT2M (likely means idmapped mounts ..."
+
+
+class _SysboxFailingRentalClient:
+    def __init__(self, fail_images):
+        self.fail_images = fail_images
+        self.events: list[str] = []
+
+    async def run_container(self, spec):
+        self.events.append(f"run {spec.image}")
+        if spec.image in self.fail_images:
+            raise Exception(_SYSBOX_MANY_LAYERS_ERR)
+        return "cid"
+
+    async def remove_container(self, *, container_name, force, remove_volumes):
+        self.events.append(f"rm {container_name}")
+
+
+async def _create_with_flatten(docker_service, client, flatten):
+    docker_service.stream_log = AsyncMock()
+    with patch.object(docker_service_module, "flatten_image_on_host", flatten):
+        return await docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=client,
+            ssh_client=Mock(),
+            run_spec=ContainerRunSpec(image="sglang", name="pod_x"),
+            container_name="pod_x",
+            default_extra={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_sysbox_many_layers_create_retries_once_from_a_flattened_copy_on_the_same_node(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    assert await _create_with_flatten(docker_service, client, flatten) == "cid"
+    assert client.events == ["run sglang", "rm pod_x", "run lium-flattened:abc"]
+    flatten.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sysbox_many_layers_create_flattens_at_most_once(docker_service):
+    client = _SysboxFailingRentalClient({"sglang", "lium-flattened:abc"})
+    flatten = AsyncMock(return_value="lium-flattened:abc")
+    with pytest.raises(Exception, match="ID-mapped mount"):
+        await _create_with_flatten(docker_service, client, flatten)
+    flatten.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_flatten_fails_the_create_with_the_sysbox_error(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(side_effect=RuntimeError("flatten failed: export=1 import=0"))
+    with pytest.raises(Exception) as exc:
+        await _create_with_flatten(docker_service, client, flatten)
+    assert docker_service_module.sysbox_many_layers_sentence(exc.value)
+    assert client.events == ["run sglang"]
+
+
+@pytest.mark.asyncio
+async def test_no_disk_for_the_flattened_copy_fails_with_the_renter_sentence(docker_service):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = AsyncMock(side_effect=ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE))
+    with pytest.raises(ImageFlattenNoDisk) as exc:
+        await _create_with_flatten(docker_service, client, flatten)
+    assert exc.value.renter_sentence.startswith("not enough free disk on this node")
 
 
 @pytest.mark.asyncio

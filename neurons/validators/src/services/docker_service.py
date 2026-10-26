@@ -115,6 +115,7 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk, flatten_image_on_host
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
@@ -2568,6 +2569,7 @@ class DockerService:
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
         vloopback_mount_repair_attempted = False
+        image_flattened = False
         remapped = False
         while True:
             try:
@@ -2609,6 +2611,23 @@ class DockerService:
                             default_extra=default_extra,
                             warning_event="STALE_MOUNT_RETRY_RM_FAILED",
                         )
+                        continue
+
+                if not image_flattened and sysbox_many_layers_sentence(exc):
+                    # the renter picked this node: start a one-layer copy of the image here (owner, 26 Oct)
+                    image_flattened = True
+                    flat_image = await self._flatten_rental_image(
+                        ssh_client=ssh_client, image=run_spec.image, default_extra=default_extra, log_tag=log_tag
+                    )
+                    if flat_image is not None:
+                        await self._remove_failed_rental_container_for_retry(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="FLATTEN_RETRY_RM_FAILED",
+                        )
+                        run_spec = dataclasses.replace(run_spec, image=flat_image)
+                        attempt += 1
                         continue
 
                 port_allocation_phrase = _port_allocated_phrase(exc)
@@ -2704,6 +2723,47 @@ class DockerService:
                 )
                 await self.stream_log(error_text, "error", log_tag)
                 raise
+
+    async def _flatten_rental_image(
+        self, *, ssh_client: asyncssh.SSHClientConnection, image: str, default_extra: dict, log_tag: str
+    ) -> str | None:
+        """The one-layer copy's tag, or None when the flatten failed (the create then fails with
+        Sysbox's error). Raises ImageFlattenNoDisk when the node has no room for the copy."""
+        await self.stream_log(
+            "This image has too many layers for this node's storage driver; "
+            "preparing a single-layer copy (a large image takes several minutes)",
+            "info",
+            log_tag,
+        )
+        started = time.monotonic()
+        try:
+            flat_image = await flatten_image_on_host(ssh_client, image)
+        except ImageFlattenNoDisk:
+            logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
+            await self.stream_log(FLATTEN_NO_DISK_RENTER_SENTENCE, "error", log_tag)
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "SYSBOX_FLATTEN_FAILED",
+                    extra=get_extra_info({**default_extra, "image": image, "error": str(exc)[:2000]}),
+                ),
+                exc_info=True,
+            )
+            return None
+        logger.info(
+            _m(
+                "SYSBOX_FLATTEN_RETRY",
+                extra=get_extra_info({
+                    **default_extra,
+                    "image": image,
+                    "flat_image": flat_image,
+                    "seconds": int(time.monotonic() - started),
+                }),
+            )
+        )
+        await self.stream_log("Single-layer copy ready; starting the pod", "success", log_tag)
+        return flat_image
 
     async def _remove_failed_rental_container_for_retry(
         self,
@@ -9563,7 +9623,7 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=(
                     last_exc.renter_sentence
-                    if isinstance(last_exc, ContainerKilledDuringBootstrap)
+                    if isinstance(last_exc, (ContainerKilledDuringBootstrap, ImageFlattenNoDisk))
                     else sysbox_many_layers_sentence(e) or str(log_text)
                 ),
                 detail=failure_detail,
