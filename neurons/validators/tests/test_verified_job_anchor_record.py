@@ -40,7 +40,7 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, f"hk:{EXECUTOR}"))
 
 
-async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool, spot: bool = False):
+async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool, spot: bool = False, model: str = "A100"):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
     Pipeline, the outcome persisted by the ResultHandler."""
     verified = await service.get_verified_job_info("hk", EXECUTOR)
@@ -48,7 +48,7 @@ async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool, s
     ctx = context_factory(
         state=build_state(
             gpu_uuids=uuids,
-            gpu_model_count=f"A100:{len(uuids.split(','))}",
+            gpu_model_count=f"{model}:{len(uuids.split(','))}",
             rented_data=RentedExecutorsResponse(executors={}, spot_executor_ids=spot_ids),
         ),
         verified=verified,
@@ -115,15 +115,18 @@ async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_re_anchored(cont
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("spot", "swapped", "anchored_after"),
+    ("spot", "swapped", "anchored_after", "model"),
     [
-        (True, "gpu-001,gpu-003", "gpu-001,gpu-003"),  # Spot, one card replaced: re-anchored, same node id
-        (False, "gpu-001,gpu-003", "gpu-001,gpu-002"),  # off Spot (e.g. Secure), one card replaced: the anchor stays
-        (True, "gpu-003", "gpu-001,gpu-002"),  # Spot, a card missing: the anchor stays
-        (True, "gpu-001,gpu-002,gpu-003", "gpu-001,gpu-002"),  # Spot, a card added: the anchor stays
+        (True, "gpu-001,gpu-003", "gpu-001,gpu-003", "A100"),  # Spot, one card replaced: re-anchored, same node id
+        (False, "gpu-001,gpu-003", "gpu-001,gpu-002", "A100"),  # off Spot (e.g. Secure), one card replaced: the anchor stays
+        (True, "gpu-003", "gpu-001,gpu-002", "A100"),  # Spot, a card missing: the anchor stays
+        (True, "gpu-001,gpu-002,gpu-003", "gpu-001,gpu-002", "A100"),  # Spot, a card added: the anchor stays
+        (True, "gpu-003,gpu-004", "gpu-001,gpu-002", "H100"),  # same count, another model: the anchor stays
     ],
 )
-async def test_replaced_cards_on_an_idle_spot_node_re_verify_in_place(context_factory, spot, swapped, anchored_after):
+async def test_replaced_cards_on_an_idle_spot_node_re_verify_in_place(
+    context_factory, spot, swapped, anchored_after, model
+):
     """A provider replaced GPUs on a Spot node and was told to remove and re-add it. The swap cycle says it
     re-verifies in place; the next cycle passes with the new set under the same executor id."""
     service = _redis_service()
@@ -131,13 +134,13 @@ async def test_replaced_cards_on_an_idle_spot_node_re_verify_in_place(context_fa
     handler = ResultHandler(redis_service=service, dry_run=False)
     await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=False, spot=spot)
 
-    ok, event, _ = await _cycle(service, handler, context_factory, uuids=swapped, hard=False, spot=spot)
+    ok, event, _ = await _cycle(service, handler, context_factory, uuids=swapped, hard=False, spot=spot, model=model)
     reanchored = anchored_after == swapped
     assert ok is False and event.reason_code == "GPU_UUID_CHANGED"
     assert event.what_we_saw.get("reanchored", False) is reanchored
     assert ("do not remove the node" in event.remediation) is reanchored
 
-    ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False, spot=spot)
+    ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False, spot=spot, model=model)
     assert record["uuids"] == anchored_after
     assert ok is reanchored
 

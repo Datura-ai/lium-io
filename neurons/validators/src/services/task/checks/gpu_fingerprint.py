@@ -119,9 +119,11 @@ class GpuFingerprintCheck:
                 from .gpu_loss_hold import rented_pods  # gpu_loss_hold imports this module
 
                 # still a reset (score 0 this cycle); the next cycle anchors the new cards
+                # another GPU model keeps the old `spec`, so SpecChangeCheck would fail it every cycle
+                spec, new_spec = verified.get("spec"), ctx.state.gpu_model_count
                 reanchor = cards_replaced(
                     anchor, current, rented=bool(rented_pods(ctx)), spot=is_spot(ctx)
-                )
+                ) and not (spec and new_spec and spec != new_spec)
                 event = render_message(
                     Msg.UUID_REPLACED if reanchor else Msg.UUID_CHANGED,
                     ctx=ctx,
