@@ -9,7 +9,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
-    MissingFlagshipCapability,
+    MissingFull8xCapability,
     PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
@@ -35,7 +35,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "nvidia_driver_below_minimum",
         "sysbox_not_enabled",
         "insufficient_disk_for_vram",
-        "flagship_without_ncu_or_split",
+        "full_8x_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
@@ -151,13 +151,13 @@ def _job(**overrides) -> JobResult:
             "rented node",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            lambda job: MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job,
-                MissingFlagshipCapability(
+                MissingFull8xCapability(
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),
-            "flagship_without_ncu_or_split",
+            "full_8x_without_ncu_or_split",
             "NCU profiling",
         ),
         (

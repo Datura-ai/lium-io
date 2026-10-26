@@ -1,4 +1,4 @@
-"""DAH-2546 / DAH-2594 — unrented incentive flagship capability gate.
+"""DAH-2546 / DAH-2594 — unrented incentive full 8x capability gate.
 
 An unrented 8x H200/B200/B300 executor that has none of NCU profiling counters
 open on the host (ncu_profiling_access == "unrestricted"), real GPU splitting
@@ -87,11 +87,11 @@ async def test_enforced_drops_rental_eligibility(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rented_flagship_without_capabilities_untouched(monkeypatch):
+async def test_rented_full_8x_without_capabilities_untouched(monkeypatch):
     # The gate governs only the unrented pool: a rented machine keeps normal scoring
     # and is never told about the missing capabilities.
     incentive = _build_incentive()
 
     result = await incentive.calculate_executor_score(_make_job(is_rented=True))
 
-    assert "flagship_without_ncu_or_split" not in "\n".join(result.incentive_logs)
+    assert "full_8x_without_ncu_or_split" not in "\n".join(result.incentive_logs)
