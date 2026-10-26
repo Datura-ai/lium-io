@@ -8,6 +8,8 @@ import pytest
 from services import image_flatten
 from services.image_flatten import (
     FLATTEN_DISK_MARGIN_BYTES,
+    FLATTEN_LOCK_PATH,
+    FLATTEN_NO_DISK_EXIT,
     ImageFlattenNoDisk,
     _flatten_command,
     flatten_image_on_host,
@@ -50,15 +52,13 @@ def test_changes_refuse_an_env_value_with_a_line_break():
         image_flatten_changes({"Env": ["A=1\n2"]})
 
 
-def _ssh(*, exists: bool, avail: int, size: int = 24 * 1024**3):
+def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3):
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker image inspect --format"):
             return Mock(exit_status=0, stdout=json.dumps({"Id": _IMAGE_ID, "Size": size, "Config": _CONFIG}))
         if command.startswith(f"/usr/bin/docker image inspect {_TAG}"):
             return Mock(exit_status=0 if exists else 1, stdout="")
-        if "df -P -B1" in command:
-            return Mock(exit_status=0, stdout=f"Filesystem 1-blocks Used Available Capacity Mounted\n/dev/x 1 1 {avail} 1% /hostfs\n")
-        return Mock(exit_status=0, stdout="")
+        return Mock(exit_status=flatten_rc, stdout="", stderr="boom")
 
     ssh = Mock()
     ssh.run = AsyncMock(side_effect=run)
@@ -67,64 +67,95 @@ def _ssh(*, exists: bool, avail: int, size: int = 24 * 1024**3):
 
 @pytest.mark.asyncio
 async def test_an_existing_copy_of_the_same_image_id_is_reused():
-    ssh = _ssh(exists=True, avail=0)
+    ssh = _ssh(exists=True)
     assert await flatten_image_on_host(ssh, "lmsysorg/sglang:dev") == _TAG
     assert ssh.run.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_too_little_disk_refuses_before_copying():
-    ssh = _ssh(exists=False, avail=24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES - 1)
+async def test_the_no_disk_exit_raises_the_renter_sentence_and_other_failures_raise():
     with pytest.raises(ImageFlattenNoDisk) as exc:
-        await flatten_image_on_host(ssh, "lmsysorg/sglang:dev")
+        await flatten_image_on_host(_ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT), "lmsysorg/sglang:dev")
     assert "not enough free disk" in exc.value.renter_sentence
-    assert not any("docker export" in c.args[0] for c in ssh.run.await_args_list)
+    with pytest.raises(RuntimeError, match="boom"):
+        await flatten_image_on_host(_ssh(exists=False, flatten_rc=98), "lmsysorg/sglang:dev")
 
 
 @pytest.mark.asyncio
-async def test_enough_disk_builds_the_copy_and_returns_its_tag():
-    ssh = _ssh(exists=False, avail=24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES)
-    assert await flatten_image_on_host(ssh, "lmsysorg/sglang:dev") == _TAG
+async def test_the_copy_is_built_from_the_inspected_image_id_never_the_mutable_tag():
+    ssh = _ssh(exists=False)
+    assert await flatten_image_on_host(ssh, "model:dev") == _TAG
     command = ssh.run.await_args_list[-1].args[0]
-    assert "docker export" in command and "--change 'CMD [\"python3\"" in command and _TAG in command
+    create = command.split("docker create", 1)[1].split(")", 1)[0]
+    assert create.endswith(f" {_IMAGE_ID}") and "model:dev" not in command
+    assert "--change 'CMD [\"python3\"" in command and _TAG in command
+    assert f"-ge {24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES} ]" in command
 
 
-def _run_flatten_script(tmp_path, *, export_rc: int, import_rc: int) -> tuple[int, str]:
-    """Run the real shell line against a fake docker that logs its calls."""
+def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
+    """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
     fake = tmp_path / "docker"
     fake.write_text(
         "#!/bin/sh\n"
-        f'echo "$1" >> {log}\n'
+        f'echo "$*" >> {log}\n'
         'case "$1" in\n'
+        "  info) echo /var/lib/docker ;;\n"
+        f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 {avail} 1%% /hostfs\\n' ;;\n"
+        f"  image) [ -e {tmp_path}/tagged ] ;;\n"
         "  create) echo cid1 ;;\n"
         f"  export) echo tar; exit {export_rc} ;;\n"
-        f"  import) cat >/dev/null; echo sha256:new; exit {import_rc} ;;\n"
+        f"  import) cat >/dev/null; sleep {import_sleep}; echo sha256:new; exit {import_rc} ;;\n"
+        f"  tag) touch {tmp_path}/tagged ;;\n"
         "esac\n"
     )
     fake.chmod(0o755)
-    script = _flatten_command("img", "lium-flattened:x", ['CMD ["a"]']).replace("/usr/bin/docker", str(fake))
-    rc = subprocess.run(["sh", "-c", script], capture_output=True, env={"PATH": os.environ["PATH"]}).returncode
-    return rc, log.read_text().split()
+    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100)
+    return ["sh", "-c", script.replace("/usr/bin/docker", str(fake)).replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock"))]
+
+
+def _calls(tmp_path) -> list[str]:
+    return (tmp_path / "calls").read_text().splitlines()
 
 
 @pytest.mark.parametrize(
-    "export_rc, import_rc, expected_rc, expected_calls",
+    "export_rc, import_rc, avail, expected_rc, expected_calls",
     [
-        (0, 0, 0, ["create", "export", "import", "rm", "tag"]),
+        (0, 0, 100, 0, ["image", "info", "run", "create", "export", "import", "rm", "tag"]),
         # a truncated export must never be tagged: the import of it is removed
-        (1, 0, 98, ["create", "export", "import", "rm", "rmi"]),
-        (0, 1, 98, ["create", "export", "import", "rm", "rmi"]),
+        (1, 0, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        (0, 1, 100, 98, ["image", "info", "run", "create", "export", "import", "rm", "rmi"]),
+        # too little disk: nothing is created
+        (0, 0, 99, FLATTEN_NO_DISK_EXIT, ["image", "info", "run"]),
     ],
 )
 def test_flatten_script_tags_only_a_complete_copy_and_always_removes_the_container(
-    tmp_path, export_rc, import_rc, expected_rc, expected_calls
+    tmp_path, export_rc, import_rc, avail, expected_rc, expected_calls
 ):
-    rc, calls = _run_flatten_script(tmp_path, export_rc=export_rc, import_rc=import_rc)
-    assert rc == expected_rc
-    assert sorted(calls) == sorted(expected_calls)  # export and import run concurrently
+    argv = _flatten_script(tmp_path, export_rc=export_rc, import_rc=import_rc, avail=avail)
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == expected_rc
+    calls = _calls(tmp_path)
+    assert sorted(c.split()[0] for c in calls) == sorted(expected_calls)  # export and import run concurrently
+    if "rm" in expected_calls:
+        assert "rm -fv cid1" in calls  # -v: the container's anonymous volumes go with it
+
+
+def test_declared_volumes_get_empty_volumes_so_create_copies_nothing_into_them(tmp_path):
+    argv = _flatten_script(tmp_path, volumes=["/models"])
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
+    create = next(c for c in _calls(tmp_path) if c.startswith("create"))
+    assert create == "create --entrypoint /lium-flatten-noop --mount type=volume,dst=/models,volume-nocopy sha256:id"
+
+
+def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
+    argv = _flatten_script(tmp_path, import_sleep=1)
+    env = {"PATH": os.environ["PATH"]}
+    procs = [subprocess.Popen(argv, env=env), subprocess.Popen(argv, env=env)]
+    assert [p.wait(timeout=30) for p in procs] == [0, 0]
+    # the second waits for the node lock, then finds the copy the first tagged
+    assert [c.split()[0] for c in _calls(tmp_path)].count("create") == 1
 
 
 def test_timeout_bounds_both_sides_of_the_copy():
-    script = _flatten_command("img", "t", [])
+    script = _flatten_command("img", "t", [], [], 0)
     assert script.count(f"timeout {image_flatten.FLATTEN_TIMEOUT_SECONDS} ") == 2

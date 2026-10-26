@@ -13,7 +13,7 @@ import shlex
 
 import asyncssh
 
-from core.docker_utils import df_command, parse_df_available_bytes
+from core.docker_utils import df_command
 
 FLATTENED_IMAGE_REPO = "lium-flattened"
 # headroom left on the Docker disk after the copy, so the pod and the node still have room to write
@@ -21,6 +21,8 @@ FLATTEN_DISK_MARGIN_BYTES = 10 * 1024**3
 # a 24 GB image takes about 5-15 minutes to copy; past this the create fails with the original error
 FLATTEN_TIMEOUT_SECONDS = 1800
 _DOCKER_READ_TIMEOUT_SECONDS = 120
+FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"
+FLATTEN_NO_DISK_EXIT = 95
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
     "not enough free disk on this node to prepare this image; choose another node or a smaller image"
@@ -65,17 +67,29 @@ def image_flatten_changes(config: dict) -> list[str]:
     return changes
 
 
-def _flatten_command(image: str, tag: str, changes: list[str]) -> str:
-    """Create (never start) a container from `image`, pipe its export into an import, tag the result
-    only when both sides succeeded, and always remove the container. Plain sh: no pipefail."""
+def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int) -> str:
+    """Under a node-wide lock: reuse a copy another flatten finished meanwhile, check the Docker disk
+    holds `need_bytes`, create (never start) a container from the image ID, pipe its export into an
+    import, tag the result only when both sides succeeded, and always remove the container and its
+    volumes. Plain sh: no pipefail."""
     t = FLATTEN_TIMEOUT_SECONDS
     change_args = " ".join(f"--change {shlex.quote(c)}" for c in changes)
+    # an empty volume per VOLUME path: create would otherwise copy the image's files there (extra disk)
+    mounts = " ".join(f"--mount {shlex.quote(f'type=volume,dst={v},volume-nocopy')}" for v in volumes)
+    root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
     return (
-        f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {shlex.quote(image)}) || exit 97; "
+        # one flatten per node: concurrent rentals would each pass the disk check and copy at once
+        f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
+        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && exit 0; "
+        f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
+        'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
+        f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
+        # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
+        f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
         'st=$(mktemp); '
         f'iid=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") '
         f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
-        'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -f "$cid" >/dev/null 2>&1; '
+        'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; '
         f'if [ "$irc" = 0 ] && [ "$erc" = 0 ]; then /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
         'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
         'echo "flatten failed: export=$erc import=$irc" >&2; exit 98; fi'
@@ -102,15 +116,18 @@ async def flatten_image_on_host(ssh_client: asyncssh.SSHClientConnection, image:
     )
     if existing.exit_status == 0:
         return tag
-    changes = image_flatten_changes(info.get("Config") or {})
-    df = await ssh_client.run(
-        df_command("\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""),
-        check=True,
-        timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+    config = info.get("Config") or {}
+    command = _flatten_command(
+        info["Id"],
+        tag,
+        image_flatten_changes(config),
+        sorted(config.get("Volumes") or ()),
+        int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES,
     )
-    if parse_df_available_bytes(df.stdout) < int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES:
+    # waits up to one flatten for the node lock, then runs its own
+    result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
+    if result.exit_status == FLATTEN_NO_DISK_EXIT:
         raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
-    await ssh_client.run(
-        _flatten_command(image, tag, changes), check=True, timeout=FLATTEN_TIMEOUT_SECONDS * 2 + 120
-    )
+    if result.exit_status != 0:
+        raise RuntimeError(f"flatten exited {result.exit_status}: {str(result.stderr or '')[-2000:]}")
     return tag
