@@ -433,8 +433,9 @@ class StorageLimitMessages:
         "found no usable spare storage to build the limit on (see capable). A renter who "
         "fills their disk fills the host's Docker storage and takes the host and every pod on it down",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
-        "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check with `sudo docker run --rm "
-        "--storage-opt size=1g --gpus all daturaai/compute-subnet-executor:latest nvidia-smi`.",
+        "pquota): https://docs.lium.io/providers/nodes/docker-storage . Check that `docker info` shows Storage Driver "
+        "overlay2 and that `sudo docker run --rm --storage-opt size=1g --gpus all "
+        "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
     )
     REQUIRED = MessageTemplate(
         event="Node rejected: Docker cannot limit a container's disk",
@@ -447,7 +448,7 @@ class StorageLimitMessages:
         "per-container storage limit",
         remediation="Set up Docker storage that enforces a per-container limit (overlay2 on xfs mounted with "
         "pquota): https://docs.lium.io/providers/nodes/docker-storage . The node passes again on the next "
-        "validation once `sudo docker run --rm --storage-opt size=1g --gpus all "
+        "validation once `docker info` shows Storage Driver overlay2 and `sudo docker run --rm --storage-opt size=1g --gpus all "
         "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
     )
     INCONCLUSIVE = MessageTemplate(

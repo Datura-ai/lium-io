@@ -1,15 +1,18 @@
 """DAH-1997 (Fish 21 Oct): the storage limit is required only of hosts that can build it.
 
-storage_limit_capable() in machine_scrape.py: docker's data root already on xfs (only `pquota` missing), or a
-blank whole disk of 100 GiB+ that passes `lium gpu-splitting setup`'s target checks (not mounted, not swap, no holders, not
+storage_limit_capable() in machine_scrape.py: docker's data root already on xfs (only `pquota` missing), 100 GiB+
+free on docker's filesystem (setup's xfs image file), or a blank whole disk of 100 GiB+ that passes `lium gpu-splitting setup`'s target checks (not mounted, not swap, no holders, not
 partitioned, writable, not removable or non-local, no signature). Partitions and free regions are never counted.
-A host with one disk, all of it in use, is not capable and keeps the STORAGE_LIMIT_MISSING warning only.
+A host with less free space and no spare disk is not capable and keeps the STORAGE_LIMIT_MISSING warning only.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -47,7 +50,7 @@ def scrape(tmp_path: Path) -> dict[str, Any]:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         HELPERS,
-        {"os": os, "docker_api_get": lambda path: {"DockerRootDir": "/var/lib/docker"}},
+        {"os": os, "shutil": shutil, "docker_api_get": lambda path: {"DockerRootDir": "/var/lib/docker"}},
     )
     namespace["HOST_ROOT_PREFIX"] = str(tmp_path / "pid1-root")
     namespace["SYS_CLASS_BLOCK_PATH"] = str(tmp_path / "class_block")
@@ -152,3 +155,77 @@ def test_an_unused_partition_is_never_spare(scrape: dict[str, Any], parent: str)
 
     assert scrape["spare_block_device"](ROOT_ON_SDA1) is None
     assert capable(scrape, ROOT_ON_SDA1) is False
+
+
+def test_free_space_on_dockers_filesystem_is_capable(scrape: dict[str, Any]) -> None:
+    # a single-disk host with room for the xfs image file `lium gpu-splitting setup` builds
+    docker_root = Path(scrape["HOST_ROOT_PREFIX"]) / "var" / "lib" / "docker"
+    docker_root.mkdir(parents=True)
+    free = {"bytes": scrape["STORAGE_CAPABLE_MIN_BYTES"]}
+    scrape["shutil"] = SimpleNamespace(disk_usage=lambda path: SimpleNamespace(free=free["bytes"]))
+
+    assert capable(scrape, ROOT_ON_SDA1) is True
+    free["bytes"] -= 1
+    assert capable(scrape, ROOT_ON_SDA1) is False
+
+
+PROBE_HELPERS = {
+    "HOST_MOUNTS_PATH",
+    "MountLine",
+    "covering_mount",
+    "XFS_PROJECT_QUOTA_OPTIONS",
+    "docker_storage_limits_containers",
+    "check_storage_limit_ability",
+}
+XFS_PQUOTA_DOCKER = "/dev/sdb /var/lib/docker xfs rw,relatime,attr2,inode64,prjquota 0 0\n"
+
+
+def probe(tmp_path: Path, driver: str, mounts: str, run: Any) -> tuple[bool, str]:
+    namespace = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        PROBE_HELPERS,
+        {
+            "subprocess": SimpleNamespace(run=run, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired),
+            "docker_api_get": lambda path: {"Driver": driver, "DockerRootDir": "/var/lib/docker"},
+            "COMMANDS": {"CHECK_STORAGE_LIMIT_ABILITY": ["docker", "run"]},
+        },
+    )
+    namespace["HOST_MOUNTS_PATH"] = str(tmp_path / "mounts")
+    (tmp_path / "mounts").write_text(ROOT_ON_SDA1 + mounts)
+    return namespace["check_storage_limit_ability"]()
+
+
+def passing_run(*args: Any, **kwargs: Any) -> Any:
+    return SimpleNamespace(returncode=0)
+
+
+def timed_out_run(*args: Any, **kwargs: Any) -> Any:
+    raise subprocess.TimeoutExpired("docker", 30)
+
+
+def test_overlay2_on_xfs_with_pquota_and_a_passing_probe_is_supported(tmp_path: Path) -> None:
+    assert probe(tmp_path, "overlay2", XFS_PQUOTA_DOCKER, passing_run)[0] is True
+
+
+@pytest.mark.parametrize(
+    "driver, mounts",
+    [
+        ("overlayfs", XFS_PQUOTA_DOCKER),  # Docker 29's containerd image store passes the probe with no limit
+        ("overlay2", "/dev/sdb /var/lib/docker xfs rw,relatime 0 0\n"),  # no project quota
+        ("overlay2", ""),  # docker's root on the ext4 root disk
+    ],
+)
+def test_a_passing_probe_without_overlay2_xfs_pquota_is_not_supported(
+    tmp_path: Path, driver: str, mounts: str
+) -> None:
+    supported, detail = probe(tmp_path, driver, mounts, passing_run)
+
+    assert supported is False
+    assert "not overlay2 on xfs with pquota" in detail
+
+
+def test_a_timed_out_probe_on_a_capped_setup_is_not_a_missing_limit(tmp_path: Path) -> None:
+    supported, detail = probe(tmp_path, "overlay2", XFS_PQUOTA_DOCKER, timed_out_run)
+
+    assert supported is True
+    assert detail.startswith("Test command timed out")

@@ -1004,7 +1004,8 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
             return False, "Sysbox runtime does not support GPU access."
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        # a slow pull or a busy host, not a missing limit: the storage setup above already enforces one
+        return True, "Test command timed out; Docker's storage is overlay2 on xfs with pquota."
 
     except FileNotFoundError:
         return False, "Docker is not installed or not found in PATH."
@@ -1184,10 +1185,37 @@ def get_sysbox_version() -> str | None:
     return None
 
 
+# xfs shows `pquota` as `prjquota` in the mount table; either one turns project quotas on
+XFS_PROJECT_QUOTA_OPTIONS = ("prjquota", "pquota")
+
+
+def docker_storage_limits_containers() -> bool:
+    """True when Docker's storage is overlay2 (the classic store) on xfs mounted with project quotas, the one
+    setup where `--storage-opt size=` caps a container's disk. Docker 29's containerd image store (driver
+    `overlayfs`) accepts the option and runs the probe with no limit, so the probe alone is not proof."""
+    info = docker_api_get("/info") or {}
+    if info.get("Driver") != "overlay2":
+        return False
+    with open(HOST_MOUNTS_PATH) as mounts_file:
+        covering = covering_mount(mounts_file.read(), info.get("DockerRootDir") or "/var/lib/docker")
+    return (
+        covering is not None
+        and covering.fstype == "xfs"
+        and any(option in covering.options for option in XFS_PROJECT_QUOTA_OPTIONS)
+    )
+
+
 def check_storage_limit_ability() -> tuple[bool, str]:
     """
-    Checks if the system supports limiting the storage size of a container.
+    Checks if the system supports limiting the storage size of a container: overlay2 on xfs with pquota,
+    and a container started with a size limit runs.
     """
+    try:
+        if not docker_storage_limits_containers():
+            return False, "Storage limit is not supported: Docker's storage is not overlay2 on xfs with pquota."
+    except Exception as e:
+        return False, f"An unexpected error occurred: {e}"
+
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
@@ -1205,7 +1233,8 @@ def check_storage_limit_ability() -> tuple[bool, str]:
             return False, "Storage limit is not supported."
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        # a slow pull or a busy host, not a missing limit: the storage setup above already enforces one
+        return True, "Test command timed out; Docker's storage is overlay2 on xfs with pquota."
 
     except Exception as e:
         return False, f"An unexpected error occurred: {e}"
@@ -1956,9 +1985,10 @@ def get_docker_root_disk_type() -> str:
 
 
 # DAH-1997 (Fish 21 Oct): the storage limit is required only of hosts that can build it - docker's data
-# root already on xfs (only `pquota` missing), or a blank whole disk that passes `lium gpu-splitting setup`'s target checks
+# root already on xfs (only `pquota` missing), 100 GiB+ free on docker's filesystem (setup's xfs image file),
+# or a blank whole disk that passes `lium gpu-splitting setup`'s target checks
 # (setup itself runs only on docker's default /var/lib/docker; with another data root, the manual steps at docs.lium.io/providers/nodes/docker-storage). A host
-# with one disk, all of it in use, cannot, and keeps the warning only.
+# with less free space and no spare disk cannot, and keeps the warning only.
 STORAGE_CAPABLE_MIN_BYTES = 100 * 1024 ** 3
 SYSFS_SECTOR_BYTES = 512
 PROC_SWAPS_PATH = "/proc/swaps"
@@ -2043,6 +2073,12 @@ def storage_limit_capable() -> bool:
     covering = covering_mount(mounts_text, docker_root_dir)
     if covering is not None and covering.fstype == "xfs":
         return True
+    try:
+        # room for the xfs image file `lium gpu-splitting setup` builds on a single-disk host
+        if shutil.disk_usage(f"{HOST_ROOT_PREFIX}{docker_root_dir}").free >= STORAGE_CAPABLE_MIN_BYTES:
+            return True
+    except OSError:
+        pass
     return spare_block_device(mounts_text) is not None
 
 

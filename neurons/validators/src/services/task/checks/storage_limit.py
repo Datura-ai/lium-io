@@ -8,9 +8,9 @@ renter who fills the container's disk fills the host's ``/var/lib/docker``: the 
 Pure data, no SSH. While ``REQUIRE_STORAGE_LIMIT_SUPPORTED`` is off every node without the limit gets the
 non-fatal STORAGE_LIMIT_MISSING warning, score unchanged, so providers see it in their logs before enforcement.
 With the setting on, a node without the limit that is not rented and whose host could build it (the scrape's
-``storage_limit_capable``: docker's root already on xfs, or a blank whole disk of 100 GiB+ that passes `lium gpu-splitting setup`'s target checks; setup needs docker's default
+``storage_limit_capable``: docker's root already on xfs, 100 GiB+ free on docker's filesystem, or a blank whole disk of 100 GiB+ that passes `lium gpu-splitting setup`'s target checks; setup needs docker's default
 /var/lib/docker, otherwise the manual steps at docs.lium.io/providers/nodes/docker-storage) fails (score 0,
-STORAGE_LIMIT_REQUIRED) until the host passes the probe; a single-disk host keeps the warning only; a rented node only gets the warning, so this check never touches a running rental.
+STORAGE_LIMIT_REQUIRED) until the host passes the probe; a host with less free space and no spare disk keeps the warning only; a rented node only gets the warning, so this check never touches a running rental.
 It runs right after the scrape, before the rented short-circuit, like GpuThermalThrottleCheck.
 """
 
