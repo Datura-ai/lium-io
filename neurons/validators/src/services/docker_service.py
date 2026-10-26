@@ -87,7 +87,7 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.container_cleanup import evict_cache_volumes_oldest_first
+from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER, evict_cache_volumes_oldest_first
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
@@ -4716,7 +4716,7 @@ class DockerService:
                 return await retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental")
 
             if not requested_gb:
-                await remove(DockerCommand.volume_remove(*cache_volumes))
+                await remove(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*cache_volumes)}")
                 return True
 
             async def rental_fits() -> bool:
@@ -4925,7 +4925,9 @@ class DockerService:
         )
         try:
             await retry_ssh_command(
-                ssh_client, DockerCommand.volume_remove(*stale_volumes), "sweep_stale_cache_volumes"
+                ssh_client,
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*stale_volumes)}",
+                "sweep_stale_cache_volumes",
             )
         except asyncio.CancelledError:
             raise

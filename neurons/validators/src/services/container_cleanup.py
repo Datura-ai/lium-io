@@ -55,6 +55,11 @@ DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 # near a minute means a wedged docker daemon rather than work in progress.
 DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 
+# The sweep helper mounts every cache volume. `--rm` only fires once the container has run, so a
+# `docker run` whose client is killed (timeout, dropped SSH) between create and start leaves it in
+# Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
+REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
+
 async def evict_cache_volumes_oldest_first(
     ssh_client: asyncssh.SSHClientConnection,
     volume_names: list[str],
@@ -82,7 +87,7 @@ async def evict_cache_volumes_oldest_first(
         pass
     ordered: list[str] = sorted(volume_names, key=lambda name: (created_at.get(name, "~"), name))
     for index, name in enumerate(ordered):
-        await run_removal(DockerCommand.volume_remove(name))
+        await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(name)}")
         if index + 1 < len(ordered) and await has_room():
             return
 
@@ -481,20 +486,22 @@ class ContainerCleanup:
             f"-v {shlex.quote(name)}:/cache{index}" for index, name in enumerate(volume_names)
         )
         search_roots: str = " ".join(f"/cache{index}" for index in range(len(volume_names)))
-        # The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
+        # The `rm -f` after: a run killed before its container started leaves it Created, pinning the
+        # volumes (see REMOVE_CACHE_SWEEP_CONTAINER). The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
         # container would hold the name for good — the sweep would then fail silently on that node
         # forever. Worst case it interrupts a sweep another validator started, which simply runs again.
         # `timeout` bounds a wedged dockerd the same way machine_scrape does for `docker stats`: this
         # call sits in the per-executor pipeline ahead of the fatal port checks, so a hang here would
         # cost the node its whole cycle. A killed sweep simply removes nothing and runs again later.
         result = await ssh_client.run(
-            f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1; "
+            f"{REMOVE_CACHE_SWEEP_CONTAINER}; "
             f"timeout {DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS} "
             f"/usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} {mount_flags} {ALPINE_HELPER_IMAGE} "
             f"find {search_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
             "-type d \\( -name xet -o -name runtimes \\) -prune -o "
             f"-name '*.incomplete' -type f -mmin +{DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES} "
-            "-print -exec rm -f {} + 2>/dev/null || true"
+            "-print -exec rm -f {} + 2>/dev/null; "
+            f"{REMOVE_CACHE_SWEEP_CONTAINER} || true"
         )
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 

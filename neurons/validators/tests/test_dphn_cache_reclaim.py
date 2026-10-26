@@ -107,3 +107,40 @@ async def test_the_engy_checkpoint_is_reclaimed_oldest_first_and_only_as_far_as_
 
     assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
     assert _removed(ssh_client) == ["dphn_cache_hf_x"]
+
+
+class CreatedSweepSshClient(FakeSshClient):
+    """A sweep `docker run` killed between create and start: `lium_cache_sweep` sits in Created, never
+    auto-removed, and dockerd refuses `volume rm` on the cache volume it mounts until it is gone."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sweep_container_exists = True
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command:
+            # the shell runs the command's parts left to right
+            if "docker rm -f lium_cache_sweep" in command.split("volume rm", 1)[0]:
+                self.sweep_container_exists = False
+            self._refuses = set(self._volumes) if self.sweep_container_exists else set()
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_never_started_sweep_container_cannot_pin_the_cache_the_reclaim_removes(cleanup):
+    ssh_client = CreatedSweepSshClient(containers=[], volumes=["engy_cache_hf_glm"], free_gb=40)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
+    assert _removed(ssh_client) == ["engy_cache_hf_glm"] and ssh_client._volumes == []
+
+
+@pytest.mark.asyncio
+async def test_the_download_sweep_removes_its_helper_container_after_the_run_too(cleanup):
+    ssh_client = FakeSshClient(containers=[], volumes=["engy_cache_hf_glm"], free_gb=40)
+
+    await cleanup.sweep_abandoned_download_temporaries(ssh_client, "exec-1")
+
+    (sweep,) = [c for c in ssh_client.commands if "docker run" in c]
+    before, _, after = sweep.partition("docker run")
+    # `--rm` never fires for a container the killed client created but never started
+    assert "docker rm -f lium_cache_sweep" in before and "docker rm -f lium_cache_sweep" in after
