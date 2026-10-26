@@ -8,7 +8,7 @@ import math
 import re
 import shlex
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal, NamedTuple
 
 import aiohttp
@@ -428,7 +428,7 @@ class RegistryPullCheck:
             last_state = _ProbeState(at=now, outcome=_SCHEDULED)
             await self._save(ctx, last_state)
         if now < last_state.next_due_at(ctx.executor.uuid):
-            return self._verdict(ctx, last_state, probed=False)
+            return _with_image_store(ctx, last_state, self._verdict(ctx, last_state, probed=False))
 
         reading = await self._pull(ctx)
         failures = last_state.failures_in_a_row
@@ -454,7 +454,7 @@ class RegistryPullCheck:
             hub_control=hub_control,
         )
         await self._save(ctx, state)
-        return self._verdict(ctx, state, probed=True)
+        return _with_image_store(ctx, state, self._verdict(ctx, state, probed=True))
 
     async def _read_docker_hub_control(
         self, ctx: Context, now: float, *, pull_started: float
@@ -582,6 +582,19 @@ class RegistryPullCheck:
             what["last"] = last
         event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
+
+
+def _with_image_store(ctx: Context, state: _ProbeState, result: CheckResult) -> CheckResult:
+    """DAH-5159: the node's last read image store rides executor.specs["docker_image_store"] to the backend, which
+    moves a many-layer image Sysbox 0.7.1 cannot start on the classic store only to a "containerd" node. An unknown
+    store (no reading yet, a daemon the CLI could not reach) publishes no key."""
+    store = state.reading.get("image_store")
+    if not store:
+        return result
+    specs = {**(ctx.state.specs or {}), "docker_image_store": store}
+    return result.model_copy(
+        update={"updates": {**result.updates, "state": replace(ctx.state, specs=specs)}}
+    )
 
 
 def _is_rented(ctx: Context) -> bool:

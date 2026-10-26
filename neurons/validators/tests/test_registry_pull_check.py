@@ -8,9 +8,14 @@ node passed every one.
 
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-
+import pytest
 from services.task.checks import registry_pull as module
+
+from tests.helpers import build_services, build_state, make_context
 
 # Docker 29.1.3 (containerd image store) with that mirror configured and its DNS answers dropped: the 2.4 KB
 # pull took 51 s on one run and over 60 s on another, and the 30 s bound ended it on both runs after; with the resolver refusing, the pull failed at once
@@ -34,9 +39,55 @@ def test_defaults_bounded():
 # ------------------------------------------------------------------ the check
 
 
+def _pull_output(driver: str) -> str:
+    return f"lium_pull driver={driver} mirrors=null\nlium_pull cached=no cache=removed\nlium_pull exit=0 seconds=2\n"
+
+
+def _ctx(stdout: str):
+    services = build_services()
+    runner = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(error_type=None, stdout=stdout))
+    )
+    return make_context(
+        services=services, state=build_state(specs={"gpu": {"count": 1}}), runner=runner
+    )
+
+
+async def _pull_now(ctx):
+    # a scheduled state already due, so this cycle pulls
+    state = module._ProbeState(at=time.time() - 10 * 24 * 3600, outcome="ok")
+    await ctx.services.redis.set(f"{module._REDIS_PREFIX}:{ctx.executor.uuid}", state.as_json())
+    return await module.RegistryPullCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver, store", [("overlayfs", "containerd"), ("overlay2", "classic")])
+async def test_the_image_store_rides_the_specs(driver, store):
+    """DAH-5159: the backend moves a Sysbox many-layers failure only to a node whose specs say "containerd"."""
+    result = await _pull_now(_ctx(_pull_output(driver)))
+    assert result.passed is True
+    assert result.updates["state"].specs == {"gpu": {"count": 1}, "docker_image_store": store}
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_store_publishes_no_key():
+    result = await _pull_now(_ctx(_pull_output("")))
+    assert "state" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_between_pulls_publishes_the_last_reading():
+    ctx = _ctx(_pull_output("overlayfs"))
+    await _pull_now(ctx)
+    ctx.runner.run.reset_mock()
+
+    result = await module.RegistryPullCheck().run(ctx)
+
+    ctx.runner.run.assert_not_called()
+    assert result.updates["state"].specs["docker_image_store"] == "containerd"
+
+
 # ------------------------------------------------------------------ the Docker Hub control
 
 
 # ------------------------------------------------------------------ fleets over many cycles
-
-
