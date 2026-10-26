@@ -1,9 +1,9 @@
 """DAH-1997 (26 Oct plan): the storage limit and who must build it, as machine_scrape.py decides.
 
 The limit counts only for overlay2 on xfs mounted with pquota (and a `--storage-opt size=` container that runs);
-a probe that timed out gives no verdict (None), not "no limit". A host is capable of building the limit when the
-filesystem holding docker's data root has 100 GiB+ free (room for the xfs image file `lium gpu-splitting setup`
-builds); with less it keeps the STORAGE_LIMIT_MISSING warning only.
+a probe that timed out gives no verdict (None), not "no limit". A host is capable of building the limit when
+`lium gpu-splitting setup` could place its xfs image file: on the local filesystem with the most free space, other
+than docker's own mount, 100 GiB left after a reserve of max(10%, 20 GiB); otherwise it keeps the warning only.
 """
 
 from __future__ import annotations
@@ -26,6 +26,13 @@ HELPERS = {
     "covering_mount",
     "storage_limit_setup_gap",
     "check_storage_limit_ability",
+    "STORAGE_CAPABLE_MIN_BYTES",
+    "STORAGE_IMAGE_FILE_RESERVE_FRACTION",
+    "STORAGE_IMAGE_FILE_MIN_RESERVE_BYTES",
+    "STORAGE_IMAGE_FILE_FSTYPES",
+    "HOST_ROOT_PREFIX",
+    "image_file_room",
+    "storage_limit_capable",
 }
 OVERLAY2 = {"Driver": "overlay2", "DockerRootDir": "/var/lib/docker"}
 ROOT = "/dev/sda1 / ext4 rw,relatime 0 0\n"
@@ -97,3 +104,47 @@ def test_a_timed_out_probe_gives_no_verdict(tmp_path):
     scrape = namespace(tmp_path, DOCKER_XFS_PQUOTA, OVERLAY2, run=timeout)
 
     assert scrape["check_storage_limit_ability"]() == (None, "Test command timed out.")
+
+
+GIB = 1024**3
+ROOT_ONLY = "/dev/sda1 / ext4 rw 0 0\n"
+DOCKER_OWN_DISK = ROOT_ONLY + "/dev/sdb /var/lib/docker ext4 rw 0 0\n"
+
+
+@pytest.mark.parametrize(
+    "mounts, filesystems, capable",
+    [
+        (ROOT_ONLY, {"/": (500, 150)}, True),  # 150 free - 50 reserve (10%) = 100 GiB
+        (ROOT_ONLY, {"/": (500, 149)}, False),
+        (ROOT_ONLY, {"/": (150, 120)}, True),  # 120 free - 20 GiB minimum reserve = 100 GiB
+        (ROOT_ONLY, {"/": (150, 119)}, False),
+        # docker's own mount is where the image file gets mounted, never where it is put
+        (DOCKER_OWN_DISK, {"/": (150, 10), "/var/lib/docker": (2000, 1500)}, False),
+        (
+            "/dev/sda1 / btrfs rw 0 0\n",
+            {"/": (2000, 1500)},
+            False,
+        ),  # copy-on-write: fallocate reserves nothing
+        (
+            "tmpfs /tmp tmpfs rw 0 0\n" + ROOT_ONLY,
+            {"/": (150, 120)},
+            True,
+        ),  # not a block device: skipped
+        # setup takes the filesystem with the most free space: 200 free of 2000 leaves 0 after the 200 reserve
+        (
+            ROOT_ONLY + "/dev/sdc /data ext4 rw 0 0\n",
+            {"/": (2000, 200), "/data": (150, 130)},
+            False,
+        ),
+    ],
+)
+def test_capable_is_setups_image_file_rule(tmp_path, mounts, filesystems, capable):
+    scrape = namespace(tmp_path, mounts, OVERLAY2)
+    scrape["HOST_ROOT_PREFIX"] = "/host"
+    statvfs = {
+        f"/host{point}": SimpleNamespace(f_blocks=size * GIB, f_bavail=free * GIB, f_frsize=1)
+        for point, (size, free) in filesystems.items()
+    }
+    scrape["os"] = SimpleNamespace(statvfs=statvfs.__getitem__)
+
+    assert scrape["storage_limit_capable"]() is capable

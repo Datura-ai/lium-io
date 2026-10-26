@@ -2005,15 +2005,13 @@ def storage_limit_capable() -> bool:
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     with open(HOST_MOUNTS_PATH) as mounts_file:
         mounts_text = mounts_file.read()
+    # setup picks the candidate filesystem with the most free space and sizes the file on that one alone
     # shortcut: setup also refuses removable / usb / iscsi disks, which the scrape does not read; a host whose only
     # room is on one counts as capable and gets the REQUIRED message pointing at the manual steps
+    best = None
     for line in mounts_text.splitlines():
         fields = line.split()
-        if (
-            len(fields) < 3
-            or not fields[0].startswith("/dev/")
-            or fields[2] not in STORAGE_IMAGE_FILE_FSTYPES
-        ):
+        if len(fields) < 3 or not fields[0].startswith("/dev/") or fields[2] not in STORAGE_IMAGE_FILE_FSTYPES:
             continue
         if fields[1] == docker_root_dir:
             continue
@@ -2021,10 +2019,11 @@ def storage_limit_capable() -> bool:
             stats = os.statvfs(f"{HOST_ROOT_PREFIX}{fields[1]}")
         except OSError:
             continue
-        room = image_file_room(stats.f_blocks * stats.f_frsize, stats.f_bavail * stats.f_frsize)
-        if room >= STORAGE_CAPABLE_MIN_BYTES:
-            return True
-    return False
+        if best is None or stats.f_bavail * stats.f_frsize > best.f_bavail * best.f_frsize:
+            best = stats
+    if best is None:
+        return False
+    return image_file_room(best.f_blocks * best.f_frsize, best.f_bavail * best.f_frsize) >= STORAGE_CAPABLE_MIN_BYTES
 
 
 def write_probe_failure_reason(errno_value) -> str:
