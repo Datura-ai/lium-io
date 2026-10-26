@@ -1,10 +1,8 @@
-import asyncio
-import ipaddress
 import logging
-import socket
 
 import aiohttp
 from services.executor_connectivity.models import PortPair
+from services.node_host import resolve_node_host
 
 from core.config import settings
 
@@ -30,7 +28,7 @@ class ExternalPortProbe:
         which is never a verdict on the node."""
         address = await _address(host)
         if address is None:
-            logger.warning("external port prober skipped: could not resolve %s", host)
+            logger.warning("external port prober skipped: %s has no single public address", host)
             return None
         body = {"targets": [{"host": address, "port": p.external} for p in ports], "timeout": 3}
         try:
@@ -49,18 +47,17 @@ class ExternalPortProbe:
 
 
 async def _address(host: str) -> str | None:
-    """The prober takes IP literals only (it refuses names, so a name cannot resolve to a private address there);
-    a node registered by DNS name is probed at the IPv4 address that name has now."""
+    """The prober takes IP literals only. A node registered by DNS name is probed at its address only when the
+    name resolves to exactly one public address: the validator's own test tries every address, so one sampled
+    address of several could flag a node a renter still reaches."""
     try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        pass
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, None, family=socket.AF_INET)
+        infos = await resolve_node_host(host, 0)
     except OSError:
         return None
-    return infos[0][4][0] if infos else None
+    if not infos:
+        return host  # an IP literal
+    addresses = {info[4][0] for info in infos}
+    return addresses.pop() if len(addresses) == 1 else None
 
 
 def external_port_probe() -> ExternalPortProbe | None:
