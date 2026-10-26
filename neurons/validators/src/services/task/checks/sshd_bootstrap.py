@@ -11,9 +11,9 @@ from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.redis_service import (
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
-    SSHD_BOOTSTRAP_FAILED_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
+    sshd_bootstrap_failed_key,
 )
 
 from ...const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
@@ -109,7 +109,7 @@ class SshdBootstrapCheck:
 
     async def _sshd_bootstrap_failed(self, ctx: Context) -> bool:
         """The verdict for an unrented node: its stamp, else a probe of its running filler (stamped on failure)."""
-        key = f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{ctx.executor.uuid}"
+        key = sshd_bootstrap_failed_key(ctx.miner_hotkey, ctx.executor.uuid)
         try:
             if await ctx.services.redis.get(key):
                 return True

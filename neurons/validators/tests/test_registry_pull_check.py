@@ -10,6 +10,9 @@ from __future__ import annotations
 
 
 
+import pytest
+
+from tests.helpers import FakeRedis, build_services
 from services.task.checks import registry_pull as module
 
 # Docker 29.1.3 (containerd image store) with that mirror configured and its DNS answers dropped: the 2.4 KB
@@ -40,3 +43,16 @@ def test_defaults_bounded():
 # ------------------------------------------------------------------ fleets over many cycles
 
 
+
+
+@pytest.mark.asyncio
+async def test_a_node_copying_the_uuid_keeps_its_own_pull_state(context_factory):
+    redis = FakeRedis()
+    owner = context_factory(services=build_services(redis=redis))
+    copycat = context_factory(services=build_services(redis=redis), miner_hotkey="copycat-hotkey")
+    check = module.RegistryPullCheck()
+
+    await check._save(copycat, module._ProbeState(at=1.0, outcome=module._SCHEDULED))
+
+    assert owner.executor.uuid == copycat.executor.uuid
+    assert await check._load(owner) is None

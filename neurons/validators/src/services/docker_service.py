@@ -125,11 +125,11 @@ from services.redis_service import (
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
-    SSHD_BOOTSTRAP_FAILED_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
     STREAMING_LOG_CHANNEL,
     RedisService,
+    sshd_bootstrap_failed_key,
 )
 from services.rental_docker_observability import (
     exec_logged_rental_docker_sdk_operation,
@@ -5479,9 +5479,9 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
         raise_if_container_gone: bool = False,
-        sshd_verdict_executor_uuid: str | None = None,
+        sshd_verdict_key: str | None = None,
     ) -> bool:
-        # sshd_verdict_executor_uuid: a filler create (Lium's own image) records the executor's sshd
+        # sshd_verdict_key: a filler create (Lium's own image) records the executor's sshd
         # verdict for SshdBootstrapCheck; a renter's image can break sshd itself, so it records nothing.
         # raise_if_container_gone: the create path wants the ContainerGoneBeforeExec (with the
         # State it carries) rather than a False it never read; the start path keeps its
@@ -5611,10 +5611,10 @@ class DockerService:
             )
             # only sshd installed but not serving is the node's fault; a failed apt-get exits before that line
             if SSHD_VERIFY_FAILED_MARKER in f"{run_result.stdout}{run_result.stderr}":
-                await self._record_sshd_verdict(sshd_verdict_executor_uuid, failed=True, log_extra=log_extra)
+                await self._record_sshd_verdict(sshd_verdict_key, failed=True, log_extra=log_extra)
             return False
 
-        await self._record_sshd_verdict(sshd_verdict_executor_uuid, failed=False, log_extra=log_extra)
+        await self._record_sshd_verdict(sshd_verdict_key, failed=False, log_extra=log_extra)
         return True
 
     def _pod_ssh_host_key_script_path(self) -> Path:
@@ -5677,10 +5677,9 @@ class DockerService:
                 ),
             )
 
-    async def _record_sshd_verdict(self, executor_uuid: str | None, *, failed: bool, log_extra: dict) -> None:
-        if not executor_uuid:
+    async def _record_sshd_verdict(self, key: str | None, *, failed: bool, log_extra: dict) -> None:
+        if not key:
             return
-        key = f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{executor_uuid}"
         try:
             if failed:
                 await self.redis_service.set(key, "1", ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
@@ -9173,8 +9172,10 @@ class DockerService:
                         log_tag=log_tag,
                         log_extra=default_extra,
                         raise_if_container_gone=True,
-                        sshd_verdict_executor_uuid=(
-                            payload.executor_id if payload.workload_kind == WorkloadKind.FILLER else None
+                        sshd_verdict_key=(
+                            sshd_bootstrap_failed_key(payload.miner_hotkey, payload.executor_id)
+                            if payload.workload_kind == WorkloadKind.FILLER
+                            else None
                         ),
                     ):
                         soft_failed_step = current_step
