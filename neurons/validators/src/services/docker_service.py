@@ -1063,6 +1063,31 @@ def _flatten_reserved_bytes(storage_limit_gb: int | None, volume_limit_gb: int |
     return ((storage_limit_gb or 0) + ((volume_limit_gb or 0) if sparse_volume else 0)) * 1024**3
 
 
+# name, --storage-opt size (empty without one) and bytes written, for every container on the node
+_WRITABLE_LAYERS_COMMAND = (
+    "/usr/bin/docker ps -aq | xargs -r /usr/bin/docker inspect --size "
+    "--format '{{.Name}} {{index .HostConfig.StorageOpt \"size\"}} {{.SizeRw}}'"
+)
+
+
+def _neighbours_unwritten_bytes(inspect_stdout: str, container_name: str) -> int:
+    """What the node's other containers may still write into their writable layers: each one's size cap
+    less what it wrote. Their preallocated volumes already took their disk; a sparse volume is
+    full-node only, so it has no neighbour. Raises ValueError on a line it cannot read."""
+    total = 0
+    for line in inspect_stdout.splitlines():
+        if not line.strip():
+            continue
+        name, cap, written = line.split(" ")
+        if name.lstrip("/") == container_name or not cap:
+            continue  # the pod's own cap is in its reserve; no cap: Docker cannot bound that layer either
+        cap_bytes = _parse_volume_size_to_bytes(cap)
+        if cap_bytes is None:
+            raise ValueError(f"unreadable storage size {cap!r} on {name}")
+        total += max(cap_bytes - int(written or 0), 0)
+    return total
+
+
 def sysbox_many_layers_sentence(exc: Exception) -> str | None:
     """The renter sentence when `docker run` died on Sysbox's ID-mapping of a many-layer image, else None."""
     if any(_SYSBOX_RELATIVE_LAYER_RE.search(text) for text in _exception_texts(exc)):
@@ -1763,6 +1788,12 @@ class _CustomerCreateRegistry:
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
             return (miner_hotkey, executor_id) in self._running_by_executor
+
+    def others_running(self, payload: ContainerCreateRequest) -> bool:
+        """Another customer create than `payload`'s runs on its executor now."""
+        with self._lock:
+            running = self._running_by_executor[(payload.miner_hotkey, payload.executor_id)]
+            return running - (id(payload) in self._customer_create_reached_create_container) > 0
 
     def ran_since_filler_started(self, filler: ContainerCreateRequest) -> bool:
         # a customer create on the filler's executor running now or ended since the filler's track();
@@ -2562,6 +2593,7 @@ class DockerService:
         remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
         flatten_reserved_bytes: int | None = None,
         before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
+        flatten_beside_other_create: Callable[[], bool] | None = None,
     ) -> str | None:
         """`_run_rental_docker_create_attempts`, then the release of the flattened copy's lease (when a
         flatten ran) however the create ended: success (the container now keeps the copy), failure or
@@ -2581,6 +2613,7 @@ class DockerService:
                 remove_port_checks_listed_live=remove_port_checks_listed_live,
                 flatten_reserved_bytes=flatten_reserved_bytes,
                 before_flatten_retry=before_flatten_retry,
+                flatten_beside_other_create=flatten_beside_other_create,
                 flatten_lease=flatten_lease,
             )
         finally:
@@ -2605,6 +2638,7 @@ class DockerService:
         remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
         flatten_reserved_bytes: int | None = None,
         before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
+        flatten_beside_other_create: Callable[[], bool] | None = None,
         flatten_lease: list[str],
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
@@ -2612,7 +2646,9 @@ class DockerService:
         Sysbox many-layer failure: only when `flatten_reserved_bytes` is given (customer rentals), the
         image is copied into one layer on the node, keeping free the disk the pod's limits already
         granted (`flatten_reserved_bytes`), and the run is retried once after `before_flatten_retry`
-        (the delete-cancellation check, which raises when the pod was deleted meanwhile).
+        (the delete-cancellation check, which raises when the pod was deleted meanwhile). The copy also
+        keeps free what the node's other containers may still write into their writable layers, and is
+        refused while `flatten_beside_other_create` says another create on the node is still sizing.
 
         Returns the container's ID, or None when the client gave none. A ContainerCreateRefused of
         the spec's `before_create` or `before_start` (checked on every attempt) is raised as is.
@@ -2686,6 +2722,8 @@ class DockerService:
                         reserved_bytes=flatten_reserved_bytes,
                         default_extra=default_extra,
                         log_tag=log_tag,
+                        container_name=container_name,
+                        beside_other_create=flatten_beside_other_create,
                     )
                     if before_flatten_retry is not None:
                         await before_flatten_retry()
@@ -2806,9 +2844,12 @@ class DockerService:
         reserved_bytes: int,
         default_extra: dict,
         log_tag: str,
+        container_name: str = "",
+        beside_other_create: Callable[[], bool] | None = None,
     ) -> str | None:
         """The one-layer copy's tag, or None when the flatten failed (the create then fails with
-        Sysbox's error). Raises ImageFlattenNoDisk when the node has no room for the copy."""
+        Sysbox's error). Raises ImageFlattenNoDisk when the node has no room for the copy beside this
+        pod's and its neighbours' unwritten grants, or another create on the node has not taken its own yet."""
         await self.stream_log(
             "This image has too many layers for this node's storage driver; "
             "preparing a single-layer copy (a large image takes several minutes)",
@@ -2817,6 +2858,11 @@ class DockerService:
         )
         started = time.monotonic()
         try:
+            if beside_other_create is not None and beside_other_create():
+                # its grant is not on the node yet, so the copy cannot keep it free
+                raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
+            layers = await ssh_client.run(_WRITABLE_LAYERS_COMMAND, check=True, timeout=120)
+            reserved_bytes += _neighbours_unwritten_bytes(str(layers.stdout or ""), container_name)
             flat_image = await flatten_image_on_host(ssh_client, image, lease=lease, reserved_bytes=reserved_bytes)
         except ImageFlattenNoDisk:
             logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
@@ -9108,6 +9154,7 @@ class DockerService:
                         before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
                             ssh_client, payload, default_extra
                         ),
+                        flatten_beside_other_create=lambda: customer_creates.others_running(payload),
                     )
                     edit_swap.replacement_id = container_id
                     # A customer create that ran while the daemon created this container may have

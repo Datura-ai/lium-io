@@ -19,6 +19,7 @@ from tenacity import Future, RetryError
 import services.docker_service as docker_service_module
 from services.attestation_service import AttestationError
 from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
+import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
@@ -8140,17 +8141,24 @@ class _SysboxFailingRentalClient:
         self.events.append(f"rm {container_name}")
 
 
-async def _create_with_flatten(docker_service, client, flatten, *, reserved_bytes=0, before_retry=None, ssh=None):
+def _node_ssh(writable_layers=""):
+    return Mock(run=AsyncMock(return_value=Mock(stdout=writable_layers)))
+
+
+async def _create_with_flatten(
+    docker_service, client, flatten, *, reserved_bytes=0, before_retry=None, ssh=None, beside_other_create=None
+):
     docker_service.stream_log = AsyncMock()
     with patch.object(docker_service_module, "flatten_image_on_host", flatten):
         return await docker_service._run_rental_docker_create_with_port_retry(
             docker_client=client,
-            ssh_client=ssh or Mock(run=AsyncMock()),
+            ssh_client=ssh or _node_ssh(),
             run_spec=ContainerRunSpec(image="sglang", name="pod_x"),
             container_name="pod_x",
             default_extra={},
             flatten_reserved_bytes=reserved_bytes,
             before_flatten_retry=before_retry,
+            flatten_beside_other_create=beside_other_create,
         )
 
 
@@ -8184,6 +8192,68 @@ async def test_a_delete_during_the_flatten_retry_rm_stops_the_create_before_the_
     with pytest.raises(docker_service_module._CreateCancelledByDelete):
         await _create_with_flatten(docker_service, client, flatten, before_retry=cancelled)
     assert client.events == ["run sglang", "rm pod_x"]  # no run from the flattened copy
+
+
+_GIB = 1024**3
+
+
+def _flatten_on_disk(avail_bytes, image_bytes):
+    # the node-side check of flatten_image_on_host: image + margin + reserve must fit in df's free bytes
+    async def flatten(ssh_client, image, *, lease, reserved_bytes):
+        if avail_bytes < image_bytes + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES + reserved_bytes:
+            raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
+        return "lium-flattened:abc"
+
+    return AsyncMock(side_effect=flatten)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage_gb, volume_gb, full_node, avail_gb, writable_layers, beside_other_create, flattens",
+    [
+        # review: 100 GiB free, two disk_share=0.5 rentals of 26 GiB preallocated volume + 13 GiB layer each;
+        # 48 GiB left, a 24 GiB copy: 24 + 10 + 13 (own) + 13 (neighbour's unwritten layer) > 48
+        (13, 26, False, 48, "/pod_a 13g 0\n/pod_x 13g 0\n", False, False),
+        # the neighbour already wrote 12 of its 13 GiB: 24 + 10 + 13 + 1 = 48 fits
+        (13, 26, False, 48, "/pod_a 13g 12884901888\n/pod_x 13g 0\n", False, True),
+        # a second split still sizing on the node: its grant is not on disk yet
+        (13, 26, False, 100, "/pod_x 13g 0\n", True, False),
+        # full node: own layer + sparse volume, no neighbour; 24 + 10 + 26 + 53 = 113
+        (26, 53, True, 113, "/pod_x 26g 0\n", False, True),
+        (26, 53, True, 112, "/pod_x 26g 0\n", False, False),
+    ],
+    ids=["review_split_neighbour", "split_neighbour_wrote", "split_in_flight", "full_node_fits", "full_node_short"],
+)
+async def test_the_flatten_keeps_every_granted_allowance_free(
+    docker_service, storage_gb, volume_gb, full_node, avail_gb, writable_layers, beside_other_create, flattens
+):
+    client = _SysboxFailingRentalClient({"sglang"})
+    flatten = _flatten_on_disk(avail_gb * _GIB, 24 * _GIB)
+    create = _create_with_flatten(
+        docker_service,
+        client,
+        flatten,
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(storage_gb, volume_gb, full_node),
+        ssh=_node_ssh(writable_layers),
+        beside_other_create=lambda: beside_other_create,
+    )
+    if flattens:
+        assert await create == "cid"
+        assert client.events[-1] == "run lium-flattened:abc"
+    else:
+        with pytest.raises(ImageFlattenNoDisk):
+            await create
+        assert client.events == ["run sglang"]
+
+
+def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
+    registry = docker_service_module._CustomerCreateRegistry()
+    own, other = (Mock(miner_hotkey="hk", executor_id="ex", workload_kind=WorkloadKind.CUSTOMER_RENTAL) for _ in range(2))
+    with registry.track(own):
+        assert not registry.others_running(own)
+        with registry.track(other):
+            assert registry.others_running(own)
+        assert not registry.others_running(own)
 
 
 def test_flatten_keeps_free_the_writable_layer_and_a_sparse_volume_only():
@@ -8221,7 +8291,7 @@ def _released_leases(flatten, ssh) -> list[str]:
 async def test_the_flatten_lease_is_released_however_the_create_ends(
     docker_service, fail_images, before_retry, flatten_error
 ):
-    ssh = Mock(run=AsyncMock())
+    ssh = _node_ssh()
     flatten = AsyncMock(return_value="lium-flattened:abc", side_effect=flatten_error)
     with contextlib.suppress(Exception):
         await _create_with_flatten(docker_service, _SysboxFailingRentalClient(fail_images), flatten, before_retry=before_retry, ssh=ssh)
@@ -8230,7 +8300,7 @@ async def test_the_flatten_lease_is_released_however_the_create_ends(
 
 @pytest.mark.asyncio
 async def test_no_flatten_no_lease_release(docker_service):
-    ssh = Mock(run=AsyncMock())
+    ssh = _node_ssh()
     assert await _create_with_flatten(docker_service, _SysboxFailingRentalClient(set()), AsyncMock(), ssh=ssh) == "cid"
     ssh.run.assert_not_awaited()
 
