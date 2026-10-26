@@ -258,7 +258,7 @@ def _pull_pinned(
     return "pull_ok", None
 
 
-def _abort_stream(api, response) -> None:
+def _abort_stream(api: docker.APIClient, response: requests.Response) -> None:
     """Wake the thread blocked reading the pull stream. On Linux a close() from another thread
     does not wake a blocked recv(), and closing the buffered reader waits for that read to end;
     a shutdown() of the socket ends the read at once."""
