@@ -33,6 +33,8 @@ MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 # DAH-2002: bound the helper so a backup cannot OOM the rental. Measured restic 0.19.1 peak RSS: 0.41 GiB at
 # 2M files, ~125 B per extra file; bytes barely matter (20 GiB file: 0.17 GiB). 4g covers ~30M files.
+# restic sizes its worker pools from GOMAXPROCS (~7.5 MiB per CPU); unpinned, 192+ CPU hosts hit 4g in seconds.
+RESTIC_HELPER_GOMAXPROCS = "8"
 RESTIC_HELPER_MEMORY = "4g"
 # Highest OOM score: the kernel kills the helper before the rental.
 RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
@@ -799,6 +801,8 @@ class ResticStorageRunner:
             RESTIC_HELPER_OOM_SCORE_ADJ,
             "-e",
             f"GOGC={RESTIC_HELPER_GOGC}",
+            "-e",
+            f"GOMAXPROCS={RESTIC_HELPER_GOMAXPROCS}",
             "--read-only",
             "--tmpfs",
             f"/tmp:rw,nosuid,nodev,size={RESTIC_TMPFS_BYTES}",
