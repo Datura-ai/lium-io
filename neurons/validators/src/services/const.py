@@ -137,7 +137,11 @@ GPU_WEDGE_MEMORY_MAX = 1  # percent (periodic check, NVML memory-utilization)
 GPU_WEDGE_SWEEP_MEMORY_MAX_MIB = 16  # teardown sweep, nvidia-smi memory.used
 GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is removed
 
+# DAH-3698: the listing, rent and idle-pay port floor (PortCountCheck, the split-remainder idle pay). Kept at 3
+# until the platform's one-port-per-split rent path (lium-platform DAH-3698) is live, then dropped to 1.
 MIN_PORT_COUNT = 3
+# DAH-3698: a pod needs only its SSH port (plus one for Jupyter); generate_portMappings creates it from that many.
+MIN_POD_PORT_COUNT = 1
 BATCH_PORT_VERIFICATION_SIZE = 300
 # DAH-3698: window in which only the first failed port verification is forgiven
 PORT_VERIFY_FIRST_MISS_TTL_SECONDS = 3600
