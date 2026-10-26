@@ -356,3 +356,29 @@ def test_the_portal_auth_blob_is_what_signature_auth_miner_verifies():
     assert keypair.verify(blob, f"0x{keypair.sign(blob).hex()}")
 
 
+
+
+@pytest.mark.asyncio
+async def test_wave_publishes_a_new_executor_that_passed_without_waiting_for_the_cycle():
+    """A wave result is listed as soon as its miner answers when the node is new and passed;
+    a validated, failed or rented one waits for the cycle's publish."""
+    service = MinerService.__new__(MinerService)
+    service.redis_service = _redis_service()
+    service.publish_machine_specs = AsyncMock()
+    new, known, failed, rented = (str(uuid4()) for _ in range(4))
+    await service.redis_service.mark_executors_validated([known])
+    rented_result = _job_result(rented)
+    rented_result.is_rented = True
+    job = {
+        "miner_hotkey": "miner-hotkey",
+        "miner_coldkey": "miner-coldkey",
+        "results": [_job_result(new), _job_result(known), _job_result(failed, score=0), rented_result],
+    }
+
+    await service.publish_new_executors_at_pass(job)
+
+    service.publish_machine_specs.assert_awaited_once()
+    args, kwargs = service.publish_machine_specs.await_args
+    assert [r.executor_info.uuid for r in args[0]] == [new]
+    assert args[1:] == ("miner-hotkey", "miner-coldkey")
+    assert kwargs == {"is_whole_miner_batch": False}

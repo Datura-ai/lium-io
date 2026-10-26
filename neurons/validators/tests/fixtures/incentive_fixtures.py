@@ -149,6 +149,7 @@ def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_se
     validator.miner_service = MagicMock()
     validator.miner_service.request_job_to_miner = AsyncMock()
     validator.miner_service.publish_machine_specs = AsyncMock()
+    validator.miner_service.publish_new_executors_at_pass = AsyncMock()
     # sync() asks the express lane (built in initiate_services) which job-file directories to keep
     validator.express_lane = MagicMock()
     validator.express_lane.directories_in_use = MagicMock(return_value=())
