@@ -1158,6 +1158,19 @@ class RentalPriceIncentive(DefaultIncentive):
         for base_model, result in self._spot_pay_candidates:
             rate_sum_by_model[base_model] = rate_sum_by_model.get(base_model, 0.0) + result.gpu_count * result.effective_rate
             pool_by_model[base_model] = result.filler_revenue_usd_per_hour or 0.0
+        for base_model, rate_sum in rate_sum_by_model.items():
+            logger.info(
+                _m(
+                    "Spot pay shares the GPU model's filler earnings",
+                    extra={
+                        "base_model": base_model,
+                        "filler_revenue_usd_per_hour": pool_by_model[base_model],
+                        "spot_rate_sum_usd_per_hour": rate_sum,
+                        "spot_pool_multiplier": min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0,
+                        "spot_gpu_count": sum(r.gpu_count for m, r in self._spot_pay_candidates if m == base_model),
+                    },
+                )
+            )
         total: float = 0.0
         for base_model, result in self._spot_pay_candidates:
             rate_sum: float = rate_sum_by_model[base_model]
