@@ -73,6 +73,7 @@ from services import build_context as build_context_service
 from services.const import (
     EDIT_PARKED_SUFFIX,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
+    PREVIOUS_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
@@ -454,8 +455,10 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 # DAH-5101: the pod's volume files are unlinked before the stop, so the unmount at the stop has no
-# unwritten data to flush to a slow disk.
+# unwritten data to flush to a slow disk. A filler's wipe fits the backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS
+# budget next to FILLER_CONTAINER_STOP_GRACE_SECONDS.
 _VOLUME_WIPE_TIMEOUT_SEC = 120
+_FILLER_VOLUME_WIPE_TIMEOUT_SEC = 10
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
 # when that lookup fails (DAH-3217).
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
@@ -673,14 +676,13 @@ _LOOPBACK_PLUGIN_STATE_COMMAND = _loopback_plugin_state_command(LOOPBACK_PLUGIN_
 
 
 class NoUsableLoopbackPluginError(Exception):
-    """v2 cannot be used and the old plugin is not enabled: the validator never installs or
-    enables the old plugin, so the rent fails naming both."""
+    """The current plugin cannot be used and neither older plugin is enabled: the validator never
+    installs or enables an older plugin, so the rent fails naming them."""
 
-    def __init__(self, v2_unusable_reason: str, old_plugin_state: str):
-        super().__init__(
-            f"no usable vloopback plugin on host (v2: {v2_unusable_reason}; "
-            f"old plugin {LEGACY_LOOPBACK_PLUGIN_ALIAS} state {old_plugin_state})"
-        )
+    def __init__(self, v2_unusable_reason: str, old_plugin_states: dict[str, str]):
+        # "plugin vloopback" + "disabled" is what the stats classifier files as volume.plugin_disabled
+        states = ", ".join(f"plugin {alias} state {state}" for alias, state in old_plugin_states.items())
+        super().__init__(f"no usable vloopback plugin on host (v2: {v2_unusable_reason}; old {states})")
 
 
 @dataclass
@@ -2167,22 +2169,27 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
-def _wipe_volume_cmd(local_volume: str) -> str:
+def _wipe_volume_cmd(local_volume: str, docker: str = "/usr/bin/docker", host_root: str = "/proc/1/root") -> str:
     # unlink the volume's files on the host, through the executor's view of the host root: the
     # pod's open files stay writable until its processes die, and the kernel drops an unlinked
     # file's unwritten pages at that last close instead of writing them. No `docker run`: with
     # gigabytes dirty dockerd takes a minute to start a container (temp-dev, 26.10). The vloopback
-    # mount is only visible on the host under the plugin's propagated-mount dir.
+    # mount is only visible on the host under the plugin's propagated-mount dir. The path is built
+    # from the validated name and each lookup must answer, so a failed or empty answer can never
+    # widen the rm to the host root or to the other volumes (review, 27.10).
     volume = shlex.quote(local_volume)
     return (
-        f"v={volume}; d=$(/usr/bin/docker volume inspect -f '{{{{.Driver}}}}' $v) || exit 2; "
-        f"m=$(/usr/bin/docker volume inspect -f '{{{{.Mountpoint}}}}' $v); "
-        'case "$d" in local) p=$m;; '
-        "*) root=$(/usr/bin/docker info -f '{{.DockerRootDir}}'); "
-        "id=$(/usr/bin/docker plugin inspect -f '{{.Id}}' \"$d\") || exit 3; "
-        'p=$root/plugins/$id/propagated-mount/$(basename "$m");; esac; '
-        '[ -d "/proc/1/root$p" ] || { echo "no dir $p"; exit 4; }; '
-        'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} +; echo "wiped $p"'
+        f"v={volume}; d=$({docker} volume inspect -f '{{{{.Driver}}}}' $v) || exit 2; "
+        f"m=$({docker} volume inspect -f '{{{{.Mountpoint}}}}' $v) || exit 2; "
+        'case "$d" in '
+        'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
+        f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
+        f"root=$({docker} info -f '{{{{.DockerRootDir}}}}') || exit 3; "
+        f"id=$({docker} plugin inspect -f '{{{{.Id}}}}' \"$d\") || exit 3; "
+        'p=$root/plugins/$id/propagated-mount/$v;; '
+        '*) echo "unexpected driver $d"; exit 5;; esac; '
+        f'[ -d "{host_root}$p" ] || {{ echo "no dir $p"; exit 4; }}; '
+        f'find "{host_root}$p" -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo "wiped $p"'
     )
 
 
@@ -6189,23 +6196,27 @@ class DockerService:
         log_extra: dict,
         v2_unusable_reason: str,
     ) -> str:
-        """The old plugin for one new volume when v2 cannot be used, only if it is already enabled:
-        until it is retired a node without v2 keeps renting. Returns the driver to create on, else
-        raises NoUsableLoopbackPluginError; never installs or enables the old plugin.
-        The only place a plugin command may name the old plugin; it goes away with it."""
-        old_plugin_alias = LEGACY_LOOPBACK_PLUGIN_ALIAS
-        try:
-            state_result = await _run_with_host_timeout(
-                ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout
-            )
-            state = (state_result.stdout or "").strip() or "unknown"
-        except TimeoutError:
-            state = "unknown"
-        if state != "true":
-            raise NoUsableLoopbackPluginError(v2_unusable_reason, state)
+        """An older plugin for one new volume when the current one cannot be used, only if it is
+        already enabled: the previous version first (its volumes behave as today), then the legacy
+        one, so a node the current install does not reach keeps renting. Returns the driver to
+        create on, else raises NoUsableLoopbackPluginError; never installs or enables either.
+        The only place a plugin command may name the old plugins; it goes away with them."""
+        old_plugin_states: dict[str, str] = {}
+        for old_plugin_alias in (PREVIOUS_LOOPBACK_PLUGIN_ALIAS, LEGACY_LOOPBACK_PLUGIN_ALIAS):
+            try:
+                state_result = await _run_with_host_timeout(
+                    ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout
+                )
+                old_plugin_states[old_plugin_alias] = (state_result.stdout or "").strip() or "unknown"
+            except TimeoutError:
+                old_plugin_states[old_plugin_alias] = "unknown"
+            if old_plugin_states[old_plugin_alias] == "true":
+                break
+        else:
+            raise NoUsableLoopbackPluginError(v2_unusable_reason, old_plugin_states)
         logger.warning(
             _m(
-                "Loopback plugin v2 unusable; creating this volume on the old plugin",
+                "Loopback plugin v3 unusable; creating this volume on an older plugin",
                 extra=get_extra_info(
                     {**log_extra, "loopback_plugin": old_plugin_alias, "reason": v2_unusable_reason}
                 ),
@@ -10404,10 +10415,17 @@ class DockerService:
         local_volume = payload.local_volume
         if not local_volume:
             return
+        timeout = (
+            _FILLER_VOLUME_WIPE_TIMEOUT_SEC
+            if payload.workload_kind == WorkloadKind.FILLER
+            else _VOLUME_WIPE_TIMEOUT_SEC
+        )
         fields = dict(container_name=payload.container_name, local_volume=local_volume)
         started = time.monotonic()
         try:
-            result = await ssh_client.run(_wipe_volume_cmd(local_volume), timeout=_VOLUME_WIPE_TIMEOUT_SEC)
+            # the host ends an overlong wipe itself and the channel is closed, so a slow rm never
+            # runs on beside the stop or holds the session (MaxSessions=1) the forced removal needs
+            result = await _run_with_host_timeout(ssh_client, _wipe_volume_cmd(local_volume), timeout)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
