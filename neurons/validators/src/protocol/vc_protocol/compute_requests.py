@@ -383,6 +383,12 @@ class RentedGpuDropResponse(BaseModel):
     delivery: str | None = None
 
 
+
+class PodSshReachabilityResponse(BaseModel):
+    # False when nothing was written (no open rental, or the state was already recorded).
+    recorded: bool
+
+
 GPU_DROP_DELIVERY_DISABLED = "disabled"
 GPU_DROP_DELIVERY_NOT_RENTED = "not_rented"
 

@@ -20,6 +20,7 @@ from protocol.vc_protocol.compute_requests import (
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
+    PodSshReachabilityResponse,
     RentedExecutorsResponse,
     RentedGpuDropResponse,
     VerificationStartedResponse,
@@ -442,6 +443,25 @@ class BackendClient:
             },
             timeout=10,
             non_200_log_level=logging.WARNING,
+        )
+
+    async def report_pod_ssh_reachability(
+        self, pod_id: str, *, state: str, since: str, result: str | None, errno: int | None
+    ) -> PodSshReachabilityResponse | None:
+        """Tell the backend a rented pod's SSH stopped answering (``state="unreachable"``, ``since`` =
+        the first missed probe) or answers again (``state="reachable"``, ``since`` = when it came back).
+
+        Raises ``BackendRejected`` on 404 (an older backend without the route); None on any other
+        failure, which the caller reports again next tick.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-reachability",
+            PodSshReachabilityResponse,
+            json_data={"state": state, "since": since, "result": result, "errno": errno},
+            timeout=10,
+            # once a minute per down pod: the watch logs the counts, not every failed post
+            non_200_log_level=logging.DEBUG,
+            raise_on_4xx=True,
         )
 
     async def get_filler_run_active(
