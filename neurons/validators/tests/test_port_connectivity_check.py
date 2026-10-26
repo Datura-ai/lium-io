@@ -731,3 +731,27 @@ async def test_rented_node_with_a_timed_out_scrape_test_keeps_its_probe_and_fall
     assert connectivity.called_with["sysbox_runtime"] is False
     assert result.updates["state"].sysbox_runtime is True
     assert result.updates["default_extra"]["sysbox_from_last_verified"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dind_ok", "measured", "expected"),
+    [(False, None, False), (True, None, False), (True, False, False), (True, True, True)],
+    ids=["no_container", "container_not_tested", "measured_no_sysbox", "measured_in_container"],
+)
+async def test_f16_requested_sysbox_probe_counts_only_its_in_container_measurement(
+    context_factory, dind_ok, measured, expected
+):
+    """F-16: the timeout makes the validator request a sysbox-runc probe, and a run that measured nothing (no ports,
+    an error) echoes that request back as sysbox_runtime=True. Only the probe's in-container measurement passes."""
+    redis_service = DummyRedis()
+    state = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS)
+    ctx, connectivity = _probe_ctx(
+        context_factory, redis_service, state, dind_ok=dind_ok, sysbox=True, measured=measured
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with["sysbox_runtime"] is True
+    assert result.updates["state"].sysbox_runtime is expected
+    assert result.updates["state"].specs["sysbox_runtime"] is expected

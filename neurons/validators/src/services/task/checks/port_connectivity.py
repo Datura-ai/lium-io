@@ -71,6 +71,10 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
         )
+        if probe_sysbox and not ctx.state.sysbox_runtime:
+            # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
+            # own in-container measurement may say Sysbox works
+            result = replace(result, sysbox_runtime=result.sysbox_measured is True)
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
         declared_port_count = result.declared_port_count
