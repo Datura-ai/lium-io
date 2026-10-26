@@ -714,6 +714,17 @@ class GpuFingerprintMessages:
         "purpose, remove the node in the portal and add it again: a node keeps the cards it was first "
         "verified with.",
     )
+    # Warn mode, the replaced cards are accepted (cards_replaced): this cycle resets, the next one anchors them.
+    UUID_REPLACED = MessageTemplate(
+        event="GPU set replaced; re-verifying with the new GPUs",
+        reason="GPU_UUID_CHANGED",
+        severity="warning",
+        category="env",
+        impact="Verification reset this cycle; the node keeps its ID and is checked with the new GPUs "
+        "next cycle",
+        remediation="No action needed, and do not remove the node: it is listed again once the new GPUs pass "
+        "the usual checks.",
+    )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
     GPU_MISSING = MessageTemplate(

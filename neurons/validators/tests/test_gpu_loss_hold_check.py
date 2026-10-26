@@ -60,6 +60,7 @@ def _ctx(
     scrape_error=None,
     pods=(4,),
     owner="miner-hotkey",
+    spot=False,
 ):
     executor = default_executor()
     specs: dict = {"gpu": {"count": count, "details": _details(listed)}}
@@ -78,7 +79,9 @@ def _ctx(
         gpu_count=count,
         gpu_details=_details(listed),
         gpu_uuids=",".join(listed),
-        rented_data=RentedExecutorsResponse(executors=rented),
+        rented_data=RentedExecutorsResponse(
+            executors=rented, spot_executor_ids=[executor.uuid] if spot else []
+        ),
     )
     return context_factory(
         services=build_services(redis=redis),
@@ -364,5 +367,17 @@ async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_not_held(context
     replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
 
     result = await _cycle(context_factory, redis, listed=replaced, pods=pods)
+
+    assert _hidden(result) is held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("spot", "pods", "held"), [(True, (), False), (False, (), True), (True, (4,), True)])
+async def test_a_partly_replaced_set_is_not_held_only_on_an_idle_spot_node(context_factory, spot, pods, held):
+    """One card replaced is re-anchored on an idle Spot node (GpuFingerprintCheck), so it is not a lost card there;
+    off Spot or under a rental the anchored card is still missing."""
+    partly = UUIDS[:3] + ["GPU-b0b0-0000-0000-0000-000000000000"]
+
+    result = await _cycle(context_factory, FakeRedis(), listed=partly, pods=pods, spot=spot)
 
     assert _hidden(result) is held
