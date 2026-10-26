@@ -2,8 +2,8 @@
 
 import shlex
 
-LOOPBACK_PLUGIN_TAG = "daturaai/docker-volume-loopback:1.0.0-lium2"
-LOOPBACK_PLUGIN_DIGEST = "sha256:589adbe6bf4239a55286b44f57289b32bafc63a6fc213f48475c420abb60237d"
+LOOPBACK_PLUGIN_TAG = "daturaai/docker-volume-loopback:1.0.0-lium3"
+LOOPBACK_PLUGIN_DIGEST = "sha256:e4afe23dc3e9abdda36d307d9b16b380de2fd0959427a6b138e947a8730e1b17"
 
 # Executed by the executor's Python, not the validator's filesystem. Docker's plugin metadata
 # is on the host; the privileged executor has host PID access and can read it via /proc/1/root.

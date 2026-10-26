@@ -73,7 +73,7 @@ def _setup_arguments(tmp_path: Path, overrides: dict) -> list[str]:
     docker.chmod(0o700)
     return [
         sys.executable, "-c", _SETUP_SCRIPT, str(docker), "vloopback:v3",
-        "daturaai/docker-volume-loopback:1.0.0-lium2", LOOPBACK_PLUGIN_DIGEST,
+        "daturaai/docker-volume-loopback:1.0.0-lium3", LOOPBACK_PLUGIN_DIGEST,
         str(tmp_path), "", str(tmp_path / "setup.lock"),
     ]
 
