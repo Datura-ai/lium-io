@@ -1162,6 +1162,32 @@ async def test_a_container_recreated_under_an_ended_id_keeps_its_gpu_processes_t
 
 
 @pytest.mark.asyncio
+async def test_a_consumed_exemption_never_re_arms_with_age(monkeypatch):
+    """Review 4374006889: a marker written long ago still blocks a recreated container, and the
+    exemption hash is never given a TTL."""
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    redis = _DictRedis()
+    expired: list[str] = []
+
+    async def expire(key, seconds):
+        expired.append(key)
+
+    monkeypatch.setattr(redis, "expire", expire)
+    redis.hashes["reaped_gpu_exempt:executor-123"] = {name: "2020-01-01T00:00:00+00:00"}
+    processes = [{"pid": 1, "container_name": name}]
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx([name], processes, backend=_ended_here_backend(holder), redis=redis)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].gpu_processes == processes
+    assert redis.hashes["reaped_gpu_exempt:executor-123"] == {name: "2020-01-01T00:00:00+00:00"}
+    assert not [key for key in expired if key.startswith("reaped_gpu_exempt:")]
+
+
+@pytest.mark.asyncio
 async def test_an_unreadable_exemption_record_keeps_the_removed_containers_gpu_processes():
     from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
 
