@@ -7663,6 +7663,12 @@ async def test_restore_volume_mount_of_running_container_remounts_or_stops_the_p
         pytest.param(None, None, "pod_pod-1", id="marked_keeps_its_name"),
         pytest.param(ConnectionError("temporary Redis failure"), None, "pod_pod-1__prev", id="failed_mark_parks_it"),
         pytest.param("hang", None, "pod_pod-1__prev", id="stalled_mark_parks_it"),
+        pytest.param(
+            ConnectionError("temporary Redis failure"),
+            ConnectionError("SSH lost after the stop"),
+            "pod_pod-1__prev",
+            id="failed_mark_and_stop_reply_lost_still_parked",
+        ),
         pytest.param(None, ConnectionError("SSH lost after the stop"), "pod_pod-1", id="stop_applied_reply_lost"),
         pytest.param(None, TimeoutError(), "pod_pod-1", id="stop_applied_reply_timed_out"),
         pytest.param(None, "nonzero", "pod_pod-1", id="docker_refused_the_stop"),
@@ -7681,7 +7687,7 @@ async def test_mark_and_stop_unmounted_pod_leaves_a_retry_anchor(
     marks: dict[str, str] = {}
 
     async def run(command, *_args, **_kwargs):
-        if command == "/usr/bin/docker stop pod_pod-1" and host["name"] == "pod_pod-1":
+        if command == f"/usr/bin/docker stop {host['name']}":
             if stop_reply_error == "nonzero":
                 return _make_ssh_command_result(exit_status=1)
             if stop_reply_error == "signalled_still_stopping":
@@ -7691,12 +7697,15 @@ async def test_mark_and_stop_unmounted_pod_leaves_a_retry_anchor(
                 return _make_ssh_command_result(exit_status=137)  # the CLI was killed after the stop applied
             if stop_reply_error:
                 raise stop_reply_error
-        elif command == "/usr/bin/docker inspect -f '{{.State.Running}}' pod_pod-1":
+        elif command == f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {host['name']}":
             if stop_reply_error == "signalled_inspect_fails":
                 raise ConnectionError("SSH lost")
             return _make_ssh_command_result(stdout=f"{str(host['running']).lower()}\n")
         elif command.startswith("/usr/bin/docker rename pod_pod-1 "):
+            assert host["running"]  # parked before the stop, never after
             host["name"] = command.rsplit(" ", 1)[1]
+        else:
+            return _make_ssh_command_result(exit_status=1)
         return _make_ssh_command_result()
 
     ssh_client = AsyncMock()

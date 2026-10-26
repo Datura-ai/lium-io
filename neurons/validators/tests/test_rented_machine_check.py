@@ -1307,13 +1307,19 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         return TenantEnforcementCheck().run(ctx)
 
     first = await cycle()
-    assert not first.passed
-    assert first.event.reason_code == Msg.POD_NOT_RUNNING.reason
     assert _pod_states(first)["pod-1"] != "running"
     assert not ssh.pod_running
-    # a pod the validator stopped is down without the host reset; one stopped by anyone else keeps it
-    assert first.updates.get("clear_verified_job_reason") == (None if stopped_by_us else ResetVerifiedJobReason.POD_NOT_RUNNING.value)
-    assert ("clear_verified_job_info" in first.updates) is not stopped_by_us
+    if stopped_by_us:
+        # reported down through its pod state only: a renter breaking the mount from inside neither fails
+        # the provider's validation nor gets the host reset
+        assert first.passed and first.halt, first.event
+        assert first.event.reason_code == Msg.ALREADY_RENTED.reason
+        assert not any(key.startswith("clear_verified_job") for key in first.updates)
+        assert first.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
+    else:
+        assert not first.passed
+        assert first.event.reason_code == Msg.POD_NOT_RUNNING.reason
+        assert first.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
 
     backend.active, backend.local_volume_path = True, "/workspace"
     second = await cycle()

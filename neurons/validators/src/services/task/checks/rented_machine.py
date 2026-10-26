@@ -497,10 +497,14 @@ class TenantEnforcementCheck:
             )
 
         # a pod the validator stopped itself (its mount could not be restored) is down, but not by the
-        # host: no host reset, so a renter breaking the mount from inside cannot get the node reset
+        # host: reported down through its pod state, yet no failed check or host reset, so a renter
+        # breaking the mount from inside cannot fail the provider's validation or get the node reset
         stopped_by_validator = False
         with contextlib.suppress(Exception):
             stopped_by_validator = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}") is not None
+        if stopped_by_validator:
+            extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
+            return _DownedPodOutcome(failure=None, ssh_pub_keys=[], container_state=container_state)
         event = render_message(
             Msg.POD_NOT_RUNNING,
             ctx=ctx,
@@ -511,16 +515,9 @@ class TenantEnforcementCheck:
                 "container_name": container_name,
                 "executor_uuid": ctx.executor.uuid,
                 "diagnostics": diagnostics,
-                **({"stopped_by_validator": True} if stopped_by_validator else {}),
             },
             extra=extra,
         )
-        if stopped_by_validator:
-            return _DownedPodOutcome(
-                failure=CheckResult(passed=False, event=event, updates={"default_extra": extra}),
-                ssh_pub_keys=[],
-                container_state=container_state,
-            )
         return _DownedPodOutcome(
             failure=CheckResult(
                 passed=False,

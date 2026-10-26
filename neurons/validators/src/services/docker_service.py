@@ -10512,18 +10512,20 @@ class DockerService:
         # marked before the stop (at most the mark's 5 s bound), since no later cycle restarts an
         # unmarked pod stopped under its own name, and a stop whose reply is lost may still have
         # applied. When the mark cannot be written the pod is parked instead, which the next
-        # cycle's rename-back finds without any mark.
+        # cycle's rename-back finds without any mark; parked before the stop, so a stop whose reply
+        # is lost with the SSH transport still leaves that anchor.
         try:
             await self._mark_stopped_by_recovery(pod_id)
             marked = True
         except Exception:
             marked = False
+        parked = f"{container_name}{EDIT_PARKED_SUFFIX}"
+        if not marked and await self._park_by_id(ssh_client, container_name, parked):
+            container_name = parked
         outcome = await self._stop_outcome(ssh_client, container_name)
         if outcome == "failed" and marked:
             # docker said it did not stop: the pod still runs, and the mark must not restart a later provider stop
             await self._clear_stopped_by_recovery(pod_id)
-        elif not marked:
-            await self._park_by_id(ssh_client, container_name, f"{container_name}{EDIT_PARKED_SUFFIX}")
         return outcome == "stopped"
 
     async def _local_volume_encryption_state(
