@@ -23,6 +23,11 @@ FLATTEN_DISK_MARGIN_BYTES = 10 * 1024**3
 FLATTEN_TIMEOUT_SECONDS = 1800
 _DOCKER_READ_TIMEOUT_SECONDS = 120
 FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"
+# short lock over "mark a copy as in use" and "remove copies not in use", so a removal never races a reuse
+FLATTEN_USE_LOCK_PATH = "/tmp/lium-flatten-use.lock"
+# a copy flattened or reused this recently may still be waiting for its rental's create: never removed
+FLATTEN_LEASE_DIR = "/tmp/lium-flatten-leases"
+FLATTEN_LEASE_MINUTES = 60
 FLATTEN_NO_DISK_EXIT = 95
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
@@ -97,9 +102,23 @@ def image_flatten_changes(config: dict) -> list[str]:
     return changes
 
 
+def _lease_command(tag: str) -> str:
+    """Mark `tag` as wanted by a rental that has not created its container yet."""
+    return f"mkdir -p {FLATTEN_LEASE_DIR} && touch {FLATTEN_LEASE_DIR}/{shlex.quote(tag.partition(':')[2])}"
+
+
+def _reuse_command(tag: str) -> str:
+    """Exit 0 and lease the copy when it exists; under the use lock so a cleanup cannot remove it in between."""
+    return (
+        f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
+        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && {_lease_command(tag)}"
+    )
+
+
 def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int) -> str:
     """Under a node-wide lock: reuse a copy another flatten finished meanwhile, remove every earlier copy
-    no container uses (so renters cannot fill the disk with copies), check the Docker disk
+    no container uses and no rental leased in the last FLATTEN_LEASE_MINUTES (so renters cannot fill the
+    disk with copies, and a rental never loses its copy before its create), check the Docker disk
     holds `need_bytes`, create (never start) a container from the image ID, pipe its export into an
     import, tag the result only when both sides succeeded, and always remove the container and its
     volumes. Plain sh: no pipefail."""
@@ -111,10 +130,12 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
     return (
         # one flatten per node: concurrent rentals would each pass the disk check and copy at once
         f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
-        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && exit 0; "
+        f"({_reuse_command(tag)}) && exit 0; "
+        f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
         # rmi without -f refuses a copy a container (running or stopped) still uses
         f"for old in $(/usr/bin/docker image ls --format '{{{{.Repository}}}}:{{{{.Tag}}}}' {FLATTENED_IMAGE_REPO}); "
-        'do /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
+        f'do [ -n "$(find {FLATTEN_LEASE_DIR}/"${{old#*:}}" -mmin -{FLATTEN_LEASE_MINUTES} 2>/dev/null)" ] '
+        '|| /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; flock -u 8; '
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
         f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
@@ -125,7 +146,7 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
         f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
         'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
         # a left-over container or volume fails the flatten untagged, so the next rental retries the cleanup
-        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
+        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag)}; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
         'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
         'echo "flatten failed: export=$erc import=$irc rm=$rrc" >&2; exit 98; fi'
     )
@@ -155,7 +176,7 @@ async def flatten_image_on_host(
     info = json.loads(inspect.stdout)
     tag = f"{FLATTENED_IMAGE_REPO}:{info['Id'].removeprefix('sha256:')}"
     existing = await ssh_client.run(
-        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1",
+        _reuse_command(tag),
         check=False,
         timeout=_DOCKER_READ_TIMEOUT_SECONDS,
     )

@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -8,7 +9,9 @@ import pytest
 from services import image_flatten
 from services.image_flatten import (
     FLATTEN_DISK_MARGIN_BYTES,
+    FLATTEN_LEASE_DIR,
     FLATTEN_LOCK_PATH,
+    FLATTEN_USE_LOCK_PATH,
     FLATTEN_NO_DISK_EXIT,
     ImageFlattenNoDisk,
     _flatten_command,
@@ -58,7 +61,7 @@ def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver:
             return Mock(exit_status=0, stdout=f"{driver}\n")
         if command.startswith("/usr/bin/docker image inspect --format"):
             return Mock(exit_status=0, stdout=json.dumps({"Id": _IMAGE_ID, "Size": size, "Config": _CONFIG}))
-        if command.startswith(f"/usr/bin/docker image inspect {_TAG}"):
+        if "docker create" not in command and f"/usr/bin/docker image inspect {_TAG}" in command:
             return Mock(exit_status=0 if exists else 1, stdout="")
         return Mock(exit_status=flatten_rc, stdout="", stderr="boom")
 
@@ -159,7 +162,14 @@ def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12
     )
     fake.chmod(0o755)
     script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100)
-    return ["sh", "-c", script.replace("/usr/bin/docker", str(fake)).replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock"))]
+    for real, local in (
+        ("/usr/bin/docker", fake),
+        (FLATTEN_LOCK_PATH, tmp_path / "lock"),
+        (FLATTEN_USE_LOCK_PATH, tmp_path / "use.lock"),
+        (FLATTEN_LEASE_DIR, tmp_path / "leases"),
+    ):
+        script = script.replace(real, str(local))
+    return ["sh", "-c", script]
 
 
 def _calls(tmp_path) -> list[str]:
@@ -207,6 +217,31 @@ def test_each_new_flatten_first_removes_earlier_copies_no_container_uses(tmp_pat
     # without -f: dockerd refuses a copy a pod still uses; before the disk check, so the space counts
     first = [c.split()[0] for c in calls]
     assert calls.index("rmi lium-flattened:old1") < calls.index("rmi lium-flattened:old2") < first.index("info")
+    assert (tmp_path / "leases" / "x").exists()  # the new copy is leased to the rental that waits for it
+
+
+def test_cleanup_keeps_a_copy_a_rental_still_waits_to_create_from(tmp_path):
+    # pending: flattened or reused by a rental that has not created its container yet
+    (tmp_path / "copies").write_text("lium-flattened:pending\nlium-flattened:stale\nlium-flattened:unleased\n")
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    (leases / "pending").touch()
+    (leases / "stale").touch()
+    old = time.time() - (image_flatten.FLATTEN_LEASE_MINUTES + 5) * 60
+    os.utime(leases / "stale", (old, old))
+    argv = _flatten_script(tmp_path)
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
+    rmi = [c for c in _calls(tmp_path) if c.startswith("rmi lium-flattened:")]
+    assert rmi == ["rmi lium-flattened:stale", "rmi lium-flattened:unleased"]
+
+
+def test_reusing_a_copy_leases_it_under_the_cleanup_lock(tmp_path):
+    (tmp_path / "tagged").touch()
+    argv = _flatten_script(tmp_path)
+    assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
+    assert (tmp_path / "leases" / "x").exists() and "create" not in " ".join(_calls(tmp_path))
+    reuse = image_flatten._reuse_command("lium-flattened:x")
+    assert reuse.index("flock -w") < reuse.index("image inspect") < reuse.index("touch")
 
 
 def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
