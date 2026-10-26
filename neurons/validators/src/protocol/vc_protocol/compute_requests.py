@@ -3,7 +3,7 @@ import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, RootModel, ValidationError, field_validator
+from pydantic import BaseModel, RootModel, ValidationError, field_validator, model_validator
 
 from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
@@ -94,6 +94,8 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
+    # DAH-2348: volumes of the node's paused pods, which are not in `pods`; never swept. Empty from an older backend.
+    kept_volume_names: list[str] = []
 
     def get_rented_ports(self) -> list[int]:
         """Aggregate rented ports from all pods."""
@@ -209,6 +211,24 @@ class RentedExecutorsResponse(BaseModel):
     # executor_ids of the nodes of banned pool accounts, listed as soon as a node is added, so a node
     # added after an account ban fails the ban check in its first cycle. An older backend bans none.
     banned_executor_ids: list[str] = []
+    # DAH-2348: executor_id -> kept volumes of a node whose only pods are paused. Such a node is moved
+    # here out of `executors` on parse, so every check reads it as unrented, as if it were not listed.
+    kept_volume_names_by_executor: dict[str, list[str]] = {}
+
+    @model_validator(mode="after")
+    def _move_paused_only_executors(self) -> "RentedExecutorsResponse":
+        for executor_id, executor in list(self.executors.items()):
+            if not executor.pods and executor.kept_volume_names:
+                self.kept_volume_names_by_executor[executor_id] = executor.kept_volume_names
+                del self.executors[executor_id]
+        return self
+
+    def get_kept_volume_names(self, executor_uuid: str) -> list[str]:
+        """The paused pods' volumes on the node, wherever the backend listed them."""
+        executor = self.executors.get(str(executor_uuid))
+        return (executor.kept_volume_names if executor else []) or self.kept_volume_names_by_executor.get(
+            str(executor_uuid), []
+        )
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float

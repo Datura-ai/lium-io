@@ -830,10 +830,14 @@ def _probe_payload(
             for internal, external in ctx.state.verified_port_pairs
         ],
         pod_mapping=[],
-        # nothing to protect: the backend lists no pod here, and create_container's `beside_fillers`
-        # keeps every filler_* on the node, not only the ones listed at this moment
+        # no container to protect: the backend lists no pod here, and create_container's `beside_fillers`
+        # keeps every filler_* on the node, not only the ones listed at this moment. A paused pod's
+        # volume stays (DAH-2348); the probe only runs when the cycle's snapshot lists no live pod, so
+        # a pod paused since then is still in that snapshot's pods and the probe skips the node.
         active_container_names=[],
-        active_volume_names=[],
+        active_volume_names=(
+            ctx.state.rented_data.get_kept_volume_names(ctx.executor.uuid) if ctx.state.rented_data else []
+        ),
     )
 
 
