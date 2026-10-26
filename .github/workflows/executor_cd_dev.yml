@@ -16,6 +16,9 @@ jobs:
       VALIDATOR_HOTKEY_SS58: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
       TARGET_FILE: "docker-compose.app.dev.yml"
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      # One OCI index for x86 and ARM (GB300 Grace) hosts; docker_build.sh / docker_runner_build.sh build it
+      # with buildx and the publish scripts push it with skopeo. Prod follows once a dev image runs on both.
+      PLATFORMS: "linux/amd64,linux/arm64"
     permissions:
       contents: read
       id-token: write
@@ -29,6 +32,10 @@ jobs:
           chmod +x neurons/executor/docker_publish.sh
           chmod +x neurons/executor/docker_runner_build.sh
           chmod +x neurons/executor/docker_runner_publish.sh
+
+      # arm64 is emulated on this x86 runner; the container builder is what can write a multi-arch OCI archive
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       # Build before the login: the base images (python, docker) are public docker.io images, and once
       # the OIDC token is the docker.io credential every pull uses it. It covers only the daturaai push
