@@ -94,4 +94,4 @@ async def test_rented_full_8x_without_capabilities_untouched(monkeypatch):
 
     result = await incentive.calculate_executor_score(_make_job(is_rented=True))
 
-    assert "full_8x_without_ncu_or_split" not in "\n".join(result.incentive_logs)
+    assert "flagship_without_ncu_or_split" not in "\n".join(result.incentive_logs)

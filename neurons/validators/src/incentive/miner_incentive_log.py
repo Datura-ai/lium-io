@@ -109,7 +109,7 @@ class ZeroIncentiveReason(StrEnum):
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
-    FULL_8X_WITHOUT_NCU_OR_SPLIT = "full_8x_without_ncu_or_split"
+    FULL_8X_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"  # wire code, append-only: consumers key on it (DAH-5197 keeps the value)
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"

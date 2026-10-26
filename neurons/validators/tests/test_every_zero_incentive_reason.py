@@ -79,7 +79,7 @@ async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch, di
     result = await _incentive().calculate_executor_score(_idle_full_8x(provider_discord_connected=False))
 
     # the first entry is the one the old first-match evaluation reported
-    assert _codes(result) == ["provider_discord_not_connected", "full_8x_without_ncu_or_split"]
+    assert _codes(result) == ["provider_discord_not_connected", "flagship_without_ncu_or_split"]
     assert result.mining_score == 0
     assert result.eligible_for_rental_share is False
 
@@ -103,7 +103,7 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
         "new_rentals_paused",
         "price_above_market_p90_soft_limit",
         "insufficient_disk_for_vram",
-        "full_8x_without_ncu_or_split",
+        "flagship_without_ncu_or_split",
     ]
     assert result.mining_score == 0
 
@@ -128,7 +128,7 @@ def _logged(caplog, reason: str) -> int:
 # The last two are the probes' "cannot measure ...; unrented incentive kept" lines: no reason, and
 # the sentence is false for a node that is already excluded.
 GATE_LOG_CASES = [
-    (None, {}, "full_8x_without_ncu_or_split", "full_8x_without_ncu_or_split"),
+    (None, {}, "flagship_without_ncu_or_split", "flagship_without_ncu_or_split"),
     (None, {"gpu_count": 4, "spec": SHORT_DISK_SPEC}, "insufficient_disk_for_vram", "insufficient_disk_for_vram"),
     (
         None,

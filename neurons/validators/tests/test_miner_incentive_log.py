@@ -35,7 +35,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "nvidia_driver_below_minimum",
         "sysbox_not_enabled",
         "insufficient_disk_for_vram",
-        "full_8x_without_ncu_or_split",
+        "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
@@ -157,7 +157,7 @@ def _job(**overrides) -> JobResult:
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),
-            "full_8x_without_ncu_or_split",
+            "flagship_without_ncu_or_split",
             "NCU profiling",
         ),
         (
