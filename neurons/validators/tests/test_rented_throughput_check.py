@@ -17,6 +17,7 @@ from services.task.checks.rented_throughput import (
     parse_busy,
     parse_disk,
     parse_during,
+    pods_stopped,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
@@ -204,6 +205,10 @@ def test_parse_disk_and_busy():
     assert parse_during(snaps(pod=False)) == (None, (None, None))
     restarted = snaps().rsplit("pod=4242", 1)  # the pod restarted (a new pid) during the fetch
     assert parse_during("pod=4243".join(restarted))[0] is None
+    assert pods_stopped("pod=4243".join(restarted)) == (True, False)
+    assert pods_stopped(snaps()) == (False, False)
+    assert pods_stopped(two) == (False, False)  # a missing snapshot is not a stopped pod
+    assert pods_stopped(snaps(pod=False)) == (False, False)  # never readable is not a stopped pod
 
 
 async def test_good_reading_passes():
@@ -353,6 +358,20 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     )
     answer += disk(secs=30.0) + SLOW
     assert parse_during(answer)[0] == pytest.approx(32.0)
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("none", "none")
+
+
+# The only busy pod restarts during the fetch and its cgroup goes unreadable during the disk write: what it moved is
+# unknown, so neither slow side is a strike.
+async def test_a_pod_stopped_mid_probe_is_no_verdict():
+    lines = snaps().splitlines()
+    b = ["5151:1:1:1:1,", "5151:1:1:1:1,", "5151:1:1::,", "5151:::,"]
+    answer = "\n".join(
+        lines[:2] + [ln.replace(" pod=", f" pod={x}") for ln, x in zip(lines[2:], b)]
+    )
+    answer += "\n" + disk(secs=30.0) + SLOW
     with flags():
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
     assert (net, disk_side) == ("none", "none")
