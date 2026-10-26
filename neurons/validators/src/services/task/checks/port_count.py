@@ -80,11 +80,13 @@ class PortCountCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
-        # The probe skips our idle filler's ports, but a rental frees them, so they count toward
-        # the floor, so a small declared range is not hidden and failed by our own filler.
-        filler_ports = (
-            set(rented_data.get_filler_ports(ctx.executor.uuid)) if rented_data else set()
-        )
+        # The probe skips our idle filler's ports, but a rental removes the filler (create-time
+        # cleanup) and frees them, so they join both the count and verified_ports, the set the
+        # platform's rent guard and prepare_ports_data allocate from; the two stay in step.
+        probed = list((ctx.state.specs or {}).get("verified_ports") or [])
+        held = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
+        filler_ports = sorted(set(held) - set(probed))
+        verified_ports = probed + filler_ports  # probed first: rental verification uses [0]
         port_count = ctx.state.verified_port_count + len(filler_ports)
 
         # Check if executor is rented (same pattern as rented_machine.py)
@@ -96,6 +98,7 @@ class PortCountCheck:
             specs={
                 **ctx.state.specs,
                 "available_port_count": port_count,
+                "verified_ports": verified_ports,
                 "port_range": ctx.executor.port_range,
                 "port_mappings": ctx.executor.port_mappings,
             },

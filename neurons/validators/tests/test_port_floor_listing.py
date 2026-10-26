@@ -561,16 +561,26 @@ async def test_a_range_next_to_empty_mappings_is_named_while_the_event_says_no_p
 
 
 @pytest.mark.asyncio
-async def test_ports_held_by_our_filler_count_toward_the_floor(context_factory):
-    """A 6-port node whose idle filler holds 2 ports and answers 2 of the other 4 passes with 4:
-    a rental removes the filler and frees its ports (prod 22 Oct, declared ranges of 6-11)."""
+async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented(context_factory):
+    """A 6-port node whose idle filler holds 2 ports and answers 2 of the other 4 passes with 4,
+    and a rent can allocate them: a rental removes the filler and frees its ports (prod 22 Oct,
+    declared ranges of 6-11). The platform's rent guard (verify 2) and prepare_ports_data take
+    `verified_ports` minus the pods' busy ports, so the filler ports must be in that list too."""
     rented_data = RentedExecutorsResponse(
         executors={}, filler_ports_by_executor={"executor-123": [2004, 2001]}
     )
-    ctx = context_factory(state=build_state(verified_port_count=2, rented_data=rented_data))
+    state = build_state(
+        verified_port_count=2, specs={"verified_ports": [2003, 2005]}, rented_data=rented_data
+    )
+    ctx = context_factory(state=state)
 
     result = await PortCountCheck().run(ctx)
 
     assert result.passed is True
-    assert result.updates["port_count"] == 4
-    assert result.updates["state"].specs["available_port_count"] == 4
+    specs = result.updates["state"].specs
+    assert result.updates["port_count"] == specs["available_port_count"] == 4
+    # probed ports first (rental verification uses [0]), then the filler's
+    assert specs["verified_ports"] == [2003, 2005, 2001, 2004]
+    # rent path: no pod holds a port (a filler creates none), so all 4 are free to allocate
+    busy_pod_ports: set[int] = set()
+    assert len(set(specs["verified_ports"]) - busy_pod_ports) >= MIN_PORT_COUNT
