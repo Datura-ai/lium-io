@@ -256,12 +256,6 @@ class Settings(BaseSettings):
     INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
         env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
     )
-    # DAH-4548: on, the sensor's rental-interference verdict of a host write into a rented pod fails
-    # the Inspector check and zeroes the score. Off: unchanged, logged as INSPECTOR_HOST_WRITE with
-    # enforced=false. A read is only logged either way.
-    INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -275,6 +269,8 @@ class Settings(BaseSettings):
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
+    # Emergency switch for new volumes only; existing recorded drivers remain usable.
+    LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
@@ -581,13 +577,6 @@ class Settings(BaseSettings):
     # idle moved to the burner, never an older vector.
     SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
-    # Two executors of ONE miner hotkey that report the same GPU UUID in one cycle are one set of
-    # cards listed twice. Always logged (GPU_ALIAS_SAME_MINER); with this on, every copy but one
-    # scores 0 for the cycle. Only the miner's own executors are compared, so another miner
-    # reporting the same UUIDs cannot cost it anything.
-    GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED: bool = Field(
-        env="GPU_ALIAS_SAME_MINER_ENFORCEMENT_ENABLED", default=False
-    )
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
@@ -633,7 +622,8 @@ class Settings(BaseSettings):
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
     # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR); a spot node without a filler, or whose configuration
+    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
+    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
     # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
     # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
     # False: every spot node earns 0, as before.

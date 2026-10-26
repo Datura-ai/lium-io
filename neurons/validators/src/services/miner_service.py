@@ -50,8 +50,11 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    GpuResetErrorCode,
     InstallJupyterServerRequest,
     JupyterInstallationFailed,
+    PodGpuResetResult,
+    ResetPodGpuRequest,
     WorkloadKind,
     now_ms,
 )
@@ -1281,6 +1284,20 @@ class MinerService:
                 workload_kind=payload.workload_kind,
                 msg=detail or headline,
             )
+        elif isinstance(payload, ResetPodGpuRequest):
+            # nothing on the host changed: the reset never reached the executor
+            return PodGpuResetResult(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                request_id=payload.request_id,
+                ok=False,
+                error_code=GpuResetErrorCode.OperationInProgress
+                if error_code == FailedContainerErrorCodes.RentingInProgress
+                else GpuResetErrorCode.ExecutorUnreachable,
+                detail=headline,
+            )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -2249,6 +2266,8 @@ class MinerService:
                     result = await docker_service.remove_ssh_keys(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, InstallJupyterServerRequest):
                     result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, ResetPodGpuRequest):
+                    result = await docker_service.reset_pod_gpus(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, BackupContainerRequest):
                     result = await self.handle_backup_container_req(executor, payload, ssh_pkey, docker_service)
                 elif isinstance(payload, RestoreContainerRequest):

@@ -45,6 +45,8 @@ from payload_models.payloads import (
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
     InstallJupyterServerRequest,
+    PodGpuResetResult,
+    ResetPodGpuRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
 )
@@ -65,6 +67,7 @@ from protocol.vc_protocol.validator_requests import (
     LogStreamRequest,
     PodStatesReport,
     RentedMachineRequest,
+    ResetVerifiedJobEvidence,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
@@ -76,6 +79,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import create_steps_after_reply, inflight_creates
+from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -446,6 +450,31 @@ class ComputeClient:
                         async with self.lock:
                             self.message_queue.append(inspector_event)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
+                        # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
+                        # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
+                        evidence = ResetVerifiedJobEvidence.model_validate(data.get("evidence") or {})
+                        reset_marks = (
+                            self.miner_service.redis_service,
+                            data["miner_hotkey"],
+                            data["executor_uuid"],
+                            evidence.pod_id,
+                        )
+                        if reset_caused(data.get("check_id"), data.get("reason_code"), evidence) and (
+                            await renter_gpu_reset_in_progress(*reset_marks)
+                            or await renter_gpu_reset_recent(*reset_marks)
+                        ):
+                            logger.info(
+                                _m(
+                                    "Verified-job reset not sent: renter GPU reset in progress",
+                                    extra=get_extra_info({
+                                        **self.logging_extra,
+                                        "miner_hotkey": data["miner_hotkey"],
+                                        "executor_uuid": data["executor_uuid"],
+                                        "check_id": data.get("check_id"),
+                                    }),
+                                )
+                            )
+                            continue
                         reset_request = ResetVerifiedJobRequest(
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
@@ -955,7 +984,8 @@ class ComputeClient:
         | AddDebugSshKeyRequest
         | BackupContainerRequest
         | RestoreContainerRequest
-        | InstallJupyterServerRequest,
+        | InstallJupyterServerRequest
+        | ResetPodGpuRequest,
     ):
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
@@ -1035,6 +1065,7 @@ class ComputeClient:
         | BackupContainerRequest
         | RestoreContainerRequest
         | InstallJupyterServerRequest
+        | ResetPodGpuRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -1199,6 +1230,13 @@ class ComputeClient:
             response: (
                 JupyterServerInstalled | JupyterInstallationFailed
             ) = await self.miner_service.handle_container(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, ResetPodGpuRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: PodGpuResetResult = await self.miner_service.handle_container(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

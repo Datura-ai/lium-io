@@ -38,11 +38,17 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && docker --version
 
+# TARGETARCH (amd64 or arm64) is set by buildx; a plain `docker build` on an x86 host leaves it empty = amd64.
+# arm64 is for GB300 / Grace hosts (docker_build.sh with PLATFORMS builds both).
+ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1
 ARG RESTIC_LINUX_AMD64_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
-RUN curl -fsSLo /tmp/restic.bz2 \
-      "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2" \
-  && echo "${RESTIC_LINUX_AMD64_SHA256}  /tmp/restic.bz2" | sha256sum -c - \
+ARG RESTIC_LINUX_ARM64_SHA256=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465
+RUN arch="${TARGETARCH:-amd64}" \
+  && case "$arch" in amd64) sha="${RESTIC_LINUX_AMD64_SHA256}" ;; arm64) sha="${RESTIC_LINUX_ARM64_SHA256}" ;; *) echo "no restic pin for $arch" >&2; exit 1 ;; esac \
+  && curl -fsSLo /tmp/restic.bz2 \
+      "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${arch}.bz2" \
+  && echo "${sha}  /tmp/restic.bz2" | sha256sum -c - \
   && bunzip2 /tmp/restic.bz2 \
   && install -m 0755 /tmp/restic /usr/local/bin/restic \
   && rm -f /tmp/restic \
@@ -50,9 +56,12 @@ RUN curl -fsSLo /tmp/restic.bz2 \
 
 ARG GOCRYPTFS_VERSION=2.6.1
 ARG GOCRYPTFS_LINUX_AMD64_SHA256=49b8c0eb0f6373b6ac99c394a52909d8478e74c08d0961527c1162967cc28c44
-RUN curl -fsSLo /tmp/gocryptfs.tgz \
-      "https://github.com/rfjakob/gocryptfs/releases/download/v${GOCRYPTFS_VERSION}/gocryptfs_v${GOCRYPTFS_VERSION}_linux-static_amd64.tar.gz" \
-  && echo "${GOCRYPTFS_LINUX_AMD64_SHA256}  /tmp/gocryptfs.tgz" | sha256sum -c - \
+ARG GOCRYPTFS_LINUX_ARM64_SHA256=64576d550ab8af3f1dc729e93779540c5ecc00967d0185aae51a29a3755d86d0
+RUN arch="${TARGETARCH:-amd64}" \
+  && case "$arch" in amd64) sha="${GOCRYPTFS_LINUX_AMD64_SHA256}" ;; arm64) sha="${GOCRYPTFS_LINUX_ARM64_SHA256}" ;; *) echo "no gocryptfs pin for $arch" >&2; exit 1 ;; esac \
+  && curl -fsSLo /tmp/gocryptfs.tgz \
+      "https://github.com/rfjakob/gocryptfs/releases/download/v${GOCRYPTFS_VERSION}/gocryptfs_v${GOCRYPTFS_VERSION}_linux-static_${arch}.tar.gz" \
+  && echo "${sha}  /tmp/gocryptfs.tgz" | sha256sum -c - \
   && tar -xzf /tmp/gocryptfs.tgz -C /usr/local/bin gocryptfs \
   && chmod 0755 /usr/local/bin/gocryptfs \
   && rm -f /tmp/gocryptfs.tgz \
@@ -84,7 +93,13 @@ RUN if [ "$INSTALL_GPU_ATTESTATION" = "true" ]; then \
 
 COPY . .
 
-RUN mv /root/app/libdmcompverify.so /usr/lib/ \
+# arm64 takes the aarch64 builds (lib*-aarch64.so, from celium-gpu-verifier's aarch64 build) once they are
+# vendored; until then the validator refuses ARM hosts with ARM_VERIFIER_NOT_AVAILABLE.
+RUN for f in libdmcompverify libverifyx libinspector; do \
+      if [ "${TARGETARCH:-amd64}" = arm64 ] && [ -e "/root/app/$f-aarch64.so" ]; then mv -f "/root/app/$f-aarch64.so" "/root/app/$f.so"; fi; \
+    done \
+  && rm -f /root/app/lib*-aarch64.so \
+  && mv /root/app/libdmcompverify.so /usr/lib/ \
   && mv /root/app/libverifyx.so /usr/lib/ \
   && mv /root/app/libinspector.so /usr/lib/
 
