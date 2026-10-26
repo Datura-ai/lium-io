@@ -25,12 +25,17 @@ _DOCKER_READ_TIMEOUT_SECONDS = 120
 FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"
 # short lock over "mark a copy as in use" and "remove copies not in use", so a removal never races a reuse
 FLATTEN_USE_LOCK_PATH = "/tmp/lium-flatten-use.lock"
-# a copy leased this recently may still be waiting for its rental's create: never removed. Beside the
-# validator's other node state, not on /tmp, which a renter's or provider's files can fill.
+# One lease file `<copy id>.<rental lease>` per rental between its flatten (or reuse) and the end of its
+# create; a leased copy is never removed. The rental releases it when the create ends (success, failure or
+# cancel), after which a container using the copy protects it; the expiry only covers a validator crash.
+# Beside the validator's other node state, not on /tmp, which a renter's or provider's files can fill.
 FLATTEN_LEASE_DIR = "/root/app/flatten-leases"
 FLATTEN_LEASE_EXIT = 93
 # the lease is written before the copy, so it covers the copy (bounded by the timeout) and the create after it
 FLATTEN_LEASE_MINUTES = FLATTEN_TIMEOUT_SECONDS // 60 + 60
+# rentals waiting with a new copy per node: more would let one renter hold that many abandoned copies
+FLATTEN_MAX_LEASES = 2
+FLATTEN_BUSY_EXIT = 92
 FLATTEN_NO_DISK_EXIT = 95
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
@@ -105,22 +110,34 @@ def image_flatten_changes(config: dict) -> list[str]:
     return changes
 
 
-def _lease_command(tag: str) -> str:
-    """Mark `tag` as wanted by a rental that has not created its container yet."""
-    return f"mkdir -p {FLATTEN_LEASE_DIR} && touch {FLATTEN_LEASE_DIR}/{shlex.quote(tag.partition(':')[2])}"
+def _lease_path(tag: str, lease: str) -> str:
+    return f"{FLATTEN_LEASE_DIR}/{shlex.quote(tag.partition(':')[2] + '.' + lease)}"
 
 
-def _reuse_command(tag: str) -> str:
+def _lease_command(tag: str, lease: str) -> str:
+    """Mark `tag` as wanted by the rental `lease` until its create ends."""
+    return f"mkdir -p {FLATTEN_LEASE_DIR} && touch {_lease_path(tag, lease)}"
+
+
+def flatten_lease_release_command(lease: str) -> str:
+    """Drop the rental's lease: from here a container using the copy, or nothing, keeps it."""
+    return f"rm -f {FLATTEN_LEASE_DIR}/*.{shlex.quote(lease)}"
+
+
+def _reuse_command(tag: str, lease: str) -> str:
     """Exit 0 and lease the copy when it exists; under the use lock so a cleanup cannot remove it in between.
     A copy whose lease cannot be written is not handed out: nothing would stop a cleanup removing it."""
     return (
         f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
-        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && {_lease_command(tag)}"
+        f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1 && {_lease_command(tag, lease)}"
     )
 
 
-def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int) -> str:
-    """Under a node-wide lock: reuse a copy another flatten finished meanwhile, remove every earlier copy
+def _flatten_command(
+    image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int, lease: str
+) -> str:
+    """Under a node-wide lock: reuse a copy another flatten finished meanwhile, refuse a new copy while
+    FLATTEN_MAX_LEASES other rentals still wait on theirs, remove every earlier copy
     no container uses and no rental leased in the last FLATTEN_LEASE_MINUTES (so renters cannot fill the
     disk with copies, and a rental never loses its copy before its create), check the Docker disk
     holds `need_bytes`, create (never start) a container from the image ID, pipe its export into an
@@ -134,17 +151,21 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
     return (
         # one flatten per node: concurrent rentals would each pass the disk check and copy at once
         f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
-        f"({_reuse_command(tag)}) && exit 0; "
+        f"({_reuse_command(tag, lease)}) && exit 0; "
         f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
+        # unknown lease count (unreadable dir) is treated as full: never more waiting copies than the cap
+        f"mkdir -p {FLATTEN_LEASE_DIR}; "
+        f"held=$(find {FLATTEN_LEASE_DIR} -maxdepth 1 -type f ! -mmin +{FLATTEN_LEASE_MINUTES}) && "
+        f'[ "$(printf %s "$held" | grep -c .)" -lt {FLATTEN_MAX_LEASES} ] || '
+        f"{{ echo 'flatten refused: other rentals on this node still wait for their copies' >&2; exit {FLATTEN_BUSY_EXIT}; }}; "
         # leased before the copy: a disk that fills during the copy cannot leave the copy unleased
-        f"{_lease_command(tag)} || {{ echo 'flatten failed: cannot write the lease' >&2; exit {FLATTEN_LEASE_EXIT}; }}; "
-        # any doubt about a lease keeps the copy: an unlistable lease dir skips the cleanup, an unreadable
-        # lease file keeps its copy; rmi without -f refuses a copy a container (running or stopped) uses
+        f"{_lease_command(tag, lease)} || {{ echo 'flatten failed: cannot write the lease' >&2; exit {FLATTEN_LEASE_EXIT}; }}; "
+        # any doubt about a lease keeps the copy: an unlistable lease dir skips the cleanup, a lease find
+        # cannot read keeps its copy; rmi without -f refuses a copy a container (running or stopped) uses
         f"if ls {FLATTEN_LEASE_DIR} >/dev/null 2>&1 && [ -x {FLATTEN_LEASE_DIR} ]; then "
         f"for old in $(/usr/bin/docker image ls --format '{{{{.Repository}}}}:{{{{.Tag}}}}' {FLATTENED_IMAGE_REPO}); "
-        f'do lease={FLATTEN_LEASE_DIR}/"${{old#*:}}"; '
-        f'if [ -e "$lease" ] || [ -L "$lease" ]; then [ -n "$(find "$lease" -mmin +{FLATTEN_LEASE_MINUTES} 2>/dev/null)" ]; fi '
-        '&& /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
+        f'do live=$(find {FLATTEN_LEASE_DIR} -maxdepth 1 -name "${{old#*:}}.*" ! -mmin +{FLATTEN_LEASE_MINUTES}) '
+        '&& [ -z "$live" ] && /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
         "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
@@ -156,16 +177,19 @@ def _flatten_command(image_id: str, tag: str, changes: list[str], volumes: list[
         f"| timeout {t} /usr/bin/docker import {change_args} -); irc=$?; "
         'erc=$(cat "$st"); rm -f "$st"; /usr/bin/docker rm -fv "$cid" >/dev/null 2>&1; rrc=$?; '
         # a left-over container or volume fails the flatten untagged, so the next rental retries the cleanup
-        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag)} 2>/dev/null; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
+        f'if [ "$irc" = 0 ] && [ "$erc" = 0 ] && [ "$rrc" = 0 ]; then {_lease_command(tag, lease)} 2>/dev/null; /usr/bin/docker tag "$iid" {shlex.quote(tag)}; '
         'else [ -n "$iid" ] && /usr/bin/docker rmi -f "$iid" >/dev/null 2>&1; '
         'echo "flatten failed: export=$erc import=$irc rm=$rrc" >&2; exit 98; fi'
     )
 
 
 async def flatten_image_on_host(
-    ssh_client: asyncssh.SSHClientConnection, image: str, *, reserved_bytes: int = 0
+    ssh_client: asyncssh.SSHClientConnection, image: str, *, lease: str, reserved_bytes: int = 0
 ) -> str:
     """The local tag of a one-layer copy of `image`, built on the node unless one exists already.
+
+    The copy is leased to `lease` (hex, unique per rental): the caller must run
+    `flatten_lease_release_command(lease)` on the node once its create ended, however it ended.
 
     Keyed by the image ID, so a retry or a later rental of the same image reuses the copy. Raises
     ImageFlattenNoDisk when the Docker disk cannot hold the copy and still keep `reserved_bytes`
@@ -186,7 +210,7 @@ async def flatten_image_on_host(
     info = json.loads(inspect.stdout)
     tag = f"{FLATTENED_IMAGE_REPO}:{info['Id'].removeprefix('sha256:')}"
     existing = await ssh_client.run(
-        _reuse_command(tag),
+        _reuse_command(tag, lease),
         check=False,
         timeout=_DOCKER_READ_TIMEOUT_SECONDS,
     )
@@ -199,6 +223,7 @@ async def flatten_image_on_host(
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
         int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
+        lease,
     )
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)

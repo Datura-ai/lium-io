@@ -8140,12 +8140,12 @@ class _SysboxFailingRentalClient:
         self.events.append(f"rm {container_name}")
 
 
-async def _create_with_flatten(docker_service, client, flatten, *, reserved_bytes=0, before_retry=None):
+async def _create_with_flatten(docker_service, client, flatten, *, reserved_bytes=0, before_retry=None, ssh=None):
     docker_service.stream_log = AsyncMock()
     with patch.object(docker_service_module, "flatten_image_on_host", flatten):
         return await docker_service._run_rental_docker_create_with_port_retry(
             docker_client=client,
-            ssh_client=Mock(),
+            ssh_client=ssh or Mock(run=AsyncMock()),
             run_spec=ContainerRunSpec(image="sglang", name="pod_x"),
             container_name="pod_x",
             default_extra={},
@@ -8189,6 +8189,39 @@ async def test_sysbox_many_layers_create_retries_once_from_a_flattened_copy_on_t
     assert await _create_with_flatten(docker_service, client, flatten) == "cid"
     assert client.events == ["run sglang", "rm pod_x", "run lium-flattened:abc"]
     flatten.assert_awaited_once()
+
+
+def _released_leases(flatten, ssh) -> list[str]:
+    lease = flatten.await_args.kwargs["lease"]
+    return [c.args[0] for c in ssh.run.await_args_list if c.args[0].endswith(f"*.{lease}")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fail_images, before_retry, flatten_error",
+    [
+        ({"sglang"}, None, None),  # created: from here the container keeps the copy
+        ({"sglang", "lium-flattened:abc"}, None, None),  # the create from the copy failed
+        ({"sglang"}, AsyncMock(side_effect=docker_service_module._CreateCancelledByDelete("deleted")), None),
+        ({"sglang"}, None, RuntimeError("flatten failed: export=1 import=0")),
+    ],
+    ids=["created", "create_failed", "cancelled", "flatten_failed"],
+)
+async def test_the_flatten_lease_is_released_however_the_create_ends(
+    docker_service, fail_images, before_retry, flatten_error
+):
+    ssh = Mock(run=AsyncMock())
+    flatten = AsyncMock(return_value="lium-flattened:abc", side_effect=flatten_error)
+    with contextlib.suppress(Exception):
+        await _create_with_flatten(docker_service, _SysboxFailingRentalClient(fail_images), flatten, before_retry=before_retry, ssh=ssh)
+    assert len(_released_leases(flatten, ssh)) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_flatten_no_lease_release(docker_service):
+    ssh = Mock(run=AsyncMock())
+    assert await _create_with_flatten(docker_service, _SysboxFailingRentalClient(set()), AsyncMock(), ssh=ssh) == "cid"
+    ssh.run.assert_not_awaited()
 
 
 @pytest.mark.asyncio

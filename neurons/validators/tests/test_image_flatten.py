@@ -73,23 +73,23 @@ def _ssh(*, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver:
 @pytest.mark.asyncio
 async def test_an_existing_copy_of_the_same_image_id_is_reused():
     ssh = _ssh(exists=True)
-    assert await flatten_image_on_host(ssh, "lmsysorg/sglang:dev") == _TAG
+    assert await flatten_image_on_host(ssh, "lmsysorg/sglang:dev", lease="r1") == _TAG
     assert ssh.run.await_count == 3
 
 
 @pytest.mark.asyncio
 async def test_the_no_disk_exit_raises_the_renter_sentence_and_other_failures_raise():
     with pytest.raises(ImageFlattenNoDisk) as exc:
-        await flatten_image_on_host(_ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT), "lmsysorg/sglang:dev")
+        await flatten_image_on_host(_ssh(exists=False, flatten_rc=FLATTEN_NO_DISK_EXIT), "lmsysorg/sglang:dev", lease="r1")
     assert "not enough free disk" in exc.value.renter_sentence
     with pytest.raises(RuntimeError, match="boom"):
-        await flatten_image_on_host(_ssh(exists=False, flatten_rc=98), "lmsysorg/sglang:dev")
+        await flatten_image_on_host(_ssh(exists=False, flatten_rc=98), "lmsysorg/sglang:dev", lease="r1")
 
 
 @pytest.mark.asyncio
 async def test_the_copy_is_built_from_the_inspected_image_id_never_the_mutable_tag():
     ssh = _ssh(exists=False)
-    assert await flatten_image_on_host(ssh, "model:dev", reserved_bytes=79 * 1024**3) == _TAG
+    assert await flatten_image_on_host(ssh, "model:dev", lease="r1", reserved_bytes=79 * 1024**3) == _TAG
     command = ssh.run.await_args_list[-1].args[0]
     create = command.split("docker create", 1)[1].split(")", 1)[0]
     assert create.endswith(f" {_IMAGE_ID}") and "model:dev" not in command
@@ -103,7 +103,7 @@ async def test_no_flatten_off_the_classic_overlay2_store():
     # the containerd store keeps images outside the data root the disk check measures
     ssh = _ssh(exists=False, driver="overlayfs")
     with pytest.raises(RuntimeError, match="storage driver"):
-        await flatten_image_on_host(ssh, "model:dev")
+        await flatten_image_on_host(ssh, "model:dev", lease="r1")
     assert ssh.run.await_count == 1
 
 
@@ -142,7 +142,7 @@ def test_changes_refuse_a_health_check_they_cannot_carry():
         image_flatten_changes({"Healthcheck": {"Test": ["CMD-SHELL"]}})
 
 
-def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
+def _flatten_script(tmp_path, *, lease="r1", export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
     fake = tmp_path / "docker"
@@ -161,7 +161,7 @@ def _flatten_script(tmp_path, *, export_rc=0, import_rc=0, rm_rc=0, avail=10**12
         "esac\n"
     )
     fake.chmod(0o755)
-    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100)
+    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100, lease)
     for real, local in (
         ("/usr/bin/docker", fake),
         (FLATTEN_LOCK_PATH, tmp_path / "lock"),
@@ -217,7 +217,7 @@ def test_each_new_flatten_first_removes_earlier_copies_no_container_uses(tmp_pat
     # without -f: dockerd refuses a copy a pod still uses; before the disk check, so the space counts
     first = [c.split()[0] for c in calls]
     assert calls.index("rmi lium-flattened:old1") < calls.index("rmi lium-flattened:old2") < first.index("info")
-    assert (tmp_path / "leases" / "x").exists()  # the new copy is leased to the rental that waits for it
+    assert (tmp_path / "leases" / "x.r1").exists()  # the new copy is leased to the rental that waits for it
 
 
 def test_cleanup_keeps_a_copy_a_rental_still_waits_to_create_from(tmp_path):
@@ -225,10 +225,10 @@ def test_cleanup_keeps_a_copy_a_rental_still_waits_to_create_from(tmp_path):
     (tmp_path / "copies").write_text("lium-flattened:pending\nlium-flattened:stale\nlium-flattened:unleased\n")
     leases = tmp_path / "leases"
     leases.mkdir()
-    (leases / "pending").touch()
-    (leases / "stale").touch()
+    (leases / "pending.r0").touch()
+    (leases / "stale.r9").touch()  # a crashed validator never released it
     old = time.time() - (image_flatten.FLATTEN_LEASE_MINUTES + 5) * 60
-    os.utime(leases / "stale", (old, old))
+    os.utime(leases / "stale.r9", (old, old))
     argv = _flatten_script(tmp_path)
     assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
     rmi = [c for c in _calls(tmp_path) if c.startswith("rmi lium-flattened:")]
@@ -250,23 +250,53 @@ def test_an_unreadable_lease_dir_deletes_nothing(tmp_path):
     (tmp_path / "copies").write_text("lium-flattened:unleased\n")
     leases = tmp_path / "leases"
     leases.mkdir()
-    (leases / "x").touch()  # this run's own lease is written; reading the dir back fails
-    leases.chmod(0o300)
+    leases.chmod(0o300)  # leases can be written, not listed: how many are held is unknown
     try:
         result = subprocess.run(_flatten_script(tmp_path), capture_output=True, env={"PATH": os.environ["PATH"]})
     finally:
         leases.chmod(0o700)
-    assert result.returncode == 0 and b"cleanup skipped" in result.stderr
-    assert not [c for c in _calls(tmp_path) if c.startswith("rmi")]
+    assert result.returncode == image_flatten.FLATTEN_BUSY_EXIT
+    assert not [c for c in _calls(tmp_path) if c.split()[0] in ("rmi", "create")]
 
 
 def test_reusing_a_copy_leases_it_under_the_cleanup_lock(tmp_path):
     (tmp_path / "tagged").touch()
     argv = _flatten_script(tmp_path)
     assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
-    assert (tmp_path / "leases" / "x").exists() and "create" not in " ".join(_calls(tmp_path))
-    reuse = image_flatten._reuse_command("lium-flattened:x")
+    assert (tmp_path / "leases" / "x.r1").exists() and "create" not in " ".join(_calls(tmp_path))
+    reuse = image_flatten._reuse_command("lium-flattened:x", "r1")
     assert reuse.index("flock -w") < reuse.index("image inspect") < reuse.index("touch")
+
+
+def _sh(command: str, tmp_path) -> int:
+    command = command.replace(FLATTEN_LEASE_DIR, str(tmp_path / "leases"))
+    return subprocess.run(["sh", "-c", command], env={"PATH": os.environ["PATH"]}).returncode
+
+
+def test_a_released_lease_leaves_an_abandoned_copy_to_the_next_cleanup(tmp_path):
+    # a renter flattens, then cancels: the create path releases the lease at once, not after the expiry
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    (leases / "abandoned.r0").touch()
+    (leases / "other.r5").touch()  # another rental still waits on its copy
+    assert _sh(image_flatten.flatten_lease_release_command("r0"), tmp_path) == 0
+    assert sorted(p.name for p in leases.iterdir()) == ["other.r5"]
+    (tmp_path / "copies").write_text("lium-flattened:abandoned\nlium-flattened:other\n")
+    assert subprocess.run(_flatten_script(tmp_path), env={"PATH": os.environ["PATH"]}).returncode == 0
+    assert [c for c in _calls(tmp_path) if c.startswith("rmi lium-flattened:")] == ["rmi lium-flattened:abandoned"]
+
+
+def test_a_new_copy_waits_for_fewer_than_the_cap_of_held_leases(tmp_path):
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    for n in range(image_flatten.FLATTEN_MAX_LEASES):
+        (leases / f"copy{n}.r{n}").touch()
+    result = subprocess.run(_flatten_script(tmp_path), capture_output=True, env={"PATH": os.environ["PATH"]})
+    assert result.returncode == image_flatten.FLATTEN_BUSY_EXIT and b"still wait" in result.stderr
+    assert not [c for c in _calls(tmp_path) if c.split()[0] in ("rmi", "create")]
+    # a reuse adds no copy: not capped
+    (tmp_path / "tagged").touch()
+    assert subprocess.run(_flatten_script(tmp_path), env={"PATH": os.environ["PATH"]}).returncode == 0
 
 
 def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
@@ -279,5 +309,5 @@ def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
 
 
 def test_timeout_bounds_both_sides_of_the_copy():
-    script = _flatten_command("img", "t", [], [], 0)
+    script = _flatten_command("img", "t", [], [], 0, "r1")
     assert script.count(f"timeout {image_flatten.FLATTEN_TIMEOUT_SECONDS} ") == 2

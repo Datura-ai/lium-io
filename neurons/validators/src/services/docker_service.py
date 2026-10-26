@@ -115,7 +115,12 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
-from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk, flatten_image_on_host
+from services.image_flatten import (
+    FLATTEN_NO_DISK_RENTER_SENTENCE,
+    ImageFlattenNoDisk,
+    flatten_image_on_host,
+    flatten_lease_release_command,
+)
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
@@ -2558,6 +2563,50 @@ class DockerService:
         flatten_reserved_bytes: int | None = None,
         before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
     ) -> str | None:
+        """`_run_rental_docker_create_attempts`, then the release of the flattened copy's lease (when a
+        flatten ran) however the create ended: success (the container now keeps the copy), failure or
+        cancel (the copy is free for the next flatten's cleanup)."""
+        flatten_lease: list[str] = []
+        try:
+            return await self._run_rental_docker_create_attempts(
+                docker_client=docker_client,
+                ssh_client=ssh_client,
+                run_spec=run_spec,
+                container_name=container_name,
+                default_extra=default_extra,
+                local_volume=local_volume,
+                log_tag=log_tag,
+                port_maps=port_maps,
+                spare_port_pairs=spare_port_pairs,
+                remove_port_checks_listed_live=remove_port_checks_listed_live,
+                flatten_reserved_bytes=flatten_reserved_bytes,
+                before_flatten_retry=before_flatten_retry,
+                flatten_lease=flatten_lease,
+            )
+        finally:
+            for lease in flatten_lease:
+                try:
+                    await ssh_client.run(flatten_lease_release_command(lease), check=False, timeout=60)
+                except Exception:  # the lease expires on its own; a failed release only delays the cleanup
+                    logger.warning(_m("SYSBOX_FLATTEN_LEASE_RELEASE_FAILED", extra=get_extra_info(default_extra)))
+
+    async def _run_rental_docker_create_attempts(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        run_spec: ContainerRunSpec,
+        container_name: str,
+        default_extra: dict,
+        local_volume: str | None = None,
+        log_tag: str = "container_creation",
+        port_maps: list[tuple[int, int, int]] | None = None,
+        spare_port_pairs: list[PayloadPortMapping] | None = None,
+        remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
+        flatten_reserved_bytes: int | None = None,
+        before_flatten_retry: Callable[[], Awaitable[None]] | None = None,
+        flatten_lease: list[str],
+    ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
         Sysbox many-layer failure: only when `flatten_reserved_bytes` is given (customer rentals), the
@@ -2629,9 +2678,11 @@ class DockerService:
                 if flatten_reserved_bytes is not None and not image_flattened and sysbox_many_layers_sentence(exc):
                     # the renter picked this node: start a one-layer copy of the image here (owner, 26 Oct)
                     image_flattened = True
+                    flatten_lease.append(secrets.token_hex(8))
                     flat_image = await self._flatten_rental_image(
                         ssh_client=ssh_client,
                         image=run_spec.image,
+                        lease=flatten_lease[0],
                         reserved_bytes=flatten_reserved_bytes,
                         default_extra=default_extra,
                         log_tag=log_tag,
@@ -2748,6 +2799,7 @@ class DockerService:
         *,
         ssh_client: asyncssh.SSHClientConnection,
         image: str,
+        lease: str,
         reserved_bytes: int,
         default_extra: dict,
         log_tag: str,
@@ -2762,7 +2814,7 @@ class DockerService:
         )
         started = time.monotonic()
         try:
-            flat_image = await flatten_image_on_host(ssh_client, image, reserved_bytes=reserved_bytes)
+            flat_image = await flatten_image_on_host(ssh_client, image, lease=lease, reserved_bytes=reserved_bytes)
         except ImageFlattenNoDisk:
             logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
             await self.stream_log(FLATTEN_NO_DISK_RENTER_SENTENCE, "error", log_tag)
