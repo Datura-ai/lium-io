@@ -534,3 +534,30 @@ def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: 
 
     # Assert
     assert hard_disk == {"hard_disk_volumes": 0}
+
+
+def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> None:
+    # DAH-5192: `--rm` never fires for a container a killed client created but never started
+    removed: list[list[str]] = []
+
+    def timing_out_run(command, **kwargs):
+        raise TimeoutError(command)
+
+    scrape = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {"CAPABILITY_CHECK_NAME_PREFIX", "run_capability_check"},
+        {
+            "os": os,
+            "subprocess": SimpleNamespace(run=timing_out_run, PIPE=-1),
+            "run_storage_probe": lambda command, timeout: removed.append(command),
+            "VLOOPBACK_CLEANUP_TIMEOUT_SECONDS": 10,
+        },
+    )
+
+    with pytest.raises(TimeoutError) as raised:
+        scrape["run_capability_check"](["docker", "run", "--rm", "--gpus", "all", "img", "nvidia-smi"])
+
+    command = raised.value.args[0]
+    name = command[command.index("--name") + 1]
+    assert command[:3] == ["docker", "run", "--rm"] and name.startswith("lium_capability_check_")
+    assert removed == [["docker", "rm", "-f", name]]

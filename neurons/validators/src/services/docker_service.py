@@ -87,7 +87,11 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER, evict_cache_volumes_oldest_first
+from services.container_cleanup import (
+    REMOVE_CACHE_SWEEP_CONTAINER,
+    REMOVE_IDLE_FILLER_IMAGES,
+    evict_cache_volumes_oldest_first,
+)
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
@@ -4716,7 +4720,10 @@ class DockerService:
                 return await retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental")
 
             if not requested_gb:
-                await remove(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*cache_volumes)}")
+                await remove(
+                    f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*cache_volumes)}; "
+                    f"{REMOVE_IDLE_FILLER_IMAGES}"
+                )
                 return True
 
             async def rental_fits() -> bool:
@@ -4821,9 +4828,8 @@ class DockerService:
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
         """The cache prefixes these volume names belong to, e.g. `dphn_cache_` for a DPHN launch.
 
-        DAH-2805: a launch may only sweep its OWN family. A node that moves from DPHN to ENGY asks
-        for engy volumes, and sweeping every cache prefix there would delete the Dolphin cache the
-        node needs for its next fast start — the very thing these volumes exist for.
+        DAH-2805: a launch may only sweep its OWN family. sweep_stale_cache_volumes adds the Dolphin
+        family to an Engy launch's sweep (DAH-5192); the fit check above stays on the own family.
         """
         return tuple(
             prefix
@@ -4904,11 +4910,16 @@ class DockerService:
             return []
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
+        families: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
+        if ENGY_CACHE_VOLUME_PREFIX in families and DPHN_CACHE_VOLUME_PREFIX not in families:
+            # A node moved to Engy no longer runs Dolphin, so its old Dolphin cache is leftover disk.
+            # Only this way round: the Dolphin cache is tens of GB, an Engy checkpoint terabytes.
+            families += (DPHN_CACHE_VOLUME_PREFIX,)
         stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
             ssh_client,
             keep_names,
             default_extra,
-            self._cache_volume_families(sorted(keep_names)),
+            families,
             host_probe=host_probe,
         )
         if not stale_volumes:

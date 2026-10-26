@@ -167,7 +167,9 @@ async def test_rental_evicts_the_oldest_cache_first_and_keeps_the_rest_once_it_f
     ssh_client = InspectingSshClient(["engy_cache_hf_new", "engy_cache_hf_old", "volume_pod"])
     monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
     monkeypatch.setattr(
-        docker_service, "_get_fs_available_bytes", AsyncMock(side_effect=[50 * 1024**3, 900 * 1024**3])
+        docker_service,
+        "_get_fs_available_bytes",
+        AsyncMock(side_effect=[50 * 1024**3, 50 * 1024**3, 900 * 1024**3]),
     )
     payload = _make_payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL, cache_volumes=None)
     payload.volume_limit_gb = 500
@@ -175,3 +177,22 @@ async def test_rental_evicts_the_oldest_cache_first_and_keeps_the_rest_once_it_f
     await docker_service.reclaim_dphn_cache_for_rental(ssh_client, payload, {})
 
     assert _removed_volumes(ssh_client) == ["engy_cache_hf_old"]
+    # DAH-5192: the idle filler images went first, without -f so an image a container uses stays
+    (image_rm,) = [c for c in ssh_client.commands if "image rm" in c]
+    assert "engy-golden-serve" in image_rm and "image rm -f" not in image_rm
+
+
+@pytest.mark.asyncio
+async def test_an_engy_create_sweeps_the_old_dolphin_cache_but_a_dolphin_create_keeps_the_engy_one(docker_service):
+    # DAH-5192: a node moved to Engy no longer runs Dolphin; the reverse would drop a TB checkpoint
+    engy = [CacheVolume(name="engy_cache_hf_new", target="/c")]
+    ssh_client = FakeSshClient(["engy_cache_hf_new", "dphn_cache_hf_old", "volume_pod"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=engy)
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["dphn_cache_hf_old"]
+
+    dolphin = [CacheVolume(name="dphn_cache_hf_new", target="/c")]
+    ssh_client = FakeSshClient(["dphn_cache_hf_new", "engy_cache_hf_old"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=dolphin)
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == []

@@ -1028,6 +1028,26 @@ def get_gpu_processes(pids: set, containers: list[dict]):
     return processes
 
 
+# literal: the validator's stale-container cleanup removes leftovers by this prefix
+CAPABILITY_CHECK_NAME_PREFIX = "lium_capability_check_"
+
+
+def run_capability_check(command):
+    # Named and removed after: `--rm` only fires once the container has run, so a run cut off by its
+    # timeout, or refused by the NVIDIA hook at start, used to leave a Created container behind.
+    name = f"{CAPABILITY_CHECK_NAME_PREFIX}{os.getpid()}_{os.urandom(3).hex()}"
+    try:
+        return subprocess.run(
+            command[:3] + ["--name", name] + command[3:],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+    finally:
+        run_storage_probe(["docker", "rm", "-f", name], VLOOPBACK_CLEANUP_TIMEOUT_SECONDS)
+
+
 def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
@@ -1039,13 +1059,7 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     test_command = COMMANDS["CHECK_SYSBOX_COMPATIBILITY"]
 
     try:
-        result = subprocess.run(
-            test_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30
-        )
+        result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Sysbox runtime supports GPU access."
@@ -1240,13 +1254,7 @@ def check_storage_limit_ability() -> tuple[bool, str]:
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
-        result = subprocess.run(
-            test_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30
-        )
+        result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Storage limit is supported."

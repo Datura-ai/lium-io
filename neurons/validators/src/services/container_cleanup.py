@@ -60,6 +60,16 @@ DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 # Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
 REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
 
+# The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
+# `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
+FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
+REMOVE_IDLE_FILLER_IMAGES = (
+    "/usr/bin/docker image ls "
+    + " ".join(f"--filter reference={repository}" for repository in FILLER_IMAGE_REPOSITORIES)
+    + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+)
+
+
 async def evict_cache_volumes_oldest_first(
     ssh_client: asyncssh.SSHClientConnection,
     volume_names: list[str],
@@ -70,7 +80,7 @@ async def evict_cache_volumes_oldest_first(
 
     DAH-5014: an Engy checkpoint is up to ~1.6 TB and buys a fast restart, so a rental or the listing
     floor takes only what it needs. The caller has already found there is not enough room, so the
-    first volume goes without a re-check. An order docker cannot report falls back to name order.
+    idle filler images go first without a re-check. An order docker cannot report falls back to name order.
     """
     created_at: dict[str, str] = {}
     try:
@@ -85,6 +95,10 @@ async def evict_cache_volumes_oldest_first(
         raise
     except Exception:
         pass
+    # the image first: a pull brings it back far faster than a checkpoint download
+    await run_removal(REMOVE_IDLE_FILLER_IMAGES)
+    if await has_room():
+        return
     ordered: list[str] = sorted(volume_names, key=lambda name: (created_at.get(name, "~"), name))
     for index, name in enumerate(ordered):
         await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(name)}")
@@ -133,6 +147,27 @@ def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -
     if not listed_container_names(rented_data):
         return RENTED_LIST_EMPTY
     return None
+
+
+# The machine scrape's two capability checks (machine_scrape.run_capability_check): named since
+# DAH-5192; before that unnamed, so recognised by the exact check, the executor image running
+# `nvidia-smi`. Only never-started (Created) ones are removed: a running one is a check in progress.
+CAPABILITY_CHECK_NAME_PREFIX = "lium_capability_check_"
+CAPABILITY_CHECK_IMAGE = "daturaai/compute-subnet-executor:latest"
+LIST_CREATED_CONTAINERS = (
+    "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}} {{.Image}} {{.Command}}'"
+)
+
+
+def never_started_check_containers(listing: str) -> list[str]:
+    ids: list[str] = []
+    for fields in (line.split(None, 3) for line in listing.splitlines()):
+        if len(fields) == 4 and (
+            fields[1].startswith(CAPABILITY_CHECK_NAME_PREFIX)
+            or (fields[2] == CAPABILITY_CHECK_IMAGE and fields[3].strip().strip('"') == "nvidia-smi")
+        ):
+            ids.append(fields[0])
+    return ids
 
 
 class ContainerCleanup:
@@ -254,8 +289,26 @@ class ContainerCleanup:
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
+        await self.remove_never_started_check_containers(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
+        # best-effort like the volume prune above: never raises
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            listed = await ssh_client.run(LIST_CREATED_CONTAINERS)
+            if getattr(listed, "exit_status", 0) != 0:
+                return 0
+            ids: list[str] = never_started_check_containers(listed.stdout or "")
+            if not ids or self.dry_run:
+                return 0
+            await ssh_client.run(f"/usr/bin/docker rm -f {' '.join(ids)} >/dev/null 2>&1 || true")
+            logger.info(_m(f"Removed {len(ids)} never-started capability check container(s)", extra=extra))
+            return len(ids)
+        except Exception as e:
+            logger.warning(_m("Never-started check container removal failed", extra=extra | {"error": str(e)}))
+            return 0
 
     async def prune_dangling_anonymous_volumes(
         self,
