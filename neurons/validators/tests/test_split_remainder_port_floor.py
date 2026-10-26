@@ -324,6 +324,26 @@ def test_leftover_gpus_below_one_split_ride_with_the_last_paid_split():
     assert incentive._port_limited_remainder(remainder) is None
 
 
+@pytest.mark.parametrize(
+    ("rented", "unpaid_gpus"),
+    [(8, 2), (2, None), (1, None)],
+    ids=["below_min", "equal_min", "above_min"],
+)
+def test_remainder_below_one_whole_split_earns_no_idle_pay(rented, unpaid_gpus):
+    # 10-GPU node, 8-GPU minimum, 3 free ports: 2 free GPUs are no rentable split, 8 and 9 are one
+    incentive = _build_incentive(
+        _make_job(available_port_count=3, gpu_count=10, rented_gpu_count=rented, min_count=8)
+    )
+    incentive._expand_partially_rented_split_results()
+    _, remainder = incentive.job_results[MINER_HOTKEY]
+
+    limited = incentive._port_limited_remainder(remainder)
+
+    assert (limited.unpaid_gpu_count if limited else None) == unpaid_gpus
+    if limited:
+        assert limited.paid_split_count == 0
+
+
 def test_ports_held_by_the_rental_are_not_free_ports():
     # PortCountCheck publishes only ports no pod holds: 6 verified free on a node whose tenant
     # holds 3 more. The 6 free ones are all the 8 free splits can use.

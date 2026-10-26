@@ -538,7 +538,8 @@ class RentalPriceIncentive(DefaultIncentive):
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
         paid_split_count: int = min(free_split_count, available) if available >= MIN_PORT_COUNT else 0
-        if available >= MIN_PORT_COUNT and paid_split_count >= free_split_count:
+        # free GPUs below one whole split can't be listed or rented, so they get no idle pay either
+        if free_split_count > 0 and available >= MIN_PORT_COUNT and paid_split_count >= free_split_count:
             return None
         return PortLimitedRemainder(
             available_port_count=available,
