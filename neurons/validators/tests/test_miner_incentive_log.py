@@ -177,6 +177,16 @@ def _job(**overrides) -> JobResult:
             "port_limited_remainder",
             "2 free port",
         ),
+        (
+            # below one whole split: no port remedy (DAH-3698 F15)
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(
+                    available_port_count=3, required_port_count=3, free_split_count=0, paid_split_count=0, unpaid_gpu_count=2
+                )
+            ),
+            "port_limited_remainder",
+            "fewer than its minimum rental",
+        ),
     ],
 )
 def test_zero_reason_constructor_code_and_message(build, expected_code, message_fragment):

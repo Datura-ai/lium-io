@@ -489,6 +489,24 @@ class MinerLogLine(BaseModel):
     ) -> MinerLogLine:
         # `result` is the free portion; the message names the GPUs the missing ports leave unpaid.
         unpaid: int = port_limited.unpaid_gpu_count
+        if port_limited.free_split_count == 0:
+            # fewer free GPUs than the minimum rental: no port change makes them rentable
+            return MinerLogLine._no_payout(
+                result,
+                reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+                message=(
+                    f"No unrented incentive for the {unpaid} free GPU(s) on this partially rented node: "
+                    "they are fewer than its minimum rental, so nobody can rent them. The rented GPUs "
+                    "keep earning. Idle pay resumes when the rental ends."
+                ),
+                extra_fields={
+                    "gpu_count": unpaid,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required_port_count,
+                    "free_split_count": 0,
+                    "paid_split_count": 0,
+                },
+            )
         if port_limited.paid_split_count:
             lead = (
                 f"No unrented incentive for {unpaid} of the free GPUs on this partially rented node: "
