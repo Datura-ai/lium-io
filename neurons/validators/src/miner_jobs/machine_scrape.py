@@ -2058,37 +2058,12 @@ def get_disk_health() -> DiskHealthObservation:
     return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
 
 
-def get_machine_specs():
-    """Get Specs of miner machine."""
-    data = {}
-
-    if os.environ.get('LD_PRELOAD'):
-        return data
-
-    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
-    gpu_process_ids = set()
-
-    libnvidia_path = get_libnvidia_ml_path()
-    if not libnvidia_path:
-        return data
-
-    nvmlLib_content = get_file_content(libnvidia_path)
-    docker_content = get_file_content("/usr/bin/docker")
-    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
-
-    try:
-        nvmlInit(nvmlLib_content)
-
-        device_count = nvmlDeviceGetCount()
-
-        data["data_gpu"] = {
-            "gpu_count": device_count,
-            "gpu_driver": nvmlSystemGetDriverVersion(),
-            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
-            "gpu_details": []
-        }
-
-        for i in range(device_count):
+def read_gpu_details(device_count, gpu_process_ids):
+    """The detail rows of every card NVML can read, and the first per-card error (repr) or None."""
+    gpu_details = []
+    first_error = None
+    for i in range(device_count):
+        try:
             handle = nvmlDeviceGetHandleByIndex(i)
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
@@ -2098,7 +2073,7 @@ def get_machine_specs():
             utilization = nvmlDeviceGetUtilizationRates(handle)
             memory_info = nvmlDeviceGetMemoryInfo(handle)
 
-            data["data_gpu"]["gpu_details"].append(
+            gpu_details.append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
@@ -2144,6 +2119,47 @@ def get_machine_specs():
             # Collect process IDs
             for proc in processes:
                 gpu_process_ids.add(proc.c_nvmlProcessInfo_v2_t_pid)
+        except Exception as exc:
+            # one hung card (e.g. NVML 999) must not hide the cards after it: skip it, read the rest
+            first_error = first_error or repr(exc)
+    return gpu_details, first_error
+
+
+def get_machine_specs():
+    """Get Specs of miner machine."""
+    data = {}
+
+    if os.environ.get('LD_PRELOAD'):
+        return data
+
+    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
+    gpu_process_ids = set()
+
+    libnvidia_path = get_libnvidia_ml_path()
+    if not libnvidia_path:
+        return data
+
+    nvmlLib_content = get_file_content(libnvidia_path)
+    docker_content = get_file_content("/usr/bin/docker")
+    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
+
+    try:
+        nvmlInit(nvmlLib_content)
+
+        device_count = nvmlDeviceGetCount()
+
+        data["data_gpu"] = {
+            "gpu_count": device_count,
+            "gpu_driver": nvmlSystemGetDriverVersion(),
+            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
+            "gpu_details": []
+        }
+
+        gpu_details, gpu_error = read_gpu_details(device_count, gpu_process_ids)
+        data["data_gpu"]["gpu_details"] = gpu_details
+        if gpu_error:
+            # same field and repr as a whole-scrape NVML failure, so the checks read the NVML code alike
+            data["gpu_scrape_error"] = gpu_error
 
         nvmlShutdown()
     except Exception as exc:
@@ -2290,6 +2306,10 @@ def get_machine_specs():
         data["kernel_scrape_error"] = repr(exc)
 
     
+    # aarch64 (GB300 Grace) ships a different libnvidia-ml; the validator picks its digest list by this
+    # os.uname(), not platform.machine(): the obfuscator renames the bare name `platform` (never its import)
+    data["data_machine_arch"] = os.uname().machine
+
     data["data_network"] = {}
 
     data["data_md5_checksums"] = {

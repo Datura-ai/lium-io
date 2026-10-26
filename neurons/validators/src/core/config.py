@@ -546,6 +546,17 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
+    # ContainerDownloadSpeedCheck measures idle nodes only; a renter on a node listed at ~3 Gbps got
+    # 0.7-2 MB/s and a crawling disk. RentedThroughputCheck reads the same two files from a throwaway container on a
+    # rented node and writes 256 MiB with fsync, once per INTERVAL_HOURS (30 min retry after a failing reading).
+    # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
+    # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
+    # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
+    RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
+    RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
+    RENTED_THROUGHPUT_BUSY_MBPS: float = Field(env="RENTED_THROUGHPUT_BUSY_MBPS", default=200.0, gt=0)
+    RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S", default=200.0, gt=0)
     # A filler create runs the validator's sshd bootstrap in Lium's own image. When sshd is installed but
     # never runs or listens there (e.g. a host runtime that leaves /run/sshd group/world-writable), no
     # renter can SSH into any container on the node either. The connector stamps that per executor and
@@ -622,7 +633,8 @@ class Settings(BaseSettings):
     # Spot-node pay. True: an unrented spot node on the backend's spot pay list (provider_spot_executor_ids:
     # set to Spot by its provider, or demoted for penalties) and that runs Lium fillers earns
     # min(1.0 x its GPU configuration's average filler revenue, its secure idle rate before
-    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR); a spot node without a filler, or whose configuration
+    # bucket-cap dilution), with no bucket cap (1.0 = FILLER_REVENUE_PAY_FACTOR), scaled down so that a GPU
+    # model's spot nodes together earn at most what its fillers earn per hour (DAH-5128); a spot node without a filler, or whose configuration
     # has no usable average, earns 0, and a banned, pinned or no-incentive-rental one
     # earns 0 as before. Pays nobody until the backend sends provider_spot_executor_ids.
     # False: every spot node earns 0, as before.
