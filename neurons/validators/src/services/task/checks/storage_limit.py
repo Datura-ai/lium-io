@@ -40,7 +40,6 @@ class StorageLimitCheck:
         what = {
             "storage_limit_supported": False,
             "detail": str(specs.get("storage_limit_scrape_error") or "")[:300] or None,
-            "enforced": True,
             "rented": rented,
         }
         if not rented:
