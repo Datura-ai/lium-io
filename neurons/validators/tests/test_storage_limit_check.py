@@ -131,12 +131,68 @@ async def test_enforced_a_single_disk_host_only_warns(context_factory, enforced)
     assert "score" not in result.updates
 
 
+INCONCLUSIVE = ["Test command timed out.", "An unexpected error occurred: boom"]
+
+
+async def run_with(ctx, specs):
+    # ContextState is frozen; a cycle's scrape refills the same specs dict
+    ctx.state.specs.clear()
+    ctx.state.specs.update(specs)
+    return await StorageLimitCheck().run(ctx)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", ["Test command timed out.", "An unexpected error occurred: boom"])
-async def test_a_probe_without_a_verdict_only_warns_even_when_enforced(context_factory, enforced, error):
-    result = await run(context_factory, {"storage_limit_supported": False, "storage_limit_scrape_error": error})
+@pytest.mark.parametrize("error", INCONCLUSIVE)
+async def test_a_probe_without_a_verdict_reuses_a_recent_pass_and_publishes_it(
+    context_factory, enforced, error
+):
+    ctx = context_factory(state=build_state(specs={}))
+    await run_with(ctx, {"storage_limit_supported": True})
+
+    result = await run_with(
+        ctx, {"storage_limit_supported": False, "storage_limit_scrape_error": error}
+    )
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.MISSING.reason
-    assert result.event.what_we_saw["conclusive"] is False
+    assert result.event.reason_code == Msg.OK.reason
+    assert result.event.what_we_saw["reused_last_pass"] is True
+    # the published specs keep the limit, so the backend never offers this host uncapped
+    assert ctx.state.specs["storage_limit_supported"] is True
     assert not result.updates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", INCONCLUSIVE)
+async def test_a_probe_without_a_verdict_and_no_recent_pass_holds_the_node(
+    context_factory, enforced, error
+):
+    result = await run(
+        context_factory, {"storage_limit_supported": False, "storage_limit_scrape_error": error}
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.what_we_saw["conclusive"] is False
+    assert result.updates["score"] == 0.0
+    assert availability_errors([result.event])
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_finds_no_limit_forgets_the_pass(context_factory, enforced):
+    ctx = context_factory(state=build_state(specs={}))
+    await run_with(ctx, {"storage_limit_supported": True})
+    await run_with(
+        ctx,
+        {
+            "storage_limit_supported": False,
+            "storage_limit_scrape_error": "Storage limit is not supported.",
+        },
+    )
+
+    result = await run_with(
+        ctx,
+        {"storage_limit_supported": False, "storage_limit_scrape_error": "Test command timed out."},
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.INCONCLUSIVE.reason

@@ -450,6 +450,18 @@ class StorageLimitMessages:
         "validation once `sudo docker run --rm --storage-opt size=1g --gpus all "
         "daturaai/compute-subnet-executor:latest nvidia-smi` works.",
     )
+    INCONCLUSIVE = MessageTemplate(
+        event="Node held: the disk-limit test did not finish",
+        reason="STORAGE_LIMIT_INCONCLUSIVE",
+        severity="error",
+        # hidden at once like REQUIRED: without a verdict the node could otherwise take a whole-host rental uncapped
+        category=AVAILABILITY_CATEGORY,
+        impact="Job skipped; score set to 0 and the node hidden from new rentals until the disk-limit test finishes "
+        "and passes (the test timed out or crashed, see detail; this is not a finding that the limit is missing)",
+        remediation="Usually a busy host or a slow image pull: the node passes again on the next validation once "
+        "`sudo docker run --rm --storage-opt size=1g --gpus all daturaai/compute-subnet-executor:latest nvidia-smi` "
+        "finishes quickly.",
+    )
     OK = MessageTemplate(
         event="Docker limits a container's disk",
         reason="STORAGE_LIMIT_OK",

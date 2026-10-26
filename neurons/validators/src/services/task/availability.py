@@ -61,6 +61,8 @@ class AvailabilityErrorCode(StrEnum):
     GPU_MEMORY_HEALTH_FAILED = "GPU_MEMORY_HEALTH_FAILED"
     # DAH-1997: an unrented node whose Docker cannot cap a container's disk (StorageLimitCheck, when required)
     STORAGE_LIMIT_REQUIRED = "STORAGE_LIMIT_REQUIRED"
+    # ... or whose disk-limit probe gave no verdict and has no recent pass to keep
+    STORAGE_LIMIT_INCONCLUSIVE = "STORAGE_LIMIT_INCONCLUSIVE"
 
 
 # Faults of the node itself (its cards, its Docker storage): never a sign of our own outage, never silenced with one.
