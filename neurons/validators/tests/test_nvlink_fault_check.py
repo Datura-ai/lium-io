@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -54,13 +55,14 @@ def report(**fields) -> str:
     return "noise\n" + PROBE_JSON_MARKER + " " + json.dumps(fields) + "\n"
 
 
-async def run_check(context_factory, specs, stdout="", rented_data=None, services=None):
+async def run_check(context_factory, specs, stdout="", rented_data=None, services=None, ssh=None):
     runner = FakeRunner(stdout)
     ctx = context_factory(
         services=services or build_services(),
         config=build_context_config(),
         state=build_state(specs=specs, rented_data=rented_data),
         runner=runner,
+        ssh=ssh,
     )
     return await NvlinkFaultCheck().run(ctx), runner
 
@@ -278,3 +280,38 @@ async def test_an_unreadable_fault_record_keeps_the_filler_skip(context_factory)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+
+
+@pytest.mark.asyncio
+async def test_our_filler_on_a_recorded_fault_is_removed_so_a_repaired_node_recovers(
+    context_factory,
+):
+    services = build_services()
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    filler = f"{FILLER_CONTAINER_PREFIX}active"
+    rented_data = RentedExecutorsResponse(
+        executors={},
+        banned_guids=[],
+        filler_containers_by_executor={default_executor().uuid: filler},
+        default_job_owner_by_executor={default_executor().uuid: "lium"},
+    )
+    with patch.object(nvlink_fault.settings, "NVLINK_FAULT_ENFORCEMENT_ENABLED", True):
+        await run_check(context_factory, NVLINK_BOARD, FAULT, services=services)
+        result, runner = await run_check(
+            context_factory,
+            NVLINK_BOARD,
+            report(status="ok", gpus=8),
+            rented_data=rented_data,
+            services=services,
+            ssh=ssh,
+        )
+
+    assert ssh.run.await_args.args[0] == f"/usr/bin/docker rm -fv {filler}"
+    services.backend.get_filler_run_active.assert_awaited_once_with(
+        "active", container_missing=True
+    )
+    assert len(runner.calls) == 1
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PROBE_OK.reason
+    assert services.redis.store == {}

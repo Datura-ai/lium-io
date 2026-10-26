@@ -486,7 +486,7 @@ class Settings(BaseSettings):
     # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
     # DAH-5048 — the NVLink multicast probe always runs on all-NVLink boards and logs NVLINK_FAULT; ENFORCEMENT
-    # lets a fault fail the node. Shadow first: the false-fail count on healthy boards is unknown yet.
+    # lets a fault fail the node. On since the shadow run showed no false fails; off is the kill switch.
     NVLINK_FAULT_ENFORCEMENT_ENABLED: bool = Field(env="NVLINK_FAULT_ENFORCEMENT_ENABLED", default=True)
     # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
     # row remap, a required recovery action) fails the node like a GPU ban until the host resets or

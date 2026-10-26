@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import shlex
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from ...const import DEFAULT_JOB_OWNER_LIUM
 from ..messages import NvlinkFaultMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .capability import get_filler_only_container
+from .sshd_bootstrap import remove_lium_fillers
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,16 @@ FAULT_KEY_PREFIX = "nvlink_fault"
 FAULT_KEY_TTL_SECONDS = 7 * 24 * 3600
 
 
+@dataclass(frozen=True)
+class FaultRecord:
+    """The bounded probe fields kept in Redis while a filler blocks the probe."""
+
+    status: str | None = None
+    error: str | None = None
+    gpus: int | None = None
+    size_mb: int | float | None = None
+
+
 class NvlinkFaultCheck:
     """Fail an all-NVLink node whose GPUs cannot bind NVLink multicast memory (sticky NVLink fault).
 
@@ -41,7 +54,8 @@ class NvlinkFaultCheck:
 
     A filler holds every GPU, so the probe is skipped while one runs. A fault seen before the filler started
     is kept in Redis and still reported on those cycles: on 24 Oct an 8x board faulted at 18:52Z, a filler
-    started, and every later cycle skipped the probe and passed the faulted node.
+    started, and every later cycle skipped the probe and passed the faulted node. When enforced, our own
+    (Lium) fillers on a recorded-faulty node are removed and the probe runs, so a repaired node recovers.
     """
 
     check_id = "gpu.validate.nvlink_fault"
@@ -57,19 +71,20 @@ class NvlinkFaultCheck:
         filler_container = get_filler_only_container(ctx)
         if filler_container:
             last_fault = await self._last_fault(ctx)
-            if last_fault is not None:
+            if last_fault is not None and not await self._removed_our_fillers(ctx):
                 return self._fault(
-                    ctx, {"filler_container": filler_container, "last_probe": last_fault}
+                    ctx, {"filler_container": filler_container, "last_probe": asdict(last_fault)}
                 )
-            return CheckResult(
-                passed=True,
-                event=render_message(
-                    Msg.FILLER_SKIPPED,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"filler_container": filler_container},
-                ),
-            )
+            if last_fault is None:
+                return CheckResult(
+                    passed=True,
+                    event=render_message(
+                        Msg.FILLER_SKIPPED,
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        what={"filler_container": filler_container},
+                    ),
+                )
 
         run = await ctx.runner.run(
             f"{shlex.quote(ctx.executor.python_path)} -I -",
@@ -95,10 +110,10 @@ class NvlinkFaultCheck:
         }
         status = report.get("status")
         if status == "fault":
-            await self._remember(ctx, what["probe"])
+            await self._save_fault_record(ctx, FaultRecord(**what["probe"]))
             return self._fault(ctx, what)
         if status == "ok":
-            await self._remember(ctx, None)
+            await self._clear_fault_record(ctx)
         template = Msg.PROBE_OK if status == "ok" else Msg.UNKNOWN
         return CheckResult(
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
@@ -116,24 +131,46 @@ class NvlinkFaultCheck:
         )
         return CheckResult(passed=not enforce, event=event)
 
-    async def _last_fault(self, ctx: Context) -> dict[str, Any] | None:
+    @staticmethod
+    async def _removed_our_fillers(ctx: Context) -> bool:
+        """Remove our own fillers so the probe can re-run; True only if every filler is gone."""
+        rented_data = ctx.state.rented_data
+        if (
+            settings.DRY_RUN
+            or not settings.NVLINK_FAULT_ENFORCEMENT_ENABLED
+            or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
+        ):
+            return False
+        fillers = rented_data.get_filler_containers(ctx.executor.uuid)
+        return set(await remove_lium_fillers(ctx, fillers)) == set(fillers)
+
+    async def _last_fault(self, ctx: Context) -> FaultRecord | None:
         try:
             raw = await ctx.services.redis.get(f"{FAULT_KEY_PREFIX}:{ctx.executor.uuid}")
-            return json.loads(raw) if raw is not None else None
+            if raw is None:
+                return None
+            data = json.loads(raw)
+            return FaultRecord(**{f.name: data.get(f.name) for f in fields(FaultRecord)})
         except Exception:
             # an unreadable record keeps the plain filler skip, as before the record existed
             logger.warning(_m("NVLink fault record unreadable", extra=get_extra_info(ctx.default_extra)))
             return None
 
-    async def _remember(self, ctx: Context, probe: dict[str, Any] | None) -> None:
-        key = f"{FAULT_KEY_PREFIX}:{ctx.executor.uuid}"
+    async def _save_fault_record(self, ctx: Context, record: FaultRecord) -> None:
         try:
-            if probe is None:
-                await ctx.services.redis.delete(key)
-            else:
-                await ctx.services.redis.set(key, json.dumps(probe), ex=FAULT_KEY_TTL_SECONDS)
+            await ctx.services.redis.set(
+                f"{FAULT_KEY_PREFIX}:{ctx.executor.uuid}",
+                json.dumps(asdict(record)),
+                ex=FAULT_KEY_TTL_SECONDS,
+            )
         except Exception:
             logger.warning(_m("NVLink fault record not written", extra=get_extra_info(ctx.default_extra)))
+
+    async def _clear_fault_record(self, ctx: Context) -> None:
+        try:
+            await ctx.services.redis.delete(f"{FAULT_KEY_PREFIX}:{ctx.executor.uuid}")
+        except Exception:
+            logger.warning(_m("NVLink fault record not cleared", extra=get_extra_info(ctx.default_extra)))
 
 
 def _parse_report(stdout: str) -> dict[str, Any] | None:
