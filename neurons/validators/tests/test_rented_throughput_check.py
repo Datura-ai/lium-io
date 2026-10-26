@@ -281,8 +281,8 @@ async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
         assert (await check.run(ctx)).passed is False
 
 
-# The renter starts loading the disk or the link only after the 2 s window, while the probe measures it: no verdict,
-# never a strike. Idle during the probe, the same slow reading fails.
+# The renter starts loading the disk or the link only after the 2 s window, while the probe measures it: inconclusive,
+# so one or two such readings are never a strike. Idle during the probe, the same slow reading fails.
 @pytest.mark.parametrize(
     "answer, side",
     [
@@ -295,12 +295,12 @@ async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
     ],
     ids=["disk_bytes", "disk_requests", "network"],
 )
-async def test_renter_load_during_the_probe_is_no_verdict(answer, side):
+async def test_renter_load_during_the_probe_is_inconclusive(answer, side):
     with flags():
         ctx, _ = make_ctx(answer)
         reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
-    assert (net == "none") is (side in ("net", "both"))
-    assert (disk_side == "none") is (side in ("disk", "both"))
+    assert (net == "inconclusive") is (side in ("net", "both"))
+    assert (disk_side == "inconclusive") is (side in ("disk", "both"))
     assert "during_disk_iops" in reading
     with flags() as clock:
         ctx, _ = make_ctx(answer, answer)
@@ -343,7 +343,7 @@ async def test_cover_traffic_outside_the_pod_does_not_excuse_a_slow_node(answer)
 
 
 # Pod A moves renter traffic on both sides while pod B's cgroup goes unreadable and B then restarts (a new pid): A's
-# readings still count, so neither slow side is a verdict.
+# readings still count, so both slow sides are inconclusive rather than failing.
 async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     lines = snaps(during_rx=40_000_000, during_sectors=2_000_000).splitlines()
     b = ["5151:1:1:1:1,", "5151:1:1:1:1,", "5151:1:1::,", "5152:1:1:1:1,"]
@@ -355,7 +355,34 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     assert parse_during(answer)[0] == pytest.approx(32.0)
     with flags():
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
-    assert (net, disk_side) == ("none", "none")
+    assert (net, disk_side) == ("inconclusive", "inconclusive")
+
+
+# A host helper attached to the pod's cgroup (or netns) issuing tiny IO looks exactly like renter load: one such excused
+# slow probe is no strike, but INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next one zeroes the score.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(during_ios=200)
+        + disk(secs=30.0)
+        + FAST,  # 20 tiny requests/s charged to the pod cgroup
+        snaps(during_rx=7_000_000) + disk() + SLOW,  # ~5.6 Mbps charged to the pod netns
+    ],
+    ids=["cgroup_helper", "netns_helper"],
+)
+async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * (n + 1))
+        check = RentedThroughputCheck()
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 0  # one excused probe: no strike
+        for _ in range(n - 1):
+            clock.now += 31 * 60
+            assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 1  # the n-th excused probe in a row: a strike
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
 
 
 def stopped_pod(answer_tail: str) -> str:
