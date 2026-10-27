@@ -388,6 +388,9 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
+    # protocol 1.17.0: False when the backend rents the pod part of its host, so it gets no host-wide devices
+    # (RDMA, nvidia-caps) even when every GPU the host shows is requested. None from an older backend.
+    whole_host: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):

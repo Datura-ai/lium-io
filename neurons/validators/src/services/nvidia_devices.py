@@ -207,6 +207,7 @@ async def build_gpu_docker_config_for_executor(
     executor_id: str | None = None,
     default_extra: dict | None = None,
     host_probe: PrerunHostProbe | None = None,
+    whole_host: bool | None = None,
 ) -> GpuDockerConfig:
     """Resolve structured GPU Docker options for SDK container creation.
 
@@ -227,6 +228,9 @@ async def build_gpu_docker_config_for_executor(
         else:
             per_gpu = await _query_all_gpu_nodes(ssh_client, host_probe=host_probe)
             is_partial_rental = False
+        # The live count alone can be fooled by GPUs that are off the bus at this create. The backend's
+        # whole_host=False (protocol 1.17.0) also makes the rental partial, so neither side can grant the devices alone.
+        is_partial_rental = is_partial_rental or whole_host is False
 
         # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
         # /dev/nvidia-caps/* are per-GPU/per-MIG control nodes that would let a tenant peek at or

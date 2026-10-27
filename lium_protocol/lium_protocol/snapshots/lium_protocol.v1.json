@@ -1035,6 +1035,18 @@
           "default": null,
           "title": "Volume Limit Gb"
         },
+        "whole_host": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Whole Host"
+        },
         "workload_kind": {
           "$ref": "#/$defs/WorkloadKind",
           "default": "CUSTOMER_RENTAL"
@@ -6150,7 +6162,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.16.0",
+  "protocol_version": "1.17.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
