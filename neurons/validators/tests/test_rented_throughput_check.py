@@ -625,13 +625,10 @@ def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
     assert out.splitlines()[-1] == "4242:1000:60:300:7:1:,4343:1000:60::::,", out
 
 
-# own(): a process is the container's when it shares the init's PID namespace or descends from the init (nested
-# namespaces); a host process attached to the cgroup is neither. Here the PID-namespace test is switched off (the test
-# runs in one namespace), so only the ancestry decides: this shell plays the container init.
+# own(): a process is the container's when it descends from the init; a host process attached to the cgroup is not,
+# even in the init's PID namespace (pid 1 shares this test's namespace). This shell plays the container init.
 def test_provenance_tells_the_containers_processes_from_a_host_helper(tmp_path):
-    script = module._SNAPSHOT.replace(
-        "[ /proc/$1/ns/pid -ef /proc/$p/ns/pid ] && return 0; ", ""
-    ).split("pods() {")[0]
+    script = module._SNAPSHOT.split("pods() {")[0]
     cmd = (
         f"{script} p=$$; sleep 30 & child=$!; "
         'echo "$child" | prov; printf "%s\n%s\n" "$child" 1 | prov; echo 999999999 | prov; '
