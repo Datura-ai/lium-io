@@ -359,6 +359,12 @@ async def test_a_replacement_sizes_on_disk_measured_under_the_flatten_lock(tmp_p
         running.wait()
 
 
+def test_no_flatten_lock_or_mark_lives_on_tmp():
+    # review: /tmp is janitor-managed and can fill up
+    for path in (FLATTEN_LOCK_PATH, FLATTEN_USE_LOCK_PATH, image_flatten.FLATTEN_SIZED_PATH):
+        assert path.startswith("/root/app/")
+
+
 @pytest.mark.asyncio
 async def test_a_node_without_flock_runs_no_flatten_and_gives_no_locked_measure():
     ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=0, stdout="")))

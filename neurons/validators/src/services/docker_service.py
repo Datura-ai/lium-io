@@ -6825,10 +6825,12 @@ class DockerService:
         log_extra: dict,
         host_probe: VolumeHostProbe | None = None,
         locked_df_avail_bytes: int | None = None,
+        locked_df_error: Exception | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
 
-        `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure.
+        `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure;
+        `locked_df_error` (that measure failed) takes the measurement-failure fallback below.
 
         With `host_probe` (DAH-3240) the fresh path reads DockerRootDir,
         df and the vloopback volume names from the probe instead of running three commands;
@@ -6863,6 +6865,9 @@ class DockerService:
             )
 
         try:
+            if locked_df_error is not None:
+                # never size on another measure: it may predate a copy
+                raise locked_df_error
             df_avail_bytes = locked_df_avail_bytes
             if host_probe is not None and host_probe.df_avail_bytes is not None:
                 docker_root_dir = host_probe.docker_root_dir
@@ -9029,6 +9034,7 @@ class DockerService:
                     # (a failed probe → None → the per-command path below).
                     volume_probe: VolumeHostProbe | None = None
                     locked_df_avail_bytes: int | None = None
+                    locked_df_error: Exception | None = None
                     if measures_host:
                         # a copy (its pod maybe deleted meanwhile) takes disk this sizing would otherwise
                         # grant: size on df measured under the flatten lock, never on a probe that may
@@ -9036,7 +9042,12 @@ class DockerService:
                         if early_volume_probe is not None and not early_volume_probe.cancelled():
                             await early_volume_probe
                         current_step = "flatten_wait"
-                        locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
+                        try:
+                            locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            locked_df_error = exc  # the sizing's measurement-failure fallback, not an abort
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
@@ -9069,6 +9080,7 @@ class DockerService:
                         log_extra=default_extra,
                         host_probe=volume_probe,
                         locked_df_avail_bytes=locked_df_avail_bytes,
+                        locked_df_error=locked_df_error,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

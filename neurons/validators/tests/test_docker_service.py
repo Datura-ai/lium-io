@@ -5804,6 +5804,18 @@ async def test_resolve_volume_sizing_below_min_raises(docker_service):
 
 
 @pytest.mark.asyncio
+async def test_resolve_volume_sizing_failed_locked_measure_falls_back_not_on_the_probe(docker_service):
+    payload = _make_sizing_payload(disk_share=0.5, volume_limit_gb=40, storage_limit_gb=20)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=900 * _SIZING_GB)
+
+    result = await docker_service.resolve_volume_sizing(
+        ssh_client, payload, "tag", {}, locked_df_error=RuntimeError("measure failed")
+    )
+
+    assert (result.path, result.volume_limit_gb, result.storage_limit_gb) == ("fresh_fallback", 40, 20)
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_measurement_failure_falls_back(docker_service):
     # Arrange
     payload = _make_sizing_payload(disk_share=0.5, volume_limit_gb=40, storage_limit_gb=20)

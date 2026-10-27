@@ -401,6 +401,21 @@ async def test_create_container_sizes_on_the_disk_measured_under_the_flatten_loc
 
 
 @pytest.mark.asyncio
+async def test_a_failed_measure_under_the_flatten_lock_takes_the_sizing_fallback(svc, monkeypatch):
+    # review: a transient failure of the locked measure must not abort the create
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+    error = RuntimeError("measure failed")
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", AsyncMock(side_effect=error))
+
+    await _run_create_container(svc, _create_payload())
+
+    assert svc.resolve_volume_sizing.await_args.kwargs["locked_df_error"] is error
+    assert svc.resolve_volume_sizing.await_args.kwargs["locked_df_avail_bytes"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "overrides",
     [

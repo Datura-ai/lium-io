@@ -22,16 +22,17 @@ FLATTEN_DISK_MARGIN_BYTES = 10 * 1024**3
 # a 24 GB image takes about 5-15 minutes to copy; past this the create fails with the original error
 FLATTEN_TIMEOUT_SECONDS = 1800
 _DOCKER_READ_TIMEOUT_SECONDS = 120
-FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"  # held by a flatten from its disk check to its tag
+FLATTEN_LOCK_PATH = "/root/app/lium-flatten.lock"  # held by a flatten from its disk check to its tag
 # touched under the node lock by every disk-measuring create as it measures: a flatten that saw no
 # other create before this changed refuses, as that create's grant is not on the node yet
-FLATTEN_SIZED_PATH = "/tmp/lium-flatten-sized"
+FLATTEN_SIZED_PATH = "/root/app/lium-flatten-sized"
 # short lock over "mark a copy as in use" and "remove copies not in use", so a removal never races a reuse
-FLATTEN_USE_LOCK_PATH = "/tmp/lium-flatten-use.lock"
+FLATTEN_USE_LOCK_PATH = "/root/app/lium-flatten-use.lock"
 # One lease file `<copy id>.<rental lease>` per rental between its flatten (or reuse) and the end of its
 # create; a leased copy is never removed. The rental releases it when the create ends (success, failure or
 # cancel), after which a container using the copy protects it; the expiry only covers a validator crash.
-# Beside the validator's other node state, not on /tmp, which a renter's or provider's files can fill.
+# Beside the validator's other node state, not on /tmp, which a renter's or provider's files can fill
+# (the lock and mark files above too).
 FLATTEN_LEASE_DIR = "/root/app/flatten-leases"
 FLATTEN_LEASE_EXIT = 93
 # the lease is written before the copy, so it covers the copy (bounded by the timeout) and the create after it
