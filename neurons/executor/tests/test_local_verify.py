@@ -15,9 +15,9 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import bittensor
 import pytest
 import services.local_verify_service as lvs
+from bittensor_wallet import Keypair
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
@@ -69,7 +69,7 @@ FAKE_VERIFYX = textwrap.dedent(
 
 @pytest.fixture(scope="module")
 def validator_keypair():
-    return bittensor.Keypair.create_from_uri("//LiumTestValidator")
+    return Keypair.create_from_uri("//LiumTestValidator")
 
 
 @pytest.fixture()
@@ -156,10 +156,10 @@ def _app(validator_keypair, monkeypatch) -> FastAPI:
     # The configured miner and the shared portal hotkey are two different keys here, so the
     # "portal hotkey binds nothing" refusal is tested against a real difference, not conftest's.
     monkeypatch.setattr(
-        settings, "MINER_HOTKEY_SS58_ADDRESS", bittensor.Keypair.create_from_uri("//Miner").ss58_address
+        settings, "MINER_HOTKEY_SS58_ADDRESS", Keypair.create_from_uri("//Miner").ss58_address
     )
     monkeypatch.setattr(
-        settings, "DEFAULT_MINER_HOTKEY", bittensor.Keypair.create_from_uri("//Portal").ss58_address
+        settings, "DEFAULT_MINER_HOTKEY", Keypair.create_from_uri("//Portal").ss58_address
     )
     monkeypatch.setattr(apis_module, "_local_verify_service", None)
     monkeypatch.setattr(apis_module, "_local_verify_nonces", NonceCache())
@@ -207,7 +207,7 @@ def test_a_network_peer_is_403_before_the_body_is_read_and_burns_nothing(
 
 
 def test_wrong_key_or_tampered_field_is_401(client, validator_keypair):
-    stranger = bittensor.Keypair.create_from_uri("//Stranger")
+    stranger = Keypair.create_from_uri("//Stranger")
     assert client.post("/verify", json=_signed(_body(), stranger)).status_code == 401
 
     tampered = _signed(_body(), validator_keypair)
@@ -224,7 +224,7 @@ def test_an_intent_for_another_miners_executor_is_401_and_not_burnt(client, vali
     executor (same validator signature, B's flag on) must not run B's GPU suite — B would answer
     the real validator 409 busy meanwhile. The executor knows only its miner, so the signed
     `miner_hotkey` is what binds the intent; the portal hotkey every executor trusts does not."""
-    other_miner = bittensor.Keypair.create_from_uri("//OtherMiner").ss58_address
+    other_miner = Keypair.create_from_uri("//OtherMiner").ss58_address
     relayed = client.post("/verify", json=_signed(_body(miner_hotkey=other_miner), validator_keypair))
     assert relayed.status_code == 401 and "another miner" in relayed.text
     portal = client.post(

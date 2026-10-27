@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
@@ -467,7 +468,9 @@ class FillerSSHClient:
         removed_from_host: bool = True,
         exit_code: int = 255,
         oom_killed: bool = False,
+        error: str = "error while mounting volume",
     ):
+        self.error = error
         # True = `docker inspect` says "No such object" (a removal); False = still there, exited.
         self.removed_from_host = removed_from_host
         self.exit_code = exit_code
@@ -502,7 +505,7 @@ class FillerSSHClient:
                 result.stdout = (
                     f'{{"Status": "exited", "ExitCode": {self.exit_code},'
                     f' "OOMKilled": {str(self.oom_killed).lower()},'
-                    ' "Error": "error while mounting volume", "StartedAt": "2026-08-18T06:45:54Z",'
+                    f' "Error": {json.dumps(self.error)}, "StartedAt": "2026-08-18T06:45:54Z",'
                     ' "FinishedAt": "2026-08-18T22:44:30Z"}'
                 )
         return result
@@ -684,6 +687,7 @@ async def test_rental_verification_filler_ssh_transport_error_fails_without_rech
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
+    assert result.event.severity == "error"
     assert backend_client.filler_run_active_calls == []
 
 
@@ -968,8 +972,7 @@ def _cpu_quota_response() -> ExecutorHealthCheckResponse:
 
 
 @pytest.mark.asyncio
-async def test_cpu_quota_verdict_is_observe_only_in_shadow():
-    """CHECK on, ENFORCEMENT off: the daemon-rejected count is logged but the score is untouched."""
+async def test_cpu_quota_verdict_zeroes_score():
     backend_client = DummyBackendClient(response=_cpu_quota_response())
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
@@ -977,30 +980,7 @@ async def test_cpu_quota_verdict_is_observe_only_in_shadow():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = False
-        result = await RentalVerificationCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON
-    assert result.updates == {}
-    assert result.event.what_we_saw["advertised_cpu_count"] == 176
-    assert "Range of CPUs is from" in result.event.what_we_saw["stderr"]
-
-
-@pytest.mark.asyncio
-async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
-    backend_client = DummyBackendClient(response=_cpu_quota_response())
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
 
     assert result.passed is False
@@ -1021,8 +1001,7 @@ async def test_advertised_cpu_count_is_sent_to_the_backend():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 44
@@ -1043,29 +1022,10 @@ async def test_fake_present_population_does_not_cap_the_advertised_count():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44, present=176))
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 176
-
-
-@pytest.mark.asyncio
-async def test_cpu_count_is_not_sent_when_the_check_is_disabled():
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 44}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state)
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = False
-        await RentalVerificationCheck().run(ctx)
-
-    assert backend_client.called_with["cpu_count"] is None
 
 
 @pytest.mark.asyncio
@@ -1082,8 +1042,7 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
     executor.tdx_quote = '{"quote": "..."}'
     ctx = make_context(executor=executor, services=services, state=state)
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] is None
@@ -1115,7 +1074,6 @@ async def test_rental_verification_filler_create_kill_enforcement_fails():
     assert backend_client.called_with is None
 
 
-@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_rental_verification_filler_create_kill_ignored_for_a_customer_rental():
     """A paying customer's pod is never punished for the node's default-job history."""
@@ -1176,7 +1134,7 @@ async def test_filler_terminated_by_a_signal_is_a_kill():
     back anything else. Prod: all 4 such runs in 7 days came from the one host with a container
     auto-killer."""
     backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=143)
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=143, error="")
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
     result = await _run_filler_check(ctx)
@@ -1190,7 +1148,7 @@ async def test_filler_terminated_by_a_signal_is_a_kill():
 async def test_filler_killed_by_sigkill_is_a_kill():
     """Exit 137 = SIGKILL from outside the container."""
     backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=137)
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=137, error="")
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
     result = await _run_filler_check(ctx)
@@ -1215,13 +1173,32 @@ async def test_out_of_memory_kill_is_not_a_host_kill():
 
 
 @pytest.mark.asyncio
+async def test_signal_stop_docker_could_not_restart_is_not_a_host_kill():
+    """A VM reboot SIGTERMs the filler (143) and docker's restart then fails on a GPU device that is gone:
+    docker never restarts a container stopped on purpose, so this is not the host's choice."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(
+        running=False,
+        removed_from_host=False,
+        exit_code=143,
+        error='error gathering device information while adding custom device "/dev/nvidia4": no such file or directory',
+    )
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
+
+
+@pytest.mark.asyncio
 async def test_signal_killed_bundle_outranks_a_healthy_sibling_on_a_split_node():
     """A stopped bundle must decide the node even when its siblings are fine (DAH-2465)."""
     backend_client = _killed_filler_backend()
     healthy_container = "filler_11111111-2222-3333-4444-555555555555"
     stopped_container = "filler_99999999-8888-7777-6666-555555555555"
     ssh_client = FillerSSHClient(
-        dead_containers={stopped_container}, removed_from_host=False, exit_code=143
+        dead_containers={stopped_container}, removed_from_host=False, exit_code=143, error=""
     )
     ctx = _filler_context(
         backend_client=backend_client,

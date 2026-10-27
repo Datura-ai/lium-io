@@ -8,7 +8,8 @@ missing is the chain: the subtensor client is never constructed, the miner never
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
-**`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
+**`e2e-gate`**, routed by `.github/actions/changed-packages`; a push to `main` runs it when the push changed one of
+those); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
 `tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
 stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
