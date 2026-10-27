@@ -1130,9 +1130,30 @@ def test_restore_reporter_surfaces_scan_then_restore_stages() -> None:
     second_payload = session.requests[1]["json"]
     assert isinstance(first_payload, dict)
     assert isinstance(second_payload, dict)
-    assert first_payload["stage"] == "PREPARING"
+    assert first_payload["stage"] == "SCANNING"
     assert first_payload["total_files"] == 123
     assert second_payload["stage"] == "RESTORING"
+
+
+def test_restore_reporter_stays_preparing_until_restic_reports_status() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.RESTORE,
+        ),
+        session=session,
+        clock=_ManualClock(),
+    )
+
+    reporter.send({"event": "heartbeat"})
+
+    payload = session.requests[0]["json"]
+    assert isinstance(payload, dict)
+    assert payload["stage"] == "PREPARING"
 
 
 def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
