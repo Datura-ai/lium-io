@@ -385,7 +385,9 @@ def _stub_filesystem(scrape: dict, monkeypatch, *, host_dirs: set[str], usage_by
         scrape,
         "os",
         SimpleNamespace(
-            path=SimpleNamespace(isdir=lambda path: path in host_dirs, join=os.path.join, dirname=os.path.dirname)
+            path=SimpleNamespace(
+                isdir=lambda path: path in host_dirs, join=os.path.join, dirname=os.path.dirname, normpath=os.path.normpath
+            )
         ),
     )
     monkeypatch.setitem(scrape, "shutil", type("_Shutil", (), {"disk_usage": staticmethod(disk_usage)}))
@@ -473,9 +475,10 @@ def _stub_containerd_config(scrape: dict, monkeypatch, files: dict, dump: str | 
         return dump
 
     def open_host(path):
-        if path.removeprefix("/proc/1/root") not in files:
+        path = os.path.normpath(path.removeprefix("/proc/1/root"))  # "./x" is x, as on a real filesystem
+        if path not in files:
             raise FileNotFoundError(path)
-        return io.StringIO(files[path.removeprefix("/proc/1/root")])
+        return io.StringIO(files[path])
 
     scrape["run_cmd"] = run_cmd
     scrape["open"] = open_host
@@ -518,6 +521,8 @@ def test_disk_usage_follows_a_containerd_root_moved_in_an_imported_config(scrape
     [
         # an imported file the scrape cannot read: the root may be set there
         ({"/etc/containerd/config.toml": 'imports = ["/etc/containerd/extra.toml"]\n'}, {"/proc/1/root/var/lib/containerd"}),
+        # a literal import that is gone: containerd opens it directly, no glob ever matches it
+        ({"/etc/containerd/config.toml": 'imports = ["/etc/containerd/missing.toml"]\n'}, {"/proc/1/root/var/lib/containerd"}),
         # the configured root is not on the host: never fall back to the leftover default
         ({"/etc/containerd/config.toml": 'root = "/gone/containerd"\n'}, {"/proc/1/root/var/lib/containerd"}),
     ],
@@ -525,14 +530,32 @@ def test_disk_usage_follows_a_containerd_root_moved_in_an_imported_config(scrape
 def test_an_undeterminable_containerd_root_is_not_measured(scrape: dict, monkeypatch, files, host_dirs) -> None:
     _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
     _stub_containerd_config(scrape, monkeypatch, files)
-    # extra.toml is matched by the import but unreadable
-    if "extra" in str(files):
-        monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: ["/proc/1/root/etc/containerd/extra.toml"]))
     asked = _stub_filesystem(scrape, monkeypatch, host_dirs=host_dirs, usage_by_path={})
 
     with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
         scrape["get_host_disk_usage"]()
     assert asked == []
+
+
+@pytest.mark.parametrize(
+    "files, expected_root",
+    [
+        # a commented-out import is not configuration
+        ({"/etc/containerd/config.toml": 'root = "/data/containerd"\nimports = [\n  # "/etc/containerd/storage.toml",\n]\n',
+          "/etc/containerd/storage.toml": 'root = "/var/lib/containerd"\n'}, "/data/containerd"),
+        # "./10-root.toml" is the already-loaded 10-root.toml: it must not override 99-override.toml again
+        ({"/etc/containerd/config.toml": 'imports=["10-root.toml", "99-override.toml"]\n',
+          "/etc/containerd/10-root.toml": 'root="/data/containerd"\n',
+          "/etc/containerd/99-override.toml": 'root="/var/lib/containerd"\nimports=["./10-root.toml"]\n'}, "/var/lib/containerd"),
+    ],
+)
+def test_containerd_root_reads_imports_as_containerd_does(scrape: dict, monkeypatch, files, expected_root) -> None:
+    _stub_containerd_config(scrape, monkeypatch, files)
+    # every import here is literal: a real glob answers an existing literal path with itself
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [pattern]))
+    _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/data/containerd", "/proc/1/root/var/lib/containerd"}, usage_by_path={})
+
+    assert scrape["containerd_root"]() == expected_root
 
 
 def test_filler_cache_on_another_filesystem_is_not_reported_as_free(scrape: dict, monkeypatch) -> None:

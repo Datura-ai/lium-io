@@ -839,7 +839,11 @@ def containerd_root():
                     text = ""  # no config at all: containerd runs on its default root
                 roots += toml_top_level(text, "root")
                 for pattern in toml_top_level(text, "imports"):
-                    pattern = os.path.join(os.path.dirname(path), pattern)
+                    # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
+                    pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
+                    if "*" not in pattern:
+                        pending.append(pattern)  # literal: containerd opens it, a missing one fails
+                        continue
                     # a later file overrides an earlier one, in the order containerd merges them
                     pending += sorted(match[len("/proc/1/root"):] for match in glob.glob(f"/proc/1/root{pattern}"))
         except OSError as exc:
@@ -852,6 +856,7 @@ def containerd_root():
 
 def toml_top_level(text, key):
     # string values of a top-level key (before the first [table]); one string or an array of them
+    text = re.sub(r"""("[^"]*"|'[^']*')|#[^\n]*""", r"\1", text)  # drop comments outside strings
     top = re.split(r"(?m)^\s*\[", text, maxsplit=1)[0]
     match = re.search(rf"""(?ms)^\s*{key}\s*=\s*(\[.*?\]|"[^"]*"|'[^']*')""", top)
     return re.findall(r"""["']([^"']*)["']""", match.group(1)) if match else []
