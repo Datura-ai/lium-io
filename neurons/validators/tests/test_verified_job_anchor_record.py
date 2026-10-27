@@ -79,3 +79,28 @@ async def test_a_swap_breaks_the_anchor_through_pipeline_context_and_handler(con
     assert service.publish.await_count == 1
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("swapped", "anchored_after"),
+    [
+        ("gpu-003,gpu-004", "gpu-003,gpu-004"),  # every card replaced (a VM host after a reboot): re-anchored
+        ("gpu-001,gpu-003", "gpu-001,gpu-002"),  # one card replaced: the anchor stays
+        ("gpu-003", "gpu-001,gpu-002"),  # fewer cards: the anchor stays
+    ],
+)
+async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_re_anchored(context_factory, swapped, anchored_after):
+    """Regression: a node whose cards were all replaced failed GPU_UUID_CHANGED on every cycle under its executor id,
+    so a VM host had to remove and re-add the node after each reboot that brought other GPUs."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=False)
+
+    ok, event, _ = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
+    assert ok is False and event.reason_code == "GPU_UUID_CHANGED"  # the swap cycle is still a reset
+
+    ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=False)
+    assert record["uuids"] == anchored_after
+    assert ok is (anchored_after == swapped)

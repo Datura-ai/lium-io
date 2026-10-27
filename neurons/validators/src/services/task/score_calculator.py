@@ -99,6 +99,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Host pinned or throttled a rented pod below its deployed CPUs")
 
+    # Rented throughput gate: same mechanics.
+    if not ctx.rented_throughput_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("A rented pod gets far too little network or disk throughput")
+
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
     # score there; shadow leaves the flag True.
     if not ctx.gpu_attestation_identity_passed:
