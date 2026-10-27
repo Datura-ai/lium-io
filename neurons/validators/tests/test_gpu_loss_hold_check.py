@@ -417,3 +417,7 @@ async def test_a_node_whose_whole_gpu_set_was_replaced_is_held(context_factory, 
         reanchored = _ctx(context_factory, redis, listed=replaced, pods=(), anchor=replaced)
         clean = await GpuLossHoldCheck().run(reanchored)
         assert _hidden(clean) and _fatal(clean)
+        # a second whole swap inside the hold is judged against the new anchor and starts the hold again
+        third = [f"GPU-c0c{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+        again = await GpuLossHoldCheck().run(_ctx(context_factory, redis, listed=third, pods=(), anchor=replaced))
+        assert _hidden(again) and again.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]

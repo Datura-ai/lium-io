@@ -110,7 +110,7 @@ class GpuFingerprintCheck:
             if not hard:
                 from .gpu_loss_hold import rented_pods  # gpu_loss_hold imports this module
 
-                # still a reset (score 0 this cycle); the next cycle anchors the new cards
+                # still a reset (score 0 this cycle); a whole replaced set becomes the anchor now
                 reanchor = whole_set_replaced(anchor, current, rented=bool(rented_pods(ctx)))
                 event = render_message(
                     Msg.UUID_CHANGED,
