@@ -7,6 +7,7 @@ from services.redis_service import GPU_ANCHOR_BROKEN_KEY, GPU_ANCHOR_KEY
 
 from ..messages import GpuFingerprintMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .banned_provider import has_live_rental
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ def split_uuids(csv: str) -> list[str]:
     return sorted({u for u in csv.split(",") if u})
 
 
+def _failed(ctx: Context, event, updates: dict) -> CheckResult:
+    """A failed check; under a live rental the run continues to the rented-pod checks and the score gate
+    (calculate_scores) zeroes the node instead of the halt."""
+    if not has_live_rental(ctx):
+        return CheckResult(passed=False, event=event, updates=updates)
+    return CheckResult(passed=False, event=event, updates={**updates, "gpu_fingerprint_passed": False}, fatal=False)
+
+
 class GpuFingerprintCheck:
     """Compare the anchored GPU UUID set with the latest scrape.
 
@@ -55,6 +64,10 @@ class GpuFingerprintCheck:
     A node whose record is already marked broken fails before the sets are compared. With the flag off again
     the mark is kept in the record but ignored; it applies again on the next flip on.
 
+    Every failure is fatal only when no renter's pod is running. Under a live rental the score is zeroed
+    through `gpu_fingerprint_passed` instead and the run goes on to the rented-pod checks, so a pod on a
+    node whose cards changed is still checked (container state, resources, throughput, sensor).
+
     Both sets are compared as distinct UUIDs. A scrape that lists one anchored card twice matches the anchor
     (`duplicate_uuid: true` on the event, one warning in the log). A scrape with zero cards passes this check
     and leaves the anchor unchanged. Neither is read as a set change.
@@ -76,7 +89,7 @@ class GpuFingerprintCheck:
                 check_id=self.check_id,
                 what={"previous": prev_uuids, "current": current_uuids, "anchor_broken": True},
             )
-            return CheckResult(passed=False, event=event)
+            return _failed(ctx, event, {})
 
         anchor = split_uuids(prev_uuids)
         current = split_uuids(current_uuids)
@@ -117,10 +130,10 @@ class GpuFingerprintCheck:
                     check_id=self.check_id,
                     what={**what, "anchor_hard_would_be": decision, **({"reanchored": True} if reanchor else {})},
                 )
-                return CheckResult(
-                    passed=False,
-                    event=event,
-                    updates={
+                return _failed(
+                    ctx,
+                    event,
+                    {
                         "clear_verified_job_info": True,
                         # tells a missing card (a renter's GPU reset can cause it) from a swap
                         "clear_verified_job_evidence": {"anchor_hard_would_be": decision},
@@ -130,7 +143,7 @@ class GpuFingerprintCheck:
 
             if decision == DECISION_GPU_MISSING:
                 event = render_message(Msg.GPU_MISSING, ctx=ctx, check_id=self.check_id, what=what)
-                return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
+                return _failed(ctx, event, {"clear_verified_job_info": True})
 
             event = render_message(
                 Msg.ANCHOR_BROKEN,
@@ -138,11 +151,7 @@ class GpuFingerprintCheck:
                 check_id=self.check_id,
                 what={**what, "anchor_broken": True},
             )
-            return CheckResult(
-                passed=False,
-                event=event,
-                updates={"clear_verified_job_info": True, "gpu_anchor_broken": True},
-            )
+            return _failed(ctx, event, {"clear_verified_job_info": True, "gpu_anchor_broken": True})
 
         event = render_message(
             Msg.UUID_OK,
