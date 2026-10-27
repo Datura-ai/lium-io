@@ -8199,7 +8199,7 @@ _GIB = 1024**3
 
 def _flatten_on_disk(avail_bytes, image_bytes):
     # the node-side check of flatten_image_on_host: image + margin + reserve must fit in df's free bytes
-    async def flatten(ssh_client, image, *, lease, reserved_bytes):
+    async def flatten(ssh_client, image, *, lease, reserved_bytes, sized_mark):
         if avail_bytes < image_bytes + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES + reserved_bytes:
             raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
         return "lium-flattened:abc"

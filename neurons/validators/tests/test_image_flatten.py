@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -142,7 +143,9 @@ def test_changes_refuse_a_health_check_they_cannot_carry():
         image_flatten_changes({"Healthcheck": {"Test": ["CMD-SHELL"]}})
 
 
-def _flatten_script(tmp_path, *, lease="r1", export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=()) -> list[str]:
+def _flatten_script(
+    tmp_path, *, lease="r1", export_rc=0, import_rc=0, rm_rc=0, avail=10**12, import_sleep=0, volumes=(), sized_mark=""
+) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
     fake = tmp_path / "docker"
@@ -161,12 +164,13 @@ def _flatten_script(tmp_path, *, lease="r1", export_rc=0, import_rc=0, rm_rc=0, 
         "esac\n"
     )
     fake.chmod(0o755)
-    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100, lease)
+    script = _flatten_command("sha256:id", "lium-flattened:x", ['CMD ["a"]'], list(volumes), 100, lease, sized_mark)
     for real, local in (
         ("/usr/bin/docker", fake),
         (FLATTEN_LOCK_PATH, tmp_path / "lock"),
         (FLATTEN_USE_LOCK_PATH, tmp_path / "use.lock"),
         (FLATTEN_LEASE_DIR, tmp_path / "leases"),
+        (image_flatten.FLATTEN_SIZED_PATH, tmp_path / "sized"),
     ):
         script = script.replace(real, str(local))
     return ["sh", "-c", script]
@@ -320,17 +324,20 @@ async def test_a_replacement_waits_for_a_running_flatten_before_it_measures_the_
     # measures the disk only after the copy landed, so all it is granted stays backed.
     lock, used = tmp_path / "lock", tmp_path / "used"
     used.write_text("0")
+    lock.touch()
+    os.utime(lock, (time.time() - 60, time.time() - 60))  # the last flatten ended before any probe
     monkeypatch.setattr(image_flatten, "FLATTEN_LOCK_PATH", str(lock))
+    monkeypatch.setattr(image_flatten, "FLATTEN_SIZED_PATH", str(tmp_path / "sized"))
     env = {"PATH": os.environ["PATH"]}
     if flatten_running:
         copy = subprocess.Popen(["flock", str(lock), "sh", "-c", f"sleep 1; echo 30 > {used}"], env=env)
         while subprocess.run(["flock", "-n", str(lock), "true"], env=env).returncode == 0:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
 
     async def run(command, check=False, timeout=None):
         return Mock(exit_status=subprocess.run(["sh", "-c", command], env=env).returncode)
 
-    assert await image_flatten.wait_for_node_flatten(Mock(run=run)) is flatten_running
+    assert await image_flatten.wait_for_node_flatten(Mock(run=run), 0) is flatten_running
     granted_gib = 120 - int(used.read_text())  # B's sizing reads df now
     assert granted_gib + int(used.read_text()) <= 120
     assert granted_gib == (90 if flatten_running else 120)
@@ -342,4 +349,35 @@ async def test_a_replacement_waits_for_a_running_flatten_before_it_measures_the_
 async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
     ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=1)))
     with pytest.raises(RuntimeError, match="image copy"):
-        await image_flatten.wait_for_node_flatten(ssh)
+        await image_flatten.wait_for_node_flatten(ssh, 0)
+
+
+def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_other_creates(tmp_path, monkeypatch):
+    # review: A saw no other create, then B waited (no flatten held the lock yet) and measured the full
+    # free disk; A must not copy into what B was just granted
+    monkeypatch.setattr(image_flatten, "FLATTEN_SIZED_PATH", str(tmp_path / "sized"))
+    env = {"PATH": os.environ["PATH"]}
+    mark = subprocess.run(["sh", "-c", image_flatten.flatten_sized_mark_command()], capture_output=True, text=True)
+    assert _sh(image_flatten.flatten_wait_command(0).replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock")), tmp_path) in (0, 3)
+    result = subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), capture_output=True, env=env)
+    assert result.returncode == FLATTEN_NO_DISK_EXIT and b"sized its disk" in result.stderr
+    assert "create" not in [c.split()[0] for c in _calls(tmp_path)]
+    # read after B's mark: B is visible to A's own check for other creates, so the copy goes ahead
+    mark = subprocess.run(["sh", "-c", image_flatten.flatten_sized_mark_command()], capture_output=True, text=True)
+    assert subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), env=env).returncode == 0
+
+
+def test_a_flatten_that_ended_after_the_early_probe_makes_the_wait_ask_for_a_fresh_probe(tmp_path):
+    # review: B's early probe measured while A copied; A ended before B's wait, so the lock is free again
+    lock = tmp_path / "lock"
+    command = image_flatten.flatten_wait_command(30).replace(FLATTEN_LOCK_PATH, str(lock))
+    command = command.replace(image_flatten.FLATTEN_SIZED_PATH, str(tmp_path / "sized"))
+    lock.touch()  # a flatten exits by touching the lock: ended 0 s ago, within the 30 s probe age
+    assert _sh(command, tmp_path) == 3
+    old = time.time() - 60
+    os.utime(lock, (old, old))  # ended before the probe measured
+    assert _sh(command, tmp_path) == 0
+    assert (tmp_path / "sized").exists()
+    # every flatten exit marks its end on the lock file (this one refuses: B marked the node sized)
+    subprocess.run(_flatten_script(tmp_path), env={"PATH": os.environ["PATH"]})
+    assert _sh(command, tmp_path) == 3

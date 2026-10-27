@@ -125,6 +125,7 @@ from services.image_flatten import (
     ImageFlattenNoDisk,
     flatten_image_on_host,
     flatten_lease_release_command,
+    flatten_sized_mark_command,
     wait_for_node_flatten,
 )
 from services.loopback_plugin_setup import loopback_plugin_setup_command
@@ -2969,12 +2970,16 @@ class DockerService:
         )
         started = time.monotonic()
         try:
+            # read before the check: a create that marks the node sized after it makes the flatten refuse
+            sized_mark = str((await ssh_client.run(flatten_sized_mark_command(), check=True, timeout=120)).stdout or "")
             if beside_other_create is not None and beside_other_create():
                 # its grant is not on the node yet, so the copy cannot keep it free
                 raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
             layers = await ssh_client.run(_WRITABLE_LAYERS_COMMAND, check=True, timeout=120)
             reserved_bytes += _neighbours_unwritten_bytes(str(layers.stdout or ""), container_name)
-            flat_image = await flatten_image_on_host(ssh_client, image, lease=lease, reserved_bytes=reserved_bytes)
+            flat_image = await flatten_image_on_host(
+                ssh_client, image, lease=lease, reserved_bytes=reserved_bytes, sized_mark=sized_mark.strip()
+            )
         except ImageFlattenNoDisk:
             logger.warning(_m("SYSBOX_FLATTEN_NO_DISK", extra=get_extra_info({**default_extra, "image": image})))
             await self.stream_log(FLATTEN_NO_DISK_RENTER_SENTENCE, "error", log_tag)
@@ -8267,6 +8272,7 @@ class DockerService:
             )
             early_host_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
             early_volume_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
+            probes_not_before = time.monotonic()  # no early probe measures before this
             # DAH-3980: a customer's create removes every filler (DAH-3706). The kill is started after the
             # fail-closed host reads below (never before — a refused probe must leave the filler in place),
             # so it still runs beside the image inspect instead of after it. Any other create (a filler
@@ -9024,7 +9030,9 @@ class DockerService:
                         if early_volume_probe is not None and not early_volume_probe.cancelled():
                             await early_volume_probe
                         current_step = "flatten_wait"
-                        flatten_finished = await wait_for_node_flatten(ssh_client)
+                        flatten_finished = await wait_for_node_flatten(
+                            ssh_client, int(time.monotonic() - probes_not_before) + 2
+                        )
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command

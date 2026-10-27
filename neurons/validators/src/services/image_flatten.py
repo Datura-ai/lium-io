@@ -22,7 +22,10 @@ FLATTEN_DISK_MARGIN_BYTES = 10 * 1024**3
 # a 24 GB image takes about 5-15 minutes to copy; past this the create fails with the original error
 FLATTEN_TIMEOUT_SECONDS = 1800
 _DOCKER_READ_TIMEOUT_SECONDS = 120
-FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"
+FLATTEN_LOCK_PATH = "/tmp/lium-flatten.lock"  # its mtime: when the last flatten ended (touched on exit)
+# touched under the node lock by every disk-measuring create before it measures: a flatten that saw no
+# other create before this changed refuses, as that create's grant is not on the node yet
+FLATTEN_SIZED_PATH = "/tmp/lium-flatten-sized"
 # short lock over "mark a copy as in use" and "remove copies not in use", so a removal never races a reuse
 FLATTEN_USE_LOCK_PATH = "/tmp/lium-flatten-use.lock"
 # One lease file `<copy id>.<rental lease>` per rental between its flatten (or reuse) and the end of its
@@ -134,13 +137,13 @@ def _reuse_command(tag: str, lease: str) -> str:
 
 
 def _flatten_command(
-    image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int, lease: str
+    image_id: str, tag: str, changes: list[str], volumes: list[str], need_bytes: int, lease: str, sized_mark: str = ""
 ) -> str:
     """Under a node-wide lock: reuse a copy another flatten finished meanwhile, refuse a new copy while
     FLATTEN_MAX_LEASES other rentals still wait on theirs, remove every earlier copy
     no container uses and no rental leased in the last FLATTEN_LEASE_MINUTES (so renters cannot fill the
     disk with copies, and a rental never loses its copy before its create), check the Docker disk
-    holds `need_bytes`, create (never start) a container from the image ID, pipe its export into an
+    holds `need_bytes` and no create sized its disk since `sized_mark` (flatten_sized_mark_command), create (never start) a container from the image ID, pipe its export into an
     import, tag the result only when both sides succeeded, and always remove the container and its
     volumes. Plain sh: no pipefail."""
     t = FLATTEN_TIMEOUT_SECONDS
@@ -150,8 +153,10 @@ def _flatten_command(
     root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
     return (
         # one flatten per node: concurrent rentals would each pass the disk check and copy at once
-        f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
+        f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; trap 'touch {FLATTEN_LOCK_PATH}' EXIT; "
         f"({_reuse_command(tag, lease)}) && exit 0; "
+        f'[ "$(stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null)" = {shlex.quote(sized_mark)} ] || '
+        f"{{ echo 'flatten refused: another create sized its disk meanwhile' >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; "
         f"exec 8>>{FLATTEN_USE_LOCK_PATH}; flock -w {_DOCKER_READ_TIMEOUT_SECONDS} 8 || exit 96; "
         # unknown lease count (unreadable dir) is treated as full: never more waiting copies than the cap
         f"mkdir -p {FLATTEN_LEASE_DIR}; "
@@ -186,26 +191,43 @@ def _flatten_command(
 _FLATTEN_WAITED_EXIT = 3
 
 
-def flatten_wait_command() -> str:
-    lock = FLATTEN_LOCK_PATH
+def flatten_sized_mark_command() -> str:
+    """Prints the mtime of FLATTEN_SIZED_PATH (empty when absent); `_flatten_command` refuses once it changed."""
+    return f"stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null; true"
+
+
+def flatten_wait_command(probe_age_seconds: int) -> str:
+    lock, sized = FLATTEN_LOCK_PATH, FLATTEN_SIZED_PATH
+    # the mark is under the lock: a flatten from here on refuses; one that ended within the caller's
+    # probe age wrote its copy after that probe measured
     return (
-        f"command -v flock >/dev/null || exit 0; flock -n {lock} true && exit 0; "
-        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} {lock} true && exit {_FLATTEN_WAITED_EXIT}; exit 1"
+        f"command -v flock >/dev/null || exit 0; flock -n {lock} touch {sized} && "
+        f"{{ [ $(( $(date +%s) - $(stat -c %Y {lock} 2>/dev/null || echo 0) )) -gt {int(probe_age_seconds)} ] "
+        f"&& exit 0; exit {_FLATTEN_WAITED_EXIT}; }}; "
+        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} {lock} touch {sized} && exit {_FLATTEN_WAITED_EXIT}; exit 1"
     )
 
 
-async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> bool:
+async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection, probe_age_seconds: int) -> bool:
     """Wait until no flatten holds the node lock, so a sizing measures the disk with its copy on it (a pod
-    deleted mid-flatten no longer keeps that disk free). True when one was running. A node without flock
-    runs no flatten. Raises when the wait fails or times out."""
-    result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
+    deleted mid-flatten no longer keeps that disk free), and mark the node as sized so a flatten that has
+    not started copying refuses. True when a flatten ran or ended within the last `probe_age_seconds`
+    (an earlier disk probe is stale). A node without flock runs no flatten. Raises when the wait fails."""
+    result = await ssh_client.run(
+        flatten_wait_command(probe_age_seconds), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420
+    )
     if result.exit_status not in (0, _FLATTEN_WAITED_EXIT):
         raise RuntimeError(f"waiting for an image copy on this node failed (exit {result.exit_status})")
     return result.exit_status == _FLATTEN_WAITED_EXIT
 
 
 async def flatten_image_on_host(
-    ssh_client: asyncssh.SSHClientConnection, image: str, *, lease: str, reserved_bytes: int = 0
+    ssh_client: asyncssh.SSHClientConnection,
+    image: str,
+    *,
+    lease: str,
+    reserved_bytes: int = 0,
+    sized_mark: str = "",
 ) -> str:
     """The local tag of a one-layer copy of `image`, built on the node unless one exists already.
 
@@ -214,7 +236,8 @@ async def flatten_image_on_host(
 
     Keyed by the image ID, so a retry or a later rental of the same image reuses the copy. Raises
     ImageFlattenNoDisk when the Docker disk cannot hold the copy and still keep `reserved_bytes`
-    (granted to the pod, not yet written) free, any other error when it failed or the node does not
+    (granted to the pod, not yet written) free, or a create sized its disk since `sized_mark` was read
+    (flatten_sized_mark_command, before the caller checked for other creates); any other error when it failed or the node does not
     use the classic overlay2 store.
     """
     driver = await ssh_client.run(
@@ -245,6 +268,7 @@ async def flatten_image_on_host(
         sorted(config.get("Volumes") or ()),
         int(info.get("Size") or 0) + FLATTEN_DISK_MARGIN_BYTES + reserved_bytes,
         lease,
+        sized_mark,
     )
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
