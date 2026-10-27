@@ -42,8 +42,8 @@ _REDIS_TTL_SECONDS = 7 * 24 * 3600
 # container, their container cgroup's io.stat around the disk container) at or above these is renter load on what the
 # probe measured. Only the pods' own counters count, so traffic the host makes anywhere else cannot excuse a slow node.
 # The host can still attach its own process to a pod's cgroup or network namespace, so the processes there are checked
-# (pods_provenance): only the container's own = no verdict (owner decision: a renter keeping the disk or link busy is
-# never SLOW); a foreign one = the failure stands; not readable = inconclusive.
+# per pod: only the container's own = its IO is renter load, no verdict (owner decision: a renter keeping the disk or
+# link busy is never SLOW); a foreign one = its IO does not count; not readable = inconclusive.
 DURING_NET_MBPS = 5.0
 DURING_DISK_MB_PER_S = 2.0
 DURING_DISK_IOPS = 20.0
@@ -85,11 +85,11 @@ _SNAPSHOT = (
     "q=$(awk '/^PPid:/{print $2}' /proc/$q/status 2>/dev/null); [ -n \"$q\" ] || return 2; "
     '[ "$q" -gt 0 ] || return 1; done; return 0; }; '
     "prov() { r=1; while read i; do own $i; case $? in 1) r=0; break;; 2) r=;; esac; done; echo $r; }; "
-    # Per rented pod ($pp: pid/container id, set by throughput_command): rx:tx of its own network namespace (not
+    # Per rented pod, keyed by its position in $pp (pid/container id, set by throughput_command): rx:tx of its own network namespace (not
     # the host's), bytes:requests of its container cgroup (systemd or cgroupfs driver), then the provenance of the
     # processes in that cgroup (its subtree) and in that network namespace; a field left empty is not readable.
     # Nothing when /proc/1 is not the host's, where a docker pid means nothing here.
-    "pods() { [ /proc/1/root/ -ef / ] && return; for x in $pp; do p=${x%%/*}; c=${x#*/}; "
+    "pods() { [ /proc/1/root/ -ef / ] && return; k=0; for x in $pp; do k=$((k+1)); p=${x%%/*}; c=${x#*/}; "
     "n=$([ /proc/$p/ns/net -ef /proc/1/ns/net ] || sed 's/:/ /' /proc/$p/net/dev 2>/dev/null | "
     'awk \'NR>2 && $1!="lo"{r+=$2; t+=$10; k++} END{if (k) printf "%.0f:%.0f", r, t}\'); d=; g=; '
     "for f in /proc/1/root/sys/fs/cgroup/system.slice/docker-$c.scope/io.stat /proc/1/root/sys/fs/cgroup/docker/$c/io.stat; "
@@ -99,7 +99,7 @@ _SNAPSHOT = (
     'cg=; [ -r "$g/cgroup.procs" ] && cg=$(find "$g" -name cgroup.procs -exec cat {} + 2>/dev/null | prov); '
     "nt=; [ -e /proc/$p/ns/net ] && ! [ /proc/$p/ns/net -ef /proc/1/ns/net ] && nt=$(for q in /proc/[0-9]*; do "
     "[ $q/ns/net -ef /proc/$p/ns/net ] && echo ${q#/proc/}; done 2>/dev/null | prov); "
-    'printf "%s:%s:%s:%s:%s," "$p" "${n:-:}" "${d:-:}" "$cg" "$nt"; done; }; '
+    'printf "%s/%s:%s:%s:%s:%s," "$k" "$p" "${n:-:}" "${d:-:}" "$cg" "$nt"; done; }; '
     f'snap() {{ echo "{SNAP_MARKER} t=$(cut -d" " -f1 /proc/uptime) '
     '$([ /proc/1/root/ -ef / ] || sed \'s/:/ /\' /proc/1/net/dev 2>/dev/null | awk -v sl="$sl" -v ph="$ph" '
     '\'function keep(x) {return x!="lo" && x!~/[.@]/ && '
@@ -129,7 +129,7 @@ def throughput_command(sysbox: bool, containers: list[str]) -> str:
     # one container per side, counters after each: what the renter's pods moved while that side was measured
     names = " ".join(shlex.quote(c) for c in containers)
     return (
-        f"pp=$(for c in {names}; do /usr/bin/docker inspect -f '{{{{.State.Pid}}}}/{{{{.Id}}}}' \"$c\" 2>/dev/null; done); "
+        f"pp=$(for c in {names}; do /usr/bin/docker inspect -f '{{{{.State.Pid}}}}/{{{{.Id}}}}' \"$c\" 2>/dev/null || echo 0/-; done); "
         + _SNAPSHOT
         + download_speed_command(sysbox, _DISK_SCRIPT)
         + "; snap; "
@@ -226,7 +226,15 @@ def _moved(a: _Snap, b: _Snap, devices: set[str]) -> tuple[float | None, float |
     return max(net1[0] - net0[0], net1[1] - net0[1], 0) * 8 / dt / 1e6, disk
 
 
-def _pods_moved(a: _Snap, b: _Snap, side: int) -> tuple[float, float] | None:
+def _own(a: _Snap, b: _Snap, pid: str, side: int) -> bool | None:
+    """Provenance of one pod's processes for that side (cgroup for disk, netns for network) in both snapshots."""
+    marks = [snap[3].get(pid, (None,) * 4)[3 - side] for snap in (a, b)]
+    return False if False in marks else (True if marks == [True, True] else None)
+
+
+def _pods_moved(
+    a: _Snap, b: _Snap, side: int, only: tuple[bool | None, ...] = (True, False, None)
+) -> tuple[float, float] | None:
     """What the rented pods themselves moved between two snapshots, summed per second: (received, sent)
     for side 0 (their network namespaces' bytes), (bytes, requests) per second for side 1 (their cgroups' disk
     IO). Only pods readable in both snapshots count: one that restarted (a new pid, or a counter reset) or whose
@@ -235,7 +243,7 @@ def _pods_moved(a: _Snap, b: _Snap, side: int) -> tuple[float, float] | None:
     both = [
         (c[side], pods1[pid][side])
         for pid, c in pods0.items()
-        if pid in pods1 and _both(c[side], pods1[pid][side])
+        if pid in pods1 and _both(c[side], pods1[pid][side]) and _own(a, b, pid, side) in only
     ]
     if not both:
         return None
@@ -247,16 +255,16 @@ def _pods_moved(a: _Snap, b: _Snap, side: int) -> tuple[float, float] | None:
 
 
 def pods_incomplete(stdout: str, pods: int) -> tuple[bool, bool]:
-    """(network, disk): fewer than `pods` rented pods were readable both when that side's measurement began and when
-    it ended (a pod stopped or restarted mid-probe, a counter was reset, never readable, or a snapshot is missing), so
-    what the renter
-    moved while that side was measured is not fully known."""
+    """(network, disk): one of the first `pods` rented pods (the running ones, listed first) was not readable both when
+    that side's measurement began and when it ended (stopped or restarted mid-probe, a counter reset, never readable,
+    or a snapshot missing), so what the renter moved while that side was measured is not fully known."""
     snaps, _ = _parse_snaps(stdout)
     if len(snaps) < 4:
         return pods > 0, pods > 0
 
     def incomplete(a: _Snap, b: _Snap, side: int) -> bool:
-        both = [pid for pid, c in a[3].items() if _both(c[side], b[3].get(pid, (None, None))[side])]
+        first = list(a[3].items())[:pods]
+        both = [pid for pid, c in first if _both(c[side], b[3].get(pid, (None, None))[side])]
         return len(both) < pods
 
     return incomplete(snaps[2], snaps[3], 0), incomplete(snaps[1], snaps[2], 1)
@@ -288,15 +296,17 @@ def parse_busy(stdout: str) -> tuple[float | None, float | None]:
     return _moved(snaps[0], snaps[1], devices)
 
 
-def parse_during(stdout: str) -> tuple[float | None, tuple[float | None, float | None]]:
+def parse_during(
+    stdout: str, only: tuple[bool | None, ...] = (True, False, None)
+) -> tuple[float | None, tuple[float | None, float | None]]:
     """The rented pods' own traffic while each side was measured: (network Mbps, the busier direction, during the
     fetch container; (disk MB/s, disk IO/s) during the disk container). The probe and anything else on the host is
-    outside those counters. None = not measured."""
+    outside those counters. `only`: the pods whose provenance for that side is one of these. None = not measured."""
     snaps, _ = _parse_snaps(stdout)
     if len(snaps) < 4:
         return None, (None, None)
-    net = _pods_moved(snaps[2], snaps[3], 0)
-    disk = _pods_moved(snaps[1], snaps[2], 1)
+    net = _pods_moved(snaps[2], snaps[3], 0, only)
+    disk = _pods_moved(snaps[1], snaps[2], 1, only)
     return (
         None if net is None else max(net) * 8 / 1e6,
         (None, None) if disk is None else (disk[0] / 1e6, disk[1]),
@@ -308,18 +318,15 @@ def phase_offset_seconds(uuid: str) -> float:
     return fraction * settings.RENTED_THROUGHPUT_INTERVAL_HOURS * 3600
 
 
-def _excuse(side: str, renter_io: bool, provenance: str | None, unsure: bool) -> str:
-    """A failing side with the rented pods' own IO at DURING_* while it was measured: renter load, no verdict (owner
-    decision: a renter keeping the disk or link busy is never SLOW), when only the containers' own processes were in
-    their cgroups/netns; still a failure when a foreign (host) process was attached there; else inconclusive, like a
-    failing side the host's state leaves unsure."""
+def _excuse(side: str, renter_io: bool, maybe_renter_io: bool, unsure: bool) -> str:
+    """A failing side: no verdict when pods holding only their own processes carried renter load while it was
+    measured (owner decision: a renter keeping the disk or link busy is never SLOW); inconclusive when pods of unknown
+    provenance could have, or when the measurement is unsure; else it fails. Pods with a foreign process never excuse."""
     if side != "fail":
         return side
-    if renter_io and provenance == "own":
+    if renter_io:
         return "none"
-    if renter_io and provenance == "foreign":
-        return "fail"
-    return "inconclusive" if renter_io or unsure else "fail"
+    return "inconclusive" if maybe_renter_io or unsure else "fail"
 
 
 def _step(failures: int, side: str) -> int:
@@ -374,9 +381,9 @@ class RentedThroughputCheck:
     container that never reports and a disk write that fails or reports nothing are inconclusive too. Only an HTTP
     error or an endpoint the validator cannot reach either stays no verdict (not the node's doing). When the
     rented pods themselves moved DURING_* on that resource while the probe measured it (their own network namespace
-    and container cgroup counters, not the host's), a failing side is no verdict if only the containers'
-    own processes were in those cgroups and namespaces; it still fails if a foreign (host) process was attached there,
-    and is inconclusive if that cannot be read. Incomplete pod counters (a pod stopped, restarted or unreadable) make a
+    and container cgroup counters, not the host's), a failing side is no verdict, counting only pods whose cgroup or
+    namespace held just the container's own processes; a pod with a foreign (host) process adds nothing, and one that
+    cannot be read makes it inconclusive; an unsure measurement stays inconclusive. Incomplete pod counters (a pod stopped, restarted or unreadable) make a
     failing side inconclusive too. Inconclusive = no strike and no pass however many in a row (owner decision: IO that
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
     READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
@@ -463,12 +470,15 @@ class RentedThroughputCheck:
         all_pods = rented_executor.pods if rented_executor else []
         # every rented pod's IO is the renter's, whatever its backend status (a running one may be reported as in
         # transition); completeness counts the running ones, whose counters must be readable
-        # shortcut: counts readable pods, not which ones; map pid to pod if a stale pod ever masks a running one
         pods = [p for p in all_pods if p.status in (None, POD_STATUS_RUNNING)]
         result = await ctx.runner.run(
             throughput_command(
                 bool(ctx.state.sysbox_runtime),
-                [pod.docker_container_name for pod in all_pods],
+                # running pods first: pods_incomplete checks them by position
+                [
+                    pod.docker_container_name
+                    for pod in pods + [p for p in all_pods if p not in pods]
+                ],
             ),
             timeout=COMMAND_TIMEOUT_SECONDS,
             retryable=False,
@@ -478,6 +488,8 @@ class RentedThroughputCheck:
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)
+        own = parse_during(stdout, (True,))
+        maybe = parse_during(stdout, (True, None))
         net_incomplete, disk_incomplete = pods_incomplete(stdout, len(pods))
         net_provenance, disk_provenance = pods_provenance(stdout)
         # A busy host before the probe, no host counters, docker root devices unresolved or a bridge fallback make a
@@ -501,12 +513,15 @@ class RentedThroughputCheck:
             net = "none"
         else:
             net = "none" if net_unsure else "pass"
-        net = _excuse(
-            net,
-            during_net is not None and during_net >= DURING_NET_MBPS,
-            net_provenance,
-            net_unsure or net_incomplete,
-        )
+
+        def net_load(during: tuple[Any, Any]) -> bool:
+            return during[0] is not None and during[0] >= DURING_NET_MBPS
+
+        def disk_load(during: tuple[Any, Any]) -> bool:
+            mb, iops = during[1]
+            return (mb or 0) >= DURING_DISK_MB_PER_S or (iops or 0) >= DURING_DISK_IOPS
+
+        net = _excuse(net, net_load(own), net_load(maybe), net_unsure or net_incomplete)
         disk_unsure = disk_is_busy or disk_busy is None
         if disk.mb_per_s is None:
             # the disk write failed or reported nothing (the renter can saturate the disk past the timeout): no strike
@@ -516,10 +531,7 @@ class RentedThroughputCheck:
         else:
             disk_side = "none" if disk_unsure else "pass"
         disk_side = _excuse(
-            disk_side,
-            (during_disk or 0) >= DURING_DISK_MB_PER_S or (during_iops or 0) >= DURING_DISK_IOPS,
-            disk_provenance,
-            disk_unsure or disk_incomplete,
+            disk_side, disk_load(own), disk_load(maybe), disk_unsure or disk_incomplete
         )
         reading = {
             "endpoints": [asdict(r) for r in endpoints],

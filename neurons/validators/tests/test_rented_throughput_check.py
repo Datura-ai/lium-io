@@ -494,6 +494,70 @@ async def test_a_host_helper_in_the_pods_cgroup_or_netns_is_a_failure(answer, si
         assert (await check.run(ctx)).passed is False
 
 
+def with_pod(answer: str, entry: str) -> str:
+    """Another rented pod listed before 4242, the same entry in every snapshot."""
+    return answer.replace(" pod=", f" pod={entry}")
+
+
+# Unsure measurement prerequisites keep a slow side inconclusive even when a pod holds a foreign process.
+@pytest.mark.parametrize(
+    "answer, side",
+    [
+        (snaps(counters=False, during_rx=40_000_000, prov="1:0") + disk() + SLOW, "net"),
+        (
+            (snaps(during_rx=40_000_000, prov="1:0") + disk() + SLOW).replace(
+                "lium_dl_net name=lium-rentals", "lium_dl_net name=bridge"
+            ),
+            "net",
+        ),
+        (
+            snaps(during_ios=500, prov="0:1").replace(
+                "lium_tp_device name=nvme0n1p2\nlium_tp_device name=nvme0n1\n", ""
+            )
+            + disk(secs=30.0)
+            + FAST,
+            "disk",
+        ),
+    ],
+    ids=["no_host_counters", "bridge_fallback", "docker_root_unresolved"],
+)
+async def test_unsure_measurement_wins_over_a_foreign_process(answer, side):
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert {"net": net, "disk": disk_side}[side] == "inconclusive"
+
+
+# Each pod is judged on its own: a foreign process in an idle pod does not void another pod's renter load.
+@pytest.mark.parametrize(
+    "answer, side",
+    [
+        (snaps(during_ios=200, prov="1:1") + disk(secs=30.0) + FAST, "disk"),
+        (snaps(during_rx=7_000_000, prov="1:1") + disk() + SLOW, "net"),
+    ],
+    ids=["disk", "network"],
+)
+async def test_a_foreign_process_in_another_pod_does_not_void_renter_load(answer, side):
+    answer = with_pod(answer, "5151:1:1:1:1:0:0,")
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert {"net": net, "disk": disk_side}[side] == "none"
+
+
+# A transitional pod's readable counters never stand in for a running pod whose container could not be read.
+async def test_a_transitional_pod_does_not_mask_a_running_pods_missing_counters():
+    answer = with_pod(snaps() + disk(secs=30.0) + SLOW, "1/0::::::,")
+    assert pods_incomplete(answer, 1) == (True, True)
+    data = rented()
+    data.executors[EXECUTOR.uuid].pods.insert(
+        0, RentedPod(pod_id="p0", container_name="pod_p0", status="REBOOT_PENDING")
+    )
+    with flags():
+        ctx, runner = make_ctx(answer, rented_data=data)
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert (net, disk_side) == ("inconclusive", "inconclusive")
+    assert "for c in pod_p1 pod_p0;" in runner.commands[0] and "|| echo 0/-" in runner.commands[0]
+
+
 def stopped_pod(answer_tail: str) -> str:
     """The rented pod (4242) readable when each side began, unreadable at its end (stopped or restarted mid-probe)."""
     lines = snaps().splitlines()
@@ -618,7 +682,7 @@ def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
     ).stdout
     # the second pod's cgroup is gone: its disk counters and provenance are empty (unreadable), never zero; no netns
     # here, so no network provenance either
-    assert out.splitlines()[-1] == "4242:1000:60:300:7:1:,4343:1000:60::::,", out
+    assert out.splitlines()[-1] == "1/4242:1000:60:300:7:1:,2/4343:1000:60::::,", out
 
 
 # own(): a process is the container's when it descends from the init; a host process attached to the cgroup is not,
