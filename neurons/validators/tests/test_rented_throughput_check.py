@@ -248,7 +248,7 @@ async def test_only_the_docker_root_disk_excuses_the_disk(resolved, seconds, rel
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "pass"
     # an unresolved docker root is never judged on another disk's traffic, and neither it nor a busy docker-root disk
-    # is an outright excuse: a slow write is inconclusive (capped by INCONCLUSIVE_BEFORE_STRIKE)
+    # is an outright excuse: a slow write is inconclusive (never a strike)
     slow = seconds == 30
     if not resolved or relevant:
         assert disk_side == ("inconclusive" if slow else "none")
@@ -374,8 +374,18 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     assert (net, disk_side) == ("inconclusive", "inconclusive")
 
 
-# Pod IO whose provenance cannot be read (who was in the pod's cgroup or netns) may be a host helper issuing tiny IO:
-# one such excused slow probe is no strike, but INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
+async def never_strikes(answer: str, readings: int = 5) -> None:
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * readings)
+        check = RentedThroughputCheck()
+        for _ in range(readings):
+            assert (await check.run(ctx)).passed
+            assert stored(ctx)["failures_in_a_row"] == 0
+            clock.now += 31 * 60
+
+
+# Owner decision: IO that cannot be attributed never fails a node. Pod IO whose provenance cannot be read (who was in
+# the pod's cgroup or netns) is inconclusive: no strike, however many probes in a row.
 @pytest.mark.parametrize(
     "answer",
     [
@@ -388,25 +398,14 @@ async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
     ],
     ids=["cgroup_io", "netns_io", "cgroup_provenance_unreadable", "netns_provenance_unreadable"],
 )
-async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
-    n = module.INCONCLUSIVE_BEFORE_STRIKE
-    with flags() as clock:
-        ctx, _ = make_ctx(*[answer] * (n + 1))
-        check = RentedThroughputCheck()
-        assert (await check.run(ctx)).passed
-        assert stored(ctx)["failures_in_a_row"] == 0  # one excused probe: no strike
-        for _ in range(n - 1):
-            clock.now += 31 * 60
-            assert (await check.run(ctx)).passed
-        assert stored(ctx)["failures_in_a_row"] == 1  # the n-th excused probe in a row: a strike
-        clock.now += 31 * 60
-        assert (await check.run(ctx)).passed is False
+async def test_unattributed_pod_io_never_strikes(answer):
+    await never_strikes(answer)
 
 
-# Host state the provider controls (load on the host NICs or the docker-root disk in the 2 s before the probe, host NIC
-# counters it hides, a docker root it hides the devices of, lium-rentals not inspectable so the probe falls back to the
-# default bridge, a fetch container that never reports, a disk write that fails or reports nothing) cannot excuse a slow
-# side forever: one such reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
+# Load on the host NICs or the docker-root disk in the 2 s before the probe (whoever made it), host NIC counters not
+# readable, docker root devices unresolved, lium-rentals not inspectable so the probe falls back to the default bridge,
+# a fetch container that never reports, a disk write that fails or reports nothing, no output at all (an SSH timeout):
+# nothing attributable to the host was measured, so inconclusive and never a strike, however many in a row.
 @pytest.mark.parametrize(
     "answer",
     [
@@ -422,6 +421,9 @@ async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
         snaps() + disk() + RENTALS,  # the fetch container did not start: no endpoint line
         snaps() + disk(rc=1) + FAST,  # the disk write failed
         snaps() + FAST,  # the disk container reported nothing
+        "",  # the whole command timed out: no helper output
+        # the renter saturates the disk until the write times out unreported, with its own pod IO over DURING_DISK_*
+        snaps(during_ios=500, prov="1:1") + FAST,
     ],
     ids=[
         "busy_nics",
@@ -432,21 +434,12 @@ async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
         "fetch_container_not_started",
         "disk_write_failed",
         "disk_no_output",
+        "no_output",
+        "renter_saturates_disk_past_timeout",
     ],
 )
-async def test_provider_made_host_load_cannot_excuse_a_slow_node_forever(answer):
-    n = module.INCONCLUSIVE_BEFORE_STRIKE
-    with flags() as clock:
-        ctx, _ = make_ctx(*[answer] * (n + 1))
-        check = RentedThroughputCheck()
-        assert (await check.run(ctx)).passed
-        assert stored(ctx)["failures_in_a_row"] == 0
-        for _ in range(n - 1):
-            clock.now += 31 * 60
-            assert (await check.run(ctx)).passed
-        assert stored(ctx)["failures_in_a_row"] == 1
-        clock.now += 31 * 60
-        assert (await check.run(ctx)).passed is False
+async def test_unmeasured_or_unattributable_never_strikes(answer):
+    await never_strikes(answer)
 
 
 # What the validator cannot tell apart from the endpoint's own fault stays no verdict, uncapped: an HTTP error, or an
@@ -553,45 +546,48 @@ async def test_one_inconclusive_reading_is_no_strike_and_is_reprobed_soon():
         result = await RentedThroughputCheck().run(ctx)
         assert result.passed
         state = stored(ctx)
-        assert state["failures_in_a_row"] == 0 and state["net_inconclusive"] == 1
-        assert state["disk_inconclusive"] == 1 and state["measured"] is False
+        assert state["failures_in_a_row"] == 0 and state["measured"] is False
         clock.now += 31 * 60  # re-probed after RETRY_SECONDS, not the 3 h interval
         await RentedThroughputCheck().run(ctx)
         assert stored(ctx)["at"] == clock.now
 
 
-# A provider restarting the pod on every probe: the INCONCLUSIVE_BEFORE_STRIKE-th inconclusive reading in a row is a
-# strike, the next one a second strike, and the node is slow.
-async def test_consecutive_inconclusive_readings_strike():
-    n = module.INCONCLUSIVE_BEFORE_STRIKE
+# Inconclusive readings neither strike nor clear: a slow node's streak stays, and the next failing reading zeroes it.
+async def test_inconclusive_readings_keep_the_streak():
     with flags() as clock:
-        ctx, _ = make_ctx(*[STOPPED] * (n + 1))
+        ctx, _ = make_ctx(SLOW_NET, *[STOPPED] * 4, SLOW_NET)
         check = RentedThroughputCheck()
-        for i in range(1, n):
+        for _ in range(5):
             assert (await check.run(ctx)).passed
-            assert stored(ctx)["failures_in_a_row"] == 0 and stored(ctx)["net_inconclusive"] == i
+            assert stored(ctx)["failures_in_a_row"] == 1
             clock.now += 31 * 60
-        assert (await check.run(ctx)).passed
-        assert stored(ctx)["failures_in_a_row"] == 1
-        clock.now += 31 * 60
         assert (await check.run(ctx)).passed is False
 
 
-async def test_a_clean_reading_resets_the_inconclusive_run():
-    n = module.INCONCLUSIVE_BEFORE_STRIKE
-    answers = [STOPPED] * (n - 1) + [GOOD] + [STOPPED] * (n - 1)
-    with flags() as clock:
-        ctx, _ = make_ctx(*answers)
-        check = RentedThroughputCheck()
-        for _ in range(n - 1):
-            await check.run(ctx)
-            clock.now += 31 * 60
-        await check.run(ctx)
-        assert stored(ctx)["net_inconclusive"] == 0 and stored(ctx)["disk_inconclusive"] == 0
-        for _ in range(n - 1):
-            clock.now += 3 * 3600 + 60
-            assert (await check.run(ctx)).passed
-        assert stored(ctx)["failures_in_a_row"] == 0
+# The container restarts mid-probe: its cgroup is recreated with lower counters under the same pid key. A reset counter
+# is unknown IO, not zero: the slow side is inconclusive, not a failure.
+async def test_a_reset_pod_counter_is_incomplete_not_idle():
+    lines = snaps().splitlines()
+    lines[4] = re.sub(r" pod=4242:(\d+):(\d+):\d*:\d*,", r" pod=4242:\1:\2:0:0,", lines[4])
+    lines[3] = lines[3].replace(" pod=4242:1000:1000:0:0,", " pod=4242:1000:1000:5000:50,")
+    answer = "\n".join(lines) + "\n" + disk(secs=30.0) + FAST
+    assert pods_incomplete(answer, 1) == (False, True)
+    with flags():
+        _, _, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert disk_side == "inconclusive"
+
+
+# Every rented pod's container is read, whatever its backend status: a running rental reported in transition still
+# has its IO attributed to the renter.
+async def test_every_rented_pod_is_attributed():
+    data = rented()
+    data.executors[EXECUTOR.uuid].pods.append(
+        RentedPod(pod_id="p2", container_name="pod_p2", status="RESTARTING")
+    )
+    with flags():
+        ctx, runner = make_ctx(GOOD, rented_data=data)
+        await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert "for c in pod_p1 pod_p2;" in runner.commands[0]
 
 
 def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
@@ -632,12 +628,12 @@ def test_provenance_tells_the_containers_processes_from_a_host_helper(tmp_path):
     cmd = (
         f"{script} p=$$; sleep 30 & child=$!; "
         'echo "$child" | prov; printf "%s\n%s\n" "$child" 1 | prov; echo 999999999 | prov; '
-        "own 1; echo $?; kill $child"
+        "own 1; echo $?; (p=999999999; own $child; echo $?); kill $child"
     )
     out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=30).stdout
     # the child is the container's; pid 1 (a host process) is foreign; a PID gone mid-read is unreadable (empty),
-    # never the container's own
-    assert out.splitlines()[-4:] == ["1", "0", "", "1"], out
+    # never the container's own; the init itself gone (the container restarted) is unreadable too, never foreign
+    assert out.splitlines()[-5:] == ["1", "0", "", "1", "2"], out
 
 
 async def test_idle_foreign_or_stopped_rentals_are_left_alone():
