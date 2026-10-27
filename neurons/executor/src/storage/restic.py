@@ -136,6 +136,10 @@ class JsonEventWriter:
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
 
+    def log(self, message: str) -> None:
+        """operation log only; never becomes the stored error"""
+        self._write({"event": "log", "operation_id": self._operation_id, "message": message})
+
     def rerun(self) -> None:
         """the next restic run starts over: its own failure, not this one's, describes the operation"""
         self._write({"event": "rerun", "operation_id": self._operation_id})
@@ -695,12 +699,10 @@ class ResticStorageRunner:
         if state.get("OOMKilled") is True:
             return f"{action} ran out of memory"
         fields = ("Status", "OOMKilled", "Dead", "ExitCode", "Error", "StartedAt", "FinishedAt")
-        # stderr goes to the operation log only; a diagnostic event would become the stored error
-        print(
+        # a log event, not stderr: detached runs delete their stderr log on exit
+        self._events.log(
             f"{action} helper exited 137; docker state "
-            + json.dumps({field: state.get(field) for field in fields}),
-            file=sys.stderr,
-            flush=True,
+            + json.dumps({field: state.get(field) for field in fields})
         )
         if state.get("OOMKilled") is False:
             return f"{action} helper was killed (Docker recorded no out-of-memory kill)"

@@ -759,7 +759,6 @@ class _KilledPopen(_FakePopen):
 )
 def test_killed_helper_reports_oom_only_when_docker_says_so(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
     oom_killed: bool | str | None,
     message: str,
     action: str,
@@ -799,7 +798,8 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
     assert str(raised.value) == f"{action}{message}"
     assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
     assert calls[-1][1:3] == ["rm", "--force"]
-    log = capsys.readouterr().err
+    # detached runs delete stderr, so the state line must reach the reported operation logs
+    log = "\n".join(session.puts[-1]["json"]["logs"] or [])
     assert ("docker state" in log) is (oom_killed is not True)
     if oom_killed is False:
         assert '"ExitCode": 137' in log
