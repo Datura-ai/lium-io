@@ -687,6 +687,7 @@ async def test_rental_verification_filler_ssh_transport_error_fails_without_rech
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
+    assert result.event.severity == "error"
     assert backend_client.filler_run_active_calls == []
 
 
@@ -1118,7 +1119,6 @@ async def test_rental_verification_filler_create_kill_enforcement_fails():
     assert backend_client.called_with is None
 
 
-@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_rental_verification_filler_create_kill_ignored_for_a_customer_rental():
     """A paying customer's pod is never punished for the node's default-job history."""

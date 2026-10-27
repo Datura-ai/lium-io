@@ -2164,9 +2164,9 @@ class RentalVerificationMessages:
     FILLER_TRANSPORT_UNREACHABLE = MessageTemplate(
         event="SSH transport lost while verifying Lium default job",
         reason="FILLER_TRANSPORT_UNREACHABLE",
-        severity="warning",
+        severity="error",
         category="runtime",
-        impact="Filler state unknown for this cycle",
+        impact="Unrented incentive withheld: SSH was lost while checking the Lium default job",
         remediation="Ensure the executor is reachable over SSH and stays online",
     )
 
