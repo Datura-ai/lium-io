@@ -1748,3 +1748,49 @@ def test_backup_renews_at_most_three_times(monkeypatch: pytest.MonkeyPatch, tmp_
     with pytest.raises(ResticOperationError, match="credentials expired"):
         runner.run()
     assert (len(environments), len(session.posts)) == (4, 3)
+
+
+TIMEOUT_EXIT = (
+    '{"message_type":"exit_error","code":1,"message":"Fatal: unable to save snapshot: client.PutObject: '
+    'Put \\"https://bucket.s3.amazonaws.com/restic/v1/pods/p/data/54/54ce\\": request timeout"}\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("first_runs", "runs", "completed"),
+    [
+        pytest.param([TIMEOUT_EXIT], 2, True, id="one timeout reruns and completes"),
+        pytest.param([TIMEOUT_EXIT, TIMEOUT_EXIT], 2, False, id="a second timeout fails"),
+        pytest.param(
+            ['{"message_type":"exit_error","code":1,"message":"Fatal: repository is already locked"}\n'],
+            1,
+            False,
+            id="no rerun for a non-network failure",
+        ),
+    ],
+)
+def test_backup_reruns_once_after_an_s3_upload_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_runs: list[str], runs: int, completed: bool
+) -> None:
+    runner, _ = _renewing_runner(monkeypatch, tmp_path, _RenewalSession(), expired_runs=0)
+    calls: list[list[str]] = []
+
+    class _Popen(_FakePopen):
+        def __init__(self, command: list[str], *args: object, **kwargs: object) -> None:
+            super().__init__(command, *args, **kwargs)
+            calls.append(command)
+            self._failed = len(calls) <= len(first_runs)
+            if self._failed:
+                self.stdout = iter([first_runs[len(calls) - 1]])
+
+        def wait(self) -> int:
+            return 1 if self._failed else 0
+
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _Popen)
+
+    if completed:
+        assert (runner.run().status, len(calls)) == ("COMPLETED", runs)
+    else:
+        with pytest.raises(ResticOperationError, match="restic backup failed with exit 1"):
+            runner.run()
+        assert len(calls) == runs
