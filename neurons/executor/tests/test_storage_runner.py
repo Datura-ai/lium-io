@@ -36,6 +36,7 @@ from storage.restic import (
     BACKUP_SOURCE_SCRIPT,
     JsonEventWriter,
     ResticOperationError,
+    ResticResult,
     ResticStorageRunner,
     RestoreStats,
     StorageOperationCancelled,
@@ -750,13 +751,18 @@ class _KilledPopen(_FakePopen):
 @pytest.mark.parametrize(
     ("oom_killed", "message"),
     [
-        (True, " ran out of memory$"),
-        (False, r" helper was stopped by the host \(not out of memory\)$"),
-        (None, r" helper was stopped by the host \(not out of memory\)$"),  # state unreadable
+        (True, " ran out of memory"),
+        (False, " helper was killed (Docker recorded no out-of-memory kill)"),
+        (None, " helper was killed (often out of memory)"),  # docker inspect failed
+        ("", " helper was killed (often out of memory)"),  # docker inspect printed nothing
     ],
 )
 def test_killed_helper_reports_oom_only_when_docker_says_so(
-    monkeypatch: pytest.MonkeyPatch, oom_killed: bool | None, message: str, action: str
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    oom_killed: bool | str | None,
+    message: str,
+    action: str,
 ) -> None:
     calls: list[list[str]] = []
     state = {"Status": "exited", "OOMKilled": oom_killed, "ExitCode": 137}
@@ -764,8 +770,9 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
         if "inspect" in command:
-            stdout = json.dumps(state) if oom_killed is not None else ""
-            return SimpleNamespace(returncode=0 if oom_killed is not None else 1, stdout=stdout, stderr="")
+            if oom_killed is None:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(state) if oom_killed != "" else "", stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"id": SNAPSHOT_ID}]), stderr="")
 
     monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)  # restore's empty-target check
@@ -773,16 +780,29 @@ def test_killed_helper_reports_oom_only_when_docker_says_so(
     monkeypatch.setattr("storage.restic.subprocess.Popen", _KilledPopen)
     operation = StorageOperationSpec.from_mapping(_operation_payload(action=action))
     workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
-    output = io.StringIO()
-    events = JsonEventWriter(str(OPERATION_ID), 0, output=output)
+    session = _RenewalSession()  # no cancellation requested
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction(action),
+        ReporterSpec(api_url="https://api.example", auth_token="token", resource=ReporterResource.BACKUP),
+        session=session,
+    )
+    events = JsonEventWriter(str(OPERATION_ID), 0, output=io.StringIO(), reporter=reporter)
     runner = ResticStorageRunner(operation, workspace, event_writer=events)
 
-    with pytest.raises(ResticOperationError, match=f"^{action}{message}"):
+    with pytest.raises(ResticOperationError) as raised:
         runner.run()
+    # what storage_runner.main does with the raised failure
+    events.diagnostic(str(raised.value))
+    events.result(ResticResult("FAILED", None, None, 1))
+
+    assert str(raised.value) == f"{action}{message}"
+    assert session.puts[-1]["json"]["error_message"] == f"{action}{message}"
     assert calls[-1][1:3] == ["rm", "--force"]
-    assert ("docker state" in output.getvalue()) is (oom_killed is not True)
+    log = capsys.readouterr().err
+    assert ("docker state" in log) is (oom_killed is not True)
     if oom_killed is False:
-        assert '\\"ExitCode\\": 137' in output.getvalue()
+        assert '"ExitCode": 137' in log
 
 
 class _TerminatedRunnerPopen(_FakePopen):
@@ -1685,8 +1705,10 @@ class _RenewalSession:
     def __init__(self, status_code: int = 200) -> None:
         self.status_code = status_code
         self.posts: list[dict[str, object]] = []
+        self.puts: list[dict[str, object]] = []
 
     def put(self, url: str, **kwargs: object) -> SimpleNamespace:
+        self.puts.append(kwargs)
         return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {})
 
     def post(self, url: str, **kwargs: object) -> SimpleNamespace:

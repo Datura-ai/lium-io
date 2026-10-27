@@ -695,11 +695,16 @@ class ResticStorageRunner:
         if state.get("OOMKilled") is True:
             return f"{action} ran out of memory"
         fields = ("Status", "OOMKilled", "Dead", "ExitCode", "Error", "StartedAt", "FinishedAt")
-        self._events.diagnostic(
-            f"{action} helper killed, not out of memory; docker state "
-            + json.dumps({field: state.get(field) for field in fields})
+        # stderr goes to the operation log only; a diagnostic event would become the stored error
+        print(
+            f"{action} helper exited 137; docker state "
+            + json.dumps({field: state.get(field) for field in fields}),
+            file=sys.stderr,
+            flush=True,
         )
-        return f"{action} helper was stopped by the host (not out of memory)"
+        if state.get("OOMKilled") is False:
+            return f"{action} helper was killed (Docker recorded no out-of-memory kill)"
+        return f"{action} helper was killed (often out of memory)"
 
     def _stop_helper_container(self) -> None:
         subprocess.run(
