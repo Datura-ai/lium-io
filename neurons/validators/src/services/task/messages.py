@@ -2492,6 +2492,37 @@ class RentedPodResourcesMessages:
     )
 
 
+class RentedPodNetworkMessages:
+    SUMMARY = MessageTemplate(
+        event="Rented pod network summary",
+        reason="RENTED_POD_NETWORK_SUMMARY",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    FANOUT = MessageTemplate(
+        event="Rented pod network summary needs review",
+        reason="RENTED_POD_OUTBOUND_FANOUT",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    UNREAD = MessageTemplate(
+        event="Rented pod network summary not read",
+        reason="RENTED_POD_NETWORK_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed; observation only",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rented pod network summary skipped: no running rental",
+        reason="RENTED_POD_NETWORK_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 class GpuAttestationIdentityMessages:
     # DAH-4551: warning in shadow; fails the node under GPU_ATTESTATION_IDENTITY_ENFORCEMENT_ENABLED.
     MISMATCH = MessageTemplate(
