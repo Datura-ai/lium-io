@@ -898,7 +898,7 @@ def test_encrypted_restore_preserves_user_xattrs() -> None:
     assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
     assert command[command.index("-t") + 1] == "4321"
     assert "/proc/4321/root/root/restored" in command
-    assert command[command.index("--memory") + 1] == "16g"  # DAH-5254: backups keep 4g
+    assert command[command.index("--memory") + 1] == "16g"  # backups and legacy tar restores keep 4g
     assert "restore" in command
     assert "--json" in command
     excluded_xattrs = [
@@ -977,6 +977,22 @@ def test_no_rendered_helper_spec_carries_a_volume_passphrase(
     assert not any("passphrase" in item.lower() for item in rendered), rendered
     assert not any("gocryptfs" in item for item in rendered), rendered
     assert "leaked-from-the-executor-environment" not in " ".join(rendered)
+
+
+def test_legacy_tar_restore_keeps_the_4g_helper_cap() -> None:
+    payload = _operation_payload(action="restore")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    workspace = DockerVolumeWorkspace(
+        image="executor:test",
+        volume_name="customer-volume",
+        path=PurePosixPath("/workspace/restored"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)
+
+    command, _ = runner._legacy_restore_execution_command("legacy/object.tgz")
+
+    assert command[command.index("--memory") + 1] == "4g"
 
 
 def test_local_cancellation_marker_is_observed() -> None:
