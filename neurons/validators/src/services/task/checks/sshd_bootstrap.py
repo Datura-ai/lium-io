@@ -11,8 +11,10 @@ from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.redis_service import (
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
+    SSHD_BOOTSTRAP_FAILED_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
+    get_or_adopt_legacy,
     sshd_bootstrap_failed_key,
 )
 
@@ -110,8 +112,11 @@ class SshdBootstrapCheck:
     async def _sshd_bootstrap_failed(self, ctx: Context) -> bool:
         """The verdict for an unrented node: its stamp, else a probe of its running filler (stamped on failure)."""
         key = sshd_bootstrap_failed_key(ctx.miner_hotkey, ctx.executor.uuid)
+        legacy_key = f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{ctx.executor.uuid}"
         try:
-            if await ctx.services.redis.get(key):
+            if await get_or_adopt_legacy(
+                ctx.services.redis, key, legacy_key, SSHD_BOOTSTRAP_FAILED_TTL_SECONDS
+            ):
                 return True
         except Exception:
             # an unreadable stamp is no evidence against the node

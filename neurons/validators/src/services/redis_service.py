@@ -56,6 +56,16 @@ def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
     return f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{miner_hotkey}:{executor_uuid}"
 
 
+async def get_or_adopt_legacy(redis, key: str, legacy_key: str, ttl_seconds: int):
+    """`key`'s value; on a miss, the pre-hotkey `legacy_key`'s, saved under `key` (a deploy keeps open state)."""
+    raw = await redis.get(key)
+    if raw is None:
+        raw = await redis.get(legacy_key)
+        if raw is not None:
+            await redis.set(key, raw, ex=ttl_seconds)
+    return raw
+
+
 # sshd_bootstrap.sh's verify_sshd line: sshd is installed but not running or listening
 SSHD_VERIFY_FAILED_MARKER = "sshd verification failed"
 # where the sshd bootstrap script is copied in a filler container

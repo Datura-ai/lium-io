@@ -15,6 +15,7 @@ import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.redis_service import get_or_adopt_legacy
 
 from ..messages import RegistryPullMessages as Msg
 from ..messages import render_message
@@ -548,7 +549,12 @@ class RegistryPullCheck:
 
     async def _load(self, ctx: Context) -> _ProbeState | None:
         try:
-            raw = await ctx.services.redis.get(_state_key(ctx))
+            raw = await get_or_adopt_legacy(
+                ctx.services.redis,
+                _state_key(ctx),
+                f"{_REDIS_PREFIX}:{ctx.executor.uuid}",
+                _REDIS_TTL_SECONDS,
+            )
         except Exception as exc:
             logger.warning(
                 _m(

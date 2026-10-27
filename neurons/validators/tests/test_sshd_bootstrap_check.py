@@ -323,3 +323,14 @@ async def test_a_node_copying_the_uuid_cannot_stamp_the_owner(context_factory):
 
     assert result.passed is True
     assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_keeps_a_stamp_saved_under_the_uuid_alone(context_factory):
+    redis = FakeRedis()
+    redis.store[f"sshd_bootstrap_failed:{EXECUTOR}"] = "1"
+
+    result = await SshdBootstrapCheck().run(_ctx(context_factory, redis))
+
+    assert result.passed is False
+    assert redis.store[KEY] == "1" and redis.ttl[KEY] == SSHD_BOOTSTRAP_FAILED_TTL_SECONDS
