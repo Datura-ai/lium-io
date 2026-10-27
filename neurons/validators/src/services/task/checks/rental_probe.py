@@ -23,7 +23,6 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.redis_service import (
     RENTAL_PROBE_FAILED_PREFIX,
-    RENTAL_PROBE_FAILED_TTL_SECONDS,
     RENTAL_PROBE_OK_PREFIX,
 )
 
@@ -141,9 +140,8 @@ _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 _TAIL_CHARS = 600
 _REDIS_LAST_OK_PREFIX = RENTAL_PROBE_OK_PREFIX
 # the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
-# next cycle must not relist the node without a clean probe). The key lives RENTAL_PROBE_FAILED_TTL_SECONDS
-# (a day) from the last probe that failed: a node the probe cannot reach at all is not held forever
-# (25 Oct, Pixel's review of DAH-5107), and a node probed and failing again stays out.
+# next cycle must not relist the node without a clean probe). It has no lifetime: a broken node relisted
+# without a clean probe would fail a renter's pod first.
 _REDIS_FAILED_PREFIX = RENTAL_PROBE_FAILED_PREFIX
 # the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
 # probe run again on the next idle cycle
@@ -208,10 +206,9 @@ class RentalProbeCheck:
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
     and the step's name, the same mechanics as the GPU runtime quarantine in rental_verification.py.
-    The failure stands until a probe passes, or for a day after the last failed probe: the failed
-    step is kept in Redis, and every later cycle that reaches no verdict of its own (the node
-    skipped for a filler or a missing image, an inconclusive probe, an unreadable input) fails the
-    node again with that step, so a node is not
+    The failure stands until a probe passes: the failed step is kept in Redis, and every later cycle
+    that reaches no verdict of its own (the node skipped for a filler or a missing image, an
+    inconclusive probe, an unreadable input) fails the node again with that step, so a node is not
     relisted without a clean probe while Redis is readable (an unreadable Redis is logged and the cycle
     decides as if no failure stood, as every other unreadable input does). Only a rented node is left
     alone, whichever read says so (the cycle's snapshot, the re-read before the create, a renter's
@@ -717,7 +714,7 @@ class _Failure:
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:
-    """The last probe's failed step, kept until a probe passes or for a day after the last failure.
+    """The last probe's failed step, kept until a probe passes.
 
     None when there is none or Redis could not be read (logged; this cycle then decides as if none
     stood, which is what today's code does)."""
@@ -729,10 +726,8 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
     if raw is None:
         return None
     try:
-        # a key written before the TTL existed lives forever; NX gives it the TTL once (Redis >= 7)
-        await ctx.services.redis.expire(
-            f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}", RENTAL_PROBE_FAILED_TTL_SECONDS, nx=True
-        )
+        # keys written on 27 Oct got a day's lifetime; drop it so only a passing probe clears them
+        await ctx.services.redis.persist(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
     except Exception:
         _read_failed(ctx, "the lifetime of its standing failure in Redis")
     text = raw.decode() if isinstance(raw, bytes) else str(raw)
@@ -744,12 +739,11 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
 
 
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
-    # the failure stands until _clear_failure or a day without a failed probe (see _REDIS_FAILED_PREFIX)
+    # the failure stands until _clear_failure (see _REDIS_FAILED_PREFIX)
     try:
         await ctx.services.redis.set(
             f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}",
             f"{failure.step}:{failure.create_step or ''}",
-            ex=RENTAL_PROBE_FAILED_TTL_SECONDS,
         )
     except Exception:
         logger.warning(

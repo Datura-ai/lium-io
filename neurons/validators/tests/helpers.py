@@ -221,10 +221,14 @@ class FakeRedis:
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
 
-    async def expire(self, key: str, seconds: int, nx: bool = False):
+    async def expire(self, key: str, seconds: int):
         self._touch()
         if key in self.store or key in self.hashes:
             self.ttl[key] = seconds
+
+    async def persist(self, key: str):
+        self._touch()
+        self.ttl.pop(key, None)
 
 
 def default_executor() -> ExecutorSSHInfo:

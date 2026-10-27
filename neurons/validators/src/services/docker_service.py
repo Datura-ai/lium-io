@@ -128,7 +128,6 @@ from services.redis_service import (
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     RENTAL_PROBE_FAILED_PREFIX,
-    RENTAL_PROBE_FAILED_TTL_SECONDS,
     RENTAL_PROBE_OK_PREFIX,
     SSHD_BOOTSTRAP_FAILED_PREFIX,
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
@@ -9679,7 +9678,6 @@ class DockerService:
             await self.redis_service.set(
                 f"{RENTAL_PROBE_FAILED_PREFIX}:{executor_uuid}",
                 f"{_RENTAL_PROBE_CONTAINER_START_STEP}:{current_step}",
-                ex=RENTAL_PROBE_FAILED_TTL_SECONDS,
             )
             await self.redis_service.delete(f"{RENTAL_PROBE_OK_PREFIX}:{executor_uuid}")
         except Exception:  # noqa: BLE001 — the create's own failure reply still goes out

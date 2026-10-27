@@ -210,9 +210,9 @@ class FakeRedis:
         self.store.pop(key, None)
         self.expiries.pop(key, None)
 
-    async def expire(self, key, seconds, nx=False):
-        if key in self.store and not (nx and self.expiries.get(key) is not None):
-            self.expiries[key] = seconds
+    async def persist(self, key):
+        if key in self.store:
+            self.expiries[key] = None
 
     def age_past_every_lifetime(self) -> None:
         # what Redis does once every `ex` has run out: a key written with a lifetime is gone
@@ -457,16 +457,17 @@ async def test_a_standing_failure_with_too_little_time_for_any_probe_is_carried(
 
 
 @pytest.mark.asyncio
-async def test_a_standing_failure_written_without_a_lifetime_gets_one_when_read():
-    """Review: keys written before the TTL existed would stay forever; the next read gives them the day."""
+async def test_a_standing_failure_written_with_a_lifetime_loses_it_when_read():
+    """Keys written while the failure had a day's lifetime (27 Oct) would relist a broken node unprobed."""
     redis = FakeRedis(failed_step=STEP_CONTAINER_START)
+    key = f"rental_probe_failed:{EXECUTOR.uuid}"
+    redis.expiries[key] = 24 * 3600
     ctx, _, _ = make_probe_context(redis=redis, image_present=False)
     with probe_settings():
         await RentalProbeCheck().run(ctx)
-    key = f"rental_probe_failed:{EXECUTOR.uuid}"
-    assert redis.expiries[key] == module.RENTAL_PROBE_FAILED_TTL_SECONDS
+    assert redis.expiries[key] is None
     redis.age_past_every_lifetime()
-    assert redis.standing_failure() is None
+    assert redis.standing_failure() == STEP_CONTAINER_START
 
 
 @pytest.mark.asyncio
@@ -532,8 +533,8 @@ async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_faile
     assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
     assert not redis.stamped()
     assert redis.standing_failure() == STEP_SSHD_LISTEN
-    # a day from the last failed probe (DAH-5107 review): a node the probe never reaches is not held forever
-    assert redis.expiries[f"rental_probe_failed:{EXECUTOR.uuid}"] == 24 * 3600
+    # no lifetime: only a probe that passes relists the node
+    assert redis.expiries[f"rental_probe_failed:{EXECUTOR.uuid}"] is None
 
     # next cycle: the node is probed again, not skipped
     ctx, docker, _ = make_probe_context(redis=redis)
@@ -638,10 +639,9 @@ async def test_a_standing_failure_ends_with_a_passed_probe():
 
 
 @pytest.mark.asyncio
-async def test_a_standing_failure_holds_through_cycles_without_a_verdict_then_lapses_after_a_day():
-    """The failure is carried by every cycle that reaches no verdict, and lasts a day from the last probe
-    that failed (DAH-5107 review, Pixel): with no lifetime, a node the probe could never reach (its other
-    checks left too little cycle time) stayed delisted forever after its fault was fixed."""
+async def test_a_standing_failure_holds_through_cycles_without_a_verdict_until_a_probe_passes():
+    """The failure is carried by every cycle that reaches no verdict and never lapses on its own: a broken
+    node relisted without a clean probe fails a renter's pod first."""
     redis = FakeRedis()
     ctx, docker, _ = make_probe_context(redis=redis)
     with probe_settings(deadline=1), renter_path(sshd_listens=False):
@@ -656,15 +656,11 @@ async def test_a_standing_failure_holds_through_cycles_without_a_verdict_then_la
         assert result.event.what_we_saw["standing_failure"] is True
         assert redis.standing_failure() == STEP_SSHD_LISTEN
 
-    # a day with no probe that failed again: the failure lapses and the cycle decides on its own
+    # no time lifts it
     redis.age_past_every_lifetime()
-    assert redis.standing_failure() is None
-    ctx, docker, _ = make_probe_context(redis=redis, image_present=False)
-    with probe_settings(deadline=1):
-        result = await RentalProbeCheck().run(ctx)
-    assert result.passed is True and result.event.reason_code == Msg.SKIPPED.reason
+    assert redis.standing_failure() == STEP_SSHD_LISTEN
 
-    # the first probe that passes stamps the interval
+    # only a probe that passes clears it
     ctx, docker, _ = make_probe_context(redis=redis)
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
