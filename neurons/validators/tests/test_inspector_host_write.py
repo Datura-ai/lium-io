@@ -191,3 +191,46 @@ async def test_copy_up_into_a_new_pod_volume_does_not_fail_the_node(context_fact
     assert "inspector_host_write_passed" not in result.updates
     assert later.passed is False
     assert [log["enforced"] for log in _logs(caplog, "INSPECTOR_HOST_WRITE")] == [True]
+
+
+class _InspectSsh:
+    def __init__(self, stdout="", error=None):
+        self.stdout, self.error, self.commands = stdout, error, []
+
+    async def run(self, command, timeout=None):
+        self.commands.append(command)
+        if self.error:
+            raise self.error
+        return type("Res", (), {"stdout": self.stdout, "exit_status": 0})()
+
+
+@pytest.mark.parametrize(
+    ("ssh", "passed"),
+    [
+        # a 3-minute pull: Docker created the container, and copied the volume, at +180 s
+        (_InspectSsh('{"name":"/pod_pod-1","created":"2026-10-26T14:44:00.123456789Z"}\n'), True),
+        (None, False),  # no container read: the pod's created_at is the anchor, +185 s fails
+        (_InspectSsh(error=OSError("ssh down")), False),
+        (_InspectSsh('{"name":"/pod_other","created":"2026-10-26T14:44:00Z"}\n'), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_copy_up_after_a_slow_pull_is_anchored_on_the_container(context_factory, ssh, passed):
+    report = _healthy_report(findings=[{**COPY_UP, "time": _at(185)}], interference_rules_version=1)
+    rented_data = _rented_data("executor-123")
+    for pod in rented_data.executors["executor-123"].pods:
+        pod.created_at = CREATED
+    ctx = context_factory(
+        config=build_context_config(inspector_enabled=True),
+        services=build_services(
+            inspector=DummyInspectorService(InspectorValidationResponse(report=report)),
+            redis=FakeRedis(),
+        ),
+        state=build_state(rented_data=rented_data),
+        ssh=ssh,
+    )
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is passed
+    if ssh is not None:
+        assert "docker inspect" in ssh.commands[-1] and "pod_pod-1" in ssh.commands[-1]

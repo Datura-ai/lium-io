@@ -364,13 +364,14 @@ def _parse_time(value: Any) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
-def is_volume_copy_up(finding: dict[str, Any], pod_created_at: datetime | None) -> bool:
+def is_volume_copy_up(finding: dict[str, Any], pod_created_at: datetime | str | None) -> bool:
     """Docker's own copy of the image's `.bashrc`/`.profile` into a brand-new `volume_<pod_id>`
     (DAH-5234). The sensor means to drop it (rental.rs `copy_up_container`) but misses the live
     shape — the writer is dockerd, which arrives unresolved as `parent: {"pid": null, "binary": ""}`
     rather than no parent — so it reaches the validator as a host write. Exempt only that exact
     shape: an OverlayFsWrite of a file at the volume root, by an unresolved writer, within
-    `VOLUME_COPY_UP_WINDOW` of the pod's creation. The same file written later still fails."""
+    `VOLUME_COPY_UP_WINDOW` of the pod's creation (its container's Docker `.Created` when the
+    validator read it, else the backend's `created_at`). The same file written later still fails."""
     if _kind(finding) != "OverlayFsWrite" or pod_created_at is None:
         return False
     parent = finding.get("parent")
@@ -405,7 +406,7 @@ def host_write_findings(
     report: dict[str, Any],
     provider_findings: list[dict[str, Any]],
     rented_pod_ids: list[str],
-    pod_created_at: dict[str, datetime | None] | None = None,
+    pod_created_at: dict[str, datetime | str | None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
     """The sensor's rental-interference verdict on the rented pods (DAH-4548), split into
     (writes, reads). The classification lives in the sensor (`rental_interference` and
