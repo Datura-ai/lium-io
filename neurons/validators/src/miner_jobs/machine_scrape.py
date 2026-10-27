@@ -685,11 +685,12 @@ DOCKER_API_TIMEOUT_SECONDS = 20
 VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # the v2 plugin's DATA_DIR on the host, under DockerRootDir: loopback_plugin_setup.py uses the same name
 VLOOPBACK_V2_DATA_DIR_NAME = "vloopback-v2"
-# DAH-5014: the persistent filler model caches (services/const.py FILLER_CACHE_VOLUME_PREFIXES). The
-# validator evicts them before a rental or the listing floor needs the room, so they read as free disk.
+# DAH-5045: the Engy checkpoint cache, reported for its download progress. Like the Dolphin cache it is
+# kept across rentals (Fish 26 Oct), so it reads as used disk: renters are listed the real free space.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
-# literal: the obfuscator does not rename names inside this tuple
-FILLER_CACHE_VOLUME_PREFIXES = ("dphn_cache_", "engy_cache_")
+# the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
+FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
+FILLER_VOLUME_LABEL_VALUE = "filler"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -730,9 +731,11 @@ def get_executor_pid_mode():
     return pid_mode
 
 
-def get_vloopback_volume_bytes(docker_root_dir):
+def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
+    # filler_only: just the volumes a filler create labelled as its own (pass it positionally: the
+    # obfuscator renames arguments, not call keywords).
     volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
     names = [
         volume.get("Name")
@@ -740,6 +743,7 @@ def get_vloopback_volume_bytes(docker_root_dir):
         if (volume.get("Driver") or "").startswith(VLOOPBACK_DRIVER_PREFIX)
         and volume.get("Name")
         and "/" not in volume.get("Name")
+        and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
     if not names:
         return 0
@@ -882,14 +886,16 @@ def get_docker_disk_usage():
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
     )
-    filler_cache = cache_volume_bytes(df, FILLER_CACHE_VOLUME_PREFIXES)
-    volumes -= filler_cache
     info = docker_api_get("/info") or {}
     docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
-    # the cache volumes sit under data-root: they free disk only when that is the measured filesystem
+    # A filler's own run volume is preallocated to its full size, but any rental removes the filler
+    # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
+    # renters were shown half of an idle node's disk. The model caches stay: rentals keep them.
+    filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
+    volumes += get_vloopback_volume_bytes(docker_root_dir) - filler_run_volumes
+    # the run volumes sit under data-root: they free disk only when that is the measured filesystem
     if not on_one_filesystem(docker_root_dir, disk_root_dir(info)):
-        filler_cache = 0
-    volumes += get_vloopback_volume_bytes(docker_root_dir)
+        filler_run_volumes = 0
     containers += get_container_log_bytes(docker_root_dir)
 
     # BuildCache rides in the same answer and holds image layers a custom build left behind.
@@ -902,7 +908,7 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_cache_kb": filler_cache // 1024,
+        "filler_run_volume_kb": filler_run_volumes // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
     }
@@ -918,10 +924,10 @@ def on_one_filesystem(host_dir, other_host_dir):
 
 
 def release_filler_cache(hard_disk):
-    # DAH-5014: report the filler model cache as free disk, so the listing floor, the disk a renter is
-    # offered and the filler fit checks all see it as the reclaimable space it is. The key is dropped:
-    # it is not part of the reported hard_disk block.
-    cache_kb = hard_disk.pop("filler_cache_kb", 0)
+    # DAH-5192: report the filler run volumes as free disk (a rental removes them), so the listing floor,
+    # the disk a renter is offered and the filler fit checks see that space. The model caches are not in
+    # it: kept across rentals, they stay used. The key is dropped: not part of the reported block.
+    cache_kb = hard_disk.pop("filler_run_volume_kb", 0)
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
@@ -1104,6 +1110,26 @@ def get_gpu_processes(pids: set, containers: list[dict]):
     return processes
 
 
+# literal: the validator's stale-container cleanup removes leftovers by this prefix
+CAPABILITY_CHECK_NAME_PREFIX = "lium_capability_check_"
+
+
+def run_capability_check(command):
+    # Named and removed after: `--rm` only fires once the container has run, so a run cut off by its
+    # timeout, or refused by the NVIDIA hook at start, used to leave a Created container behind.
+    name = f"{CAPABILITY_CHECK_NAME_PREFIX}{os.getpid()}_{os.urandom(3).hex()}"
+    try:
+        return subprocess.run(
+            command[:3] + ["--name", name] + command[3:],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+    finally:
+        run_storage_probe(["docker", "rm", "-f", name], VLOOPBACK_CLEANUP_TIMEOUT_SECONDS)
+
+
 def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
@@ -1115,13 +1141,7 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     test_command = COMMANDS["CHECK_SYSBOX_COMPATIBILITY"]
 
     try:
-        result = subprocess.run(
-            test_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30
-        )
+        result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Sysbox runtime supports GPU access."
@@ -1316,13 +1336,7 @@ def check_storage_limit_ability() -> tuple[bool, str]:
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
-        result = subprocess.run(
-            test_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30
-        )
+        result = run_capability_check(test_command)
 
         if result.returncode == 0:
             return True, "Storage limit is supported."

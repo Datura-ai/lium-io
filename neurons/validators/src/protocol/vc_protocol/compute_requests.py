@@ -15,8 +15,7 @@ GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
 GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
 # DAH-2671: the rental-verification container was created with `--cpus=<advertised>` and the host's
 # Docker daemon rejected the count — the machine has fewer physical cores than the miner reported.
-# Unlike the two GPU faults above this is spec fraud, not a broken runtime, and it is rolled out
-# shadow-first (see RENTAL_CPU_LIMIT_* in core/config.py).
+# Unlike the two GPU faults above this is spec fraud, not a broken runtime; it zeroes the score.
 CPU_QUOTA_EXCEEDS_HOST_REASON = "CPU_QUOTA_EXCEEDS_HOST"
 
 
