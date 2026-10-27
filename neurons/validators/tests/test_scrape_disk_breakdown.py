@@ -41,6 +41,7 @@ DISK_HELPERS = {
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_VOLUME_LABEL_KEY",
     "FILLER_VOLUME_LABEL_VALUE",
+    "FILLER_CONTAINER_PREFIX",
     "release_filler_cache",
     "disk_root_dir",
     "containerd_root",
@@ -687,6 +688,7 @@ def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeyp
                     {"Name": "volume_other", "Driver": "vloopback:v2", "Labels": None},
                 ]
             },
+            "/containers/json?all=1": [{"Names": ["/filler_pod1"], "Mounts": [{"Name": "volume_filler"}]}],
         },
     )
     hard_disk = {
@@ -704,6 +706,30 @@ def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeyp
     assert hard_disk["hard_disk_free"] == 3950 * 1024**2
     assert hard_disk["hard_disk_used"] == 50 * 1024**2
     assert hard_disk["hard_disk_volumes"] == 10 * 1024**2
+
+
+def test_a_labelled_volume_a_non_filler_container_mounts_stays_used(scrape: dict, monkeypatch) -> None:
+    # Arrange — a provider labels a volume as filler and mounts it into its own container
+    v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=lambda p: SimpleNamespace(st_blocks=8)))
+    _stub_docker_api(
+        scrape,
+        {
+            "/volumes": {
+                "Volumes": [{"Name": "volume_x", "Driver": "vloopback:v2", "Labels": {"io.lium.workload": "filler"}}]
+            },
+            "/containers/json?all=1": [
+                {"Names": ["/filler_pod1"], "Mounts": [{"Name": "volume_x"}]},
+                {"Names": ["/provider_app"], "Mounts": [{"Name": "volume_x"}]},
+            ],
+        },
+    )
+
+    # Act / Assert — not reclaimable, still counted among all volumes
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker", True) == 0
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == 8 * 512
 
 
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:

@@ -691,6 +691,8 @@ ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 # the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
 FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
+# the filler container's name prefix (services/const.py FILLER_CONTAINER_PREFIX): the rental path removes these
+FILLER_CONTAINER_PREFIX = "filler_"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -745,6 +747,15 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
         and "/" not in volume.get("Name")
         and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
+    if filler_only and names:
+        # the label is free to set: a labelled volume another container mounts survives the rental cleanup
+        held = {
+            mount.get("Name")
+            for container in docker_api_get("/containers/json?all=1") or []
+            if not all(name.lstrip("/").startswith(FILLER_CONTAINER_PREFIX) for name in container.get("Names") or [""])
+            for mount in container.get("Mounts") or []
+        }
+        names = [name for name in names if name not in held]
     if not names:
         return 0
 
