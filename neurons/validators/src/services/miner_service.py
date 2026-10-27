@@ -1253,7 +1253,8 @@ class MinerService:
                     exc_info=True,
                 )
                 continue
-            if gpu_uuids := _gpu_uuids(result):
+            # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
+            if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
             if settings.POD_STATES_REPORT_ENABLED:
                 await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)

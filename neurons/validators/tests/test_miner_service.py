@@ -270,3 +270,21 @@ async def test_a_node_back_under_a_new_gpu_uuid_is_published_before_the_cycle_en
     assert [(spec["executor_uuid"], spec["batch_total"]) for spec in published] == [(changed, None)]
     assert published[0]["specs"]["gpu"]["details"] == [{"uuid": "GPU-new"}]
     assert miner_service.published_gpu_uuids[changed] == {"GPU-new"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery(mocker, miner_service):
+    """A failed report of the new UUID does not move the cache, so the pass after it still publishes at once."""
+    mocker.patch("services.miner_service.settings.DRY_RUN", False)
+    node = str(uuid4())
+    await miner_service.publish_machine_specs([_passed_result(node, "GPU-old")], "hk", "ck")
+    failed = _passed_result(node, "GPU-new").model_copy(update={"score": 0.0, "job_score": 0.0})
+    await miner_service.publish_machine_specs([failed], "hk", "ck")
+    assert miner_service.published_gpu_uuids[node] == {"GPU-old"}
+
+    miner_service.redis_service.publish.reset_mock()
+    await miner_service.publish_gpu_set_changes(
+        {"miner_hotkey": "hk", "miner_coldkey": "ck", "results": [_passed_result(node, "GPU-new")]}
+    )
+    published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
+    assert [spec["executor_uuid"] for spec in published] == [node]
