@@ -221,7 +221,7 @@ class GpuPowerLimitCheck:
             )
         ]
         records_restored = 0
-        if self.restore_stale_caps and stale_records and ctx.state.rented_data is not None:
+        if self.restore_stale_caps and stale_records and rented_data is not None:
             records_restored = await restore_tracked_gpu_power_limits(
                 ctx.ssh,
                 ctx.services.redis,

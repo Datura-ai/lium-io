@@ -249,9 +249,9 @@ async def test_power_limit_ignores_record_from_another_executor(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("old_id_runs_our_filler, restored", [(False, True), (True, False)])
+@pytest.mark.parametrize("old_id_runs_our_filler, expect_cap_restored", [(False, True), (True, False)])
 async def test_power_limit_with_flag_counts_our_cap_recorded_under_a_previous_executor_id(
-    context_factory, read_records_mock, restore_mock, monkeypatch, old_id_runs_our_filler, restored
+    context_factory, read_records_mock, restore_mock, monkeypatch, old_id_runs_our_filler, expect_cap_restored
 ) -> None:
     # support:node-1690fde2: the box was re-registered under a new executor id while our filler ran;
     # our cap on its GPUs is still ours. The cap is lifted only once no filler of ours runs on the old id.
@@ -266,7 +266,7 @@ async def test_power_limit_with_flag_counts_our_cap_recorded_under_a_previous_ex
 
     assert result.passed is True
     assert result.event.reason_code == "GPU_POWER_LIMIT_RESTORED_STALE_CAP"
-    assert restore_mock.await_count == (1 if restored else 0)
+    assert restore_mock.await_count == (1 if expect_cap_restored else 0)
 
 
 @pytest.mark.asyncio
