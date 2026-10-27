@@ -432,6 +432,9 @@ class MinerService:
             return
         try:
             validated = await self.redis_service.get_validated_executors()
+            if not validated:
+                # cold set (fresh box or Redis wipe): every executor would look new; the cycle publishes
+                return
             new = [
                 result
                 for result in job.get("results", [])

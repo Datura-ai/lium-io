@@ -382,3 +382,17 @@ async def test_wave_publishes_a_new_executor_that_passed_without_waiting_for_the
     assert [r.executor_info.uuid for r in args[0]] == [new]
     assert args[1:] == ("miner-hotkey", "miner-coldkey")
     assert kwargs == {"is_whole_miner_batch": False}
+
+
+@pytest.mark.asyncio
+async def test_wave_publishes_nothing_at_pass_while_the_validated_set_is_cold():
+    """After a fresh box or Redis wipe the validated set is empty and every executor would look
+    new; the first cycle publishes them, as the express lane waits for it."""
+    service = MinerService.__new__(MinerService)
+    service.redis_service = _redis_service()
+    service.publish_machine_specs = AsyncMock()
+    job = {"miner_hotkey": "miner-hotkey", "miner_coldkey": "miner-coldkey", "results": [_job_result(str(uuid4()))]}
+
+    await service.publish_new_executors_at_pass(job)
+
+    service.publish_machine_specs.assert_not_awaited()
