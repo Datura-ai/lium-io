@@ -26,8 +26,7 @@ Public surface
 
 Failure handling
 ----------------
-`build_gpu_flags` raises only one thing: `MissingRentedGpuError`, and only under
-KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED — a rented UUID the kernel cannot see must not become a
+`build_gpu_flags` raises only one thing: `MissingRentedGpuError` — a rented UUID the kernel cannot see must not become a
 container (DAH-2671, item 1). Every other probe failure (SSH error, missing
 nvidia-smi, etc.) is logged at WARNING and the function falls
 back to the legacy `--gpus`-only string. The pod still gets created — it
@@ -47,7 +46,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import asyncssh
 
-from core.config import settings
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
 
 if TYPE_CHECKING:
@@ -126,7 +124,6 @@ def _emit_kernel_xml_disagreement(
     xml_map: dict[str, int],
     *,
     proc_unreadable: bool,
-    enforce: bool,
     executor_id: str | None,
     default_extra: dict | None,
 ) -> None:
@@ -139,9 +136,9 @@ def _emit_kernel_xml_disagreement(
             "executor_peer": _ssh_peer(ssh),
             # proc_unreadable distinguishes the honest case (an unreadable /proc map, which
             # enforcement also refuses) from a real spoof (proc readable but missing a card the
-            # spoofable XML claims). Under shadow, placement is unchanged; only this line is emitted.
+            # spoofable XML claims).
             "proc_unreadable": proc_unreadable,
-            "enforced": enforce,
+            "enforced": True,
             "requested_uuids": list(gpu_uuids),
             "kernel_visible_uuids": sorted(proc_map),
             "xml_visible_uuids": sorted(xml_map),
@@ -242,17 +239,15 @@ async def build_gpu_docker_config_for_executor(
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception as exc:
         # 1a: the kernel-truth verdict (a rented UUID absent from procfs) otherwise dies as a bare
-        # WARNING. Surface it as a stable structured event so ops can alert on it; behavior is
-        # unchanged — we still fall back to the legacy --gpus string below.
+        # WARNING. Surface it as a stable structured event so ops can alert on it.
         if isinstance(exc, MissingRentedGpuError):
             _emit_missing_rented_gpu(
                 ssh_client, exc, executor_id=executor_id, default_extra=default_extra
             )
-            if settings.KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED:
-                # Fail closed: falling through to the legacy --gpus string would still create the
-                # container on a host that cannot hand over a rented card, only without the --device
-                # entries. The caller records this create FAILED, the same way gpu_power_cap does.
-                raise
+            # Fail closed: falling through to the legacy --gpus string would still create the
+            # container on a host that cannot hand over a rented card, only without the --device
+            # entries. The caller records this create FAILED, the same way gpu_power_cap does.
+            raise
         logger.warning(
             "nvidia_devices: probe failed, falling back to legacy --gpus only "
             "(pod will not survive systemd daemon-reload on the executor)",
@@ -315,9 +310,9 @@ async def _query_gpu_nodes_for_uuids(
     if not uuid_to_minor or _missing_gpu_uuids(gpu_uuids, uuid_to_minor):
         # The kernel (procfs) map cannot satisfy the request; today we consult the NVML-backed
         # nvidia-smi XML, which the shim can spoof, and let it replace the kernel truth. 1b: treat a
-        # kernel-vs-XML disagreement (XML supplies a UUID the kernel lacks) as the finding. Under
-        # enforcement, refuse the overwrite — the kernel truth stands and the missing-GPU verdict
-        # below fires (fail closed). Under shadow, emit and preserve today's overwrite exactly.
+        # kernel-vs-XML disagreement (XML supplies a UUID the kernel lacks) as the finding: refuse
+        # the overwrite — the kernel truth stands and the missing-GPU verdict below fires (fail
+        # closed).
         try:
             xml_uuid_to_minor = await _query_gpu_minor_map_from_nvidia_smi_xml(ssh)
         except RuntimeError as exc:
@@ -330,20 +325,17 @@ async def _query_gpu_nodes_for_uuids(
                 u for u in gpu_uuids if u not in uuid_to_minor and u in xml_uuid_to_minor
             ]
             if xml_would_add:
-                enforce = settings.KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED
                 _emit_kernel_xml_disagreement(
                     ssh,
                     gpu_uuids,
                     uuid_to_minor,
                     xml_uuid_to_minor,
                     proc_unreadable=proc_unreadable,
-                    enforce=enforce,
                     executor_id=executor_id,
                     default_extra=default_extra,
                 )
-                if enforce:
-                    overwrite_with_xml = False
-                    refused_xml_overwrite = True
+                overwrite_with_xml = False
+                refused_xml_overwrite = True
         if overwrite_with_xml:
             uuid_to_minor = xml_uuid_to_minor
 

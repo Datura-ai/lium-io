@@ -22,7 +22,9 @@ from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
 # a scrape without the NCU observation: the flagship gate reads it as "not unrestricted"
-FLAGSHIP_SPEC: dict = {"hard_disk": {"total": 200 * 1024**2}, "gpu": {"details": [{"capacity": 141 * 1024}] * 8}}
+FLAGSHIP_SPEC: dict = {"hard_disk": {"total": 2000 * 1024**2}, "gpu": {"details": [{"capacity": 141 * 1024}] * 8}}
+# the always-enforced disk/VRAM gate fires only on this one
+SHORT_DISK_SPEC: dict = {**FLAGSHIP_SPEC, "hard_disk": {"total": 200 * 1024**2}}
 
 
 def _incentive() -> RentalPriceIncentive:
@@ -73,7 +75,6 @@ def discord_cutoff_passed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_flagship_gate_is_recorded_even_when_discord_blocks(monkeypatch, discord_cutoff_passed):
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", True)
 
     result = await _incentive().calculate_executor_score(_idle_flagship(provider_discord_connected=False))
 
@@ -87,17 +88,13 @@ async def test_flagship_gate_is_recorded_even_when_discord_blocks(monkeypatch, d
 async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order(
     monkeypatch, discord_cutoff_passed
 ):
-    for flag in (
-        "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT",
-        "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT",
-        "ENABLE_UNRENTED_SOFT_PRICE_LIMIT",
-    ):
-        monkeypatch.setattr(settings, flag, True)
     new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": {H200: 0.5}})
     monkeypatch.setattr(shared_client, "_config", new_cfg)
 
     result = await _incentive().calculate_executor_score(
-        _idle_flagship(provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True)
+        _idle_flagship(
+            provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True, spec=dict(SHORT_DISK_SPEC)
+        )
     )
 
     assert _codes(result) == [
@@ -114,12 +111,10 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
 @pytest.mark.asyncio
 async def test_two_idle_pool_gates_are_both_recorded(monkeypatch):
     # price used to stop the chain: a node over the price limit never heard about its disk
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", True)
     new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": {H200: 0.5}})
     monkeypatch.setattr(shared_client, "_config", new_cfg)
 
-    result = await _incentive().calculate_executor_score(_idle_flagship(gpu_count=4))
+    result = await _incentive().calculate_executor_score(_idle_flagship(gpu_count=4, spec=dict(SHORT_DISK_SPEC)))
 
     assert _codes(result) == ["price_above_market_p90_soft_limit", "insufficient_disk_for_vram"]
     assert result.eligible_for_rental_share is False
@@ -129,19 +124,19 @@ def _logged(caplog, reason: str) -> int:
     return sum(1 for record in caplog.records if getattr(record.msg, "extra", {}).get("reason") == reason)
 
 
-# (the gate's flag, the node, the reason it records when enforced, the reason its log line carries).
+# (the gate's flag or None when the gate is always enforced, the node, the reason it records when enforced, the reason its log line carries).
 # The last two are the probes' "cannot measure ...; unrented incentive kept" lines: no reason, and
 # the sentence is false for a node that is already excluded.
 GATE_LOG_CASES = [
-    ("ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", {}, "flagship_without_ncu_or_split", "flagship_without_ncu_or_split"),
-    ("ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", {"gpu_count": 4}, "insufficient_disk_for_vram", "insufficient_disk_for_vram"),
+    (None, {}, "flagship_without_ncu_or_split", "flagship_without_ncu_or_split"),
+    (None, {"gpu_count": 4, "spec": SHORT_DISK_SPEC}, "insufficient_disk_for_vram", "insufficient_disk_for_vram"),
     (
-        "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT",
+        None,
         {"gpu_count": 4, "spec": {"gpu": {"details": []}}},
         None,
         "insufficient_disk_unmeasured",
     ),
-    ("ENABLE_UNRENTED_POWER_CAP_LIMIT", {"gpu_count": 4}, None, "power_cap_capability_unmeasured"),
+    (None, {"gpu_count": 4}, None, "power_cap_capability_unmeasured"),  # power cap gate: no flag
 ]
 
 
@@ -153,7 +148,10 @@ async def test_a_gate_logs_only_while_the_node_is_still_eligible(
 ):
     # the gate lines count eligible nodes only, as before every reason was recorded; an enforced
     # gate still records its reason on the blocked node
-    monkeypatch.setattr(settings, flag, enforced)
+    if flag is None and not enforced:
+        pytest.skip("the gate is always enforced")
+    if flag:
+        monkeypatch.setattr(settings, flag, enforced)
 
     with caplog.at_level(logging.INFO):
         blocked = await _incentive().calculate_executor_score(

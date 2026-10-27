@@ -1,6 +1,7 @@
 """GPU_LOST: a node whose GPU dropped out is hidden and takes no new rentals until its cards stay back (DAH-4457)."""
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,8 @@ from neurons.validators.src.services.task.checks import (
 )
 from neurons.validators.src.services.task.messages import GpuLossHoldMessages as Msg
 from neurons.validators.src.services.task.models import JobResult
+from neurons.validators.src.services.task.pipeline import CheckResult, Context, Pipeline, ValidationEvent
+from neurons.validators.src.services.task.runner import SSHCommandResult
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
@@ -285,9 +288,46 @@ async def test_a_scrape_that_lists_no_gpu_starts_the_hold(context_factory):
     redis = FakeRedis()
     ctx = _ctx(context_factory, redis, listed=[])
 
-    await machine_spec_scrape._report_rented_gpu_loss(ctx, {"gpu": {"count": 4, "details": []}})
+    events = await machine_spec_scrape._report_rented_gpu_loss(ctx, {"gpu": {"count": 4, "details": []}})
 
     assert json.loads(redis.store[gpu_loss_hold._key(ctx)])["held"] is True
+    assert [e.reason_code for e in events] == [AvailabilityErrorCode.GPU_LOST]
+
+
+class _ListSink:
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, event: ValidationEvent) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_a_driver_crash_scrape_hides_the_node_through_the_run_it_ends(context_factory):
+    # node 2288a966, 26 Oct 2026: NVML raised on every scrape, the run ended at the scrape, and the GPU_LOST
+    # entry the hold built never reached the backend, so the node stayed listed
+    ctx = _ctx(context_factory, FakeRedis(), listed=[], count=0, pods=())
+    driver_report = json.dumps(
+        {"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}, "gpu_scrape_error": "NVMLError(3)"}}
+    )
+    now = datetime.now(UTC)
+    scrape_run = SSHCommandResult(
+        command="scrape", command_id="c1", exit_code=1, stdout=driver_report, stderr="", duration_ms=1,
+        started_at=now, finished_at=now, success=False,
+    )
+
+    class _ScrapeCheckStub:
+        check_id = MachineSpecScrapeCheck.check_id
+        fatal = True
+
+        async def run(self, run_ctx: Context) -> CheckResult:
+            return await MachineSpecScrapeCheck()._check_result_from_scrape_run(run_ctx, scrape_run, delivery="stdin")
+
+    ok, events, _ = await Pipeline([_ScrapeCheckStub()], _ListSink()).run(ctx)
+
+    assert not ok
+    assert [e.reason_code for e in events] == [AvailabilityErrorCode.GPU_LOST, "SCRAPE_FAILED_DRIVER"]
+    assert [e.reason_code for e in availability_errors(events)] == [AvailabilityErrorCode.GPU_LOST]
 
 
 def test_gpu_lost_entries_do_not_count_toward_our_own_outage():
@@ -328,3 +368,41 @@ def test_the_check_runs_after_the_scrape_and_before_the_gpu_checks_and_the_rente
     at = kinds.index(GpuLossHoldCheck)
     assert kinds.index(MachineSpecScrapeCheck) < kinds.index(RentedGpuDropCheck) < at
     assert at < kinds.index(GpuModelValidCheck) < kinds.index(TenantEnforcementCheck)
+
+
+@pytest.mark.asyncio
+async def test_a_card_missing_while_the_renter_resets_it_holds_the_cycle_without_a_hold(context_factory):
+    """DAH-4658: the cards leave nvidia-smi for ~4-40 s during a renter's reset; that scrape is not a GPU loss."""
+    from services.redis_service import RedisService
+
+    class PendingRedis(FakeRedis):
+        get_pending_pods = RedisService.get_pending_pods
+        add_pending_pod = RedisService.add_pending_pod
+        gpu_reset_marks = RedisService.gpu_reset_marks
+
+    redis = PendingRedis()
+    ctx = _ctx(context_factory, redis, listed=UUIDS[:2], count=2, pods=(2, 2))
+    await redis.add_pending_pod(ctx.miner_hotkey, ctx.executor.uuid, "pod2", kind="gpu_reset", gpu_uuids=UUIDS[2:])
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    # held as the zero-GPU scrape is, so the cycle carries the last score instead of GPU_MISSING zeroing it
+    assert not result.passed and result.event.reason_code == Msg.MISSING_GPUS_UNDER_RESET.reason == "SCRAPE_GPU_RESET_IN_PROGRESS"
+    assert await redis.get(gpu_loss_hold._key(ctx)) is None
+
+    # a card of the other pod missing during the reset is still a loss
+    other = _ctx(context_factory, redis, listed=UUIDS[1:], count=3, pods=(2, 2))
+    assert (await GpuLossHoldCheck().run(other)).event.reason_code != Msg.MISSING_GPUS_UNDER_RESET.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("pods", "held"), [((), False), ((4,), True)])
+async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_not_held(context_factory, pods, held):
+    """Replaced cards are not lost ones on an idle node (GpuFingerprintCheck re-anchors them);
+    under a rental they are."""
+    redis = FakeRedis()
+    replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+
+    result = await _cycle(context_factory, redis, listed=replaced, pods=pods)
+
+    assert _hidden(result) is held

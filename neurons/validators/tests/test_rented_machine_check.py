@@ -1204,6 +1204,20 @@ async def test_pod_states_reports_running_for_a_healthy_rented_pod(context_facto
 
 
 @pytest.mark.asyncio
+async def test_a_pod_stopped_by_its_renters_gpu_reset_is_not_penalised(context_factory):
+    # DAH-4658: the reset stops the container for a moment; only the pod named on the mark is spared
+    pods = {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]}
+    for marked_pod, spared in (("pod-1", True), ("pod-2", False)):
+        ctx = _tenant_ctx(context_factory, DummySSHClient(pod_running=False), pods)
+        ctx.services.redis.gpu_reset_marks = AsyncMock(return_value=[{"pod_id": marked_pod, "kind": "gpu_reset"}])
+
+        result = await TenantEnforcementCheck().run(ctx)
+
+        assert result.passed is spared
+        assert (result.event.reason_code == Msg.POD_NOT_RUNNING.reason) is not spared
+
+
+@pytest.mark.asyncio
 async def test_pod_states_reports_exited_when_inspect_shows_a_stopped_container(context_factory):
     # DummySSHClient answers docker inspect with Status=exited; the rental is still open, so
     # the cycle also fails with POD_NOT_RUNNING as before.
