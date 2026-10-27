@@ -26,7 +26,7 @@ from services.redis_service import (
     RENTAL_PROBE_OK_PREFIX,
 )
 
-from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
+from ...const import MIN_POD_PORT_COUNT, POD_CONTAINER_PREFIX
 from ...node_host import open_public_connection, public_host_sock
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
@@ -594,10 +594,10 @@ async def _busy_now(ctx: Context) -> _BusyNow:
 
 
 def _missing_inputs(ctx: Context) -> str | None:
-    # generate_portMappings refuses fewer than MIN_PORT_COUNT free ports, so a create with fewer would
-    # fail at port_mapping every cycle
-    if len(ctx.state.verified_port_pairs) < MIN_PORT_COUNT:
-        return f"{MIN_PORT_COUNT} verified ports"
+    # generate_portMappings refuses fewer than MIN_POD_PORT_COUNT free ports (the probe runs no Jupyter), so a
+    # create with fewer would fail at port_mapping every cycle
+    if len(ctx.state.verified_port_pairs) < MIN_POD_PORT_COUNT:
+        return "verified port"
     if not _gpu_uuids(ctx):
         return "GPU UUIDs"
     if not ctx.executor_ssh_private_key_encrypted or ctx.config.validator_keypair is None:

@@ -88,7 +88,7 @@ from services.const import (
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
-    MIN_PORT_COUNT,
+    MIN_POD_PORT_COUNT,
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
@@ -3459,9 +3459,11 @@ class DockerService:
                     available_ports = {}
                     pod_mapping = {}
 
-                if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
+                # SSH, plus Jupyter when enabled; the renter's other ports take what the backend offered
+                required_port_count = MIN_POD_PORT_COUNT + (1 if enable_jupyter else 0)
+                if not pod_mapping and len(available_ports) < required_port_count:
                     logger.warning(
-                        f"Insufficient ports available ({len(available_ports)}/{MIN_PORT_COUNT}) "
+                        f"Insufficient ports available ({len(available_ports)}/{required_port_count}) "
                         f"for executor {executor_id}"
                     )
                     return [], None
