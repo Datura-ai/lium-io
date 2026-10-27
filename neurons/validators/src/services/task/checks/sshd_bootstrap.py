@@ -114,9 +114,7 @@ class SshdBootstrapCheck:
         key = sshd_bootstrap_failed_key(ctx.miner_hotkey, ctx.executor.uuid)
         legacy_key = f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{ctx.executor.uuid}"
         try:
-            if await get_or_adopt_legacy(
-                ctx.services.redis, key, legacy_key, SSHD_BOOTSTRAP_FAILED_TTL_SECONDS
-            ):
+            if await get_or_adopt_legacy(ctx.services.redis, key, legacy_key):
                 return True
         except Exception:
             # an unreadable stamp is no evidence against the node

@@ -553,7 +553,6 @@ class RegistryPullCheck:
                 ctx.services.redis,
                 _state_key(ctx),
                 f"{_REDIS_PREFIX}:{ctx.executor.uuid}",
-                _REDIS_TTL_SECONDS,
             )
         except Exception as exc:
             logger.warning(

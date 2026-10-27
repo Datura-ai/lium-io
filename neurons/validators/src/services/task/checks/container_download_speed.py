@@ -237,7 +237,7 @@ class ContainerDownloadSpeedCheck:
         redis = ctx.services.redis
         try:
             legacy_key = f"{_REDIS_PREFIX}:{ctx.executor.uuid}"
-            raw = await get_or_adopt_legacy(redis, key, legacy_key, _REDIS_TTL_SECONDS)
+            raw = await get_or_adopt_legacy(redis, key, legacy_key)
         except Exception:
             # without the last reading the interval cannot be kept; measuring every cycle is the cost to avoid
             logger.warning(_m("Container download speed: Redis unreadable", extra=get_extra_info(ctx.default_extra)))

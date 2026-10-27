@@ -80,6 +80,9 @@ class FakeRedis:
     async def set(self, key, value, ex=None):
         self.store[key] = value
 
+    async def pttl(self, key):
+        return -1 if key in self.store else -2
+
 
 class Clock:
     now = 1_790_000_000.0
