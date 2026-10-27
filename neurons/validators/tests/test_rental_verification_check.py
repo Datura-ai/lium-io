@@ -972,8 +972,7 @@ def _cpu_quota_response() -> ExecutorHealthCheckResponse:
 
 
 @pytest.mark.asyncio
-async def test_cpu_quota_verdict_is_observe_only_in_shadow():
-    """ENFORCEMENT off: the daemon-rejected count is logged but the score is untouched."""
+async def test_cpu_quota_verdict_zeroes_score():
     backend_client = DummyBackendClient(response=_cpu_quota_response())
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
@@ -981,28 +980,7 @@ async def test_cpu_quota_verdict_is_observe_only_in_shadow():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = False
-        result = await RentalVerificationCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON
-    assert result.updates == {}
-    assert result.event.what_we_saw["advertised_cpu_count"] == 176
-    assert "Range of CPUs is from" in result.event.what_we_saw["stderr"]
-
-
-@pytest.mark.asyncio
-async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
-    backend_client = DummyBackendClient(response=_cpu_quota_response())
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
 
     assert result.passed is False

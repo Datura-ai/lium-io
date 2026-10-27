@@ -391,9 +391,8 @@ class Settings(BaseSettings):
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
     # host's Docker daemon creates the probe with `--cpus=<advertised>` and rejects a count that
     # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd
-    # reads the kernel directly). The count is always sent (not on TDX hosts) and the verdict is
-    # observed; ENFORCEMENT additionally zeroes the score on CPU_QUOTA_EXCEEDS_HOST.
-    RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # reads the kernel directly). The count is always sent (not on TDX hosts); a
+    # CPU_QUOTA_EXCEEDS_HOST verdict zeroes the score.
     # Rented pod SSH, observe only: at the start of each cycle the validator
     # reads the SSH identification line of every rented pod listed with an ssh_port, from outside the
     # container (services/pod_ssh_probe.py), and reports each result with the node's result. The
