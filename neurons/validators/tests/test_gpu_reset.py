@@ -55,6 +55,7 @@ class FakeHost:
         mounts=(),
         own_cgroup="0::/user.slice/user-0.slice/session-7.scope",
         fabric_manager=False,
+        nvlsm=False,
         fm_start_ok=True,
     ):
         self.commands: list[str] = []
@@ -71,8 +72,9 @@ class FakeHost:
         self.cgroups = {main_pid: f"0::/../docker-{CID}.scope", **(cgroups or {})}
         self.reset_exit, self.inspect_exit, self.stop_exit = reset_exit, inspect_exit, stop_exit
         self.own_cgroup = own_cgroup
-        self.fm_active, self.fm_start_ok = fabric_manager, fm_start_ok
-        self.fm_active_during_reset: bool | None = None
+        self.active = {"nvidia-fabricmanager": fabric_manager, "nvidia-nvlsm": nvlsm}
+        self.fm_start_ok = fm_start_ok
+        self.active_during_reset: dict[str, bool] | None = None
         self.reset_raises = False
 
     async def run(self, cmd: str, *, timeout: int = 60, retryable: bool = True, **_):
@@ -97,17 +99,16 @@ class FakeHost:
             pids = [int(p) for p in cmd.split(";")[0].split()[3:]]
             out = "\n".join(f"{pid} {self.cgroups[pid]} " for pid in pids if pid in self.cgroups)
             return make_command_result(True, out)
-        if cmd == "nsenter -t 1 -m -- systemctl is-active nvidia-fabricmanager":
-            state = "active" if self.fm_active else "inactive"
-            return make_command_result(self.fm_active, state, exit_code=0 if self.fm_active else 3)
-        if cmd == "nsenter -t 1 -m -- systemctl stop nvidia-fabricmanager":
-            self.fm_active = False
-            return make_command_result(True)
-        if cmd == "nsenter -t 1 -m -- systemctl start nvidia-fabricmanager":
-            self.fm_active = self.fm_start_ok
-            return make_command_result(self.fm_start_ok, exit_code=0 if self.fm_start_ok else 1)
+        if cmd.startswith("nsenter -t 1 -m -- systemctl "):
+            verb, unit = cmd.split()[-2:]
+            if verb == "is-active":
+                up = self.active[unit]
+                return make_command_result(up, "active" if up else "inactive", exit_code=0 if up else 3)
+            ok = verb == "stop" or unit != "nvidia-fabricmanager" or self.fm_start_ok
+            self.active[unit] = verb == "start" and ok
+            return make_command_result(ok, exit_code=0 if ok else 1)
         if cmd.startswith("nvidia-smi -r"):
-            self.fm_active_during_reset = self.fm_active
+            self.active_during_reset = dict(self.active)
             if self.reset_raises:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
@@ -227,15 +228,19 @@ async def test_an_nvswitch_node_the_pod_owns_whole_resets_every_gpu():
     assert report.ok and {g.uuid for g in report.gpus} == set(U)
 
 
-def _fm_commands(host: FakeHost) -> list[str]:
-    return [cmd.rsplit(" ", 2)[1] for cmd in host.commands if cmd.startswith("nsenter -t 1 -m -- systemctl")]
+FM, NVLSM = "nvidia-fabricmanager", "nvidia-nvlsm"
+CHECK_BOTH = [("is-active", FM), ("is-active", NVLSM)]
+
+
+def _fm_commands(host: FakeHost) -> list[tuple[str, str]]:
+    return [tuple(cmd.split()[-2:]) for cmd in host.commands if cmd.startswith("nsenter -t 1 -m -- systemctl")]
 
 
 @pytest.mark.asyncio
 async def test_a_non_nvswitch_node_never_touches_fabric_manager():
     host = FakeHost()
     report, _ = await _reset(host)
-    assert report.ok and _fm_commands(host) == ["is-active"]
+    assert report.ok and _fm_commands(host) == CHECK_BOTH
 
 
 @pytest.mark.asyncio
@@ -244,9 +249,27 @@ async def test_a_fabric_manager_node_the_pod_owns_whole_stops_fm_around_the_rese
     host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
     report, start = await _reset(host, backend=U, indices=[2])
     assert report.ok and {g.uuid for g in report.gpus} == set(U)
-    assert host.fm_active_during_reset is False and host.fm_active
-    assert _fm_commands(host) == ["is-active", "stop", "start", "is-active"]
+    assert host.active_during_reset == {FM: False, NVLSM: False} and host.active[FM]
+    assert _fm_commands(host) == [*CHECK_BOTH, ("stop", FM), ("start", FM), ("is-active", FM)]
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_nvlsm_is_stopped_after_fm_and_started_before_it():
+    # HGX Blackwell: the NVLink subnet manager runs alongside Fabric Manager
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True, nvlsm=True)
+    report, _ = await _reset(host, backend=U)
+    assert report.ok and host.active_during_reset == {FM: False, NVLSM: False}
+    assert host.active == {FM: True, NVLSM: True}
+    assert _fm_commands(host) == [
+        *CHECK_BOTH,
+        ("stop", FM),
+        ("stop", NVLSM),
+        ("start", NVLSM),
+        ("is-active", NVLSM),
+        ("start", FM),
+        ("is-active", FM),
+    ]
 
 
 @pytest.mark.asyncio
@@ -254,18 +277,17 @@ async def test_a_fabric_manager_node_shared_with_other_pods_is_refused():
     host = FakeHost(fabric_manager=True)
     report, start = await _reset(host)
     assert not report.ok and report.error_code == GpuResetErrorCode.NvlinkPeersOutsidePod
-    assert "provider must reset" in report.detail and host.fm_active
-    assert _fm_commands(host) == ["is-active"]
+    assert "provider must reset" in report.detail and host.active[FM]
+    assert _fm_commands(host) == CHECK_BOTH
     _no_change(host, start)
 
 
 @pytest.mark.asyncio
 async def test_fabric_manager_is_started_again_when_the_reset_fails():
-    host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True, nvlsm=True)
     host.reset_raises = True
     report, start = await _reset(host, backend=U)
-    assert not report.ok and host.fm_active
-    assert _fm_commands(host) == ["is-active", "stop", "start", "is-active"]
+    assert not report.ok and host.active == {FM: True, NVLSM: True}
     start.assert_awaited_once()
 
 
@@ -274,7 +296,7 @@ async def test_fabric_manager_not_coming_back_fails_the_reset():
     host = FakeHost(device_ids=(), count=-1, fabric_manager=True, fm_start_ok=False)
     report, _ = await _reset(host, backend=U)
     assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
-    assert "Fabric Manager" in report.detail
+    assert "nvidia-fabricmanager is not active" in report.detail
 
 
 @pytest.mark.asyncio

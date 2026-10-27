@@ -8,8 +8,9 @@ Nothing is ever read from inside the pod (no `docker exec`): the renter controls
         -> nvidia-smi -r -i <uuids> (or the DAH-2427 latch cure when the driver refuses) -> start
 
 On an NVSwitch node whose Fabric Manager runs (many HGX nodes show no /dev/nvidia-nvswitch*), the driver
-refuses `-r` while Fabric Manager holds the GPUs: a pod that owns every host GPU gets Fabric Manager
-stopped around the reset and always started again; any other pod is refused (the provider resets).
+refuses `-r` while Fabric Manager holds the GPUs: a pod that owns every host GPU gets Fabric Manager (and
+the NVLink subnet manager on HGX Blackwell, when it runs) stopped around the reset and always started
+again; any other pod is refused (the provider resets).
 
 Safety invariants, each pinned by a test:
 - the reset set is a subset of BOTH the container's own DeviceRequests GPUs (from the docker
@@ -48,8 +49,9 @@ NVSWITCH_COMMAND = (
 )
 # the executor runs privileged with pid: host; PID 1's mount namespace reaches the host's systemd
 HOST_SYSTEMCTL = "nsenter -t 1 -m -- systemctl"
-FABRIC_MANAGER = "nvidia-fabricmanager"
-FABRIC_MANAGER_ACTIVE_COMMAND = f"{HOST_SYSTEMCTL} is-active {FABRIC_MANAGER}"
+# the NVSwitch fabric's host services, in stop order (started again in reverse): Fabric Manager, then the
+# NVLink subnet manager it uses on HGX Blackwell
+FABRIC_SERVICES = ("nvidia-fabricmanager", "nvidia-nvlsm")
 STOP_GRACE_SECONDS = 10
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
@@ -188,7 +190,7 @@ class _Plan:
     targets: list[str]
     index_by_uuid: dict[str, int]
     widened: bool
-    fabric_manager: bool = False
+    fabric_services: list[str] = field(default_factory=list)
 
 
 async def _precheck(
@@ -254,7 +256,7 @@ async def _precheck(
             raise GpuResetRefused(GpuResetErrorCode.GpuNotInContainer, f"no pod GPU at index {gpu_indices}")
         requested = [ordered[index] for index in sorted(set(gpu_indices))]
 
-    targets, fabric_manager = await _widen_targets_to_nvlink_peers(runner, requested, ordered, host_gpus)
+    targets, fabric_services = await _widen_targets_to_nvlink_peers(runner, requested, ordered, host_gpus)
     # on the final set: an NVLink peer reset with the requested GPUs must not be MIG either
     if any(host_by_uuid[uuid].mig_enabled for uuid in targets):
         raise GpuResetRefused(GpuResetErrorCode.MigEnabled, "MIG is enabled on a GPU to reset")
@@ -273,24 +275,24 @@ async def _precheck(
         targets,
         index_by_uuid,
         widened=set(targets) != set(requested),
-        fabric_manager=fabric_manager,
+        fabric_services=fabric_services,
     )
 
 
-async def _fabric_manager_active(runner: SSHCommandRunner) -> bool:
-    result = await _run(runner, FABRIC_MANAGER_ACTIVE_COMMAND)
+async def _service_active(runner: SSHCommandRunner, unit: str) -> bool:
+    result = await _run(runner, f"{HOST_SYSTEMCTL} is-active {unit}")
     return (result.stdout or "").strip() == "active"
 
 
 async def _widen_targets_to_nvlink_peers(
     runner: SSHCommandRunner, requested: list[str], ordered: list[str], host_gpus: list[HostGpu]
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], list[str]]:
     """The requested GPUs plus every NVLink peer they reach (in pod order); refuses a peer outside the pod.
 
-    Also returns whether Fabric Manager runs on the host (it then has to be stopped for the reset)."""
+    Also returns the fabric services running on the host (they have to be stopped for the reset)."""
     nvswitch = await _run(runner, NVSWITCH_COMMAND)
-    fabric_manager = await _fabric_manager_active(runner)
-    if (nvswitch.stdout or "").strip() or fabric_manager:
+    fabric_services = [unit for unit in FABRIC_SERVICES if await _service_active(runner, unit)]
+    if (nvswitch.stdout or "").strip() or fabric_services:
         # NVSwitch fabrics reset as one: only a pod that owns every host GPU, and then all of them
         if set(ordered) != {gpu.uuid for gpu in host_gpus}:
             raise GpuResetRefused(
@@ -298,7 +300,7 @@ async def _widen_targets_to_nvlink_peers(
                 "NVSwitch node shared with other pods: its GPUs reset only together, so the provider must "
                 "reset them on the host",
             )
-        return list(ordered), fabric_manager
+        return list(ordered), fabric_services
     topology = await _run(runner, TOPOLOGY_COMMAND)
     if topology.exit_code != 0:
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "could not read the GPU topology")
@@ -314,18 +316,21 @@ async def _widen_targets_to_nvlink_peers(
             if peer not in targets:
                 targets.add(peer)
                 frontier.append(peer)
-    return [uuid for uuid in ordered if uuid in targets], False
+    return [uuid for uuid in ordered if uuid in targets], []
 
 
-async def _start_fabric_manager(runner: SSHCommandRunner) -> str | None:
-    """Starts Fabric Manager again; the problem when it is not active afterwards, else None."""
-    try:
-        await _run(runner, f"{HOST_SYSTEMCTL} start {FABRIC_MANAGER}", timeout=_RESET_TIMEOUT_SECONDS)
-        if await _fabric_manager_active(runner):
-            return None
-        return "Fabric Manager is not active again after the reset"
-    except Exception as exc:
-        return f"Fabric Manager did not start again: {exc}"
+async def _start_fabric_services(runner: SSHCommandRunner, stopped: list[str]) -> str | None:
+    """Starts the stopped fabric services again, last stopped first; the problem when one is not active
+    afterwards, else None."""
+    problems: list[str] = []
+    for unit in reversed(stopped):
+        try:
+            await _run(runner, f"{HOST_SYSTEMCTL} start {unit}", timeout=_RESET_TIMEOUT_SECONDS)
+            if not await _service_active(runner, unit):
+                problems.append(f"{unit} is not active again after the reset")
+        except Exception as exc:
+            problems.append(f"{unit} did not start again: {exc}")
+    return "; ".join(problems) or None
 
 
 async def _own_cgroup(runner: SSHCommandRunner) -> str | None:
@@ -411,21 +416,21 @@ async def reset_pod_gpus(
             )
 
         command = build_reset_command(plan.targets, container_uuids=plan.container_uuids, pod_gpu_uuids=pod_gpu_uuids)
-        fabric_manager_stopped = False
+        stopped_services: list[str] = []
         try:
-            if plan.fabric_manager:
-                # the driver refuses -r while Fabric Manager holds the GPUs; the pod owns every one of them
-                fabric_manager_stopped = True  # a failed stop may still have stopped it: start it regardless
-                fm_stop = await _run(runner, f"{HOST_SYSTEMCTL} stop {FABRIC_MANAGER}", timeout=60)
-                if fm_stop.exit_code != 0:
+            # the driver refuses -r while Fabric Manager holds the GPUs; the pod owns every one of them
+            for unit in plan.fabric_services:
+                stopped_services.append(unit)  # a failed stop may still have stopped it: start it regardless
+                unit_stop = await _run(runner, f"{HOST_SYSTEMCTL} stop {unit}", timeout=60)
+                if unit_stop.exit_code != 0:
                     raise GpuResetRefused(
-                        GpuResetErrorCode.ResetNotSupported, f"could not stop Fabric Manager: {_tail(fm_stop.stderr)}"
+                        GpuResetErrorCode.ResetNotSupported, f"could not stop {unit}: {_tail(unit_stop.stderr)}"
                     )
             reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
         finally:
             # before the latch cure and the container start: CUDA on an NVSwitch node needs Fabric Manager
-            if fabric_manager_stopped:
-                fabric_manager_problem = await _start_fabric_manager(runner)
+            if stopped_services:
+                fabric_manager_problem = await _start_fabric_services(runner, stopped_services)
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)
         if reset.exit_code == 0:
