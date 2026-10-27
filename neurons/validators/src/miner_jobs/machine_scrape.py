@@ -748,7 +748,9 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False):
         and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
     if filler_only and names:
-        # the label is free to set: a labelled volume another container mounts survives the rental cleanup
+        # the label is free to set: the rental cleanup (docker_service clean_stale_vloopback_volumes) removes
+        # only unmounted `volume_*` vloopback volumes once the filler_* containers are gone, so only those count
+        names = [name for name in names if name.startswith("volume_")]
         held = {
             mount.get("Name")
             for container in docker_api_get("/containers/json?all=1") or []

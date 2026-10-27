@@ -740,6 +740,27 @@ def test_a_labelled_volume_a_non_filler_container_mounts_stays_used(scrape: dict
     assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == 8 * 512
 
 
+def test_a_labelled_volume_the_rental_cleanup_does_not_sweep_stays_used(scrape: dict, monkeypatch) -> None:
+    # Arrange — a labelled, unmounted vloopback volume outside the `volume_*` names the rental cleanup removes
+    v2_dir = "/proc/1/root/var/lib/docker/vloopback-v2"
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == v2_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=lambda p: SimpleNamespace(st_blocks=8)))
+    _stub_docker_api(
+        scrape,
+        {
+            "/volumes": {
+                "Volumes": [{"Name": "provider_data", "Driver": "vloopback:v2", "Labels": {"io.lium.workload": "filler"}}]
+            },
+            "/containers/json?all=1": [],
+        },
+    )
+
+    # Act / Assert — not reclaimable, still counted among all volumes
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker", True) == 0
+    assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == 8 * 512
+
+
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
     # Arrange — the host half of the scrape failed, the docker half did not
     hard_disk = {"hard_disk_volumes": 0, "filler_run_volume_kb": 5}
