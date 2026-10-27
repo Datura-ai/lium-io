@@ -676,6 +676,9 @@ def run_cmd(cmd):
 
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+CONTAINERD_CONFIG_PATH = "/etc/containerd/config.toml"
+# the validator's disk gate reads this marker in hard_disk_scrape_error: an unknown root is not a passed check
+CONTAINERD_ROOT_UNKNOWN = "containerd root unknown"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
@@ -803,26 +806,55 @@ def get_host_disk_usage():
 def disk_root_dir(info):
     # Docker's containerd image store (default on Docker 29+) keeps container root filesystems in
     # containerd's root whatever data-root says: a 14 TB data-root over a 436 GB root disk (webg8845).
-    # That root is the top-level `root` of the host's containerd config, /var/lib/containerd by default.
-    # shortcut: a root set only in an `imports`ed config file is missed; read `containerd config dump` if that shows up.
     docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
     if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
         return docker_root_dir
-    containerd_root = "/var/lib/containerd"
+    return containerd_root()
+
+
+def containerd_root():
+    # containerd's effective root on the host. A leftover /var/lib/containerd proves nothing: a root
+    # moved in an imported config file leaves it behind, so the default is used only when no config
+    # sets one, and a root that cannot be read raises (CONTAINERD_ROOT_UNKNOWN) instead of measuring it.
     try:
-        with open("/proc/1/root/etc/containerd/config.toml") as config_file:
-            for line in config_file:
-                if line.lstrip().startswith("["):
-                    break
-                match = re.match(r"""\s*root\s*=\s*["']([^"']+)["']""", line)
-                if match:
-                    containerd_root = match.group(1)
-                    break
-    except OSError:
-        pass
-    if os.path.isdir(f"/proc/1/root{containerd_root}"):
-        return containerd_root
-    return docker_root_dir
+        # the host's own merged config, imports resolved: what the installer's preflight reads
+        roots = toml_top_level(run_cmd("timeout 20 chroot /proc/1/root containerd config dump"), "root")
+    except Exception:
+        roots = None
+    if not roots:
+        roots = []
+        pending, seen = [CONTAINERD_CONFIG_PATH], set()
+        try:
+            while pending:
+                path = pending.pop(0)
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    with open(f"/proc/1/root{path}") as config_file:
+                        text = config_file.read()
+                except FileNotFoundError:
+                    if path != CONTAINERD_CONFIG_PATH:
+                        raise
+                    text = ""  # no config at all: containerd runs on its default root
+                roots += toml_top_level(text, "root")
+                for pattern in toml_top_level(text, "imports"):
+                    pattern = os.path.join(os.path.dirname(path), pattern)
+                    # a later file overrides an earlier one, in the order containerd merges them
+                    pending += sorted(match[len("/proc/1/root"):] for match in glob.glob(f"/proc/1/root{pattern}"))
+        except OSError as exc:
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+    root = roots[-1] if roots else "/var/lib/containerd"
+    if not os.path.isdir(f"/proc/1/root{root}"):
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
+    return root
+
+
+def toml_top_level(text, key):
+    # string values of a top-level key (before the first [table]); one string or an array of them
+    top = re.split(r"(?m)^\s*\[", text, maxsplit=1)[0]
+    match = re.search(rf"""(?ms)^\s*{key}\s*=\s*(\[.*?\]|"[^"]*"|'[^']*')""", top)
+    return re.findall(r"""["']([^"']*)["']""", match.group(1)) if match else []
 
 
 def cache_volume_bytes(df, prefixes):
