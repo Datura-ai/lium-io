@@ -1175,7 +1175,7 @@ def test_restore_reporter_surfaces_scan_then_restore_stages() -> None:
     second_payload = session.requests[1]["json"]
     assert isinstance(first_payload, dict)
     assert isinstance(second_payload, dict)
-    assert first_payload["stage"] == "PREPARING"
+    assert first_payload["stage"] == "SCANNING"
     assert first_payload["total_files"] == 123
     assert second_payload["stage"] == "RESTORING"
 
