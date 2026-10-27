@@ -91,6 +91,7 @@ from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
     GPU_ESTIMATES_CHANNEL,
+    InflightBackendCreate,
     INSPECTOR_EVENT_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
@@ -230,15 +231,7 @@ class ComputeClient:
         self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
         await self.take_connector_lead()
 
-        try:
-            await self.fail_creates_cut_off_by_restart()
-        except Exception as exc:  # the sweep is best-effort; it must never keep the connector from starting
-            logger.error(
-                _m(
-                    "Failed to report creates cut off by a connector restart",
-                    extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
-                )
-            )
+        await self.fail_creates_cut_off_by_restart_until_done()
         try:
             await self.miner_service.redis_service.clear_running_backend_commands()
         except Exception:
@@ -578,10 +571,9 @@ class ComputeClient:
                         await self.send_model(log_to_send)
                         if getattr(log_to_send, "failure_step", None) == CREATE_CUT_OFF_BY_RESTART_STEP:
                             # kept until now so a second restart before the send reports it again;
-                            # only the interrupted create's own record, never a retry's newer one
-                            await self._retire_backend_create_record(
-                                log_to_send.pod_id, self._restart_reported_create_ids.pop(log_to_send.pod_id, "")
-                            )
+                            # only the interrupted creates' own records, never a retry's newer one
+                            for create_id in self._restart_reported_create_ids.pop(log_to_send.pod_id, ()):
+                                await self._retire_backend_create_record(log_to_send.pod_id, create_id)
                     except Exception as exc:
                         async with self.lock:
                             self.message_queue.insert(0, log_to_send)
@@ -1111,18 +1103,35 @@ class ComputeClient:
             except Exception as exc:
                 logger.warning(_m("Could not renew the connector lead", extra={**extra, "error": str(exc)}))
 
+    async def fail_creates_cut_off_by_restart_until_done(self) -> None:
+        # retried before any new create is accepted: a record left by a failed sweep would keep the
+        # rented-pod recovery off its pod for good
+        while True:
+            try:
+                await self.fail_creates_cut_off_by_restart()
+                return
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Failed to report creates cut off by a connector restart; retrying",
+                        extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
+                    )
+                )
+                await asyncio.sleep(BACKEND_CREATE_TRACKING_RETRY_SECONDS)
+
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
         replied, so the backend kept the pod PENDING / the filler STARTING, and its pending-pod flag refused the
-        delete for 30 min. Each one is reported failed now, which frees the node, and its flag is cleared."""
+        delete for 30 min. Each one is reported failed now, which frees the node, and its flag is cleared.
+        Reports are queued only once the whole sweep succeeded, so a retried sweep never sends one twice."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
-        # pod id -> the interrupted create's id, retired once its report is sent
-        self._restart_reported_create_ids = {pod_id: create.create_id for pod_id, create in creates.items()}
-        for pod_id, create in creates.items():
+        reports: list[tuple[FailedContainerRequest, InflightBackendCreate]] = []
+        for pod_id, pod_creates in creates.items():
+            create = pod_creates[0]
             # the validator wipes these flags on its own start; this covers a connector that restarted alone
             await redis_service.remove_pending_pod(create.miner_hotkey, create.executor_id, pod_id)
-            self.message_queue.append(
+            reports.append((
                 FailedContainerRequest(
                     miner_hotkey=create.miner_hotkey,
                     executor_id=create.executor_id,
@@ -1133,12 +1142,19 @@ class ComputeClient:
                     msg="The create was interrupted by a validator restart. Please try again.",
                     detail=f"validator connector restarted during the create (started {create.started_at_unix_seconds})",
                     failure_step=CREATE_CUT_OFF_BY_RESTART_STEP,
-                )
-            )
+                ),
+                create,
+            ))
+        # pod id -> the interrupted creates' ids, retired once the pod's report is sent
+        self._restart_reported_create_ids = {
+            pod_id: [create.create_id for create in pod_creates] for pod_id, pod_creates in creates.items()
+        }
+        for report, create in reports:
+            self.message_queue.append(report)
             logger.warning(
                 _m(
                     "Create cut off by a connector restart, reported failed",
-                    extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, **create.model_dump(mode="json")}),
+                    extra=get_extra_info({**self.logging_extra, "pod_id": report.pod_id, **create.model_dump(mode="json")}),
                 )
             )
 

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import random
 import re
 import secrets
@@ -133,6 +134,8 @@ from services.redis_service import (
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
     STOPPED_BY_RECOVERY_PREFIX,
+    STOPPED_BY_RECOVERY_RENAMING,
+    STOPPED_BY_RECOVERY_STOPPED,
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
@@ -10378,7 +10381,7 @@ class DockerService:
             if current_name == parked:
                 # before the rename: should its reply and the park-again below both be lost with the
                 # SSH transport, the next cycle still knows the stopped <name> is ours to start
-                await self._mark_stopped_by_recovery(pod_id)
+                await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_RENAMING)
         except TimeoutError:
             logger.warning(_m("POD_PARKED_CONTAINER_RECOVERY_TIMED_OUT", extra=get_extra_info(log_extra)))
             return False
@@ -10475,12 +10478,12 @@ class DockerService:
                 lambda done: _RECOVERY_MARK_CLEANUPS.get(pod_id) is done and _RECOVERY_MARK_CLEANUPS.pop(pod_id)
             )
 
-    async def _mark_stopped_by_recovery(self, pod_id: str) -> None:
+    async def _mark_stopped_by_recovery(self, pod_id: str, value: str) -> None:
         # bounded: RedisService.set waits on a process-wide lock, and the recovery must end inside
         # the create lock
         _cancel_recovery_mark_cleanup(pod_id)
         await asyncio.wait_for(
-            self.redis_service.set(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}", "1"),
+            self.redis_service.set(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}", value),
             timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
         )
 
@@ -10511,12 +10514,14 @@ class DockerService:
         return False
 
     async def encrypted_volume_mount_missing(
-        self, ssh_client: asyncssh.SSHClientConnection, container_name: str
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, plaintext_path: str | None
     ) -> bool:
         """True when a running pod container holds an encrypted volume at /lium-cipher but no
-        gocryptfs mount: a bare ``docker start`` (by hand, or dockerd's restart policy) brought it up,
-        so the renter's workspace is an empty dir and writes to it land unencrypted on the host
-        disk. False when it cannot tell."""
+        gocryptfs mount of it at ``plaintext_path``: a bare ``docker start`` (by hand, or dockerd's
+        restart policy) brought it up, so the renter's workspace is an empty dir and writes to it
+        land unencrypted on the host disk. Only a mount of /lium-cipher counts, never another
+        gocryptfs mount in the pod; with ``plaintext_path`` unknown, one at any destination does.
+        False when it cannot tell."""
         q_name = shlex.quote(container_name)
         probed = await ssh_client.run(
             f"/usr/bin/docker inspect {q_name} "
@@ -10529,8 +10534,12 @@ class DockerService:
         destinations, mounts = (probed.stdout or "").split("\n----\n", 1)
         if _LIUM_CIPHER_MOUNT not in destinations.split():
             return False
+        expected = os.path.normpath(plaintext_path) if plaintext_path else None
         return not any(
-            len(fields) > 2 and fields[2] == "fuse.gocryptfs"
+            len(fields) > 2
+            and fields[0] == _LIUM_CIPHER_MOUNT
+            and fields[2] == "fuse.gocryptfs"
+            and (expected is None or os.path.normpath(fields[1]) == expected)
             for fields in (line.split() for line in mounts.splitlines())
         )
 
@@ -10605,7 +10614,7 @@ class DockerService:
         # cycle's rename-back finds without any mark; parked before the stop, so a stop whose reply
         # is lost with the SSH transport still leaves that anchor.
         try:
-            await self._mark_stopped_by_recovery(pod_id)
+            await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_STOPPED)
             marked = True
         except Exception:
             marked = False

@@ -28,7 +28,11 @@ from ...const import (
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
-from services.redis_service import EXECUTOR_CREATE_LOCK_TIMEOUT, STOPPED_BY_RECOVERY_PREFIX
+from services.redis_service import (
+    EXECUTOR_CREATE_LOCK_TIMEOUT,
+    STOPPED_BY_RECOVERY_PREFIX,
+    STOPPED_BY_RECOVERY_STOPPED,
+)
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
@@ -499,9 +503,11 @@ class TenantEnforcementCheck:
         # a pod the validator stopped itself (its mount could not be restored) is down, but not by the
         # host: reported down through its pod state, yet no failed check or host reset, so a renter
         # breaking the mount from inside cannot fail the provider's validation or get the node reset
+        # only a stop's mark: a mark written before a rename that then failed stopped nothing
         stopped_by_validator = False
         with contextlib.suppress(Exception):
-            stopped_by_validator = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}") is not None
+            mark = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}")
+            stopped_by_validator = (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED
         if stopped_by_validator:
             extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
             return _DownedPodOutcome(failure=None, ssh_pub_keys=[], container_state=container_state)
@@ -947,20 +953,15 @@ async def _restore_missing_volume_mount(
     )
     running = True
     try:
-        if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name):
+        # the mount must be the rental's own, at its path: another gocryptfs mount in the pod does not count
+        local_volume_path = await _plaintext_volume_path(ctx, pod_id)
+        if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name, local_volume_path):
             return True
         async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
             if not clear:
                 return True
             running = False  # from here every failure has stopped the pod
             async with asyncio.timeout(_RECOVERY_DEADLINE_SEC):
-                try:
-                    local_volume_path = await _plaintext_volume_path(ctx, pod_id)
-                except asyncio.CancelledError:
-                    # remount-or-stop holds under a cancel too: with no path, the restore's
-                    # protected cleanup stops the pod
-                    await restore(local_volume_path=None)
-                    raise
                 running = await restore(local_volume_path=local_volume_path)
     except TimeoutError as exc:  # before OSError: a missed deadline is not a dead transport
         _log_recovery_failed("POD_VOLUME_MOUNT_RESTORE_FAILED", ctx, container_name, pod_id, exc)

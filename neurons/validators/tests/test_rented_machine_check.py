@@ -1204,6 +1204,8 @@ async def test_tenant_enforcement_remounts_a_running_pods_missing_encrypted_volu
     result = await TenantEnforcementCheck(recover_stale_pods=recover_enabled).run(ctx)
 
     assert result.passed is True, result.event
+    if recover_enabled:  # the probe matches the rental's own mount, at its path
+        assert docker.encrypted_volume_mount_missing.await_args.args[1:] == ("pod_pod-1", local_volume_path)
     if expected_restored:
         kwargs = docker.restore_volume_mount_of_running_container.await_args.kwargs
         assert (kwargs["container_name"], kwargs["local_volume_path"]) == ("pod_pod-1", local_volume_path)
@@ -1286,7 +1288,7 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
     async def restore(**kwargs):  # as the real one: no path -> marked and stopped
         if kwargs["local_volume_path"]:
             return True
-        marks[f"stopped_by_recovery:{kwargs['pod_id']}"] = "1"
+        marks[f"stopped_by_recovery:{kwargs['pod_id']}"] = "stopped"
         ssh.pod_running = False
         return False
 
@@ -1334,7 +1336,8 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_stops_the_unmounted_pod_when_cancelled_during_the_path_lookup(context_factory):
+async def test_tenant_enforcement_leaves_the_pod_untouched_when_cancelled_during_the_path_lookup(context_factory):
+    # the path is looked up before the mount probe, so a cancel there has not judged or changed anything yet
     ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
     docker = AsyncMock()
     docker.encrypted_volume_mount_missing.return_value = True
@@ -1362,8 +1365,9 @@ async def test_tenant_enforcement_stops_the_unmounted_pod_when_cancelled_during_
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert not ssh.pod_running
-    lock.release.assert_awaited_once()
+    assert ssh.pod_running
+    docker.encrypted_volume_mount_missing.assert_not_awaited()
+    lock.acquire.assert_not_awaited()
 
 
 @pytest.mark.asyncio
