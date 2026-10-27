@@ -36,6 +36,7 @@ import hashlib
 import json
 import shlex
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel
@@ -343,13 +344,76 @@ def build_verdict(
     )
 
 
+# Docker copies the image's home files into a new, empty volume mounted on it (sensor rental.rs
+# VOLUME_COPY_UP_FILES); store.rs COPY_UP_WINDOW bounds it by the container's create event.
+_VOLUME_COPY_UP_FILES = frozenset({".bashrc", ".profile"})
+VOLUME_COPY_UP_WINDOW = timedelta(seconds=60)
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    # the backend's pod created_at is naive UTC (rented_machine.py reads it the same way)
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def is_volume_copy_up(finding: dict[str, Any], pod_created_at: datetime | str | None) -> bool:
+    """Docker's own copy of the image's `.bashrc`/`.profile` into a brand-new `volume_<pod_id>`
+    (DAH-5234). The sensor means to drop it (rental.rs `copy_up_container`) but misses the live
+    shape — the writer is dockerd, which arrives unresolved as `parent: {"pid": null, "binary": ""}`
+    rather than no parent — so it reaches the validator as a host write. Exempt only that exact
+    shape: an OverlayFsWrite of a file at the volume root, by an unresolved writer, within
+    `VOLUME_COPY_UP_WINDOW` of the pod's creation (its container's Docker `.Created` when the
+    validator read it, else the backend's `created_at`). The same file written later still fails."""
+    if _kind(finding) != "OverlayFsWrite" or pod_created_at is None:
+        return False
+    parent = finding.get("parent")
+    parent_unresolved = parent is None or (
+        isinstance(parent, dict) and not parent.get("binary") and parent.get("pid") is None
+    )
+    if finding.get("binary") or not parent_unresolved:
+        return False
+    command = finding.get("command")
+    if not isinstance(command, str):
+        return False
+    segments = [segment for segment in command.split("/") if segment]
+    index = next(
+        (i for i, segment in enumerate(segments) if segment in ("volumes", "propagated-mount")),
+        None,
+    )
+    if index is None:
+        return False
+    rest = segments[index + 2 :]
+    if segments[index] == "volumes" and rest[:1] == ["_data"]:
+        rest = rest[1:]
+    if len(rest) != 1 or rest[0] not in _VOLUME_COPY_UP_FILES:
+        return False
+    written = _parse_time(finding.get("time"))
+    created = _parse_time(pod_created_at)
+    if written is None or created is None:
+        return False
+    return abs(written - created) <= VOLUME_COPY_UP_WINDOW
+
+
 def host_write_findings(
-    report: dict[str, Any], provider_findings: list[dict[str, Any]], rented_pod_ids: list[str]
+    report: dict[str, Any],
+    provider_findings: list[dict[str, Any]],
+    rented_pod_ids: list[str],
+    pod_created_at: dict[str, datetime | str | None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
     """The sensor's rental-interference verdict on the rented pods (DAH-4548), split into
     (writes, reads). The classification lives in the sensor (`rental_interference` and
-    `direction` on each finding); the validator only filters to this rental's pods. None when the
-    report has no `interference_rules_version`: a sensor without the verdict, so nothing is read."""
+    `direction` on each finding); the validator only filters to this rental's pods and drops
+    Docker's volume copy-up the sensor misses (`is_volume_copy_up`, by `pod_created_at`). None
+    when the report has no `interference_rules_version`: a sensor without the verdict, so nothing
+    is read."""
     version = report.get("interference_rules_version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         return None
@@ -359,7 +423,13 @@ def host_write_findings(
         if finding.get("rental_interference") is not True:
             continue
         name = _named_resource(finding)
-        if not name or pod_id_of(name) not in rented:
+        pod_id = pod_id_of(name) if name else None
+        if pod_id not in rented:
+            continue
+        # name is the path's volume (not a container the finding names) for the copy-up shape
+        if name and name.startswith(VOLUME_CONTAINER_PREFIX) and is_volume_copy_up(
+            finding, (pod_created_at or {}).get(pod_id)
+        ):
             continue
         (writes if finding.get("direction") == "write" else reads).append(finding)
     return writes, reads

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
+import shlex
 import time
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 
 from core.utils import _m, get_extra_info
@@ -28,6 +31,7 @@ BLIND_OUTCOMES = frozenset(
 )
 BLIND_STREAK_KEY_PREFIX = "inspector:blind_streak"
 BLIND_STREAK_TTL_SECONDS = 24 * 60 * 60
+CONTAINER_CREATED_READ_TIMEOUT_SECONDS = 15
 
 
 class InspectorRentedCheck:
@@ -147,6 +151,7 @@ class InspectorRentedCheck:
                 rented_pods=rented_pods,
                 result=result,
                 extra=extra,
+                created_at=await _containers_created_at(ctx.ssh, rented_pods),
             )
 
         clean_what: dict[str, Any] = {
@@ -234,6 +239,7 @@ class InspectorRentedCheck:
         rented_pods: list[RentedPod],
         result: InspectorValidationResponse,
         extra: dict[str, Any],
+        created_at: dict[str, datetime | str | None] | None = None,
     ) -> CheckResult:
         """A provider-origin verdict becomes the MALICIOUS event and the inspector event that
         carries its evidence. It is a record only: the check passes, nothing reaches the score
@@ -241,7 +247,10 @@ class InspectorRentedCheck:
         of a host write into a rented pod (DAH-4548), which fails the check and the score. A read is
         logged only."""
         interference = host_write_findings(
-            report, verdict.provider_findings, [p.pod_id for p in rented_pods]
+            report,
+            verdict.provider_findings,
+            [p.pod_id for p in rented_pods],
+            {p.pod_id: (created_at or {}).get(p.pod_id) or p.created_at for p in rented_pods},
         )
         if interference is None:
             writes, reads = [], []
@@ -313,6 +322,39 @@ class InspectorRentedCheck:
                 **({"inspector_host_write_passed": False} if enforced else {}),
             },
         )
+
+
+async def _containers_created_at(ssh, rented_pods: list[RentedPod]) -> dict[str, str]:
+    """Each rented container's Docker `.Created` by pod id (DAH-5234). Docker copies the image
+    home into the new volume when it creates the container, after the image pull, so a big
+    uncached pull puts the copy past the backend's pod `created_at`. Empty on any failure; the
+    caller then falls back to the pod's `created_at`."""
+    if ssh is None:
+        return {}
+    by_name = {p.container_name: p.pod_id for p in rented_pods}
+    try:
+        # docker inspect exits 1 when one name is missing but still prints the others
+        res = await ssh.run(
+            "/usr/bin/docker inspect --format "
+            + shlex.quote('{"name":{{json .Name}},"created":{{json .Created}}}')
+            + " "
+            + " ".join(shlex.quote(n) for n in by_name),
+            timeout=CONTAINER_CREATED_READ_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 — a read that fails leaves the pod's created_at in charge
+        return {}
+    created = {}
+    for line in (getattr(res, "stdout", "") or "").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not isinstance(row.get("created"), str):
+            continue
+        pod_id = by_name.get(str(row.get("name", "")).lstrip("/"))
+        if pod_id:
+            created[pod_id] = row["created"]
+    return created
 
 
 async def _record_blind_streak_and_decide_pass(ctx: Context, outcome: str) -> bool:
