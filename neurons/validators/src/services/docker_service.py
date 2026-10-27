@@ -1593,6 +1593,7 @@ class _InflightCreate:
     running: int = 0
     cancelled_by_delete: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class _InflightCreateRegistry:
@@ -1626,7 +1627,13 @@ class _InflightCreateRegistry:
         if create is None:
             return False
         create.cancelled_by_delete = True
+        create.cancelled.set()
         return True
+
+    async def wait_cancelled(self, pod_id: str) -> None:
+        """Return once a delete cancels this pod's create; never while no create is tracked for it."""
+        create = self._creates_by_pod_id.get(pod_id)
+        await (create.cancelled if create is not None else asyncio.Event()).wait()
 
     def is_cancelled(self, pod_id: str) -> bool:
         create = self._creates_by_pod_id.get(pod_id)
@@ -7622,6 +7629,38 @@ class DockerService:
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
 
+    async def _pull_unless_cancelled_by_delete(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+        pull: Awaitable[Any],
+    ) -> None:
+        """Run the pull, but stop it as soon as this pod's delete cancels the create.
+
+        DAH-5283: the delete only flags the create, and the create looks at the flag after the pull. A
+        slow pull therefore kept streaming up to its 1 h deadline after the renter had deleted the pod,
+        and competed with the next create on the node. Closing the Docker client ends the SSH stream,
+        which makes dockerd drop the pull.
+        """
+        pull_task = asyncio.ensure_future(pull)
+        cancelled = asyncio.ensure_future(inflight_creates.wait_cancelled(payload.pod_id))
+        try:
+            await asyncio.wait({pull_task, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            pull_task.cancel()
+            raise
+        finally:
+            cancelled.cancel()
+        if not pull_task.done():
+            pull_task.cancel()
+            with contextlib.suppress(Exception):
+                await docker_client.aclose()
+            await asyncio.wait({pull_task})
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+        await pull_task
+
     def _explain_container_killed_during_bootstrap(
         self,
         gone: ContainerGoneBeforeExec,
@@ -8428,12 +8467,20 @@ class DockerService:
                             log_tag,
                         )
                         try:
-                            await run_logged_rental_docker_sdk_operation(
-                                operation="pull",
-                                log_extra=default_extra,
-                                call=lambda: docker_client.pull(image=payload.docker_image),
-                                image=payload.docker_image,
+                            await self._pull_unless_cancelled_by_delete(
+                                ssh_client,
+                                docker_client,
+                                payload,
+                                default_extra,
+                                run_logged_rental_docker_sdk_operation(
+                                    operation="pull",
+                                    log_extra=default_extra,
+                                    call=lambda: docker_client.pull(image=payload.docker_image),
+                                    image=payload.docker_image,
+                                ),
                             )
+                        except _CreateCancelledByDelete:
+                            raise
                         except Exception as exc:
                             if login_error is None:
                                 raise
