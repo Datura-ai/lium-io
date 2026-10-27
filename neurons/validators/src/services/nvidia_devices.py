@@ -411,6 +411,19 @@ _INFORMATION_FILE_RE = re.compile(
 )
 
 
+# mountinfo marks a bind whose source dentry is gone (e.g. after a driver reload) with this suffix
+STALE_ROOT_SUFFIX = "//deleted"
+
+
+def _has_stale_proc_bind(mountinfo: str) -> bool:
+    return any(
+        len(f := line.split()) > 4
+        and f[3].endswith(STALE_ROOT_SUFFIX)
+        and f[4].startswith(PROC_NVIDIA_GPUS_PATH)
+        for line in mountinfo.splitlines()
+    )
+
+
 class KernelGpuView(NamedTuple):
     """What the kernel says about the cards, and whether anything sits between us and the kernel."""
 
@@ -455,7 +468,7 @@ def foreign_mounts_over_proc_nvidia_gpus(
             found.append(f"{mount_point} {fstype}")
         elif on_gpus and fstype != "proc":
             found.append(f"{mount_point} {fstype}")
-        elif on_gpus and root != mount_point[len("/proc") :]:
+        elif on_gpus and root.removesuffix(STALE_ROOT_SUFFIX) != mount_point[len("/proc") :]:
             found.append(f"{mount_point} proc:{root}")
     for line in file_fs.splitlines():
         if not line.strip():
@@ -546,6 +559,13 @@ async def read_kernel_gpu_view(
             extra={"executor_peer": _ssh_peer(ssh)},
         )
         return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
+    if _has_stale_proc_bind(mountinfo):
+        logger.warning(
+            "%s went through a stale procfs bind; withheld",
+            what,
+            extra={"executor_peer": _ssh_peer(ssh)},
+        )
+        return KernelGpuView(uuids=None, foreign_mounts=[])
     uuids = list(_parse_uuid_minor_csv(uuid_lines))
     # positive evidence: every UUID row must come from a file stat placed on procfs; a host whose
     # stat printed nothing is unreadable (None), not a finding

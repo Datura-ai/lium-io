@@ -292,6 +292,24 @@ async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(
 
 
 @pytest.mark.asyncio
+async def test_stale_procfs_bind_is_unreadable_and_the_node_passes(context_factory):
+    stale = CONTAINER_MOUNTS[1].replace(
+        "/driver/nvidia/gpus/0001:00:00.0 ", "/driver/nvidia/gpus/0001:00:00.0//deleted ", 1
+    )
+    rented = RentedExecutorsResponse(executors={})
+    ctx = context_factory(
+        state=build_state(gpu_uuids=REAL, rented_data=rented),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"], mounts=[CONTAINER_MOUNTS[0], stale]),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
+
+
+@pytest.mark.asyncio
 async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factory):
     """Like a ban, the overlay finding must not stop verifying a node whose pod is in use."""
     ctx = context_factory(
