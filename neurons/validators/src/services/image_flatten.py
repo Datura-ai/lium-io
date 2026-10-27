@@ -41,6 +41,7 @@ FLATTEN_LEASE_MINUTES = FLATTEN_TIMEOUT_SECONDS // 60 + 60
 FLATTEN_MAX_LEASES = 2
 FLATTEN_BUSY_EXIT = 92
 FLATTEN_NO_DISK_EXIT = 95
+FLATTEN_MEASURE_FAILED_EXIT = 90
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
     "not enough free disk on this node to prepare this image; choose another node or a smaller image"
@@ -49,6 +50,10 @@ FLATTEN_NO_DISK_RENTER_SENTENCE = (
 
 class ImageFlattenNoDisk(RuntimeError):
     renter_sentence = FLATTEN_NO_DISK_RENTER_SENTENCE
+
+
+class FlattenMeasureFailed(RuntimeError):
+    """Only the disk measure failed, after the node lock was held and the mark written."""
 
 
 def _dockerfile_word(value: str) -> str:
@@ -201,7 +206,7 @@ def flatten_wait_command() -> str:
     return (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
         f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; "
-        f"{df_command(root)}"
+        f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )
 
 
@@ -212,12 +217,19 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
     (whose pod may have been deleted meanwhile) and counts every copy written so far; it also marks the
     node as sized under that lock, so a flatten that has not started copying refuses (`sized_mark`).
     A disk probe taken before this, outside the lock, may predate a copy and must not size the create.
-    None on a node without flock, which runs no flatten. Raises when the wait or the measure fails."""
+    None on a node without flock, which runs no flatten. Raises FlattenMeasureFailed when only the
+    measure failed (lock held, mark written); any other error when the lock or the mark was not taken,
+    which must stop the create: no other sizing is safe then."""
     result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
+    if result.exit_status == FLATTEN_MEASURE_FAILED_EXIT:
+        raise FlattenMeasureFailed("measuring the disk under the node flatten lock failed")
     if result.exit_status != 0:
-        raise RuntimeError(f"measuring the disk after any image copy on this node failed (exit {result.exit_status})")
+        raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status})")
     out = str(result.stdout or "")
-    return parse_df_available_bytes(out) if out.strip() else None
+    try:
+        return parse_df_available_bytes(out) if out.strip() else None
+    except Exception as exc:
+        raise FlattenMeasureFailed(str(exc)) from exc
 
 
 async def flatten_image_on_host(

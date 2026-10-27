@@ -374,8 +374,30 @@ async def test_a_node_without_flock_runs_no_flatten_and_gives_no_locked_measure(
 @pytest.mark.asyncio
 async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
     ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=1)))
-    with pytest.raises(RuntimeError, match="image copy"):
+    with pytest.raises(RuntimeError, match="image copy") as raised:
         await image_flatten.wait_for_node_flatten(ssh)
+    assert not isinstance(raised.value, image_flatten.FlattenMeasureFailed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["lock", "mark", "measure"])
+async def test_only_a_failed_measure_under_the_held_lock_and_mark_may_fall_back(tmp_path, monkeypatch, broken):
+    # review: a lock or mark that cannot be written must stop the create, not authorize fallback sizing
+    fake = tmp_path / "docker"
+    fake.write_text('#!/bin/sh\n[ "$1" = info ] && echo /var/lib/docker\nexit 1\n')
+    fake.chmod(0o755)
+    missing = str(tmp_path / "missing" / "f")  # parent dir absent: the file cannot be created
+    monkeypatch.setattr(image_flatten, "FLATTEN_LOCK_PATH", missing if broken == "lock" else str(tmp_path / "lock"))
+    monkeypatch.setattr(image_flatten, "FLATTEN_SIZED_PATH", missing if broken == "mark" else str(tmp_path / "sized"))
+    env = {"PATH": os.environ["PATH"]}
+
+    async def run(command, check=False, timeout=None):
+        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", str(fake))], env=env, capture_output=True)
+        return Mock(exit_status=done.returncode, stdout=done.stdout.decode())
+
+    with pytest.raises(RuntimeError) as raised:
+        await image_flatten.wait_for_node_flatten(Mock(run=run))
+    assert isinstance(raised.value, image_flatten.FlattenMeasureFailed) == (broken == "measure")
 
 
 def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_other_creates(tmp_path, monkeypatch):

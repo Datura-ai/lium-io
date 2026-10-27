@@ -122,6 +122,7 @@ from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, 
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
+    FlattenMeasureFailed,
     ImageFlattenNoDisk,
     flatten_image_on_host,
     flatten_lease_release_command,
@@ -9044,10 +9045,10 @@ class DockerService:
                         current_step = "flatten_wait"
                         try:
                             locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:
-                            locked_df_error = exc  # the sizing's measurement-failure fallback, not an abort
+                        except FlattenMeasureFailed as exc:
+                            # lock held and mark written: the sizing's measurement-failure fallback;
+                            # a lock or mark failure propagates and stops the create
+                            locked_df_error = exc
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
