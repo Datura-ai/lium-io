@@ -745,27 +745,29 @@ class _KilledPopen(_FakePopen):
         return 137
 
 
+@pytest.mark.parametrize("action", ["backup", "restore"])
 @pytest.mark.parametrize(
     ("oom_killed", "message"),
-    [("true", "^backup ran out of memory$"), ("false", r"^backup helper was killed \(often out of memory\)$")],
+    [("true", " ran out of memory$"), ("false", r" helper was killed \(often out of memory\)$")],
 )
 def test_killed_helper_reports_oom_only_when_docker_says_so(
-    monkeypatch: pytest.MonkeyPatch, oom_killed: str, message: str
+    monkeypatch: pytest.MonkeyPatch, oom_killed: str, message: str, action: str
 ) -> None:
-    operation = StorageOperationSpec.from_mapping(_operation_payload())
-    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
-    runner = ResticStorageRunner(operation, workspace)
     calls: list[list[str]] = []
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
-        stdout = f"{oom_killed}\n" if "inspect" in command else "[]"
+        stdout = f"{oom_killed}\n" if "inspect" in command else json.dumps([{"id": SNAPSHOT_ID}])
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
+    monkeypatch.setattr("storage.workspace.subprocess.run", fake_run)  # restore's empty-target check
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
     monkeypatch.setattr("storage.restic.subprocess.Popen", _KilledPopen)
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action=action))
+    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
+    runner = ResticStorageRunner(operation, workspace)
 
-    with pytest.raises(ResticOperationError, match=message):
+    with pytest.raises(ResticOperationError, match=f"^{action}{message}"):
         runner.run()
     assert calls[-1][1:3] == ["rm", "--force"]
 

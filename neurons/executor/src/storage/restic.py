@@ -448,6 +448,12 @@ class ResticStorageRunner:
             raise ResticOperationError("restore requires a snapshot ID")
         command, cwd = self._restore_execution_command(snapshot_id)
         exit_code, _ = self._stream_command(command, cwd)
+        if exit_code == SIGKILL_EXIT:
+            raise ResticOperationError(
+                "restore ran out of memory"
+                if self._helper_oom_killed
+                else "restore helper was killed (often out of memory)"
+            )
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
         self._events.stage("FINALIZING")
