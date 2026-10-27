@@ -560,4 +560,8 @@ def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> Non
     command = raised.value.args[0]
     name = command[command.index("--name") + 1]
     assert command[:3] == ["docker", "run", "--rm"] and name.startswith("lium_capability_check_")
+    # the exact name the stale cleanup removes by, and nothing looser
+    from services.container_cleanup import never_started_check_containers
+
+    assert never_started_check_containers(f"a1 {name}") == ["a1"]
     assert removed == [["docker", "rm", "-f", name]]

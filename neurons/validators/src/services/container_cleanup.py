@@ -181,25 +181,20 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
     return label if label == container_name else ""
 
 
-# The machine scrape's two capability checks (machine_scrape.run_capability_check): named since
-# DAH-5192; before that unnamed, so recognised by the exact check, the executor image running
-# `nvidia-smi`. Only never-started (Created) ones are removed: a running one is a check in progress.
-CAPABILITY_CHECK_NAME_PREFIX = "lium_capability_check_"
-CAPABILITY_CHECK_IMAGE = "daturaai/compute-subnet-executor:latest"
-LIST_CREATED_CONTAINERS = (
-    "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}} {{.Image}} {{.Command}}'"
-)
+# The machine scrape's two capability checks (machine_scrape.run_capability_check), named since DAH-5192.
+# Only the exact name it gives counts: a provider's lookalike name, or an unnamed executor-image
+# diagnostic of theirs, is never removed. Only never-started (Created) ones go: a running one is a check
+# in progress.
+CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
+LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
 
 
 def never_started_check_containers(listing: str) -> list[str]:
-    ids: list[str] = []
-    for fields in (line.split(None, 3) for line in listing.splitlines()):
-        if len(fields) == 4 and (
-            fields[1].startswith(CAPABILITY_CHECK_NAME_PREFIX)
-            or (fields[2] == CAPABILITY_CHECK_IMAGE and fields[3].strip().strip('"') == "nvidia-smi")
-        ):
-            ids.append(fields[0])
-    return ids
+    return [
+        fields[0]
+        for fields in (line.split() for line in listing.splitlines())
+        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1])
+    ]
 
 
 class ContainerCleanup:
