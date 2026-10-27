@@ -474,6 +474,10 @@ async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, m
         return inner(cmd, *args, **kwargs)
 
     ssh.run = AsyncMock(side_effect=_dies_after_park)
+    # the cleanup's retry_ssh_command retries the dead session 5 times 10 s apart: 40 s of CI per run for nothing
+    monkeypatch.setattr(
+        "services.docker_service.retry_ssh_command", lambda *a, **k: retry_ssh_command(*a, **{**k, "wait_seconds": 0})
+    )
 
     result = await _run(svc, payload)
 
