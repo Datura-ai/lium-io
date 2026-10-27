@@ -17,7 +17,7 @@ jobs:
       TARGET_FILE: "docker-compose.app.dev.yml"
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
       # One OCI index for x86 and ARM (GB300 Grace) hosts; docker_build.sh / docker_runner_build.sh build it
-      # with buildx and the publish scripts push it with skopeo. Prod follows once a dev image runs on both.
+      # with buildx and the publish scripts push it with skopeo.
       PLATFORMS: "linux/amd64,linux/arm64"
     permissions:
       contents: read
