@@ -6824,8 +6824,11 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
         host_probe: VolumeHostProbe | None = None,
+        locked_df_avail_bytes: int | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure.
 
         With `host_probe` (DAH-3240) the fresh path reads DockerRootDir,
         df and the vloopback volume names from the probe instead of running three commands;
@@ -6860,15 +6863,18 @@ class DockerService:
             )
 
         try:
+            df_avail_bytes = locked_df_avail_bytes
             if host_probe is not None and host_probe.df_avail_bytes is not None:
                 docker_root_dir = host_probe.docker_root_dir
-                df_avail_bytes = host_probe.df_avail_bytes
+                if df_avail_bytes is None:
+                    df_avail_bytes = host_probe.df_avail_bytes
                 existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
                     ssh_client, host_probe.vloopback_volume_names
                 )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                if df_avail_bytes is None:
+                    df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
         except asyncio.CancelledError:
             raise
@@ -8272,7 +8278,6 @@ class DockerService:
             )
             early_host_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
             early_volume_probe: asyncio.Task[AnswerWithOwnDuration] | None = None
-            probes_not_before = time.monotonic()  # no early probe measures before this
             # DAH-3980: a customer's create removes every filler (DAH-3706). The kill is started after the
             # fail-closed host reads below (never before — a refused probe must leave the filler in place),
             # so it still runs beside the image inspect instead of after it. Any other create (a filler
@@ -9023,16 +9028,15 @@ class DockerService:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (a failed probe → None → the per-command path below).
                     volume_probe: VolumeHostProbe | None = None
-                    flatten_finished = False
+                    locked_df_avail_bytes: int | None = None
                     if measures_host:
-                        # a flatten still copying (its pod deleted meanwhile) takes disk this sizing would
-                        # otherwise grant: wait for it, after the early probe's channel closed (MaxSessions=1)
+                        # a copy (its pod maybe deleted meanwhile) takes disk this sizing would otherwise
+                        # grant: size on df measured under the flatten lock, never on a probe that may
+                        # predate the copy; after the early probe's channel closed (MaxSessions=1)
                         if early_volume_probe is not None and not early_volume_probe.cancelled():
                             await early_volume_probe
                         current_step = "flatten_wait"
-                        flatten_finished = await wait_for_node_flatten(
-                            ssh_client, int(time.monotonic() - probes_not_before) + 2
-                        )
+                        locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
@@ -9042,7 +9046,6 @@ class DockerService:
                             early_volume_probe is not None
                             and image_present
                             and not cleanup_changed_host
-                            and not flatten_finished
                         ):
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
@@ -9065,6 +9068,7 @@ class DockerService:
                         log_tag=log_tag,
                         log_extra=default_extra,
                         host_probe=volume_probe,
+                        locked_df_avail_bytes=locked_df_avail_bytes,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

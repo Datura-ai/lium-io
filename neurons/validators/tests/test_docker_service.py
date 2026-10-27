@@ -26,6 +26,7 @@ from services.docker_service import (
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
     NoUsableLoopbackPluginError,
+    VolumeHostProbe,
     VolumeMinSizeError,
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
@@ -5693,6 +5694,22 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_probe", [True, False])
+async def test_resolve_volume_sizing_takes_the_free_disk_measured_under_the_flatten_lock(docker_service, with_probe):
+    # an earlier probe (or a df outside the lock) may predate an image copy; the locked measure wins
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=900 * _SIZING_GB, volume_ls_stdout="", volume_inspect_stdout="")
+    probe = VolumeHostProbe("/var/lib/docker", 900 * _SIZING_GB, [], True) if with_probe else None
+
+    result = await docker_service.resolve_volume_sizing(
+        ssh_client, payload, "tag", {}, host_probe=probe, locked_df_avail_bytes=600 * _SIZING_GB
+    )
+
+    assert result.path == "fresh"
+    assert result.df_avail_bytes == 600 * _SIZING_GB
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_fresh_caps_volume_at_ext4_file_limit(docker_service):
     # Arrange: ~28 TiB free, whole node -> 2/3 slice is ~18 TiB, above the 16 TiB ext4 file cap.
     payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)
@@ -5851,9 +5868,9 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
     # slice 590GB (request cap 500*1.5=750GB does not bind) -> volume 393, storage 196.
     def ssh_run(command, **kwargs):
-        if "docker info" in command:
+        if "docker info" in command and "flock" not in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
-        if "df -P -B1 /hostfs" in command:
+        if "df -P -B1 /hostfs" in command:  # also the measure under the flatten lock
             return _make_ssh_command_result(
                 stdout=(
                     "Filesystem           1-blocks       Used Available Capacity Mounted on\n"

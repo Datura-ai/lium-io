@@ -318,38 +318,58 @@ def test_timeout_bounds_both_sides_of_the_copy():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flatten_running", [False, True])
-async def test_a_replacement_waits_for_a_running_flatten_before_it_measures_the_disk(tmp_path, monkeypatch, flatten_running):
-    # review: 120 GiB free; rental A was deleted while its 30 GiB copy is still being written. Rental B
-    # measures the disk only after the copy landed, so all it is granted stays backed.
+@pytest.mark.parametrize("copy", ["none", "running", "ended_after_the_early_probe"])
+async def test_a_replacement_sizes_on_disk_measured_under_the_flatten_lock(tmp_path, monkeypatch, copy):
+    # review: 120 GiB free; rental A was deleted while its 30 GiB copy is written. Rental B's early probe may
+    # have measured 120 before the copy landed (also when it ended before B's wait): B sizes on the free disk
+    # read under the lock the copy holds, so all it is granted stays backed.
     lock, used = tmp_path / "lock", tmp_path / "used"
-    used.write_text("0")
-    lock.touch()
-    os.utime(lock, (time.time() - 60, time.time() - 60))  # the last flatten ended before any probe
+    used.write_text("30" if copy == "ended_after_the_early_probe" else "0")
+    gib = 1024**3
+    fake = tmp_path / "docker"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  info) echo /var/lib/docker ;;\n"
+        f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 %s 1%% /hostfs\\n' "
+        f"$(( (120 - $(cat {used})) * {gib} )) ;;\n"
+        "esac\n"
+    )
+    fake.chmod(0o755)
     monkeypatch.setattr(image_flatten, "FLATTEN_LOCK_PATH", str(lock))
     monkeypatch.setattr(image_flatten, "FLATTEN_SIZED_PATH", str(tmp_path / "sized"))
     env = {"PATH": os.environ["PATH"]}
-    if flatten_running:
-        copy = subprocess.Popen(["flock", str(lock), "sh", "-c", f"sleep 1; echo 30 > {used}"], env=env)
+    if copy == "running":
+        lock.touch()
+        running = subprocess.Popen(["flock", str(lock), "sh", "-c", f"sleep 1; echo 30 > {used}"], env=env)
         while subprocess.run(["flock", "-n", str(lock), "true"], env=env).returncode == 0:
             await asyncio.sleep(0.01)
 
     async def run(command, check=False, timeout=None):
-        return Mock(exit_status=subprocess.run(["sh", "-c", command], env=env).returncode)
+        done = subprocess.run(
+            ["sh", "-c", command.replace("/usr/bin/docker", str(fake))], env=env, capture_output=True, text=True
+        )
+        return Mock(exit_status=done.returncode, stdout=done.stdout)
 
-    assert await image_flatten.wait_for_node_flatten(Mock(run=run), 0) is flatten_running
-    granted_gib = 120 - int(used.read_text())  # B's sizing reads df now
-    assert granted_gib + int(used.read_text()) <= 120
-    assert granted_gib == (90 if flatten_running else 120)
-    if flatten_running:
-        copy.wait()
+    free = await image_flatten.wait_for_node_flatten(Mock(run=run))
+    assert free + int(used.read_text()) * gib <= 120 * gib
+    assert free == (120 if copy == "none" else 90) * gib
+    assert (tmp_path / "sized").exists()
+    if copy == "running":
+        running.wait()
+
+
+@pytest.mark.asyncio
+async def test_a_node_without_flock_runs_no_flatten_and_gives_no_locked_measure():
+    ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=0, stdout="")))
+    assert await image_flatten.wait_for_node_flatten(ssh) is None
 
 
 @pytest.mark.asyncio
 async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
     ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=1)))
     with pytest.raises(RuntimeError, match="image copy"):
-        await image_flatten.wait_for_node_flatten(ssh, 0)
+        await image_flatten.wait_for_node_flatten(ssh)
 
 
 def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_other_creates(tmp_path, monkeypatch):
@@ -358,26 +378,12 @@ def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_oth
     monkeypatch.setattr(image_flatten, "FLATTEN_SIZED_PATH", str(tmp_path / "sized"))
     env = {"PATH": os.environ["PATH"]}
     mark = subprocess.run(["sh", "-c", image_flatten.flatten_sized_mark_command()], capture_output=True, text=True)
-    assert _sh(image_flatten.flatten_wait_command(0).replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock")), tmp_path) in (0, 3)
+    _flatten_script(tmp_path)  # writes the fake docker
+    wait = image_flatten.flatten_wait_command().replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock"))
+    assert _sh(wait.replace("/usr/bin/docker", str(tmp_path / "docker")), tmp_path) == 0
     result = subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), capture_output=True, env=env)
     assert result.returncode == FLATTEN_NO_DISK_EXIT and b"sized its disk" in result.stderr
     assert "create" not in [c.split()[0] for c in _calls(tmp_path)]
     # read after B's mark: B is visible to A's own check for other creates, so the copy goes ahead
     mark = subprocess.run(["sh", "-c", image_flatten.flatten_sized_mark_command()], capture_output=True, text=True)
     assert subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), env=env).returncode == 0
-
-
-def test_a_flatten_that_ended_after_the_early_probe_makes_the_wait_ask_for_a_fresh_probe(tmp_path):
-    # review: B's early probe measured while A copied; A ended before B's wait, so the lock is free again
-    lock = tmp_path / "lock"
-    command = image_flatten.flatten_wait_command(30).replace(FLATTEN_LOCK_PATH, str(lock))
-    command = command.replace(image_flatten.FLATTEN_SIZED_PATH, str(tmp_path / "sized"))
-    lock.touch()  # a flatten exits by touching the lock: ended 0 s ago, within the 30 s probe age
-    assert _sh(command, tmp_path) == 3
-    old = time.time() - 60
-    os.utime(lock, (old, old))  # ended before the probe measured
-    assert _sh(command, tmp_path) == 0
-    assert (tmp_path / "sized").exists()
-    # every flatten exit marks its end on the lock file (this one refuses: B marked the node sized)
-    subprocess.run(_flatten_script(tmp_path), env={"PATH": os.environ["PATH"]})
-    assert _sh(command, tmp_path) == 3
