@@ -2,11 +2,11 @@
 
 The validator↔backend wire, once. Pydantic v2 models for:
 
-- `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 27 types: cycle results and scores, the per-cycle pod-states report, and the answers to container requests).
-- `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 16 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
+- `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 28 types: cycle results and scores, the per-cycle pod-states report, and the answers to container requests).
+- `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 17 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.12.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.16.0`) is semver over the wire.
 
 ## Using it
 
@@ -56,6 +56,10 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `1.9.0` — `ContainerWarningCode.DockerInDockerDisabled`: the container was created with its external volume attached, but without nested Docker on this node. A reader that requires nested Docker can refuse the container instead of handing it over without it.
 - `1.11.0` — `ContainerCreateRequest.build_context_url` and `ContainerCreateRequest.build_context_sha256` (optional): a gzipped tar the validator downloads and checks against the sha256 (hex), then unpacks as the build context of `dockerfile_content`. A validator that does not take build contexts refuses such a request instead of building without the files.
 - `1.12.0` — `RentedExecutorsResponse.renter_hardware_fault_executor_ids` (optional, default empty): the nodes whose rentals drew hardware-fault reports from at least two distinct renters in the backend's report window; the validator owes each a post-rental GPU recheck.
+- `1.13.0` — `command_id` (optional, default empty) on every `ServerRequest`; a validator that knows it answers a repeat from the first run instead of running it again.
+- `1.14.0` — `command_id` (optional, default empty) on `SshPubKeyAdded` and `FailedContainerRequest`: a validator that knows it echoes the `AddSshPublicKeyRequest`'s `command_id`, so the backend can tell which send an answer confirms.
+- `1.15.0` — `RestoreContainerRequest.recovery` (optional, default false): a re-dispatch of a restore that may already be running (after a reconnect or a redelivered create); the validator does not report its dispatch failure. An older validator ignores it.
+- `1.16.0` — `ResetPodGpuRequest` (backend → validator; `local_volume_path` optional, needed for a pod with an encrypted volume) and its answer `PodGpuResetResult` with `GpuResetErrorCode` and `GpuResetOutcome` (a renter resets their pod's GPUs; the validator stops the container, runs `nvidia-smi -r -i` on the pod's GPUs only and starts it again).
 - `1.0.0` — first release.
 
 ## Tests

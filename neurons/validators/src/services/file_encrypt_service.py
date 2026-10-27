@@ -119,9 +119,12 @@ ORIGINAL_KEYS = {
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
     # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
     'hard_disk_disk_type': "disk_type",
+    # DAH-5045: used size of the engy_cache_* volumes, in GB
+    'hard_disk_engy_cache_used_gb': "engy_cache_used_gb",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
+    'data_machine_arch': "machine_arch",
     'data_ram': "ram",
     'data_hard_disk': "hard_disk",
     "data_docker_cfg_scrape_error": "docker_cfg_scrape_error",
@@ -178,6 +181,8 @@ ORIGINAL_KEYS = {
     'data_boot_id': "boot_id",
     'data_egress_ip': "egress_ip",
     'data_container_cap_eff': "container_cap_eff",
+    'data_executor_pid_mode_scrape_error': "executor_pid_mode_scrape_error",
+    'data_executor_pid_mode': "executor_pid_mode",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
     # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
@@ -327,9 +332,11 @@ class FileEncryptService:
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
             'hard_disk_disk_type': "",
+            'hard_disk_engy_cache_used_gb': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",
+            'data_machine_arch': "",
             'os_scrape_error': "",
             'data_network': "",
             'data_hard_disk': "",
@@ -389,6 +396,8 @@ class FileEncryptService:
             'data_boot_id': "",
             'data_egress_ip': "",
             'data_container_cap_eff': "",
+            'data_executor_pid_mode_scrape_error': "",
+            'data_executor_pid_mode': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)

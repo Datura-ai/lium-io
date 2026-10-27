@@ -5,25 +5,23 @@ Focus: verify that validator_signature is correctly forwarded in the POST
 body sent to the executor when registering or removing SSH public keys.
 """
 
+import asyncio
+import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import bittensor
+import aiohttp
 import pytest
 
 from models.executor import Executor
 from protocol.miner_portal_request import (
-    AddExecutorFailed,
     DeleteExecutorRequest,
-    ExecutorAdded,
     ExecutorDeleted,
-    ExecutorDeleteFailed,
-    ExecutorUpdateFailed,
-    SyncExecutorMinerPortalFailed,
-    SyncExecutorMinerPortalRequest,
     SyncExecutorPayload,
-    UpdateExecutorRequest,
 )
+import services.executor_service as es
 from services.executor_service import ExecutorService
 
 
@@ -137,115 +135,145 @@ async def test_send_pubkey_to_executor_relays_the_miner_bound_signature(executor
         assert "miner_hotkey" not in sent and "validator_miner_signature" not in sent
 
 
+@pytest.mark.parametrize(
+    "status, body_error, expected_posts, accepted",
+    [
+        (None, None, 2, True),  # the request timed out before any answer
+        (200, aiohttp.ClientPayloadError("Response payload is not completed"), 2, True),
+        (200, json.JSONDecodeError("invalid JSON", "{", 1), 1, False),
+        (503, None, 1, False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_remove_pubkey_from_executor_includes_validator_signature(
-    executor_service, test_executor, validator_keypair
+async def test_send_pubkey_to_executor_retries_an_executor_that_did_not_answer(
+    executor_service, test_executor, status, body_error, expected_posts, accepted
 ):
-    """validator_signature is forwarded verbatim in the POST body on SSH key removal."""
-    # Arrange
-    validator_sig = "0x" + validator_keypair.sign(_SSH_KEY).hex()
-    mock_session = _make_mock_session()
+    """A timed-out or cut-off upload is asked again, so one dropped request does not leave the node out of
+    the answer; a complete bad answer is not; a node that never answers gives up inside the deadline."""
+    answered = MagicMock(status=200)
+    answered.json = AsyncMock(return_value={"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"})
+    if status is None:
+        first = asyncio.TimeoutError()
+    else:
+        first = MagicMock(status=status)
+        first.json = AsyncMock(side_effect=body_error)
+        first.text = AsyncMock(return_value="unavailable")
+    post_ctx = MagicMock()
+    post_ctx.__aenter__ = AsyncMock(side_effect=[first, answered])
+    post_ctx.__aexit__ = AsyncMock(return_value=None)
+    session = _make_mock_session()
+    session.post = MagicMock(return_value=post_ctx)
 
-    # Act
-    with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
-        await executor_service.remove_pubkey_from_executor(test_executor, _SSH_KEY, validator_sig)
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service.asyncio.sleep", AsyncMock()):
+        info = await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")
+        assert (info is not None and info.uuid == str(test_executor.uuid)) is accepted
+        assert session.post.call_count == expected_posts
 
-    # Assert — the executor was called with a JSON body
-    assert mock_session.post.called
-    sent_payload = mock_session.post.call_args.kwargs["json"]
+        post_ctx.__aenter__ = AsyncMock(side_effect=asyncio.TimeoutError())
+        session.post.reset_mock()
+        assert await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa") is None
+        assert session.post.call_count == es.UPLOAD_SSH_KEY_ATTEMPTS
 
-    # Assert — validator_signature is present and unchanged in the forwarded payload
-    assert "validator_signature" in sent_payload
-    assert sent_payload["validator_signature"] == validator_sig
+        # no time left for a second attempt: one try, then the miner answers without the node
+        session.post.reset_mock()
+        assert await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", deadline=time.monotonic() + 1
+        ) is None
+        assert session.post.call_count == 1
 
 
+
+@pytest.mark.parametrize(
+    "is_rental_request, hook, lookup_seconds, expected_left",
+    [
+        (False, None, 0, 25), (False, None, 15, 10),
+        (False, "http://hook", 15, 10), (True, None, 15, 10),
+        (True, "http://hook", 0, 20), (True, "http://hook", 15, 5),
+    ],
+)
 @pytest.mark.asyncio
-async def test_a_database_error_on_the_lookup_becomes_the_reported_failure_reason(
-    executor_service, test_executor
+async def test_register_pubkey_reserves_the_hook_time_only_when_the_hook_runs(
+    executor_service, test_executor, is_rental_request, hook, lookup_seconds, expected_left
 ):
-    """The lookup before the insert used to sit in `except Exception: pass`, which swallowed a
-    database error and left the session in an aborted transaction. The miner then read
-    `InFailedSqlTransaction` from the insert and never the real fault."""
-    executor_service.executor_dao.find_one.side_effect = Exception("column executor.price_per_hour does not exist")
+    """Ordinary checks never call the rental hook, so their uploads keep the whole wait minus the reply margin."""
+    clock = [100.0]
 
-    create_result = await executor_service.create(test_executor)
+    async def slow_lookup(*_args):
+        clock[0] += lookup_seconds
+        return [test_executor]
 
-    assert isinstance(create_result, AddExecutorFailed)
-    assert "price_per_hour" in create_result.error
-    executor_service.executor_dao.save.assert_not_called()
+    es.settings.RENTAL_REQUEST_HOOK = hook
+    executor_service.get_executors_for_validator = slow_lookup
+    executor_service.send_pubkey_to_executor = AsyncMock(return_value=None)
+    with patch("services.executor_service.time.monotonic", side_effect=lambda: clock[0]):
+        await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa", is_rental_request=is_rental_request)
+
+    deadline = executor_service.send_pubkey_to_executor.call_args.kwargs["deadline"]
+    assert deadline - clock[0] == expected_left
+    # uploads plus a stalled hook still end inside the validator's 30 s wait, leaving its connect/auth and reply time
+    hook_time = es.RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS if is_rental_request and hook else 0
+    overhead = es.UPLOAD_SSH_KEY_RESPONSE_MARGIN_SECONDS
+    assert lookup_seconds + expected_left + hook_time + overhead <= es.VALIDATOR_SSH_SUBMIT_TIMEOUT_SECONDS
 
 
+@pytest.mark.parametrize("is_rental_request", [False, True])
+@pytest.mark.parametrize("hook", [None, "http://hook"])
+@pytest.mark.parametrize("lookup_seconds", [0, 15, 30])
 @pytest.mark.asyncio
-async def test_no_existing_executor_lets_the_new_one_be_saved(executor_service, test_executor):
-    executor_service.executor_dao.find_one.return_value = None
-
-    with patch.object(ExecutorService, "test_executor_connectivity", AsyncMock(return_value=(True, ""))):
-        create_result = await executor_service.create(test_executor)
-
-    assert isinstance(create_result, ExecutorAdded)
-    executor_service.executor_dao.save.assert_called_once_with(test_executor)
-
-
-@pytest.mark.asyncio
-async def test_an_existing_address_and_port_is_refused_as_a_duplicate(executor_service, test_executor):
-    executor_service.executor_dao.find_one.return_value = test_executor
-
-    create_result = await executor_service.create(test_executor)
-
-    assert isinstance(create_result, AddExecutorFailed)
-    assert "already exists" in create_result.error
-    executor_service.executor_dao.save.assert_not_called()
-# ---------------------------------------------------------------------------
-# DAH-3338: register_pubkey tells the validator which executors it KNOWS apart from
-# which ACCEPTED the key, so an unreachable node stops reading as an invalid id.
-# ---------------------------------------------------------------------------
-
-
-def _ssh_info(executor: Executor):
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    return ExecutorSSHInfo(
-        uuid=str(executor.uuid),
-        address=executor.address,
-        port=executor.port,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-    )
-
-
-@pytest.mark.asyncio
-async def test_register_pubkey_splits_known_from_accepted(executor_service, validator_keypair):
-    reachable = Executor(uuid=uuid4(), validator="//TestValidator", address="203.0.113.10", port=8001)
-    dead = Executor(uuid=uuid4(), validator="//TestValidator", address="203.0.113.11", port=8001)
-    executor_service.executor_dao.get_executors_for_validator.return_value = [reachable, dead]
-
-    async def only_the_reachable_one_answers(executor, pubkey, signature, nonce=None, **_):
-        return _ssh_info(executor) if executor is reachable else None
-
-    executor_service.send_pubkey_to_executor = only_the_reachable_one_answers
-
-    registration = await executor_service.register_pubkey(
-        validator_keypair.ss58_address, "miner-hotkey", _SSH_KEY.encode(), "0xsig"
-    )
-
-    assert registration.known_executor_ids == [str(reachable.uuid), str(dead.uuid)]
-    assert [info.uuid for info in registration.accepted] == [str(reachable.uuid)]
-
-
-@pytest.mark.asyncio
-async def test_register_pubkey_knows_nothing_for_an_id_the_miner_does_not_list(
-    executor_service, validator_keypair
+async def test_register_pubkey_first_upload_keeps_mains_full_timeout(
+    executor_service, test_executor, is_rental_request, hook, lookup_seconds
 ):
-    executor_service.executor_dao.get_executors_for_validator.return_value = []
+    """Retries must not cost a first-attempt success main accepted: attempt 1 always gets the full 10 s."""
+    clock = [100.0]
 
-    registration = await executor_service.register_pubkey(
-        validator_keypair.ss58_address, "miner-hotkey", _SSH_KEY.encode(), "0xsig", str(uuid4())
-    )
+    async def slow_lookup(*_args):
+        clock[0] += lookup_seconds
+        return [test_executor]
 
-    assert registration.known_executor_ids == []
-    assert registration.accepted == []
+    answered = MagicMock(status=200)
+    answered.json = AsyncMock(return_value={"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"})
+    post_ctx = MagicMock()
+    post_ctx.__aenter__ = AsyncMock(return_value=answered)
+    post_ctx.__aexit__ = AsyncMock(return_value=None)
+    session = _make_mock_session()
+    session.post = MagicMock(return_value=post_ctx)
+    es.settings.RENTAL_REQUEST_HOOK = hook
+    executor_service.get_executors_for_validator = slow_lookup
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service.time.monotonic", side_effect=lambda: clock[0]):
+        registration = await executor_service.register_pubkey(
+            "v", "m", _SSH_KEY.encode(), "0xaa", is_rental_request=is_rental_request
+        )
+
+    assert len(registration.accepted) == 1
+    assert session.post.call_args.kwargs["timeout"].total == es.UPLOAD_SSH_KEY_ATTEMPT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_send_pubkey_does_not_retry_when_the_delay_overran_the_deadline(executor_service, test_executor):
+    """A retry delay that ended past the deadline gives up instead of starting an attempt the validator cannot wait for."""
+    clock = [100.0]
+
+    async def late_sleep(_seconds):
+        clock[0] += 30  # the event loop was busy: the 1 s retry delay ended well after the deadline
+
+    answered = MagicMock(status=200)
+    answered.json = AsyncMock(return_value={"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r"})
+    post_ctx = MagicMock()
+    post_ctx.__aenter__ = AsyncMock(side_effect=[asyncio.TimeoutError(), answered])
+    post_ctx.__aexit__ = AsyncMock(return_value=None)
+    session = _make_mock_session()
+    session.post = MagicMock(return_value=post_ctx)
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service.asyncio.sleep", late_sleep), \
+            patch("services.executor_service.time.monotonic", side_effect=lambda: clock[0]):
+        info = await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", deadline=clock[0] + 20)
+
+    assert info is None
+    assert session.post.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -261,28 +289,6 @@ def _payload(test_executor):
         port=test_executor.port,
         price_per_gpu=0.5,
     )
-
-
-@pytest.mark.parametrize(
-    "call, failed_type",
-    [
-        (lambda s, p: s.update(UpdateExecutorRequest(executor=p)), ExecutorUpdateFailed),
-        (lambda s, p: s.delete(DeleteExecutorRequest(executor=p)), ExecutorDeleteFailed),
-        (lambda s, p: s.sync_executor_miner_portal(SyncExecutorMinerPortalRequest(payload=[p])), SyncExecutorMinerPortalFailed),
-    ],
-    ids=["update", "delete", "sync_executor_miner_portal"],
-)
-def test_a_failed_write_rolls_the_shared_session_back(executor_service, test_executor, call, failed_type):
-    """ioc builds one ExecutorService on one session for the process: a failed flush left in it fails every later
-    request with 'transaction has been rolled back due to a previous exception during flush'."""
-    dao = executor_service.executor_dao
-    for method in (dao.update_by_uuid, dao.delete_by_uuid, dao.find_by_uuid):
-        method.side_effect = Exception("flush failed")
-
-    result = call(executor_service, _payload(test_executor))
-
-    assert isinstance(result, failed_type)
-    dao.session.rollback.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

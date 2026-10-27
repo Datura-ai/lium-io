@@ -1,12 +1,18 @@
 import asyncio
 import json
 import logging
+import os
 import time
+from contextlib import suppress
+from contextvars import ContextVar
 from typing import NoReturn
+from uuid import uuid4
 
 import aiohttp
 import bittensor
 import pydantic
+import redis.asyncio as aioredis
+import redis.exceptions
 import tenacity
 import websockets
 from payload_models.payloads import (
@@ -15,6 +21,7 @@ from payload_models.payloads import (
     CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
+    BaseValidatorResponse,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
@@ -41,6 +48,8 @@ from payload_models.payloads import (
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
     InstallJupyterServerRequest,
+    PodGpuResetResult,
+    ResetPodGpuRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
 )
@@ -61,6 +70,7 @@ from protocol.vc_protocol.validator_requests import (
     LogStreamRequest,
     PodStatesReport,
     RentedMachineRequest,
+    ResetVerifiedJobEvidence,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
@@ -72,9 +82,11 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import create_steps_after_reply, inflight_creates
+from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
+    BackendCommand,
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
     GPU_ESTIMATES_CHANNEL,
@@ -97,6 +109,20 @@ WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
+# DAH-5177: one connector leads (talks to the backend, runs the restart sweep) at a time. A rollout starts the new
+# pod beside the old one; it does its ~60 s of startup, marks itself ready, then waits here until the old one is gone,
+# so the backend loses the validator for seconds, not the whole startup.
+CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
+CONNECTOR_LEAD_LOCK_TTL_SECONDS = 15
+CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
+
+
+def mark_connector_unready() -> None:
+    with suppress(FileNotFoundError):
+        os.remove(CONNECTOR_READY_FILE)
+
+
+command_responses: ContextVar[list[str] | None] = ContextVar("command_responses", default=None)
 
 
 class OutgoingMessages(list[DeliveryStamps]):
@@ -106,6 +132,8 @@ class OutgoingMessages(list[DeliveryStamps]):
         self.appended = asyncio.Event()
 
     def append(self, message: DeliveryStamps) -> None:
+        if (responses := command_responses.get()) is not None:
+            responses.append(message.model_dump_json())
         super().append(message)
         self.appended.set()
 
@@ -196,6 +224,7 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         self.subtensor_client = await SubtensorClient.initialize(chain_reads_in_thread=True)
+        await self.take_connector_lead()
 
         try:
             await self.fail_creates_cut_off_by_restart()
@@ -206,6 +235,10 @@ class ComputeClient:
                     extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
                 )
             )
+        try:
+            await self.miner_service.redis_service.clear_running_backend_commands()
+        except Exception:
+            logger.exception("Failed to clear running backend commands on connector start")
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
@@ -432,6 +465,31 @@ class ComputeClient:
                         async with self.lock:
                             self.message_queue.append(inspector_event)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
+                        # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
+                        # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
+                        evidence = ResetVerifiedJobEvidence.model_validate(data.get("evidence") or {})
+                        reset_marks = (
+                            self.miner_service.redis_service,
+                            data["miner_hotkey"],
+                            data["executor_uuid"],
+                            evidence.pod_id,
+                        )
+                        if reset_caused(data.get("check_id"), data.get("reason_code"), evidence) and (
+                            await renter_gpu_reset_in_progress(*reset_marks)
+                            or await renter_gpu_reset_recent(*reset_marks)
+                        ):
+                            logger.info(
+                                _m(
+                                    "Verified-job reset not sent: renter GPU reset in progress",
+                                    extra=get_extra_info({
+                                        **self.logging_extra,
+                                        "miner_hotkey": data["miner_hotkey"],
+                                        "executor_uuid": data["executor_uuid"],
+                                        "check_id": data.get("check_id"),
+                                    }),
+                                )
+                            )
+                            continue
                         reset_request = ResetVerifiedJobRequest(
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
@@ -844,7 +902,91 @@ class ComputeClient:
         miner = await self.subtensor_client.get_miner(hotkey)
         return miner.axon_info
 
-    async def miner_driver(
+    async def miner_driver(self, job_request: BaseServerRequest):
+        if not job_request.command_id:
+            return await self._run_miner_job(job_request)
+        command_id = job_request.command_id
+        redis_service = self.miner_service.redis_service
+        claim = BackendCommand(state="running", owner=uuid4().hex).model_dump_json()
+        try:
+            existing = await redis_service.claim_backend_command(command_id, claim)
+        except Exception:
+            logger.exception(_m(
+                "Backend command dedup failed open",
+                extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
+            ))
+            return await self._run_miner_job(job_request)
+        if existing is not None:
+            return await self._handle_backend_command_duplicate(job_request, existing)
+
+        responses: list[str] = []
+        token = command_responses.set(responses)
+        heartbeat = asyncio.create_task(self._refresh_backend_command(command_id, claim))
+        succeeded = False
+        try:
+            result = await self._run_miner_job(job_request)
+            succeeded = True
+            return result
+        finally:
+            command_responses.reset(token)
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+            # A failure without any answer releases the claim so a retry can run.
+            value = (
+                BackendCommand(state="finished", responses=responses).model_dump_json()
+                if succeeded or responses
+                else ""
+            )
+            try:
+                await redis_service.update_backend_command(
+                    command_id, claim, value, settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+                )
+            except Exception:
+                logger.exception("Failed to finish backend command: %s", command_id)
+
+    async def _handle_backend_command_duplicate(
+        self, job_request: BaseServerRequest, existing: BackendCommand
+    ) -> None:
+        command_id = job_request.command_id
+        if existing.state == "finished":
+            try:
+                replies = [BaseValidatorResponse.parse(raw) for raw in existing.responses]
+            except Exception:
+                logger.exception(_m(
+                    "Backend command reply replay failed open",
+                    extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
+                ))
+                await self._run_miner_job(job_request)
+                return
+            async with self.lock:
+                for reply in replies:
+                    self.message_queue.append(reply)
+        else:
+            logger.info(
+                _m(
+                    "Ignoring running backend command duplicate",
+                    extra=get_extra_info({
+                        **self.logging_extra,
+                        "command_id": command_id,
+                        "request_type": job_request.message_type.value,
+                    }),
+                )
+            )
+
+    async def _refresh_backend_command(self, command_id: str, claim: str) -> None:
+        ttl = settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
+        interval = min(settings.BACKEND_COMMAND_HEARTBEAT_SECONDS, ttl / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.miner_service.redis_service.update_backend_command(
+                    command_id, claim, claim, ttl
+                )
+            except Exception:
+                logger.exception("Failed to refresh backend command claim: %s", command_id)
+
+    async def _run_miner_job(
         self,
         job_request: ContainerCreateRequest
         | ContainerDeleteRequest
@@ -858,6 +1000,7 @@ class ComputeClient:
         | BackupContainerRequest
         | RestoreContainerRequest
         | InstallJupyterServerRequest
+        | ResetPodGpuRequest,
     ):
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
@@ -893,6 +1036,47 @@ class ComputeClient:
                 extra=get_extra_info({**self.logging_extra, "pod_id": pod_id, "error": str(exc)}),
             )
         )
+
+    async def take_connector_lead(self) -> None:
+        """Wait until no other connector leads, then lead while this process lives (DAH-5177).
+
+        Ready (the deployment lets the old pod go) only while waiting on the lock or leading: a Redis error retries
+        here, unready, instead of unwinding into start_process's full restart with the probe still passing."""
+        lock = aioredis.lock.Lock(
+            self.miner_service.redis_service.redis,
+            CONNECTOR_LEAD_LOCK_KEY,
+            timeout=CONNECTOR_LEAD_LOCK_TTL_SECONDS,
+            sleep=0.5,
+            thread_local=False,
+        )
+        extra = get_extra_info(self.logging_extra)
+        while True:
+            with open(CONNECTOR_READY_FILE, "w"):
+                pass
+            logger.info(_m("Waiting to lead the backend connection", extra=extra))
+            try:
+                await lock.acquire()
+                break
+            except redis.exceptions.RedisError as exc:
+                mark_connector_unready()
+                logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
+                await asyncio.sleep(1)
+        logger.info(_m("Leading the backend connection", extra=extra))
+        self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
+
+    async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
+        extra = get_extra_info(self.logging_extra)
+        while True:
+            await asyncio.sleep(CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3)
+            try:
+                await lock.reacquire()
+            except redis.exceptions.LockNotOwnedError:
+                # expired in a Redis outage or a stalled loop: lead on if nobody took over, else stop
+                if not await lock.acquire(blocking=False):
+                    logger.error(_m("Another connector took the lead; exiting", extra=extra))
+                    os._exit(1)
+            except Exception as exc:
+                logger.warning(_m("Could not renew the connector lead", extra={**extra, "error": str(exc)}))
 
     async def fail_creates_cut_off_by_restart(self) -> None:
         """DAH-4698: a create the previous connector was running when it died (every lium-io deploy recreates it) never
@@ -937,6 +1121,7 @@ class ComputeClient:
         | BackupContainerRequest
         | RestoreContainerRequest
         | InstallJupyterServerRequest
+        | ResetPodGpuRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -1040,6 +1225,8 @@ class ComputeClient:
             response: (
                 SshPubKeyAdded | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            # the backend matches the answer to its send by this id (a delayed answer must not confirm a later send)
+            response.command_id = job_request.command_id
 
             logger.info(
                 _m(
@@ -1099,6 +1286,13 @@ class ComputeClient:
             response: (
                 JupyterServerInstalled | JupyterInstallationFailed
             ) = await self.miner_service.handle_container(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, ResetPodGpuRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: PodGpuResetResult = await self.miner_service.handle_container(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

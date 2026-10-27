@@ -249,11 +249,37 @@ class StorageEventReporter:
                 )
                 retry_delay_seconds = min(retry_delay_seconds * 2, RETRY_BACKOFF_CAP_SECONDS)
 
-    def _url(self) -> str:
+    def renew_credentials(self) -> dict[str, str] | None:
+        """DAH-4945: fresh scoped credentials for this backup's repository, or None if refused"""
+        if self._spec.resource is not ReporterResource.BACKUP:
+            return None
+        for attempt in range(3):
+            try:
+                response = self._session.post(
+                    self._url("credentials"),
+                    headers={"Authorization": f"Bearer {self._spec.auth_token}"},
+                    timeout=30,
+                )
+                if getattr(response, "status_code", None) in (401, 404, 409, 410):
+                    return None
+                response.raise_for_status()
+                body = response.json()
+                keys = ("access_key_id", "secret_access_key", "session_token")
+                if isinstance(body, Mapping) and all(
+                    _optional_string(body.get(key)) for key in keys
+                ):
+                    return {key: body[key] for key in keys}
+                return None
+            except (requests.RequestException, ValueError):
+                if attempt < 2:
+                    self._sleeper(5.0 * (attempt + 1))
+        return None
+
+    def _url(self, endpoint: str = "progress") -> str:
         resource_path = (
             "backup-logs" if self._spec.resource is ReporterResource.BACKUP else "restore-logs"
         )
-        return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/progress"
+        return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/{endpoint}"
 
 
 def _first_integer(value: Mapping[str, object], *keys: str) -> int | None:

@@ -25,7 +25,10 @@ class DockerCommand:
             f"/usr/bin/docker run -d --rm --name {name} "
             f"{network_flag} docker.io/library/alpine:3.19 sh -c "
             f"'cat << \"{heredoc}\" > /tmp/nc.sh\n{script}\n{heredoc}\n"
-            f"timeout {timeout} sh /tmp/nc.sh'"
+            # `; exit $?`: as the last command sh would exec timeout, which execs the script as the
+            # container's PID 1, and PID 1 ignores timeout's SIGTERM; any port nobody fetched then kept
+            # the listener (and its port) up for hours. Not last, the script runs as a child and dies.
+            f"timeout {timeout} sh /tmp/nc.sh; exit $?'"
         )
 
     @staticmethod

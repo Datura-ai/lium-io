@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -22,7 +23,8 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
+import services.docker_service as docker_service_module
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -635,6 +637,27 @@ async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
     ]
 
 
+def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_removed_or_reconfigured():
+    # disable, rm, set or upgrade on a loopback plugin loses every volume whose backing file is in its rootfs
+    source = open(docker_service_module.__file__).read()
+
+    targets = re.findall(r"""docker plugin (?:disable|rm|remove|set|upgrade|push|create) ([^\s"']+)""", source)
+
+    assert set(targets) == {"{plugin_alias}"}
+    installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
+    assert set(installed_or_enabled) == {
+        "{S3FS_PLUGIN_IMAGE}",
+        "{plugin_alias}",
+        "{LEGACY_S3FS_PLUGIN_ALIAS}",
+    }
+    assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
+
+
+@pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc"])
+def test_s3fs_plugin_alias_never_names_a_loopback_plugin(volume_name):
+    assert not _is_vloopback_driver(_s3fs_plugin_alias(volume_name))
+
+
 @pytest.mark.asyncio
 async def test_remove_s3fs_volume_plugin_ignores_unsafe_volume_name(
     docker_service,
@@ -1109,8 +1132,8 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
     assert docker_client.created_volumes == []
 
 
-def _pod_host_key_specs(docker_client):
-    return [spec for spec in docker_client.exec_specs if "pod_ssh_host_key" in spec.argv]
+def _pod_host_key_commands(ssh_client):
+    return [shlex.split(cmd) for cmd in ssh_client.commands if "pod_ssh_host_key" in cmd]
 
 
 @pytest.mark.asyncio
@@ -1121,6 +1144,7 @@ async def test_create_container_installs_the_same_ssh_host_key_each_time_a_pod_i
     monkeypatch,
 ):
     ssh_client = RecordingSSHClient()
+    ssh_client.run = AsyncMock(wraps=ssh_client.run)
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
 
     for _ in range(2):
@@ -1131,13 +1155,14 @@ async def test_create_container_installs_the_same_ssh_host_key_each_time_a_pod_i
             private_key="encrypted-private-key",
         )
 
-    specs = _pod_host_key_specs(docker_service.rental_docker_client_factory.client)
+    specs = _pod_host_key_commands(ssh_client)
     assert len(specs) == 2
-    public_keys = {spec.argv[-1] for spec in specs}
+    public_keys = {spec[-1] for spec in specs}
     assert len(public_keys) == 1
     assert next(iter(public_keys)).startswith("ssh-ed25519 ")
-    assert all("OPENSSH PRIVATE KEY" in spec.stdin for spec in specs)
-    assert all("OPENSSH PRIVATE KEY" not in " ".join(spec.argv) for spec in specs)
+    calls = [c for c in ssh_client.run.call_args_list if "pod_ssh_host_key" in c.args[0]]
+    assert all("OPENSSH PRIVATE KEY" in c.kwargs["input"] for c in calls)
+    assert all("OPENSSH PRIVATE KEY" not in " ".join(spec) for spec in specs)
 
 
 @pytest.mark.asyncio
@@ -1158,4 +1183,4 @@ async def test_create_container_skips_the_pod_ssh_host_key_without_a_master_secr
         private_key="encrypted-private-key",
     )
 
-    assert _pod_host_key_specs(docker_service.rental_docker_client_factory.client) == []
+    assert _pod_host_key_commands(ssh_client) == []

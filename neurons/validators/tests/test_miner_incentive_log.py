@@ -9,7 +9,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
-    MissingFlagshipCapability,
+    MissingFull8xCapability,
     PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
@@ -96,7 +96,7 @@ def _job(**overrides) -> JobResult:
         (
             lambda job: MinerLogLine.no_payout_because_email_not_confirmed(job),
             "provider_email_not_confirmed",
-            "to remove this hold. Other listing and incentive requirements still apply.",
+            "A listed node stays listed and rented. Other listing and incentive requirements still apply.",
         ),
         (
             lambda job: MinerLogLine.no_payout_because_paused_for_new_rentals(job),
@@ -151,9 +151,9 @@ def _job(**overrides) -> JobResult:
             "rented node",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            lambda job: MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job,
-                MissingFlagshipCapability(
+                MissingFull8xCapability(
                     ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
                 ),
             ),

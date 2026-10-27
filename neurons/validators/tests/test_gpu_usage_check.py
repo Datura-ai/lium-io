@@ -1500,25 +1500,23 @@ def test_lium_workload_containers_counts_the_pod_container_of_an_unnamed_pod():
 
 @pytest.mark.parametrize("load", [(100, 61), (2, 3)], ids=["high_load", "low_load"])
 @pytest.mark.parametrize(
-    "scraped_digest, enforced, expected_pass",
+    "scraped_digest, expected_pass",
     [
-        ("sha256:filler", True, True),  # the image it was started from
-        ("sha256:other", False, True),  # another image, logged only
-        ("sha256:other", True, False),  # another image under enforcement: foreign GPU work
-        ("", True, False),  # a local build has no RepoDigests: an empty digest is a mismatch
-        (None, True, True),  # container missing from the scrape: not judged
+        ("sha256:filler", True),  # the image it was started from
+        ("sha256:other", False),  # another image: foreign GPU work
+        ("", False),  # a local build has no RepoDigests: an empty digest is a mismatch
+        (None, True),  # container missing from the scrape: not judged
     ],
 )
 @pytest.mark.asyncio
 async def test_filler_gpu_work_counts_only_on_the_filler_image(
-    context_factory, monkeypatch, scraped_digest, enforced, expected_pass, load
+    context_factory, scraped_digest, expected_pass, load
 ):
     from neurons.validators.src.services.redis_service import (
         FILLER_IMAGE_DIGESTS_PREFIX,
         FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     )
 
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED", enforced)
     filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     services = build_services()
     await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{filler_container}", '["sha256:filler"]')
@@ -1550,7 +1548,6 @@ async def test_filler_gpu_work_counts_only_on_the_filler_image(
 async def _filler_image_ctx(context_factory, monkeypatch, record, extra_processes=()):
     from neurons.validators.src.services.redis_service import FILLER_IMAGE_DIGESTS_PREFIX
 
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_IMAGE_IDENTITY_ENFORCEMENT_ENABLED", True)
     swapped, intact = "filler_swapped", "filler_intact"
     services = build_services()
     await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{swapped}", record)
