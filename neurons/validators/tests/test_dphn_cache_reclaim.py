@@ -311,6 +311,8 @@ def test_only_never_started_capability_checks_are_picked():
             "b2 eager_kalam daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
             "c3 executor daturaai/compute-subnet-executor:latest \"/start.sh\"",
             "d4 his_job nvidia/cuda:12.4 \"nvidia-smi\"",
+            "e5 pod_0b1c2d3e daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
+            "f6 filler_run7 daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
         ]
     )
 

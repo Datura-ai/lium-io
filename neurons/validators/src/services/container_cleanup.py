@@ -172,7 +172,12 @@ def never_started_check_containers(listing: str) -> list[str]:
     for fields in (line.split(None, 3) for line in listing.splitlines()):
         if len(fields) == 4 and (
             fields[1].startswith(CAPABILITY_CHECK_NAME_PREFIX)
-            or (fields[2] == CAPABILITY_CHECK_IMAGE and fields[3].strip().strip('"') == "nvidia-smi")
+            or (
+                # a renter can start a pod/filler on this image with this command: never a check
+                not fields[1].startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+                and fields[2] == CAPABILITY_CHECK_IMAGE
+                and fields[3].strip().strip('"') == "nvidia-smi"
+            )
         ):
             ids.append(fields[0])
     return ids
