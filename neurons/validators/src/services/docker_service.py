@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import enum
 import ipaddress
@@ -1571,14 +1572,25 @@ class _InflightCreateRegistry:
 
     def __init__(self) -> None:
         self._creates_by_pod_id: dict[str, _InflightCreate] = {}
+        # Pods this task's create already holds: the job runner and the miner handler both
+        # register one create, and that must count once so `running` counts distinct creates.
+        self._held_pod_ids: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+            "inflight_create_held_pod_ids", default=frozenset()
+        )
 
     @contextlib.contextmanager
     def track(self, pod_id: str) -> Iterator[None]:
+        held = self._held_pod_ids.get()
+        if pod_id in held:
+            yield
+            return
+        token = self._held_pod_ids.set(held | {pod_id})
         create = self._creates_by_pod_id.setdefault(pod_id, _InflightCreate())
         create.running += 1
         try:
             yield
         finally:
+            self._held_pod_ids.reset(token)
             create.running -= 1
             if create.running <= 0:
                 self._creates_by_pod_id.pop(pod_id, None)
@@ -5003,33 +5015,38 @@ class DockerService:
         volume_name: str | None = None,
         remove_volume: bool = False,
         container_id: str | None = None,
+        pod_id: str | None = None,
     ) -> bool:
         """Remove the failed container's artifacts; report whether it was already gone.
 
         ``container_id``, once the create has one, is what gets read and removed: a concurrent
         retry for the same pod can be running its own container under ``container_name``.
+        Without an id, the name is removed only while no other create for ``pod_id`` is live.
 
         DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
         on missing evidence.
         """
         container_missing = False
+        # without an id, the container under this name may be another live create's: leave it to that create
+        owns_container = container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
         try:
-            # DAH-2395: read the death evidence before `rm -fv` destroys it —
-            # without this line, "why did the container die" (OOM vs entrypoint
-            # crash) is unanswerable: the host is the miner's, not ours.
-            diagnostics = await self.capture_failed_container_diagnostics(
-                ssh_client=ssh_client,
-                default_extra=default_extra,
-                container_name=container_id or container_name,
-            )
-            container_missing = diagnostics.container_missing
+            if owns_container:
+                # DAH-2395: read the death evidence before `rm -fv` destroys it —
+                # without this line, "why did the container die" (OOM vs entrypoint
+                # crash) is unanswerable: the host is the miner's, not ours.
+                diagnostics = await self.capture_failed_container_diagnostics(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    container_name=container_id or container_name,
+                )
+                container_missing = diagnostics.container_missing
 
-            container = shlex.quote(container_id or container_name)
-            await retry_ssh_command(
-                ssh_client,
-                f"/usr/bin/docker rm -fv {container} 2>/dev/null || true",
-                "cleanup_failed_container_creation",
-            )
+                container = shlex.quote(container_id or container_name)
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker rm -fv {container} 2>/dev/null || true",
+                    "cleanup_failed_container_creation",
+                )
 
             if remove_volume and volume_name:
                 volume = shlex.quote(volume_name)
@@ -9054,6 +9071,7 @@ class DockerService:
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                         container_id=container_id,
+                        pod_id=payload.pod_id,
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.

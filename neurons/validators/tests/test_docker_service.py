@@ -4683,6 +4683,27 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
     assert events == ["run", "rm pod_test", "run"]
 
 
+@contextlib.asynccontextmanager
+async def _another_create_live(pod_id: str, live: bool):
+    """Hold a second, separate create for the pod (its own task) while the body runs."""
+    registered, release = asyncio.Event(), asyncio.Event()
+
+    async def other_create():
+        with docker_service_module.inflight_creates.track(pod_id):
+            registered.set()
+            await release.wait()
+
+    other = asyncio.create_task(other_create()) if live else None
+    if other:
+        await registered.wait()
+    try:
+        yield
+    finally:
+        release.set()
+        if other:
+            await other
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "conflict_name, live_creates, expected_events",
@@ -4713,23 +4734,44 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
             events.append(f"rm {container_name}")
 
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    with contextlib.ExitStack() as creates:
-        for _ in range(live_creates):
-            creates.enter_context(docker_service_module.inflight_creates.track("test"))
-        run = docker_service._run_rental_docker_create_with_port_retry(
-            docker_client=FakeRentalClient(),
-            ssh_client=Mock(),
-            run_spec=ContainerRunSpec(image="img", name="pod_test"),
-            container_name="pod_test",
-            default_extra={},
-            pod_id="test",
-        )
-        if "rm pod_test" in expected_events:
-            assert await run == "cid"
-        else:
-            with pytest.raises(Exception, match="already in use"):
-                await run
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        # production registers one create twice: the job runner, then the miner handler
+        with registry.track("test"), registry.track("test"):
+            run = docker_service._run_rental_docker_create_with_port_retry(
+                docker_client=FakeRentalClient(),
+                ssh_client=Mock(),
+                run_spec=ContainerRunSpec(image="img", name="pod_test"),
+                container_name="pod_test",
+                default_extra={},
+                pod_id="test",
+            )
+            if "rm pod_test" in expected_events:
+                assert await run == "cid"
+            else:
+                with pytest.raises(Exception, match="already in use"):
+                    await run
     assert events == expected_events
+    assert not registry.is_running("test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
+async def test_failed_create_without_container_id_removes_by_name_only_when_no_other_create_is_live(
+    docker_service, monkeypatch, live_creates, removed,
+):
+    monkeypatch.setattr(
+        docker_service, "capture_failed_container_diagnostics", AsyncMock(return_value=Mock(container_missing=False))
+    )
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    registry = docker_service_module.inflight_creates
+    async with _another_create_live("test", live_creates == 2):
+        with registry.track("test"), registry.track("test"):
+            await docker_service.cleanup_failed_container_creation(
+                ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
+            )
+    assert any("rm -fv pod_test" in str(call) for call in ssh_commands.call_args_list) is removed
 
 
 @pytest.mark.asyncio
