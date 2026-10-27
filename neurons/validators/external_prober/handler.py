@@ -21,13 +21,22 @@ MAX_TARGETS = 64
 CANARY_URL = os.environ.get("CANARY_URL", "http://checkip.amazonaws.com/")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # a redirect could lead to a private address the public-IP check never saw; the 3xx itself is the answer
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
 def _fetch(host: str, port: int, timeout: float) -> str | None:
     return _get(f"http://{host}:{port}/", timeout)
 
 
 def _get(url: str, timeout: float) -> str | None:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _opener.open(url, timeout=timeout) as resp:
             return resp.read(256).decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.read(256).decode(errors="replace")

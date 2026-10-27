@@ -12,7 +12,6 @@ from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental, kernel_gpu_view, reported_gpu_uuids
 
-SHADOW_ONLY_IMPACT = "Shadow observation only: the validation result was NOT changed"
 KERNEL_VIEW_SOURCE_CONTAINER = "container"
 KERNEL_VIEW_SOURCE_HOST = "host_pid1_root"
 
@@ -164,9 +163,8 @@ class GpuKernelCountCheck:
     The reported count and UUIDs come from the scrape (NVML); the kernel list is
     /proc/driver/nvidia/gpus as BannedProviderCheck reads it once per cycle. A node whose kernel
     list is present and shorter than its reported GPU count gets GPU_KERNEL_COUNT_MISMATCH. That
-    verdict fails the validation only under GPU_KERNEL_COUNT_ENFORCEMENT_ENABLED; without it the
-    check always passes and the verdict is only logged. As with the ban checks, a failure stops
-    the run only when the node has no live rental.
+    verdict fails the validation. As with the ban checks, a failure stops the run only when the
+    node has no live rental.
 
     The container the check reads in may have been handed only some of the host's cards. So a
     short list is checked once more against the host's own list (host_view_verdict): if that one
@@ -222,7 +220,6 @@ class GpuKernelCountCheck:
             kernel_check_fields["not_evaluated_reason"] = (
                 "kernel_list_behind_foreign_mount" if foreign_mounts else "kernel_list_unavailable"
             )
-        enforce = bool(settings.GPU_KERNEL_COUNT_ENFORCEMENT_ENABLED)
         would_fail = verdict == "count_lower"
         kernel_check_fields.update(
             {
@@ -230,36 +227,24 @@ class GpuKernelCountCheck:
                 "kernel_gpu_uuids": kernel_uuids,
                 "kernel_gpu_foreign_mounts": foreign_mounts,
                 "would_fail": would_fail,
-                "enforced": enforce,
             }
         )
 
         event = self._render_event(ctx, kernel_check_fields)
-        if would_fail and enforce:
+        if would_fail:
             # Like the ban checks: a node with a renter's pod on it keeps being verified, so the
             # failure stops the run only when there is no live rental.
             return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx))
         return CheckResult(passed=True, event=event)
 
     def _render_event(self, ctx: Context, kernel_check_fields: dict[str, Any]) -> ValidationEvent:
-        """The event for a finished evaluation: which template, and for a count mismatch in
-        shadow, a warning that says the result was not changed."""
-        if kernel_check_fields["would_fail"]:
-            enforce = kernel_check_fields["enforced"]
-            return render_message(
-                Msg.COUNT_MISMATCH,
-                ctx=ctx,
-                check_id=self.check_id,
-                severity=None if enforce else "warning",
-                impact=None if enforce else SHADOW_ONLY_IMPACT,
-                what=kernel_check_fields,
-            )
-        return render_message(
-            self._template_for(kernel_check_fields),
-            ctx=ctx,
-            check_id=self.check_id,
-            what=kernel_check_fields,
+        """The event for a finished evaluation."""
+        template = (
+            Msg.COUNT_MISMATCH
+            if kernel_check_fields["would_fail"]
+            else self._template_for(kernel_check_fields)
         )
+        return render_message(template, ctx=ctx, check_id=self.check_id, what=kernel_check_fields)
 
     @staticmethod
     def _template_for(kernel_check_fields: dict[str, Any]) -> MessageTemplate:

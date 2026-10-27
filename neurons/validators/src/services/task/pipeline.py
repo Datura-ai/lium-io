@@ -114,14 +114,11 @@ class ContextConfig:
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
-    # DAH-3011: True only for a never-validated executor's first, unscored verification AND with
-    # FIRST_PASS_FAST_PATH_ENABLED on (resolved in PipelineFactory.build_context). The capability
+    # DAH-3011: True only for a never-validated executor's first, unscored verification
+    # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
-    # The caller's raw first_pass (the express lane), whatever FIRST_PASS_FAST_PATH_ENABLED says.
-    # The rental probe skips its shadow run on it (DAH-4258).
-    express_first_pass: bool = False
 
 
 @dataclass(frozen=True)
@@ -247,6 +244,9 @@ class Context(BaseModel):
     # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
+    # Set by GpuFingerprintCheck (legacy rule) when an idle node's whole GPU set was replaced: the reset drops the
+    # anchor, so the next passing cycle anchors the new cards (whole_set_replaced).
+    gpu_reanchor: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -274,6 +274,9 @@ class Context(BaseModel):
     # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     rented_pod_resources_passed: bool = True
+    # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
+    # score gate lives in calculate_scores.
+    rented_throughput_passed: bool = True
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True

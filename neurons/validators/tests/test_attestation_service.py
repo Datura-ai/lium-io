@@ -41,7 +41,6 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
 
     monkeypatch.setattr(AttestationService, "_call_verifier", fake_call_verifier)
     monkeypatch.setattr(asyncssh, "import_public_key", lambda value: object())
-    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     # This test exercises the verify-and-accept happy path; whitelist gating is a
     # separate concern. Pin it off so the test is deterministic regardless of a

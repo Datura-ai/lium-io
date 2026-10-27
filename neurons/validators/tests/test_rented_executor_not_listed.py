@@ -10,7 +10,7 @@ synthesis next to it); the last tests drive the REST path end to end, so the emp
 and the result list are checked where the cycle reads them.
 """
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -30,7 +30,6 @@ from services.task.availability import (
     silence_availability_errors_on_our_own_outage,
 )
 from tests.test_express_lane import _cycle_inputs, _executor_info, _job_result
-from tests.test_verification_started_report import _accepted, _FakeMinerClient
 
 MINER_HOTKEY = "5MinerHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 OTHER_MINER_HOTKEY = "5OtherMinerHotkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
@@ -220,11 +219,9 @@ def test_not_listed_rows_are_not_silenced_and_do_not_pad_the_checked_count():
 @pytest.fixture
 def rest_service(mocker, monkeypatch, tmp_path):
     import services.file_encrypt_service as file_encrypt_service
-    from core.config import settings
 
     # the cycle inputs name a job-files directory that must exist; keep it under pytest's tmp_path
     monkeypatch.setattr(file_encrypt_service, "JOB_FILES_ROOT", tmp_path)
-    monkeypatch.setattr(settings, "USE_REST_API", True)
     my_key = Mock(ss58_address="validator-hotkey")
     my_key.sign.return_value = b"\x01\x02\x03"
     mocker.patch(
@@ -306,23 +303,6 @@ async def test_a_miner_whose_only_rented_node_is_down_gets_a_row_for_the_node_no
     rented_data = RentedExecutorsResponse(executors={MISSING: rented()})
 
     out = await request(rest_service, rented_data)
-
-    assert [r.executor_info.uuid for r in out["results"]] == [MISSING]
-    assert out["results"][0].failure_reason_code == "RENTED_EXECUTOR_NOT_LISTED"
-
-
-@pytest.mark.asyncio
-async def test_websocket_path_zero_executors_falls_through_to_the_rented_node_row(
-    rest_service, monkeypatch
-):
-    """The same fall-through on the WebSocket path, the default transport."""
-    from core.config import settings
-
-    monkeypatch.setattr(settings, "USE_REST_API", False)
-    rented_data = RentedExecutorsResponse(executors={MISSING: rented()})
-
-    with patch("services.miner_service.MinerClient", return_value=_FakeMinerClient(_accepted())):
-        out = await request(rest_service, rented_data)
 
     assert [r.executor_info.uuid for r in out["results"]] == [MISSING]
     assert out["results"][0].failure_reason_code == "RENTED_EXECUTOR_NOT_LISTED"

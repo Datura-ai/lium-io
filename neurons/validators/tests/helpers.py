@@ -142,6 +142,10 @@ class FakeRedis:
         self._touch()
         return self.store.get(key)
 
+    async def mget(self, keys: list[str]):
+        self._touch()
+        return [self.store.get(key) for key in keys]
+
     def _set_hook(self, key: str):
         if key in self.fail_next_set_of:
             self.fail_next_set_of.discard(key)

@@ -1,13 +1,12 @@
 """G21: hello-world inside the sysbox probe container passes under privileged runc too; only sysbox gives the
-container a user namespace, so an identity uid map is logged and, under the flag, refuses sysbox."""
+container a user namespace, so an identity uid map is logged and refuses sysbox."""
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
-from core.config import settings
 from services.executor_connectivity import dind_probe
 from services.executor_connectivity.dind_probe import DindVerifier
 
@@ -40,33 +39,20 @@ async def test_a_user_namespace_is_sysbox(caplog):
 
 
 @pytest.mark.asyncio
-async def test_an_identity_map_is_logged_and_still_sysbox_by_default(caplog):
+async def test_an_identity_map_is_logged_and_not_sysbox(caplog):
     with caplog.at_level(logging.WARNING, logger=dind_probe.logger.name):
         works = await DindVerifier(Mock())._sysbox_works(_InnerSSH(IDENTITY_MAP), {})
 
-    assert works is True
-    assert len(_identity_logs(caplog)) == 1
-
-
-@pytest.mark.asyncio
-async def test_an_identity_map_is_not_sysbox_under_enforcement():
-    with patch.object(settings, "SYSBOX_USERNS_ENFORCEMENT_ENABLED", True):
-        works = await DindVerifier(Mock())._sysbox_works(_InnerSSH(IDENTITY_MAP), {})
-
     assert works is False
+    assert len(_identity_logs(caplog)) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("uid_map,exit_status", [("", 0), (None, 0), (IDENTITY_MAP, 1)])
 async def test_an_unreadable_map_decides_nothing(uid_map, exit_status):
-    with patch.object(settings, "SYSBOX_USERNS_ENFORCEMENT_ENABLED", True):
-        works = await DindVerifier(Mock())._sysbox_works(_InnerSSH(uid_map, exit_status), {})
+    works = await DindVerifier(Mock())._sysbox_works(_InnerSSH(uid_map, exit_status), {})
 
     assert works is True
-
-
-def test_user_namespace_enforcement_is_off_by_default():
-    assert type(settings).model_fields["SYSBOX_USERNS_ENFORCEMENT_ENABLED"].default is False
 
 
 def _unreadable_logs(caplog) -> list[logging.LogRecord]:

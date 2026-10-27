@@ -265,12 +265,12 @@ class MinerLogLine(BaseModel):
             result,
             reason=ZeroIncentiveReason.PROVIDER_EMAIL_NOT_CONFIRMED,
             message=(
-                "No subnet incentive: this executor is not listed until the provider account "
-                "confirms an e-mail address. Confirm your e-mail under Profile Settings in the "
-                "provider portal to remove this hold. Other listing and incentive requirements "
-                "still apply."
+                "No idle pay or rented extra: the provider account has not confirmed an e-mail "
+                "address. Confirm your e-mail under Profile Settings in the provider portal to "
+                "remove this hold. A listed node stays listed and rented. Other listing and "
+                "incentive requirements still apply."
             ),
-            internal_message="Executor excluded from both pools - provider e-mail not confirmed, node not listed",
+            internal_message="Executor excluded from both pools - provider e-mail not confirmed",
         )
 
     @staticmethod
@@ -695,7 +695,9 @@ class MinerLogLine(BaseModel):
             message=(
                 "Spot-tier incentive for executor is calculated successfully. Formula: "
                 "unbucketed_share * gpu_count * effective_rate / unbucketed_rental_cost, "
-                f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate); "
+                f"effective_rate = min({pay_factor:g} * filler_revenue_per_gpu_hour, secure_rate) "
+                "* spot_pool_multiplier (below 1 when the GPU model's spot nodes together would be paid "
+                "more than its fillers earn per hour, filler_revenue_usd_per_hour); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
                 "that part of spot pay and floor top-ups)"
             ),
@@ -710,6 +712,8 @@ class MinerLogLine(BaseModel):
                 "sysbox_multiplier": result.sysbox_multiplier,
                 "driver_multiplier": result.driver_multiplier,
                 "secure_rate": secure_rate,
+                "filler_revenue_usd_per_hour": result.filler_revenue_usd_per_hour,
+                "spot_pool_multiplier": result.spot_pool_multiplier,
                 "effective_rate": result.effective_rate,
                 "rental_share": result.rental_share,
                 "burn_share": result.burn_share,

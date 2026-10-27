@@ -399,14 +399,12 @@ class RegistryPullCheck:
     node's recovery, comes soon). A Docker Hub 429 (anonymous pulls are counted
     per IP, and a provider's nodes can share one) is no verdict, never a failure. Between pulls the last
     reading stands. A node fails once REGISTRY_PULL_FAILURES_BEFORE_VERDICT measured pulls in a row
-    failed (timeout, DNS error, unreachable, manifest unknown), and only under
-    REGISTRY_PULL_ENFORCEMENT_ENABLED; without it the finding is logged as REGISTRY_PULL_FAILED_OBSERVED
-    and the node passes.
+    failed (timeout, DNS error, unreachable, manifest unknown): REGISTRY_PULL_FAILED, score 0.
 
     A failed pull counts only if the validator's own GET of DOCKER_HUB_CONTROL_URL answers 200 or 401
     (cached for HUB_CONTROL_TTL_SECONDS; a cached answer counts only if read after the pull began); else it is REGISTRY_PULL_NO_VERDICT_HUB_DOWN, neither counting nor
     resetting the streak. An outage the validator cannot see (Docker Hub's CDN in one region, a mirror many
-    providers share) is not guarded here: enforcement stays off until the OBSERVED rows have been reviewed.
+    providers share) is not guarded here.
     """
 
     check_id = "executor.validate.registry_pull"
@@ -506,7 +504,6 @@ class RegistryPullCheck:
             "pull": state.reading,
             "probed_this_cycle": probed,
             "failures_in_a_row": state.failures_in_a_row,
-            "enforced": settings.REGISTRY_PULL_ENFORCEMENT_ENABLED,
         }
         if not probed:
             what["read_at"] = state.at
@@ -516,13 +513,8 @@ class RegistryPullCheck:
         if state.hub_control is not None:
             what["docker_hub_control"] = asdict(state.hub_control)
         if state.standing_failure:
-            template = (
-                Msg.REGISTRY_PULL_FAILED
-                if settings.REGISTRY_PULL_ENFORCEMENT_ENABLED
-                else Msg.REGISTRY_PULL_FAILED_OBSERVED
-            )
-            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=not settings.REGISTRY_PULL_ENFORCEMENT_ENABLED, event=event)
+            event = render_message(Msg.REGISTRY_PULL_FAILED, ctx=ctx, check_id=self.check_id, what=what)
+            return CheckResult(passed=False, event=event)
         if not probed:
             return self._skipped(ctx, "not due", last=what)
         if state.no_verdict == "docker_hub_down":

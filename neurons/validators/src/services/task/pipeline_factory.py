@@ -55,6 +55,7 @@ from .checks import (
     InspectorRentedCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
+    NvlinkFaultCheck,
     NvmlDigestCheck,
     PinnedMemoryProbeCheck,
     PortConnectivityCheck,
@@ -66,6 +67,7 @@ from .checks import (
     RentalVerificationCheck,
     RentedGpuDropCheck,
     RentedPodResourcesCheck,
+    RentedThroughputCheck,
     ScoreCheck,
     SpecChangeCheck,
     SshdAuthLogCheck,
@@ -73,6 +75,7 @@ from .checks import (
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
+    PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
     TenantEnforcementCheck,
@@ -179,8 +182,7 @@ class PipelineFactory:
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
-            first_pass: the executor's first, unscored verification (DAH-3011); takes effect
-                only with settings.FIRST_PASS_FAST_PATH_ENABLED
+            first_pass: the executor's first, unscored verification (DAH-3011)
 
         Returns:
             Configured Context ready for pipeline execution
@@ -247,11 +249,7 @@ class PipelineFactory:
                 # DAH-2794: an executor that can run the source needs no upload at all. The
                 # binary stays built because the miner picks the executor image, and one that
                 # predates a dependency the scrape imports has to keep the self-contained path.
-                machine_scrape_source=(
-                    encrypted_files.machine_scrape_source
-                    if settings.ENABLE_SCRAPE_SOURCE_DELIVERY
-                    else None
-                ),
+                machine_scrape_source=encrypted_files.machine_scrape_source,
                 machine_scrape_timeout=JOB_LENGTH,
                 obfuscation_keys=encrypted_files.all_keys,
                 default_docker_image_digests=default_docker_image_digests,
@@ -268,8 +266,7 @@ class PipelineFactory:
                 port_private_key=private_key,
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
-                first_pass=first_pass and settings.FIRST_PASS_FAST_PATH_ENABLED,
-                express_first_pass=first_pass,
+                first_pass=first_pass,
             ),
             state=ContextState(
                 upload_local_dir=encrypted_files.tmp_directory,
@@ -334,10 +331,10 @@ class PipelineFactory:
                 # the node like a GPU ban (not fatal under a live pod), so it sits before the rented
                 # short-circuit
                 GpuMemoryHealthCheck(),
-                # DAH-2671 item 2a: non-fatal, observe-only CPU-count corroboration. Placed right
+                # DAH-2671 item 2a: non-fatal CPU-count corroboration. Placed right
                 # after the GPU spec-check group (and before the rented short-circuit) so it reads
                 # advertised specs already populated by the scrape; it only reads over SSH, mutates
-                # no executor state, and never zeroes score outside CPU_TRUTH_ENFORCEMENT_ENABLED.
+                # no executor state; a mismatch zeroes the score via cpu_truth_passed.
                 CpuTruthCheck(),
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
@@ -352,9 +349,9 @@ class PipelineFactory:
                 HardwareIdentityCheck(),
                 BannedGpuCheck(),
                 # Reported GPU count and UUIDs against the kernel's list, which BannedProviderCheck
-                # read above. Logs a verdict every cycle; fails the validation only under
-                # GPU_KERNEL_COUNT_ENFORCEMENT_ENABLED. Before the rented short-circuit, so rented
-                # and idle nodes are judged alike.
+                # read above. Logs a verdict every cycle and fails the validation on a short
+                # kernel list. Before the rented short-circuit, so rented and idle nodes are
+                # judged alike.
                 GpuKernelCountCheck(),
                 DuplicateExecutorCheck(),
                 CollateralStatusCheck(),
@@ -390,9 +387,12 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
+                # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
+                RentedThroughputCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
@@ -410,6 +410,8 @@ class PipelineFactory:
                 # DAH-4482: a node the rented health read flagged proves every card before it re-lists.
                 # Rented nodes halted above, so this only runs unrented. Off by default: logs only.
                 PostRentalGpuRecheckCheck(),
+                # a sticky NVLink fault leaves every single-GPU check passing; NVLS cannot bind (23 Oct)
+                NvlinkFaultCheck(),
                 # DAH-2265 Plan 2: advisory, non-fatal — observes whether the executor has
                 # the recommended default image pre-pulled (DOCKER_PULL no-op). Runs here,
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
@@ -508,6 +510,8 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
+                # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
+                RentedThroughputCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
@@ -520,6 +524,7 @@ class PipelineFactory:
                             RegistryPullCheck(),
                             ContainerDownloadSpeedCheck(),
                             SysboxRequiredCheck(),
+                            PidHostRequiredCheck(),
                             RentalVerificationCheck(),
                         ],
                         [
@@ -527,6 +532,7 @@ class PipelineFactory:
                             GpuFaultProbeCheck(),
                             PinnedMemoryProbeCheck(),
                             PostRentalGpuRecheckCheck(),
+                            NvlinkFaultCheck(),
                             CachedTemplateVerificationCheck(),
                         ],
                     ]
@@ -606,6 +612,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
@@ -618,6 +625,7 @@ class PipelineFactory:
                 GpuFaultProbeCheck(),
                 PinnedMemoryProbeCheck(),
                 PostRentalGpuRecheckCheck(),
+                NvlinkFaultCheck(),
                 RentalVerificationCheck(),
                 # RentalProbeCheck(),  # SKIP: creates and removes a container on the executor
                 ScoreCheck(),

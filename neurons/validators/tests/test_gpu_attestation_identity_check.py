@@ -185,6 +185,19 @@ async def test_verified_cards_pass_and_are_pinned(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_an_eight_gpu_node_reads_and_pins_in_two_redis_round_trips(context_factory):
+    # Each Redis call waits on the validator-wide lock; one per key kept multi-GPU nodes minutes in this check.
+    ca = FakeCa()
+    gpus = tuple(f"GPU-{i}" for i in range(8))
+    cards = {g: ca.card() for g in gpus}
+    ctx = _ctx(context_factory, ca, lambda n: [_row(g, cards[g], n) for g in gpus], gpus=gpus)
+    result = await _run(ctx, ca, enforce=True)
+    assert result.event.reason_code == Msg.OK.reason
+    assert ctx.services.redis.calls == 2
+    assert all(ctx.services.redis.store.get(f"gpu_identity:uuid:{g}") for g in gpus)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enforce", [False, True])
 async def test_uuid_moved_to_another_card_fails_only_when_enforced(context_factory, enforce):
     ca = FakeCa()
@@ -311,6 +324,8 @@ async def test_every_uuid_new_in_the_same_slots_is_a_swap(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.SWAPPED.reason
     assert result.event.what_we_saw["findings"] == ["uuids_changed_same_slots"]
+    # different physical cards in the same slots look identical here, so the message must not claim "same cards"
+    assert "same cards" not in result.event.event
 
 
 @pytest.mark.asyncio

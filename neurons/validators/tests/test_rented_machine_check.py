@@ -87,7 +87,7 @@ def build_rented_data(
     ]
 
     executor = RentedExecutor(
-        miner_hotkey="test-miner",
+        miner_hotkey="miner-hotkey",
         executor_ip_address="127.0.0.1",
         executor_ip_port="22",
         pods=pods,
@@ -1201,6 +1201,20 @@ async def test_pod_states_reports_running_for_a_healthy_rented_pod(context_facto
     assert _pod_states(result) == {"pod-1": "running"}
     observed_at = result.updates["state"].pod_states[0].observed_at
     assert observed_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_a_pod_stopped_by_its_renters_gpu_reset_is_not_penalised(context_factory):
+    # DAH-4658: the reset stops the container for a moment; only the pod named on the mark is spared
+    pods = {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]}
+    for marked_pod, spared in (("pod-1", True), ("pod-2", False)):
+        ctx = _tenant_ctx(context_factory, DummySSHClient(pod_running=False), pods)
+        ctx.services.redis.gpu_reset_marks = AsyncMock(return_value=[{"pod_id": marked_pod, "kind": "gpu_reset"}])
+
+        result = await TenantEnforcementCheck().run(ctx)
+
+        assert result.passed is spared
+        assert (result.event.reason_code == Msg.POD_NOT_RUNNING.reason) is not spared
 
 
 @pytest.mark.asyncio

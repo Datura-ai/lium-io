@@ -66,7 +66,7 @@ _FETCH_SCRIPT = (
 )
 
 
-def download_speed_command(sysbox: bool) -> str:
+def download_speed_command(sysbox: bool, script: str = _FETCH_SCRIPT) -> str:
     """A throwaway container on the rentals bridge, under sysbox-runc where renters get it.
 
     Pods run on RENTAL_NETWORK_NAME (own DNS and MTU), so that is the path to measure. The node creates it at its
@@ -77,7 +77,7 @@ def download_speed_command(sysbox: bool) -> str:
         f"net=bridge; /usr/bin/docker network inspect {RENTAL_NETWORK_NAME} >/dev/null 2>&1 && "
         f"net={RENTAL_NETWORK_NAME}; echo \"{MARKER}_net name=$net\"; "
         f"/usr/bin/docker run --rm --network \"$net\" {runtime}--entrypoint /bin/sh {ALPINE_HELPER_IMAGE} "
-        f"-c {shlex.quote(_FETCH_SCRIPT)}"
+        f"-c {shlex.quote(script)}"
     )
 
 
@@ -212,9 +212,9 @@ class ContainerDownloadSpeedCheck:
     CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or the container cannot reach an endpoint (DNS, refused, nothing read in
     time) that the validator itself reaches. An endpoint the validator cannot reach either, an HTTP error, or a
     container that did not run is no verdict. READINGS_BEFORE_VERDICT failing readings in a row (the second
-    RETRY_SECONDS after the first) are the finding: CONTAINER_DOWNLOAD_SLOW_OBSERVED in shadow, and under
-    CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED a fail (CONTAINER_DOWNLOAD_SLOW, score 0) that stands until a
-    reading passes. Idle nodes only (no pod, no filler: both would share the link), once per
+    RETRY_SECONDS after the first) are the finding: a fail (CONTAINER_DOWNLOAD_SLOW, score 0) that stands
+    until a reading passes, or CONTAINER_DOWNLOAD_SLOW_OBSERVED (logged only) when a failing reading in the
+    streak was not taken on the rentals network. Idle nodes only (no pod, no filler: both would share the link), once per
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS at a per-node phase.
     """
 
@@ -277,7 +277,6 @@ class ContainerDownloadSpeedCheck:
                         "failing": failing,
                         "no_verdict": no_verdict,
                         "failures_in_a_row": failures,
-                        "enforced": settings.CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED,
                     }
                 ),
             )
@@ -310,10 +309,7 @@ class ContainerDownloadSpeedCheck:
         return Judgement(is_failing=False, has_no_verdict=any(r.mbps is None for r in readings))
 
     def _verdict(self, ctx: Context, state: _State, *, probed: bool) -> CheckResult:
-        enforced = (
-            settings.CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED
-            and state.failing_readings_on_rentals_network >= READINGS_BEFORE_VERDICT
-        )
+        enforced = state.failing_readings_on_rentals_network >= READINGS_BEFORE_VERDICT
         what: dict[str, Any] = {
             "endpoints": [asdict(r) for r in state.readings],
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,

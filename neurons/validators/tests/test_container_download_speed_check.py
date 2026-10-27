@@ -89,10 +89,9 @@ class Clock:
 
 
 @contextmanager
-def flags(*, enforced=False, reachable=True):
+def flags(*, reachable=True):
     fake = SimpleNamespace(
         CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED=True,
-        CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED=enforced,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
         CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS=6.0,
     )
@@ -122,10 +121,9 @@ def make_ctx(*answers: str, redis=None, rented_data=None):
     return ctx, runner, redis
 
 
-def test_defaults_shadow_and_bounded():
+def test_defaults_are_bounded():
     fields = type(module.settings).model_fields
     assert fields["CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED"].default is True
-    assert fields["CONTAINER_DOWNLOAD_SPEED_ENFORCEMENT_ENABLED"].default is False
     assert fields["CONTAINER_DOWNLOAD_SPEED_MIN_MBPS"].default == 10.0
     assert fields["CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS"].default == 6.0
 
@@ -174,29 +172,25 @@ async def test_fast_passes_and_logs_the_reading(caplog):
     assert record is not None
 
 
-async def test_slow_twice_is_observed_in_shadow_and_fails_under_enforcement():
-    for enforced in (False, True):
-        with flags(enforced=enforced) as clock:
-            ctx, runner, redis = make_ctx(SLOW, SLOW)
-            check = ContainerDownloadSpeedCheck()
-            first = await check.run(ctx)
-            assert first.passed and first.event.reason_code == Msg.SLOW_ONCE.reason
-            clock.now += 31 * 60  # the confirming reading comes after RETRY, not an interval later
-            second = await check.run(ctx)
-            assert len(runner.commands) == 2
-            if enforced:
-                assert not second.passed and second.event.reason_code == Msg.SLOW.reason
-            else:
-                assert second.passed and second.event.reason_code == Msg.SLOW_OBSERVED.reason
-            # the finding stands between readings
-            clock.now += 60
-            third = await check.run(ctx)
-            assert len(runner.commands) == 2 and third.passed is (not enforced)
+async def test_slow_twice_fails_the_node():
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(SLOW, SLOW)
+        check = ContainerDownloadSpeedCheck()
+        first = await check.run(ctx)
+        assert first.passed and first.event.reason_code == Msg.SLOW_ONCE.reason
+        clock.now += 31 * 60  # the confirming reading comes after RETRY, not an interval later
+        second = await check.run(ctx)
+        assert len(runner.commands) == 2
+        assert not second.passed and second.event.reason_code == Msg.SLOW.reason
+        # the finding stands between readings
+        clock.now += 60
+        third = await check.run(ctx)
+        assert len(runner.commands) == 2 and third.passed is False
 
 
 async def test_a_streak_with_a_default_bridge_reading_is_never_enforced():
     for answers in ((SLOW_ON_BRIDGE, SLOW_ON_BRIDGE), (SLOW_ON_BRIDGE, SLOW)):
-        with flags(enforced=True) as clock:
+        with flags() as clock:
             ctx, runner, redis = make_ctx(*answers)
             check = ContainerDownloadSpeedCheck()
             await check.run(ctx)
@@ -206,7 +200,7 @@ async def test_a_streak_with_a_default_bridge_reading_is_never_enforced():
 
 
 async def test_rentals_failures_after_a_bridge_failure_are_enforced():
-    with flags(enforced=True) as clock:
+    with flags() as clock:
         ctx, runner, redis = make_ctx(SLOW_ON_BRIDGE, SLOW, SLOW)
         check = ContainerDownloadSpeedCheck()
         for _ in range(2):
@@ -217,7 +211,7 @@ async def test_rentals_failures_after_a_bridge_failure_are_enforced():
 
 
 async def test_a_streak_saved_without_the_rentals_count_is_not_enforced():
-    with flags(enforced=True) as clock:
+    with flags() as clock:
         redis = FakeRedis()
         # a failing reading saved by an earlier release: no failing_readings_on_rentals_network
         redis.store[f"{module._REDIS_PREFIX}:{EXECUTOR.uuid}"] = json.dumps(
@@ -229,7 +223,7 @@ async def test_a_streak_saved_without_the_rentals_count_is_not_enforced():
 
 
 async def test_slow_then_fast_resets():
-    with flags(enforced=True) as clock:
+    with flags() as clock:
         ctx, runner, redis = make_ctx(SLOW, FAST)
         check = ContainerDownloadSpeedCheck()
         await check.run(ctx)
@@ -239,12 +233,12 @@ async def test_slow_then_fast_resets():
 
 
 async def test_endpoint_unreachable_counts_only_when_the_validator_reaches_it():
-    with flags(enforced=True, reachable=True):
+    with flags(reachable=True):
         ctx, _, redis = make_ctx(DNS_DOWN)
         res = await ContainerDownloadSpeedCheck().run(ctx)
         assert res.event.reason_code == Msg.SLOW_ONCE.reason
         assert res.event.what_we_saw["endpoints"][0]["error"] == "dns_failed"
-    with flags(enforced=True, reachable=False):
+    with flags(reachable=False):
         ctx, _, redis = make_ctx(DNS_DOWN)
         res = await ContainerDownloadSpeedCheck().run(ctx)
         assert res.passed and res.event.reason_code == Msg.UNMEASURED.reason
@@ -252,7 +246,7 @@ async def test_endpoint_unreachable_counts_only_when_the_validator_reaches_it():
 
 
 async def test_container_that_did_not_run_is_no_verdict():
-    with flags(enforced=True):
+    with flags():
         ctx, _, _ = make_ctx("docker: Error response from daemon: unknown runtime")
         res = await ContainerDownloadSpeedCheck().run(ctx)
     assert res.passed and res.event.reason_code == Msg.UNMEASURED.reason

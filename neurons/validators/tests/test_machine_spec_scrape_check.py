@@ -309,8 +309,7 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 async def test_machine_spec_scrape_runs_the_uploaded_binary_when_no_source_was_delivered(
     context_factory,
 ):
-    # With ENABLE_SCRAPE_SOURCE_DELIVERY off the config carries no source, so UploadFilesCheck
-    # uploaded the binary and it is what runs.
+    # A config that carries no source: UploadFilesCheck uploaded the binary and it is what runs.
     # Arrange
     runner = DummySSHCommandRunner(
         result=make_command_result(success=True, stdout=FERNET_TOKEN)

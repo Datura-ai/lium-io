@@ -6,8 +6,7 @@ rental can keep passing the single-card matmul once the renter leaves. GpuMemory
 read that runs on rented nodes (DAH-3110), records a per-executor marker when it flags a card under a live
 rental; on the node's next unrented cycle this check runs the all-cards matmul and the kernel-fault probe
 on every card, whatever the MATMUL_ALLCARDS_* / GPU_FAULT_PROBE_* flags say. A failure fails the node and keeps the marker; a pass
-clears it. Off by default (POST_RENTAL_GPU_RECHECK_ENABLED): the cycle then only logs
-POST_RENTAL_GPU_RECHECK_WOULD_REQUIRE.
+clears it.
 
 A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker, and so
 does the backend's renter_hardware_fault_executor_ids (hardware-fault reports from two distinct renters):
@@ -155,13 +154,6 @@ class PostRentalGpuRecheckCheck:
                 passed=True, event=render_message(Msg.NO_MARKER, ctx=ctx, check_id=self.check_id)
             )
         what: dict[str, Any] = {"executor_uuid": ctx.executor.uuid, "marker": asdict(marker)}
-
-        if not settings.POST_RENTAL_GPU_RECHECK_ENABLED:
-            self._log(ctx, "POST_RENTAL_GPU_RECHECK_WOULD_REQUIRE", what, logging.WARNING)
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.WOULD_REQUIRE, ctx=ctx, check_id=self.check_id, what=what),
-            )
 
         if get_filler_only_container(ctx):
             if marker.filler_skips < FILLER_SKIP_LIMIT:

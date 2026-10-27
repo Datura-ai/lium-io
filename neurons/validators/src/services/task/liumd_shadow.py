@@ -13,9 +13,9 @@ log line. Nothing is returned to the caller, stored, or scored.
 
 It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (reserved, non-rentable
 dev executors, each matched on miner hotkey, executor UUID, address and SSH port; empty by default),
-never on an express-lane first pass. With `VERIFYX_COLD_SAMPLE_RETRY_ENABLED`, VerifyX is not
-compared on an executor with no stored download EMA: today's check may take a second sample there,
-the shadow takes one (`liumd_reason="cold_sample_retry"`).
+never on an express-lane first pass. VerifyX is not compared on an executor with no stored download
+EMA: today's check may take a second sample there, the shadow takes one
+(`liumd_reason="cold_sample_retry"`).
 
 Today's verdict per step comes from the pipeline's events: both checks are fatal, so a check that
 failed is the run's last event on a run that did not pass; one that reported a skip reason did not
@@ -316,9 +316,9 @@ def _stored_ema(ctx: Context):
 
 
 def _cold_retry_possible(ctx: Context) -> bool:
-    """Whether today's VerifyX could have taken a cold-sample retry on this executor: retries on,
-    the backend's answer present, and no stored download EMA (`_is_cold_sample_below_gate`)."""
-    if not settings.VERIFYX_COLD_SAMPLE_RETRY_ENABLED or ctx.state.rented_data is None:
+    """Whether today's VerifyX could have taken a cold-sample retry on this executor: the
+    backend's answer present and no stored download EMA (`_is_cold_sample_below_gate`)."""
+    if ctx.state.rented_data is None:
         return False
     prev_ema = _stored_ema(ctx)
     return prev_ema is None or prev_ema.ema_verifyx_download_speed is None

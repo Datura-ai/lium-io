@@ -252,20 +252,6 @@ async def test_the_8_sep_prod_cycle_is_104_requests_not_483(client):
 # --------------------------------------------------------------------------- MinerService
 
 
-class _FakeMinerClient:
-    def __init__(self, accepted: AcceptSSHKeyRequest):
-        future = asyncio.get_running_loop().create_future()
-        future.set_result(accepted)
-        self.job_state = SimpleNamespace(miner_accepted_ssh_key_or_failed_future=future)
-        self.send_model = AsyncMock()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-
 def _miner_service_recording(order: list[str]) -> MinerService:
     """A MinerService whose task_service records the order of the start report and each create_task."""
     service = MinerService.__new__(MinerService)
@@ -306,29 +292,6 @@ def _accepted(*uuids: str) -> AcceptSSHKeyRequest:
 
 
 @pytest.mark.asyncio
-async def test_websocket_path_reports_the_miner_once_before_launching_its_executors(monkeypatch):
-    order: list[str] = []
-    service = _miner_service_recording(order)
-    uuids = ["exec-a", "exec-b", "exec-c"]
-    monkeypatch.setattr(settings, "USE_REST_API", False)
-    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
-    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
-
-    with (
-        patch(
-            "services.miner_service.MinerClient", return_value=_FakeMinerClient(_accepted(*uuids))
-        ),
-        patch("services.miner_service.measure_and_attach", AsyncMock()),
-    ):
-        await service.request_job_to_miner(
-            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
-        )
-
-    assert order[0] == "report:5Miner:exec-a,exec-b,exec-c"
-    assert sorted(order[1:]) == [f"create_task:{u}" for u in uuids]
-
-
-@pytest.mark.asyncio
 async def test_rest_path_reports_the_miner_once_before_launching_its_executors(monkeypatch):
     order: list[str] = []
     service = _miner_service_recording(order)
@@ -338,7 +301,6 @@ async def test_rest_path_reports_the_miner_once_before_launching_its_executors(m
         return_value=(200, _accepted(*uuids).model_dump(mode="json"))
     )
     service._remove_ssh_key_via_rest = AsyncMock()
-    monkeypatch.setattr(settings, "USE_REST_API", True)
     monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
     monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
 
@@ -359,18 +321,15 @@ async def test_the_report_carries_the_claimed_list_not_what_the_express_lane_hol
     order: list[str] = []
     service = _miner_service_recording(order)
     service.in_flight = {"exec-b": EXPRESS_LANE}
-    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
-    monkeypatch.setattr(settings, "USE_REST_API", False)
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(
+        return_value=(200, _accepted("exec-a", "exec-b", "exec-c").model_dump(mode="json"))
+    )
+    service._remove_ssh_key_via_rest = AsyncMock()
     monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
     monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
 
-    with (
-        patch(
-            "services.miner_service.MinerClient",
-            return_value=_FakeMinerClient(_accepted("exec-a", "exec-b", "exec-c")),
-        ),
-        patch("services.miner_service.measure_and_attach", AsyncMock()),
-    ):
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
         await service.request_job_to_miner(
             _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
         )
@@ -387,18 +346,15 @@ async def test_an_express_lane_run_reports_its_one_executor(monkeypatch):
     answers with more."""
     order: list[str] = []
     service = _miner_service_recording(order)
-    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
-    monkeypatch.setattr(settings, "USE_REST_API", False)
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(
+        return_value=(200, _accepted("exec-a", "exec-b").model_dump(mode="json"))
+    )
+    service._remove_ssh_key_via_rest = AsyncMock()
     monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
     monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
 
-    with (
-        patch(
-            "services.miner_service.MinerClient",
-            return_value=_FakeMinerClient(_accepted("exec-a", "exec-b")),
-        ),
-        patch("services.miner_service.measure_and_attach", AsyncMock()),
-    ):
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
         await service.request_job_to_miner(
             _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}, executor_id="exec-b"
         )

@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -35,11 +35,7 @@ def test_only_failures_on_the_node_itself_are_host_faults(current_step, expected
 async def test_a_host_fault_stands_as_a_failed_probe_and_drops_the_interval_stamp():
     service, redis_service = _service()
 
-    with (
-        patch("services.docker_service.settings.RENTAL_PROBE_ENABLED", True),
-        patch("services.docker_service.settings.RENTAL_PROBE_ENFORCEMENT_ENABLED", True),
-    ):
-        await service.hold_node_until_probe_passes(EXECUTOR_UUID, "volume_creation", {})
+    await service.hold_node_until_probe_passes(EXECUTOR_UUID, "volume_creation", {})
 
     redis_service.set.assert_awaited_once_with(
         f"rental_probe_failed:{EXECUTOR_UUID}", f"{STEP_CONTAINER_START}:volume_creation"
@@ -48,35 +44,10 @@ async def test_a_host_fault_stands_as_a_failed_probe_and_drops_the_interval_stam
 
 
 @pytest.mark.asyncio
-async def test_in_shadow_a_host_fault_only_drops_the_interval_stamp():
-    service, redis_service = _service()
-
-    with (
-        patch("services.docker_service.settings.RENTAL_PROBE_ENABLED", True),
-        patch("services.docker_service.settings.RENTAL_PROBE_ENFORCEMENT_ENABLED", False),
-    ):
-        await service.hold_node_until_probe_passes(EXECUTOR_UUID, "volume_creation", {})
-
-    redis_service.set.assert_not_awaited()
-    redis_service.delete.assert_awaited_once_with(f"rental_probe_ok:{EXECUTOR_UUID}")
-
-
-@pytest.mark.asyncio
-async def test_nothing_is_stamped_while_the_rental_probe_is_off():
-    service, redis_service = _service()
-
-    with patch("services.docker_service.settings.RENTAL_PROBE_ENABLED", False):
-        await service.hold_node_until_probe_passes(EXECUTOR_UUID, "volume_creation", {})
-
-    redis_service.set.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_a_renter_side_failure_is_not_stamped():
     service, redis_service = _service()
 
-    with patch("services.docker_service.settings.RENTAL_PROBE_ENABLED", True):
-        await service.hold_node_until_probe_passes(EXECUTOR_UUID, "docker_pull", {})
+    await service.hold_node_until_probe_passes(EXECUTOR_UUID, "docker_pull", {})
 
     redis_service.set.assert_not_awaited()
 
@@ -86,10 +57,6 @@ async def test_a_redis_error_while_stamping_does_not_raise():
     service, redis_service = _service()
     redis_service.set.side_effect = ConnectionError("redis down")
 
-    with (
-        patch("services.docker_service.settings.RENTAL_PROBE_ENABLED", True),
-        patch("services.docker_service.settings.RENTAL_PROBE_ENFORCEMENT_ENABLED", True),
-    ):
-        await service.hold_node_until_probe_passes(EXECUTOR_UUID, "gpu_flags", {})
+    await service.hold_node_until_probe_passes(EXECUTOR_UUID, "gpu_flags", {})
 
     redis_service.delete.assert_not_awaited()

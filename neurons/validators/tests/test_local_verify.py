@@ -1461,7 +1461,6 @@ async def test_transport_names_the_sample_the_cold_retry_kept(
     """DAH-2959's cold-sample retry always runs over SSH. When it wins, the event's `transport`
     must say so; a consumed local answer that lost to it is not what the event describes.
     First pass, so the kept-first case ends in the DAH-3011 deferred-gate success event too."""
-    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
     local_answer = vvs.VerifyXResponse(
         data={"success": True, "network": {"download_speed": 59.9, "upload_speed": 20.0}}
     )

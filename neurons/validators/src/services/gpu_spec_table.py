@@ -74,6 +74,7 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     "NVIDIA H800 PCIe":                                   [81920],         # 80 GB
     # Blackwell consumer
     "NVIDIA GeForce RTX 5090":                            [32768],         # 32 GB; observed: 32607
+    "NVIDIA GeForce RTX 5090 D":                          [32768],         # 32 GB; China SKU
     "NVIDIA GeForce RTX 5080":                            [16384],         # 16 GB
     "NVIDIA GeForce RTX 5070 Ti":                         [16384],         # 16 GB
     "NVIDIA GeForce RTX 5070":                            [12288],         # 12 GB
@@ -98,6 +99,7 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
     "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": [98304],  # 96 GB
     "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],         # 84 GB; China SKU, 448-bit bus
     "NVIDIA RTX 6000D":                                   [86016],         # 84 GB; China SKU, 448-bit bus
     "NVIDIA RTX 4500 Ada Generation":                     [24576],         # 24 GB; observed: 23034

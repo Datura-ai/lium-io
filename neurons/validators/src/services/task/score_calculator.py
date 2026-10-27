@@ -60,8 +60,7 @@ def calculate_scores(
     # on. Non-CVM executors (no quote) are untouched — omitted-quote bypass by a
     # known CVM is rejected upstream by the attestation ratchet.
     if (
-        settings.ENABLE_TDX_ATTESTATION
-        and settings.ENABLE_TCB_ENFORCEMENT
+        settings.ENABLE_TCB_ENFORCEMENT
         and ctx.executor.tdx_quote
         and not ctx.tdx_attestation_passed
     ):
@@ -99,6 +98,12 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("Host pinned or throttled a rented pod below its deployed CPUs")
+
+    # Rented throughput gate: same mechanics.
+    if not ctx.rented_throughput_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("A rented pod gets far too little network or disk throughput")
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
     # score there; shadow leaves the flag True.
