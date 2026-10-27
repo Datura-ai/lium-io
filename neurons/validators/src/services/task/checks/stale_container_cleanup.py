@@ -21,6 +21,7 @@ from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 from ...const import (
     EDIT_PARKED_SUFFIX,
     FILLER_CONTAINER_PREFIX,
+    LEGACY_LIUM_CONTAINER_NAME,
     LIUM_WORKLOAD_LOOKUPS_PER_CYCLE,
     POD_CONTAINER_PREFIX,
 )
@@ -290,7 +291,12 @@ class StaleContainerCleanupCheck:
 
 async def _lium_workload_ended_here(ctx: Context, container_name: str) -> bool:
     """DAH-5117: the backend's record shows a pre-label pod_/filler_<uuid> was this node's Lium
-    workload and has ended: a rental with a close time, or a filler run in a terminal state."""
+    workload and has ended: a rental with a close time, or a filler run in a terminal state.
+    Only the canonical lowercase dashed name counts, labelled or not: the backend resolves an
+    uppercase or dashless spelling to the same record, so each spelling would claim its own GPU
+    exemption for one historical run (review 4392604823)."""
+    if LEGACY_LIUM_CONTAINER_NAME.fullmatch(container_name) is None:
+        return False
     record_id = container_name.removesuffix(EDIT_PARKED_SUFFIX).partition("_")[2]
     record: PodRentalActiveResponse | FillerRunActiveResponse | None
     if container_name.startswith(FILLER_CONTAINER_PREFIX):

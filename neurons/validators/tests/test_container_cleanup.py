@@ -1141,6 +1141,11 @@ class _DictRedis:
         ("filler_00000000-0000-4000-8000-0000000000a1", "filler_00000000-0000-4000-8000-0000000000a1"),
         # an edit-parked copy is the same record
         ("pod_00000000-0000-4000-8000-0000000000a1", f"pod_00000000-0000-4000-8000-0000000000a1{EDIT_PARKED_SUFFIX}"),
+        # review 4392604823: another spelling of the same UUID is the same record
+        ("pod_00000000-0000-4000-8000-0000000000a1", "pod_00000000-0000-4000-8000-0000000000A1"),
+        ("pod_00000000-0000-4000-8000-0000000000a1", "pod_000000000000400080000000000000a1"),
+        ("filler_00000000-0000-4000-8000-0000000000a1", "filler_00000000-0000-4000-8000-0000000000A1"),
+        ("filler_00000000-0000-4000-8000-0000000000a1", f"filler_000000000000400080000000000000a1{EDIT_PARKED_SUFFIX}"),
     ],
 )
 async def test_a_container_recreated_under_an_ended_id_keeps_its_gpu_processes_the_second_time(first, second):
