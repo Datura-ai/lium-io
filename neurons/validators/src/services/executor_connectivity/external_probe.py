@@ -2,6 +2,7 @@ import logging
 
 import aiohttp
 from services.executor_connectivity.models import PortPair
+from services.node_host import resolve_node_host
 
 from core.config import settings
 
@@ -25,7 +26,11 @@ class ExternalPortProbe:
     async def reached(self, host: str, ports: list[PortPair], token: str) -> list[PortPair] | None:
         """The ports whose listener answered the outside fetch; None when the prober itself failed,
         which is never a verdict on the node."""
-        body = {"targets": [{"host": host, "port": p.external} for p in ports], "timeout": 3}
+        address = await _address(host)
+        if address is None:
+            logger.warning("external port prober skipped: %s has no single public address", host)
+            return None
+        body = {"targets": [{"host": address, "port": p.external} for p in ports], "timeout": 3}
         try:
             async with aiohttp.ClientSession(timeout=PROBER_TIMEOUT) as session:
                 async with session.post(
@@ -39,6 +44,20 @@ class ExternalPortProbe:
             logger.warning("external port prober failed: %s", e)
             return None
         return [p for p, r in zip(ports, results) if (r.get("body") or "").strip() == f"{token}:{p.internal}"]
+
+
+async def _address(host: str) -> str | None:
+    """The prober takes IP literals only. A node registered by DNS name is probed at its address only when the
+    name resolves to exactly one public address: the validator's own test tries every address, so one sampled
+    address of several could flag a node a renter still reaches."""
+    try:
+        infos = await resolve_node_host(host, 0)
+    except OSError:
+        return None
+    if not infos:
+        return host  # an IP literal
+    addresses = {info[4][0] for info in infos}
+    return addresses.pop() if len(addresses) == 1 else None
 
 
 def external_port_probe() -> ExternalPortProbe | None:
