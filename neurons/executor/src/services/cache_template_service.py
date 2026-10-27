@@ -21,8 +21,8 @@ import asyncio
 import glob
 import os
 import random
-import re
 import time
+import tomllib
 
 import aiohttp
 import docker
@@ -300,8 +300,9 @@ HOST_ROOT = "/proc/1/root"
 def _containerd_roots() -> list[str]:
     """containerd's default root plus every top-level ``root`` in the host's config.toml and its imports.
 
-    Imports resolve as containerd does: relative to the importing file, a pattern with ``*`` is a
-    glob. Measuring more paths only makes the prune start sooner, so the default stays measured too.
+    Imports resolve as containerd does: relative to the importing file, a pattern with glob
+    characters is a glob. Measuring more paths only makes the prune start sooner, so the default
+    stays measured too.
     """
     roots = ["/var/lib/containerd"]
     prefix = next((p for p in (HOST_ROOT, "") if os.path.isfile(p + "/etc/containerd/config.toml")), None)
@@ -314,16 +315,17 @@ def _containerd_roots() -> list[str]:
             continue
         seen.add(config)
         try:
-            with open(config) as config_file:
-                top = re.split(r"(?m)^\s*\[", config_file.read(), maxsplit=1)[0]  # before the first [table]
-        except OSError:
+            with open(config, "rb") as config_file:
+                top = tomllib.load(config_file)  # a real parser: comments, multi-line arrays, escapes
+        except (OSError, tomllib.TOMLDecodeError):
             continue
-        roots += re.findall(r"""(?m)^\s*root\s*=\s*["']([^"']+)["']""", top)
-        # quoted strings are skipped whole: a glob like "[0-9]*.toml" holds a "]" that does not end the array
-        imports = re.search(r"""(?m)^\s*imports\s*=\s*\[((?:[^\]"']|"[^"]*"|'[^']*')*)\]""", top)
-        for pattern in re.findall(r"""["']([^"']+)["']""", imports.group(1)) if imports else []:
+        if isinstance(top.get("root"), str):
+            roots.append(top["root"])
+        for pattern in top.get("imports") or []:
+            if not isinstance(pattern, str):
+                continue
             path = prefix + pattern if pattern.startswith("/") else os.path.join(os.path.dirname(config), pattern)
-            todo += sorted(glob.glob(path)) if "*" in pattern else [path]
+            todo += sorted(glob.glob(path)) if glob.has_magic(pattern) else [path]
     return roots
 
 

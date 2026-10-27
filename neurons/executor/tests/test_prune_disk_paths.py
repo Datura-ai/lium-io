@@ -61,6 +61,12 @@ def test_containerd_root_set_in_a_bracket_glob_import_is_measured(monkeypatch, t
     assert _run(monkeypatch, tmp_path, SNAPSHOTTER, config, "nvme/containerd", files) == 1
 
 
+def test_containerd_root_set_in_a_commented_multiline_import_is_measured(monkeypatch, tmp_path):
+    config = "imports = [\n  # the provider's drop-ins ] go here\n  '/etc/containerd/conf.d/[0-9]*.toml', # \"x\"\n]\n"
+    files = {"etc/containerd/conf.d/10-storage.toml": 'root = "/nvme/containerd"\n'}
+    assert _run(monkeypatch, tmp_path, SNAPSHOTTER, config, "nvme/containerd", files) == 1
+
+
 def test_containerd_root_set_in_a_relative_nested_import_is_measured(monkeypatch, tmp_path):
     config = 'imports = ["extra.toml"]\n'
     files = {
