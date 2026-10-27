@@ -209,7 +209,7 @@ class DummyRedisService:
     async def hgetall(self, key: str):
         return dict(self.store.get(key) or {})
 
-    async def expire(self, key: str, seconds: int):
+    async def expire(self, key: str, seconds: int, nx: bool = False):
         pass
 
     async def write_atomically(self, writes):

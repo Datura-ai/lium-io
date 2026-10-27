@@ -221,7 +221,7 @@ class FakeRedis:
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
 
-    async def expire(self, key: str, seconds: int):
+    async def expire(self, key: str, seconds: int, nx: bool = False):
         self._touch()
         if key in self.store or key in self.hashes:
             self.ttl[key] = seconds

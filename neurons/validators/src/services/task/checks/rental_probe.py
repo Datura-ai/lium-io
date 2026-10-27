@@ -21,7 +21,11 @@ from payload_models.payloads import (
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.redis_service import RENTAL_PROBE_FAILED_PREFIX, RENTAL_PROBE_OK_PREFIX
+from services.redis_service import (
+    RENTAL_PROBE_FAILED_PREFIX,
+    RENTAL_PROBE_FAILED_TTL_SECONDS,
+    RENTAL_PROBE_OK_PREFIX,
+)
 
 from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
 from ...node_host import open_public_connection, public_host_sock
@@ -111,7 +115,18 @@ _CREATE_DEADLINE_SECONDS = 300
 _IDLENESS_REREAD_BUDGET_SECONDS = 30
 # the executor task is cancelled at JOB_TIME_OUT - 120 (miner_service), and a cancel there drops the
 # miner's whole result; a probe starts only while a stuck create plus a usual teardown still fit
-_MIN_TASK_SECONDS_LEFT = _CREATE_DEADLINE_SECONDS + 60
+_USUAL_TEARDOWN_SECONDS = 60
+_MIN_TASK_SECONDS_LEFT = _CREATE_DEADLINE_SECONDS + _USUAL_TEARDOWN_SECONDS
+# A node with a standing failure is probed on less time: only a passed probe clears the failure, and a
+# node whose other checks take longer than JOB_TIME_OUT allows for a full create reserve was never
+# probed again (8x B300, 25 Oct: ~470 s of checks, delisted after its fault was fixed). A probe that
+# runs out of this time fails as the standing failure already does, so the shorter budget costs
+# nothing. Passing probes took 155 s at most (Loki, 25 Oct; p95 66 s). 270 s still fits a create plus
+# the 90 s sshd wait before the task cancel (review).
+_MIN_TASK_SECONDS_LEFT_STANDING = 270
+# the gate's reads can eat into the create's share; below this the probe would fail on our own budget
+# and renew the hold, so the cycle reaches no verdict instead (review)
+_MIN_CREATE_DEADLINE_SECONDS = 60
 _TASK_TIMEOUT_MARGIN_SECONDS = 120
 # the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
 # outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
@@ -126,10 +141,9 @@ _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 _TAIL_CHARS = 600
 _REDIS_LAST_OK_PREFIX = RENTAL_PROBE_OK_PREFIX
 # the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
-# next cycle must not relist the node without a clean probe). The key has NO lifetime: only a passed
-# probe deletes it (review: with a lifetime, a node skipped or inconclusive for longer than it was
-# relisted without a clean probe). The key is one short string per executor that failed and never
-# passed again, deregistered ones included.
+# next cycle must not relist the node without a clean probe). The key lives RENTAL_PROBE_FAILED_TTL_SECONDS
+# (a day) from the last probe that failed: a node the probe cannot reach at all is not held forever
+# (25 Oct, Pixel's review of DAH-5107), and a node probed and failing again stays out.
 _REDIS_FAILED_PREFIX = RENTAL_PROBE_FAILED_PREFIX
 # the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
 # probe run again on the next idle cycle
@@ -194,9 +208,10 @@ class RentalProbeCheck:
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
     and the step's name, the same mechanics as the GPU runtime quarantine in rental_verification.py.
-    The failure stands until a probe passes: the failed step is kept in Redis, and every later cycle
-    that reaches no verdict of its own (the node skipped for a filler or a missing image, an
-    inconclusive probe, an unreadable input) fails the node again with that step, so a node is not
+    The failure stands until a probe passes, or for a day after the last failed probe: the failed
+    step is kept in Redis, and every later cycle that reaches no verdict of its own (the node
+    skipped for a filler or a missing image, an inconclusive probe, an unreadable input) fails the
+    node again with that step, so a node is not
     relisted without a clean probe while Redis is readable (an unreadable Redis is logged and the cycle
     decides as if no failure stood, as every other unreadable input does). Only a rented node is left
     alone, whichever read says so (the cycle's snapshot, the re-read before the create, a renter's
@@ -230,9 +245,23 @@ class RentalProbeCheck:
             return gate
         standing = gate.standing
         image_ref = gate.image_ref
+        create_deadline = _create_deadline_seconds(ctx)
+        if create_deadline < _MIN_CREATE_DEADLINE_SECONDS:
+            await gate.create_lock.release(ctx)
+            return self._inconclusive(
+                ctx,
+                "too little cycle time left for the create",
+                steps=[],
+                what={"create_deadline_seconds": int(create_deadline)},
+                standing=standing,
+            )
         try:
             outcome = await _probe(
-                ctx, image_ref, gate.create_lock, beside_fillers=bool(gate.fillers_beside)
+                ctx,
+                image_ref,
+                gate.create_lock,
+                beside_fillers=bool(gate.fillers_beside),
+                create_deadline=create_deadline,
             )
         finally:
             await gate.create_lock.release(ctx)
@@ -304,7 +333,7 @@ class RentalProbeCheck:
         # Redis could not be read (then this cycle behaves as if there were none, and logs why)
         standing = await _standing_failure(ctx)
 
-        skip_reason, skip_what = await _skip_reason(ctx)
+        skip_reason, skip_what = await _skip_reason(ctx, standing)
         if skip_reason == "rented":
             return self._skipped(ctx, skip_reason, skip_what)
         if skip_reason:
@@ -488,15 +517,22 @@ class RentalProbeCheck:
         return CheckResult(passed=True, event=event)
 
 
-async def _skip_reason(ctx: Context) -> tuple[str | None, dict[str, Any]]:
+def _task_seconds_left(ctx: Context) -> float:
+    return settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
+
+
+def _create_deadline_seconds(ctx: Context) -> float:
+    """The create's deadline: the full one, or what is left after a usual teardown when the cycle is late."""
+    return min(_CREATE_DEADLINE_SECONDS, _task_seconds_left(ctx) - _USUAL_TEARDOWN_SECONDS)
+
+
+async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[str | None, dict[str, Any]]:
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
     if rented_executor and rented_executor.pods:
         return "rented", {"pods": [pod.pod_id for pod in rented_executor.pods]}
-    task_seconds_left = (
-        settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
-    )
-    if task_seconds_left < _MIN_TASK_SECONDS_LEFT:
+    task_seconds_left = _task_seconds_left(ctx)
+    if task_seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
         return "too little cycle time left", {"task_seconds_left": int(task_seconds_left)}
 
     try:
@@ -681,8 +717,10 @@ class _Failure:
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:
-    """The last probe's failed step, kept until a probe passes; None when there is none or Redis could
-    not be read (logged; this cycle then decides as if none stood, which is what today's code does)."""
+    """The last probe's failed step, kept until a probe passes or for a day after the last failure.
+
+    None when there is none or Redis could not be read (logged; this cycle then decides as if none
+    stood, which is what today's code does)."""
     try:
         raw = await ctx.services.redis.get(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
     except Exception:
@@ -690,6 +728,13 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
         return None
     if raw is None:
         return None
+    try:
+        # a key written before the TTL existed lives forever; NX gives it the TTL once (Redis >= 7)
+        await ctx.services.redis.expire(
+            f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}", RENTAL_PROBE_FAILED_TTL_SECONDS, nx=True
+        )
+    except Exception:
+        _read_failed(ctx, "the lifetime of its standing failure in Redis")
     text = raw.decode() if isinstance(raw, bytes) else str(raw)
     step, _, create_step = text.partition(":")
     if step == STEP_EGRESS and not settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
@@ -699,12 +744,12 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
 
 
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
-    # no lifetime: the failure stands until _clear_failure, however long the node is skipped or
-    # inconclusive in between (see _REDIS_FAILED_PREFIX)
+    # the failure stands until _clear_failure or a day without a failed probe (see _REDIS_FAILED_PREFIX)
     try:
         await ctx.services.redis.set(
             f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}",
             f"{failure.step}:{failure.create_step or ''}",
+            ex=RENTAL_PROBE_FAILED_TTL_SECONDS,
         )
     except Exception:
         logger.warning(
@@ -838,7 +883,12 @@ def _probe_payload(
 
 
 async def _probe(
-    ctx: Context, image_ref: str, create_lock: _CreateLock, *, beside_fillers: bool = False
+    ctx: Context,
+    image_ref: str,
+    create_lock: _CreateLock,
+    *,
+    beside_fillers: bool = False,
+    create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> _ProbeOutcome:
     """Run the six steps in order; whatever happens, the node and this validator's Redis are left as found.
 
@@ -869,6 +919,7 @@ async def _probe(
             public_key=public_key,
             create_lock=create_lock,
             beside_fillers=beside_fillers,
+            create_deadline=create_deadline,
         )
         if created is None:
             return outcome
@@ -896,6 +947,7 @@ async def _step_container_start(
     public_key: str,
     create_lock: _CreateLock,
     beside_fillers: bool = False,
+    create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> ContainerCreated | None:
     """Step 1: start the container through create_container, the path a renter's pod takes.
 
@@ -919,7 +971,7 @@ async def _step_container_start(
                 ctx.executor_ssh_private_key_encrypted,
                 beside_fillers=beside_fillers,
             ),
-            timeout=_CREATE_DEADLINE_SECONDS,
+            timeout=create_deadline,
         )
     except TimeoutError:
         outcome.steps.append(
@@ -927,7 +979,7 @@ async def _step_container_start(
                 STEP_CONTAINER_START,
                 time.perf_counter() - started,
                 False,
-                f"create_container did not finish in {_CREATE_DEADLINE_SECONDS} s",
+                f"create_container did not finish in {int(create_deadline)} s",
             )
         )
         outcome.failed_step = STEP_CONTAINER_START
