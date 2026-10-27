@@ -115,11 +115,13 @@ _MIN_TASK_SECONDS_LEFT = _CREATE_DEADLINE_SECONDS + 60
 _TASK_TIMEOUT_MARGIN_SECONDS = 120
 # the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
 # outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
-# it, and six "volume is in use" retries 5 s apart come to about 190 s on the inspect-confirmed
-# path; a stop that itself runs into the SDK's read timeout adds to that and stays under this
-# cap, which is what ends a delete that is still slower (the probe then records "did not finish",
-# and the by-name removals in _step_teardown run)
+# it and six "volume is in use" retries 5 s apart come to about 190 s on the inspect-confirmed
+# path; a stop that itself runs into the SDK's read timeout adds to that and stays under this cap,
+# which is what ends a delete that is still slower (the probe then records "did not finish", and the
+# by-name removals in _step_teardown run)
 _TEARDOWN_DEADLINE_SECONDS = 300
+# the two wipes of the volume's files around the SIGTERM grace (DAH-5101, up to 35 s each)
+_WIPE_TEARDOWN_EXTRA_SECONDS = 120
 # one shell command over the validation connection (the image check, the by-name removals)
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 # every string copied out of the host into the event is bounded (PR_PROCESS §5)
@@ -1085,6 +1087,12 @@ def _step_egress(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
     )
 
 
+def _teardown_deadline_seconds() -> int:
+    return _TEARDOWN_DEADLINE_SECONDS + (
+        _WIPE_TEARDOWN_EXTRA_SECONDS if settings.POD_VOLUME_WIPE_BEFORE_STOP_ENABLED else 0
+    )
+
+
 async def _step_teardown(
     ctx: Context,
     outcome: _ProbeOutcome,
@@ -1421,10 +1429,10 @@ async def _teardown(ctx: Context, created: ContainerCreated, pod_id: str) -> str
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
             ),
-            timeout=_TEARDOWN_DEADLINE_SECONDS,
+            timeout=_teardown_deadline_seconds(),
         )
     except TimeoutError:
-        return f"delete_container did not finish in {_TEARDOWN_DEADLINE_SECONDS} s"
+        return f"delete_container did not finish in {_teardown_deadline_seconds()} s"
     except Exception as exc:
         return repr(exc)
     if isinstance(deleted, ContainerDeleted):
