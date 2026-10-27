@@ -512,6 +512,7 @@ def test_the_live_gpu_denominator_counts_rented_spot_only_when_it_earns(monkeypa
     monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", flag_on)
     spot = _spot(is_rented=True)
     spot.executor_info.port = 8081
+    spot.executor_info.ssh_port = 2222  # its own machine: one SSH endpoint under two hotkeys is a duplicate
     results = {"hk-spot": [spot], "hk-secure": [_node("secure-1", is_rented=True)]}
 
     assert settle_cycle_results(results, {}) == {H100: gpus}
