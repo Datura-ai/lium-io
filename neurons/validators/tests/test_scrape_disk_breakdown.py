@@ -415,6 +415,22 @@ def test_disk_usage_follows_a_custom_docker_data_root(scrape: dict, monkeypatch)
     assert asked == ["/proc/1/root/mnt/nvme/docker"]
 
 
+def test_disk_usage_is_measured_where_the_containerd_image_store_keeps_containers(scrape: dict, monkeypatch) -> None:
+    # webg8845: data-root on a big disk, but Docker's containerd image store keeps the containers on
+    # the root disk under /var/lib/containerd; the data-root is not where rentals land
+    info = {"DockerRootDir": "/data/docker", "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]]}
+    _stub_docker_api(scrape, {"/info": info})
+    asked = _stub_filesystem(
+        scrape,
+        monkeypatch,
+        host_dirs={"/proc/1/root/data/docker", "/proc/1/root/var/lib/containerd"},
+        usage_by_path={"/proc/1/root/data/docker": _DOCKER_PARTITION, "/proc/1/root/var/lib/containerd": _ROOT_PARTITION},
+    )
+
+    assert scrape["get_host_disk_usage"]() == _ROOT_PARTITION
+    assert asked == ["/proc/1/root/var/lib/containerd"]
+
+
 def test_disk_usage_falls_back_to_root_without_a_reachable_docker_root(scrape: dict, monkeypatch) -> None:
     # outside the executor container (no pid: host) the host path does not exist; `/` is what there is
     _stub_docker_api(scrape, {"/info": {"DockerRootDir": "/var/lib/docker"}})

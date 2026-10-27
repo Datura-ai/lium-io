@@ -71,6 +71,7 @@ STUBS = {
             "info --format")
                 case "$3" in
                     *DockerRootDir*) echo "$root" ;;
+                    *DriverStatus*) echo "${STUB_DRIVER_STATUS:-[[\\"Backing Filesystem\\",\\"extfs\\"]]}" ;;
                     *Runtimes*) echo "${STUB_DOCKER_RUNTIMES:-\\"runc\\", \\"sysbox-runc\\"}" ;;
                 esac ;;
             "plugin inspect")
@@ -160,9 +161,14 @@ STUBS = {
         """\
         #!/bin/bash
         echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+        case "${!#}" in   # STUB_DATA_DF_TOTAL_KB: a data-root on its own big disk, the rest on the root disk
+            */docker) [ -z "${STUB_DATA_DF_TOTAL_KB:-}" ] || { echo "/dev/md0 $STUB_DATA_DF_TOTAL_KB 1 $STUB_DATA_DF_TOTAL_KB 1% /data"; exit 0; } ;;
+        esac
         echo "/dev/nvme0n1p1 ${STUB_DF_TOTAL_KB:-1048576000} 1 ${STUB_DF_AVAIL_KB:-943718400} 1% /"
         """
     ),
+    # `containerd config dump` prints the root in 1.x quotes "..." or 2.x quotes '...'
+    "containerd": '#!/bin/bash\n[ -z "${STUB_CONTAINERD_ROOT:-}" ] || printf "version = 3\\nroot = %s\\n" "$STUB_CONTAINERD_ROOT"\n',
 }
 
 GOOD_FILES = {
@@ -324,6 +330,39 @@ def test_blackwell_without_a_driver_gets_the_open_module_from_pci(tmp_path):
 
 
 # ── disk >= 1.5x VRAM (validators' MIN_DISK_TO_VRAM_RATE) ────────────────────
+
+
+SNAPSHOTTER = {"STUB_DRIVER_STATUS": '[["driver-type","io.containerd.snapshotter.v1"]]'}
+
+
+def test_disk_is_measured_where_the_containerd_image_store_keeps_containers(tmp_path):
+    # webg8845, 27 Oct 2026: data-root on a 14 TB disk, but Docker 29's containerd image store kept the
+    # containers on the 436 GB root disk; the check read the data-root and passed
+    env = {**SNAPSHOTTER, "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    files = {"var/lib/containerd/.keep": ""}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files)
+    assert rc == 1, out
+    assert "FIX  Disk 436.0 GB on " in out and "/var/lib/containerd is below" in out
+    assert '"features": {"containerd-snapshotter": false}' in out
+
+
+def test_disk_follows_the_data_root_without_the_containerd_image_store(tmp_path):
+    env = {"STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3), "STUB_DF_TOTAL_KB": str(436 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files={"var/lib/containerd/.keep": ""})
+    assert rc == 0, out
+    assert "containerd" not in out
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_free_disk_reads_containerds_configured_root(tmp_path, quote):
+    ctrd = tmp_path / "root" / "nvme" / "containerd"
+    ctrd.mkdir(parents=True)
+    env = {**SNAPSHOTTER, "STUB_CONTAINERD_ROOT": f"{quote}{ctrd}{quote}", "STUB_DATA_DF_TOTAL_KB": str(14 * 1024**3),
+           "STUB_DF_AVAIL_KB": str(50 * 1024**2)}
+    rc, out, _ = run_check(tmp_path, "check_free_disk_for_node", env=env)
+    assert rc == 1, out
+    assert f"FIX  Free disk 50.0 GB on {ctrd} is below" in out
+    assert "containerd-snapshotter" in out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────

@@ -426,16 +426,34 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
+resolve_disk_dir() {
+    # DISK_DIR: where container root filesystems live. That is Docker's data-root, except under Docker's
+    # containerd image store (default on Docker 29+, `docker info` driver-type io.containerd.snapshotter.v1):
+    # its snapshots stay in containerd's root whatever data-root says (a 14 TB data-root read as 436 GB).
+    # SNAPSHOTTER_FIX: the extra fix line for that case, else empty.
+    local ctrd_root
+    DISK_DIR=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$DISK_DIR" ] || [ ! -d "$DISK_DIR" ]; then DISK_DIR=/var/lib/docker; fi
+    [ -d "$DISK_DIR" ] || DISK_DIR=/
+    SNAPSHOTTER_FIX=""
+    docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io\.containerd\.snapshotter' || return 0
+    # containerd 1.x dumps root = "...", 2.x root = '...'
+    ctrd_root=$(containerd config dump 2>/dev/null | sed -n "s/^root *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1)
+    [ -n "$ctrd_root" ] && [ -d "$ctrd_root" ] || ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
+    [ -d "$ctrd_root" ] || return 0
+    DISK_DIR=$ctrd_root
+    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $ctrd_root, not under data-root: set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker (pulled images are pulled again), or move containerd's root (\"root\" in /etc/containerd/config.toml) to the big disk."
+}
+
 check_total_disk_for_vram() {
     # The validators compare the TOTAL size of the filesystem the executor sees as / (its
-    # rootfs lives under Docker's data-root) with total GPU VRAM; free space is not the rule.
+    # rootfs lives under DISK_DIR) with total GPU VRAM; free space is not the rule.
     local vram_mib vram_gb data_root total_kb total_gb needed_gb
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
     vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
-    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
-    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
-    [ -d "$data_root" ] || data_root=/
+    resolve_disk_dir
+    data_root=$DISK_DIR
     total_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $2}')
     [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $data_root."; return 0; }
     vram_gb=$(awk -v m="$vram_mib" 'BEGIN {printf "%.1f", m / 1024}')
@@ -447,16 +465,16 @@ check_total_disk_for_vram() {
         return 0
     fi
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
-        "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+        "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
+        ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
 }
 
 check_free_disk_for_node() {
     # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
     # still have to come out of the same free space
     local data_root free_kb free_gb needed_gb
-    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
-    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
-    [ -d "$data_root" ] || data_root=/
+    resolve_disk_dir
+    data_root=$DISK_DIR
     free_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $4}')
     [ "${free_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Free disk for the node — cannot read the free space of $data_root."; return 0; }
     free_gb=$(awk -v k="$free_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
@@ -468,7 +486,8 @@ check_free_disk_for_node() {
         return 0
     fi
     pf_fix "Free disk ${free_gb} GB on $data_root is below ${needed_gb} GB — the validators' storage test needs ${MIN_FREE_STORAGE_GB} GB free after the node's images (~${NODE_IMAGES_GB} GB) are pulled, so \`lium mine\` would fail at validation." \
-        "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+        "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
+        ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
 }
 
 resolve_preflight_ports() {

@@ -121,6 +121,7 @@ To set every value by hand, use the [manual setup](neurons/executor/README.md#ma
 | Job Logs mention `sysbox-runc` | Sysbox is missing or not working | Rerun step 3; see [Sysbox](https://docs.lium.io/providers/nodes/sysbox) |
 | `VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW` | Download speed below 100 Mbps | Reproduce it with the [VerifyX benchmark](https://docs.lium.io/providers/troubleshooting#2-run-the-verifyx-benchmark-to-reproduce-validator-checks), then fix the uplink |
 | No idle pay, and the reason mentions disk | Total disk is below 1.5× total GPU VRAM | Add disk; see [Docker storage](https://docs.lium.io/providers/nodes/docker-storage) |
+| Disk reads as the root disk, though Docker's `data-root` is on a bigger one | Docker's containerd image store (the default on new Docker 29 installs) keeps containers under `/var/lib/containerd`, whatever `data-root` says | Set `"features": {"containerd-snapshotter": false}` in `/etc/docker/daemon.json`, then `sudo systemctl restart docker` (images are pulled again) |
 
 Every reason code and its fix: [Troubleshooting → Validator reason codes](https://docs.lium.io/providers/troubleshooting#6-validator-reason-codes). Still stuck? Open a ticket in [`#tickets`](https://discord.com/channels/1350984082733142026/1547193098969284650). Never share a seed phrase, private key or coldkey with anyone who offers help ([how support scams work](https://docs.lium.io/security/official-support-and-scams)).
 

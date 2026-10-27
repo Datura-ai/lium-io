@@ -790,10 +790,17 @@ def get_host_disk_usage():
     # container's own overlay: on a host with /var/lib/docker on its own partition it reported the
     # root partition, so a 5 TB docker volume listed as 1.8 TB (ticket-0286, DAH-2771). Without a
     # docker answer, or outside the executor container, `/` stays the measurement.
+    # Docker's containerd image store (default on Docker 29+) keeps container root filesystems in
+    # containerd's root whatever data-root says: a 14 TB data-root over a 436 GB root disk (webg8845).
+    # shortcut: the default containerd root only, not a moved one from /etc/containerd/config.toml.
     try:
-        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+        info = docker_api_get("/info") or {}
     except Exception:
-        docker_root_dir = "/var/lib/docker"
+        info = {}
+    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
+    if any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        if os.path.isdir("/proc/1/root/var/lib/containerd"):
+            docker_root_dir = "/var/lib/containerd"
     host_docker_root = f"/proc/1/root{docker_root_dir}"
     if os.path.isdir(host_docker_root):
         return shutil.disk_usage(host_docker_root)
