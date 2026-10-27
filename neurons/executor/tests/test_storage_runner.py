@@ -1762,6 +1762,12 @@ TIMEOUT_EXIT = (
         pytest.param([TIMEOUT_EXIT], 2, True, id="one timeout reruns and completes"),
         pytest.param([TIMEOUT_EXIT, TIMEOUT_EXIT], 2, False, id="a second timeout fails"),
         pytest.param(
+            [TIMEOUT_EXIT, '{"message_type":"exit_error","code":1,"message":"Fatal: repository is already locked"}\n'],
+            2,
+            False,
+            id="a different second failure is the one reported",
+        ),
+        pytest.param(
             ['{"message_type":"exit_error","code":1,"message":"Fatal: repository is already locked"}\n'],
             1,
             False,
@@ -1794,3 +1800,5 @@ def test_backup_reruns_once_after_an_s3_upload_timeout(
         with pytest.raises(ResticOperationError, match="restic backup failed with exit 1"):
             runner.run()
         assert len(calls) == runs
+        # the reported cause is the last run's own fatal error, not the first run's timeout
+        assert first_runs[-1].split('"message":"')[1][:30] in runner._events._reporter._restic_failure_detail

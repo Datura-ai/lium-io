@@ -119,6 +119,10 @@ class JsonEventWriter:
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
 
+    def rerun(self) -> None:
+        """the next restic run starts over: its own failure, not this one's, describes the operation"""
+        self._write({"event": "rerun", "operation_id": self._operation_id})
+
     def stage(self, stage: str) -> None:
         self._write({"event": "stage", "operation_id": self._operation_id, "stage": stage})
 
@@ -414,6 +418,7 @@ class ResticStorageRunner:
                 and _transient_upload_failure(self._last_error_text)
             ):
                 reruns += 1
+                self._events.rerun()
                 continue
             break
         snapshot_id = _snapshot_id(summary)

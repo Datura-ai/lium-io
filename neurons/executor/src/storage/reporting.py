@@ -79,6 +79,9 @@ class StorageEventReporter:
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = None
+            return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
