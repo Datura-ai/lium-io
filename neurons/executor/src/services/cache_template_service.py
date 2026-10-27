@@ -319,7 +319,8 @@ def _containerd_roots() -> list[str]:
         except OSError:
             continue
         roots += re.findall(r"""(?m)^\s*root\s*=\s*["']([^"']+)["']""", top)
-        imports = re.search(r"(?ms)^\s*imports\s*=\s*\[(.*?)\]", top)
+        # quoted strings are skipped whole: a glob like "[0-9]*.toml" holds a "]" that does not end the array
+        imports = re.search(r"""(?m)^\s*imports\s*=\s*\[((?:[^\]"']|"[^"]*"|'[^']*')*)\]""", top)
         for pattern in re.findall(r"""["']([^"']+)["']""", imports.group(1)) if imports else []:
             path = prefix + pattern if pattern.startswith("/") else os.path.join(os.path.dirname(config), pattern)
             todo += sorted(glob.glob(path)) if "*" in pattern else [path]
