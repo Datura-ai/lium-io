@@ -85,7 +85,7 @@ async def test_query_shared_nodes_skips_host_wide_nodes_on_a_partial_rental():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("whole_host", "gets_host_wide_nodes"), [(None, True), (True, True), (False, False)])
 async def test_the_backend_marking_a_rental_partial_withholds_host_wide_nodes(whole_host, gets_host_wide_nodes):
-    # every GPU the host shows is requested, but GPUs off the bus at this create are not shown (protocol 1.17.0)
+    # every GPU the host shows is requested; the backend's whole_host decides (protocol 1.17.0)
     ssh = fake_ssh(FakeRun("GPU-aaa, 0\nGPU-bbb, 1\n"), FakeRun(""))
 
     await build_gpu_docker_config_for_executor(ssh, ["GPU-aaa", "GPU-bbb"], whole_host=whole_host)
