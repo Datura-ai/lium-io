@@ -10458,8 +10458,18 @@ class DockerService:
             require_rental_docker_ssh_host_key(executor_info)
             if current_name == parked:
                 # before the rename: should its reply and the park-again below both be lost with the
-                # SSH transport, the next cycle still knows the stopped <name> is ours to start
-                await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_RENAMING)
+                # SSH transport, the next cycle still knows the stopped <name> is ours to start. Never over
+                # a stop's mark (unless a start since cleared it and only its delete is late): it is the
+                # only evidence the pod is down by our hand, so a start the renter breaks again and again
+                # must not turn it into a failed check of the host
+                mark = await asyncio.wait_for(
+                    self.redis_service.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"),
+                    timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+                )
+                if pod_id in _RECOVERY_MARK_CLEANUPS or (
+                    mark.decode() if isinstance(mark, bytes) else mark
+                ) != STOPPED_BY_RECOVERY_STOPPED:
+                    await self._mark_stopped_by_recovery(pod_id, STOPPED_BY_RECOVERY_RENAMING)
         except TimeoutError:
             logger.warning(_m("POD_PARKED_CONTAINER_RECOVERY_TIMED_OUT", extra=get_extra_info(log_extra)))
             return False

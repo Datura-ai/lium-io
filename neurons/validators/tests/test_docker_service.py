@@ -7369,6 +7369,7 @@ def _parked_recovery(docker_service, monkeypatch, listed, *, mounts="/workspace\
     marks: dict[str, str] = {}
     docker_service.redis_service.set = AsyncMock(side_effect=lambda key, value, ex=None: marks.__setitem__(key, value))
     docker_service.redis_service.delete = AsyncMock(side_effect=lambda key: marks.pop(key, None))
+    docker_service.redis_service.get = AsyncMock(side_effect=lambda key: marks.get(key))
     docker_service.redis_service.marks = marks
     kwargs = dict(
         ssh_client=ssh_client,
@@ -7475,6 +7476,27 @@ async def test_recover_parked_stops_and_parks_again_when_the_start_fails(
     if expected_parked_again:
         expected.append("/usr/bin/docker rename c0ffee pod_pod-1__prev")
     assert _renames(ssh_client) == expected
+
+
+@pytest.mark.asyncio
+async def test_recover_parked_keeps_the_stop_mark_while_the_renter_breaks_every_start(docker_service, monkeypatch):
+    # the validator stopped the pod (its mount could not be restored); each later start fails and parks it
+    # again: the stop's mark must survive, or the check would fail the host for a pod we keep down
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", start=AsyncMock(side_effect=RuntimeError("broken"))
+    )
+    marks = docker_service.redis_service.marks
+    marks["stopped_by_recovery:pod-1"] = "stopped"
+
+    for _ in range(2):
+        assert await docker_service.recover_parked_pod_container(**kwargs, stopped_by_recovery=True) is False
+        assert marks == {"stopped_by_recovery:pod-1": "stopped"}
+    assert start.await_count == 2
+
+    # an unmarked parked pod still gets the rename's mark
+    marks.clear()
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+    assert marks == {"stopped_by_recovery:pod-1": "renaming"}
 
 
 @pytest.mark.asyncio
