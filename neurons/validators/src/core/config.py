@@ -271,6 +271,9 @@ class Settings(BaseSettings):
     )
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
+    # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
+    POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker

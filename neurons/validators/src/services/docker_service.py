@@ -16,6 +16,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple
 from uuid import UUID, uuid4
@@ -464,6 +465,14 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
+# DAH-5101: a rental's volume files are unlinked before the stop and once more before the kill when
+# the pod outlives the SIGTERM grace, so the unmount at the stop flushes only what the pod wrote
+# after the last wipe. The host ends the rm at this many seconds. The wipe and the SIGTERM wait each
+# run on their own SSH connection, which ends _OWN_SSH_CONNECTION_MARGIN_SEC after the host timeout.
+# A filler is never wiped: its delete must answer inside the backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS
+# (30 s), which the FILLER_CONTAINER_STOP_GRACE_SECONDS and the removal already fill.
+_VOLUME_WIPE_TIMEOUT_SEC = 30
+_OWN_SSH_CONNECTION_MARGIN_SEC = 5
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
 # when that lookup fails (DAH-3217).
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
@@ -2170,9 +2179,49 @@ async def _run_with_host_timeout(
         return await _run_closing_channel_on_timeout(ssh_client, command, None)
     return await _run_closing_channel_on_timeout(
         ssh_client,
-        f"timeout -k 5 {host_timeout} sh -c {shlex.quote(command)}",
+        _host_bounded_command(command, host_timeout),
         host_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
     )
+
+
+def _host_bounded_command(command: str, host_timeout: float) -> str:
+    return f"timeout -k 5 {host_timeout} sh -c {shlex.quote(command)}"
+
+
+async def _ssh_connect_kwargs(executor_info: ExecutorSSHInfo, pkey: Any, known_hosts_policy: Any) -> dict:
+    # a fresh call per connection: public_host_sock pins a name to one dialled socket, which
+    # asyncssh consumes, so the kwargs of one connection cannot open another
+    return dict(
+        host=executor_info.address,
+        port=executor_info.ssh_port,
+        **await public_host_sock(executor_info.address, executor_info.ssh_port),
+        username=executor_info.ssh_username,
+        client_keys=[pkey],
+        known_hosts=known_hosts_policy,
+    )
+
+
+@contextlib.asynccontextmanager
+async def _connect_own_ssh(executor_info: ExecutorSSHInfo, pkey: Any, known_hosts_policy: Any):
+    async with asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as own_ssh:
+        yield own_ssh
+
+
+async def _run_on_own_ssh_connection(
+    connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+    command: str,
+    host_timeout: float,
+) -> asyncssh.SSHCompletedProcess:
+    # one deadline for the dial, the command and the close, and the connection is aborted when it
+    # fires: a command the host cannot end (rm in D state, a wait on a wedged container) never holds
+    # the session (MaxSessions=1) of the connection the forced removal and its kill run on
+    async with asyncio.timeout(host_timeout + _OWN_SSH_CONNECTION_MARGIN_SEC):
+        async with connect_ssh() as own_ssh:
+            try:
+                return await own_ssh.run(_host_bounded_command(command, host_timeout))
+            except BaseException:
+                own_ssh.abort()
+                raise
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -2188,6 +2237,35 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
         "/usr/bin/docker run --rm "
         f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
         f"{_VLOOPBACK_REPAIR_IMAGE} {helper_command}"
+    )
+
+
+def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
+    # unlink the volume's files on the host, through the executor's view of the host root: the
+    # pod's open files stay writable until its processes die, and the kernel drops an unlinked
+    # file's unwritten pages at that last close instead of writing them. No `docker run`: with
+    # gigabytes dirty dockerd takes a minute to start a container (temp-dev, 26.10). The vloopback
+    # mount is only visible on the host under the plugin's propagated-mount dir. The path is built
+    # from the validated name and each lookup must answer, so a failed or empty answer can never
+    # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
+    # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
+    volume = shlex.quote(local_volume)
+    pod = shlex.quote(container_name)
+    docker = "/usr/bin/docker"
+    return (
+        f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
+        'd=${dm%% *}; m=${dm#* }; '
+        f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
+        f'for u in $users; do [ "$u" = {pod} ] || {{ echo "volume in use by $u"; exit 6; }}; done; '
+        'case "$d" in '
+        'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
+        f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
+        f"root=$({docker} info -f '{{{{.DockerRootDir}}}}') || exit 3; "
+        f"id=$({docker} plugin inspect -f '{{{{.Id}}}}' \"$d\") || exit 3; "
+        'p=$root/plugins/$id/propagated-mount/$v;; '
+        '*) echo "unexpected driver $d"; exit 5;; esac; '
+        '[ -d "/proc/1/root$p" ] || { echo "no dir $p"; exit 4; }; '
+        'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "wiped $p"'
     )
 
 
@@ -10458,6 +10536,92 @@ class DockerService:
                 return status
             await asyncio.sleep(min(REMOVE_CONFIRM_POLL_SECONDS, remaining))
 
+    @staticmethod
+    def _wipes_volume_before_stop(payload: ContainerDeleteRequest) -> bool:
+        return (
+            bool(payload.local_volume)
+            and payload.workload_kind != WorkloadKind.FILLER
+            and settings.POD_VOLUME_WIPE_BEFORE_STOP_ENABLED
+        )
+
+    async def _wipe_volume(
+        self,
+        connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        stage: str,
+    ) -> None:
+        # DAH-5101: a pod whose volume holds gigabytes of unwritten data stalls its delete for as
+        # long as a slow disk needs to absorb them: dockerd unmounts the volume when the container
+        # stops and the unmount flushes it. The rental is over and the volume is removed below, so
+        # its files are unlinked first (_wipe_volume_cmd). Never fatal: a failure leaves the delete
+        # as it always was.
+        fields = dict(container_name=payload.container_name, local_volume=payload.local_volume, stage=stage)
+        started = time.monotonic()
+        try:
+            result = await _run_on_own_ssh_connection(
+                connect_ssh,
+                _wipe_volume_cmd(payload.local_volume, payload.container_name),
+                _VOLUME_WIPE_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Wiping the volume failed; the delete will wait for the disk",
+                error=f"{type(exc).__name__}: {exc}",
+                **fields,
+            )
+            return
+        fields["duration_ms"] = int((time.monotonic() - started) * 1000)
+        fields["result"] = (result.stdout or "").strip()
+        if getattr(result, "exit_status", 0) != 0:
+            log.warning(
+                "Wiping the volume failed; the delete will wait for the disk",
+                exit_status=getattr(result, "exit_status", None),
+                stderr=(result.stderr or "").strip(),
+                **fields,
+            )
+        else:
+            log.info("Wiped the volume's files", **fields)
+
+    async def _terminate_and_wait(
+        self,
+        connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> bool:
+        # The stop signal and the same grace as _stop_container_gracefully, without the SIGKILL and
+        # the unmount `docker stop` ends with: a workload that outlives the grace is wiped once more
+        # before the forced removal kills it, so what it wrote after the first wipe is dropped too.
+        # Returns False only when `docker wait` itself reported the exit inside the grace; a wait
+        # that timed out (124), failed (a Docker API error, a container already gone) or raised
+        # counts as still running, and the second wipe on a gone container is harmless. Never fatal.
+        try:
+            result = await _run_on_own_ssh_connection(
+                connect_ssh,
+                DockerCommand.terminate_and_wait(payload.container_name, CONTAINER_STOP_GRACE_SECONDS),
+                CONTAINER_STOP_GRACE_SECONDS + _OWN_SSH_CONNECTION_MARGIN_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Graceful termination failed; proceeding to forced removal",
+                container_name=payload.container_name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return True
+        still_running = result.exit_status != 0
+        log.info(
+            "Sent the stop signal and waited for the container",
+            container_name=payload.container_name,
+            still_running=still_running,
+            exit_status=result.exit_status,
+            result=(result.stdout or "").strip(),
+        )
+        return still_running
+
     async def _stop_container_gracefully(
         self,
         docker_client: RentalDockerSdkClient,
@@ -10750,21 +10914,22 @@ class DockerService:
             return self._failed_delete(payload, msg=str(log_text))
 
         try:
+            # the wipe and the SIGTERM wait each open their own connection (_run_on_own_ssh_connection),
+            # the removal and its kill share ssh_client
+            connect_ssh = partial(_connect_own_ssh, executor_info, pkey, known_hosts_policy)
             async with (
-                asyncssh.connect(
-                    host=executor_info.address,
-                    port=executor_info.ssh_port,
-                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
-                    username=executor_info.ssh_username,
-                    client_keys=[pkey],
-                    known_hosts=known_hosts_policy,
-                ) as ssh_client,
+                asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as ssh_client,
                 self.rental_docker_client_factory.connect(
                     executor_info=executor_info,
                     private_key=private_key,
                 ) as docker_client,
             ):
-                await self._stop_container_gracefully(docker_client, payload, log)
+                if self._wipes_volume_before_stop(payload):
+                    await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
+                    if await self._terminate_and_wait(connect_ssh, payload, log):
+                        await self._wipe_volume(connect_ssh, payload, log, stage="before the kill")
+                else:
+                    await self._stop_container_gracefully(docker_client, payload, log)
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.

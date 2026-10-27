@@ -66,6 +66,23 @@ class DockerCommand:
         )
 
     @staticmethod
+    def terminate_and_wait(name: str, grace_seconds: int) -> str:
+        """SIGTERM the container and wait up to grace_seconds for it to exit (DAH-5101).
+
+        The two halves of `docker stop` without its ending: the image's stop signal (STOPSIGNAL,
+        SIGTERM by default, as `docker stop` sends it) and the grace, but no SIGKILL and so no unmount
+        yet, which lets the delete wipe the volume once more before the forced removal kills the
+        container. Exit 0 = the container exited inside the grace; 124 = still running; any other
+        exit = unknown (a Docker API error, a container already gone), to be treated as running.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"s=$(/usr/bin/docker inspect --format '{{{{.Config.StopSignal}}}}' {quoted}) && "
+            f'/usr/bin/docker kill --signal "${{s:-SIGTERM}}" {quoted} >/dev/null && '
+            f"timeout {grace_seconds} /usr/bin/docker wait {quoted}"
+        )
+
+    @staticmethod
     def kill_container_processes(name: str) -> str:
         """SIGKILL a container's init and its containerd shim directly (DAH-2991).
 
