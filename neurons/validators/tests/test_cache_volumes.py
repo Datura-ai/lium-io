@@ -252,13 +252,13 @@ async def test_an_unmeasurable_cache_is_mounted_as_before(docker_service, du_std
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("volume_limit_gb", [1900, None])
-@pytest.mark.parametrize(("free_gb", "granted"), [(2500, False), (2600, True), (3700, True), (5100, True)])
-async def test_a_big_checkpoint_is_cached_only_with_a_terabyte_left_beside_it(
+@pytest.mark.parametrize(("free_gb", "granted"), [(2600, False), (3500, False), (3600, True), (5100, True)])
+async def test_a_big_checkpoint_is_cached_only_when_the_node_still_fits_kimi_k3_beside_it(
     docker_service, free_gb, granted, volume_limit_gb
 ):
-    # The cache stays through rentals: 2500 - 1561 = 939 GB would be all a renter is listed, so the run downloads
-    # into its own volume instead (removed by a rental); 2600 leaves 1039 GB. 3700-5100 GB B300s were refused by
-    # the 30% share in prod (26 Oct) and re-downloaded on every run. No volume limit: same rule.
+    # The cache stays used, and the backend gives kimi-k3 only to a node with 2000 GB free. 3500 - 1561 = 1939 GB:
+    # cached, the node would never fit kimi-k3 again, so the run downloads into its own volume. 3600 leaves 2039 GB.
+    # 3700-5100 GB B300s were refused by the 30% share in prod (26 Oct) and re-downloaded on every run.
     ssh_client = HostSshClient(["volume_pod"], free_gb=free_gb)
 
     affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(volume_limit_gb), {})

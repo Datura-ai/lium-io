@@ -4812,7 +4812,7 @@ class DockerService:
         )
         # A download the run's own volume could hold is not refused for its share: refused, it lands in that
         # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
-        # Granted for that reason only while renters are still listed ENGY_CACHE_MIN_FREE_BESIDE_GB beside it.
+        # Granted for that reason only while the node still fits the model beside it (ENGY_CACHE_MIN_FREE_BESIDE_GB).
         # No volume limit (no --storage-opt): the run writes the weights to the same disk anyway.
         over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and (
             (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
@@ -4955,16 +4955,19 @@ class DockerService:
             return []
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
-        families: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
-        if ENGY_CACHE_VOLUME_PREFIX in families and DPHN_CACHE_VOLUME_PREFIX not in families:
+        cache_prefixes_to_sweep: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
+        if (
+            ENGY_CACHE_VOLUME_PREFIX in cache_prefixes_to_sweep
+            and DPHN_CACHE_VOLUME_PREFIX not in cache_prefixes_to_sweep
+        ):
             # A node moved to Engy no longer runs Dolphin, so its old Dolphin cache is leftover disk.
             # Only this way round: the Dolphin cache is tens of GB, an Engy checkpoint terabytes.
-            families += (DPHN_CACHE_VOLUME_PREFIX,)
+            cache_prefixes_to_sweep += (DPHN_CACHE_VOLUME_PREFIX,)
         stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
             ssh_client,
             keep_names,
             default_extra,
-            families,
+            cache_prefixes_to_sweep,
             host_probe=host_probe,
         )
         if not stale_volumes:

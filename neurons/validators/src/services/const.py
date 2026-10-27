@@ -329,9 +329,10 @@ FILLER_CACHE_MAX_FREE_DISK_SHARE = 0.3
 # backend's size (1900 GB for kimi-k3) still applies when the cache is refused. Tune here.
 FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE = 100
 # DAH-5192: an Engy checkpoint over FILLER_CACHE_MAX_FREE_DISK_SHARE of free disk is cached only when the node
-# still has this much free beside it: the cache is kept through rentals, so this is the least disk a renter
-# is listed. Below it the run re-downloads into its own volume, which a rental removes. Tune here.
-ENGY_CACHE_MIN_FREE_BESIDE_GB = 1000
+# still has this much free beside it. The backend gives kimi-k3 only to a node with 1900 + 100 GB free
+# (strategies.py required_free_disk_gb), and the cache stays used: with less beside it, the node never fits
+# the model again and the cache is dead disk. Below it the run re-downloads into its own volume.
+ENGY_CACHE_MIN_FREE_BESIDE_GB = 2000
 # DAH-5192: an Engy cache volume holding less than this share of its checkpoint (size in its name) is a
 # partial download, e.g. one a rental interrupted. It is kept and remounted, so the next run resumes it file
 # by file, but what is still missing is charged like a download.

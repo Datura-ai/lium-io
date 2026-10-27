@@ -134,7 +134,7 @@ def test_a_node_whose_filler_cache_reads_as_free_disk_still_clears_the_gate():
         "hard_disk_used": 1800 * KB_PER_GB,
         "hard_disk_free": 200 * KB_PER_GB,
         "hard_disk_utilization": 90.0,
-        "filler_cache_kb": 1561 * KB_PER_GB,
+        "filler_run_volume_kb": 1561 * KB_PER_GB,
     }
 
     # Act

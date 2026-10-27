@@ -841,7 +841,7 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_cache_kb": filler_run_volumes // 1024,
+        "filler_run_volume_kb": filler_run_volumes // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
     }
@@ -851,7 +851,7 @@ def release_filler_cache(hard_disk):
     # DAH-5192: report the filler run volumes as free disk (a rental removes them), so the listing floor,
     # the disk a renter is offered and the filler fit checks see that space. The model caches are not in
     # it: kept across rentals, they stay used. The key is dropped: not part of the reported block.
-    cache_kb = hard_disk.pop("filler_cache_kb", 0)
+    cache_kb = hard_disk.pop("filler_run_volume_kb", 0)
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)

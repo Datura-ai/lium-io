@@ -82,7 +82,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_images": (45079943748 + 2000000000) // 1024,
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
-        "filler_cache_kb": 0,
+        "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
     }
 
@@ -110,7 +110,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
         "hard_disk_volumes": 0,
-        "filler_cache_kb": 0,
+        "filler_run_volume_kb": 0,
         "hard_disk_engy_cache_used_gb": 0,
     }
 
@@ -527,7 +527,7 @@ def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeyp
 
 def test_release_filler_cache_without_a_disk_reading_only_drops_the_key(scrape: dict) -> None:
     # Arrange — the host half of the scrape failed, the docker half did not
-    hard_disk = {"hard_disk_volumes": 0, "filler_cache_kb": 5}
+    hard_disk = {"hard_disk_volumes": 0, "filler_run_volume_kb": 5}
 
     # Act
     scrape["release_filler_cache"](hard_disk)
