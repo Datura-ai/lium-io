@@ -208,10 +208,10 @@ class RentalProbeCheck:
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
     and the step's name, the same mechanics as the GPU runtime quarantine in rental_verification.py.
-    The failure stands until a probe passes, or for a day after the last failed probe: the failed step is
-    kept in Redis, and every later cycle
-    that reaches no verdict of its own (the node skipped for a filler or a missing image, an
-    inconclusive probe, an unreadable input) fails the node again with that step, so a node is not
+    The failure stands until a probe passes, or for a day after the last failed probe: the failed
+    step is kept in Redis, and every later cycle that reaches no verdict of its own (the node
+    skipped for a filler or a missing image, an inconclusive probe, an unreadable input) fails the
+    node again with that step, so a node is not
     relisted without a clean probe while Redis is readable (an unreadable Redis is logged and the cycle
     decides as if no failure stood, as every other unreadable input does). Only a rented node is left
     alone, whichever read says so (the cycle's snapshot, the re-read before the create, a renter's
@@ -717,8 +717,10 @@ class _Failure:
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:
-    """The last probe's failed step, kept until a probe passes; None when there is none or Redis could
-    not be read (logged; this cycle then decides as if none stood, which is what today's code does)."""
+    """The last probe's failed step, kept until a probe passes or for a day after the last failure.
+
+    None when there is none or Redis could not be read (logged; this cycle then decides as if none
+    stood, which is what today's code does)."""
     try:
         raw = await ctx.services.redis.get(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
     except Exception:
