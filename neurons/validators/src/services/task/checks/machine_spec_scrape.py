@@ -518,7 +518,7 @@ class MachineSpecScrapeCheck:
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
-            # DAH-3698: PortConnectivityCheck's grace marker is validator-owned; a provider must never report it
+            # DAH-3698: validator-owned marker
             specs.pop("port_verify_first_miss", None)
 
             gpu_info = specs.get("gpu", {}) or {}

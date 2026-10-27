@@ -700,7 +700,7 @@ async def test_a_failed_vloopback_test_changes_no_stored_spec(context_factory):
 
 @pytest.mark.asyncio
 async def test_a_provider_reported_port_grace_marker_is_dropped(context_factory):
-    # DAH-3698: the marker is PortConnectivityCheck's; a provider-sent one would bypass the split-remainder port gate
+    # DAH-3698: the marker is PortConnectivityCheck's
     result = await _scrape_ok_event_for(context_factory, {"port_verify_first_miss": True})
 
     assert "port_verify_first_miss" not in result.updates["state"].specs

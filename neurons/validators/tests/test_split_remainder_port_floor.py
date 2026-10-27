@@ -373,7 +373,7 @@ def test_colliding_ports_count_once():
 
 @pytest.mark.asyncio
 async def test_a_first_failed_port_verification_does_not_cost_the_remainder():
-    # PortConnectivityCheck marks the first failed verification inside its window; the gate skips it
+    # PortConnectivityCheck's marker
     job, incentive = await _score_split(0, gpu_count=9, rented=1, spec_extra={"port_verify_first_miss": True})
     assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 8
     assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value not in _reason_codes(job)

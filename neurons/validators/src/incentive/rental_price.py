@@ -522,7 +522,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # older validator must never cost a miner the incentive.
         if not result.is_split_remainder or result.spec is None or not result.gpu_splitting_min_count:
             return None
-        # a single failed port verification is not a verdict (PortConnectivityCheck's first miss)
+        # see PortConnectivityCheck
         if result.spec.get("port_verify_first_miss") is True:
             return None
         # a Lium filler does not exempt it: not rentable on Lium means no idle pay

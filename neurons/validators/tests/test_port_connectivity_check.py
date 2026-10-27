@@ -54,7 +54,7 @@ class DummyRedis:
         self.cleared_misses.append((miner_hotkey, executor_id))
         self.dind_miss_on_record = False
 
-    # DAH-3698: first failed port verification inside the window
+    # DAH-3698: port verification marker
     port_miss_on_record: bool = False
 
     async def record_port_verify_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
@@ -746,7 +746,7 @@ async def test_a_passing_port_verification_keeps_the_miss_on_record(context_fact
 
 @pytest.mark.asyncio
 async def test_alternating_pass_and_failure_earns_grace_only_once(context_factory):
-    # success -> failure -> success -> failure inside the window: only the first failure is forgiven
+    # repeated failures
     redis_service = DummyRedis()
     marks = []
     for success in (True, False, True, False):
