@@ -76,14 +76,18 @@ class StorageLimitCheck:
         conclusive = not detail.startswith(INCONCLUSIVE_PROBE_ERRORS)
         last = await self._load(ctx)
         now = datetime.now(UTC)
-        if conclusive:
+        if last is None:
+            state = {}
+        elif conclusive:
             state = {"verdict": "fail", "failures": int(last.get("failures") or 0) + 1}
         else:
             state = {
                 **last,
                 "inconclusive_since": last.get("inconclusive_since") or now.isoformat(),
             }
-        await self._save(ctx, state)
+        if last is None or not await self._save(ctx, state):
+            # verdict memory unavailable: fail closed and hold the node, never a reused pass or a first warning
+            state = {}
         verdict = state.get("verdict")
         inconclusive_since = state.get("inconclusive_since")
         long_inconclusive = bool(
@@ -153,19 +157,22 @@ class StorageLimitCheck:
         )
 
     @staticmethod
-    async def _load(ctx: Context) -> dict:
+    async def _load(ctx: Context) -> dict | None:
+        """The node's stored verdict ({} when none); None when Redis could not be read."""
         try:
             raw = await ctx.services.redis.get(_verdict_key(ctx))
             return json.loads(raw) if raw else {}
-        except Exception as e:  # noqa: BLE001 — without the memory the node counts as never verdicted (hold)
+        except Exception as e:  # noqa: BLE001 — the caller holds the node
             logger.warning("storage limit verdict not read for %s: %s", ctx.executor.uuid, e)
-            return {}
+            return None
 
     @staticmethod
-    async def _save(ctx: Context, state: dict) -> None:
+    async def _save(ctx: Context, state: dict) -> bool:
         try:
             await ctx.services.redis.set(
                 _verdict_key(ctx), json.dumps(state), ex=STORAGE_LIMIT_VERDICT_TTL_SECONDS
             )
-        except Exception as e:  # noqa: BLE001 — a Redis blip must not fail the check
+            return True
+        except Exception as e:  # noqa: BLE001 — the caller holds the node (a pass needs no memory)
             logger.warning("storage limit verdict not recorded for %s: %s", ctx.executor.uuid, e)
+            return False

@@ -277,3 +277,27 @@ async def test_inconclusive_for_over_a_day_warns_without_a_score_change(context_
     assert result.event.severity == "warning"
     assert not result.updates
     assert ctx.state.specs["storage_limit_supported"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["read", "write"])
+@pytest.mark.parametrize("probe", [NO_LIMIT, TIMEOUT])
+async def test_a_redis_error_on_the_verdict_memory_holds_the_node(
+    context_factory, enforced, fault, probe
+):
+    # after a pass, "unsupported" would be a first warning and a timeout would reuse the pass
+    ctx = context_factory(state=build_state(specs={}))
+    await run_with(ctx, {"storage_limit_supported": True})
+    if fault == "read":
+        ctx.services.redis.failing = True
+    else:
+        ctx.services.redis.fail_next_set_of.add(
+            f"storage_limit_verdict:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+        )
+
+    result = await run_with(ctx, probe)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.updates["score"] == 0.0
+    assert ctx.state.specs["storage_limit_supported"] is not True
