@@ -1,9 +1,9 @@
 """RENTED_GPU_DROP — a rented node shows fewer GPUs than it rents, or NVML failed listing them.
 
 A card that falls off the bus on a rented node breaks the renter's workload, and without this check nobody
-is told until the next fatal cycle is investigated. The scrape's per-device loop stops at the first NVML
-error, so `gpu.count` keeps the driver's count while `gpu.details` holds only the cards read before it and
-`gpu_scrape_error` carries the NVML error.
+is told until the next fatal cycle is investigated. The scrape's per-device loop skips a card NVML errors
+on and reads the rest, so `gpu.count` keeps the driver's count while `gpu.details` lacks only the failed
+cards and `gpu_scrape_error` carries the first NVML error.
 
 The fatal checks after the scrape (GpuModelValidCheck's DETAILS_MISMATCH, GpuFingerprintCheck) halt such a
 cycle long before TenantEnforcementCheck, so this check runs right after MachineSpecScrapeCheck and never

@@ -16,6 +16,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple
 from uuid import UUID, uuid4
@@ -72,12 +73,18 @@ from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
     EDIT_PARKED_SUFFIX,
+    LEGACY_LOOPBACK_PLUGIN_ALIAS,
+    LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_SIZE_GB,
     ENGY_CACHE_VOLUME_PREFIX,
     FILLER_CACHE_MAX_FREE_DISK_SHARE,
+    FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
+    ENGY_CACHE_COMPLETE_SHARE,
+    ENGY_CACHE_MIN_FREE_BESIDE_GB,
+    CACHE_SWEEP_CONTAINER_NAME,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
@@ -85,7 +92,7 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.container_cleanup import evict_cache_volumes_oldest_first
+from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER, evict_cache_volumes_oldest_first
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
@@ -113,6 +120,7 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
@@ -441,6 +449,13 @@ def _cache_download_gb(volume_name: str) -> float:
     return int(match.group(1)) if match else math.inf
 
 
+def _filler_run_volume_gb(volume_limit_gb: int | None, cache_volumes: list[CacheVolume] | None) -> int | None:
+    # DAH-5192: with the Engy checkpoint in its mounted cache, the run volume would only hold it a second time.
+    if volume_limit_gb is None or not any(v.name.startswith(ENGY_CACHE_VOLUME_PREFIX) for v in cache_volumes or []):
+        return volume_limit_gb
+    return min(volume_limit_gb, FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE)
+
+
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "VolumeDriver.Mount",
     "cannot create mount point dir",
@@ -450,12 +465,20 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
+# DAH-5101: a rental's volume files are unlinked before the stop and once more before the kill when
+# the pod outlives the SIGTERM grace, so the unmount at the stop flushes only what the pod wrote
+# after the last wipe. The host ends the rm at this many seconds. The wipe and the SIGTERM wait each
+# run on their own SSH connection, which ends _OWN_SSH_CONNECTION_MARGIN_SEC after the host timeout.
+# A filler is never wiped: its delete must answer inside the backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS
+# (30 s), which the FILLER_CONTAINER_STOP_GRACE_SECONDS and the removal already fill.
+_VOLUME_WIPE_TIMEOUT_SEC = 30
+_OWN_SSH_CONNECTION_MARGIN_SEC = 5
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
 # when that lookup fails (DAH-3217).
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-# DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
-# has to go. Covers the image layers and scratch the pod needs beyond its own volume.
+# DAH-2475: slack kept free above a rental's requested volume before a filler cache has to go. Covers the
+# image layers and scratch the pod needs beyond its own volume.
 RENTAL_DISK_HEADROOM_GB = 20
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
@@ -644,26 +667,36 @@ class VolumeSizingResult:
     existing_volumes_bytes: int | None = None
 
 
-_LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
-_LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
+# New volumes go to a second plugin installed beside the old one under the same name with a tag:
+# `_is_vloopback_driver` matches both. The untagged name resolves to the old `vloopback:latest`,
+# whose volumes live inside its rootfs, so only `_fall_back_to_old_loopback_plugin` may name it.
+_LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 60
+# how much longer than the host's `timeout` the validator waits: for a connection that stops answering
+_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS = 10
 _PROBE_OUTPUT_LOG_CAP = 512
+# the volume host probe (with its df helper container) ends on the host by then; a probe that
+# does not answer returns None and the create takes the per-command path
+_VOLUME_HOST_PROBE_TIMEOUT_SECONDS = 30
 # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
 # so only the last line is the state: true / false / absent
-_LOOPBACK_PLUGIN_STATE_COMMAND = (
-    "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
-    f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1"
-)
+def _loopback_plugin_state_command(loopback_plugin_alias: str) -> str:
+    return (
+        "( /usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+        f"{shlex.quote(loopback_plugin_alias)} 2>/dev/null || echo absent) | tail -n 1"
+    )
 
 
-class LoopbackPluginDisabledError(Exception):
-    """The vloopback plugin is installed but disabled and `docker plugin enable` did not fix it.
-    The message keeps "plugin vloopback" and "disabled" so the platform classifier still files
-    it as volume.plugin_disabled."""
+_LOOPBACK_PLUGIN_STATE_COMMAND = _loopback_plugin_state_command(LOOPBACK_PLUGIN_ALIAS)
 
-    def __init__(self, detail: str):
+
+class NoUsableLoopbackPluginError(Exception):
+    """v2 cannot be used and the old plugin is not enabled: the validator never installs or
+    enables the old plugin, so the rent fails naming both."""
+
+    def __init__(self, v2_unusable_reason: str, old_plugin_state: str):
         super().__init__(
-            "vloopback plugin disabled on host and could not be enabled "
-            f"(plugin {_LOOPBACK_PLUGIN_ALIAS}: {detail})"
+            f"no usable vloopback plugin on host (v2: {v2_unusable_reason}; "
+            f"old plugin {LEGACY_LOOPBACK_PLUGIN_ALIAS} state {old_plugin_state})"
         )
 
 
@@ -1345,6 +1378,10 @@ _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
 
 
+class _UnkillableParkedContainer(Exception):
+    """Park could not end the container even by killing its processes directly: a wedged host process (F-1633)."""
+
+
 class _EditSwap:
     """DAH-2740: keep the customer's container until its replacement runs, so a failed edit can be undone.
 
@@ -1377,6 +1414,8 @@ class _EditSwap:
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
         self.replacement_id: str | None = None
+        # set when `docker kill` got no exit event and killing the processes directly did not stop it either
+        self.unkillable = False
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1439,13 +1478,17 @@ class _EditSwap:
             # The container cannot be stopped: give it its name back and fail the edit with the
             # pod exactly as it was. This is the wedge that used to surface as RetryError[...]
             # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
-            # stays set so __aexit__ tries the full restore once more.
-            renamed_back = await self.ssh_client.run(
-                f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
-            )
-            if renamed_back.exit_status == 0:
-                self.parked_name = None
-            raise Exception(
+            # stays set so __aexit__ tries the full restore once more. The kill can still land after
+            # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
+            # container stays parked for __aexit__ to restore.
+            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            if running.exit_status == 0 and (running.stdout or "").strip() == "true":
+                renamed_back = await self.ssh_client.run(
+                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
+                )
+                if renamed_back.exit_status == 0:
+                    self.parked_name = None
+            raise (_UnkillableParkedContainer if self.unkillable else Exception)(
                 "[park_current_container] the running container could not be stopped, the pod was left "
                 f"as it was: {(stopped.stderr or '').strip()}"
             )
@@ -1462,6 +1505,12 @@ class _EditSwap:
             is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
             if is_stopped:
                 break
+        if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
+            # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
+            await self.ssh_client.run(DockerCommand.kill_container_processes(parked))
+            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
+            self.unkillable = not is_stopped
         logger.warning(
             _m(
                 "docker stop failed while parking the current container; tried docker kill",
@@ -2070,6 +2119,111 @@ async def _with_own_duration(
     return AnswerWithOwnDuration(answer, ProfilerStep.since(step_name, started_ms))
 
 
+class SshSessionMayStillBeTakenError(Exception):
+    """A timed-out channel whose open or close was not confirmed in time may still hold the host's
+    only SSH session (MaxSessions=1): no further command goes on this connection, the rent fails."""
+
+
+def _close_process_opened_late(opening: asyncio.Future) -> None:
+    if not opening.cancelled() and opening.exception() is None:
+        opening.result().close()
+
+
+async def _close_channel_within(process: asyncssh.SSHClientProcess, timeout: float | None) -> None:
+    # sshd keeps a closed channel's session while its command still runs (MaxSessions=1)
+    process.close()
+    try:
+        async with asyncio.timeout(timeout):
+            await process.wait_closed()
+    except TimeoutError:
+        raise SshSessionMayStillBeTakenError(f"channel close not confirmed within {timeout} s") from None
+
+
+async def _run_closing_channel_on_timeout(
+    ssh_client: asyncssh.SSHClientConnection, command: str, timeout: float | None
+) -> asyncssh.SSHCompletedProcess:
+    # asyncssh's timeout= bounds neither the channel open nor frees the channel when it fires;
+    # closing it lets a host with MaxSessions=1 run the next command. The command's own timeout
+    # starts once its channel is open, as a host-side `timeout` does. Raises TimeoutError once the
+    # channel is closed, SshSessionMayStillBeTakenError when that could not be confirmed.
+    opening = asyncio.ensure_future(ssh_client.create_process(command))
+    try:
+        async with asyncio.timeout(timeout):
+            process = await asyncio.shield(opening)
+    except TimeoutError:
+        # a cancelled open whose answer comes late leaves its session taken: never cancel it;
+        # give it one more timeout to answer and close, else close it whenever it answers
+        done, _ = await asyncio.wait({opening}, timeout=timeout)
+        if not done:
+            opening.add_done_callback(_close_process_opened_late)
+            raise SshSessionMayStillBeTakenError(
+                f"channel open not answered within {2 * timeout} s"
+            ) from None
+        if opening.exception() is None:
+            await _close_channel_within(opening.result(), timeout)
+        raise
+    try:
+        async with asyncio.timeout(timeout):
+            return await process.wait()
+    except TimeoutError:
+        await _close_channel_within(process, timeout)
+        raise
+
+
+async def _run_with_host_timeout(
+    ssh_client: asyncssh.SSHClientConnection, command: str, host_timeout: float | None
+) -> asyncssh.SSHCompletedProcess:
+    # the host ends the command itself (exit 124), so sshd frees its session before the next
+    # command opens one (MaxSessions=1); without a timeout the command runs unbounded, as before
+    if not host_timeout:
+        return await _run_closing_channel_on_timeout(ssh_client, command, None)
+    return await _run_closing_channel_on_timeout(
+        ssh_client,
+        _host_bounded_command(command, host_timeout),
+        host_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
+    )
+
+
+def _host_bounded_command(command: str, host_timeout: float) -> str:
+    return f"timeout -k 5 {host_timeout} sh -c {shlex.quote(command)}"
+
+
+async def _ssh_connect_kwargs(executor_info: ExecutorSSHInfo, pkey: Any, known_hosts_policy: Any) -> dict:
+    # a fresh call per connection: public_host_sock pins a name to one dialled socket, which
+    # asyncssh consumes, so the kwargs of one connection cannot open another
+    return dict(
+        host=executor_info.address,
+        port=executor_info.ssh_port,
+        **await public_host_sock(executor_info.address, executor_info.ssh_port),
+        username=executor_info.ssh_username,
+        client_keys=[pkey],
+        known_hosts=known_hosts_policy,
+    )
+
+
+@contextlib.asynccontextmanager
+async def _connect_own_ssh(executor_info: ExecutorSSHInfo, pkey: Any, known_hosts_policy: Any):
+    async with asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as own_ssh:
+        yield own_ssh
+
+
+async def _run_on_own_ssh_connection(
+    connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+    command: str,
+    host_timeout: float,
+) -> asyncssh.SSHCompletedProcess:
+    # one deadline for the dial, the command and the close, and the connection is aborted when it
+    # fires: a command the host cannot end (rm in D state, a wait on a wedged container) never holds
+    # the session (MaxSessions=1) of the connection the forced removal and its kill run on
+    async with asyncio.timeout(host_timeout + _OWN_SSH_CONNECTION_MARGIN_SEC):
+        async with connect_ssh() as own_ssh:
+            try:
+                return await own_ssh.run(_host_bounded_command(command, host_timeout))
+            except BaseException:
+                own_ssh.abort()
+                raise
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -2083,6 +2237,35 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
         "/usr/bin/docker run --rm "
         f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
         f"{_VLOOPBACK_REPAIR_IMAGE} {helper_command}"
+    )
+
+
+def _wipe_volume_cmd(local_volume: str, container_name: str) -> str:
+    # unlink the volume's files on the host, through the executor's view of the host root: the
+    # pod's open files stay writable until its processes die, and the kernel drops an unlinked
+    # file's unwritten pages at that last close instead of writing them. No `docker run`: with
+    # gigabytes dirty dockerd takes a minute to start a container (temp-dev, 26.10). The vloopback
+    # mount is only visible on the host under the plugin's propagated-mount dir. The path is built
+    # from the validated name and each lookup must answer, so a failed or empty answer can never
+    # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
+    # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
+    volume = shlex.quote(local_volume)
+    pod = shlex.quote(container_name)
+    docker = "/usr/bin/docker"
+    return (
+        f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
+        'd=${dm%% *}; m=${dm#* }; '
+        f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
+        f'for u in $users; do [ "$u" = {pod} ] || {{ echo "volume in use by $u"; exit 6; }}; done; '
+        'case "$d" in '
+        'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
+        f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
+        f"root=$({docker} info -f '{{{{.DockerRootDir}}}}') || exit 3; "
+        f"id=$({docker} plugin inspect -f '{{{{.Id}}}}' \"$d\") || exit 3; "
+        'p=$root/plugins/$id/propagated-mount/$v;; '
+        '*) echo "unexpected driver $d"; exit 5;; esac; '
+        '[ -d "/proc/1/root$p" ] || { echo "no dir $p"; exit 4; }; '
+        'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "wiped $p"'
     )
 
 
@@ -4455,7 +4638,7 @@ class DockerService:
             for name, driver in volume_rows:
                 if not (
                     name.startswith("volume_")
-                    and (driver == "vloopback" or driver.startswith("vloopback:"))
+                    and _is_vloopback_driver(driver)
                 ):
                     continue
                 vloopback_volumes.add(name)
@@ -4588,17 +4771,15 @@ class DockerService:
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
     ) -> bool:
-        """Free the DPHN filler cache when a customer rental needs the disk it occupies; True when
+        """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
 
-        DAH-2475: the cache is filler property worth ~37 GB. Once a customer rents the node the disk
-        belongs to the renter, so if what they asked for does not fit next to the cache, the cache
-        goes — reclaiming here rather than at filler-stop is what stops the node re-downloading it
-        every cycle (see sweep_stale_cache_volumes). Runs before volume sizing so the freed space is
-        already visible when the pod's volume is measured and created.
-
-        Only for CUSTOMER_RENTAL, only when the rental actually needs the room, and best-effort — a
-        failure here must never break the rent.
+        DAH-5192: the caches are kept across rentals and listed as used disk, so a renter offered the listed
+        free disk normally fits and nothing is evicted. The listing can still be stale (it is ~15 min old, and
+        an Engy download writes ~1 GB/s until the filler is removed), so an idle cache must never be the reason
+        a paid create fails: when the requested volume does not fit, caches go oldest first until it does.
+        With no requested size (no --storage-opt) the renter gets the disk beside the cache, as listed.
+        Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             return False
@@ -4611,17 +4792,12 @@ class DockerService:
             if not cache_volumes:
                 return False
 
-            # The backend sends volume_limit_gb=None for every executor whose docker lacks
-            # --storage-opt support (calc_volume_storage_limit), so "no limit" does NOT mean "no disk
-            # needed" — it means the renter may use the whole disk and no fit check is possible. Err on
-            # the renter's side and give the cache back unconditionally; the filler re-downloads it
-            # after the rental, which is the filler's cost to pay, not the customer's.
-            if requested_gb:
-                docker_root_dir = await self.get_docker_root_dir(ssh_client)
-                free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-                free_gb = free_bytes / (1024**3)
-                if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
-                    return False
+            if not requested_gb:
+                return False
+            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+            if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
+                return False
 
             logger.info(
                 _m(
@@ -4629,17 +4805,13 @@ class DockerService:
                     extra=get_extra_info({
                         **default_extra,
                         "volumes": cache_volumes,
-                        "free_gb": round(free_gb, 1) if requested_gb else None,
+                        "free_gb": round(free_gb, 1),
                         "requested_gb": requested_gb,
                     }),
                 )
             )
             async def remove(command: str) -> object:
                 return await retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental")
-
-            if not requested_gb:
-                await remove(DockerCommand.volume_remove(*cache_volumes))
-                return True
 
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
@@ -4691,7 +4863,15 @@ class DockerService:
                 host_probe=host_probe,
             )
         )
-        present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name in existing]
+        # DAH-5192: a partial checkpoint (an interrupted download) is not "present": what it still lacks is charged.
+        missing_gb: dict[str, float] = {
+            name: await self._engy_cache_missing_gb(ssh_client, name, default_extra)
+            for name in existing
+            if name.startswith(ENGY_CACHE_VOLUME_PREFIX)
+        }
+        present: list[CacheVolume] = [
+            volume for volume in payload.cache_volumes if volume.name in existing and not missing_gb.get(volume.name)
+        ]
         if len(present) == len(payload.cache_volumes):
             return list(payload.cache_volumes)
 
@@ -4714,12 +4894,25 @@ class DockerService:
         floor_gb: int = DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
         # One family per launch: DPHN's whole set is DPHN_CACHE_SIZE_GB, an Engy launch asks for one volume.
         download_gb: float = max(
-            _cache_download_gb(volume.name) for volume in payload.cache_volumes if volume.name not in existing
+            missing_gb.get(volume.name) or _cache_download_gb(volume.name)
+            for volume in payload.cache_volumes
+            if volume.name not in {kept.name for kept in present}
         )
         # DAH-5014: free_gb is real disk, every cache on it counted as used. The pod's own volume is
         # created (preallocated) after this check, so the floor must hold with both on disk.
-        free_after_gb: float = free_gb - download_gb - (payload.volume_limit_gb or 0)
-        if download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE or free_after_gb <= floor_gb:
+        # Granted, the cache shrinks the run volume (_filler_run_volume_gb), so the floor is held with that size.
+        free_after_gb: float = free_gb - download_gb - (
+            _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes) or 0
+        )
+        # A download the run's own volume could hold is not refused for its share: refused, it lands in that
+        # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
+        # Granted for that reason only while the node still fits the model beside it (ENGY_CACHE_MIN_FREE_BESIDE_GB).
+        # No volume limit (no --storage-opt): the run writes the weights to the same disk anyway.
+        over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and (
+            (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
+            or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
+        )
+        if over_share or free_after_gb <= floor_gb:
             logger.info(
                 _m(
                     "Node cannot afford the filler cache download; keeping only the volumes it already has",
@@ -4734,13 +4927,48 @@ class DockerService:
             return present
         return list(payload.cache_volumes)
 
+    async def _engy_cache_missing_gb(
+        self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
+    ) -> float:
+        """GB an existing Engy cache still lacks of the checkpoint size in its name; 0 when complete or unknown.
+
+        Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
+        container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
+        `du` is quick. Unmeasurable reads as complete: mounting what exists costs nothing, as before.
+        """
+        expected_gb: float = _cache_download_gb(volume_name)
+        if math.isinf(expected_gb):
+            return 0
+        try:
+            result = await ssh_client.run(
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
+                f"-v {shlex.quote(volume_name)}:/cache:ro {ALPINE_HELPER_IMAGE} du -sk /cache; "
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return 0
+        used_kb: str = ((result.stdout or "").split() or [""])[0]
+        if not used_kb.isdigit():
+            return 0
+        held_gb: float = int(used_kb) * 1024 / 10**9
+        if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
+            return 0
+        logger.info(
+            _m(
+                "Engy cache is a partial download; the run resumes it",
+                extra=get_extra_info({**default_extra, "volume": volume_name, "held_gb": round(held_gb, 1)}),
+            )
+        )
+        return expected_gb - held_gb
+
     @staticmethod
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
         """The cache prefixes these volume names belong to, e.g. `dphn_cache_` for a DPHN launch.
 
-        DAH-2805: a launch may only sweep its OWN family. A node that moves from DPHN to ENGY asks
-        for engy volumes, and sweeping every cache prefix there would delete the Dolphin cache the
-        node needs for its next fast start — the very thing these volumes exist for.
+        DAH-2805: a launch may only sweep its OWN family. sweep_stale_cache_volumes adds the Dolphin
+        family to an Engy launch's sweep (DAH-5192); the fit check above stays on the own family.
         """
         return tuple(
             prefix
@@ -4821,11 +5049,19 @@ class DockerService:
             return []
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
+        cache_prefixes_to_sweep: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
+        if (
+            ENGY_CACHE_VOLUME_PREFIX in cache_prefixes_to_sweep
+            and DPHN_CACHE_VOLUME_PREFIX not in cache_prefixes_to_sweep
+        ):
+            # A node moved to Engy no longer runs Dolphin, so its old Dolphin cache is leftover disk.
+            # Only this way round: the Dolphin cache is tens of GB, an Engy checkpoint terabytes.
+            cache_prefixes_to_sweep += (DPHN_CACHE_VOLUME_PREFIX,)
         stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
             ssh_client,
             keep_names,
             default_extra,
-            self._cache_volume_families(sorted(keep_names)),
+            cache_prefixes_to_sweep,
             host_probe=host_probe,
         )
         if not stale_volumes:
@@ -4842,7 +5078,9 @@ class DockerService:
         )
         try:
             await retry_ssh_command(
-                ssh_client, DockerCommand.volume_remove(*stale_volumes), "sweep_stale_cache_volumes"
+                ssh_client,
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*stale_volumes)}",
+                "sweep_stale_cache_volumes",
             )
         except asyncio.CancelledError:
             raise
@@ -6082,50 +6320,83 @@ class DockerService:
         )
         return max(requested_timeout, min(scaled_timeout, _LOCAL_VOLUME_TIMEOUT_MAX_SEC))
 
-    async def _enable_loopback_plugin(
+    async def _fall_back_to_old_loopback_plugin(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         timeout: int,
         log_extra: dict,
-    ) -> None:
-        """`docker plugin enable` the installed-but-disabled loopback plugin, then read its state
-        again. Raises LoopbackPluginDisabledError when it is still not enabled, so the rent fails
-        at volume creation with a clear reason instead of Docker's create error."""
-        run_kwargs = {"timeout": timeout} if timeout else {}
-        extra = {**log_extra, "loopback_plugin": _LOOPBACK_PLUGIN_ALIAS}
+        v2_unusable_reason: str,
+    ) -> str:
+        """The old plugin for one new volume when v2 cannot be used, only if it is already enabled:
+        until it is retired a node without v2 keeps renting. Returns the driver to create on, else
+        raises NoUsableLoopbackPluginError; never installs or enables the old plugin.
+        The only place a plugin command may name the old plugin; it goes away with it."""
+        old_plugin_alias = LEGACY_LOOPBACK_PLUGIN_ALIAS
         try:
-            result = await ssh_client.run(
-                f"/usr/bin/docker plugin enable {shlex.quote(_LOOPBACK_PLUGIN_ALIAS)}", **run_kwargs
+            state_result = await _run_with_host_timeout(
+                ssh_client, _loopback_plugin_state_command(old_plugin_alias), timeout
             )
-            state_result = await ssh_client.run(_LOOPBACK_PLUGIN_STATE_COMMAND, **run_kwargs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # typed fields only: an asyncssh error's text can carry the host's banner
-            error_type = exc.__class__.__name__
-            logger.warning(
-                _m(
-                    "Loopback plugin enable failed",
-                    extra=get_extra_info({**extra, "error_type": error_type}),
-                )
-            )
-            raise LoopbackPluginDisabledError(f"enable error: {error_type}") from exc
-        state = (state_result.stdout or "").strip()
+            state = (state_result.stdout or "").strip() or "unknown"
+        except TimeoutError:
+            state = "unknown"
         if state != "true":
-            detail = (result.stderr or result.stdout or "").strip()[:_PROBE_OUTPUT_LOG_CAP]
-            logger.warning(
-                _m(
-                    "Loopback plugin still disabled after enable",
-                    extra=get_extra_info(
-                        {**extra, "enable_exit_status": result.exit_status, "state": state, "error": detail}
-                    ),
+            raise NoUsableLoopbackPluginError(v2_unusable_reason, state)
+        logger.warning(
+            _m(
+                "Loopback plugin v2 unusable; creating this volume on the old plugin",
+                extra=get_extra_info(
+                    {**log_extra, "loopback_plugin": old_plugin_alias, "reason": v2_unusable_reason}
+                ),
+            )
+        )
+        return old_plugin_alias
+
+    @staticmethod
+    async def _get_loopback_v2_state(ssh_client: asyncssh.SSHClientConnection, requested_timeout: int) -> str:
+        # `plugin inspect` output of v2 ("true", "false", empty when absent), "unknown" when the read timed out
+        try:
+            state_result = await _run_with_host_timeout(ssh_client, _LOOPBACK_PLUGIN_STATE_COMMAND, requested_timeout)
+        except TimeoutError:
+            return "unknown"
+        return (state_result.stdout or "").strip()
+
+    async def _pick_loopback_driver_for_new_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        timeout: int,
+        log_extra: dict,
+        host_probe: VolumeHostProbe | None,
+    ) -> str:
+        if not settings.LOOPBACK_PLUGIN_V2_ENABLED:
+            return await self._fall_back_to_old_loopback_plugin(
+                ssh_client, timeout, log_extra, "v2 disabled by LOOPBACK_PLUGIN_V2_ENABLED"
+            )
+        if host_probe is not None and host_probe.loopback_plugin_enabled:
+            return LOOPBACK_PLUGIN_ALIAS
+        root = host_probe.docker_root_dir if host_probe else await self.get_docker_root_dir(ssh_client)
+        if not root.startswith("/"):
+            # An existing enabled v2 remains usable even when DockerRootDir could not be read.
+            if await self._get_loopback_v2_state(ssh_client, timeout) == "true":
+                return LOOPBACK_PLUGIN_ALIAS
+            reason = "Docker data root unknown"
+        else:
+            try:
+                result = await _run_with_host_timeout(
+                    ssh_client,
+                    loopback_plugin_setup_command(root, LOOPBACK_PLUGIN_ALIAS),
+                    _LOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS,
                 )
-            )
-            raise LoopbackPluginDisabledError(
-                f"enable exit {result.exit_status}, state {state or 'unknown'}"
-                + (f": {detail}" if detail else "")
-            )
-        logger.info(_m("Loopback plugin was disabled; enabled it", extra=get_extra_info(extra)))
+                if result.exit_status == 0:
+                    return LOOPBACK_PLUGIN_ALIAS
+                reason = f"v2 setup exit {result.exit_status}: {(result.stderr or '').strip()[:_PROBE_OUTPUT_LOG_CAP]}"
+            except (SshSessionMayStillBeTakenError, asyncssh.Error):
+                raise
+            except TimeoutError:
+                reason = "v2 setup timed out"
+            except Exception as exc:
+                # SSH errors can contain provider banners or credentials. Log only the type.
+                reason = f"v2 setup error: {type(exc).__name__}"
+        return await self._fall_back_to_old_loopback_plugin(ssh_client, timeout, log_extra, reason)
 
     async def create_local_volume(
         self,
@@ -6147,40 +6418,9 @@ class DockerService:
             field_name="local_volume",
         )
         if limit:
-            # install loopback plugin
-            loopback_plugin_name = _LOOPBACK_PLUGIN_ALIAS
-
-            if host_probe is not None:
-                docker_root_dir = host_probe.docker_root_dir
-            else:
-                docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
-
-            if host_probe is not None and host_probe.loopback_plugin_enabled:
-                # The probe saw the plugin installed and enabled: `docker plugin install` would
-                # only ask Docker Hub for the plugin's privileges and then fail with "already
-                # exists" (~0.9 s measured on a 4090 node, every rent). Nothing to do.
-                logger.info(
-                    _m(
-                        "Loopback plugin already enabled; skipping plugin install",
-                        extra=get_extra_info({**log_extra, "loopback_plugin": loopback_plugin_name}),
-                    )
-                )
-            elif host_probe is not None and host_probe.loopback_plugin_installed:
-                # Installed but disabled: `docker plugin install` would fail with "already exists"
-                # and the volume create with "plugin vloopback found but disabled".
-                await self._enable_loopback_plugin(ssh_client, requested_timeout, log_extra)
-            else:
-                loopback_plugin_arg = shlex.quote(loopback_plugin_name)
-                data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
-                command = (
-                    f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
-                    f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
-                )
-                # TODO: migrate Docker plugin management if/when plugin setup becomes
-                # part of the SDK migration scope. The user-controlled volume name is
-                # not used in this shell command; volume creation below is SDK-backed.
-                await ssh_client.run(command)
+            loopback_plugin_name = await self._pick_loopback_driver_for_new_volume(
+                ssh_client, requested_timeout, log_extra, host_probe
+            )
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
             # by default (creation time scales with size). `sparse=true` writes a sparse
@@ -6325,14 +6565,19 @@ class DockerService:
         Replaces `docker info` + the df helper container + `docker volume ls` (fresh sizing) and the
         second `docker info` + the unconditional `docker plugin install` (create) — five serial
         commands, one of them a Docker Hub round trip — with one command and, when vloopback
-        volumes exist, the same `docker volume inspect` as before. Never fatal: on any failure it
-        returns None and the callers take the per-command path.
+        volumes exist, the same `docker volume inspect` as before. On any failure it returns None
+        and the callers take the per-command path, except when its channel may still hold the
+        host's only SSH session: SshSessionMayStillBeTakenError stops the create.
         """
         started = now_ms()
         try:
-            result = await ssh_client.run(_volume_host_probe_command(with_df=with_df))
+            result = await _run_with_host_timeout(
+                ssh_client,
+                _volume_host_probe_command(with_df=with_df),
+                _VOLUME_HOST_PROBE_TIMEOUT_SECONDS,
+            )
             probe = _parse_volume_host_probe(result.stdout or "", with_df=with_df)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
             raise
         except Exception as exc:
             logger.warning(
@@ -8297,7 +8542,12 @@ class DockerService:
                         )
                     # a delete that landed during the wait must find the pod as it was, not parked
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-                    parked_name = await edit_swap.park()
+                    try:
+                        parked_name = await edit_swap.park()
+                    except _UnkillableParkedContainer:
+                        # the backend reads container_cleanup as the host's fault; park_current_container alone is not
+                        current_step = "container_cleanup"
+                        raise
                     if parked_name:
                         protected_container_names.append(parked_name)
 
@@ -8429,9 +8679,12 @@ class DockerService:
                     default_extra=default_extra,
                     host_probe=docker_listing_probe,
                 )
+                payload.volume_limit_gb = _filler_run_volume_gb(payload.volume_limit_gb, payload.cache_volumes)
 
+                # Fish 26 Oct: the filler caches are kept across rentals and listed as used disk, so a renter
+                # offered the listed free disk fits beside them; they go only when the requested volume does not.
                 reclaimed_cache_volumes = (
-                    []
+                    False
                     if beside_fillers
                     else await self.reclaim_dphn_cache_for_rental(
                         ssh_client=ssh_client,
@@ -8563,6 +8816,10 @@ class DockerService:
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
                         else:
+                            # a discarded early probe ends (it is bounded) before the next one opens a
+                            # channel (MaxSessions=1), and stops the create as the probe itself would
+                            if early_volume_probe is not None and not early_volume_probe.cancelled():
+                                await early_volume_probe
                             volume_probe = await self.probe_volume_host(
                                 ssh_client,
                                 with_df=measures_host,
@@ -10279,6 +10536,92 @@ class DockerService:
                 return status
             await asyncio.sleep(min(REMOVE_CONFIRM_POLL_SECONDS, remaining))
 
+    @staticmethod
+    def _wipes_volume_before_stop(payload: ContainerDeleteRequest) -> bool:
+        return (
+            bool(payload.local_volume)
+            and payload.workload_kind != WorkloadKind.FILLER
+            and settings.POD_VOLUME_WIPE_BEFORE_STOP_ENABLED
+        )
+
+    async def _wipe_volume(
+        self,
+        connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        stage: str,
+    ) -> None:
+        # DAH-5101: a pod whose volume holds gigabytes of unwritten data stalls its delete for as
+        # long as a slow disk needs to absorb them: dockerd unmounts the volume when the container
+        # stops and the unmount flushes it. The rental is over and the volume is removed below, so
+        # its files are unlinked first (_wipe_volume_cmd). Never fatal: a failure leaves the delete
+        # as it always was.
+        fields = dict(container_name=payload.container_name, local_volume=payload.local_volume, stage=stage)
+        started = time.monotonic()
+        try:
+            result = await _run_on_own_ssh_connection(
+                connect_ssh,
+                _wipe_volume_cmd(payload.local_volume, payload.container_name),
+                _VOLUME_WIPE_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Wiping the volume failed; the delete will wait for the disk",
+                error=f"{type(exc).__name__}: {exc}",
+                **fields,
+            )
+            return
+        fields["duration_ms"] = int((time.monotonic() - started) * 1000)
+        fields["result"] = (result.stdout or "").strip()
+        if getattr(result, "exit_status", 0) != 0:
+            log.warning(
+                "Wiping the volume failed; the delete will wait for the disk",
+                exit_status=getattr(result, "exit_status", None),
+                stderr=(result.stderr or "").strip(),
+                **fields,
+            )
+        else:
+            log.info("Wiped the volume's files", **fields)
+
+    async def _terminate_and_wait(
+        self,
+        connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> bool:
+        # The stop signal and the same grace as _stop_container_gracefully, without the SIGKILL and
+        # the unmount `docker stop` ends with: a workload that outlives the grace is wiped once more
+        # before the forced removal kills it, so what it wrote after the first wipe is dropped too.
+        # Returns False only when `docker wait` itself reported the exit inside the grace; a wait
+        # that timed out (124), failed (a Docker API error, a container already gone) or raised
+        # counts as still running, and the second wipe on a gone container is harmless. Never fatal.
+        try:
+            result = await _run_on_own_ssh_connection(
+                connect_ssh,
+                DockerCommand.terminate_and_wait(payload.container_name, CONTAINER_STOP_GRACE_SECONDS),
+                CONTAINER_STOP_GRACE_SECONDS + _OWN_SSH_CONNECTION_MARGIN_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Graceful termination failed; proceeding to forced removal",
+                container_name=payload.container_name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return True
+        still_running = result.exit_status != 0
+        log.info(
+            "Sent the stop signal and waited for the container",
+            container_name=payload.container_name,
+            still_running=still_running,
+            exit_status=result.exit_status,
+            result=(result.stdout or "").strip(),
+        )
+        return still_running
+
     async def _stop_container_gracefully(
         self,
         docker_client: RentalDockerSdkClient,
@@ -10571,21 +10914,22 @@ class DockerService:
             return self._failed_delete(payload, msg=str(log_text))
 
         try:
+            # the wipe and the SIGTERM wait each open their own connection (_run_on_own_ssh_connection),
+            # the removal and its kill share ssh_client
+            connect_ssh = partial(_connect_own_ssh, executor_info, pkey, known_hosts_policy)
             async with (
-                asyncssh.connect(
-                    host=executor_info.address,
-                    port=executor_info.ssh_port,
-                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
-                    username=executor_info.ssh_username,
-                    client_keys=[pkey],
-                    known_hosts=known_hosts_policy,
-                ) as ssh_client,
+                asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as ssh_client,
                 self.rental_docker_client_factory.connect(
                     executor_info=executor_info,
                     private_key=private_key,
                 ) as docker_client,
             ):
-                await self._stop_container_gracefully(docker_client, payload, log)
+                if self._wipes_volume_before_stop(payload):
+                    await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
+                    if await self._terminate_and_wait(connect_ssh, payload, log):
+                        await self._wipe_volume(connect_ssh, payload, log, stage="before the kill")
+                else:
+                    await self._stop_container_gracefully(docker_client, payload, log)
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.

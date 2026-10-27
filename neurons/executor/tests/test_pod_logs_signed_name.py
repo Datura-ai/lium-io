@@ -10,8 +10,8 @@ Ephemeral keypairs, the real middleware and the real route; only the log store i
 
 from unittest.mock import AsyncMock, MagicMock
 
-import bittensor
 import pytest
+from bittensor_wallet import Keypair
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
@@ -28,13 +28,13 @@ _OTHER_CONTAINER = "pod_0b2a6d1e-9e2e-4e2e-8e2e-00000000beef"
 
 @pytest.fixture(scope="module")
 def miner_keypair():
-    return bittensor.Keypair.create_from_uri("//LiumTestMinerPodLogs")
+    return Keypair.create_from_uri("//LiumTestMinerPodLogs")
 
 
 @pytest.fixture(scope="module")
 def portal_keypair():
     """The fixed portal hotkey every executor also trusts (settings.DEFAULT_MINER_HOTKEY)."""
-    return bittensor.Keypair.create_from_uri("//LiumTestPortalPodLogs")
+    return Keypair.create_from_uri("//LiumTestPortalPodLogs")
 
 
 @pytest.fixture()
@@ -75,7 +75,7 @@ def test_a_signature_over_one_container_does_not_read_another(client, miner_keyp
 
 def test_a_stranger_is_still_refused_before_the_binding_is_checked(client, store):
     """The middleware's 401 comes first: a matching name with a foreign signature reads nothing."""
-    stranger = bittensor.Keypair.create_from_uri("//LiumTestStrangerPodLogs")
+    stranger = Keypair.create_from_uri("//LiumTestStrangerPodLogs")
 
     response = client.post("/pod_logs", json=_signed(stranger, _CONTAINER, _CONTAINER))
 

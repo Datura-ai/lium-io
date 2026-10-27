@@ -10,7 +10,8 @@
 #   - keeps default setup's languages, `default` query suite and `/language:<lang>` categories, so alerts carry over.
 #
 # Cut-over: code scanning rejects SARIF from a workflow while default setup is enabled, so until default setup is
-# switched off this workflow analyses but does not upload (the "preflight" step says so in the run summary). Once this
+# switched off this workflow runs only its preflight job and skips the analysis (DAH-5201: default setup already
+# analyses the same commits, so analysing here too was a duplicate that could not upload). Once this
 # file is on main, the loop runs tools/codeql_cutover.sh (disable default setup → dispatch this workflow on main →
 # verify); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
 # "Run workflow" on main with force-upload ticked (a plain re-run still sees default setup's last analysis and skips the upload).
@@ -37,10 +38,52 @@ on:
 permissions: {}
 
 jobs:
-  analyze:
-    name: Analyze (${{ matrix.language }})
+  # DAH-5201: while default setup is on it already analyses every PR and push to main ("Push on main", "PR #n"
+  # runs of dynamic/github-code-scanning/codeql) and uploads; this workflow's analysis could not upload, so both
+  # matrix legs were a duplicate (~1,500 job-minutes a week). The preflight runs alone and the analysis starts only
+  # when its SARIF can be uploaded, i.e. from the cut-over on; nothing changes for that path.
+  preflight:
+    name: Preflight (default setup still enabled?)
     # `edited` also fires on title/body edits; only a base-branch change needs a new analysis.
     if: github.event.action != 'edited' || github.event.changes.base != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      security-events: read
+      contents: read
+    outputs:
+      upload: ${{ steps.preflight.outputs.upload }}
+    steps:
+      - name: Preflight — is default setup still enabled?
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_UPLOAD: ${{ inputs.force-upload }}
+          DEFAULT_BRANCH: main
+        run: |
+          set -u
+          # (gh api prints the error body on stdout, so assign only on success)
+          state=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/default-setup" --jq .state 2>/dev/null) || state=unknown
+          if [ "$state" = unknown ]; then
+            # GITHUB_TOKEN gets 403 on that endpoint ("Resource not accessible by integration"): fall back to who produced
+            # the latest CodeQL analysis on the default branch — default setup's key is dynamic/github-code-scanning/codeql:analyze
+            key=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/analyses?tool_name=CodeQL&ref=refs/heads/$DEFAULT_BRANCH&per_page=1" --jq '.[0].analysis_key // ""' 2>/dev/null) || key=""
+            case "$key" in dynamic/github-code-scanning/*) state=configured;; "") state=unknown;; *) state=not-configured;; esac
+            echo "default-setup endpoint not readable by the workflow token; inferred '$state' from the latest analysis key '$key'"
+          fi
+          if [ "$state" = configured ] && [ "$FORCE_UPLOAD" != true ]; then
+            echo "upload=never" >> "$GITHUB_OUTPUT"
+            echo "::notice title=CodeQL default setup is still enabled::Default setup analyses this commit and code scanning rejects SARIF from a workflow while it is on, so the analysis jobs are skipped. Cut-over: tools/codeql_cutover.sh in the loop repo, or Settings → Advanced Security → CodeQL → Switch to advanced, then Actions → CodeQL → Run workflow on $DEFAULT_BRANCH with force-upload ticked (a plain re-run still sees the last default-setup analysis and skips the upload)."
+            echo "default setup: $state → no analysis here"
+          else
+            echo "upload=always" >> "$GITHUB_OUTPUT"
+            echo "default setup: $state → analyse and upload"
+          fi
+
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: preflight
+    if: needs.preflight.outputs.upload == 'always'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # job-level (not workflow-level) so a skipped title/body-edit run never cancels an analysis in progress.
@@ -61,32 +104,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Preflight — is default setup still enabled?
-        id: preflight
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FORCE_UPLOAD: ${{ inputs.force-upload }}
-          DEFAULT_BRANCH: main
-        run: |
-          set -u
-          # (gh api prints the error body on stdout, so assign only on success)
-          state=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/default-setup" --jq .state 2>/dev/null) || state=unknown
-          if [ "$state" = unknown ]; then
-            # GITHUB_TOKEN gets 403 on that endpoint ("Resource not accessible by integration"): fall back to who produced
-            # the latest CodeQL analysis on the default branch — default setup's key is dynamic/github-code-scanning/codeql:analyze
-            key=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/analyses?tool_name=CodeQL&ref=refs/heads/$DEFAULT_BRANCH&per_page=1" --jq '.[0].analysis_key // ""' 2>/dev/null) || key=""
-            case "$key" in dynamic/github-code-scanning/*) state=configured;; "") state=unknown;; *) state=not-configured;; esac
-            echo "default-setup endpoint not readable by the workflow token; inferred '$state' from the latest analysis key '$key'"
-          fi
-          if [ "$state" = configured ] && [ "$FORCE_UPLOAD" != true ]; then
-            echo "upload=never" >> "$GITHUB_OUTPUT"
-            echo "::notice title=CodeQL default setup is still enabled::Code scanning rejects SARIF from a workflow while default setup is on, so this run analyses but does not upload. Cut-over: tools/codeql_cutover.sh in the loop repo, or Settings → Advanced Security → CodeQL → Switch to advanced, then Actions → CodeQL → Run workflow on $DEFAULT_BRANCH with force-upload ticked (a plain re-run still sees the last default-setup analysis and skips the upload)."
-            echo "default setup: $state → analyse only, no upload"
-          else
-            echo "upload=always" >> "$GITHUB_OUTPUT"
-            echo "default setup: $state → upload on"
-          fi
-
       - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
@@ -95,4 +112,4 @@ jobs:
       - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
-          upload: ${{ steps.preflight.outputs.upload }}
+          upload: always
