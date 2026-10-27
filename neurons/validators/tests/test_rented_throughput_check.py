@@ -3,6 +3,8 @@ download check never looks at a rented node."""
 
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -12,32 +14,78 @@ import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.task.checks import container_download_speed as download_module
 from services.task.checks import rented_throughput as module
+from services.task.checks.container_download_speed import CAP_BYTES
 from services.task.checks.rented_throughput import (
     RentedThroughputCheck,
     parse_busy,
     parse_disk,
+    parse_during,
+    pods_incomplete,
     throughput_command,
 )
 from services.task.messages import RentedThroughputMessages as Msg
 from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_services, build_state, default_executor, make_context
-from tests.test_container_download_speed_check import FAST, SLOW, Clock, FakeRedis, FakeRunner
+from tests.test_container_download_speed_check import (
+    FAST,
+    RENTALS,
+    SLOW,
+    Clock,
+    FakeRedis,
+    FakeRunner,
+    line,
+)
 from tests.test_partial_rental_split_scoring import _build_incentive, _make_job
 
 EXECUTOR = default_executor()
 pytestmark = pytest.mark.asyncio
 
 
-def snaps(rx_bytes: int = 0, sectors: int = 0, tx_bytes: int = 0, counters: bool = True) -> str:
+def snaps(
+    rx_bytes: int = 0,
+    sectors: int = 0,
+    tx_bytes: int = 0,
+    counters: bool = True,
+    during_rx: int = 0,
+    during_sectors: int = 0,
+    during_ios: int = 0,
+    cover: bool = False,
+    pod: bool = True,
+    prov: str | None = None,
+) -> str:
     """The docker root on nvme0n1, then two host snapshots 2 s apart: bytes received and sent on the NICs and sectors
-    moved on nvme0n1 in between. counters=False: the host's NIC counters were not readable."""
-    net0 = "rx=1000 tx=1000 " if counters else ""
-    net1 = f"rx={1000 + rx_bytes} tx={1000 + tx_bytes} " if counters else ""
+    moved on nvme0n1 in between. counters=False: the host's NIC counters were not readable. Then one after the disk
+    container (10 s; the probe's own 256 MiB and 4096 requests plus during_sectors/during_ios) and one after the fetch
+    container (10 s; during_rx on top of the probe's own downloads). The rented pod (pid 4242) moved the during_*
+    traffic itself in its own network namespace and cgroup; cover=True: the host moved it outside the pod (a
+    provider's cover traffic), so the pod's counters stay still. pod=False: no pod counters readable. prov="cg:nt":
+    the provenance of the processes in the pod's cgroup and netns (1 = all the container's, 0 = a foreign one,
+    empty = unreadable); None: the older five-field format (provenance unreadable)."""
+
+    def net(rx: int, tx: int) -> str:
+        return f"rx={1000 + rx} tx={1000 + tx} " if counters else ""
+
+    def p(rx: int = 0, moved: int = 0, ios: int = 0) -> str:
+        if not pod:
+            return ""
+        if cover:
+            rx = moved = ios = 0
+        tail = "" if prov is None else f":{prov}"
+        return f" pod=4242:{1000 + rx}:1000:{moved}:{ios}{tail},"
+
+    own_sectors, own_rx = 256 * 2048, 2 * 16 * 1024 * 1024
+    s2 = 500 + sectors + own_sectors + during_sectors
+    n2 = 9 + 4096 + during_ios
+    rx3 = rx_bytes + own_rx + during_rx
+    in_disk = p(0, during_sectors * 512, during_ios)
     return (
         "lium_tp_device name=nvme0n1p2\nlium_tp_device name=nvme0n1\n"
-        f"lium_tp t=100.0 {net0}io=nvme0n1:500,sda:7,\n"
-        f"lium_tp t=102.0 {net1}io=nvme0n1:{500 + sectors},sda:7,\n"
+        f"lium_tp t=100.0 {net(0, 0)}io=nvme0n1:500:9,sda:7:1,{p()}\n"
+        f"lium_tp t=102.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{500 + sectors}:9,sda:7:1,{p()}\n"
+        f"lium_tp t=112.0 {net(rx_bytes, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,{in_disk}\n"
+        f"lium_tp t=122.0 {net(rx3, tx_bytes)}io=nvme0n1:{s2}:{n2},sda:7:1,"
+        f"{p(during_rx, during_sectors * 512, during_ios)}\n"
     )
 
 
@@ -115,8 +163,18 @@ def test_defaults_enforce_with_a_kill_switch():
 
 
 def test_command_samples_the_host_then_probes_disk_and_network_in_the_renter_runtime():
-    cmd = throughput_command(True)
+    cmd = throughput_command(True, ["pod_p1", "it's"])
     assert cmd.index("/proc/1/net/dev") < cmd.index("/usr/bin/docker run")
+    # the rented pods' pid and id first, quoted: their own counters are read in every snapshot
+    assert cmd.startswith(
+        "pp=$(for c in pod_p1 'it'\"'\"'s'; do /usr/bin/docker inspect -f '{{.State.Pid}}/{{.Id}}'"
+    )
+    assert "pod=$(pods)" in cmd
+    assert subprocess.run(["sh", "-n", "-c", cmd], capture_output=True).returncode == 0
+    # host counters after the disk container and after the fetch container
+    disk_run, fetch_run = cmd.split("/usr/bin/docker run")[1:]
+    assert "dd if=/dev/zero" in disk_run and "; snap; " in disk_run and "wget" not in disk_run
+    assert "wget" in fetch_run and fetch_run.endswith("; snap")
     assert cmd.index("DockerRootDir") < cmd.index("/proc/1/mountinfo") < cmd.index("lium_tp_device")
     assert "--runtime=sysbox-runc" in cmd and '--network "$net"' in cmd
     assert (
@@ -141,6 +199,27 @@ def test_parse_disk_and_busy():
     assert parse_busy(snaps(counters=False, sectors=2_000_000)) == (None, pytest.approx(512.0))
     assert parse_busy(snaps().replace("lium_tp_device name=nvme0n1\n", ""))[1] is None
     assert parse_busy("") == (None, None)
+    # the old two-field io format still parses
+    assert parse_busy(snaps(sectors=2_000_000).replace(":9,", ",").replace(":1,", ","))[
+        1
+    ] == pytest.approx(512.0)
+    assert parse_during(snaps()) == (0.0, (0.0, 0.0))
+    net, (mb, iops) = parse_during(
+        snaps(during_rx=50_000_000, during_sectors=200_000, during_ios=1000)
+    )
+    # the pod's own counters only: no probe bytes to take out
+    assert (
+        net == pytest.approx(40.0) and mb == pytest.approx(10.24) and iops == pytest.approx(100.0)
+    )
+    # the same traffic made by the host outside the pod is not the renter's
+    assert parse_during(
+        snaps(during_rx=50_000_000, during_sectors=200_000, during_ios=1000, cover=True)
+    ) == (0.0, (0.0, 0.0))
+    two = "".join(ln + "\n" for ln in snaps().splitlines()[:4])  # no counters after the probe
+    assert parse_during(two) == (None, (None, None))
+    assert parse_during(snaps(pod=False)) == (None, (None, None))
+    restarted = snaps().rsplit("pod=4242", 1)  # the pod restarted (a new pid) during the fetch
+    assert parse_during("pod=4243".join(restarted))[0] is None
 
 
 async def test_good_reading_passes():
@@ -155,21 +234,26 @@ async def test_good_reading_passes():
 @pytest.mark.parametrize("relevant", [0, 2_000_000])
 @pytest.mark.parametrize("unrelated", [0, 2_000_000])
 async def test_only_the_docker_root_disk_excuses_the_disk(resolved, seconds, relevant, unrelated):
+    pod = " pod=4242:1000:1000:0:0,"  # the rented pod idle and readable throughout
+    after = f"io=sda:{7 + relevant + 256 * 2048},nvme0n1:{500 + unrelated},{pod}\n"
     output = (
         ("lium_tp_device name=sda\n" if resolved else "")
-        + "lium_tp t=100 rx=1000 tx=1000 io=sda:7,nvme0n1:500,\n"
-        f"lium_tp t=102 rx=1000 tx=1000 io=sda:{7 + relevant},nvme0n1:{500 + unrelated},\n"
-        + disk(secs=seconds)
-        + FAST
+        + f"lium_tp t=100 rx=1000 tx=1000 io=sda:7,nvme0n1:500,{pod}\n"
+        f"lium_tp t=102 rx=1000 tx=1000 io=sda:{7 + relevant},nvme0n1:{500 + unrelated},{pod}\n"
+        f"lium_tp t=140 rx=1000 tx=1000 {after}"
+        f"lium_tp t=150 rx=1000 tx=1000 {after}" + disk(secs=seconds) + FAST
     )
     with flags():
         ctx, _ = make_ctx(output)
         _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "pass"
-    # an unresolved docker root is never judged on another disk's traffic
-    assert disk_side == (
-        "none" if relevant or not resolved else "fail" if seconds == 30 else "pass"
-    )
+    # an unresolved docker root is never judged on another disk's traffic, and neither it nor a busy docker-root disk
+    # is an outright excuse: a slow write is inconclusive (capped by INCONCLUSIVE_BEFORE_STRIKE)
+    slow = seconds == 30
+    if not resolved or relevant:
+        assert disk_side == ("inconclusive" if slow else "none")
+    else:
+        assert disk_side == ("fail" if slow else "pass")
 
 
 @pytest.mark.parametrize(
@@ -199,7 +283,7 @@ async def test_two_slow_readings_zero_the_score_until_that_side_passes(answer, r
         assert (await check.run(ctx)).passed is True
 
 
-# the host's NICs busy either way, or their counters unreadable: a slow download is no verdict
+# the host NICs busy either way (inconclusive), or their counters unreadable (no verdict): no strike, the streak stays
 @pytest.mark.parametrize("busy", [BUSY_NET, BUSY_UPLOAD, NO_COUNTERS])
 async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
     with flags() as clock:
@@ -211,6 +295,352 @@ async def test_a_busy_renter_is_no_verdict_and_keeps_the_streak(busy):
         assert busy.passed and busy.event.reason_code == Msg.SLOW_ONCE.reason
         clock.now += 31 * 60
         assert (await check.run(ctx)).passed is False
+
+
+# The renter starts loading the disk or the link only after the 2 s window, while the probe measures it: inconclusive,
+# so one or two such readings are never a strike. Idle during the probe, the same slow reading fails.
+@pytest.mark.parametrize(
+    "answer, side",
+    [
+        (
+            snaps(during_sectors=2_000_000) + disk(secs=30.0) + FAST,
+            "disk",
+        ),  # 100 MB/s of renter writes
+        (snaps(during_ios=500) + disk(secs=30.0) + FAST, "disk"),  # 50 random requests/s, few bytes
+        (snaps(during_rx=40_000_000) + disk() + SLOW, "net"),  # ~29 Mbps of renter downloads
+    ],
+    ids=["disk_bytes", "disk_requests", "network"],
+)
+async def test_renter_load_during_the_probe_is_inconclusive(answer, side):
+    with flags():
+        ctx, _ = make_ctx(answer)
+        reading, net, disk_side = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert (net == "inconclusive") is (side in ("net", "both"))
+    assert (disk_side == "inconclusive") is (side in ("disk", "both"))
+    assert "during_disk_iops" in reading
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        for _ in range(2):
+            assert (await check.run(ctx)).passed
+            clock.now += 31 * 60
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(SLOW_DISK)[0])
+        assert disk_side == "fail"
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(SLOW_NET)[0])
+        assert net == "fail"
+
+
+# A provider's cover traffic (the same load made by the host outside the rented pod) never excuses a slow side: the
+# failure stands.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(during_sectors=2_000_000, cover=True) + disk(secs=30.0) + SLOW,
+        snaps(during_ios=500, cover=True) + disk(secs=30.0) + SLOW,
+        snaps(during_rx=40_000_000, cover=True) + disk(secs=30.0) + SLOW,
+    ],
+    ids=[
+        "host_disk_bytes",
+        "host_disk_requests",
+        "host_network",
+    ],
+)
+async def test_cover_traffic_outside_the_pod_does_not_excuse_a_slow_node(answer):
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("fail", "fail")
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+# Pod A moves renter traffic on both sides while pod B's cgroup goes unreadable and B then restarts (a new pid): A's
+# readings still count, so both slow sides are inconclusive rather than failing.
+async def test_a_busy_pod_still_excuses_when_another_pod_restarts():
+    lines = snaps(during_rx=40_000_000, during_sectors=2_000_000).splitlines()
+    b = ["5151:1:1:1:1,", "5151:1:1:1:1,", "5151:1:1::,", "5152:1:1:1:1,"]
+    answer = (
+        "\n".join(lines[:2] + [ln.replace(" pod=", f" pod={x}") for ln, x in zip(lines[2:], b)])
+        + "\n"
+    )
+    answer += disk(secs=30.0) + SLOW
+    assert parse_during(answer)[0] == pytest.approx(32.0)
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("inconclusive", "inconclusive")
+
+
+# Pod IO whose provenance cannot be read (who was in the pod's cgroup or netns) may be a host helper issuing tiny IO:
+# one such excused slow probe is no strike, but INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(during_ios=200)
+        + disk(secs=30.0)
+        + FAST,  # 20 tiny requests/s charged to the pod cgroup
+        snaps(during_rx=7_000_000) + disk() + SLOW,  # ~5.6 Mbps charged to the pod netns
+        snaps(during_ios=200, prov=":") + disk(secs=30.0) + FAST,  # provenance fields empty
+        snaps(during_rx=7_000_000, prov=":") + disk() + SLOW,
+    ],
+    ids=["cgroup_io", "netns_io", "cgroup_provenance_unreadable", "netns_provenance_unreadable"],
+)
+async def test_host_helper_in_the_pod_cannot_excuse_a_slow_node_forever(answer):
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * (n + 1))
+        check = RentedThroughputCheck()
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 0  # one excused probe: no strike
+        for _ in range(n - 1):
+            clock.now += 31 * 60
+            assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 1  # the n-th excused probe in a row: a strike
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+# Host state the provider controls (load on the host NICs or the docker-root disk in the 2 s before the probe, host NIC
+# counters it hides, a docker root it hides the devices of, lium-rentals not inspectable so the probe falls back to the
+# default bridge, a fetch container that never reports, a disk write that fails or reports nothing) cannot excuse a slow
+# side forever: one such reading is no strike, INCONCLUSIVE_BEFORE_STRIKE in a row are, and the next zeroes the score.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(rx_bytes=100_000_000) + disk() + SLOW,  # 400 Mbps on the host NICs
+        snaps(sectors=2_000_000) + disk(secs=30.0) + FAST,  # 512 MB/s on the docker-root disk
+        snaps(counters=False) + disk() + SLOW,  # host NIC counters unreadable
+        snaps().replace("lium_tp_device name=nvme0n1p2\nlium_tp_device name=nvme0n1\n", "")
+        + disk(secs=30.0)
+        + FAST,  # docker root devices unresolved
+        SLOW_NET.replace(
+            "lium_dl_net name=lium-rentals", "lium_dl_net name=bridge"
+        ),  # bridge fallback
+        snaps() + disk() + RENTALS,  # the fetch container did not start: no endpoint line
+        snaps() + disk(rc=1) + FAST,  # the disk write failed
+        snaps() + FAST,  # the disk container reported nothing
+    ],
+    ids=[
+        "busy_nics",
+        "busy_disk",
+        "no_host_counters",
+        "docker_root_unresolved",
+        "bridge_fallback",
+        "fetch_container_not_started",
+        "disk_write_failed",
+        "disk_no_output",
+    ],
+)
+async def test_provider_made_host_load_cannot_excuse_a_slow_node_forever(answer):
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * (n + 1))
+        check = RentedThroughputCheck()
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 0
+        for _ in range(n - 1):
+            clock.now += 31 * 60
+            assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 1
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+# What the validator cannot tell apart from the endpoint's own fault stays no verdict, uncapped: an HTTP error, or an
+# endpoint the validator cannot reach either.
+async def test_validator_side_fetch_errors_stay_no_verdict():
+    http_error = RENTALS + line("pypi", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 503")
+    http_error += line("hf", CAP_BYTES, 1.0, 0)
+    with flags():
+        ctx = make_ctx(snaps() + disk() + http_error)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == "none"
+
+
+# Owner decision (#lium-io, 26 Oct 16:23Z): a renter keeping the disk or link busy gets no verdict, never SLOW. Pod IO
+# from only the container's own processes is renter load: no verdict, uncapped, however many probes in a row.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        snaps(during_ios=500, prov="1:1") + disk(secs=30.0) + FAST,
+        snaps(during_rx=40_000_000, prov="1:1") + disk() + SLOW,
+    ],
+    ids=["disk", "network"],
+)
+async def test_renter_io_from_the_containers_own_processes_never_strikes(answer):
+    with flags() as clock:
+        ctx, _ = make_ctx(*[answer] * 4)
+        check = RentedThroughputCheck()
+        for _ in range(4):
+            assert (await check.run(ctx)).passed
+            assert stored(ctx)["failures_in_a_row"] == 0
+            clock.now += 3 * 3600 + 60
+
+
+# A host process attached to the pod's cgroup or netns makes the pod IO the provider's: no excuse, the slow side fails.
+@pytest.mark.parametrize(
+    "answer, side",
+    [
+        (snaps(during_ios=500, prov="0:1") + disk(secs=30.0) + FAST, "disk"),
+        (snaps(during_rx=40_000_000, prov="1:0") + disk() + SLOW, "net"),
+    ],
+    ids=["cgroup_helper", "netns_helper"],
+)
+async def test_a_host_helper_in_the_pods_cgroup_or_netns_is_a_failure(answer, side):
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert {"net": net, "disk": disk_side}[side] == "fail"
+    with flags() as clock:
+        ctx, _ = make_ctx(answer, answer)
+        check = RentedThroughputCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+def stopped_pod(answer_tail: str) -> str:
+    """The rented pod (4242) readable when each side began, unreadable at its end (stopped or restarted mid-probe)."""
+    lines = snaps().splitlines()
+    lines[4] = re.sub(r" pod=4242:(\d+):(\d+):\d*:\d*,", r" pod=4242:\1:\2::,", lines[4])
+    lines[5] = re.sub(r" pod=4242:[^,]*,", " pod=4242::::,", lines[5])
+    return "\n".join(lines) + "\n" + answer_tail
+
+
+STOPPED = stopped_pod(disk(secs=30.0) + SLOW)
+
+
+def stored(ctx) -> dict:
+    return json.loads(ctx.services.redis.store[f"rented_throughput:{EXECUTOR.uuid}"])
+
+
+# Incomplete pod counters are no evidence of renter IO (the provider can make them incomplete) and no proof of a slow
+# node: the slow sides are inconclusive, neither excused nor failed.
+@pytest.mark.parametrize(
+    "answer",
+    [
+        STOPPED,
+        snaps(pod=False) + disk(secs=30.0) + SLOW,
+        "".join(ln + "\n" for ln in snaps().splitlines()[:4]) + disk(secs=30.0) + SLOW,
+    ],
+    ids=["stopped_mid_probe", "never_readable", "no_snapshot_after"],
+)
+async def test_incomplete_pod_counters_are_inconclusive(answer):
+    with flags():
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(make_ctx(answer)[0])
+    assert (net, disk_side) == ("inconclusive", "inconclusive")
+
+
+async def test_pods_incomplete():
+    assert pods_incomplete(STOPPED, 1) == (True, True)
+    assert pods_incomplete(snaps(), 1) == (False, False)
+    assert pods_incomplete(snaps(pod=False), 1) == (True, True)
+    # a second rented pod never readable while the first is readable and idle: still incomplete
+    assert pods_incomplete(snaps(), 2) == (True, True)
+    with flags():
+        # incomplete counters do not turn a passing side inconclusive
+        _, net, disk_side = await RentedThroughputCheck()._measure_and_judge(
+            make_ctx(stopped_pod(disk() + FAST))[0]
+        )
+        assert (net, disk_side) == ("pass", "pass")
+
+
+async def test_one_inconclusive_reading_is_no_strike_and_is_reprobed_soon():
+    with flags() as clock:
+        ctx, _ = make_ctx(STOPPED)
+        result = await RentedThroughputCheck().run(ctx)
+        assert result.passed
+        state = stored(ctx)
+        assert state["failures_in_a_row"] == 0 and state["net_inconclusive"] == 1
+        assert state["disk_inconclusive"] == 1 and state["measured"] is False
+        clock.now += 31 * 60  # re-probed after RETRY_SECONDS, not the 3 h interval
+        await RentedThroughputCheck().run(ctx)
+        assert stored(ctx)["at"] == clock.now
+
+
+# A provider restarting the pod on every probe: the INCONCLUSIVE_BEFORE_STRIKE-th inconclusive reading in a row is a
+# strike, the next one a second strike, and the node is slow.
+async def test_consecutive_inconclusive_readings_strike():
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    with flags() as clock:
+        ctx, _ = make_ctx(*[STOPPED] * (n + 1))
+        check = RentedThroughputCheck()
+        for i in range(1, n):
+            assert (await check.run(ctx)).passed
+            assert stored(ctx)["failures_in_a_row"] == 0 and stored(ctx)["net_inconclusive"] == i
+            clock.now += 31 * 60
+        assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 1
+        clock.now += 31 * 60
+        assert (await check.run(ctx)).passed is False
+
+
+async def test_a_clean_reading_resets_the_inconclusive_run():
+    n = module.INCONCLUSIVE_BEFORE_STRIKE
+    answers = [STOPPED] * (n - 1) + [GOOD] + [STOPPED] * (n - 1)
+    with flags() as clock:
+        ctx, _ = make_ctx(*answers)
+        check = RentedThroughputCheck()
+        for _ in range(n - 1):
+            await check.run(ctx)
+            clock.now += 31 * 60
+        await check.run(ctx)
+        assert stored(ctx)["net_inconclusive"] == 0 and stored(ctx)["disk_inconclusive"] == 0
+        for _ in range(n - 1):
+            clock.now += 3 * 3600 + 60
+            assert (await check.run(ctx)).passed
+        assert stored(ctx)["failures_in_a_row"] == 0
+
+
+def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "dev").write_text(
+        "Inter-|   Receive\n face |bytes\n"
+        "    lo: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n"
+        "  eth0: 1000 0 0 0 0 0 0 0 60 0 0 0 0 0 0 0\n"
+    )
+    scope = tmp_path / "cg" / "system.slice" / "docker-abc.scope"
+    scope.mkdir(parents=True)
+    (scope / "io.stat").write_text(
+        "259:0 rbytes=100 wbytes=200 rios=3 wios=4 dbytes=0 dios=0\n8:0 rbytes=0 wbytes=0 rios=0 wios=0\n"
+    )
+    (scope / "cgroup.procs").write_text("")  # no process left in it: nothing foreign
+    script = (
+        module._SNAPSHOT.replace("[ /proc/1/root/ -ef / ] && return; ", "")
+        .replace("[ /proc/$p/ns/net -ef /proc/1/ns/net ] || ", "")
+        .replace("/proc/$p/net/dev", f"{tmp_path}/net/dev")
+        .replace("/proc/1/root/sys/fs/cgroup", f"{tmp_path}/cg")
+        .split("snap() {")[0]
+    )
+    out = subprocess.run(
+        ["sh", "-c", f"pp='4242/abc 4343/gone'; {script} pods"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+    # the second pod's cgroup is gone: its disk counters and provenance are empty (unreadable), never zero; no netns
+    # here, so no network provenance either
+    assert out.splitlines()[-1] == "4242:1000:60:300:7:1:,4343:1000:60::::,", out
+
+
+# own(): a process is the container's when it shares the init's PID namespace or descends from the init (nested
+# namespaces); a host process attached to the cgroup is neither. Here the PID-namespace test is switched off (the test
+# runs in one namespace), so only the ancestry decides: this shell plays the container init.
+def test_provenance_tells_the_containers_processes_from_a_host_helper(tmp_path):
+    script = module._SNAPSHOT.replace(
+        "[ /proc/$1/ns/pid -ef /proc/$p/ns/pid ] && return 0; ", ""
+    ).split("pods() {")[0]
+    cmd = (
+        f"{script} p=$$; sleep 30 & child=$!; "
+        'echo "$child" | prov; printf "%s\n%s\n" "$child" 1 | prov; echo 999999999 | prov; '
+        "own 1; echo $?; kill $child"
+    )
+    out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=30).stdout
+    # the child is the container's; pid 1 (a host process) is foreign; a PID gone mid-read is unreadable (empty),
+    # never the container's own
+    assert out.splitlines()[-4:] == ["1", "0", "", "1"], out
 
 
 async def test_idle_foreign_or_stopped_rentals_are_left_alone():
@@ -225,8 +655,9 @@ async def test_idle_foreign_or_stopped_rentals_are_left_alone():
         assert res.passed and not runner.commands and res.event.reason_code == Msg.SKIPPED.reason
 
 
-# A download over the default bridge (lium-rentals not inspectable) did not measure the renter's path: no network verdict,
-# so it neither strikes nor clears a failure established on lium-rentals; only a fast lium-rentals reading recovers.
+# A download over the default bridge (lium-rentals not inspectable) did not measure the renter's path: a slow one is
+# inconclusive, a fast one no verdict, so it neither strikes at once nor clears a failure established on lium-rentals;
+# only a fast lium-rentals reading recovers.
 @pytest.mark.parametrize("network", ["lium-rentals", "bridge"])
 @pytest.mark.parametrize("fast", [True, False])
 async def test_only_a_reading_on_the_rentals_network_judges_the_network(network, fast):
@@ -237,7 +668,9 @@ async def test_only_a_reading_on_the_rentals_network_judges_the_network(network,
     with flags():
         ctx, _ = make_ctx(answer)
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
-    assert net == (("pass" if fast else "fail") if on_rentals else "none")
+    assert net == (
+        ("pass" if fast else "fail") if on_rentals else ("none" if fast else "inconclusive")
+    )
     with flags() as clock:
         ctx, _ = make_ctx(SLOW_NET, SLOW_NET, answer)
         check = RentedThroughputCheck()

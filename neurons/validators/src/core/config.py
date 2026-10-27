@@ -546,6 +546,7 @@ class Settings(BaseSettings):
     # Two failing readings in a row (a download under CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or a write under
     # DISK_MIN_MB_PER_S) zero the score (RENTED_THROUGHPUT_SLOW). A side whose last 2 s before the probe already
     # moved BUSY_MBPS (host NICs) or DISK_BUSY_MB_PER_S (docker root disk) is no verdict: the renter is using it, and it is not slow.
+    # So is a failing side the rented pods' own counters show they used while the probe measured it (rented_throughput.DURING_*).
     RENTED_THROUGHPUT_CHECK_ENABLED: bool = Field(env="RENTED_THROUGHPUT_CHECK_ENABLED", default=True)
     RENTED_THROUGHPUT_INTERVAL_HOURS: float = Field(env="RENTED_THROUGHPUT_INTERVAL_HOURS", default=3.0, gt=0)
     RENTED_THROUGHPUT_DISK_MIN_MB_PER_S: float = Field(env="RENTED_THROUGHPUT_DISK_MIN_MB_PER_S", default=50.0, gt=0)
