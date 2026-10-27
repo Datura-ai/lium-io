@@ -241,7 +241,10 @@ class InspectorRentedCheck:
         of a host write into a rented pod (DAH-4548), which fails the check and the score. A read is
         logged only."""
         interference = host_write_findings(
-            report, verdict.provider_findings, [p.pod_id for p in rented_pods]
+            report,
+            verdict.provider_findings,
+            [p.pod_id for p in rented_pods],
+            {p.pod_id: p.created_at for p in rented_pods},
         )
         if interference is None:
             writes, reads = [], []
