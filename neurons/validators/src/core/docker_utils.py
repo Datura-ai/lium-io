@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import asyncssh
 
-from services.const import DOCKER_DIND_IMAGE
+from services.const import DOCKER_DIND_IMAGE, LIUM_POD_ID_LABEL
 
 # Bounded so a crash-looping worker can't flood the log line; keep the tail,
 # not the head — a dying entrypoint prints its fatal error last.
@@ -38,7 +38,8 @@ class DockerCommand:
             "&& ssh-keygen -A && service ssh start && tail -f /dev/null'"
         )
         return (
-            f"/usr/bin/docker run -d {runtime} --name {name} --gpus all "
+            f"/usr/bin/docker run -d {runtime} --name {name} --label {LIUM_POD_ID_LABEL}={name} "
+            "--gpus all "
             f"-p {port}:22 {DOCKER_DIND_IMAGE} {ssh_cmd}"
         )
 
@@ -84,10 +85,10 @@ class DockerCommand:
         )
 
     @staticmethod
-    def ps_filter(*name_patterns: str) -> str:
+    def ps_filter(*name_patterns: str, output_format: str = "{{.Names}}") -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
-        return f'/usr/bin/docker ps -a {filters} --format "{{{{.Names}}}}"'
+        return f"/usr/bin/docker ps -a {filters} --format {shlex.quote(output_format)}"
 
     @staticmethod
     def inspect_status(container_id: str) -> str:

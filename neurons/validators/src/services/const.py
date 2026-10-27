@@ -1,3 +1,5 @@
+import re
+
 MIN_JOB_TAKEN_TIME = 20
 
 # the plugin alias new rental volumes are created on; the backend health check is told it
@@ -317,6 +319,21 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   container_*    — validator DinD/port-check probes (hotkey-scoped)
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+# DAH-5117: set at create on every container Lium creates (pods, fillers, the validator's DinD probe);
+# the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
+# labelled container whose pod is no longer live, so a provider's container is never touched.
+LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
+# the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.
+LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
+# A pod or filler container created before the label: reaped only when the backend's record of
+# that pod or filler run confirms it ended.
+LEGACY_LIUM_CONTAINER_NAME = re.compile(
+    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?$"
+)
+# The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
+# the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
+LIUM_HEALTH_CHECK_CONTAINER_NAME = re.compile(r"^health_check_(?:[0-9a-f]{32}|[0-9]{10})$")
 
 # DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
 # without importing the probe service: that module reaches services.task.models, which pulls

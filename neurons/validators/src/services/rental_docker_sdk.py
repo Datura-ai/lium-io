@@ -311,6 +311,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # DAH-5117: LIUM_POD_ID_LABEL for a pod or filler, so the stale cleanup knows the container is Lium's
+    labels: dict[str, str] = field(default_factory=dict)
     # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
     before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     # runs in the Docker thread between the create and the start call with the names of every container
@@ -1026,7 +1028,11 @@ class RentalDockerSdkClient:
                 name=spec.name,
                 entrypoint=spec.entrypoint or None,
                 host_config=host_config,
-                labels={RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else None,
+                labels={
+                    **spec.labels,
+                    **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
+                }
+                or None,
             )
         if spec.before_start is not None:
             spec.before_start(
