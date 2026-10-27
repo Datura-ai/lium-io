@@ -63,6 +63,7 @@ def _ctx(
     scrape_error=None,
     pods=(4,),
     owner="miner-hotkey",
+    anchor=UUIDS,
 ):
     executor = default_executor()
     specs: dict = {"gpu": {"count": count, "details": _details(listed)}}
@@ -87,7 +88,7 @@ def _ctx(
         services=build_services(redis=redis),
         state=state,
         executor=executor,
-        verified={"spec": f"{MODEL}:4", "uuids": ",".join(UUIDS)},
+        verified={"spec": f"{MODEL}:4", "uuids": ",".join(anchor)},
         config=build_context_config(gpu_model_rates={MODEL: 1.0}),
     )
 
@@ -396,13 +397,23 @@ async def test_a_card_missing_while_the_renter_resets_it_holds_the_cycle_without
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("pods", "held"), [((), False), ((4,), True)])
-async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_not_held(context_factory, pods, held):
-    """Replaced cards are not lost ones on an idle node (GpuFingerprintCheck re-anchors them);
-    under a rental they are."""
+@pytest.mark.parametrize("pods", [(), (4,)])
+async def test_a_node_whose_whole_gpu_set_was_replaced_is_held(context_factory, pods):
+    """Replaced cards are held like lost ones (a VM host reboot, 27 Oct fcd3835d); on an idle node the cycle is not
+    fatal here, so GpuFingerprintCheck still re-anchors them, and the node stays hidden for the hold window."""
     redis = FakeRedis()
     replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+    ctx = _ctx(context_factory, redis, listed=replaced, pods=pods)
 
-    result = await _cycle(context_factory, redis, listed=replaced, pods=pods)
+    result = await GpuLossHoldCheck().run(ctx)
 
-    assert _hidden(result) is held
+    assert _hidden(result) and not result.passed
+    assert redis.ttl[gpu_loss_hold._key(ctx)] == gpu_loss_hold.settings.GPU_LOSS_HOLD_SECONDS
+    if not pods:
+        assert not _fatal(result)
+        assert result.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]
+        assert result.event.event == Msg.SET_REPLACED.event
+        # next cycle: the new cards are the anchor and read clean, the node is still hidden (fatal while idle)
+        reanchored = _ctx(context_factory, redis, listed=replaced, pods=(), anchor=replaced)
+        clean = await GpuLossHoldCheck().run(reanchored)
+        assert _hidden(clean) and _fatal(clean)

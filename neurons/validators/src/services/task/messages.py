@@ -521,6 +521,17 @@ class GpuLossHoldMessages:
         "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
         "a node keeps the cards it was first verified with.",
     )
+    SET_REPLACED = MessageTemplate(
+        event="The node came back with a different set of GPUs",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
+        "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
+        remediation="Every GPU UUID changed, as when a VM host gets other cards on a restart. Keep the same GPUs "
+        "passed through to this node across restarts (`nvidia-smi -L` before and after must match) and find why "
+        "the host restarted. Nothing to re-register: the node is listed again on its own after the hold window.",
+    )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
         reason="GPU_LOST_PENDING",

@@ -19,7 +19,8 @@ DECISION_ANCHOR_BROKEN = "ANCHOR_BROKEN"
 def whole_set_replaced(anchor: list[str], current: list[str], rented: bool) -> bool:
     """An idle node lists as many cards as it was anchored with and none of the anchored ones: the cards were replaced
     (a VM host can get other physical GPUs on a reboot). It is re-anchored, as removing and re-adding the node would
-    do; a rented node, a missing card and a partly changed set are not."""
+    do, and GpuLossHoldCheck hides it for the GPU loss hold window first; a rented node, a missing card and a partly
+    changed set are not re-anchored."""
     return not rented and bool(anchor) and len(current) == len(anchor) and not set(anchor) & set(current)
 
 
