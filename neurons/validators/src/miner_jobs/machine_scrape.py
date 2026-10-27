@@ -790,21 +790,39 @@ def get_host_disk_usage():
     # container's own overlay: on a host with /var/lib/docker on its own partition it reported the
     # root partition, so a 5 TB docker volume listed as 1.8 TB (ticket-0286, DAH-2771). Without a
     # docker answer, or outside the executor container, `/` stays the measurement.
-    # Docker's containerd image store (default on Docker 29+) keeps container root filesystems in
-    # containerd's root whatever data-root says: a 14 TB data-root over a 436 GB root disk (webg8845).
-    # shortcut: the default containerd root only, not a moved one from /etc/containerd/config.toml.
     try:
         info = docker_api_get("/info") or {}
     except Exception:
         info = {}
-    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
-    if any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
-        if os.path.isdir("/proc/1/root/var/lib/containerd"):
-            docker_root_dir = "/var/lib/containerd"
-    host_docker_root = f"/proc/1/root{docker_root_dir}"
-    if os.path.isdir(host_docker_root):
-        return shutil.disk_usage(host_docker_root)
+    host_disk_root = f"/proc/1/root{disk_root_dir(info)}"
+    if os.path.isdir(host_disk_root):
+        return shutil.disk_usage(host_disk_root)
     return shutil.disk_usage("/")
+
+
+def disk_root_dir(info):
+    # Docker's containerd image store (default on Docker 29+) keeps container root filesystems in
+    # containerd's root whatever data-root says: a 14 TB data-root over a 436 GB root disk (webg8845).
+    # That root is the top-level `root` of the host's containerd config, /var/lib/containerd by default.
+    # shortcut: a root set only in an `imports`ed config file is missed; read `containerd config dump` if that shows up.
+    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
+    if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        return docker_root_dir
+    containerd_root = "/var/lib/containerd"
+    try:
+        with open("/proc/1/root/etc/containerd/config.toml") as config_file:
+            for line in config_file:
+                if line.lstrip().startswith("["):
+                    break
+                match = re.match(r"""\s*root\s*=\s*["']([^"']+)["']""", line)
+                if match:
+                    containerd_root = match.group(1)
+                    break
+    except OSError:
+        pass
+    if os.path.isdir(f"/proc/1/root{containerd_root}"):
+        return containerd_root
+    return docker_root_dir
 
 
 def cache_volume_bytes(df, prefixes):
@@ -828,7 +846,11 @@ def get_docker_disk_usage():
     )
     filler_cache = cache_volume_bytes(df, FILLER_CACHE_VOLUME_PREFIXES)
     volumes -= filler_cache
-    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    info = docker_api_get("/info") or {}
+    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
+    # the cache volumes sit under data-root: they free disk only when that is the measured filesystem
+    if not on_one_filesystem(docker_root_dir, disk_root_dir(info)):
+        filler_cache = 0
     volumes += get_vloopback_volume_bytes(docker_root_dir)
     containers += get_container_log_bytes(docker_root_dir)
 
@@ -846,6 +868,15 @@ def get_docker_disk_usage():
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX) // 10**9,
     }
+
+
+def on_one_filesystem(host_dir, other_host_dir):
+    if host_dir == other_host_dir:
+        return True
+    try:
+        return os.stat(f"/proc/1/root{host_dir}").st_dev == os.stat(f"/proc/1/root{other_host_dir}").st_dev
+    except OSError:
+        return False
 
 
 def release_filler_cache(hard_disk):
@@ -2002,7 +2033,7 @@ def disk_type_of(device_name: str | None) -> str:
 def get_docker_root_disk_type() -> str:
     """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
     try:
-        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+        docker_root_dir = disk_root_dir(docker_api_get("/info") or {})
     except Exception:
         docker_root_dir = "/var/lib/docker"
     with open(HOST_MOUNTS_PATH) as mounts_file:

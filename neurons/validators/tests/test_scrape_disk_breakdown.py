@@ -11,8 +11,10 @@ test_scrape_encryption_key_order.py parses rather than imports.
 import ast
 import glob
 import http.client
+import io
 import json
 import os
+import re
 import shutil
 import socket
 from collections import namedtuple
@@ -39,6 +41,8 @@ DISK_HELPERS = {
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_CACHE_VOLUME_PREFIXES",
     "release_filler_cache",
+    "disk_root_dir",
+    "on_one_filesystem",
 }
 
 
@@ -48,7 +52,7 @@ def scrape() -> dict:
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
-        {"glob": glob, "http": http, "json": json, "os": os, "shutil": shutil, "socket": socket},
+        {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket},
     )
 
 
@@ -420,6 +424,7 @@ def test_disk_usage_is_measured_where_the_containerd_image_store_keeps_container
     # the root disk under /var/lib/containerd; the data-root is not where rentals land
     info = {"DockerRootDir": "/data/docker", "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]]}
     _stub_docker_api(scrape, {"/info": info})
+    scrape["open"] = lambda path: io.StringIO("")  # no root in the containerd config: its default
     asked = _stub_filesystem(
         scrape,
         monkeypatch,
@@ -429,6 +434,48 @@ def test_disk_usage_is_measured_where_the_containerd_image_store_keeps_container
 
     assert scrape["get_host_disk_usage"]() == _ROOT_PARTITION
     assert asked == ["/proc/1/root/var/lib/containerd"]
+
+
+def test_disk_usage_follows_a_moved_containerd_root(scrape: dict, monkeypatch) -> None:
+    # containerd moved to the big disk: its old /var/lib/containerd is still on the root disk, but the
+    # configured root is where the containers are, the same one the installer's preflight reads
+    info = {"DockerRootDir": "/data/docker", "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]]}
+    _stub_docker_api(scrape, {"/info": info})
+    scrape["open"] = lambda path: io.StringIO('version = 2\nroot = "/data/containerd"\n[plugins]\n  root = "/x"\n')
+    asked = _stub_filesystem(
+        scrape,
+        monkeypatch,
+        host_dirs={"/proc/1/root/data/containerd", "/proc/1/root/var/lib/containerd"},
+        usage_by_path={"/proc/1/root/data/containerd": _DOCKER_PARTITION},
+    )
+
+    assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
+    assert asked == ["/proc/1/root/data/containerd"]
+
+
+def test_filler_cache_on_another_filesystem_is_not_reported_as_free(scrape: dict, monkeypatch) -> None:
+    # the cache volumes sit under data-root on one disk, the containerd store is measured on another:
+    # freeing the cache frees nothing there
+    info = {"DockerRootDir": "/data/docker", "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]]}
+    df = {"LayersSize": 0, "Containers": [], "Volumes": [{"Name": "engy_cache_hf_x", "UsageData": {"Size": 100 * 1024**3}}]}
+    _stub_docker_api(scrape, {"/info": info, "/system/df": df, "/volumes": {"Volumes": []}})
+    devices = {"/proc/1/root/data/docker": 1, "/proc/1/root/var/lib/containerd": 2}
+    monkeypatch.setitem(
+        scrape,
+        "os",
+        SimpleNamespace(
+            path=SimpleNamespace(isdir=lambda path: path in devices, join=os.path.join),
+            stat=lambda path: SimpleNamespace(st_dev=devices[path]),
+        ),
+    )
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
+    scrape["get_vloopback_volume_bytes"] = lambda docker_root_dir: 0
+    hard_disk = {"hard_disk_total": 400 * 1024**2, "hard_disk_used": 300 * 1024**2, "hard_disk_free": 100 * 1024**2}
+
+    hard_disk.update(scrape["get_docker_disk_usage"]())
+    scrape["release_filler_cache"](hard_disk)
+
+    assert (hard_disk["hard_disk_used"], hard_disk["hard_disk_free"]) == (300 * 1024**2, 100 * 1024**2)
 
 
 def test_disk_usage_falls_back_to_root_without_a_reachable_docker_root(scrape: dict, monkeypatch) -> None:

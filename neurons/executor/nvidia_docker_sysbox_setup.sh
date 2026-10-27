@@ -442,7 +442,7 @@ resolve_disk_dir() {
     [ -n "$ctrd_root" ] && [ -d "$ctrd_root" ] || ctrd_root="${SYSBOX_SETUP_HOST_ROOT:-}/var/lib/containerd"
     [ -d "$ctrd_root" ] || return 0
     DISK_DIR=$ctrd_root
-    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $ctrd_root, not under data-root: set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker (pulled images are pulled again), or move containerd's root (\"root\" in /etc/containerd/config.toml) to the big disk."
+    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $ctrd_root, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (\"root\" in /etc/containerd/config.toml) to the big disk."
 }
 
 check_total_disk_for_vram() {
