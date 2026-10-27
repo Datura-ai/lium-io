@@ -1497,10 +1497,13 @@ class RegistryPullMessages:
 
 
 CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
-    "a container on this node downloads from PyPI or Hugging Face far slower than the host does, so a renter's "
-    "`pip install` or model download crawls; check the docker bridge MTU against the uplink (`ip link`; set "
-    '"mtu" in /etc/docker/daemon.json to the uplink\'s and restart docker), NAT/firewall rules and any traffic '
-    "shaping on docker traffic, then `docker run --rm alpine:3.19 wget -O /dev/null "
+    "a container on this node downloads from PyPI or Hugging Face too slowly or cannot connect, so a renter's "
+    "`pip install` or model download crawls; remove any traffic shaping or extra firewall rules added on docker "
+    "traffic (keep docker's own NAT rules); "
+    "if the uplink MTU (`ip link`) is below 1500, recreate the rentals network with it while no pod container exists, running or stopped: "
+    "`docker network rm lium-rentals` then `docker network create -d bridge -o "
+    "com.docker.network.bridge.enable_icc=false -o com.docker.network.driver.mtu=<MTU> lium-rentals`; then "
+    "`docker run --rm --network lium-rentals alpine:3.19 wget -O /dev/null "
     "https://files.pythonhosted.org/packages/9b/b4/e3c7e6fab0f77fff6194afa173d1f2342073d91b1d3b4b30b17c3fb4407a/"
     "numpy-2.1.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` on the host must finish in seconds"
 )
