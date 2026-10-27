@@ -25,7 +25,10 @@ class DockerCommand:
             f"/usr/bin/docker run -d --rm --name {name} "
             f"{network_flag} docker.io/library/alpine:3.19 sh -c "
             f"'cat << \"{heredoc}\" > /tmp/nc.sh\n{script}\n{heredoc}\n"
-            f"timeout {timeout} sh /tmp/nc.sh'"
+            # `; exit $?`: as the last command sh would exec timeout, which execs the script as the
+            # container's PID 1, and PID 1 ignores timeout's SIGTERM; any port nobody fetched then kept
+            # the listener (and its port) up for hours. Not last, the script runs as a child and dies.
+            f"timeout {timeout} sh /tmp/nc.sh; exit $?'"
         )
 
     @staticmethod
@@ -61,6 +64,23 @@ class DockerCommand:
         return (
             f"/usr/bin/docker logs --tail {lines} {quoted} 2>&1; "
             f"/usr/bin/docker exec {quoted} tail -n {lines} /var/log/dockerd.err.log 2>&1; true"
+        )
+
+    @staticmethod
+    def terminate_and_wait(name: str, grace_seconds: int) -> str:
+        """SIGTERM the container and wait up to grace_seconds for it to exit (DAH-5101).
+
+        The two halves of `docker stop` without its ending: the image's stop signal (STOPSIGNAL,
+        SIGTERM by default, as `docker stop` sends it) and the grace, but no SIGKILL and so no unmount
+        yet, which lets the delete wipe the volume once more before the forced removal kills the
+        container. Exit 0 = the container exited inside the grace; 124 = still running; any other
+        exit = unknown (a Docker API error, a container already gone), to be treated as running.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"s=$(/usr/bin/docker inspect --format '{{{{.Config.StopSignal}}}}' {quoted}) && "
+            f'/usr/bin/docker kill --signal "${{s:-SIGTERM}}" {quoted} >/dev/null && '
+            f"timeout {grace_seconds} /usr/bin/docker wait {quoted}"
         )
 
     @staticmethod
