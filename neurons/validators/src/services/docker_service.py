@@ -1369,6 +1369,10 @@ _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
 
 
+class _UnkillableParkedContainer(Exception):
+    """Park could not end the container even by killing its processes directly: a wedged host process (F-1633)."""
+
+
 class _EditSwap:
     """DAH-2740: keep the customer's container until its replacement runs, so a failed edit can be undone.
 
@@ -1401,6 +1405,8 @@ class _EditSwap:
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
         self.replacement_id: str | None = None
+        # set when `docker kill` got no exit event and killing the processes directly did not stop it either
+        self.unkillable = False
 
     async def __aenter__(self) -> "_EditSwap":
         return self
@@ -1463,13 +1469,17 @@ class _EditSwap:
             # The container cannot be stopped: give it its name back and fail the edit with the
             # pod exactly as it was. This is the wedge that used to surface as RetryError[...]
             # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
-            # stays set so __aexit__ tries the full restore once more.
-            renamed_back = await self.ssh_client.run(
-                f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
-            )
-            if renamed_back.exit_status == 0:
-                self.parked_name = None
-            raise Exception(
+            # stays set so __aexit__ tries the full restore once more. The kill can still land after
+            # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
+            # container stays parked for __aexit__ to restore.
+            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            if running.exit_status == 0 and (running.stdout or "").strip() == "true":
+                renamed_back = await self.ssh_client.run(
+                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
+                )
+                if renamed_back.exit_status == 0:
+                    self.parked_name = None
+            raise (_UnkillableParkedContainer if self.unkillable else Exception)(
                 "[park_current_container] the running container could not be stopped, the pod was left "
                 f"as it was: {(stopped.stderr or '').strip()}"
             )
@@ -1486,6 +1496,12 @@ class _EditSwap:
             is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
             if is_stopped:
                 break
+        if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
+            # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
+            await self.ssh_client.run(DockerCommand.kill_container_processes(parked))
+            running = await self.ssh_client.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
+            self.unkillable = not is_stopped
         logger.warning(
             _m(
                 "docker stop failed while parking the current container; tried docker kill",
@@ -8448,7 +8464,12 @@ class DockerService:
                         )
                     # a delete that landed during the wait must find the pod as it was, not parked
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-                    parked_name = await edit_swap.park()
+                    try:
+                        parked_name = await edit_swap.park()
+                    except _UnkillableParkedContainer:
+                        # the backend reads container_cleanup as the host's fault; park_current_container alone is not
+                        current_step = "container_cleanup"
+                        raise
                     if parked_name:
                         protected_container_names.append(parked_name)
 
