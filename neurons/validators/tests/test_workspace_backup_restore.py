@@ -447,3 +447,36 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     assert spec["workspace"]["bootstrap"] is True
 
 
+
+
+OVERLAY_LINE = "40 1 0:50 / / rw - overlay overlay rw\n"
+
+
+async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
+    # DAH-5047: pre-backup gocryptfs liveness check and remount
+    ssh_client = AsyncMock()
+    ssh_client.run.return_value = SimpleNamespace(stdout=mountinfo)
+    monkeypatch.setattr(miner_service_module.asyncssh, "connect", Mock(return_value=_FakeSshContext(ssh_client)))
+    start = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
+    docker_service = _docker_service_with_pinned_hosts()
+    docker_service.setup_encrypted_local_volume = AsyncMock()
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.backup_log_id = "11111111-1111-4111-8111-111111111111"
+    payload.volume_encrypted = True
+    payload.container_name = "container_pod"
+    await MinerService.__new__(MinerService).handle_backup_container_req(_executor_info(), payload, Mock(), docker_service)
+    start.assert_awaited_once()
+    return docker_service.setup_encrypted_local_volume
+
+
+
+@pytest.mark.asyncio
+async def test_restic_backup_remounts_a_dropped_gocryptfs_mount_without_init(monkeypatch):
+    setup = await _run_encrypted_restic_backup(monkeypatch, OVERLAY_LINE)
+    kwargs = setup.await_args.kwargs
+    assert kwargs["allow_init"] is False
+    assert (kwargs["container_name"], kwargs["plaintext_path"], kwargs["volume_name"], kwargs["pod_id"]) == (
+        "container_pod", "/root", "source-volume", "pod",
+    )

@@ -1,3 +1,4 @@
+import itertools
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -48,6 +49,9 @@ def mock_settings(monkeypatch):
 
 @pytest.fixture
 def create_job_result():
+    # each result is its own machine: one SSH endpoint under two hotkeys is a duplicate and scores 0 (DAH-4881)
+    ssh_ports = itertools.count(2200)
+
     def _factory(
         score: float = 1.0,
         job_score: float = 1.0,
@@ -69,7 +73,7 @@ def create_job_result():
             address="192.168.1.100",
             port=8080,
             ssh_username="root",
-            ssh_port=22,
+            ssh_port=next(ssh_ports),
             port_mappings="[]",
             port_range="40000-50000",
             python_path="/usr/bin/python3",

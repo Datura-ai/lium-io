@@ -241,7 +241,7 @@ async def test_one_spot_node_keeps_its_rate_while_the_model_earns_more(spot_pay_
 
 
 @pytest.mark.asyncio
-async def test_spot_nodes_of_a_model_share_what_its_fillers_earn(spot_pay_on):
+async def test_spot_nodes_of_a_model_share_what_its_fillers_earn(spot_pay_on, caplog):
     # Fish: n $/h of B300 filler earnings is split across all spot nodes, not paid per node
     earnings = 8 * 2.0
     spots = [_spot(f"spot-{i}", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=earnings) for i in range(4)]
@@ -255,6 +255,10 @@ async def test_spot_nodes_of_a_model_share_what_its_fillers_earn(spot_pay_on):
         assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 / 4)
     assert secure.effective_rate == pytest.approx(HOURLY_RATE)
     assert _logged(spots[0], SPOT_LINE)[0]["spot_pool_multiplier"] == pytest.approx(0.25)
+    [model_line] = [r for r in caplog.records if r.getMessage().startswith("Spot pay shares the GPU model's filler earnings")]
+    assert model_line.msg.extra["spot_pool_multiplier"] == pytest.approx(0.25)
+    assert model_line.msg.extra["filler_revenue_usd_per_hour"] == pytest.approx(earnings)
+    assert model_line.msg.extra["spot_gpu_count"] == 4 * 8
     _assert_pool_pays_exactly(incentive)
 
 
@@ -508,6 +512,7 @@ def test_the_live_gpu_denominator_counts_rented_spot_only_when_it_earns(monkeypa
     monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", flag_on)
     spot = _spot(is_rented=True)
     spot.executor_info.port = 8081
+    spot.executor_info.ssh_port = 2222  # its own machine: one SSH endpoint under two hotkeys is a duplicate
     results = {"hk-spot": [spot], "hk-secure": [_node("secure-1", is_rented=True)]}
 
     assert settle_cycle_results(results, {}) == {H100: gpus}
