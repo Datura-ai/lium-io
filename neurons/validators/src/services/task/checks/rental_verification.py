@@ -195,7 +195,7 @@ class RentalVerificationCheck:
         # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
         # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
         # rent skips `--cpus` there too) and when the count is unreadable.
-        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+        cpu_count = advertised_cpu_count(ctx) if not ctx.executor.tdx_quote else None
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator

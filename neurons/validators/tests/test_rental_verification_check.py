@@ -973,7 +973,7 @@ def _cpu_quota_response() -> ExecutorHealthCheckResponse:
 
 @pytest.mark.asyncio
 async def test_cpu_quota_verdict_is_observe_only_in_shadow():
-    """CHECK on, ENFORCEMENT off: the daemon-rejected count is logged but the score is untouched."""
+    """ENFORCEMENT off: the daemon-rejected count is logged but the score is untouched."""
     backend_client = DummyBackendClient(response=_cpu_quota_response())
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
@@ -982,7 +982,6 @@ async def test_cpu_quota_verdict_is_observe_only_in_shadow():
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
         mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = False
         result = await RentalVerificationCheck().run(ctx)
 
@@ -1003,7 +1002,6 @@ async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
         mock_settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED = True
         result = await RentalVerificationCheck().run(ctx)
 
@@ -1025,8 +1023,7 @@ async def test_advertised_cpu_count_is_sent_to_the_backend():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 44
@@ -1047,29 +1044,10 @@ async def test_fake_present_population_does_not_cap_the_advertised_count():
     from tests.helpers import make_context
     ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44, present=176))
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] == 176
-
-
-@pytest.mark.asyncio
-async def test_cpu_count_is_not_sent_when_the_check_is_disabled():
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 44}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state)
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = False
-        await RentalVerificationCheck().run(ctx)
-
-    assert backend_client.called_with["cpu_count"] is None
 
 
 @pytest.mark.asyncio
@@ -1086,8 +1064,7 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
     executor.tdx_quote = '{"quote": "..."}'
     ctx = make_context(executor=executor, services=services, state=state)
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] is None
