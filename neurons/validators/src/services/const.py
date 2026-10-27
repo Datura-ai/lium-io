@@ -446,6 +446,9 @@ TDX_WHITELIST = {
             # DAH-4631 — the same runner digest with EXECUTOR_SSH_SOURCE_PIN added to init_script.sh
             # (lium-io#1677). Version 6.
             "ae7ff74c04eb0626f7cd16822693298f2202650eba9e59b9daebe77a4e018c52": 6,
+            # DAH-5243 — runner sha256:f8421a1d… (executor-v1.156, 2026-10-26)
+            # includes /miner-identity for portal registration. Measured files unchanged.
+            "0cc30085543511090db2952809f104dd30ec7d8630abb9fc4cde8590068ec104": 7,
             # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
             # that runner bakes the STAGING validator hotkey via config_override.py and answers every
             # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.
