@@ -10,8 +10,8 @@ signature is even checked. Signatures below are real (ephemeral keypair), as the
 import json
 import time
 
-import bittensor
 import pytest
+from bittensor_wallet import Keypair
 from fastapi import HTTPException
 
 import dependencies.auth as auth
@@ -22,7 +22,7 @@ WINDOW = 5  # seconds; a stale request only gets staler on a slow runner, so the
 
 @pytest.fixture(scope="module")
 def validator_keypair():
-    return bittensor.Keypair.create_from_uri("//LiumTestValidatorFreshness")
+    return Keypair.create_from_uri("//LiumTestValidatorFreshness")
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +62,7 @@ def test_a_container_logs_signature_outside_the_window_is_refused_even_though_it
 
 def test_a_bad_signature_with_a_fresh_timestamp_is_still_refused(validator_keypair):
     # freshness is added in front of the signature check, not instead of it
-    stranger = bittensor.Keypair.create_from_uri("//LiumTestStrangerFreshness")
+    stranger = Keypair.create_from_uri("//LiumTestStrangerFreshness")
     timestamp = int(time.time())
     signature = _sign(stranger, {"container_name": "container_x", "timestamp": timestamp})
 

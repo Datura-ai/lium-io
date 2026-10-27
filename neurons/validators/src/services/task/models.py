@@ -73,6 +73,9 @@ class JobResult(BaseModel):
     has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
     # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
     filler_revenue_per_gpu_hour: float | None = None
+    # DAH-5128: what Lium's fillers earn per hour in total on the node's GPU model; the most all its
+    # idle spot nodes are paid together. None = no usable sample
+    filler_revenue_usd_per_hour: float | None = None
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -140,6 +143,9 @@ class JobResult(BaseModel):
     eligible_for_rental_share: bool = False
     # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
     spot_pay_candidate: bool = False
+    # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
+    # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
+    spot_pool_multiplier: float | None = None
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
     # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),

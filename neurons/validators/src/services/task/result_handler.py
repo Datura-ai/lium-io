@@ -176,6 +176,13 @@ class ResultHandler:
             if rented_data
             else None
         )
+        filler_revenue_usd_per_hour = (
+            rented_data.get_filler_revenue_usd_per_hour(
+                BASE_GPU_MAP.get(gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
+            )
+            if rented_data
+            else None
+        )
 
         # add TDX attestation and spot tier to specs (propagated to compute-app
         # via MACHINE_SPEC_CHANNEL → executor.specs)
@@ -259,6 +266,7 @@ class ResultHandler:
             default_job_owner=default_job_owner,
             has_lium_filler=has_lium_filler,
             filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour,
+            filler_revenue_usd_per_hour=filler_revenue_usd_per_hour,
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
@@ -382,6 +390,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     anchor_broken=context.gpu_anchor_broken,
+                    reanchor=context.gpu_reanchor,
                 )
             else:
                 await self.redis_service.set_verified_job_info(

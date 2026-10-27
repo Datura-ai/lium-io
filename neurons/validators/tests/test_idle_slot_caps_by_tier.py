@@ -9,7 +9,7 @@ dilution assertions fail.
 from unittest.mock import AsyncMock
 
 import pytest
-from incentive.config import IncentiveConfig
+from incentive.config import BASE_GPU_MAP, MAX_UNRENTED_GPUS_BY_TYPE, RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task import JobResult
 
@@ -81,3 +81,11 @@ async def test_one_idle_node_per_family_is_paid_in_full():
     for jobs_of_miner in jobs.values():
         assert jobs_of_miner[0].cap_dilution_applied is False
         assert jobs_of_miner[0].effective_rate == pytest.approx(jobs_of_miner[0].hourly_rate)
+
+
+def test_every_gpu_model_has_a_positive_idle_cap_and_a_rate():
+    """Regression: a model whose base model had an empty cap earned nothing while free (DAH-5070, Fish 23 Oct)."""
+    for gpu_model, base_model in BASE_GPU_MAP.items():
+        assert MAX_UNRENTED_GPUS_BY_TYPE.get(base_model), gpu_model
+        assert all(cap > 0 for cap in MAX_UNRENTED_GPUS_BY_TYPE[base_model].values()), gpu_model
+        assert RENTAL_PRICES_PER_HOUR.get(gpu_model, 0) > 0, gpu_model

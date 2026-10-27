@@ -540,6 +540,13 @@ async def carry_renter_gpu_reset_results(
                         rented_data, miner_hotkey, miner_coldkeys.get(miner_hotkey), previous, held
                     ),
                     "filler_revenue_per_gpu_hour": _filler_revenue_now(rented_data, previous),
+                    "filler_revenue_usd_per_hour": (
+                        rented_data.get_filler_revenue_usd_per_hour(
+                            BASE_GPU_MAP.get(previous.gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
+                        )
+                        if rented_data
+                        else previous.filler_revenue_usd_per_hour
+                    ),
                     # the hold ends the run before the rented check, so the held result counts no rented GPU
                     "rented_gpu_count": pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
                     or previous.rented_gpu_count,

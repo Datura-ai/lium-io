@@ -204,6 +204,8 @@ class CheckResult(BaseModel):
     # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
     # when the node has no live rental). None = fall back to the check's class default.
     fatal: bool | None = None
+    # Events of checks this one ran inside itself, reported before its own (the scrape's GPU_LOST hold).
+    extra_events: list[ValidationEvent] = []
 
 
 class Context(BaseModel):
@@ -244,6 +246,9 @@ class Context(BaseModel):
     # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
+    # Set by GpuFingerprintCheck (legacy rule) when an idle node's whole GPU set was replaced: the reset drops the
+    # anchor, so the next passing cycle anchors the new cards (whole_set_replaced).
+    gpu_reanchor: bool = False
     is_rental_succeed: bool = False
     rented: bool = False
     renting_in_progress: bool = False
@@ -269,6 +274,9 @@ class Context(BaseModel):
     # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     rented_pod_resources_passed: bool = True
+    # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
+    # score gate lives in calculate_scores.
+    rented_throughput_passed: bool = True
     # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_attestation_identity_passed: bool = True
@@ -619,6 +627,9 @@ class Pipeline:
                         )
                     )
 
+                for extra_event in res.extra_events:
+                    await self.sink.emit(extra_event)
+                    events.append(extra_event)
                 await self.sink.emit(res.event)
                 events.append(res.event)
 

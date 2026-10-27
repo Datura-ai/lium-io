@@ -16,6 +16,7 @@ services:
     profiles: [cpu-only]   # not started
   executor:
     network_mode: host
+    pid: host
     depends_on: !reset []
     environment:
       DOCKER_HOST: unix:///var/run/docker.sock

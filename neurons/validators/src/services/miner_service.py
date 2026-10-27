@@ -70,6 +70,7 @@ from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
+from services.task.checks.duplicate_executor import _gpu_uuids
 from services.task.availability import (
     availability_errors,
     build_executor_unreachable_by_miner_event,
@@ -293,6 +294,47 @@ EXPRESS_LANE = "express"
 CYCLE_DONE = "cycle-done"
 
 
+async def _gocryptfs_mount_is_live(ssh_client, container_name: str, plaintext_path: str) -> bool:
+    # same test as the executor's workspace.py: the rental PID's mountinfo has a fuse.gocryptfs at the path
+    container_q = shlex.quote(container_name)
+    result = await ssh_client.run(
+        f"cat /proc/$(docker inspect -f '{{{{.State.Pid}}}}' {container_q})/mountinfo", check=True
+    )
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if "-" not in fields or len(fields) < 10:
+            continue
+        separator = fields.index("-")
+        if fields[4] == plaintext_path and fields[separator + 1] == "fuse.gocryptfs":
+            return True
+    return False
+
+
+async def _remount_dropped_gocryptfs(ssh_client, payload: BackupContainerRequest, docker_service: DockerService) -> None:
+    # DAH-5047: a RUNNING pod's plaintext mount can drop; remount it (never init) so the backup reads real data.
+    # Best effort: any failure is logged and the backup launches anyway, the executor reports its usual error.
+    extra = {"pod_id": payload.pod_id, "container_name": payload.container_name}
+    try:
+        if await _gocryptfs_mount_is_live(ssh_client, payload.container_name, payload.source_volume_path):
+            return
+        logger.warning(_m("DAH-5047: gocryptfs mount down before backup, remounting", extra=get_extra_info(extra)))
+        # source_volume is the encrypted volume the executor checks at /lium-cipher
+        await docker_service.setup_encrypted_local_volume(
+            ssh_client=ssh_client,
+            container_name=payload.container_name,
+            plaintext_path=payload.source_volume_path,
+            volume_name=payload.source_volume,
+            pod_id=payload.pod_id,
+            log_tag=f"backup_container_{payload.pod_id}",
+            log_extra=extra,
+            allow_init=False,
+        )
+    except Exception as error:
+        logger.error(
+            _m("DAH-5047: pre-backup gocryptfs check/remount failed", extra=get_extra_info({**extra, "error": str(error)}))
+        )
+
+
 class MinerService:
     def __init__(
         self,
@@ -318,6 +360,8 @@ class MinerService:
         # per miner hotkey, the rented executor uuids it left out of its previous answer (RENTED_NOT_LISTED_ONE_CYCLE_GRACE).
         # shortcut: in memory, so a restart costs one extra cycle before a real outage is reported.
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
+        # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
+        self.published_gpu_uuids: dict[str, set[str]] = {}
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -479,7 +523,7 @@ class MinerService:
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
         try:
-            return await self._route_job_to_miner(
+            job = await self._route_job_to_miner(
                 payload,
                 encrypted_files,
                 rented_data,
@@ -488,6 +532,9 @@ class MinerService:
                 executor_id=executor_id,
                 first_pass=first_pass,
             )
+            if executor_id is None:
+                await self.publish_gpu_set_changes(job)
+            return job
         finally:
             if executor_id is None:
                 self._stop_awaiting_wave_list(payload)
@@ -1048,6 +1095,56 @@ class MinerService:
         await self.redis_service.request_forced_validation_cycle()
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
+    async def publish_gpu_set_changes(self, job: dict | None) -> None:
+        """Publish at once a passed node that lost a GPU UUID since the spec last published for it.
+
+        The backend rents the GPU UUIDs of the spec it has, and the cycle publishes only once every
+        miner is done (up to ~15 min later); until then every rent of such a node fails the gpu_flags
+        guard (a card back under a new UUID, 27 Oct). Spec-only like the express lane, scored_at None;
+        the cycle's publish overwrites it. A UUID another of the miner's executors reports too waits for
+        the cycle's duplicate pass.
+        """
+        try:
+            if not job or not job.get("miner_coldkey"):
+                return
+            results: list[JobResult] = job.get("results") or []
+            changed = []
+            for result in results:
+                published = self.published_gpu_uuids.get(str(result.executor_info.uuid).lower())
+                current = set(_gpu_uuids(result))
+                if not (published and current and result.is_successful) or published <= current:
+                    continue
+                elsewhere = {
+                    uuid
+                    for other in results
+                    if other is not result and other.is_successful
+                    for uuid in _gpu_uuids(other)
+                }
+                if not current & elsewhere:
+                    changed.append(result)
+            if not changed:
+                return
+            logger.info(
+                _m(
+                    "Publishing nodes whose GPU UUIDs changed ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [str(result.executor_info.uuid) for result in changed],
+                        }
+                    ),
+                ),
+            )
+            await self.publish_machine_specs(
+                changed, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+        except Exception as exc:
+            # never costs the miner its cycle result: the cycle still publishes the node
+            logger.error(
+                _m("Early publish of changed GPU UUIDs failed", extra=get_extra_info({"error": str(exc)})),
+                exc_info=True,
+            )
+
     async def publish_machine_specs(
         self,
         results: list[JobResult],
@@ -1152,6 +1249,9 @@ class MinerService:
                     exc_info=True,
                 )
                 continue
+            # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
+            if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
+                self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
             if settings.POD_STATES_REPORT_ENABLED:
                 await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
@@ -1397,6 +1497,8 @@ class MinerService:
                     # report the real reason first; the generic dispatch-failure report then finds the log terminal
                     await report_launch_failure(operation_id, self._restic_backup_operation_spec(payload), error)
                     raise error
+                if payload.volume_encrypted and payload.container_name:
+                    await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,
