@@ -525,6 +525,9 @@ def test_disk_usage_follows_a_containerd_root_moved_in_an_imported_config(scrape
         ({"/etc/containerd/config.toml": 'imports = ["/etc/containerd/extra.toml"]\n'}, {"/proc/1/root/var/lib/containerd"}),
         # a literal import that is gone: containerd opens it directly, no glob ever matches it
         ({"/etc/containerd/config.toml": 'imports = ["/etc/containerd/missing.toml"]\n'}, {"/proc/1/root/var/lib/containerd"}),
+        # containerd globs only a pattern with "*": "1?-root.toml" is a literal name it fails to open
+        ({"/etc/containerd/config.toml": 'imports = ["/etc/containerd/1?-root.toml"]\n',
+          "/etc/containerd/10-root.toml": 'root = "/var/lib/containerd"\n'}, {"/proc/1/root/var/lib/containerd"}),
         # the configured root is not on the host: never fall back to the leftover default
         ({"/etc/containerd/config.toml": 'root = "/gone/containerd"\n'}, {"/proc/1/root/var/lib/containerd"}),
     ],
@@ -561,6 +564,11 @@ def test_a_missing_literal_import_is_unknown_even_when_the_dump_succeeds(scrape:
         ({"/etc/containerd/config.toml": 'imports=["10-root.toml", "99-override.toml"]\n',
           "/etc/containerd/10-root.toml": 'root="/data/containerd"\n',
           "/etc/containerd/99-override.toml": 'root="/var/lib/containerd"\nimports=["./10-root.toml"]\n'}, "/var/lib/containerd"),
+        # containerd's LoadConfig is a FIFO queue: every sibling merges before a nested import, so nested.toml wins
+        ({"/etc/containerd/config.toml": 'imports=["a.toml", "b.toml"]\n',
+          "/etc/containerd/a.toml": 'root="/var/lib/containerd"\nimports=["nested.toml"]\n',
+          "/etc/containerd/b.toml": 'root="/var/lib/containerd"\n',
+          "/etc/containerd/nested.toml": 'root="/data/containerd"\n'}, "/data/containerd"),
     ],
 )
 def test_containerd_root_reads_imports_as_containerd_does(scrape: dict, monkeypatch, files, expected_root) -> None:
