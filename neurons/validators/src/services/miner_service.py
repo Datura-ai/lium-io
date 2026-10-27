@@ -2211,12 +2211,15 @@ class MinerService:
                         log_extra=default_extra,
                         operation_name="SSH key submit",
                     )
-                    break
+                    # A request held up by the restart reaches the new miner after the signature aged out.
+                    stale = status == 401 and "too old" in str(response_data)
+                    if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                        break
                 except aiohttp.ClientConnectorError:
                     is_create = isinstance(payload, ContainerCreateRequest)
                     if not is_create or time.monotonic() >= deadline:
                         raise
-                    await asyncio.sleep(MINER_RESTART_RETRY_S)
+                await asyncio.sleep(MINER_RESTART_RETRY_S)
 
             if status != 200 or response_data is None:
                 error_msg = "Failed to submit SSH key"
