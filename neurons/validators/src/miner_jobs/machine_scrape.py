@@ -818,36 +818,37 @@ def containerd_root():
     # sets one, and a root that cannot be read raises (CONTAINERD_ROOT_UNKNOWN) instead of measuring it.
     try:
         # the host's own merged config, imports resolved: what the installer's preflight reads
-        roots = toml_top_level(run_cmd("timeout 20 chroot /proc/1/root containerd config dump"), "root")
+        dumped = toml_top_level(run_cmd("timeout 20 chroot /proc/1/root containerd config dump"), "root")
     except Exception:
-        roots = None
-    if not roots:
-        roots = []
-        pending, seen = [CONTAINERD_CONFIG_PATH], set()
-        try:
-            while pending:
-                path = pending.pop(0)
-                if path in seen:
+        dumped = []
+    # walked even after a dump: a missing literal import can still dump exit 0 with the default root
+    roots = []
+    pending, seen = [CONTAINERD_CONFIG_PATH], set()
+    try:
+        while pending:
+            path = pending.pop(0)
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                with open(f"/proc/1/root{path}") as config_file:
+                    text = config_file.read()
+            except FileNotFoundError:
+                if path != CONTAINERD_CONFIG_PATH:
+                    raise
+                text = ""  # no config at all: containerd runs on its default root
+            roots += toml_top_level(text, "root")
+            for pattern in toml_top_level(text, "imports"):
+                # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
+                pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
+                if "*" not in pattern:
+                    pending.append(pattern)  # literal: containerd opens it, a missing one fails
                     continue
-                seen.add(path)
-                try:
-                    with open(f"/proc/1/root{path}") as config_file:
-                        text = config_file.read()
-                except FileNotFoundError:
-                    if path != CONTAINERD_CONFIG_PATH:
-                        raise
-                    text = ""  # no config at all: containerd runs on its default root
-                roots += toml_top_level(text, "root")
-                for pattern in toml_top_level(text, "imports"):
-                    # normalized like containerd's, so "./x.toml" is the already-loaded x.toml
-                    pattern = os.path.normpath(os.path.join(os.path.dirname(path), pattern))
-                    if "*" not in pattern:
-                        pending.append(pattern)  # literal: containerd opens it, a missing one fails
-                        continue
-                    # a later file overrides an earlier one, in the order containerd merges them
-                    pending += sorted(match[len("/proc/1/root"):] for match in glob.glob(f"/proc/1/root{pattern}"))
-        except OSError as exc:
-            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+                # a later file overrides an earlier one, in the order containerd merges them
+                pending += sorted(match[len("/proc/1/root"):] for match in glob.glob(f"/proc/1/root{pattern}"))
+    except OSError as exc:
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+    roots = dumped or roots
     root = roots[-1] if roots else "/var/lib/containerd"
     if not os.path.isdir(f"/proc/1/root{root}"):
         raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")

@@ -537,6 +537,18 @@ def test_an_undeterminable_containerd_root_is_not_measured(scrape: dict, monkeyp
     assert asked == []
 
 
+def test_a_missing_literal_import_is_unknown_even_when_the_dump_succeeds(scrape: dict, monkeypatch) -> None:
+    # containerd config dump can exit 0 with the default root while a literal import is gone
+    _stub_docker_api(scrape, {"/info": _SNAPSHOTTER_INFO})
+    files = {"/etc/containerd/config.toml": 'imports = ["/etc/containerd/missing.toml"]\n'}
+    _stub_containerd_config(scrape, monkeypatch, files, dump='version = 2\nroot = "/var/lib/containerd"\n')
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs={"/proc/1/root/var/lib/containerd"}, usage_by_path={})
+
+    with pytest.raises(RuntimeError, match=scrape["CONTAINERD_ROOT_UNKNOWN"]):
+        scrape["get_host_disk_usage"]()
+    assert asked == []
+
+
 @pytest.mark.parametrize(
     "files, expected_root",
     [
