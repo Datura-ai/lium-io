@@ -1599,6 +1599,11 @@ class _InflightCreateRegistry:
     def is_running(self, pod_id: str) -> bool:
         return pod_id in self._creates_by_pod_id
 
+    def is_only_create(self, pod_id: str) -> bool:
+        """Exactly one create for this pod is registered (the caller's): no other attempt is live."""
+        create = self._creates_by_pod_id.get(pod_id)
+        return create is not None and create.running == 1
+
     async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""
         create = self._creates_by_pod_id.get(pod_id)
@@ -2530,6 +2535,7 @@ class DockerService:
         port_maps: list[tuple[int, int, int]] | None = None,
         spare_port_pairs: list[PayloadPortMapping] | None = None,
         remove_port_checks_listed_live: Callable[[], Awaitable[PortCheckRemoval]] | None = None,
+        pod_id: str | None = None,
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
@@ -2567,8 +2573,15 @@ class DockerService:
             except Exception as exc:
                 # A re-sent create for this pod meets its earlier attempt's container under the
                 # pod's own (unique) name: 409 "The container name "/pod_<id>" is already in use".
-                # Only that exact name is removed, once; any other name conflict fails as before.
-                if not own_leftover_removed and f'"/{container_name}" is already in use' in str(exc):
+                # Only that exact name is removed, once, and only while no other create for this pod is
+                # registered: a live attempt (registered until its own failure cleanup ends) may still own
+                # that container, so then the conflict fails as before. Any other name conflict fails too.
+                if (
+                    not own_leftover_removed
+                    and pod_id is not None
+                    and inflight_creates.is_only_create(pod_id)
+                    and f'"/{container_name}" is already in use' in str(exc)
+                ):
                     own_leftover_removed = True
                     attempt += 1
                     await self._remove_failed_rental_container_for_retry(
@@ -8940,6 +8953,7 @@ class DockerService:
                         log_tag=log_tag,
                         port_maps=port_maps,
                         spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                        pod_id=payload.pod_id,
                         remove_port_checks_listed_live=(
                             None
                             if probed_port_check_names is None

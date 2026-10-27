@@ -4685,15 +4685,17 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "conflict_name, expected_events",
+    "conflict_name, live_creates, expected_events",
     [
         # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
-        ("pod_test", ["run", "rm pod_test", "run"]),
-        ("pod_other", ["run"]),
+        ("pod_test", 1, ["run", "rm pod_test", "run"]),
+        # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
+        ("pod_test", 2, ["run"]),
+        ("pod_other", 1, ["run"]),
     ],
 )
 async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
-    docker_service, monkeypatch, conflict_name, expected_events,
+    docker_service, monkeypatch, conflict_name, live_creates, expected_events,
 ):
     events: list[str] = []
 
@@ -4711,18 +4713,22 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
             events.append(f"rm {container_name}")
 
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    run = docker_service._run_rental_docker_create_with_port_retry(
-        docker_client=FakeRentalClient(),
-        ssh_client=Mock(),
-        run_spec=ContainerRunSpec(image="img", name="pod_test"),
-        container_name="pod_test",
-        default_extra={},
-    )
-    if conflict_name == "pod_test":
-        assert await run == "cid"
-    else:
-        with pytest.raises(Exception, match="already in use"):
-            await run
+    with contextlib.ExitStack() as creates:
+        for _ in range(live_creates):
+            creates.enter_context(docker_service_module.inflight_creates.track("test"))
+        run = docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=FakeRentalClient(),
+            ssh_client=Mock(),
+            run_spec=ContainerRunSpec(image="img", name="pod_test"),
+            container_name="pod_test",
+            default_extra={},
+            pod_id="test",
+        )
+        if "rm pod_test" in expected_events:
+            assert await run == "cid"
+        else:
+            with pytest.raises(Exception, match="already in use"):
+                await run
     assert events == expected_events
 
 
