@@ -18,6 +18,12 @@ from .post_rental_gpu_recheck import RecheckMarker, record_marker
 TIMEOUT_SECONDS = 30
 # a flag names its card as "gpu <index> (<uuid>): ..." (miner_jobs/gpu_fault_probe.py nvml_health)
 _FLAG_UUID = re.compile(r"^gpu \S+ \(([^()]+)\): ")
+# A recovery action from correctable errors alone is a warning once, but a card whose NVML still
+# asks for a reset this many cycles in a row is not being reset, and a renter on it sees faults
+# (NVLink crashes on a B300 under GPU_RESET, 27 Oct): from here it is judged like a flagged card.
+# shortcut: counted per validator process, so a restart starts the count over; persist if it bites
+RESET_REQUIRED_STREAK_LIMIT = 3
+_reset_required_streak: dict[tuple[str, str], int] = {}
 
 
 async def read_memory_health(ctx: Context) -> MemoryHealthRead:
@@ -45,9 +51,11 @@ class GpuMemoryHealthCheck:
     driver loaded, a failed row remap, or a pending remap / required recovery action on a card with
     uncorrectable remapped rows or uncorrected ECC (what `nvidia-smi -q -d ECC,ROW_REMAPPER` shows);
     a pending remap or recovery action from correctable errors alone is only a warning, sent as one
-    so the provider resets the card. The fault probe sees these only as changes across its own run,
-    and only on an idle node; this is one NVML read and no CUDA, so it runs before the rented
-    short-circuit, for rented and idle executors alike.
+    so the provider resets the card, until a recovery action is still required
+    RESET_REQUIRED_STREAK_LIMIT cycles in a row: then the card is judged like a flagged one. The
+    fault probe sees these only as changes across its own run, and only on an idle node; this is
+    one NVML read and no CUDA, so it runs before the rented short-circuit, for rented and idle
+    executors alike.
 
     A flagged card fails the node while GPU_MEMORY_HEALTH_ENFORCEMENT_ENABLED (on by default) like
     a GPU ban: verified job info is cleared, so it is not rented again until the host resets or
@@ -67,8 +75,20 @@ class GpuMemoryHealthCheck:
         run, report = read.run, read.report
         what: dict[str, Any] = {"executor_uuid": ctx.executor.uuid}
         status = report.get("status")
-        if status == "flagged":
-            flags = _cap(report.get("flags"))
+        warnings = _cap(report.get("warnings")) if status == "ok" else None
+        warnings = warnings if isinstance(warnings, list) else []
+        reset_required = [w for w in warnings if " NVML recovery action " in str(w)]
+        key = (ctx.miner_hotkey, ctx.executor.uuid)
+        streak = 0
+        if reset_required:
+            streak = _reset_required_streak[key] = _reset_required_streak.get(key, 0) + 1
+        elif status in ("ok", "flagged"):
+            # a clean or flagged read ends the run; an unread cycle leaves it as it is
+            _reset_required_streak.pop(key, None)
+        if status == "flagged" or streak >= RESET_REQUIRED_STREAK_LIMIT:
+            flags = _cap(report.get("flags")) if status == "flagged" else reset_required
+            if status != "flagged":
+                what["reset_required_streak"] = streak
             what["flags"] = flags if isinstance(flags, list) else []
             if has_live_rental(ctx):
                 # DAH-4482: the node owes an every-card recheck on its next unrented cycle
@@ -88,8 +108,7 @@ class GpuMemoryHealthCheck:
             message = Msg.FLAGGED
         elif status == "ok":
             # a pending remap from correctable errors only: the card still works, but needs a reset
-            warnings = _cap(report.get("warnings"))
-            if isinstance(warnings, list) and warnings:
+            if warnings:
                 what["warnings"] = warnings
                 message = Msg.RESET_ADVISED
             else:
