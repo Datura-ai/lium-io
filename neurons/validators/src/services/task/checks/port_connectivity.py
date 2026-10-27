@@ -13,6 +13,10 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
+# machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
+# out: a busy host, not a verdict on Sysbox
+SYSBOX_TEST_TIMED_OUT = "Test command timed out."
+
 
 class PortConnectivityCheck:
     """Verify Docker port mappings by running the batch verifier exactly like before.
@@ -44,12 +48,18 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # 26 Oct: an unrented node's scrape sysbox test timed out under load, so the probe ran without sysbox-runc,
+        # failed, and the node scored 0 with Sysbox working. The timeout is provider-reported, so it is neither a
+        # pass nor a miss: the validator's own probe measures Sysbox with sysbox-runc instead.
+        scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+        probe_sysbox = ctx.state.sysbox_runtime or (rented_executor is None and scrape_error == SYSBOX_TEST_TIMED_OUT)
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
             ctx.miner_hotkey,
             ctx.executor,
-            ctx.state.sysbox_runtime,
+            probe_sysbox,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
             filler_ports=filler_ports,
@@ -61,6 +71,10 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
         )
+        if probe_sysbox and not ctx.state.sysbox_runtime:
+            # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
+            # own in-container measurement may say Sysbox works
+            result = replace(result, sysbox_runtime=result.sysbox_measured is True)
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
         declared_port_count = result.declared_port_count
@@ -272,7 +286,14 @@ class PortConnectivityCheck:
                 )
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
-            if not rented or sysbox_now or result.dind_ok:
+            if not rented:
+                # a scrape sysbox test that ran and said no supersedes the last pass; an unrented node never reads
+                # it (only a validator probe counts there), but a later rented cycle would
+                scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+                if result.sysbox_measured is None and scrape_error and scrape_error != SYSBOX_TEST_TIMED_OUT:
+                    await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
+                return False
+            if sysbox_now or result.dind_ok:
                 return False
             return await redis.is_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
         except Exception as e:  # noqa: BLE001 — a safety net; never fail the port check over it

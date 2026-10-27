@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 from core.config import settings
 
@@ -625,3 +627,131 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 
     assert result.passed is True
     assert result.updates["state"].sysbox_runtime is False
+
+
+TIMED_OUT_SPECS = {"sysbox_runtime_scrape_error": "Test command timed out."}
+# a Lium filler, an ENGY_TEE filler (the backend maps no owner for it: the 26 Oct incident) and a provider default job
+FILLER_RENTED_DATA = [
+    None,
+    RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={"executor-123": ["filler_run-1"]},
+        default_job_owner_by_executor={"executor-123": "lium"},
+    ),
+    RentedExecutorsResponse(executors={}, all_filler_containers_by_executor={"executor-123": ["filler_run-1"]}),
+    RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={"executor-123": ["filler_run-1"]},
+        default_job_owner_by_executor={"executor-123": "miner"},
+    ),
+]
+FILLER_IDS = ["no_filler", "lium_filler", "engy_tee_filler_no_owner", "provider_default_job"]
+
+
+def _probe_ctx(context_factory, redis_service, state, *, dind_ok: bool, sysbox: bool, measured: bool | None):
+    connectivity = DummyConnectivityService(
+        success=True, sysbox_runtime=sysbox, verified_port_count=100, dind_ok=dind_ok, sysbox_measured=measured
+    )
+    services = build_services(redis=redis_service, backend=DummyBackendService(), connectivity=connectivity)
+    ctx = context_factory(services=services, config=build_context_config(job_batch_id="batch-123"), state=state)
+    return ctx, connectivity
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rented_data", FILLER_RENTED_DATA, ids=FILLER_IDS)
+async def test_unrented_timed_out_scrape_test_gets_a_sysbox_probe_that_measures_it(context_factory, rented_data):
+    """26 Oct, a B300 with working Sysbox while a filler loaded it: the scrape's sysbox test timed out, the probe ran
+    without sysbox-runc and failed, SYSBOX_REQUIRED_MISSING. Now the validator's probe runs with sysbox-runc and its
+    own measurement decides, whatever the filler's owner."""
+    redis_service = DummyRedis()
+    state = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS, rented_data=rented_data)
+    ctx, connectivity = _probe_ctx(context_factory, redis_service, state, dind_ok=True, sysbox=True, measured=True)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with["sysbox_runtime"] is True
+    assert result.updates["state"].sysbox_runtime is True
+    assert "sysbox_from_last_verified" not in result.updates["default_extra"]
+    assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rented_data", FILLER_RENTED_DATA, ids=FILLER_IDS)
+@pytest.mark.parametrize(
+    ("dind_ok", "measured"), [(False, None), (True, False)], ids=["probe_stalled", "probe_found_no_sysbox"]
+)
+async def test_unrented_host_that_disabled_sysbox_and_stalls_the_test_never_reuses_a_pass(
+    context_factory, rented_data, dind_ok, measured
+):
+    """F-8: pass once, disable Sysbox, stall the provider-controlled scrape past its timeout (and the probe, or let it
+    find no Sysbox). Every such cycle, also after a fresh pass in between, records no Sysbox: an unrented node is
+    never given the cached pass."""
+    redis_service = DummyRedis()
+    passed = build_state(sysbox_runtime=True, rented_data=rented_data)
+    stalled = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS, rented_data=rented_data)
+    for _ in range(2):
+        ctx, _conn = _probe_ctx(context_factory, redis_service, passed, dind_ok=True, sysbox=True, measured=True)
+        await PortConnectivityCheck().run(ctx)
+        assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+        ctx, connectivity = _probe_ctx(
+            context_factory, redis_service, stalled, dind_ok=dind_ok, sysbox=False, measured=measured
+        )
+        result = await PortConnectivityCheck().run(ctx)
+
+        assert connectivity.called_with["sysbox_runtime"] is True
+        assert result.updates["state"].sysbox_runtime is False
+        assert "sysbox_from_last_verified" not in result.updates["default_extra"]
+
+
+@pytest.mark.asyncio
+async def test_unrented_scrape_test_that_ran_and_failed_is_a_verdict_and_forgets_the_pass(context_factory):
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    state = build_state(specs={"sysbox_runtime_scrape_error": "Sysbox runtime does not support GPU access."})
+    ctx, connectivity = _probe_ctx(context_factory, redis_service, state, dind_ok=False, sysbox=False, measured=None)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with["sysbox_runtime"] is False
+    assert result.updates["state"].sysbox_runtime is False
+    assert redis_service.sysbox_verified == {}
+
+
+@pytest.mark.asyncio
+async def test_rented_node_with_a_timed_out_scrape_test_keeps_its_probe_and_fallback(context_factory):
+    """The rented path is unchanged: probe as the scrape said, the ticket-0494 memory covers a refused probe."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    state = replace(_rented_state(), specs=TIMED_OUT_SPECS)
+    ctx, connectivity = _probe_ctx(context_factory, redis_service, state, dind_ok=False, sysbox=False, measured=None)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with["sysbox_runtime"] is False
+    assert result.updates["state"].sysbox_runtime is True
+    assert result.updates["default_extra"]["sysbox_from_last_verified"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dind_ok", "measured", "expected"),
+    [(False, None, False), (True, None, False), (True, False, False), (True, True, True)],
+    ids=["no_container", "container_not_tested", "measured_no_sysbox", "measured_in_container"],
+)
+async def test_f16_requested_sysbox_probe_counts_only_its_in_container_measurement(
+    context_factory, dind_ok, measured, expected
+):
+    """F-16: the timeout makes the validator request a sysbox-runc probe, and a run that measured nothing (no ports,
+    an error) echoes that request back as sysbox_runtime=True. Only the probe's in-container measurement passes."""
+    redis_service = DummyRedis()
+    state = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS)
+    ctx, connectivity = _probe_ctx(
+        context_factory, redis_service, state, dind_ok=dind_ok, sysbox=True, measured=measured
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert connectivity.called_with["sysbox_runtime"] is True
+    assert result.updates["state"].sysbox_runtime is expected
+    assert result.updates["state"].specs["sysbox_runtime"] is expected
