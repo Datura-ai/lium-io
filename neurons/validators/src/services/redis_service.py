@@ -41,9 +41,6 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 RENTAL_PROBE_OK_PREFIX = "rental_probe_ok"
 RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
-# A standing rental probe failure lapses after a day without a probe that fails again: a node the probe
-# can never reach (too little cycle time, 25 Oct) is not held forever. Every failed probe renews it.
-RENTAL_PROBE_FAILED_TTL_SECONDS = 24 * 3600
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
@@ -428,10 +425,15 @@ class RedisService:
         async with self.lock:
             await self.redis.delete(key)
 
-    async def expire(self, key: str, seconds: int, nx: bool = False):
-        """Set (or refresh) a key's time to live; `nx` sets it only on a key that has none."""
+    async def expire(self, key: str, seconds: int):
+        """Set (or refresh) a key's time to live."""
         async with self.lock:
-            await self.redis.expire(key, seconds, nx=nx)
+            await self.redis.expire(key, seconds)
+
+    async def persist(self, key: str):
+        """Remove a key's time to live, so it stays until deleted."""
+        async with self.lock:
+            await self.redis.persist(key)
 
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
