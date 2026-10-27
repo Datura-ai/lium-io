@@ -220,11 +220,58 @@ def _kb(gb: float) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_complete_cache_is_mounted_without_measuring_free_disk(docker_service):
-    ssh_client = DuHostSshClient([_KIMI], free_gb=10, du_stdout=_kb(1560))
+async def test_a_complete_dolphin_cache_is_mounted_without_measuring_free_disk(docker_service):
+    ssh_client = HostSshClient(["dphn_cache_hf_a"], free_gb=10)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name="dphn_cache_hf_a", target="/c")]
+    )
 
-    assert await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {}) == _kimi_filler().cache_volumes
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, payload, {}) == payload.cache_volumes
     assert not any("df -P" in command for command in ssh_client.commands)
+
+
+class VramHostSshClient(DuHostSshClient):
+    """A host with `gpus` GPUs of `mib` MiB each (nvidia-smi memory.total)."""
+
+    def __init__(self, listed_volumes: list[str], free_gb: float, gpus: int, mib: int = 275040):
+        super().__init__(listed_volumes, free_gb, _kb(1560))
+        self._vram = "\n".join([str(mib)] * gpus)
+
+    async def run(self, command: str, *args, **kwargs):
+        if "nvidia-smi" in command:
+            self.commands.append(command)
+            return SimpleNamespace(exit_status=0, stdout=self._vram, stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gpus", "free_gb", "kept"),
+    # Viren 27 Oct: an idle 8x B300 listed 2,280 GB beside the 1561 GB cache. 1.5x 2149 GiB VRAM = 3223 GiB floor.
+    [(8, 2280, False), (8, 3300, True), (1, 2280, True), (1, 1900, False), (0, 2280, True)],
+)
+async def test_a_kept_engy_cache_goes_when_the_node_lists_less_than_its_floor_beside_it(
+    docker_service, gpus, free_gb, kept
+):
+    ssh_client = VramHostSshClient([_KIMI], free_gb=free_gb, gpus=gpus)
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {})
+
+    assert bool(affordable) is kept
+    assert _removed_volumes(ssh_client) == ([] if kept else [_KIMI])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("gpus", "free_gb", "granted"), [(8, 3950, False), (8, 4800, True), (1, 3950, True)])
+async def test_kimi_k3_is_cached_only_when_the_node_keeps_1_5x_its_vram_free_beside_it(
+    docker_service, gpus, free_gb, granted
+):
+    # 8x B300 with ~3950 GB free: 3950 - 1561 = 2389 < 3223, so the run downloads into its own (listed free) volume.
+    ssh_client = VramHostSshClient(["volume_pod"], free_gb=free_gb, gpus=gpus)
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {})
+
+    assert bool(affordable) is granted
 
 
 @pytest.mark.asyncio
@@ -245,7 +292,7 @@ async def test_an_interrupted_download_is_resumed_when_the_node_can_afford_what_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("du_stdout", ["", "du: /cache: I/O error\n", "garbage"])
 async def test_an_unmeasurable_cache_is_mounted_as_before(docker_service, du_stdout):
-    ssh_client = DuHostSshClient([_KIMI], free_gb=10, du_stdout=du_stdout)
+    ssh_client = DuHostSshClient([_KIMI], free_gb=2500, du_stdout=du_stdout)
 
     assert await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {}) != []
 

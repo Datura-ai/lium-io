@@ -84,6 +84,7 @@ from services.const import (
     FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
     ENGY_CACHE_COMPLETE_SHARE,
     ENGY_CACHE_MIN_FREE_BESIDE_GB,
+    ENGY_CACHE_FREE_BESIDE_VRAM_MULTIPLE,
     CACHE_SWEEP_CONTAINER_NAME,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
@@ -4872,7 +4873,9 @@ class DockerService:
         present: list[CacheVolume] = [
             volume for volume in payload.cache_volumes if volume.name in existing and not missing_gb.get(volume.name)
         ]
-        if len(present) == len(payload.cache_volumes):
+        # An existing Engy cache is checked against the node's floor below; a DPHN one mounts unmeasured.
+        existing_engy: list[str] = [name for name in existing if name.startswith(ENGY_CACHE_VOLUME_PREFIX)]
+        if len(present) == len(payload.cache_volumes) and not existing_engy:
             return list(payload.cache_volumes)
 
         try:
@@ -4891,6 +4894,34 @@ class DockerService:
             )
             return present
 
+        engy_floor_gb: float = (
+            await self._engy_cache_floor_gb(ssh_client)
+            if any(name.startswith(ENGY_CACHE_VOLUME_PREFIX) for name in requested_names)
+            else ENGY_CACHE_MIN_FREE_BESIDE_GB
+        )
+        # free_gb counts the existing cache as used, so it is what the node lists beside it. Under the floor the
+        # cache goes and the run downloads into its own volume (listed free); a new download would be refused too.
+        if existing_engy and free_gb < engy_floor_gb:
+            logger.info(
+                _m(
+                    "Engy cache leaves less free disk than the node's floor; removing it",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "free_gb": round(free_gb, 1),
+                        "floor_gb": round(engy_floor_gb, 1),
+                        "volumes": existing_engy,
+                    }),
+                )
+            )
+            await retry_ssh_command(
+                ssh_client,
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(*existing_engy)}",
+                "select_affordable_cache_volumes",
+            )
+            return [volume for volume in present if volume.name not in existing_engy]
+        if len(present) == len(payload.cache_volumes):
+            return present
+
         floor_gb: int = DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
         # One family per launch: DPHN's whole set is DPHN_CACHE_SIZE_GB, an Engy launch asks for one volume.
         download_gb: float = max(
@@ -4906,11 +4937,11 @@ class DockerService:
         )
         # A download the run's own volume could hold is not refused for its share: refused, it lands in that
         # volume anyway and is fetched again on every launch (prod 26 Oct: kimi-k3 on an 8xB300).
-        # Granted for that reason only while the node still fits the model beside it (ENGY_CACHE_MIN_FREE_BESIDE_GB).
+        # Granted for that reason only while the node keeps its floor beside it (_engy_cache_floor_gb).
         # No volume limit (no --storage-opt): the run writes the weights to the same disk anyway.
         over_share: bool = download_gb > free_gb * FILLER_CACHE_MAX_FREE_DISK_SHARE and (
             (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
-            or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
+            or free_gb - download_gb < engy_floor_gb
         )
         if over_share or free_after_gb <= floor_gb:
             logger.info(
@@ -4926,6 +4957,24 @@ class DockerService:
             )
             return present
         return list(payload.cache_volumes)
+
+    async def _engy_cache_floor_gb(self, ssh_client: asyncssh.SSHClientConnection) -> float:
+        """Free disk (GiB) a node keeps beside a kept Engy cache: max(ENGY_CACHE_MIN_FREE_BESIDE_GB, 1.5x VRAM).
+
+        An 8x B300 (275040 MiB each) gets ~3223 GiB, a 1x-4x node the flat floor. Unreadable VRAM reads as 0.
+        """
+        vram_gib: float = 0
+        try:
+            result = await ssh_client.run(
+                "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits", timeout=NVIDIA_SMI_TIMEOUT_SECONDS
+            )
+            if getattr(result, "exit_status", 0) == 0:
+                vram_gib = sum(int(line) for line in (result.stdout or "").split()) / 1024
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        return max(ENGY_CACHE_MIN_FREE_BESIDE_GB, ENGY_CACHE_FREE_BESIDE_VRAM_MULTIPLE * vram_gib)
 
     async def _engy_cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict

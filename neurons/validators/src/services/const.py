@@ -333,6 +333,10 @@ FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE = 100
 # (strategies.py required_free_disk_gb), and the cache stays used: with less beside it, the node never fits
 # the model again and the cache is dead disk. Below it the run re-downloads into its own volume.
 ENGY_CACHE_MIN_FREE_BESIDE_GB = 2000
+# A node with more VRAM keeps more beside the cache: max(ENGY_CACHE_MIN_FREE_BESIDE_GB, this x total VRAM). A
+# provider (Viren, 27 Oct) wants an idle 8x B300 listed with ~1.5x its VRAM free (~3.2 TB); kimi-k3 then runs from
+# its own run volume there, which a rental removes and the scrape lists as free.
+ENGY_CACHE_FREE_BESIDE_VRAM_MULTIPLE = 1.5
 # DAH-5192: an Engy cache volume holding less than this share of its checkpoint (size in its name) is a
 # partial download, e.g. one a rental interrupted. It is kept and remounted, so the next run resumes it file
 # by file, but what is still missing is charged like a download.
