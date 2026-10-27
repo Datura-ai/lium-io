@@ -898,6 +898,7 @@ def test_encrypted_restore_preserves_user_xattrs() -> None:
     assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
     assert command[command.index("-t") + 1] == "4321"
     assert "/proc/4321/root/root/restored" in command
+    assert command[command.index("--memory") + 1] == "16g"  # DAH-5254: backups keep 4g
     assert "restore" in command
     assert "--json" in command
     excluded_xattrs = [

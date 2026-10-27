@@ -36,6 +36,10 @@ RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 # restic sizes its worker pools from GOMAXPROCS (~7.5 MiB per CPU); unpinned, 192+ CPU hosts hit 4g in seconds.
 RESTIC_HELPER_GOMAXPROCS = "8"
 RESTIC_HELPER_MEMORY = "4g"
+# DAH-5254: restore loads the whole repository index before writing a byte. One renter's repository (61 snapshots
+# up to 1.9M files) restored uncapped on 14 Oct; under 4g every restore of it was SIGKILLed in restic's scan.
+# The renter is waiting on a restore, and oom-score-adj 1000 still makes the helper the first victim.
+RESTIC_RESTORE_HELPER_MEMORY = "16g"
 # Highest OOM score: the kernel kills the helper before the rental.
 RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
 RESTIC_HELPER_GOGC = "50"
@@ -802,7 +806,7 @@ class ResticStorageRunner:
             "--log-driver",
             "none",
             "--memory",
-            RESTIC_HELPER_MEMORY,
+            RESTIC_RESTORE_HELPER_MEMORY if self._operation.action is StorageAction.RESTORE else RESTIC_HELPER_MEMORY,
             "--oom-score-adj",
             RESTIC_HELPER_OOM_SCORE_ADJ,
             "-e",
