@@ -271,6 +271,9 @@ class Settings(BaseSettings):
     )
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
+    # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
+    # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
+    POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
     # A rental container with a memory limit runs with swap off (--memory-swap = --memory) and
     # RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks its processes before the executor. The
     # memory limit stays the backend's memory_gb. 0 or below would protect the renter over host services, and Docker
@@ -382,7 +385,7 @@ class Settings(BaseSettings):
     # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
     # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
     # fails device selection or serialises past a wide wall-clock threshold.
-    # Defaults to False like RENTAL_CPU_LIMIT_CHECK_ENABLED: "shadow" here only means the verdict is
+    # Defaults to False: "shadow" here only means the verdict is
     # not scored — the GPU work itself is real, so an 8-card host would run 8 near-full-VRAM matmuls
     # on top of the legacy single-card one every cycle. Flip it on once elapsed/VRAM/host-RSS numbers
     # from a real 8-GPU box show what that costs an honest miner.
@@ -391,14 +394,8 @@ class Settings(BaseSettings):
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
     # host's Docker daemon creates the probe with `--cpus=<advertised>` and rejects a count that
     # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd
-    # reads the kernel directly). CHECK_ENABLED sends the count and observes the verdict; ENFORCEMENT
-    # additionally zeroes the score on CPU_QUOTA_EXCEEDS_HOST.
-    # Defaults to False, unlike the other CHECK_ENABLED flags: this one is the only item that
-    # changes what the backend does (the probe is created with `--cpus`), so a rejection the backend
-    # does not yet tag CPU_QUOTA_EXCEEDS_HOST lands in the fatal branch of the check. Flip it on once
-    # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
-    RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
-    RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # reads the kernel directly). The count is always sent (not on TDX hosts); a
+    # CPU_QUOTA_EXCEEDS_HOST verdict zeroes the score.
     # Rented pod SSH, observe only: at the start of each cycle the validator
     # reads the SSH identification line of every rented pod listed with an ssh_port, from outside the
     # container (services/pod_ssh_probe.py), and reports each result with the node's result. The
@@ -587,7 +584,6 @@ class Settings(BaseSettings):
     # nodes' idle shares moved to the verified burner); with none to serve, submit this tempo's vector with its
     # idle moved to the burner, never an older vector.
     SETTLEMENT_MODE: Literal["off", "shadow", "enforce"] = Field(env="SETTLEMENT_MODE", default="off")
-    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
     EXECUTOR_IMAGE_REF: str = Field(
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
@@ -908,8 +904,8 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
-        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=1.0, ge=0, lt=100,
-        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB.",
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
+        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,

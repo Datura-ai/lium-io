@@ -47,6 +47,7 @@ from .sshd_bootstrap import SshdBootstrapCheck
 from .sshd_auth_log import SshdAuthLogCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
+from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
@@ -100,6 +101,7 @@ __all__ = [
     "ScoreCheck",
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
+    "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
     "StorageLimitCheck",
