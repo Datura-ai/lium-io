@@ -18,6 +18,7 @@ decision: state failures are swallowed inside ``cache_prefetch_state``.
 """
 
 import asyncio
+import glob
 import os
 import random
 import re
@@ -297,20 +298,31 @@ HOST_ROOT = "/proc/1/root"
 
 
 def _containerd_roots() -> list[str]:
-    """containerd's default root plus a top-level ``root`` in the host's config.toml.
+    """containerd's default root plus every top-level ``root`` in the host's config.toml and its imports.
 
-    shortcut: a root set only in an ``imports`` file is not read; measuring more paths only makes
-    the prune start sooner, so the default stays measured too. Upgrade if such hosts show up.
+    Imports resolve as containerd does: relative to the importing file, a pattern with ``*`` is a
+    glob. Measuring more paths only makes the prune start sooner, so the default stays measured too.
     """
     roots = ["/var/lib/containerd"]
-    for config in (HOST_ROOT + "/etc/containerd/config.toml", "/etc/containerd/config.toml"):
+    prefix = next((p for p in (HOST_ROOT, "") if os.path.isfile(p + "/etc/containerd/config.toml")), None)
+    if prefix is None:
+        return roots
+    todo, seen = [prefix + "/etc/containerd/config.toml"], set()
+    while todo:
+        config = todo.pop(0)
+        if config in seen:
+            continue
+        seen.add(config)
         try:
             with open(config) as config_file:
                 top = re.split(r"(?m)^\s*\[", config_file.read(), maxsplit=1)[0]  # before the first [table]
         except OSError:
             continue
         roots += re.findall(r"""(?m)^\s*root\s*=\s*["']([^"']+)["']""", top)
-        break
+        imports = re.search(r"(?ms)^\s*imports\s*=\s*\[(.*?)\]", top)
+        for pattern in re.findall(r"""["']([^"']+)["']""", imports.group(1)) if imports else []:
+            path = prefix + pattern if pattern.startswith("/") else os.path.join(os.path.dirname(config), pattern)
+            todo += sorted(glob.glob(path)) if "*" in pattern else [path]
     return roots
 
 
@@ -336,11 +348,13 @@ def _prune_unused_images_when_disk_low(client: "docker.DockerClient", keep_refs:
             seen = next((p for p in (HOST_ROOT + root, root) if os.path.isdir(p)), None)
             if seen and seen not in paths:
                 paths.append(seen)
-    usages = [psutil.disk_usage(path) for path in paths]
-    if all(
-        u.free >= LISTING_MIN_FREE_GB * 1024**3 and u.percent <= LISTING_MAX_DISK_USED_PERCENT
-        for u in usages
-    ):
+    low = [
+        path
+        for path in paths
+        if (u := psutil.disk_usage(path)).free < LISTING_MIN_FREE_GB * 1024**3
+        or u.percent > LISTING_MAX_DISK_USED_PERCENT
+    ]
+    if not low:
         return 0
     in_use = {container.attrs.get("Image") for container in client.containers.list(all=True)}
     removed = 0
@@ -360,6 +374,9 @@ def _prune_unused_images_when_disk_low(client: "docker.DockerClient", keep_refs:
         if ok:
             removed += 1
             logger.info(f"Disk low: removed unused image {image.tags or image.id}")
+    if not removed:
+        # nothing this prune may remove: the space is held by images in use, kept templates or other files
+        logger.warning(f"Disk low on {low}; no unused image could be removed, the disk stays full")
     return removed
 
 
