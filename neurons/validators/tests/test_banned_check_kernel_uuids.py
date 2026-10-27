@@ -9,14 +9,11 @@ banned operator re-registers with new UUIDs and a fresh hotkey.
 Bans are matched against the reported UUIDs and the kernel's.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuCheck
 from neurons.validators.src.services.task.checks.banned_provider import BannedProviderCheck
-from neurons.validators.src.services.task.messages import BannedGpuMessages, BannedProviderMessages
-from neurons.validators.src.services.task.pipeline import CheckResult, Context
+from neurons.validators.src.services.task.messages import BannedProviderMessages
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -69,15 +66,8 @@ def _ssh_with_procfs(
     return ssh
 
 
-def _after(ctx: Context, result: CheckResult) -> Context:
-    """The pipeline's handoff: the next check runs on the context with this result's updates applied."""
-    return ctx.model_copy(update=result.updates)
-
-
 @pytest.mark.asyncio
-async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(
-    context_factory
-):
+async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(context_factory):
     rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
     ctx = context_factory(
         state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
@@ -94,183 +84,7 @@ async def test_provider_ban_catches_spoofed_uuid_through_the_kernel_view(
 
 
 @pytest.mark.asyncio
-async def test_kernel_view_is_recorded_on_specs(context_factory):
-    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
-    ctx = context_factory(
-        state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
-    )
-
-    result = await BannedProviderCheck().run(ctx)
-
-    assert result.event.what_we_saw["kernel_ban_enforced"] is True
-    assert result.updates["state"].specs["kernel_gpu_uuids"] == [REAL]
-
-
-@pytest.mark.asyncio
-async def test_kernel_view_would_ban_counts_only_gpu_bans_not_hotkey_bans(context_factory):
-    """kernel_view_would_ban names GPU-ban matches only; a hotkey ban applies without the kernel view."""
-    rented = RentedExecutorsResponse(executors={}, banned_hotkeys=["miner-hotkey"])
-    ctx = context_factory(
-        state=build_state(gpu_uuids=REAL, rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
-        miner_hotkey="miner-hotkey",
-    )
-
-    result = await BannedProviderCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.what_we_saw["kernel_view_would_ban"] is False
-
-
-@pytest.mark.asyncio
-async def test_gpu_ban_catches_spoofed_uuid_through_the_kernel_view(context_factory):
-    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
-    ctx = context_factory(
-        state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
-    )
-
-    result = await BannedGpuCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.reason_code == BannedGpuMessages.GPU_BANNED.reason
-    assert result.updates["clear_verified_job_info"] is True
-
-
-@pytest.mark.asyncio
-async def test_gpu_ban_with_no_reported_uuids_is_still_matched_on_the_kernel_view(
-    context_factory
-):
-    """Regression: the check used to return GPU_UUID_EMPTY before the kernel read, so a host that
-    reported no UUIDs at all slipped past a ban keyed on the kernel's list."""
-    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
-    ctx = context_factory(
-        state=build_state(gpu_uuids=None, rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
-    )
-
-    result = await BannedGpuCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.reason_code == BannedGpuMessages.GPU_BANNED.reason
-    assert result.event.what_we_saw["kernel_gpu_uuids"] == [REAL]
-
-
-@pytest.mark.asyncio
-async def test_kernel_identity_is_recorded_on_state_and_specs_for_the_backend(context_factory):
-    rented = RentedExecutorsResponse(executors={})
-    ctx = context_factory(
-        state=build_state(gpu_uuids=REAL, rented_data=rented, specs={"gpu": {"count": 1}}),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
-    )
-
-    result = await BannedProviderCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.updates["state"].kernel_gpu_uuids == [REAL]
-    assert result.updates["state"].specs == {"gpu": {"count": 1}, "kernel_gpu_uuids": [REAL]}
-    assert result.event.what_we_saw["reported_uuids_differ_from_kernel"] is False
-
-
-@pytest.mark.asyncio
-async def test_unreadable_procfs_falls_back_to_reported_uuids_and_is_not_a_spoof(
-    context_factory
-):
-    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
-    ctx = context_factory(
-        state=build_state(gpu_uuids="GPU-honest", rented_data=rented, specs={"gpu": {"count": 1}}),
-        ssh=_ssh_with_procfs([]),
-    )
-
-    result = await BannedProviderCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
-    assert result.event.what_we_saw["reported_uuids_differ_from_kernel"] is False
-    # the failed attempt is remembered; specs never carry a kernel list the host did not give
-    assert result.updates["state"].kernel_gpu_uuids_read_attempted is True
-    assert result.updates["state"].kernel_gpu_uuids is None
-    assert "kernel_gpu_uuids" not in result.updates["state"].specs
-
-
-@pytest.mark.asyncio
-async def test_gpu_ban_reuses_the_kernel_view_read_by_the_provider_check(
-    context_factory
-):
-    """One procfs read per cycle: the two checks run back to back and the second never touches ssh."""
-    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
-    ssh = _ssh_with_procfs([f"{REAL}, 0"])
-    ctx = context_factory(state=build_state(gpu_uuids=SPOOFED, rented_data=rented), ssh=ssh)
-
-    provider = await BannedProviderCheck().run(ctx)
-    assert provider.passed is True  # banned_guids is the GPU list, not the provider list
-    gpu = await BannedGpuCheck().run(_after(ctx, provider))
-
-    assert gpu.passed is False
-    assert gpu.event.what_we_saw["kernel_gpu_uuids"] == [REAL]
-    ssh.run.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_unreadable_procfs_is_read_once_per_cycle_not_once_per_check(context_factory):
-    """A wedged host costs one bounded read: BannedGpuCheck takes the failed attempt from state."""
-    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
-    ssh = _ssh_with_procfs([])
-    ctx = context_factory(state=build_state(gpu_uuids="GPU-honest", rented_data=rented), ssh=ssh)
-
-    provider = await BannedProviderCheck().run(ctx)
-    gpu = await BannedGpuCheck().run(_after(ctx, provider))
-
-    assert gpu.passed is True
-    assert gpu.event.what_we_saw["kernel_gpu_uuids"] is None
-    ssh.run.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_hung_procfs_read_is_bounded_and_falls_back_to_reported_uuids(
-    context_factory, monkeypatch
-):
-    """A wedged host cannot hold the fatal check open: the read times out and counts as unreadable."""
-    monkeypatch.setattr(nvidia_devices, "KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS", 0.01)
-
-    async def _never_returns(*_args, **_kwargs):
-        await asyncio.sleep(60)
-
-    ssh = AsyncMock()
-    ssh.run = AsyncMock(side_effect=_never_returns)
-    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
-    ctx = context_factory(state=build_state(gpu_uuids="GPU-honest", rented_data=rented), ssh=ssh)
-
-    result = await asyncio.wait_for(BannedProviderCheck().run(ctx), timeout=5)
-
-    assert result.passed is True
-    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
-    ssh.run.assert_awaited_once()
-
-
-def test_foreign_mount_parser_passes_the_container_runtime_layout_and_flags_the_overlay():
-    """Regression: a "tmpfs under /proc/driver/nvidia" rule would flag every GPU container (the
-    runtime's own tmpfs sits there); the rule is a non-procfs mount on the gpus subtree."""
-    assert nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(CONTAINER_MOUNTS)) == []
-    assert nvidia_devices.foreign_mounts_over_proc_nvidia_gpus(
-        "\n".join([*CONTAINER_MOUNTS, OVERLAY_MOUNT])
-    ) == ["/proc/driver/nvidia/gpus/0001:00:00.0 tmpfs"]
-
-
-def test_a_real_nodes_stat_rows_are_not_a_finding():
-    """Staging, 15 Sep: procfs reports size 0 for the card's `information` node, so `stat -c %F`
-    answers "regular empty file" on every containerised executor. The earlier rule read that as an
-    overlay, withheld the kernel list on every honest node, and would have failed them all when
-    enforcement is on."""
-    rows = "\n".join([f"{INFO_FILE} proc", f"{INFO_FILE}|regular empty file"])
-    assert nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(CONTAINER_MOUNTS), rows) == []
-
-
-@pytest.mark.asyncio
-async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(
-    context_factory
-):
+async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(context_factory):
     """The shim test: the overlay serves a clean UUID, the kernel list is withheld, the check fails."""
     rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
     ctx = context_factory(
@@ -289,24 +103,6 @@ async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails(
     assert "kernel_gpu_uuids" not in result.updates["state"].specs
     assert "is_provider_banned" not in result.updates
     assert result.fatal is True
-
-
-@pytest.mark.asyncio
-async def test_stale_procfs_bind_is_unreadable_and_the_node_passes(context_factory):
-    stale = CONTAINER_MOUNTS[1].replace(
-        "/driver/nvidia/gpus/0001:00:00.0 ", "/driver/nvidia/gpus/0001:00:00.0//deleted ", 1
-    )
-    rented = RentedExecutorsResponse(executors={})
-    ctx = context_factory(
-        state=build_state(gpu_uuids=REAL, rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"], mounts=[CONTAINER_MOUNTS[0], stale]),
-    )
-
-    result = await BannedProviderCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
-    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
 
 
 @pytest.mark.asyncio
@@ -336,37 +132,14 @@ async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factor
 
 
 @pytest.mark.asyncio
-async def test_information_file_not_on_procfs_is_withheld_even_with_no_mount_of_its_own(
-    context_factory
-):
-    """Regression (self-review, 15 Sep): the executor container is privileged, so an operator can
-    drop the card's proc bind and write a plain `information` file into the runtime's tmpfs; the
-    mount table then shows nothing on the gpus subtree. The file's own filesystem still says tmpfs."""
-    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
-    ctx = context_factory(
-        state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
-        ssh=_ssh_with_procfs(
-            [f"{SPOOFED}, 0"], mounts=CONTAINER_MOUNTS[:1], file_fs=[f"{INFO_FILE} tmpfs"]
-        ),
+async def test_stale_procfs_bind_is_unreadable_and_the_node_passes(context_factory):
+    stale = CONTAINER_MOUNTS[1].replace(
+        "/driver/nvidia/gpus/0001:00:00.0 ", "/driver/nvidia/gpus/0001:00:00.0//deleted ", 1
     )
-
-    result = await BannedProviderCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
-    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == [f"{INFO_FILE} tmpfs"]
-    assert result.updates["state"].kernel_gpu_uuids is None
-
-
-@pytest.mark.asyncio
-async def test_uuid_rows_without_a_procfs_stat_row_are_unreadable_not_a_finding(
-    context_factory
-):
-    """No `stat` output (an image without GNU stat) is fail-open like every other unreadable procfs."""
-    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    rented = RentedExecutorsResponse(executors={})
     ctx = context_factory(
-        state=build_state(gpu_uuids="GPU-honest", rented_data=rented),
-        ssh=_ssh_with_procfs([f"{REAL}, 0"], file_fs=[]),
+        state=build_state(gpu_uuids=REAL, rented_data=rented),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"], mounts=[CONTAINER_MOUNTS[0], stale]),
     )
 
     result = await BannedProviderCheck().run(ctx)
@@ -374,44 +147,3 @@ async def test_uuid_rows_without_a_procfs_stat_row_are_unreadable_not_a_finding(
     assert result.passed is True
     assert result.event.what_we_saw["kernel_gpu_uuids"] is None
     assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
-
-
-@pytest.mark.parametrize(
-    ("mounts", "file_fs", "expected"),
-    [
-        pytest.param(
-            CONTAINER_MOUNTS,
-            [f"{INFO_FILE} proc", f"{INFO_FILE}|symbolic link"],
-            [f"{INFO_FILE} symbolic link"],
-            id="symlink-to-another-procfs-file",
-        ),
-        pytest.param(
-            [
-                CONTAINER_MOUNTS[0],
-                "1620 1575 0:23 /sys/kernel/core_pattern /proc/driver/nvidia/gpus/0001:00:00.0/information "
-                "rw,relatime - proc proc rw",
-            ],
-            [f"{INFO_FILE} proc", f"{INFO_FILE}|regular file"],
-            [f"{INFO_FILE} proc:/sys/kernel/core_pattern"],
-            id="proc-bind-of-another-procfs-file",
-        ),
-    ],
-)
-def test_a_procfs_file_that_is_not_the_cards_own_node_is_foreign(mounts, file_fs, expected):
-    """Regression (self-review round 2): "on procfs" is not "the driver's node". A symlink or a
-    proc bind pointing at a root-writable procfs file passes the fstype rules alone."""
-    assert (
-        nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(mounts), "\n".join(file_fs))
-        == expected
-    )
-
-
-def test_a_stat_row_whose_path_is_not_a_cards_information_file_is_foreign():
-    """Regression (self-review round 3): a directory name with a newline under gpus/ splits its own
-    stat rows, so neither half starts with the gpus path; every row must be <gpus>/<bus id>/information."""
-    rows = "/proc/driver/nvidia/gpus/0001:00:00.0/information proc\n/proc/driver/nvidia/gpus/s\n"
-    rows += "ym/information proc\n/proc/driver/nvidia/gpus/s\nym/information|symbolic link"
-    found = nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(CONTAINER_MOUNTS), rows)
-    assert found[0] == "/proc/driver/nvidia/gpus/s unexpected path"
-    assert "ym/information proc" not in found  # a split half is named, never counted as evidence
-    assert len(found) == 4

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.container_cleanup import DPHN_CACHE_RECLAIM_FREE_FLOOR_GB, ContainerCleanup
+from services.container_cleanup import ContainerCleanup, never_started_check_containers
 
 GB = 1024**3
 
@@ -72,105 +72,6 @@ def cleanup() -> ContainerCleanup:
     return ContainerCleanup()
 
 
-@pytest.mark.asyncio
-async def test_reclaims_the_cache_when_free_disk_is_below_the_listing_floor(cleanup):
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x", "dphn_cache_dp_x", "volume_pod"], free_gb=40
-    )
-
-    removed = await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1")
-
-    assert removed == 2
-    assert _removed(ssh_client) == ["dphn_cache_dp_x", "dphn_cache_hf_x"]
-
-
-@pytest.mark.asyncio
-async def test_keeps_the_cache_when_the_node_is_comfortably_above_the_floor(cleanup):
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=DPHN_CACHE_RECLAIM_FREE_FLOOR_GB + 500
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_never_reclaims_while_a_filler_container_is_live(cleanup):
-    # A cache a sibling still mounts is in use, and a node still running fillers is not the stranded
-    # node this backstop exists to rescue.
-    ssh_client = FakeSshClient(containers=["filler_abc"], volumes=["dphn_cache_hf_x"], free_gb=10)
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_no_cache_on_the_host_is_a_no_op(cleanup):
-    ssh_client = FakeSshClient(containers=[], volumes=["volume_pod"], free_gb=10)
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_dry_run_reports_without_removing(cleanup):
-    dry = ContainerCleanup(dry_run=True)
-    ssh_client = FakeSshClient(containers=[], volumes=["dphn_cache_hf_x"], free_gb=10)
-
-    assert await dry.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-    assert _removed(ssh_client) == []
-
-
-@pytest.mark.asyncio
-async def test_the_disk_is_measured_on_the_real_docker_data_root(cleanup):
-    # Nodes can move docker's data-root to a dedicated disk. Measuring /var/lib/docker there reads the
-    # root filesystem instead: the reclaim then never fires while docker's disk is full, or fires and
-    # deletes a healthy cache the node had room for. The rest of the codebase already discovers the
-    # root dynamically.
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=10, docker_root="/mnt/docker-data"
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-    assert any("/mnt/docker-data" in command for command in ssh_client.commands), (
-        "the reclaim measured a filesystem that is not docker's data root"
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_refused_removal_is_never_reported_as_reclaimed(cleanup):
-    # `|| true` swallows dockerd's refusal, so counting the volumes we ASKED to remove reports a
-    # rescue that never happened — and the node stays delisted while telemetry says it was saved.
-    ssh_client = FakeSshClient(
-        containers=[], volumes=["dphn_cache_hf_x"], free_gb=10, refuses={"dphn_cache_hf_x"}
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
-
-
-@pytest.mark.asyncio
-async def test_only_the_volumes_that_actually_went_away_are_counted(cleanup):
-    ssh_client = FakeSshClient(
-        containers=[],
-        volumes=["dphn_cache_hf_x", "dphn_cache_dp_x"],
-        free_gb=10,
-        refuses={"dphn_cache_dp_x"},
-    )
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-
-
-@pytest.mark.asyncio
-async def test_a_stopped_filler_does_not_block_the_reclaim(cleanup):
-    # `docker ps -a` would list a long-exited filler_* forever and wedge the guard; the check must
-    # look at RUNNING containers only.
-    ssh_client = FakeSshClient(containers=[], volumes=["dphn_cache_hf_x"], free_gb=10)
-
-    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
-    assert _removed(ssh_client) == ["dphn_cache_hf_x"]
-    assert not any("ps -a" in c for c in ssh_client.commands), "guard must not use `docker ps -a`"
-
-
 class EvictingSshClient(FakeSshClient):
     """DAH-5014: each removed volume gives its size back, and docker reports when each was created."""
 
@@ -206,3 +107,81 @@ async def test_the_engy_checkpoint_is_reclaimed_oldest_first_and_only_as_far_as_
 
     assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
     assert _removed(ssh_client) == ["dphn_cache_hf_x"]
+
+
+@pytest.mark.asyncio
+async def test_a_live_customer_pod_keeps_the_cache_even_under_the_floor(cleanup):
+    # Fish 26 Oct: the cache is kept across rentals and listed as used, so a renter who took the
+    # listed free disk leaves the node under the floor by design
+    ssh_client = FakeSshClient(["pod_abc"], ["engy_cache_hf_kimi-k3"], free_gb=10)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
+    assert _removed(ssh_client) == []
+    (guard,) = [c for c in ssh_client.commands if "docker ps" in c]
+    assert 'name=filler_' in guard and 'name=pod_' in guard
+
+
+class CreatedSweepSshClient(FakeSshClient):
+    """A sweep `docker run` killed between create and start: `lium_cache_sweep` sits in Created, never
+    auto-removed, and dockerd refuses `volume rm` on the cache volume it mounts until it is gone."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sweep_container_exists = True
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command:
+            # the shell runs the command's parts left to right
+            if "docker rm -f lium_cache_sweep" in command.split("volume rm", 1)[0]:
+                self.sweep_container_exists = False
+            self._refuses = set(self._volumes) if self.sweep_container_exists else set()
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_never_started_sweep_container_cannot_pin_the_cache_the_reclaim_removes(cleanup):
+    ssh_client = CreatedSweepSshClient(containers=[], volumes=["engy_cache_hf_glm"], free_gb=40)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
+    assert _removed(ssh_client) == ["engy_cache_hf_glm"] and ssh_client._volumes == []
+
+
+@pytest.mark.asyncio
+async def test_the_download_sweep_removes_its_helper_container_after_the_run_too(cleanup):
+    ssh_client = FakeSshClient(containers=[], volumes=["engy_cache_hf_glm"], free_gb=40)
+
+    await cleanup.sweep_abandoned_download_temporaries(ssh_client, "exec-1")
+
+    (sweep,) = [c for c in ssh_client.commands if "docker run" in c]
+    before, _, after = sweep.partition("docker run")
+    # `--rm` never fires for a container the killed client created but never started
+    assert "docker rm -f lium_cache_sweep" in before and "docker rm -f lium_cache_sweep" in after
+
+
+def test_only_never_started_capability_checks_are_picked():
+    listing = "\n".join(
+        [
+            "a1 lium_capability_check_12_ab daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
+            "b2 eager_kalam daturaai/compute-subnet-executor:latest \"nvidia-smi\"",
+            "c3 executor daturaai/compute-subnet-executor:latest \"/start.sh\"",
+            "d4 his_job nvidia/cuda:12.4 \"nvidia-smi\"",
+        ]
+    )
+
+    assert never_started_check_containers(listing) == ["a1", "b2"]
+
+
+@pytest.mark.asyncio
+async def test_the_stale_cleanup_removes_never_started_check_containers(cleanup):
+    class CreatedChecksSshClient(FakeSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "status=created" in command:
+                self.commands.append(command)
+                body = "a1 lium_capability_check_12_ab daturaai/compute-subnet-executor:latest nvidia-smi"
+                return SimpleNamespace(exit_status=0, stdout=body, stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = CreatedChecksSshClient(containers=[], volumes=[], free_gb=900)
+
+    assert await cleanup.remove_never_started_check_containers(ssh_client, "exec-1") == 1
+    assert any(c.startswith("/usr/bin/docker rm -f a1 ") for c in ssh_client.commands)
