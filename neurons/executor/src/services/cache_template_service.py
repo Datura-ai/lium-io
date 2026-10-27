@@ -20,6 +20,7 @@ decision: state failures are swallowed inside ``cache_prefetch_state``.
 import asyncio
 import os
 import random
+import re
 import time
 
 import aiohttp
@@ -295,6 +296,24 @@ async def _ensure_template(
 HOST_ROOT = "/proc/1/root"
 
 
+def _containerd_roots() -> list[str]:
+    """containerd's default root plus a top-level ``root`` in the host's config.toml.
+
+    shortcut: a root set only in an ``imports`` file is not read; measuring more paths only makes
+    the prune start sooner, so the default stays measured too. Upgrade if such hosts show up.
+    """
+    roots = ["/var/lib/containerd"]
+    for config in (HOST_ROOT + "/etc/containerd/config.toml", "/etc/containerd/config.toml"):
+        try:
+            with open(config) as config_file:
+                top = re.split(r"(?m)^\s*\[", config_file.read(), maxsplit=1)[0]  # before the first [table]
+        except OSError:
+            continue
+        roots += re.findall(r"""(?m)^\s*root\s*=\s*["']([^"']+)["']""", top)
+        break
+    return roots
+
+
 def _prune_unused_images_when_disk_low(client: "docker.DockerClient", keep_refs: set[str]) -> int:
     """Remove every image no container uses, once the disk is under the listing floor.
 
@@ -307,11 +326,16 @@ def _prune_unused_images_when_disk_low(client: "docker.DockerClient", keep_refs:
     # "/" is what the listing reads; Docker's data root can be a separate filesystem. That root
     # is a host path: in the executor container (pid: host) the host's filesystem is /proc/1/root
     paths = ["/"]
-    root = client.info().get("DockerRootDir")
-    if isinstance(root, str) and root.startswith("/"):
-        seen = next((p for p in (HOST_ROOT + root, root) if os.path.isdir(p)), None)
-        if seen:
-            paths.append(seen)
+    info = client.info()
+    roots = [info.get("DockerRootDir")]
+    if any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        # Docker's containerd image store keeps images under containerd's root, whatever data-root says
+        roots += _containerd_roots()
+    for root in roots:
+        if isinstance(root, str) and root.startswith("/"):
+            seen = next((p for p in (HOST_ROOT + root, root) if os.path.isdir(p)), None)
+            if seen and seen not in paths:
+                paths.append(seen)
     usages = [psutil.disk_usage(path) for path in paths]
     if all(
         u.free >= LISTING_MIN_FREE_GB * 1024**3 and u.percent <= LISTING_MAX_DISK_USED_PERCENT
