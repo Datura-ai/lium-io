@@ -6,6 +6,9 @@ a warning only. With REQUIRE_STORAGE_LIMIT_SUPPORTED an unrented node without th
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from neurons.validators.tests.helpers import build_state
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
@@ -29,6 +32,8 @@ async def run(context_factory, specs: dict, *, rented: bool = False):
         )
         rented_data = RentedExecutorsResponse(executors={context_factory().executor.uuid: executor})
     ctx = context_factory(state=build_state(specs=specs, rented_data=rented_data))
+    # two cycles with the same scrape: REQUIRED needs two conclusive failures in a row
+    await StorageLimitCheck().run(ctx)
     return await StorageLimitCheck().run(ctx)
 
 
@@ -141,6 +146,21 @@ async def run_with(ctx, specs):
     return await StorageLimitCheck().run(ctx)
 
 
+TIMEOUT = {"storage_limit_supported": None, "storage_limit_scrape_error": "Test command timed out."}
+NO_LIMIT = {
+    "storage_limit_supported": False,
+    "storage_limit_scrape_error": "Storage limit is not supported.",
+}
+
+
+def inconclusive_since(ctx, delta: timedelta) -> None:
+    # backdate the node's first inconclusive probe in its stored verdict
+    key = next(k for k in ctx.services.redis.store if k.startswith("storage_limit_verdict:"))
+    state = json.loads(ctx.services.redis.store[key])
+    state["inconclusive_since"] = (datetime.now(UTC) - delta).isoformat()
+    ctx.services.redis.store[key] = json.dumps(state)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", INCONCLUSIVE)
 async def test_a_probe_without_a_verdict_reuses_a_recent_pass_and_publishes_it(
@@ -196,21 +216,64 @@ async def test_unenforced_a_probe_without_a_verdict_is_published_as_unknown(cont
 
 
 @pytest.mark.asyncio
-async def test_a_probe_that_finds_no_limit_forgets_the_pass(context_factory, enforced):
+async def test_a_timeout_after_a_pass_keeps_the_pass_after_two_hours(context_factory, enforced):
     ctx = context_factory(state=build_state(specs={}))
     await run_with(ctx, {"storage_limit_supported": True})
-    await run_with(
-        ctx,
-        {
-            "storage_limit_supported": False,
-            "storage_limit_scrape_error": "Storage limit is not supported.",
-        },
-    )
+    await run_with(ctx, TIMEOUT)
+    inconclusive_since(ctx, timedelta(hours=2))
 
-    result = await run_with(
-        ctx,
-        {"storage_limit_supported": False, "storage_limit_scrape_error": "Test command timed out."},
-    )
+    result = await run_with(ctx, TIMEOUT)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.OK.reason
+    assert ctx.state.specs["storage_limit_supported"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_after_a_fail_keeps_the_fail(context_factory, enforced):
+    ctx = context_factory(state=build_state(specs={}))
+    await run_with(ctx, NO_LIMIT)
+    await run_with(ctx, NO_LIMIT)
+
+    result = await run_with(ctx, TIMEOUT)
 
     assert result.passed is False
-    assert result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.reason_code == Msg.REQUIRED.reason
+    assert result.updates["score"] == 0.0
+    # published as the last verdict, so a whole-host rental cannot start uncapped
+    assert ctx.state.specs["storage_limit_supported"] is False
+
+
+@pytest.mark.asyncio
+async def test_one_unsupported_after_a_pass_does_not_fire_required_the_second_does(
+    context_factory, enforced
+):
+    ctx = context_factory(state=build_state(specs={}))
+    await run_with(ctx, {"storage_limit_supported": True})
+
+    first = await run_with(ctx, NO_LIMIT)
+    # a timeout in between neither resets nor counts
+    await run_with(ctx, TIMEOUT)
+    second = await run_with(ctx, NO_LIMIT)
+
+    assert first.passed is True
+    assert first.event.reason_code == Msg.MISSING.reason
+    assert "score" not in first.updates
+    assert second.passed is False
+    assert second.event.reason_code == Msg.REQUIRED.reason
+
+
+@pytest.mark.asyncio
+async def test_inconclusive_for_over_a_day_warns_without_a_score_change(context_factory, enforced):
+    ctx = context_factory(state=build_state(specs={}))
+    await run_with(ctx, {"storage_limit_supported": True})
+    await run_with(ctx, TIMEOUT)
+    inconclusive_since(ctx, timedelta(hours=25))
+
+    result = await run_with(ctx, TIMEOUT)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.INCONCLUSIVE_LONG.reason
+    assert result.event.severity == "warning"
+    assert not result.updates
+    assert ctx.state.specs["storage_limit_supported"] is True

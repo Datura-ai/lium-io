@@ -465,11 +465,20 @@ class StorageLimitMessages:
         severity="error",
         # hidden at once like REQUIRED: without a verdict the node could otherwise take a whole-host rental uncapped
         category=AVAILABILITY_CATEGORY,
-        impact="Job skipped; score set to 0 and the node hidden from new rentals until the disk-limit test finishes "
-        "and passes (the test timed out or crashed, see detail; this is not a finding that the limit is missing)",
+        impact="Job skipped; score set to 0 and the node hidden from new rentals until the disk-limit test gives its "
+        "first result (the test timed out or crashed, see detail; this is not a finding that the limit is missing)",
         remediation="Usually a busy host or a slow image pull: the node passes again on the next validation once "
         "`sudo docker run --rm --storage-opt size=1g --gpus all daturaai/compute-subnet-executor:latest nvidia-smi` "
         "finishes quickly.",
+    )
+    INCONCLUSIVE_LONG = MessageTemplate(
+        event="The disk-limit test has not finished for over 24 hours",
+        reason="STORAGE_LIMIT_INCONCLUSIVE_LONG",
+        severity="warning",
+        category="env",
+        impact="Score not changed: the node keeps its last disk-limit result (see inconclusive_since, detail)",
+        remediation="Usually a busy host or a slow image pull: check that `sudo docker run --rm --storage-opt size=1g "
+        "--gpus all daturaai/compute-subnet-executor:latest nvidia-smi` finishes within 30 seconds.",
     )
     OK = MessageTemplate(
         event="Docker limits a container's disk",

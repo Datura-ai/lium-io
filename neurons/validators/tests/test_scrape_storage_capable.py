@@ -40,15 +40,17 @@ DOCKER_XFS_PQUOTA = ROOT + "/dev/sdb /var/lib/docker xfs rw,relatime,prjquota 0 
 
 
 def namespace(tmp_path: Path, mounts: str, info: dict, run=None) -> dict[str, Any]:
+    run = run or (lambda *a, **k: SimpleNamespace(returncode=0))
     scrape = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         HELPERS,
         {
             "subprocess": SimpleNamespace(
-                run=run or (lambda *a, **k: SimpleNamespace(returncode=0)),
+                run=run,
                 PIPE=subprocess.PIPE,
                 TimeoutExpired=subprocess.TimeoutExpired,
             ),
+            "run_capability_check": run,  # the named-container wrapper around subprocess.run
             "docker_api_get": lambda path: info,
         },
     )
