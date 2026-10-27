@@ -74,6 +74,54 @@ def test_read_command_bounds_its_state_and_marks_truncation(tmp_path, monkeypatc
     assert pod["destinations"] + pod["unreplied_destinations"] <= 5
 
 
+def test_read_command_keeps_the_busiest_port_past_500_summary_rows(tmp_path):
+    rows = [(port, 10) for port in range(1000, 1600)] + [(2000, 1000)]
+    table = tmp_path / "nf_conntrack"
+    table.write_text(
+        "".join(
+            f"ipv4 2 tcp 6 117 SYN_SENT src=172.17.0.2 dst=10.2.{i // 250}.{i % 250} sport=1 dport={port} "
+            f"[UNREPLIED] src=10.2.0.1 dst=192.168.1.5 sport={port} dport=1 mark=0 zone=0 use=2\n"
+            for port, n in rows
+            for i in range(n)
+        )
+    )
+    out = subprocess.run(
+        ["sh", "-c", read_command(["172.17.0.2"], table=str(table))],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert len(out.splitlines()) > 500
+    (pod,) = parse_summary(out, {"172.17.0.2": "pod_a"})
+    assert pod["top_unreplied_ports"][0] == {"port": "2000", "flows": 1000}
+
+
+def test_read_command_keeps_a_read_failure():
+    # readable, but reading it fails with an I/O error
+    res = subprocess.run(
+        ["sh", "-c", read_command(["172.17.0.2"], table="/proc/self/mem")], capture_output=True
+    )
+    assert res.returncode not in (0, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_status", "reason"),
+    [
+        (0, Msg.SUMMARY.reason),
+        (1, Msg.UNREAD.reason),
+        (2, Msg.UNREAD.reason),
+        (127, Msg.UNREAD.reason),
+        (-1, Msg.UNREAD.reason),
+    ],
+)
+async def test_only_a_successful_read_is_a_summary(context_factory, exit_status, reason):
+    # an empty table read successfully is zero traffic; a failed or killed read is no evidence
+    result = await _run(_ctx(context_factory, _ssh("", table_exit=exit_status)))
+    assert result.passed is True
+    assert result.event.reason_code == reason
+
+
 @pytest.mark.asyncio
 async def test_truncated_summary_is_flagged(context_factory):
     result = await _run(_ctx(context_factory, _ssh("T\nS 172.17.0.2 9 3 5 3\n")))

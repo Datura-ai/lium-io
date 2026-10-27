@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 READ_TIMEOUT_SECONDS = 30
 CONNTRACK_TABLE = "/proc/1/net/nf_conntrack"
 TOP_PORTS = 5
-_MAX_LINES = 500
 _MAX_KEYS = 20000  # bounds the awk state however large the host table is
 _INSPECT_FORMAT = "{{.Name}}{{range .NetworkSettings.Networks}} {{.IPAddress}}{{end}}"
 # shortcut: IPv4 only (conntrack prints IPv6 unabbreviated); add IPv6 when pods get IPv6 bridges
@@ -47,7 +46,7 @@ def read_command(addresses: list[str], table: str = CONNTRACK_TABLE) -> str:
     """One host read of the host's connection tracking table, summarised per rented container address."""
     return (
         f"[ -r {table} ] || exit 3; "
-        f"awk -v m={_MAX_KEYS} -v ips={shlex.quote(' '.join(addresses))} {shlex.quote(_AWK)} {table} | head -n {_MAX_LINES}"
+        f"awk -v m={_MAX_KEYS} -v ips={shlex.quote(' '.join(addresses))} {shlex.quote(_AWK)} {table}"
     )
 
 
@@ -117,6 +116,10 @@ class RentedPodNetworkCheck:
             return self._unread(ctx, reason="ssh error", details={"error": repr(exc)})
         if result.exit_status == 3:
             return self._unread(ctx, reason="no connection table on this host")
+        if result.exit_status != 0:  # a failed read is no evidence of inactivity
+            return self._unread(
+                ctx, reason="read failed", details={"exit_status": result.exit_status}
+            )
 
         pods = parse_summary(result.stdout or "", names_by_address)
         what = {"executor_uuid": ctx.executor.uuid, "pods": pods}
