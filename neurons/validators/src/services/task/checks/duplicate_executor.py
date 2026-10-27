@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import DUPLICATED_MACHINE_SET
 
@@ -52,15 +51,6 @@ class DuplicateExecutorCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "miner_hotkey": ctx.miner_hotkey,
             }
-            if settings.DUPLICATE_EXECUTOR_DRY_RUN:
-                event = render_message(
-                    Msg.DUPLICATE_OBSERVED,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what=what,
-                )
-                return CheckResult(passed=True, event=event)
-
             event = render_message(
                 Msg.DUPLICATE,
                 ctx=ctx,
@@ -170,8 +160,8 @@ def keep_one_miner_per_executor(
     Scored copies from different hotkeys that the validator reached on the same SSH endpoint
     (address and ssh_port) are one machine: each request installs its own fresh key, so a
     passing login there means that machine admitted that hotkey. One hotkey keeps the score
-    (`_keeper`; `rental_hotkeys` maps a rented executor UUID to the hotkey its rental names); the copies of the others are logged with every hotkey involved and, with
-    DUPLICATE_EXECUTOR_DRY_RUN off, score 0 with EXECUTOR_DUPLICATE_ACROSS_MINERS.
+    (`_keeper`; `rental_hotkeys` maps a rented executor UUID to the hotkey its rental names); the copies of the others are logged with every hotkey involved and score 0 with
+    EXECUTOR_DUPLICATE_ACROSS_MINERS.
 
     Matches on what the node itself reports (executor UUID, listed ip:port, GPU UUIDs) are
     logged only, never zeroed: any miner can report another node's values. So is one verified
@@ -179,7 +169,6 @@ def keep_one_miner_per_executor(
     repeats are left to MinerService, unscored copies have nothing to pay twice, and a result
     the validator did not log in for (a forced pass, `ssh_port` 0) proves no endpoint.
     """
-    enforce = not settings.DUPLICATE_EXECUTOR_DRY_RUN
     scored = [
         (hotkey, result)
         for hotkey in sorted(job_results)
@@ -209,7 +198,7 @@ def keep_one_miner_per_executor(
                 other_hotkeys=tuple(sorted(hotkeys - {hotkey})),
                 matched_on=MATCH_SSH_ENDPOINT,
                 kept_by=kept_by,
-                enforced=enforce,
+                enforced=True,
             )
             duplicates.append(duplicate)
             _log(duplicate, result, default_extra)
@@ -270,16 +259,15 @@ def keep_one_miner_per_executor(
             duplicates.append(duplicate)
             _log(duplicate, result, default_extra)
 
-    if enforce:
-        for result, kept_by, shares_row, what in zeroed:
-            result.score = 0
-            result.job_score = 0
-            result.failure_reason_code = Msg.ACROSS_MINERS.reason
-            result.validation_event = render_message(
-                Msg.ACROSS_MINERS, ctx=None, check_id=CYCLE_CHECK_ID, what=what
-            )
-            result.duplicate_kept_by = kept_by
-            result.duplicate_shares_kept_row = shares_row
+    for result, kept_by, shares_row, what in zeroed:
+        result.score = 0
+        result.job_score = 0
+        result.failure_reason_code = Msg.ACROSS_MINERS.reason
+        result.validation_event = render_message(
+            Msg.ACROSS_MINERS, ctx=None, check_id=CYCLE_CHECK_ID, what=what
+        )
+        result.duplicate_kept_by = kept_by
+        result.duplicate_shares_kept_row = shares_row
     return duplicates
 
 

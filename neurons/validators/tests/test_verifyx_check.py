@@ -663,11 +663,29 @@ async def test_verifyx_keeps_the_scrapes_disk_breakdown(context_factory):
     # Act
     result = await VerifyXCheck().run(ctx)
 
-    # Assert — VerifyX wins on the fields it measures, the breakdown survives
+    # Assert — the scrape's figures win (they release the filler caches), the breakdown survives
     hard_disk = result.updates["state"].specs["hard_disk"]
-    assert hard_disk["total"] == 1000
+    assert hard_disk["total"] == 999
+    assert hard_disk["used"] == 399
     assert hard_disk["images"] == 120
     assert hard_disk["volumes"] == 250
+
+
+@pytest.mark.asyncio
+async def test_verifyx_fills_the_disk_totals_a_failed_scrape_left_out(context_factory):
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"hard_disk": {"total": 1000, "used": 400, "free": 600}, "network": {}},
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=verifyx_service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}, "hard_disk": {"disk_type": "nvme"}}),
+    )
+
+    hard_disk = (await VerifyXCheck().run(ctx)).updates["state"].specs["hard_disk"]
+
+    assert (hard_disk["free"], hard_disk["disk_type"]) == (600, "nvme")
 
 
 @pytest.mark.asyncio
