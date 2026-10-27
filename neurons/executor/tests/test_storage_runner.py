@@ -39,6 +39,7 @@ from storage.restic import (
     ResticStorageRunner,
     RestoreStats,
     StorageOperationCancelled,
+    restic_restore_helper_memory,
 )
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
@@ -878,7 +879,8 @@ def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
     assert not any(argument.startswith("s3.connections=") for argument in command)
 
 
-def test_encrypted_restore_preserves_user_xattrs() -> None:
+def test_encrypted_restore_preserves_user_xattrs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("storage.restic.restic_restore_helper_memory", lambda: "16384m")
     operation = StorageOperationSpec.from_mapping(
         _operation_payload(action="restore", mode="encrypted_running")
     )
@@ -898,7 +900,7 @@ def test_encrypted_restore_preserves_user_xattrs() -> None:
     assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
     assert command[command.index("-t") + 1] == "4321"
     assert "/proc/4321/root/root/restored" in command
-    assert command[command.index("--memory") + 1] == "16g"  # backups and legacy tar restores keep 4g
+    assert command[command.index("--memory") + 1] == "16384m"  # backups and legacy tar restores keep 4g
     assert "restore" in command
     assert "--json" in command
     excluded_xattrs = [
@@ -977,6 +979,30 @@ def test_no_rendered_helper_spec_carries_a_volume_passphrase(
     assert not any("passphrase" in item.lower() for item in rendered), rendered
     assert not any("gocryptfs" in item for item in rendered), rendered
     assert "leaked-from-the-executor-environment" not in " ".join(rendered)
+
+
+@pytest.mark.parametrize(
+    ("mem_total_kib", "expected"),
+    [
+        (14 * 1024 * 1024, "4096m"),  # quarter is 3.5 GiB: floor 4g
+        (32 * 1024 * 1024, "8192m"),
+        (128 * 1024 * 1024, "16384m"),  # quarter is 32 GiB: capped at 16g
+    ],
+)
+def test_restic_restore_helper_memory_is_a_quarter_of_host_ram_between_4g_and_16g(
+    tmp_path: Path, mem_total_kib: int, expected: str
+) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemTotal:       {mem_total_kib} kB\nMemFree:        1024 kB\n")
+
+    assert restic_restore_helper_memory(str(meminfo)) == expected
+
+
+def test_restic_restore_helper_memory_falls_back_to_4g_when_meminfo_is_unreadable(tmp_path: Path) -> None:
+    assert restic_restore_helper_memory(str(tmp_path / "missing")) == "4g"
+    garbled = tmp_path / "meminfo"
+    garbled.write_text("MemFree: 1 kB\n")
+    assert restic_restore_helper_memory(str(garbled)) == "4g"
 
 
 def test_legacy_tar_restore_keeps_the_4g_helper_cap() -> None:

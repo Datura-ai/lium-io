@@ -37,9 +37,12 @@ RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 RESTIC_HELPER_GOMAXPROCS = "8"
 RESTIC_HELPER_MEMORY = "4g"
 # restic restore loads the whole repository index before writing a byte, so its memory follows the repository,
-# not the restore. Restores that ran uncapped were SIGKILLed under 4g in restic's scan; 16g is unmeasured headroom.
+# not the restore. Restores that ran uncapped were SIGKILLed under 4g in restic's scan; 16g is unmeasured headroom,
+# limited to a quarter of host RAM so small hosts keep room for the rental, never under the 4g backups get.
 # oom-score-adj 1000 still makes the helper the first victim. Legacy tar restores load no index and keep 4g.
-RESTIC_RESTORE_HELPER_MEMORY = "16g"
+RESTIC_RESTORE_HELPER_MAX_MIB = 16 * 1024
+RESTIC_HELPER_MIN_MIB = 4 * 1024
+MEMINFO_PATH = "/proc/meminfo"
 # Highest OOM score: the kernel kills the helper before the rental.
 RESTIC_HELPER_OOM_SCORE_ADJ = "1000"
 RESTIC_HELPER_GOGC = "50"
@@ -55,6 +58,16 @@ BACKUP_SOURCE_MISSING_EXIT = 66
 
 # restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
 SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
+
+def restic_restore_helper_memory(meminfo_path: str = MEMINFO_PATH) -> str:
+    try:
+        with open(meminfo_path, encoding="ascii") as meminfo:
+            total_kib = next(int(line.split()[1]) for line in meminfo if line.startswith("MemTotal:"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return RESTIC_HELPER_MEMORY
+    quarter_mib = total_kib // 4 // 1024
+    return f"{max(RESTIC_HELPER_MIN_MIB, min(RESTIC_RESTORE_HELPER_MAX_MIB, quarter_mib))}m"
+
 
 class ResticOperationError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
@@ -806,7 +819,7 @@ class ResticStorageRunner:
             "--log-driver",
             "none",
             "--memory",
-            RESTIC_RESTORE_HELPER_MEMORY
+            restic_restore_helper_memory()
             if self._operation.action is StorageAction.RESTORE and self._operation.engine is StorageEngine.RESTIC
             else RESTIC_HELPER_MEMORY,
             "--oom-score-adj",
