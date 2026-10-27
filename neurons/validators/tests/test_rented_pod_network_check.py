@@ -72,7 +72,7 @@ def _ssh(summary="", table_exit=0, inspect="/pod_1 172.17.0.2\n", raise_exc=None
     return SimpleNamespace(run=run)
 
 
-def _ctx(context_factory, ssh, pods=True):
+def _ctx(context_factory, ssh, pods=True, pid_mode="host"):
     rented = RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
@@ -85,7 +85,8 @@ def _ctx(context_factory, ssh, pods=True):
             )
         }
     )
-    return context_factory(state=build_state(rented_data=rented), ssh=ssh)
+    specs = {"executor_pid_mode": pid_mode} if pid_mode is not None else {}
+    return context_factory(state=build_state(rented_data=rented, specs=specs), ssh=ssh)
 
 
 async def _run(ctx, limit=256):
@@ -100,6 +101,19 @@ async def test_summary_below_limit(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.SUMMARY.reason
     assert result.event.what_we_saw["pods"][0]["unreplied_destinations"] == 3
+
+
+@pytest.mark.asyncio
+async def test_every_summary_is_logged_at_info(context_factory, caplog):
+    with caplog.at_level("INFO"):
+        await _run(_ctx(context_factory, _ssh("S 172.17.0.2 9 3 5 3\n")))
+        await _run(_ctx(context_factory, _ssh("S 172.17.0.2 4 1 2 1\n")))
+    logged = [
+        r.msg.extra["pods"][0]["flows"]
+        for r in caplog.records
+        if r.levelname == "INFO" and getattr(r.msg, "message", None) == Msg.SUMMARY.event
+    ]
+    assert logged == [9, 4]
 
 
 @pytest.mark.asyncio
@@ -125,6 +139,14 @@ async def test_many_unreplied_destinations_warn_but_pass(context_factory):
 )
 async def test_unreadable_never_fails(context_factory, ssh):
     result = await _run(_ctx(context_factory, ssh))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNREAD.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pid_mode", ["", "private", None])
+async def test_executor_outside_host_pid_namespace_is_unread(context_factory, pid_mode):
+    result = await _run(_ctx(context_factory, _ssh("S 172.17.0.2 9 3 5 3\n"), pid_mode=pid_mode))
     assert result.passed is True
     assert result.event.reason_code == Msg.UNREAD.reason
 

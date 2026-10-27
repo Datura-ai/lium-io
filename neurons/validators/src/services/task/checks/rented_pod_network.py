@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import shlex
 
 import asyncssh
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 
 from ..messages import RentedPodNetworkMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rented_pod_resources import running_rented_container_names
+
+logger = logging.getLogger(__name__)
 
 READ_TIMEOUT_SECONDS = 30
 CONNTRACK_TABLE = "/proc/1/net/nf_conntrack"
@@ -92,6 +96,9 @@ class RentedPodNetworkCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id)
             )
+        # /proc/1 is the host's init only when the executor shares the host PID namespace
+        if (ctx.state.specs or {}).get("executor_pid_mode") != "host":
+            return self._unread(ctx, reason="executor not in the host PID namespace")
         try:
             names_by_address = await self._addresses(ctx.ssh, names)
             if not names_by_address:
@@ -113,6 +120,9 @@ class RentedPodNetworkCheck:
         template = (
             Msg.FANOUT if any(p["unreplied_destinations"] >= limit for p in pods) else Msg.SUMMARY
         )
+        if template is Msg.SUMMARY:
+            # the check event of an unchanged outcome drops to DEBUG; the summary is wanted every cycle
+            logger.info(_m(Msg.SUMMARY.event, extra=get_extra_info({**ctx.default_extra, **what})))
         return CheckResult(
             passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         )
