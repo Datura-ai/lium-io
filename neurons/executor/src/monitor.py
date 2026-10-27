@@ -98,14 +98,16 @@ def handle_event(event):
 
 
 def recover_executor_forever() -> None:
-    # DAH-5101: restart the executor when a stale containerd task keeps it down; see stale_task_recovery.
+    # Restart the executor when a stale containerd task keeps it down; see stale_task_recovery.
     # Its own client: the events stream holds the main one.
     client = docker.from_env()
     while True:
         try:
             done = recover_stale_executor_task(client)
             if done:
-                log_event(PodLog(event="executor_recovered", reason=done, created_at=datetime.utcnow()))
+                started, reason = done
+                event = "executor_recovered" if started else "executor_recovery_retry"
+                log_event(PodLog(event=event, reason=reason, created_at=datetime.utcnow()))
         except Exception as ex:
             log_event(PodLog(error=f"Executor stale-task recovery failed: {ex}", created_at=datetime.utcnow()))
         time.sleep(60)

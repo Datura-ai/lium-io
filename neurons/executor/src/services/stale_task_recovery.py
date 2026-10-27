@@ -1,4 +1,4 @@
-"""Restart the executor container when a stale containerd task keeps it down (DAH-5101).
+"""Restart the executor container when a stale containerd task keeps it down.
 
 If the executor dies while its containerd shim is still alive (a host IO stall can leave the shim blocked
 for minutes), every restart fails with `failed to create task for container: AlreadyExists: task <id>:
@@ -92,15 +92,18 @@ def _stale_task_id(container) -> str | None:
 
 def recover_stale_executor_task(
     client, proc_root: str = "/proc", kill=os.kill, sleep=time.sleep, wait_seconds: int = 30
-) -> str | None:
-    """One pass: start an executor container held down by its own stale task. Returns what was done."""
+) -> tuple[bool, str] | None:
+    """One pass: start an executor container held down by its own stale task.
+
+    Returns (started, what was done), or None when no container needed it.
+    """
     for container in client.containers.list(all=True, filters={"label": EXECUTOR_SERVICE_LABEL}):
         task_id = _stale_task_id(container)
         if task_id is None:
             continue
         pids = shim_pids(task_id, proc_root)
         if any(_state(proc_root, pid) == "D" for pid in pids):
-            return f"stale containerd task {task_id[:12]} is in uninterruptible IO, retrying next pass"
+            return False, f"stale containerd task {task_id[:12]} is in uninterruptible IO, retrying next pass"
         # the /proc scan takes a while: a restart that won meanwhile must not lose its fresh shim
         container.reload()
         if _stale_task_id(container) != task_id:
@@ -115,7 +118,7 @@ def recover_stale_executor_task(
                 break
             sleep(1)
         else:
-            return f"stale containerd task {task_id[:12]} survived SIGKILL, {container.name} not started"
+            return False, f"stale containerd task {task_id[:12]} survived SIGKILL, {container.name} not started"
         container.start()
-        return f"killed stale containerd task {task_id[:12]} and started {container.name}"
+        return True, f"killed stale containerd task {task_id[:12]} and started {container.name}"
     return None

@@ -1,4 +1,4 @@
-"""DAH-5101: the monitor restarts an executor held down by its own stale containerd task."""
+"""The monitor restarts an executor held down by its own stale containerd task."""
 
 import shutil
 import signal
@@ -86,7 +86,7 @@ def test_kills_only_its_own_shim_and_children_then_starts_the_executor(tmp_path)
 
     assert sorted(killed) == [(100, signal.SIGKILL), (101, signal.SIGKILL), (102, signal.SIGKILL)]
     assert container.started
-    assert done and "started executor-executor-1" in done
+    assert done[0] and "started executor-executor-1" in done[1]
 
 
 def test_another_containers_task_id_or_another_error_is_left_alone(tmp_path):
@@ -115,7 +115,7 @@ def test_a_tree_in_uninterruptible_io_is_left_for_the_next_pass(tmp_path):
 
     done = recover_stale_executor_task(client_with(container), proc_root, kill=killer(proc_root, killed))
 
-    assert killed == [] and not container.started and "uninterruptible" in done
+    assert killed == [] and not container.started and done[0] is False and "uninterruptible" in done[1]
 
 
 def test_a_process_that_survives_the_kill_keeps_the_executor_stopped(tmp_path):
@@ -126,7 +126,7 @@ def test_a_process_that_survives_the_kill_keeps_the_executor_stopped(tmp_path):
         client_with(container), proc_root, kill=killer(proc_root, killed, survivors={102}), sleep=lambda _: None
     )
 
-    assert not container.started and "survived" in done
+    assert not container.started and done[0] is False and "survived" in done[1]
 
 
 def test_a_survivor_reparented_to_init_is_still_found_by_its_cgroup(tmp_path):
