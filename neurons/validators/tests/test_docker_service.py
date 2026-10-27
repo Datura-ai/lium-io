@@ -7,7 +7,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from unittest.mock import AsyncMock, Mock, MagicMock, patch
+from unittest.mock import AsyncMock, Mock, MagicMock, call, patch
 from uuid import uuid4, UUID
 
 import asyncssh
@@ -7343,6 +7343,495 @@ async def test_recover_pod_starts_when_the_provider_already_removed_the_stale_di
         start_existing_container.assert_not_awaited()
         assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED" in events
         assert "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED" in events
+
+
+def _parked_recovery(docker_service, monkeypatch, listed, *, mounts="/workspace\n", start=None, policy=None):
+    """recover_parked_pod_container over a host whose `docker ps -a` answers ``listed`` and whose
+    parked container mounts ``mounts``; returns (kwargs, ssh_client, start, stop, repair)."""
+
+    async def run(command, *_args, **_kwargs):
+        if "docker ps" in command:
+            return _make_ssh_command_result(stdout=listed)
+        if "docker inspect" in command:
+            return _make_ssh_command_result(stdout=mounts)
+        return _make_ssh_command_result()
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    start = start or AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", policy or AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    repair = AsyncMock(return_value=None)
+    monkeypatch.setattr(docker_service, "_repair_stale_mountpoint_of_container_volume", repair)
+    stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "_stop_half_recovered_container", stop)
+    marks: dict[str, str] = {}
+    docker_service.redis_service.set = AsyncMock(side_effect=lambda key, value, ex=None: marks.__setitem__(key, value))
+    docker_service.redis_service.delete = AsyncMock(side_effect=lambda key: marks.pop(key, None))
+    docker_service.redis_service.marks = marks
+    kwargs = dict(
+        ssh_client=ssh_client,
+        executor_info=_executor_without_host_key("executor-1"),
+        miner_hotkey="miner-1",
+        private_key="key",
+        container_name="pod_pod-1",
+        pod_id="pod-1",
+        local_volume_path="/workspace",
+        default_extra={},
+    )
+    return kwargs, ssh_client, start, stop, repair
+
+
+def _renames(ssh_client) -> list[str]:
+    return [c.args[0] for c in ssh_client.run.await_args_list if "docker rename" in c.args[0]]
+
+
+@pytest.mark.parametrize(
+    "listed, expected_recovered",
+    [
+        pytest.param("c0ffee pod_pod-1__prev\n", True, id="lone_parked_is_renamed_back_and_started"),
+        pytest.param("a1 pod_pod-1\nc0ffee pod_pod-1__prev\n", False, id="pod_exists_parked_left_alone"),
+        pytest.param("", False, id="nothing_parked"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_parked_pod_container(docker_service, monkeypatch, listed, expected_recovered):
+    # 22 Oct: a failed reboot left the pod's only container as pod_<id>__prev and nothing renamed it back
+    kwargs, ssh_client, start, _stop, repair = _parked_recovery(docker_service, monkeypatch, listed)
+
+    recovered = await docker_service.recover_parked_pod_container(**kwargs)
+
+    assert recovered is expected_recovered
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("docker rm " in c for c in commands)
+    if expected_recovered:
+        # renamed by the parked container's own id
+        assert _renames(ssh_client) == ["/usr/bin/docker rename c0ffee pod_pod-1"]
+        assert (start.await_args.kwargs["container_name"], start.await_args.kwargs["local_volume_path"]) == (
+            "pod_pod-1",
+            "/workspace",
+        )
+        # the unclean stop's leftover mountpoint dir is cleared before the start, not a cycle later
+        assert repair.await_args.args[1] == "pod_pod-1"
+    else:
+        assert _renames(ssh_client) == []
+        start.assert_not_awaited()
+
+
+@pytest.mark.parametrize("local_volume_path", [None, ""])
+@pytest.mark.asyncio
+async def test_recover_parked_leaves_an_encrypted_pod_parked_without_its_plaintext_path(
+    docker_service, monkeypatch, local_volume_path
+):
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", mounts="/lium-cipher\n"
+    )
+
+    assert await docker_service.recover_parked_pod_container(**{**kwargs, "local_volume_path": local_volume_path}) is False
+    assert _renames(ssh_client) == []
+    start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_parked_retries_after_a_policy_failure_before_the_rename(docker_service, monkeypatch):
+    policy = AsyncMock(side_effect=[RuntimeError("temporary policy failure"), None])
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", policy=policy
+    )
+
+    with pytest.raises(RuntimeError):
+        await docker_service.recover_parked_pod_container(**kwargs)
+    assert _renames(ssh_client) == []  # still parked, so the next cycle finds it
+
+    assert await docker_service.recover_parked_pod_container(**kwargs) is True
+    assert policy.await_count == 2
+    start.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "start_error, expected_parked_again",
+    [
+        pytest.param(RuntimeError("gocryptfs remount failed"), True, id="remount_failure_parks_again"),
+        pytest.param(
+            RuntimeError("VolumeDriver.Mount: cannot create mount point dir /mnt/vloopback/v: file exists"),
+            False,
+            id="stale_mount_error_keeps_the_name",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_parked_stops_and_parks_again_when_the_start_fails(
+    docker_service, monkeypatch, start_error, expected_parked_again
+):
+    kwargs, ssh_client, _start, stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", start=AsyncMock(side_effect=start_error)
+    )
+
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+
+    stop.assert_awaited_once()
+    expected = ["/usr/bin/docker rename c0ffee pod_pod-1"]
+    if expected_parked_again:
+        expected.append("/usr/bin/docker rename c0ffee pod_pod-1__prev")
+    assert _renames(ssh_client) == expected
+
+
+@pytest.mark.asyncio
+async def test_recover_parked_stops_the_container_when_cancelled_mid_start(docker_service, monkeypatch):
+    kwargs, ssh_client, _start, stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", start=AsyncMock(side_effect=asyncio.CancelledError)
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await docker_service.recover_parked_pod_container(**kwargs)
+
+    stop.assert_awaited_once()
+    assert _renames(ssh_client)[-1] == "/usr/bin/docker rename c0ffee pod_pod-1__prev"
+
+
+@pytest.mark.asyncio
+async def test_recover_parked_finishes_parking_again_when_cancelled_during_the_cleanup(docker_service, monkeypatch):
+    # the recovery deadline firing while the failed start's stop is still running must not leave
+    # the pod up under its name
+    kwargs, ssh_client, _start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n", start=AsyncMock(side_effect=RuntimeError("remount"))
+    )
+    stop_entered, allow_stop_to_finish = asyncio.Event(), asyncio.Event()
+
+    async def slow_stop(*_args):
+        stop_entered.set()
+        await allow_stop_to_finish.wait()
+        return True
+
+    monkeypatch.setattr(docker_service, "_stop_half_recovered_container", slow_stop)
+    task = asyncio.create_task(docker_service.recover_parked_pod_container(**kwargs))
+    await stop_entered.wait()
+    task.cancel()
+    allow_stop_to_finish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _renames(ssh_client)[-1] == "/usr/bin/docker rename c0ffee pod_pod-1__prev"
+
+
+@pytest.mark.parametrize(
+    "rename_error",
+    [
+        pytest.param(TimeoutError(), id="rename_applied_reply_timed_out"),
+        pytest.param(asyncio.CancelledError(), id="rename_applied_then_cancelled"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_parked_keeps_the_container_parked_when_the_rename_reply_is_lost(
+    docker_service, monkeypatch, rename_error
+):
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(
+        docker_service, monkeypatch, "c0ffee pod_pod-1__prev\n"
+    )
+    host = {"name": "pod_pod-1__prev", "fail_rename": True}
+
+    async def run(command, *_args, **_kwargs):
+        if "docker ps" in command:
+            return _make_ssh_command_result(stdout=f"c0ffee {host['name']}\n")
+        if "docker inspect" in command:
+            return _make_ssh_command_result(stdout="/workspace\n")
+        if command.startswith("/usr/bin/docker rename c0ffee "):
+            host["name"] = command.rsplit(" ", 1)[1]  # docker applies it, the reply never comes back
+            if host.pop("fail_rename", False):
+                raise rename_error
+        return _make_ssh_command_result()
+
+    ssh_client.run.side_effect = run
+
+    if isinstance(rename_error, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await docker_service.recover_parked_pod_container(**kwargs)
+    else:
+        assert await docker_service.recover_parked_pod_container(**kwargs) is False
+    assert host["name"] == "pod_pod-1__prev"
+    start.assert_not_awaited()
+
+    # the next cycle finds it parked and recovers it
+    assert await docker_service.recover_parked_pod_container(**kwargs) is True
+    assert host["name"] == "pod_pod-1"
+
+
+@pytest.mark.asyncio
+async def test_recover_parked_starts_next_cycle_a_pod_whose_rename_reply_and_cleanup_were_lost(
+    docker_service, monkeypatch
+):
+    # the rename applied, then the SSH transport died: its reply and the park-again are both lost,
+    # leaving the pod stopped under its own name
+    kwargs, ssh_client, start, _stop, _repair = _parked_recovery(docker_service, monkeypatch, "")
+    marks = docker_service.redis_service.marks
+    host = {"name": "pod_pod-1__prev", "dead": False}
+
+    async def run(command, *_args, **_kwargs):
+        if host["dead"]:
+            raise asyncssh.ConnectionLost("connection lost")
+        if "docker ps" in command:
+            return _make_ssh_command_result(stdout=f"c0ffee {host['name']}\n")
+        if "docker inspect" in command:
+            return _make_ssh_command_result(stdout="/workspace\n")
+        if command.startswith("/usr/bin/docker rename c0ffee "):
+            host["name"] = command.rsplit(" ", 1)[1]
+            host["dead"] = True
+            raise asyncssh.ConnectionLost("connection lost")
+        return _make_ssh_command_result()
+
+    ssh_client.run.side_effect = run
+
+    with pytest.raises(asyncssh.ConnectionLost):
+        await docker_service.recover_parked_pod_container(**kwargs)
+    assert host["name"] == "pod_pod-1"
+    assert marks == {"stopped_by_recovery:pod-1": "1"}  # written before the rename
+    start.assert_not_awaited()
+
+    # next cycle, new connection: the mark makes the stopped pod_<id> ours to start
+    host["dead"] = False
+    renames_before = len(_renames(ssh_client))
+    assert await docker_service.recover_parked_pod_container(**kwargs, stopped_by_recovery=True) is True
+    assert len(_renames(ssh_client)) == renames_before  # already under its name
+    assert host["name"] == "pod_pod-1"
+    start.assert_awaited_once()
+    assert marks == {}
+
+    # unmarked, a stopped pod_<id> is someone else's: never started
+    assert await docker_service.recover_parked_pod_container(**kwargs) is False
+    start.assert_awaited_once()
+
+
+@contextlib.asynccontextmanager
+async def _docker_client(**_kwargs):
+    yield Mock()
+
+
+@pytest.mark.parametrize(
+    "private_key, local_volume_path, master_secret, remount_error, expected",
+    [
+        pytest.param("key", "/workspace", True, None, "restored", id="restored"),
+        pytest.param("key", None, True, None, "stopped", id="plaintext_path_unknown"),
+        pytest.param(None, "/workspace", True, None, "stopped", id="no_ssh_key"),
+        pytest.param("key", "/workspace", False, None, "stopped", id="no_master_secret"),
+        pytest.param("key", "/workspace", True, RuntimeError("gocryptfs failed"), "stopped", id="remount_failed"),
+        pytest.param("key", "/workspace", True, asyncio.CancelledError(), "cancelled", id="deadline_cancels_it"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_restore_volume_mount_of_running_container_remounts_or_stops_the_pod(
+    docker_service, monkeypatch, private_key, local_volume_path, master_secret, remount_error, expected
+):
+    # a pod known to run without its encrypted mount is either remounted or stopped,
+    # never left up taking the renter's writes unencrypted
+    if not master_secret:
+        monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", None)
+    remount = AsyncMock(side_effect=remount_error)
+    monkeypatch.setattr(docker_service, "_restore_mount_and_sshd_after_start", remount)
+    monkeypatch.setattr(docker_service, "rental_docker_client_factory", Mock(connect=_docker_client))
+    stop = AsyncMock(return_value="stopped")
+    monkeypatch.setattr(docker_service, "_stop_outcome", stop)
+    docker_service.redis_service.set = AsyncMock()
+    docker_service.redis_service.delete = AsyncMock()
+    restore = docker_service.restore_volume_mount_of_running_container(
+        ssh_client=AsyncMock(),
+        executor_info=_executor_without_host_key("executor-1"),
+        private_key=private_key,
+        container_name="pod_pod-1",
+        pod_id="pod-1",
+        local_volume_path=local_volume_path,
+        default_extra={},
+    )
+
+    if expected == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await restore
+    else:
+        assert await restore is (expected == "restored")
+    assert stop.await_count == int(expected != "restored")
+    # marked before the stop, so the next cycle starts it with its mount
+    assert docker_service.redis_service.set.await_count == int(expected != "restored")
+    # remounted: a mark from an earlier stop that did not take is cleared, so it never restarts a later provider stop
+    assert docker_service.redis_service.delete.await_args_list == (
+        [call("stopped_by_recovery:pod-1")] if expected == "restored" else []
+    )
+
+
+@pytest.mark.parametrize(
+    "mark_error, stop_reply_error, expected_name",
+    [
+        pytest.param(None, None, "pod_pod-1", id="marked_keeps_its_name"),
+        pytest.param(ConnectionError("temporary Redis failure"), None, "pod_pod-1__prev", id="failed_mark_parks_it"),
+        pytest.param("hang", None, "pod_pod-1__prev", id="stalled_mark_parks_it"),
+        pytest.param(
+            ConnectionError("temporary Redis failure"),
+            ConnectionError("SSH lost after the stop"),
+            "pod_pod-1__prev",
+            id="failed_mark_and_stop_reply_lost_still_parked",
+        ),
+        pytest.param(None, ConnectionError("SSH lost after the stop"), "pod_pod-1", id="stop_applied_reply_lost"),
+        pytest.param(None, TimeoutError(), "pod_pod-1", id="stop_applied_reply_timed_out"),
+        pytest.param(None, "nonzero", "pod_pod-1", id="docker_refused_the_stop"),
+        pytest.param(None, "signalled", "pod_pod-1", id="nonzero_exit_but_stopped"),
+        pytest.param(None, "signalled_inspect_fails", "pod_pod-1", id="nonzero_exit_inspect_fails"),
+        pytest.param(None, "signalled_still_stopping", "pod_pod-1", id="signalled_cli_shutdown_pending"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mark_and_stop_unmounted_pod_leaves_a_retry_anchor(
+    docker_service, monkeypatch, mark_error, stop_reply_error, expected_name
+):
+    # marked before the stop, so a stop whose reply is lost still leaves the mark; without a written
+    # mark the pod is parked, which the next cycle's rename-back finds by itself
+    host = {"name": "pod_pod-1", "running": True}
+    marks: dict[str, str] = {}
+
+    async def run(command, *_args, **_kwargs):
+        if command == f"/usr/bin/docker stop {host['name']}":
+            if stop_reply_error == "nonzero":
+                return _make_ssh_command_result(exit_status=1)
+            if stop_reply_error == "signalled_still_stopping":
+                return _make_ssh_command_result(exit_status=-1)
+            host["running"] = False
+            if stop_reply_error in ("signalled", "signalled_inspect_fails"):
+                return _make_ssh_command_result(exit_status=137)  # the CLI was killed after the stop applied
+            if stop_reply_error:
+                raise stop_reply_error
+        elif command == f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {host['name']}":
+            if stop_reply_error == "signalled_inspect_fails":
+                raise ConnectionError("SSH lost")
+            return _make_ssh_command_result(stdout=f"{str(host['running']).lower()}\n")
+        elif command.startswith("/usr/bin/docker rename pod_pod-1 "):
+            assert host["running"]  # parked before the stop, never after
+            host["name"] = command.rsplit(" ", 1)[1]
+        else:
+            return _make_ssh_command_result(exit_status=1)
+        return _make_ssh_command_result()
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    async def set_mark(key, value, ex=None):
+        assert ex is None  # no expiry: the only evidence the stop was ours
+        if mark_error == "hang":
+            await asyncio.Event().wait()
+        if mark_error:
+            raise mark_error
+        marks[key] = value
+
+    docker_service.redis_service.set = AsyncMock(side_effect=set_mark)
+    docker_service.redis_service.delete = AsyncMock(side_effect=lambda key: marks.pop(key, None))
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC", 0.01)
+
+    assert await docker_service._mark_and_stop_unmounted_pod(ssh_client, "pod_pod-1", "pod-1") is (
+        stop_reply_error in (None, "signalled")
+    )
+    if stop_reply_error == "signalled_still_stopping":
+        host["running"] = False  # the shutdown completes after the recovery returned
+
+    # only a container verifiably still running is a refused stop
+    refused = stop_reply_error == "nonzero"
+    assert host["running"] is refused
+    assert host["name"] == expected_name
+    # a refused stop leaves the pod running, so its mark goes: a later provider stop is never ours to undo
+    assert marks == ({} if mark_error or refused else {"stopped_by_recovery:pod-1": "1"})
+
+
+@pytest.mark.asyncio
+async def test_a_failed_mark_delete_is_retried_in_the_background(docker_service, monkeypatch):
+    marks = {"stopped_by_recovery:pod-1": "1"}
+    attempts = []
+
+    async def delete(key):
+        attempts.append(key)
+        if len(attempts) < 3:
+            raise ConnectionError("temporary Redis failure")
+        marks.pop(key, None)
+
+    docker_service.redis_service.delete = AsyncMock(side_effect=delete)
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC", 0)
+
+    await docker_service._clear_stopped_by_recovery("pod-1")
+    assert marks  # the first delete failed; the caller is not held up
+    await asyncio.gather(*docker_service_module._RECOVERY_MARK_CLEANUPS.values())
+    assert marks == {} and len(attempts) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_pending_mark_delete_retry_never_deletes_a_later_mark(docker_service, monkeypatch):
+    # a remount's cleanup still retrying when a later recovery marks the same pod must not delete that mark
+    marks = {"stopped_by_recovery:pod-1": "1"}
+    redis_up = asyncio.Event()
+
+    async def delete(key):
+        if not redis_up.is_set():
+            raise ConnectionError("Redis down")
+        marks.pop(key, None)
+
+    async def set_mark(key, value, ex=None):
+        marks[key] = value
+
+    docker_service.redis_service.delete = AsyncMock(side_effect=delete)
+    docker_service.redis_service.set = AsyncMock(side_effect=set_mark)
+    monkeypatch.setattr(docker_service_module, "_STOPPED_BY_RECOVERY_CLEAR_RETRY_SEC", 0)
+
+    await docker_service._clear_stopped_by_recovery("pod-1")
+    task = docker_service_module._RECOVERY_MARK_CLEANUPS["pod-1"]
+    redis_up.set()
+    await docker_service._mark_stopped_by_recovery("pod-1")
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert marks == {"stopped_by_recovery:pod-1": "1"}
+    assert "pod-1" not in docker_service_module._RECOVERY_MARK_CLEANUPS
+
+
+@pytest.mark.asyncio
+async def test_a_failed_mark_delete_is_retried_without_a_cap_until_a_restart_drops_it(docker_service, monkeypatch):
+    # Redis stays down past any fixed attempt count: the retry backs off to its cap and keeps going; only a validator
+    # restart (the task cancelled) leaves the mark, which the rented-machine check clears on a running pod
+    marks = {"stopped_by_recovery:pod-1": "1"}
+    docker_service.redis_service.delete = AsyncMock(side_effect=ConnectionError("Redis down"))
+    delays = []
+    twenty_retries = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay):
+        delays.append(delay)
+        if len(delays) == 20:
+            twenty_retries.set()
+        await real_sleep(0)
+
+    monkeypatch.setattr(docker_service_module.asyncio, "sleep", sleep)
+
+    await docker_service._clear_stopped_by_recovery("pod-1")
+    await twenty_retries.wait()
+    (task,) = docker_service_module._RECOVERY_MARK_CLEANUPS.values()
+    task.cancel()  # the validator restarts
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert delays[:5] == [30, 60, 120, 240, 300] and set(delays[4:]) == {300}
+    assert marks == {"stopped_by_recovery:pod-1": "1"}
+
+
+_GOCRYPTFS_MOUNT = "/lium-cipher /workspace fuse.gocryptfs rw,nosuid,nodev 0 0\n"
+
+
+@pytest.mark.parametrize(
+    "stdout, exit_status, expected_missing",
+    [
+        pytest.param("/lium-cipher\n\n----\noverlay / overlay rw 0 0\n", 0, True, id="encrypted_unmounted"),
+        pytest.param("/lium-cipher\n\n----\n" + _GOCRYPTFS_MOUNT, 0, False, id="encrypted_mounted"),
+        pytest.param("/workspace\n\n----\noverlay / overlay rw 0 0\n", 0, False, id="plain_volume"),
+        pytest.param("", 1, False, id="probe_failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_encrypted_volume_mount_missing(docker_service, stdout, exit_status, expected_missing):
+    # a hand `docker start` brought the pod up with /lium-cipher but no gocryptfs mount
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=stdout, exit_status=exit_status))
+
+    assert await docker_service.encrypted_volume_mount_missing(ssh_client, "pod_pod-1") is expected_missing
 
 
 @pytest.mark.asyncio

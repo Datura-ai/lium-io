@@ -44,6 +44,11 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
+# once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
+# pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup
+# were lost with the SSH transport
+STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
@@ -147,6 +152,8 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
+    # which execution wrote it, so a late removal never erases a newer create's record
+    create_id: str = ""
 
 
 class RedisWrite(NamedTuple):
@@ -654,18 +661,43 @@ class RedisService:
                 await self.redis.delete(key)
 
     async def add_inflight_backend_create(
-        self, pod_id: str, miner_hotkey: str, executor_id: str, workload_kind: WorkloadKind
+        self,
+        pod_id: str,
+        miner_hotkey: str,
+        executor_id: str,
+        workload_kind: WorkloadKind,
+        create_id: str = "",
     ) -> None:
         create = InflightBackendCreate(
             miner_hotkey=miner_hotkey,
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
+            create_id=create_id,
         )
         await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
 
-    async def remove_inflight_backend_create(self, pod_id: str) -> None:
-        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+    async def remove_inflight_backend_create(self, pod_id: str, create_id: str | None = None) -> None:
+        """Remove the pod's record; with ``create_id``, only while it is still that create's own."""
+        if create_id is None:
+            await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+            return
+        # every write of this hash is the connector's, through this lock, so the read and the delete
+        # cannot be split by a newer create's write
+        async with self.lock:
+            raw = await self.redis.hget(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+            if raw is None:
+                return
+            try:
+                owner = InflightBackendCreate.model_validate_json(raw).create_id
+            except ValidationError:
+                owner = None
+            if owner == create_id:
+                await self.redis.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+
+    async def backend_create_inflight(self, pod_id: str) -> bool:
+        """Whether the connector is running a create, reboot or edit of the pod (another process)."""
+        return await self.hget(INFLIGHT_BACKEND_CREATES_KEY, pod_id) is not None
 
     async def inflight_backend_creates(self) -> dict[str, InflightBackendCreate]:
         """pod id -> the create the backend sent for it"""

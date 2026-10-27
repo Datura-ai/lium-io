@@ -270,6 +270,8 @@ def build_services(**overrides) -> ContextServices:
     pod_recovery = AsyncMock()
     # A bare AsyncMock would report every pod as recovered; opt in per test instead.
     pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
+    pod_recovery.recover_parked_pod_container.return_value = False
+    pod_recovery.encrypted_volume_mount_missing.return_value = False
     backend = AsyncMock()
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)
