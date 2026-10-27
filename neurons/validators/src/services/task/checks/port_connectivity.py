@@ -13,8 +13,7 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
-# machine_scrape.py check_sysbox_gpu_compatibility's message when its 30 s `docker run --runtime=sysbox-runc` timed
-# out: a busy host, not a verdict on Sysbox
+# machine_scrape.py's message when its Sysbox test timed out
 SYSBOX_TEST_TIMED_OUT = "Test command timed out."
 
 
@@ -48,9 +47,7 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
-        # 26 Oct: an unrented node's scrape sysbox test timed out under load, so the probe ran without sysbox-runc,
-        # failed, and the node scored 0 with Sysbox working. The timeout is provider-reported, so it is neither a
-        # pass nor a miss: the validator's own probe measures Sysbox with sysbox-runc instead.
+        # A timed-out scrape Sysbox test is no verdict: the validator's own probe measures Sysbox instead.
         scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
         probe_sysbox = ctx.state.sysbox_runtime or (rented_executor is None and scrape_error == SYSBOX_TEST_TIMED_OUT)
 
@@ -72,8 +69,7 @@ class PortConnectivityCheck:
             },
         )
         if probe_sysbox and not ctx.state.sysbox_runtime:
-            # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
-            # own in-container measurement may say Sysbox works
+            # only the probe's own in-container measurement may say Sysbox works
             result = replace(result, sysbox_runtime=result.sysbox_measured is True)
         verified_port_count = len(result.successful_ports)
         probed_port_count = len(result.selected_ports)
@@ -287,8 +283,7 @@ class PortConnectivityCheck:
             elif result.sysbox_measured is False:
                 await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)
             if not rented:
-                # a scrape sysbox test that ran and said no supersedes the last pass; an unrented node never reads
-                # it (only a validator probe counts there), but a later rented cycle would
+                # a scrape Sysbox test that ran and said no supersedes the last pass
                 scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
                 if result.sysbox_measured is None and scrape_error and scrape_error != SYSBOX_TEST_TIMED_OUT:
                     await redis.clear_sysbox_verified(ctx.miner_hotkey, ctx.executor.uuid)

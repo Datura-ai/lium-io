@@ -630,7 +630,7 @@ async def test_redis_error_falls_back_to_the_current_behaviour(context_factory):
 
 
 TIMED_OUT_SPECS = {"sysbox_runtime_scrape_error": "Test command timed out."}
-# a Lium filler, an ENGY_TEE filler (the backend maps no owner for it: the 26 Oct incident) and a provider default job
+# a Lium filler, an ENGY_TEE filler and a provider default job
 FILLER_RENTED_DATA = [
     None,
     RentedExecutorsResponse(
@@ -660,9 +660,7 @@ def _probe_ctx(context_factory, redis_service, state, *, dind_ok: bool, sysbox: 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rented_data", FILLER_RENTED_DATA, ids=FILLER_IDS)
 async def test_unrented_timed_out_scrape_test_gets_a_sysbox_probe_that_measures_it(context_factory, rented_data):
-    """26 Oct, a B300 with working Sysbox while a filler loaded it: the scrape's sysbox test timed out, the probe ran
-    without sysbox-runc and failed, SYSBOX_REQUIRED_MISSING. Now the validator's probe runs with sysbox-runc and its
-    own measurement decides, whatever the filler's owner."""
+    """A timed-out scrape Sysbox test: the validator's own probe decides, whatever the filler's owner."""
     redis_service = DummyRedis()
     state = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS, rented_data=rented_data)
     ctx, connectivity = _probe_ctx(context_factory, redis_service, state, dind_ok=True, sysbox=True, measured=True)
@@ -683,9 +681,7 @@ async def test_unrented_timed_out_scrape_test_gets_a_sysbox_probe_that_measures_
 async def test_unrented_host_that_disabled_sysbox_and_stalls_the_test_never_reuses_a_pass(
     context_factory, rented_data, dind_ok, measured
 ):
-    """F-8: pass once, disable Sysbox, stall the provider-controlled scrape past its timeout (and the probe, or let it
-    find no Sysbox). Every such cycle, also after a fresh pass in between, records no Sysbox: an unrented node is
-    never given the cached pass."""
+    """An unrented node is never given a cached Sysbox pass on a timed-out scrape test."""
     redis_service = DummyRedis()
     passed = build_state(sysbox_runtime=True, rented_data=rented_data)
     stalled = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS, rented_data=rented_data)
@@ -720,7 +716,7 @@ async def test_unrented_scrape_test_that_ran_and_failed_is_a_verdict_and_forgets
 
 @pytest.mark.asyncio
 async def test_rented_node_with_a_timed_out_scrape_test_keeps_its_probe_and_fallback(context_factory):
-    """The rented path is unchanged: probe as the scrape said, the ticket-0494 memory covers a refused probe."""
+    """The rented path is unchanged."""
     redis_service = DummyRedis()
     redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
     state = replace(_rented_state(), specs=TIMED_OUT_SPECS)
@@ -742,8 +738,7 @@ async def test_rented_node_with_a_timed_out_scrape_test_keeps_its_probe_and_fall
 async def test_f16_requested_sysbox_probe_counts_only_its_in_container_measurement(
     context_factory, dind_ok, measured, expected
 ):
-    """F-16: the timeout makes the validator request a sysbox-runc probe, and a run that measured nothing (no ports,
-    an error) echoes that request back as sysbox_runtime=True. Only the probe's in-container measurement passes."""
+    """Only the probe's in-container measurement passes."""
     redis_service = DummyRedis()
     state = build_state(sysbox_runtime=False, specs=TIMED_OUT_SPECS)
     ctx, connectivity = _probe_ctx(
