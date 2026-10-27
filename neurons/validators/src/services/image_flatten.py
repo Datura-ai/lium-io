@@ -183,6 +183,27 @@ def _flatten_command(
     )
 
 
+_FLATTEN_WAITED_EXIT = 3
+
+
+def flatten_wait_command() -> str:
+    lock = FLATTEN_LOCK_PATH
+    return (
+        f"command -v flock >/dev/null || exit 0; flock -n {lock} true && exit 0; "
+        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} {lock} true && exit {_FLATTEN_WAITED_EXIT}; exit 1"
+    )
+
+
+async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> bool:
+    """Wait until no flatten holds the node lock, so a sizing measures the disk with its copy on it (a pod
+    deleted mid-flatten no longer keeps that disk free). True when one was running. A node without flock
+    runs no flatten. Raises when the wait fails or times out."""
+    result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
+    if result.exit_status not in (0, _FLATTEN_WAITED_EXIT):
+        raise RuntimeError(f"waiting for an image copy on this node failed (exit {result.exit_status})")
+    return result.exit_status == _FLATTEN_WAITED_EXIT
+
+
 async def flatten_image_on_host(
     ssh_client: asyncssh.SSHClientConnection, image: str, *, lease: str, reserved_bytes: int = 0
 ) -> str:

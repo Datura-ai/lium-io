@@ -311,3 +311,35 @@ def test_two_concurrent_flattens_on_one_node_copy_once(tmp_path):
 def test_timeout_bounds_both_sides_of_the_copy():
     script = _flatten_command("img", "t", [], [], 0, "r1")
     assert script.count(f"timeout {image_flatten.FLATTEN_TIMEOUT_SECONDS} ") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flatten_running", [False, True])
+async def test_a_replacement_waits_for_a_running_flatten_before_it_measures_the_disk(tmp_path, monkeypatch, flatten_running):
+    # review: 120 GiB free; rental A was deleted while its 30 GiB copy is still being written. Rental B
+    # measures the disk only after the copy landed, so all it is granted stays backed.
+    lock, used = tmp_path / "lock", tmp_path / "used"
+    used.write_text("0")
+    monkeypatch.setattr(image_flatten, "FLATTEN_LOCK_PATH", str(lock))
+    env = {"PATH": os.environ["PATH"]}
+    if flatten_running:
+        copy = subprocess.Popen(["flock", str(lock), "sh", "-c", f"sleep 1; echo 30 > {used}"], env=env)
+        while subprocess.run(["flock", "-n", str(lock), "true"], env=env).returncode == 0:
+            time.sleep(0.01)
+
+    async def run(command, check=False, timeout=None):
+        return Mock(exit_status=subprocess.run(["sh", "-c", command], env=env).returncode)
+
+    assert await image_flatten.wait_for_node_flatten(Mock(run=run)) is flatten_running
+    granted_gib = 120 - int(used.read_text())  # B's sizing reads df now
+    assert granted_gib + int(used.read_text()) <= 120
+    assert granted_gib == (90 if flatten_running else 120)
+    if flatten_running:
+        copy.wait()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
+    ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=1)))
+    with pytest.raises(RuntimeError, match="image copy"):
+        await image_flatten.wait_for_node_flatten(ssh)

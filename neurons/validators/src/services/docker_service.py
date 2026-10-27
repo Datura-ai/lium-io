@@ -120,6 +120,7 @@ from services.image_flatten import (
     ImageFlattenNoDisk,
     flatten_image_on_host,
     flatten_lease_release_command,
+    wait_for_node_flatten,
 )
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
@@ -8848,12 +8849,25 @@ class DockerService:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (a failed probe → None → the per-command path below).
                     volume_probe: VolumeHostProbe | None = None
+                    flatten_finished = False
+                    if measures_host:
+                        # a flatten still copying (its pod deleted meanwhile) takes disk this sizing would
+                        # otherwise grant: wait for it, after the early probe's channel closed (MaxSessions=1)
+                        if early_volume_probe is not None and not early_volume_probe.cancelled():
+                            await early_volume_probe
+                        current_step = "flatten_wait"
+                        flatten_finished = await wait_for_node_flatten(ssh_client)
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
                     if wants_volume_probe:
                         current_step = "volume_host_probe"
-                        if early_volume_probe is not None and image_present and not cleanup_changed_host:
+                        if (
+                            early_volume_probe is not None
+                            and image_present
+                            and not cleanup_changed_host
+                            and not flatten_finished
+                        ):
                             volume_probe, early_volume_probe_step = await early_volume_probe
                             profilers.append(early_volume_probe_step)
                         else:

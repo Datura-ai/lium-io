@@ -46,6 +46,7 @@ from services.docker_service import (
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
+from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
     MissingRentedGpuError,
     PROC_GPU_INFO_CMD,
@@ -601,6 +602,7 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
+        flatten_wait_command(),  # an image copy still running on the node lands before the sizing measures
     ]
     assert _relisting_commands(ssh_client) == []
     handed_on = _probe_kwarg(svc.select_affordable_cache_volumes)

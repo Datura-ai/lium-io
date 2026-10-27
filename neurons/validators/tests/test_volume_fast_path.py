@@ -383,6 +383,26 @@ async def test_create_container_probes_once_and_passes_it_on(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("flatten_was_running", [False, True])
+async def test_create_container_sizes_on_a_fresh_probe_after_waiting_out_a_flatten(svc, monkeypatch, flatten_was_running):
+    # a rental deleted mid-flatten no longer reserves the disk its copy takes: the next create waits for the copy
+    # to land and measures again, so its grant stays backed (120 GiB free before the copy, 90 after)
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    before, after = (
+        VolumeHostProbe("/var/lib/docker", free * _SIZING_GB, [], True) for free in (120, 90)
+    )
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(side_effect=[before, after]))
+    wait = AsyncMock(return_value=flatten_was_running)
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", wait)
+
+    await _run_create_container(svc, _create_payload())
+
+    wait.assert_awaited_once()
+    assert svc.resolve_volume_sizing.await_args.kwargs["host_probe"] is (after if flatten_was_running else before)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "overrides",
     [
