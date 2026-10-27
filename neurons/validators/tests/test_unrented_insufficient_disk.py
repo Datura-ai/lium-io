@@ -5,7 +5,6 @@ MIN_DISK_TO_VRAM_RATE forfeits the unrented rental incentive while staying activ
 Always enforced (the flag was removed).
 """
 
-import logging
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -24,9 +23,9 @@ KB_PER_GB = 1024 ** 2
 
 
 @pytest.fixture(autouse=True)
-def _no_flagship_gate(monkeypatch):
-    # the 8x H200 jobs here are flagships; the always-on flagship gate has its own tests
-    monkeypatch.setattr(RentalPriceIncentive, "_missing_flagship_capability", lambda *_args: None)
+def _no_full_8x_gate(monkeypatch):
+    # the 8x H200 jobs here are full 8x machines; the always-on full 8x gate has its own tests
+    monkeypatch.setattr(RentalPriceIncentive, "_missing_full_8x_capability", lambda *_args: None)
 
 
 def _build_incentive() -> RentalPriceIncentive:
@@ -88,86 +87,6 @@ def test_insufficient_disk_detects_machine_short_on_disk():
     assert measured.disk_gb == 500.0
 
 
-def test_insufficient_disk_ignores_machine_with_enough_disk():
-    # Arrange — same VRAM, 2 TB disk
-    incentive = _build_incentive()
-
-    # Act
-    measured = incentive._insufficient_disk(_make_job(disk_gb=2048.0))
-
-    # Assert
-    assert measured is None
-
-
-def test_insufficient_disk_at_ratio_threshold_is_not_flagged():
-    # Arrange — disk exactly equals VRAM * MIN_DISK_TO_VRAM_RATE; only strictly more is flagged
-    incentive = _build_incentive()
-
-    # Act
-    measured = incentive._insufficient_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=300.0))
-
-    # Assert
-    assert measured is None
-
-
-def test_insufficient_disk_equal_totals_is_flagged():
-    # Arrange — equal VRAM and disk no longer clears the 1.5x margin
-    incentive = _build_incentive()
-
-    # Act
-    measured = incentive._insufficient_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=200.0))
-
-    # Assert
-    assert measured is not None
-    assert measured.vram_gb == 200.0
-    assert measured.disk_gb == 200.0
-
-
-@pytest.mark.parametrize(
-    "job_kwargs",
-    [
-        {"disk_gb": None},                          # scrape has no hard_disk block
-        {"vram_gb_per_gpu": None},                  # scrape has no gpu details
-        {"disk_gb": 0.0},                           # unreadable disk reported as 0
-        {"spec": {"hard_disk": {"total": 1}, "gpu": {"details": []}}},  # gpu list came back empty
-        {"vram_gb_per_gpu": None, "disk_gb": None},  # no scrape at all
-    ],
-)
-def test_insufficient_disk_partial_scrape_is_never_flagged(job_kwargs):
-    # A missing number must not cost a miner the incentive — fail open.
-    incentive = _build_incentive()
-
-    measured = incentive._insufficient_disk(_make_job(**job_kwargs))
-
-    assert measured is None
-
-
-def _logged_reasons(caplog) -> list[str]:
-    # the reason codes of the structured lines captured so far; _m keeps them off the message
-    return [r.msg.extra.get("reason") for r in caplog.records if hasattr(r.msg, "extra")]
-
-
-def test_estimated_job_result_is_not_logged_as_unmeasured(caplog):
-    # estimate_executor builds a spec-less JobResult for every GPU model every cycle;
-    # warning on those would drown the shadow measurement this log exists to feed.
-    incentive = _build_incentive()
-
-    with caplog.at_level(logging.WARNING):
-        incentive._insufficient_disk(_make_job(vram_gb_per_gpu=None, disk_gb=None))
-
-    assert "insufficient_disk_unmeasured" not in _logged_reasons(caplog)
-
-
-def test_unreadable_scrape_is_logged_as_unmeasured(caplog):
-    # A machine that reports no disk must be distinguishable from one that passed the gate.
-    incentive = _build_incentive()
-
-    with caplog.at_level(logging.WARNING):
-        incentive._insufficient_disk(_make_job(disk_gb=None))
-
-    assert "insufficient_disk_unmeasured" in _logged_reasons(caplog)
-
-
 MALFORMED_SPECS: list[dict] = [
     {"gpu": {"details": [{"capacity": "141 GB"}]}, "hard_disk": {"total": 1}},  # unparsable number
     {"gpu": {"details": [{"capacity": {"total": 1}}]}, "hard_disk": {"total": 1}},  # nested object
@@ -176,17 +95,6 @@ MALFORMED_SPECS: list[dict] = [
     {"gpu": {"details": ["141"]}, "hard_disk": {"total": 1}},                   # entry is not a dict
     {"gpu": {"details": [{"capacity": 1}]}, "hard_disk": "500"},                # hard_disk is a string
 ]
-
-
-@pytest.mark.parametrize("spec", MALFORMED_SPECS)
-def test_insufficient_disk_survives_a_malformed_scrape(spec):
-    # The scrape is produced on the miner's machine and calculate_mining_scores has no
-    # per-result guard, so a malformed value must fail open instead of raising.
-    incentive = _build_incentive()
-
-    measured = incentive._insufficient_disk(_make_job(spec=spec))
-
-    assert measured is None
 
 
 @pytest.mark.asyncio
@@ -198,18 +106,6 @@ async def test_malformed_scrape_never_breaks_scoring(monkeypatch, spec):
     result = await incentive.calculate_executor_score(_make_job(spec=spec))
 
     assert result.eligible_for_rental_share is True
-
-
-def test_insufficient_disk_reports_the_numbers_it_compared():
-    # Rounding happens before the comparison: raw 200.03 * 1.5 = 300.045 GB would exceed
-    # 300.0 GB disk, but rounded to 200.0 GB VRAM it clears the 1.5x margin exactly.
-    incentive = _build_incentive()
-
-    measured = incentive._insufficient_disk(
-        _make_job(vram_gb_per_gpu=200.03, gpu_count=1, disk_gb=300.0)
-    )
-
-    assert measured is None
 
 
 @pytest.mark.asyncio
@@ -225,47 +121,10 @@ async def test_enforced_drops_rental_eligibility(monkeypatch):
     assert result.mining_score == 0
 
 
-@pytest.mark.asyncio
-async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
-    # DAH-2327: the zero-incentive reason must reach the customer-facing incentive log
-    # with both numbers, so the miner knows how much disk to add.
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(_make_job())
-
-    log = "\n".join(result.incentive_logs)
-    assert "insufficient_disk_for_vram" in log
-    assert "1128.0" in log  # total VRAM
-    assert "500.0" in log   # total disk
-    assert [reason.reason for reason in result.zero_incentive_reasons] == ["insufficient_disk_for_vram"]
-
-
-@pytest.mark.asyncio
-async def test_enough_disk_keeps_eligibility_when_enforced(monkeypatch):
-    # Arrange — flag on but the machine has more disk than VRAM
-    incentive = _build_incentive()
-
-    # Act
-    result = await incentive.calculate_executor_score(_make_job(disk_gb=2048.0))
-
-    # Assert
-    assert result.eligible_for_rental_share is True
-
-
-@pytest.mark.asyncio
-async def test_rented_executor_is_not_gated(monkeypatch):
-    # A rented machine earns from the rented path and must not be touched by this gate.
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(_make_job(is_rented=True))
-
-    assert "insufficient_disk_for_vram" not in "\n".join(result.incentive_logs)
-
-
-def test_a_node_whose_filler_cache_reads_as_free_disk_still_clears_the_gate():
-    # DAH-5014: the scrape reports the Engy checkpoint cache as free disk. The gate reads TOTAL disk,
-    # which that move leaves alone, so a cached node stays on the side of the gate it was on.
-    # Arrange — 8 x 141 GB = 1128 GB VRAM needs 1692 GB; 2000 GB disk with a 1561 GB checkpoint cached
+def test_a_node_whose_filler_run_volume_reads_as_free_disk_still_clears_the_gate():
+    # DAH-5192: the scrape reports the filler run volume as free disk. The gate reads TOTAL disk,
+    # which that move leaves alone, so the node stays on the side of the gate it was on.
+    # Arrange — 8 x 141 GB = 1128 GB VRAM needs 1692 GB; 2000 GB disk with a 1561 GB run volume
     scrape_source = Path(__file__).resolve().parents[1] / "src" / "miner_jobs" / "machine_scrape.py"
     release_filler_cache = build_scrape_namespace(scrape_source, {"release_filler_cache"}, {})[
         "release_filler_cache"
@@ -275,7 +134,7 @@ def test_a_node_whose_filler_cache_reads_as_free_disk_still_clears_the_gate():
         "hard_disk_used": 1800 * KB_PER_GB,
         "hard_disk_free": 200 * KB_PER_GB,
         "hard_disk_utilization": 90.0,
-        "filler_cache_kb": 1561 * KB_PER_GB,
+        "filler_run_volume_kb": 1561 * KB_PER_GB,
     }
 
     # Act

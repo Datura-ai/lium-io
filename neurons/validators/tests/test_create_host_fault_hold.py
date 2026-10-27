@@ -38,7 +38,8 @@ async def test_a_host_fault_stands_as_a_failed_probe_and_drops_the_interval_stam
     await service.hold_node_until_probe_passes(EXECUTOR_UUID, "volume_creation", {})
 
     redis_service.set.assert_awaited_once_with(
-        f"rental_probe_failed:{EXECUTOR_UUID}", f"{STEP_CONTAINER_START}:volume_creation"
+        f"rental_probe_failed:{EXECUTOR_UUID}",
+        f"{STEP_CONTAINER_START}:volume_creation",
     )
     redis_service.delete.assert_awaited_once_with(f"rental_probe_ok:{EXECUTOR_UUID}")
 

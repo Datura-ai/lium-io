@@ -50,12 +50,12 @@ logger = get_logger(__name__)
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
 
-# DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
+# DAH-2546 — full 8x capability gate. An unrented 8x machine of these base models must
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
 # quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
-FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
-FLAGSHIP_CAPABILITY_GPU_COUNT = 8
+FULL_8X_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300", "GB300"})  # GB300 gated as the B300 is
+FULL_8X_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
 
@@ -93,8 +93,8 @@ class InsufficientDisk(BaseModel):
     rate: float  # required disk-to-VRAM margin the machine failed to clear
 
 
-class MissingFlagshipCapability(BaseModel):
-    """What the scrape reported about NCU profiling on a flagship machine that offers no open
+class MissingFull8xCapability(BaseModel):
+    """What the scrape reported about NCU profiling on a full 8x machine that offers no open
     profiling counters, real GPU splitting or attested CVM. Sole owner of these scrape keys."""
 
     ncu_profiling_access: str | None  # None = the scrape carries no observation at all
@@ -267,6 +267,8 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unbucketed_share = 0.0
         self.unbucketed_share_raw = 0.0
         self.unbucketed_paid_fraction = 1.0
+        # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
+        self._spot_pay_candidates: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -407,13 +409,13 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _missing_flagship_capability(
+    def _missing_full_8x_capability(
         self, result: JobResult, base_model: str
-    ) -> MissingFlagshipCapability | None:
-        # None also when the machine is out of the gate's scope: not an 8x flagship, or unscraped
-        if result.gpu_count != FLAGSHIP_CAPABILITY_GPU_COUNT:
+    ) -> MissingFull8xCapability | None:
+        # None also when the machine is out of the gate's scope: not a full 8x machine, or unscraped
+        if result.gpu_count != FULL_8X_CAPABILITY_GPU_COUNT:
             return None
-        if base_model not in FLAGSHIP_CAPABILITY_BASE_MODELS:
+        if base_model not in FULL_8X_CAPABILITY_BASE_MODELS:
             return None
         if result.spec is None:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
@@ -439,18 +441,18 @@ class RentalPriceIncentive(DefaultIncentive):
             or attested_cvm
         ):
             return None
-        return MissingFlagshipCapability(
+        return MissingFull8xCapability(
             ncu_profiling_access=ncu_profiling_access,
             ncu_profiling_scrape_error=result.spec.get("ncu_profiling_scrape_error"),
         )
 
-    def _log_flagship_capability_limit(
-        self, result: JobResult, missing: MissingFlagshipCapability
+    def _log_full_8x_capability_limit(
+        self, result: JobResult, missing: MissingFull8xCapability
     ) -> None:
-        # structured log for every rental-eligible 8x flagship executor lacking all capabilities
+        # structured log for every rental-eligible 8x executor lacking all capabilities
         logger.info(
             _m(
-                "Unrented flagship executor has no NCU profiling, GPU splitting "
+                "Unrented full 8x executor has no NCU profiling, GPU splitting "
                 "or confidential computing",
                 extra={
                     "executor_id": str(result.executor_info.uuid),
@@ -465,7 +467,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     # ordinary host; attestation_digest is None on every line emitted here
                     "tdx_quote_present": bool(result.executor_info.tdx_quote),
                     "enforced": True,
-                    "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+                    "reason": ZeroIncentiveReason.FULL_8X_WITHOUT_NCU_OR_SPLIT,
                     "pool": "rental_excluded",
                 },
             )
@@ -711,8 +713,10 @@ class RentalPriceIncentive(DefaultIncentive):
     @staticmethod
     def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
         """Free-GPU count when the result is a partially rented split node, else None."""
+        # score 0 = a gate zeroed the node (job_score stays 1 on rentals for health reporting): no idle pay for its rest
         if not (
             result.is_rented
+            and result.score > 0
             and result.supports_gpu_splitting
             and result.gpu_splitting_min_count
             and result.rented_gpu_count
@@ -906,6 +910,7 @@ class RentalPriceIncentive(DefaultIncentive):
         for key, weighted_sum in self._weighted_rate_sum_by_bucket.items():
             cap_mult = self.cap_multiplier_by_bucket.get(key, 0.0)
             self.total_rental_cost += cap_mult * weighted_sum
+        self._unbucketed_rental_cost += self._spot_pay_within_filler_earnings()
         self._unbucketed_rental_cost += self._secure_floor_top_up()
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
@@ -1208,7 +1213,39 @@ class RentalPriceIncentive(DefaultIncentive):
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
-        self._unbucketed_rental_cost += result.gpu_count * result.effective_rate
+        self._spot_pay_candidates.append((base_model, result))
+
+    def _spot_pay_within_filler_earnings(self) -> float:
+        """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
+        they are not each paid an expected rate. When their spot rates add up to more, every one is
+        scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
+        Returns the USD/hour they are paid in all."""
+        rate_sum_by_model: dict[str, float] = {}
+        pool_by_model: dict[str, float] = {}
+        for base_model, result in self._spot_pay_candidates:
+            rate_sum_by_model[base_model] = rate_sum_by_model.get(base_model, 0.0) + result.gpu_count * result.effective_rate
+            pool_by_model[base_model] = result.filler_revenue_usd_per_hour or 0.0
+        for base_model, rate_sum in rate_sum_by_model.items():
+            logger.info(
+                _m(
+                    "Spot pay shares the GPU model's filler earnings",
+                    extra={
+                        "base_model": base_model,
+                        "filler_revenue_usd_per_hour": pool_by_model[base_model],
+                        "spot_rate_sum_usd_per_hour": rate_sum,
+                        "spot_pool_multiplier": min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0,
+                        "spot_gpu_count": sum(r.gpu_count for m, r in self._spot_pay_candidates if m == base_model),
+                    },
+                )
+            )
+        total: float = 0.0
+        for base_model, result in self._spot_pay_candidates:
+            rate_sum: float = rate_sum_by_model[base_model]
+            multiplier: float = min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            result.spot_pool_multiplier = multiplier
+            result.effective_rate *= multiplier
+            total += result.gpu_count * result.effective_rate
+        return total
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:
@@ -1369,17 +1406,17 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.record_incentive_log(reason)
 
-        # DAH-2546 flagship capability gate
+        # DAH-2546 full 8x capability gate
         missing_capability = (
-            self._missing_flagship_capability(job_result, base_model)
+            self._missing_full_8x_capability(job_result, base_model)
             if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, enforced=True)
             else None
         )
         if missing_capability is not None:
             if eligible_for_rental_share:
-                self._log_flagship_capability_limit(job_result, missing_capability)
+                self._log_full_8x_capability_limit(job_result, missing_capability)
             eligible_for_rental_share = False
-            reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+            reason: MinerLogLine = MinerLogLine.no_payout_because_full_8x_without_ncu_or_split(
                 job_result, missing_capability
             )
             job_result.record_incentive_log(reason)

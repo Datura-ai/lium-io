@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from core.utils import _m, get_extra_info
-from services.const import LIB_NVIDIA_ML_DIGESTS
+from services.const import LIB_NVIDIA_ML_DIGESTS, LIB_NVIDIA_ML_DIGESTS_AARCH64
 
 from ..messages import NvmlDigestMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -23,8 +23,13 @@ class NvmlDigestCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        digest_map = ctx.config.nvml_digest_map or LIB_NVIDIA_ML_DIGESTS
         specs = ctx.state.specs
+        # The shared-config map and its backend resolver cover x86_64 installers only (DAH-5053).
+        is_aarch64 = specs.get("machine_arch") == "aarch64"
+        if is_aarch64:
+            digest_map = LIB_NVIDIA_ML_DIGESTS_AARCH64
+        else:
+            digest_map = ctx.config.nvml_digest_map or LIB_NVIDIA_ML_DIGESTS
         gpu_info = specs.get("gpu", {})
         driver_version = gpu_info.get("driver") or ""
         lib_digest = specs.get("md5_checksums", {}).get("libnvidia_ml", "") or ""
@@ -43,7 +48,7 @@ class NvmlDigestCheck:
                 # confirmed as spoofs so we don't re-report a known-invalid driver.
                 invalid_drivers = ctx.config.nvml_invalid_drivers or []
                 is_confirmed_spoof = driver_version in invalid_drivers
-                if not is_confirmed_spoof:
+                if not is_confirmed_spoof and not is_aarch64:
                     await ctx.services.backend.report_unknown_driver(driver_version)
                 event = render_message(
                     Msg.DRIVER_UNKNOWN,
