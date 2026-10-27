@@ -21,6 +21,7 @@ READ_TIMEOUT_SECONDS = 30
 CONNTRACK_TABLE = "/proc/1/net/nf_conntrack"
 TOP_PORTS = 5
 _MAX_LINES = 500
+_MAX_KEYS = 20000  # bounds the awk state however large the host table is
 _INSPECT_FORMAT = "{{.Name}}{{range .NetworkSettings.Networks}} {{.IPAddress}}{{end}}"
 # shortcut: IPv4 only (conntrack prints IPv6 unabbreviated); add IPv6 when pods get IPv6 bridges
 # Per source address: S <src> <flows> <unreplied flows> <destinations> <unreplied destinations>,
@@ -32,9 +33,12 @@ _AWK = (
     'else if(d==""&&substr(f,1,4)=="dst=")d=substr(f,5);'
     'else if(p==""&&substr(f,1,6)=="dport=")p=substr(f,7);'
     'else if(f=="[UNREPLIED]")u=1}'
-    "if(!(s in w))next;t[s]++;if(!((s,d) in sd)){sd[s,d]=1;nd[s]++}"
-    'if(u){ur[s]++;if(!((s,d) in ud)){ud[s,d]=1;nud[s]++};if(p!="")up[s,p]++}}'
-    'END{for(s in t)print "S",s,t[s],ur[s]+0,nd[s]+0,nud[s]+0;'
+    "if(!(s in w))next;t[s]++;"
+    # k counts stored keys; past the cap m nothing new is stored and x marks the summary truncated
+    "if(!((s,d) in sd)){if(k<m){k++;sd[s,d]=1;nd[s]++}else x=1}"
+    "if(u){ur[s]++;if(!((s,d) in ud)){if(k<m){k++;ud[s,d]=1;nud[s]++}else x=1}"
+    'if(p!=""){if((s,p) in up)up[s,p]++;else if(k<m){k++;up[s,p]=1}else x=1}}}'
+    'END{if(x)print "T";for(s in t)print "S",s,t[s],ur[s]+0,nd[s]+0,nud[s]+0;'
     'for(k in up)if(up[k]>=10){split(k,b,SUBSEP);print "P",b[1],b[2],up[k]}}'
 )
 
@@ -43,7 +47,7 @@ def read_command(addresses: list[str], table: str = CONNTRACK_TABLE) -> str:
     """One host read of the host's connection tracking table, summarised per rented container address."""
     return (
         f"[ -r {table} ] || exit 3; "
-        f"awk -v ips={shlex.quote(' '.join(addresses))} {shlex.quote(_AWK)} {table} | head -n {_MAX_LINES}"
+        f"awk -v m={_MAX_KEYS} -v ips={shlex.quote(' '.join(addresses))} {shlex.quote(_AWK)} {table} | head -n {_MAX_LINES}"
     )
 
 
@@ -116,6 +120,8 @@ class RentedPodNetworkCheck:
 
         pods = parse_summary(result.stdout or "", names_by_address)
         what = {"executor_uuid": ctx.executor.uuid, "pods": pods}
+        if (result.stdout or "").startswith("T\n"):
+            what["truncated"] = True
         limit = settings.RENTED_POD_OUTBOUND_FANOUT_DESTINATIONS
         template = (
             Msg.FANOUT if any(p["unreplied_destinations"] >= limit for p in pods) else Msg.SUMMARY

@@ -56,6 +56,30 @@ def test_read_command_summarises_a_real_table(tmp_path):
     assert b["flows"] == 0 and b["container"] == "pod_b"
 
 
+def test_read_command_bounds_its_state_and_marks_truncation(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "neurons.validators.src.services.task.checks.rented_pod_network._MAX_KEYS", 5
+    )
+    table = tmp_path / "nf_conntrack"
+    table.write_text(TABLE)
+    out = subprocess.run(
+        ["sh", "-c", read_command(["172.17.0.2"], table=str(table))],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert out.startswith("T\n")
+    (pod,) = parse_summary(out, {"172.17.0.2": "pod_a"})
+    assert pod["flows"] == 16
+    assert pod["destinations"] + pod["unreplied_destinations"] <= 5
+
+
+@pytest.mark.asyncio
+async def test_truncated_summary_is_flagged(context_factory):
+    result = await _run(_ctx(context_factory, _ssh("T\nS 172.17.0.2 9 3 5 3\n")))
+    assert result.event.what_we_saw["truncated"] is True
+
+
 def test_read_command_without_table_exits_3(tmp_path):
     res = subprocess.run(["sh", "-c", read_command(["172.17.0.2"], table=str(tmp_path / "x"))])
     assert res.returncode == 3
