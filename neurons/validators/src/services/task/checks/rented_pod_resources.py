@@ -91,8 +91,7 @@ class RentedPodResourcesCheck:
     cores (cpuset or quota), by `docker update` or by writing the cgroup directly.
 
     The validator never sets a cpuset and records the --cpus it deployed in an immutable label
-    (RENTAL_CPU_COUNT_LABEL). Non-fatal: shadow always passes, and only
-    RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED lets a cpuset/quota finding fail and zero the score.
+    (RENTAL_CPU_COUNT_LABEL). Non-fatal: a cpuset/quota finding fails the check and zeroes the score.
     Never fails on an inability to measure.
     """
 
@@ -135,17 +134,8 @@ class RentedPodResourcesCheck:
         ]
         what = {"executor_uuid": ctx.executor.uuid, "pods": [asdict(o) for o in outcomes]}
         if any(f in SCORED_FINDINGS for o in outcomes for f in o.findings):
-            enforce = settings.RENTED_POD_RESOURCES_ENFORCEMENT_ENABLED
-            event = render_message(
-                Msg.RESOURCES_REDUCED,
-                ctx=ctx,
-                check_id=self.check_id,
-                severity=None if enforce else "warning",
-                impact=None if enforce else "Shadow observation only: score was NOT changed",
-                what=what,
-            )
-            updates = {"rented_pod_resources_passed": False} if enforce else {}
-            return CheckResult(passed=not enforce, event=event, updates=updates)
+            event = render_message(Msg.RESOURCES_REDUCED, ctx=ctx, check_id=self.check_id, what=what)
+            return CheckResult(passed=False, event=event, updates={"rented_pod_resources_passed": False})
 
         event = render_message(Msg.RESOURCES_OK, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)

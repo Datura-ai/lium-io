@@ -1,5 +1,5 @@
 from fastapi import HTTPException
-import bittensor
+from bittensor_wallet import Keypair
 import json
 import time
 from core.config import VALIDATOR_HOTKEYS_SS58, settings
@@ -17,7 +17,7 @@ def match_validator_hotkey(message: str | bytes, signature: str) -> str | None:
     as they did before; the caller decides the status code.
     """
     for key_id, ss58 in VALIDATOR_HOTKEYS_SS58.items():
-        if bittensor.Keypair(ss58_address=ss58).verify(message, signature):
+        if Keypair(ss58_address=ss58).verify(message, signature):
             # the id only: which key is in use is operational information, the key itself is not
             logger.debug("validator signature verified with the %s hotkey", key_id)
             return key_id

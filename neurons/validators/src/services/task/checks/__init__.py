@@ -25,6 +25,7 @@ from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
+from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
 from .pinned_memory_probe import PinnedMemoryProbeCheck
 from .port_connectivity import PortConnectivityCheck
@@ -36,7 +37,9 @@ from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_pod_resources import RentedPodResourcesCheck
+from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
+from .provider_maintenance import ProviderMaintenanceCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
@@ -45,6 +48,7 @@ from .sshd_bootstrap import SshdBootstrapCheck
 from .sshd_auth_log import SshdAuthLogCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
+from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
@@ -77,9 +81,11 @@ __all__ = [
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
     "RentedPodResourcesCheck",
+    "RentedThroughputCheck",
     "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
+    "NvlinkFaultCheck",
     "NvmlDigestCheck",
     "PinnedMemoryProbeCheck",
     "PortConnectivityCheck",
@@ -92,10 +98,12 @@ __all__ = [
     "RentalVerificationCheck",
     "RentedGpuDropCheck",
     "TdxHostCheck",
+    "ProviderMaintenanceCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
+    "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
     "StorageLimitCheck",

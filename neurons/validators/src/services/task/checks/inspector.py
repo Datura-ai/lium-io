@@ -238,8 +238,8 @@ class InspectorRentedCheck:
         """A provider-origin verdict becomes the MALICIOUS event and the inspector event that
         carries its evidence. It is a record only: the check passes, nothing reaches the score
         and no renter or backend is asked to act — except the sensor's rental-interference verdict
-        of a host write into a rented pod under INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED
-        (DAH-4548), which fails the check and the score. A read is logged only."""
+        of a host write into a rented pod (DAH-4548), which fails the check and the score. A read is
+        logged only."""
         interference = host_write_findings(
             report, verdict.provider_findings, [p.pod_id for p in rented_pods]
         )
@@ -255,7 +255,7 @@ class InspectorRentedCheck:
             )
         else:
             writes, reads = interference
-        enforced = bool(writes) and settings.INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED
+        enforced = bool(writes)
         if writes or reads:
             logger.warning(
                 _m(
@@ -293,6 +293,11 @@ class InspectorRentedCheck:
             ctx=ctx,
             check_id=self.check_id,
             impact=impact,
+            remediation=(
+                "Stop host-side writes (docker update/exec/cp) into rented pods; the score stays zero while they continue."
+                if enforced
+                else None
+            ),
             what=what,
             extra=extra,
         )

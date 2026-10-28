@@ -99,6 +99,7 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
     "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": [98304],  # 96 GB
     "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],         # 84 GB; China SKU, 448-bit bus
     "NVIDIA RTX 6000D":                                   [86016],         # 84 GB; China SKU, 448-bit bus
     "NVIDIA RTX 4500 Ada Generation":                     [24576],         # 24 GB; observed: 23034

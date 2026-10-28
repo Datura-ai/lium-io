@@ -74,10 +74,16 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
-            if self._state.stage == "PREPARING" and self._restore_has_started():
+            if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
+            elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
+                # restic is running and scanning the snapshot; no file restored yet.
+                self._state.stage = "SCANNING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = None
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
@@ -249,11 +255,37 @@ class StorageEventReporter:
                 )
                 retry_delay_seconds = min(retry_delay_seconds * 2, RETRY_BACKOFF_CAP_SECONDS)
 
-    def _url(self) -> str:
+    def renew_credentials(self) -> dict[str, str] | None:
+        """DAH-4945: fresh scoped credentials for this backup's repository, or None if refused"""
+        if self._spec.resource is not ReporterResource.BACKUP:
+            return None
+        for attempt in range(3):
+            try:
+                response = self._session.post(
+                    self._url("credentials"),
+                    headers={"Authorization": f"Bearer {self._spec.auth_token}"},
+                    timeout=30,
+                )
+                if getattr(response, "status_code", None) in (401, 404, 409, 410):
+                    return None
+                response.raise_for_status()
+                body = response.json()
+                keys = ("access_key_id", "secret_access_key", "session_token")
+                if isinstance(body, Mapping) and all(
+                    _optional_string(body.get(key)) for key in keys
+                ):
+                    return {key: body[key] for key in keys}
+                return None
+            except (requests.RequestException, ValueError):
+                if attempt < 2:
+                    self._sleeper(5.0 * (attempt + 1))
+        return None
+
+    def _url(self, endpoint: str = "progress") -> str:
         resource_path = (
             "backup-logs" if self._spec.resource is ReporterResource.BACKUP else "restore-logs"
         )
-        return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/progress"
+        return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/{endpoint}"
 
 
 def _first_integer(value: Mapping[str, object], *keys: str) -> int | None:

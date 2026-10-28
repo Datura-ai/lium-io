@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
@@ -44,6 +45,17 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         return specs
 
     return {**specs, "gpu": {**gpu, "details": canonical_details}}
+
+
+def pods_rented_gpu_count(rented_data: RentedExecutorsResponse | None, executor_uuid: str) -> int | None:
+    """GPUs the node's rented pods hold, or None when a pod does not report its count."""
+    rented_executor = rented_data.executors.get(executor_uuid) if rented_data else None
+    if not rented_executor or not rented_executor.pods:
+        return None
+    pod_gpu_counts: list[int | None] = [pod.gpu_count for pod in rented_executor.pods]
+    if any(count is None or count <= 0 for count in pod_gpu_counts):
+        return None
+    return sum(pod_gpu_counts)
 
 
 class ResultHandler:
@@ -143,6 +155,10 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
         )
+        is_in_maintenance = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.maintenance_executor_ids
+        )
         is_provider_email_held = bool(
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.provider_email_held_executor_ids
@@ -160,6 +176,13 @@ class ResultHandler:
         filler_revenue_per_gpu_hour = (
             rented_data.get_filler_revenue_per_gpu_hour(
                 BASE_GPU_MAP.get(gpu_model or ""), gpu_count, settings.FILLER_REVENUE_MIN_GPU_HOURS
+            )
+            if rented_data
+            else None
+        )
+        filler_revenue_usd_per_hour = (
+            rented_data.get_filler_revenue_usd_per_hour(
+                BASE_GPU_MAP.get(gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
             )
             if rented_data
             else None
@@ -241,6 +264,7 @@ class ResultHandler:
             is_spot=is_spot,
             is_on_spot_pay_list=is_on_spot_pay_list,
             is_new_rentals_paused=is_new_rentals_paused,
+            is_in_maintenance=is_in_maintenance,
             is_provider_banned=context.is_provider_banned,
             provider_discord_connected=provider_discord_connected,
             is_provider_email_held=is_provider_email_held,
@@ -248,6 +272,7 @@ class ResultHandler:
             default_job_owner=default_job_owner,
             has_lium_filler=has_lium_filler,
             filler_revenue_per_gpu_hour=filler_revenue_per_gpu_hour,
+            filler_revenue_usd_per_hour=filler_revenue_usd_per_hour,
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
@@ -263,7 +288,7 @@ class ResultHandler:
         specs: dict[str, Any],
         validation_event: ValidationEvent | None,
     ) -> dict[str, Any]:
-        """``specs`` with the VerifyX EMA held when this cycle must not move it and the flag is on."""
+        """``specs`` with the VerifyX EMA held when this cycle must not move it."""
         # The pipeline names the fatal check that ended the run in the last event's summary.
         failed_check_id = (
             validation_event.what_we_saw.get("steps_failed") if validation_event else None
@@ -272,13 +297,10 @@ class ResultHandler:
         if not ema_hold_reason:
             return specs
         held_specs = hold_verifyx_ema(context, specs)
-        hold_enabled = settings.VERIFYX_EMA_HOLD_ENABLED
         if held_specs.get("network") != specs.get("network"):
             logger.info(
                 _m(
-                    "VerifyX EMA held: this cycle's sample does not move it"
-                    if hold_enabled
-                    else "VerifyX EMA hold is off: this cycle's sample would not have moved it",
+                    "VerifyX EMA held: this cycle's sample does not move it",
                     extra=get_extra_info(
                         {
                             "executor_id": context.executor.uuid,
@@ -289,7 +311,7 @@ class ResultHandler:
                     ),
                 )
             )
-        return held_specs if hold_enabled else specs
+        return held_specs
 
     @staticmethod
     def _get_rented_gpu_count(context: Context) -> int | None:
@@ -298,16 +320,9 @@ class ResultHandler:
         None (not rented, no pod data, or a backend that doesn't report per-pod gpu_count yet)
         keeps today's whole-box rented scoring.
         """
-        rented_data = context.state.rented_data
-        if not rented_data or not context.rented:
+        if not context.rented:
             return None
-        rented_executor = rented_data.executors.get(context.executor.uuid)
-        if not rented_executor or not rented_executor.pods:
-            return None
-        pod_gpu_counts: list[int | None] = [pod.gpu_count for pod in rented_executor.pods]
-        if any(count is None or count <= 0 for count in pod_gpu_counts):
-            return None
-        return sum(pod_gpu_counts)
+        return pods_rented_gpu_count(context.state.rented_data, context.executor.uuid)
 
     @staticmethod
     def _get_rental_created_at(context: Context) -> datetime | None:
@@ -381,6 +396,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     anchor_broken=context.gpu_anchor_broken,
+                    reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                 )
             else:
                 await self.redis_service.set_verified_job_info(

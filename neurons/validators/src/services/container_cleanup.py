@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import shlex
@@ -10,7 +11,6 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_b
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
-    DPHN_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
     EDIT_PARKED_SUFFIX,
     FILLER_CACHE_VOLUME_PREFIXES,
@@ -55,6 +55,57 @@ DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 # near a minute means a wedged docker daemon rather than work in progress.
 DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 
+# The sweep helper mounts every cache volume. `--rm` only fires once the container has run, so a
+# `docker run` whose client is killed (timeout, dropped SSH) between create and start leaves it in
+# Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
+REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
+
+# The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
+# `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
+FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
+REMOVE_IDLE_FILLER_IMAGES = (
+    "/usr/bin/docker image ls "
+    + " ".join(f"--filter reference={repository}" for repository in FILLER_IMAGE_REPOSITORIES)
+    + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+)
+
+
+async def evict_cache_volumes_oldest_first(
+    ssh_client: asyncssh.SSHClientConnection,
+    volume_names: list[str],
+    run_removal: Callable[[str], Awaitable[object]],
+    has_room: Callable[[], Awaitable[bool]],
+) -> None:
+    """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
+
+    DAH-5014: an Engy checkpoint is up to ~1.6 TB and buys a fast restart, so a rental or the listing
+    floor takes only what it needs. The caller has already found there is not enough room, so the
+    idle filler images go first without a re-check. An order docker cannot report falls back to name order.
+    """
+    created_at: dict[str, str] = {}
+    try:
+        inspected = await ssh_client.run(
+            "/usr/bin/docker volume inspect --format '{{.Name}} {{.CreatedAt}}' "
+            + " ".join(shlex.quote(name) for name in volume_names)
+        )
+        for line in (inspected.stdout or "").splitlines():
+            name, _, created = line.strip().partition(" ")
+            created_at[name] = created
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    # the image first: a pull brings it back far faster than a checkpoint download
+    await run_removal(REMOVE_IDLE_FILLER_IMAGES)
+    if await has_room():
+        return
+    ordered: list[str] = sorted(volume_names, key=lambda name: (created_at.get(name, "~"), name))
+    for index, name in enumerate(ordered):
+        await run_removal(f"{REMOVE_CACHE_SWEEP_CONTAINER}; {DockerCommand.volume_remove(name)}")
+        if index + 1 < len(ordered) and await has_room():
+            return
+
+
 RENTED_LIST_UNAVAILABLE = "rented_list_unavailable"
 RENTED_LIST_EMPTY = "rented_list_empty"
 
@@ -96,6 +147,27 @@ def rented_list_unknown_reason(rented_data: Optional[RentedExecutorsResponse]) -
     if not listed_container_names(rented_data):
         return RENTED_LIST_EMPTY
     return None
+
+
+# The machine scrape's two capability checks (machine_scrape.run_capability_check): named since
+# DAH-5192; before that unnamed, so recognised by the exact check, the executor image running
+# `nvidia-smi`. Only never-started (Created) ones are removed: a running one is a check in progress.
+CAPABILITY_CHECK_NAME_PREFIX = "lium_capability_check_"
+CAPABILITY_CHECK_IMAGE = "daturaai/compute-subnet-executor:latest"
+LIST_CREATED_CONTAINERS = (
+    "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}} {{.Image}} {{.Command}}'"
+)
+
+
+def never_started_check_containers(listing: str) -> list[str]:
+    ids: list[str] = []
+    for fields in (line.split(None, 3) for line in listing.splitlines()):
+        if len(fields) == 4 and (
+            fields[1].startswith(CAPABILITY_CHECK_NAME_PREFIX)
+            or (fields[2] == CAPABILITY_CHECK_IMAGE and fields[3].strip().strip('"') == "nvidia-smi")
+        ):
+            ids.append(fields[0])
+    return ids
 
 
 class ContainerCleanup:
@@ -217,8 +289,26 @@ class ContainerCleanup:
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
+        await self.remove_never_started_check_containers(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
+        # best-effort like the volume prune above: never raises
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            listed = await ssh_client.run(LIST_CREATED_CONTAINERS)
+            if getattr(listed, "exit_status", 0) != 0:
+                return 0
+            ids: list[str] = never_started_check_containers(listed.stdout or "")
+            if not ids or self.dry_run:
+                return 0
+            await ssh_client.run(f"/usr/bin/docker rm -f {' '.join(ids)} >/dev/null 2>&1 || true")
+            logger.info(_m(f"Removed {len(ids)} never-started capability check container(s)", extra=extra))
+            return len(ids)
+        except Exception as e:
+            logger.warning(_m("Never-started check container removal failed", extra=extra | {"error": str(e)}))
+            return 0
 
     async def prune_dangling_anonymous_volumes(
         self,
@@ -281,6 +371,8 @@ class ContainerCleanup:
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
         remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
+        Nor a live customer pod (Fish 26 Oct): the cache is kept across rentals and listed as used, so
+        a renter who took the listed free disk leaves the node under the floor by design.
         Returns how many volumes were removed.
         """
         extra = {"executor_uuid": executor_uuid}
@@ -289,13 +381,14 @@ class ContainerCleanup:
             # nodes, miner-assigned nodes, nodes that never ran Dolphin — and this check runs on every
             # node every cycle. Measuring the disk before knowing there is anything to reclaim made all
             # of them start a throwaway container just to learn there was nothing to do.
-            cache_volumes = await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,))
+            # DAH-5014: the Engy checkpoint cache is reclaimed here too, oldest first.
+            cache_volumes = await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES)
             if not cache_volumes:
                 return 0
 
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
-            if await self._has_running_filler_container(ssh_client):
+            if await self._has_running_filler_or_pod(ssh_client):
                 return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
@@ -311,12 +404,16 @@ class ContainerCleanup:
                 )
                 return 0
 
-            await ssh_client.run(DockerCommand.volume_remove(*cache_volumes))
+            async def above_floor() -> bool:
+                free_now: float | None = await self._get_free_disk_gb(ssh_client)
+                return free_now is not None and free_now >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB
+
+            await evict_cache_volumes_oldest_first(ssh_client, cache_volumes, ssh_client.run, above_floor)
             # `volume_remove` ends in `|| true`, so its exit status cannot tell a removal from a
             # refusal — and dockerd refuses any volume a container still references, in ANY state.
             # Re-list instead: reporting a rescue that did not happen leaves the node delisted while
             # the check event says it was saved.
-            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,)))
+            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES))
             reclaimed: list[str] = [name for name in cache_volumes if name not in surviving]
             if not reclaimed:
                 logger.warning(
@@ -328,7 +425,7 @@ class ContainerCleanup:
                 return 0
             logger.info(
                 _m(
-                    f"Reclaimed {len(reclaimed)} DPHN cache volume(s) to get the node back over "
+                    f"Reclaimed {len(reclaimed)} filler cache volume(s) to get the node back over "
                     "the rental listing floor",
                     extra=extra | {"volumes": reclaimed, "kept_volumes": sorted(surviving), "free_gb": free_gb},
                 )
@@ -338,10 +435,11 @@ class ContainerCleanup:
             logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
             return 0
 
-    async def _has_running_filler_container(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
-        # A cache a live filler still mounts is in use; docker refuses to remove it anyway.
+    async def _has_running_filler_or_pod(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
+        # A cache a live filler still mounts is in use; a live rental keeps it (two name filters OR).
         result = await ssh_client.run(
-            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
+            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --filter "name={POD_CONTAINER_PREFIX}" '
+            '--format "{{.Names}}"'
         )
         if getattr(result, "exit_status", 0) != 0:
             return True  # cannot prove the node is idle -> do not reclaim
@@ -444,20 +542,22 @@ class ContainerCleanup:
             f"-v {shlex.quote(name)}:/cache{index}" for index, name in enumerate(volume_names)
         )
         search_roots: str = " ".join(f"/cache{index}" for index in range(len(volume_names)))
-        # The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
+        # The `rm -f` after: a run killed before its container started leaves it Created, pinning the
+        # volumes (see REMOVE_CACHE_SWEEP_CONTAINER). The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
         # container would hold the name for good — the sweep would then fail silently on that node
         # forever. Worst case it interrupts a sweep another validator started, which simply runs again.
         # `timeout` bounds a wedged dockerd the same way machine_scrape does for `docker stats`: this
         # call sits in the per-executor pipeline ahead of the fatal port checks, so a hang here would
         # cost the node its whole cycle. A killed sweep simply removes nothing and runs again later.
         result = await ssh_client.run(
-            f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1; "
+            f"{REMOVE_CACHE_SWEEP_CONTAINER}; "
             f"timeout {DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS} "
             f"/usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} {mount_flags} {ALPINE_HELPER_IMAGE} "
             f"find {search_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
             "-type d \\( -name xet -o -name runtimes \\) -prune -o "
             f"-name '*.incomplete' -type f -mmin +{DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES} "
-            "-print -exec rm -f {} + 2>/dev/null || true"
+            "-print -exec rm -f {} + 2>/dev/null; "
+            f"{REMOVE_CACHE_SWEEP_CONTAINER} || true"
         )
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 

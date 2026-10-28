@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncssh
 
-from core.config import settings
-
 from ..messages import CpuTruthMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -13,7 +11,7 @@ from ..pipeline import CheckResult, Context
 # population, so an honest host — even one with cores offlined — matches exactly; this slack only
 # absorbs a benign hotplug/measurement race. Observed spoofs advertise 4-8x their real cores (176
 # vs 44), far outside any slack, so the margin never masks a real lie. The predicate is provisional:
-# the emitted RAW counts let ops recalibrate from a week of fleet data before flipping enforcement.
+# the emitted RAW counts let ops recalibrate from fleet data.
 CPU_TRUTH_MARGIN_CORES = 4
 # Reading one sysfs file is instant on a live host; without a bound a wedged host would hold the
 # check open for the executor's whole validation budget. A timeout lands in the *_unknown path
@@ -28,9 +26,8 @@ class CpuTruthCheck:
     over ``ctx.ssh``, the kernel-present CPU population (`/sys/devices/system/cpu/present`, the same
     population lscpu counts) — one SSH read, the like-with-like comparison.
 
-    Non-fatal and observe-only: shadow always passes, and only CPU_TRUTH_ENFORCEMENT_ENABLED lets a
-    genuine mismatch fail and zero the score. Never fails on an inability to measure (SSH error, unreadable population,
-    missing advertised count) — those return passed=True with a distinct *_unknown reason.
+    Non-fatal: a genuine mismatch fails and zeroes the score. Never fails on an inability to measure
+    (SSH error, unreadable population, missing advertised count) — those return passed=True with a distinct *_unknown reason.
     """
 
     check_id = "host.validate.cpu_truth"
@@ -60,14 +57,11 @@ class CpuTruthCheck:
             "present": present,
             "margin_cores": CPU_TRUTH_MARGIN_CORES,
         }
-        enforce = settings.CPU_TRUTH_ENFORCEMENT_ENABLED
         if advertised - present > CPU_TRUTH_MARGIN_CORES:
             event = render_message(
                 Msg.CPU_MISMATCH,
                 ctx=ctx,
                 check_id=self.check_id,
-                severity=None if enforce else "warning",
-                impact=None if enforce else "Shadow observation only: score was NOT changed",
                 what=what,
             )
             # The check is non-fatal, so passed=False alone changes nothing in the pipeline, and
@@ -75,8 +69,7 @@ class CpuTruthCheck:
             # travels as a context flag that calculate_scores gates on, like the TDX one.
             # DAH-2742: the verification is deliberately kept — a host that really overstates its
             # cores fails every cycle and the stale-executor sweep deactivates it anyway.
-            updates = {"cpu_truth_passed": False} if enforce else {}
-            return CheckResult(passed=not enforce, event=event, updates=updates)
+            return CheckResult(passed=False, event=event, updates={"cpu_truth_passed": False})
 
         event = render_message(Msg.CPU_OK, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
