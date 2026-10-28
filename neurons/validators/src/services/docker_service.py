@@ -9080,15 +9080,30 @@ class DockerService:
                 # reset a pod GPU that hung. Best-effort: the reboot goes on as before whatever happens.
                 if edit_swap.parked_name and payload.gpu_uuids and not executor_info.tdx_quote:
                     try:
-                        hung = await reset_hung_pod_gpus(SSHCommandRunner(ssh_client, max_retries=0), list(payload.gpu_uuids))
-                        if hung.warning is not None:
-                            warnings.append(hung.warning)
+                        hung_gpu_result = await reset_hung_pod_gpus(SSHCommandRunner(ssh_client, max_retries=0), list(payload.gpu_uuids))
+                        if hung_gpu_result.warning is not None:
+                            warnings.append(hung_gpu_result.warning)
                             logger.warning(
                                 _m(
                                     "Hung pod GPU found on reboot",
-                                    extra=get_extra_info({**default_extra, "hung": hung.hung_uuids, "result": hung.warning.value, "detail": hung.detail}),
+                                    extra=get_extra_info({**default_extra, "hung": hung_gpu_result.hung_uuids, "result": hung_gpu_result.warning.value, "detail": hung_gpu_result.detail}),
                                 )
                             )
+                        if hung_gpu_result.warning == ContainerWarningCode.HungGpuReset:
+                            # as after a renter's Reset GPU: the reset cards drop out for a moment, and the
+                            # checks after the reboot must not blame the provider for it
+                            try:
+                                await self.redis_service.mark_gpu_reset_recent(
+                                    payload.miner_hotkey,
+                                    payload.executor_id,
+                                    payload.pod_id,
+                                    payload.gpu_uuids,
+                                    RECENT_RENTER_GPU_RESET_SECONDS,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                                )
                     except Exception as exc:
                         logger.warning(
                             _m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)}))

@@ -19,6 +19,7 @@ from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _s
 from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
 from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.prerun_host_probe import prerun_host_probe_command
 
@@ -394,11 +395,39 @@ async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc,
     _patch_happy(svc, monkeypatch, ssh)
     reset = AsyncMock(side_effect=outcome) if isinstance(outcome, Exception) else AsyncMock(return_value=outcome)
     monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", reset)
+    svc.redis_service.mark_gpu_reset_recent = AsyncMock()
 
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated) and result.warnings == warnings
     assert reset.await_args.args[1] == ["GPU-test"]
+    # a reset GPU drops out for a moment: the checks after the reboot must not blame the provider
+    if warnings:
+        svc.redis_service.mark_gpu_reset_recent.assert_awaited_once_with(
+            payload.miner_hotkey, payload.executor_id, payload.pod_id, ["GPU-test"], RECENT_RENTER_GPU_RESET_SECONDS
+        )
+    else:
+        svc.redis_service.mark_gpu_reset_recent.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "warning", [ContainerWarningCode.HungGpuReset, ContainerWarningCode.HungGpuNotResetMig]
+)
+@pytest.mark.asyncio
+async def test_a_failed_recent_reset_mark_does_not_fail_the_reboot(svc, monkeypatch, warning):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        "services.docker_service.reset_hung_pod_gpus", AsyncMock(return_value=HungGpuResult(["GPU-test"], warning))
+    )
+    svc.redis_service.mark_gpu_reset_recent = AsyncMock(side_effect=RuntimeError("redis down"))
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated) and result.warnings == [warning]
+    # only a GPU that was actually reset gets the mark
+    assert svc.redis_service.mark_gpu_reset_recent.await_count == (warning == ContainerWarningCode.HungGpuReset)
 
 
 @pytest.mark.parametrize("edit", [True, False])

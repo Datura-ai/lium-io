@@ -148,3 +148,41 @@ async def test_a_refused_reset_falls_back_to_the_context_cycle_on_the_pod_gpus(c
         f"CUDA_VISIBLE_DEVICES={U[1]}"
     ]
     assert result.warning == warning
+
+
+@pytest.mark.asyncio
+async def test_a_runner_error_changes_nothing():
+    # the SSH session failed (no exit status): nothing is known about the GPUs; the shell timeout (124) still means hung
+    host = HungHost(query="", query_exit=-1)
+    result = await _reset(host)
+    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert result.warning is None and result.hung_uuids == []
+
+
+class LostGpuHost(HungHost):
+    """U[0] fell off the bus: gone from the host listing and from `topo -m`."""
+
+    async def run(self, cmd: str, *, timeout: int = 60, retryable: bool = True, **_):
+        if cmd.startswith("nvidia-smi --query-gpu=index"):
+            self.commands.append(cmd)
+            return make_command_result(True, "\n".join(line for line in self.gpus.splitlines() if U[0] not in line))
+        return await super().run(cmd, timeout=timeout, retryable=retryable)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "pod", "warning"),
+    [
+        ({"topo": TOPO_PAIR02}, POD, W.HungGpuNotResetNvlinkShared),  # NVLink host: its peers are unknown
+        ({"nvswitch": True}, POD, W.HungGpuNotResetNvlinkShared),
+        ({}, POD, W.HungGpuReset),  # PCIe only: no peers to worry about
+        ({"topo": TOPO_PAIR02}, U, W.HungGpuReset),  # the pod owns every host GPU
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_gpu_missing_from_the_listing_is_refused_on_an_nvlink_host_unless_the_pod_owns_it_all(
+    kwargs, pod, warning
+):
+    host = LostGpuHost(query=_query({U[0]: None}), **kwargs)
+    result = await _reset(host, pod=pod)
+    assert result.warning == warning
+    assert bool(_resets(host)) == (warning == W.HungGpuReset)

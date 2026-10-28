@@ -10,6 +10,7 @@ cycle is the fallback.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,8 @@ from payload_models.payloads import ContainerWarningCode, GpuResetErrorCode
 from services.gpu_reset import (
     _RESET_TIMEOUT_SECONDS,
     HOST_GPUS_COMMAND,
+    NVSWITCH_COMMAND,
+    TOPOLOGY_COMMAND,
     GpuResetRefused,
     HostGpu,
     _own_cgroup,
@@ -45,6 +48,7 @@ HUNG_GPU_QUERY_COMMAND = (
     f"timeout {_NVIDIA_SMI_TIMEOUT_SECONDS} {GPU_QUERY_COMMAND}; echo {_APPS_MARKER}; "
     f"timeout {_NVIDIA_SMI_TIMEOUT_SECONDS} {COMPUTE_APPS_QUERY_COMMAND}"
 )
+_NVLINK_CELL = re.compile(r"\bNV\d+\b")
 _ERROR_MARKERS = ("Unknown Error", "GPU is lost", "ERR!")
 _NOT_RESET_WARNING = {
     GpuResetErrorCode.MigEnabled: ContainerWarningCode.HungGpuNotResetMig,
@@ -61,33 +65,35 @@ class HungGpuResult:
     detail: str | None = None
 
 
-def parse_hung_pod_gpus(output: str, pod_gpu_uuids: list[str]) -> list[str]:
-    """The pod GPUs missing from the query, read as an error, or latched (DAH-2427)."""
-    gpu_csv, _, apps_csv = output.partition(_APPS_MARKER)
+def parse_hung_pod_gpus(gpu_csv: str, latched: set[str], pod_gpu_uuids: list[str]) -> list[str]:
+    """The pod GPUs missing from the GPU query, read as an error, or latched (DAH-2427)."""
     healthy = {
         line.split(",")[0].strip()
         for line in gpu_csv.splitlines()
         if not any(marker in line for marker in _ERROR_MARKERS)
     }
-    latched = set(parse_wedged_gpu_uuids(gpu_csv, apps_csv))
     return [uuid for uuid in pod_gpu_uuids if uuid not in healthy or uuid in latched]
 
 
 async def reset_hung_pod_gpus(runner: SSHCommandRunner, pod_gpu_uuids: list[str]) -> HungGpuResult:
     """Call with the pod's container stopped. Changes nothing unless a pod GPU is hung."""
     query = await _run(runner, HUNG_GPU_QUERY_COMMAND, timeout=2 * _NVIDIA_SMI_TIMEOUT_SECONDS + 10)
-    hung = parse_hung_pod_gpus(query.stdout or "", pod_gpu_uuids)
-    if not hung:
+    if query.exit_code == -1 and not (query.stdout or "").strip():
+        # the SSH command itself failed: nothing is known about the GPUs (a hung nvidia-smi is the shell's 124)
         return HungGpuResult()
     gpu_csv, _, apps_csv = (query.stdout or "").partition(_APPS_MARKER)
-    if set(hung) <= set(parse_wedged_gpu_uuids(gpu_csv, apps_csv)):
+    latched = set(parse_wedged_gpu_uuids(gpu_csv, apps_csv))
+    hung = parse_hung_pod_gpus(gpu_csv, latched, pod_gpu_uuids)
+    if not hung:
+        return HungGpuResult()
+    if set(hung) <= latched:
         # latch only: the seconds-long context cycle first, not a reset (a healthy GPU stopped a moment
         # ago can still read busy); -r below only when the cycle does not clear it
         cures = await cure_wedged_gpus(runner, hung)
         if cures and all(cure.cured for cure in cures):
             return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"latch cleared on {hung}")
     try:
-        targets = await _checked_targets(runner, hung, pod_gpu_uuids)
+        targets = await _reset_targets_or_refuse(runner, hung, pod_gpu_uuids)
     except GpuResetRefused as refused:
         warning = _NOT_RESET_WARNING.get(refused.code, ContainerWarningCode.HungGpuNotResetUnsupported)
         return HungGpuResult(hung, warning, refused.detail)
@@ -107,14 +113,20 @@ async def reset_hung_pod_gpus(runner: SSHCommandRunner, pod_gpu_uuids: list[str]
     return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
 
 
-async def _checked_targets(runner: SSHCommandRunner, hung: list[str], pod_gpu_uuids: list[str]) -> list[str]:
+async def _reset_targets_or_refuse(runner: SSHCommandRunner, hung: list[str], pod_gpu_uuids: list[str]) -> list[str]:
     """The hung GPUs widened to their NVLink peers, after Reset GPU's refusal rules."""
     host_gpus = parse_host_gpus((await _run(runner, HOST_GPUS_COMMAND)).stdout or "")
     if not host_gpus:
         raise GpuResetRefused(GpuResetErrorCode.ResetNotSupported, "nvidia-smi listed no GPU on the host")
     listed = {gpu.uuid for gpu in host_gpus}
-    # a lost pod GPU can drop out of the listing: it is still the pod's, so "the pod owns every host GPU" holds
-    host_gpus += [HostGpu(-1, uuid, "", False) for uuid in pod_gpu_uuids if uuid not in listed]
+    unlisted = [uuid for uuid in pod_gpu_uuids if uuid not in listed]
+    if unlisted and not listed <= set(pod_gpu_uuids) and await _has_nvlink(runner):
+        # a GPU gone from the listing has no `topo -m` row: its NVLink peers cannot be checked
+        raise GpuResetRefused(
+            GpuResetErrorCode.NvlinkPeersOutsidePod, f"NVLink peers of {unlisted} unknown on a shared host"
+        )
+    # it is still the pod's, so "the pod owns every host GPU" holds
+    host_gpus += [HostGpu(-1, uuid, "", False) for uuid in unlisted]
     targets = await _widen_targets_to_nvlink_peers(runner, hung, pod_gpu_uuids, host_gpus)
     if any(gpu.mig_enabled for gpu in host_gpus if gpu.uuid in targets):
         raise GpuResetRefused(GpuResetErrorCode.MigEnabled, "MIG is enabled on a GPU to reset")
@@ -122,3 +134,11 @@ async def _checked_targets(runner: SSHCommandRunner, hung: list[str], pod_gpu_uu
     if outside:
         raise GpuResetRefused(GpuResetErrorCode.GpuInUseOutsidePod, f"processes use the GPUs: {outside}")
     return targets
+
+
+async def _has_nvlink(runner: SSHCommandRunner) -> bool:
+    """An NVSwitch fabric or any NVLink cell in `topo -m`; an unreadable topology counts as NVLink."""
+    if ((await _run(runner, NVSWITCH_COMMAND)).stdout or "").strip():
+        return True
+    topology = await _run(runner, TOPOLOGY_COMMAND)
+    return topology.exit_code != 0 or bool(_NVLINK_CELL.search(topology.stdout or ""))
