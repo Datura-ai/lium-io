@@ -4709,17 +4709,22 @@ async def _another_create_live(pod_id: str, live: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "conflict_name, live_creates, expected_events",
+    "conflict_name, live_creates, status, expected_events",
     [
         # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
-        ("pod_test", 1, ["run", "rm pod_test", "run"]),
+        ("pod_test", 1, "created", ["run", "rm pod_test", "run"]),
+        ("pod_test", 1, "exited", ["run", "rm pod_test", "run"]),
+        # the earlier attempt already started the pod: a running (or unreadable) container is never removed
+        ("pod_test", 1, "running", ["run"]),
+        ("pod_test", 1, "restarting", ["run"]),
+        ("pod_test", 1, RuntimeError("inspect failed"), ["run"]),
         # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
-        ("pod_test", 2, ["run"]),
-        ("pod_other", 1, ["run"]),
+        ("pod_test", 2, "created", ["run"]),
+        ("pod_other", 1, "created", ["run"]),
     ],
 )
 async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
-    docker_service, monkeypatch, conflict_name, live_creates, expected_events,
+    docker_service, monkeypatch, conflict_name, live_creates, status, expected_events,
 ):
     events: list[str] = []
 
@@ -4732,6 +4737,11 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
                     'is already in use by container "25b3b093".")'
                 )
             return "cid"
+
+        async def container_status(self, *, container_name):
+            if isinstance(status, Exception):
+                raise status
+            return status
 
         async def remove_container(self, *, container_name, force, remove_volumes):
             events.append(f"rm {container_name}")

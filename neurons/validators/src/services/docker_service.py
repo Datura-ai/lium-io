@@ -2767,6 +2767,17 @@ class DockerService:
                 except Exception:  # the lease expires on its own; a failed release only delays the cleanup
                     logger.warning(_m("SYSBOX_FLATTEN_LEASE_RELEASE_FAILED", extra=get_extra_info(default_extra)))
 
+    @staticmethod
+    async def _leftover_container_never_started(
+        docker_client: RentalDockerSdkClient, container_name: str
+    ) -> bool:
+        """True only when the same-name container is known to be stopped (created, exited or dead)."""
+        try:
+            status = await docker_client.container_status(container_name=container_name)
+        except Exception:
+            return False
+        return status in ("created", "exited", "dead")
+
     async def _run_rental_docker_create_attempts(
         self,
         *,
@@ -2834,11 +2845,14 @@ class DockerService:
                 # Only that exact name is removed, once, and only while no other create for this pod is
                 # registered: a live attempt (registered until its own failure cleanup ends) may still own
                 # that container, so then the conflict fails as before. Any other name conflict fails too.
+                # A container the earlier attempt already started (or one whose state cannot be read) is
+                # the renter's pod and is never removed: the conflict then fails as before.
                 if (
                     not own_leftover_removed
                     and pod_id is not None
                     and inflight_creates.is_only_create(pod_id)
                     and f'"/{container_name}" is already in use' in str(exc)
+                    and await self._leftover_container_never_started(docker_client, container_name)
                 ):
                     own_leftover_removed = True
                     attempt += 1
