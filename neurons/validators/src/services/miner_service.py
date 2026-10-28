@@ -467,6 +467,49 @@ class MinerService:
         for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
             del self.in_flight[executor_id]
 
+    async def publish_new_executors_at_pass(self, job: dict | None) -> None:
+        """A wave result that passed, for an executor no cycle has published yet, is published as
+        soon as its miner answers, spec-only like the express lane's (no scored_at): at the cycle's
+        end it waited for the slowest miner in the fleet, 9-14 min (a node verified at 17:51 was
+        listed at 18:03). The cycle still scores and publishes it as today. Never fails the wave."""
+        if not job:
+            return
+        try:
+            validated = await self.redis_service.get_validated_executors()
+            if not validated:
+                # cold set (fresh box or Redis wipe): every executor would look new; the cycle publishes
+                return
+            new = [
+                result
+                for result in job.get("results", [])
+                if result.is_successful
+                and not result.is_rented
+                and result.executor_info.uuid not in validated
+            ]
+            if not new:
+                return
+            await self.publish_machine_specs(
+                new, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+            )
+            logger.info(
+                _m(
+                    "[sync] New executors published at pass, ahead of the cycle",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": job["miner_hotkey"],
+                            "executor_uuids": [r.executor_info.uuid for r in new],
+                        }
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not publish new executors at pass; the cycle publishes them",
+                    extra=get_extra_info({"error": str(exc)}),
+                )
+            )
+
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
         return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
