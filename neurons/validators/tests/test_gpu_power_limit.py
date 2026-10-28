@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 import time
 from unittest.mock import AsyncMock
 
@@ -208,6 +209,19 @@ async def test_rental_start_gpu_missing_its_record_on_a_started_rental_records_s
     assert _ratio(redis, "GPU-1") == {"pod_id": "pod-1", "ratio": 1.0}
 
 
+@pytest.mark.parametrize(("pod_on_host", "ratio"), [(True, 1.0), (False, 0.8514)])
+@pytest.mark.asyncio
+async def test_rental_start_of_a_pod_already_on_the_host_records_stock(monkeypatch, pod_on_host, ratio) -> None:
+    # a rental from before the records, cut to 85 % and rebooted before its first check
+    monkeypatch.setattr(gpl, "_set_side_by_side", AsyncMock(return_value=0))
+    monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(return_value=_power(298)))
+    redis = SharedFakeRedis()
+    await gpl.raise_low_power_limits_to_default(
+        AsyncMock(), "ex-1", ["GPU-0"], redis=redis, pod_id="pod-1", pod_on_host=pod_on_host
+    )
+    assert _ratio(redis, "GPU-0") == {"pod_id": "pod-1", "ratio": ratio}
+
+
 @pytest.mark.parametrize(
     ("watts", "failing_gpus"),
     [
@@ -240,3 +254,19 @@ async def test_rental_start_record_read_outage_fails_the_create(monkeypatch) -> 
 async def test_raise_without_redis_never_records_or_raises(monkeypatch) -> None:
     monkeypatch.setattr(gpl, "_query_power_state", AsyncMock(side_effect=RuntimeError("nvidia-smi hung")))
     assert await gpl.raise_low_power_limits_to_default(AsyncMock(), "ex-1", None) == 0
+
+
+@pytest.mark.parametrize(("container_names", "expected"), [(("pod_pod-1",), True), (("pod_pod-2",), False), (None, False)])
+@pytest.mark.asyncio
+async def test_create_passes_pod_on_host_from_the_prerun_listing(monkeypatch, container_names, expected) -> None:
+    import services.docker_service as ds
+
+    raise_mock = AsyncMock(return_value=0)
+    monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", AsyncMock())
+    monkeypatch.setattr(ds, "raise_low_power_limits_to_default", raise_mock)
+    payload = SimpleNamespace(gpu_uuids=["GPU-0"], executor_id="ex-1", pod_id="pod-1")
+    probe = SimpleNamespace(container_names=container_names)
+    await ds.DockerService._restore_gpu_power_for_uncapped_pod(
+        SimpleNamespace(redis_service=object()), AsyncMock(), payload, probe, {}, record_rental_start=True
+    )
+    assert raise_mock.await_args.kwargs["pod_on_host"] is expected

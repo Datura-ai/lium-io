@@ -7758,6 +7758,9 @@ class DockerService:
             # the create's last power read is the limit the rental starts on (DAH-5302)
             redis=self.redis_service if record_rental_start else None,
             pod_id=payload.pod_id if record_rental_start else None,
+            # a reboot or edit re-creates a pod whose container is still listed (`ps -a`)
+            pod_on_host=host_probe is not None
+            and f"{POD_CONTAINER_PREFIX}{payload.pod_id}" in (host_probe.container_names or ()),
         )
 
     async def _run_create_steps_after_reply(

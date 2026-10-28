@@ -682,6 +682,7 @@ async def raise_low_power_limits_to_default(
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
     redis: RedisService | None = None,
     pod_id: str | None = None,
+    pod_on_host: bool = False,
 ) -> int:
     """State-free last-resort net for rental start: lift every GPU sitting below
     ``MIN_POWER_LIMIT_RATIO`` x its default limit back to the default.
@@ -700,9 +701,10 @@ async def raise_low_power_limits_to_default(
     The last call of a customer create passes ``redis`` and ``pod_id``: each of the pod's GPUs gets
     its limit / default as the rental starts (1.0 once raised) recorded under the pod, so
     GpuPowerLimitCheck holds a rented GPU at min(that, RENTED_MIN_POWER_LIMIT_RATIO) while the pod
-    is rented. Raises GpuPowerRestoreStateError when that record cannot be made for a GPU under
-    RENTED_MIN_POWER_LIMIT_RATIO, so the create fails and is retried instead of starting a rental
-    the check would later hold at 90 %.
+    is rented. ``pod_on_host`` (the pod's container was on the host before this create: a reboot or
+    edit) records 1.0 for a GPU with no record, so a rental from before the records keeps 90 %.
+    Raises GpuPowerRestoreStateError when a record cannot be made, so the create fails and is
+    retried instead of starting a rental without its baseline.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)
@@ -712,7 +714,9 @@ async def raise_low_power_limits_to_default(
         return 0
     raised = await _raise_below_floor(ssh, executor_id, gpu_uuids, state_by_uuid, log_extra, concurrency)
     if redis is not None and pod_id:
-        await _record_rental_start_ratios(redis, executor_id, pod_id, gpu_uuids, state_by_uuid, log_extra)
+        await _record_rental_start_ratios(
+            redis, executor_id, pod_id, gpu_uuids, state_by_uuid, log_extra, pod_on_host
+        )
     return raised
 
 
@@ -733,6 +737,7 @@ async def _record_rental_start_ratios(
     gpu_uuids: list[str] | None,
     state_by_uuid: dict[str, GpuPowerState],
     log_extra: dict[str, object] | None,
+    pod_on_host: bool = False,
 ) -> None:
     uuids = list(gpu_uuids or state_by_uuid)
     keys = [rental_start_ratio_key(executor_id, gpu_uuid) for gpu_uuid in uuids]
@@ -741,8 +746,8 @@ async def _record_rental_start_ratios(
     except Exception as exc:
         # without the old records a reboot could replace its rental's start with today's limit
         raise GpuPowerRestoreStateError("GPU power rental-start records could not be read") from exc
-    # a GPU of an already-started rental with no record of its own lost it; its start was stock
-    started = any(rental_record_pod_id(old) == pod_id for old in existing)
+    # a GPU of an already-started rental with no record of its own lost it, or predates the records
+    started = pod_on_host or any(rental_record_pod_id(old) == pod_id for old in existing)
     unrecorded: list[str] = []
     for gpu_uuid, key, old in zip(uuids, keys, existing):
         if rental_record_pod_id(old) == pod_id:
