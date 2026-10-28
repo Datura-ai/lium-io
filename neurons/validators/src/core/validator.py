@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
+from core.loop_sampler import start_loop_sampler
 from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
@@ -1583,6 +1584,8 @@ class Validator:
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
+                self.loop_sampler_stop = start_loop_sampler()
 
             while not self.should_exit:
                 await self.sync()
@@ -1615,6 +1618,8 @@ class Validator:
         )
 
         self.should_exit = True
+        if getattr(self, "loop_sampler_stop", None) is not None:
+            self.loop_sampler_stop.set()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):
