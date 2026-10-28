@@ -267,7 +267,7 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
 
 
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
-    """Check the validator issued this key for this executor's own miner hotkey.
+    """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
     Logs `ssh_key_miner_binding` with miner_binding = legacy (no miner-bound signature),
     bad_signature or mismatch, and refuses the upload only with REQUIRE_MINER_BOUND_SSH_KEY.
@@ -283,7 +283,7 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             signed = False
         if not signed:
             miner_binding = "bad_signature"
-        elif payload.miner_hotkey != own_hotkey:
+        elif payload.miner_hotkey not in settings.accepted_miner_hotkeys():
             miner_binding = "mismatch"
         else:
             return
@@ -530,7 +530,7 @@ async def _admit_verify_intent(request: Request) -> VerifyIntent:
 
     refused = check_intent_window(
         intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
-    ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
+    ) or check_intent_target(intent, settings.accepted_miner_hotkeys())
     if refused:
         logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")

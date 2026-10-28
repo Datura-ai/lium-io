@@ -122,6 +122,11 @@ class Settings(BaseSettings):
         env="DEFAULT_MINER_HOTKEY",
         default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
     )
+    # DAH-5296: a provider moved to Lium-held payouts is served under the Lium pool hotkey, so
+    # validators bind SSH keys and /verify intents to it. Empty = accept only the own hotkey.
+    LIUM_POOL_HOTKEY: str = Field(
+        env="LIUM_POOL_HOTKEY", default="5DksAY4DE3Xo9LCa4XvGM9T4Eq3Zi9jZjGXfNtuHfqMB24NM"
+    )
 
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
@@ -213,6 +218,12 @@ class Settings(BaseSettings):
     NODE_HEARTBEAT_ENABLED: bool = Field(env="NODE_HEARTBEAT_ENABLED", default=False)
     # No lower bound here: a bad value must never stop the executor. The service clamps it to 10 with a warning.
     NODE_HEARTBEAT_INTERVAL_SECONDS: int = Field(env="NODE_HEARTBEAT_INTERVAL_SECONDS", default=60)
+
+    def accepted_miner_hotkeys(self) -> set[str]:
+        """Miner hotkeys a validator may bind an SSH key or /verify intent to: this executor's own
+        and the pool hotkey. Never the shared portal hotkey, which every executor trusts."""
+        pool = {self.LIUM_POOL_HOTKEY} - {self.DEFAULT_MINER_HOTKEY}
+        return ({self.MINER_HOTKEY_SS58_ADDRESS} | pool) - {""}
 
 
 settings = Settings()

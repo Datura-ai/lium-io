@@ -104,11 +104,11 @@ def check_intent_window(body: VerifyIntentBody, now: float, window_s: int) -> st
     return None
 
 
-def check_intent_target(body: VerifyIntentBody, miner_hotkey: str) -> str | None:
-    """None when the intent names this executor's miner; otherwise why it is refused. The
-    configured miner only — never the shared portal hotkey, which every executor trusts and so
-    would bind the intent to nothing."""
-    if body.miner_hotkey != miner_hotkey:
+def check_intent_target(body: VerifyIntentBody, miner_hotkeys: set[str]) -> str | None:
+    """None when the intent names this executor's miner or the pool hotkey; otherwise why it is
+    refused. Never the shared portal hotkey (`settings.accepted_miner_hotkeys` drops it), which
+    every executor trusts and so would bind the intent to nothing."""
+    if body.miner_hotkey not in miner_hotkeys:
         return "intent is for another miner's executor"
     return None
 
