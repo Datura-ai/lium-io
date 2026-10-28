@@ -1,6 +1,5 @@
 """DAH-4548: the validator reads the Inspector sensor's rental-interference verdict. A host write
-into a rented pod fails the node under INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED; a read, a sensor
-without the verdict, a non-rented pod and the flag off never do."""
+into a rented pod fails the node; a read, a sensor without the verdict and a non-rented pod never do."""
 
 import logging
 
@@ -62,36 +61,22 @@ def _logs(caplog, name):
     return [r.msg.extra for r in caplog.records if r.getMessage() == name]
 
 
-@pytest.fixture
-def enforced(monkeypatch):
-    monkeypatch.setattr(inspector.settings, "INSPECTOR_HOST_WRITE_ENFORCEMENT_ENABLED", True)
-
-
 @pytest.mark.asyncio
-async def test_write_verdict_fails_the_node_when_enforced(context_factory, enforced, caplog):
+async def test_write_verdict_fails_the_node(context_factory, caplog):
     with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
         result = await _run(context_factory, [HOST_WRITE])
 
     assert result.passed is False
     assert result.updates["inspector_host_write_passed"] is False
     assert "node failed" in result.event.impact
-    assert [log["enforced"] for log in _logs(caplog, "INSPECTOR_HOST_WRITE")] == [True]
-
-
-@pytest.mark.asyncio
-async def test_write_verdict_with_the_flag_off_is_only_logged(context_factory, caplog):
-    with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
-        result = await _run(context_factory, [HOST_WRITE])
-
-    assert result.passed is True
-    assert "inspector_host_write_passed" not in result.updates
+    assert "score stays zero" in result.event.remediation
     logs = _logs(caplog, "INSPECTOR_HOST_WRITE")
-    assert len(logs) == 1 and logs[0]["enforced"] is False
+    assert [log["enforced"] for log in logs] == [True]
     assert "dmi-cloak-inner.sh" in logs[0]["commands"][0]
 
 
 @pytest.mark.asyncio
-async def test_read_verdict_is_logged_never_enforced(context_factory, enforced, caplog):
+async def test_read_verdict_is_logged_never_enforced(context_factory, caplog):
     with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
         result = await _run(context_factory, [HOST_READ])
 
@@ -105,7 +90,7 @@ async def test_read_verdict_is_logged_never_enforced(context_factory, enforced, 
 @pytest.mark.parametrize(
     "version", [{"interference_rules_version": None}, {"interference_rules_version": 0}]
 )
-async def test_sensor_without_the_verdict_does_not_fail(context_factory, enforced, caplog, version):
+async def test_sensor_without_the_verdict_does_not_fail(context_factory, caplog, version):
     with caplog.at_level(logging.INFO, logger=inspector.logger.name):
         result = await _run(context_factory, [HOST_WRITE], **version)
 
@@ -115,7 +100,7 @@ async def test_sensor_without_the_verdict_does_not_fail(context_factory, enforce
 
 
 @pytest.mark.asyncio
-async def test_write_into_a_pod_that_is_not_rented_is_ignored(context_factory, enforced, caplog):
+async def test_write_into_a_pod_that_is_not_rented_is_ignored(context_factory, caplog):
     with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
         result = await _run(context_factory, [OTHER_POD_WRITE])
 

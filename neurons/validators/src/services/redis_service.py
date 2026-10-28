@@ -26,6 +26,12 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+GPU_RESET_PENDING_KIND = "gpu_reset"
+# DAH-4658: the pod of a renter GPU reset that ended a moment ago, per node, for a short TTL
+GPU_RESET_RECENT_PREFIX = "gpu_reset_recent"
+# DAH-4658: a rented node's last scored result, carried into a cycle where the renter's own GPU reset hides the cards
+LAST_SCORED_RESULT_PREFIX = "last_scored_result"
+LAST_SCORED_RESULT_TTL_SECONDS = 60 * 60
 # DAH-4698: creates the backend sent that are running in this connector right now, by pod id; what is left when a
 # connector starts was cut off by the restart (a redeploy recreates the connector mid-create)
 INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
@@ -179,6 +185,17 @@ class RedisWrites:
 
     def __len__(self) -> int:
         return len(self.ops)
+
+
+class RecentGpuReset(BaseModel):
+    """DAH-4658: a renter GPU reset that ended a moment ago; a mark written before it named its GPUs has none."""
+
+    pod_id: str
+    gpu_uuids: list[str] = []
+
+
+def last_scored_result_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{LAST_SCORED_RESULT_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
 def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
@@ -413,6 +430,11 @@ class RedisService:
         async with self.lock:
             await self.redis.expire(key, seconds)
 
+    async def persist(self, key: str):
+        """Remove a key's time to live, so it stays until deleted."""
+        async with self.lock:
+            await self.redis.persist(key)
+
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
         async with self.lock:
@@ -564,11 +586,24 @@ class RedisService:
             logger.error(_m("Error getting executor uptime: {e}", extra={"error": e}), exc_info=True)
             return 0
 
-    async def add_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+    async def add_pending_pod(
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        pod_id: str,
+        kind: str | None = None,
+        gpu_uuids: list[str] | None = None,
+    ):
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
         now = int(time.time())
-        
-        pending_pods.append({"time": now, "pod_id": pod_id})
+
+        item: dict = {"time": now, "pod_id": pod_id}
+        if kind:
+            # DAH-4658: "gpu_reset" marks a renter's own GPU reset, which the rented GPU checks skip
+            item["kind"] = kind
+        if gpu_uuids:
+            item["gpu_uuids"] = list(gpu_uuids)
+        pending_pods.append(item)
         await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
@@ -668,6 +703,29 @@ class RedisService:
         
         return pending_pods
 
+    async def gpu_reset_marks(self, miner_hotkey: str, executor_id: str) -> list[dict]:
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        return [item for item in pending_pods if item.get("kind") == GPU_RESET_PENDING_KIND]
+
+    async def mark_gpu_reset_recent(
+        self, miner_hotkey: str, executor_id: str, pod_id: str, gpu_uuids: list[str], seconds: int
+    ) -> None:
+        # ponytail: one pod per node; a second pod's reset in the same window replaces the first
+        mark = RecentGpuReset(pod_id=pod_id, gpu_uuids=gpu_uuids)
+        await self.set(f"{GPU_RESET_RECENT_PREFIX}:{miner_hotkey}:{executor_id}", mark.model_dump_json(), ex=seconds)
+
+    async def gpu_reset_recent(self, miner_hotkey: str, executor_id: str) -> RecentGpuReset | None:
+        """The node's renter GPU reset that ended within the mark's TTL, if any."""
+        raw = await self.get(f"{GPU_RESET_RECENT_PREFIX}:{miner_hotkey}:{executor_id}")
+        if not raw:
+            return None
+        raw = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            return RecentGpuReset.model_validate_json(raw)
+        except ValidationError:
+            # a mark written before it named its GPUs: the bare pod id
+            return RecentGpuReset(pod_id=raw)
+
     async def renting_in_progress(self, miner_hotkey: str, executor_id: str, pod_id: str | None = None) -> bool:
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
         
@@ -722,9 +780,11 @@ class RedisService:
         reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
         evidence: dict | None = None,
         anchor_broken: bool = False,
+        reanchor_uuids: str = '',
     ):
         spec = prev_info.get('spec', '')
-        uuids = prev_info.get(GPU_ANCHOR_KEY, '')
+        # a whole replaced set is anchored now, so a second swap inside the hold is judged against it
+        uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 
         data = {
             "count": 0,

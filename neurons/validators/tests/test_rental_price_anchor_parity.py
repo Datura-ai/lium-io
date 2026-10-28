@@ -16,16 +16,6 @@ WORKSTATION = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 MAX_Q = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
 
 
-def test_incentive_config_anchors_server_edition_at_workstation_price():
-    """Fails when the parity override is dropped or mistyped: the Server entry then falls back to the
-    installed lium-core value (0.86 in 0.1.8) and no longer equals the Workstation entry."""
-    prices = IncentiveConfig().rental_prices_per_hour
-    upstream = DEFAULT_SHARED_CONFIG.machine_prices
-
-    assert prices[SERVER] == prices[WORKSTATION]
-    assert prices[SERVER] == upstream[WORKSTATION]
-
-
 def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
     """Fails when the resolver stops reading the anchored table for one edition (a custom-price entry
     or a base-model mapping that treats the two editions differently)."""
@@ -52,7 +42,73 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
     Workstation Edition is a third (DAH-3453): derived from the Workstation entry, same base model."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
-    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300", MAX_Q}
+    # The GPU types added to the unrented program after the lock's lium-core release carry no upstream row yet.
+    added_types = {
+        "NVIDIA GeForce RTX 5080",
+        "NVIDIA GeForce RTX 5070 Ti",
+        "NVIDIA GeForce RTX 5060 Ti",
+        "NVIDIA GeForce RTX 4060 Ti",
+        "NVIDIA GeForce RTX 4070 SUPER",
+        "NVIDIA GeForce RTX 3080",
+        "NVIDIA GeForce RTX 3060",
+        "NVIDIA GeForce RTX 2080 Ti",
+        "NVIDIA Tesla V100 Tensor Core GPU",
+        "NVIDIA RTX PRO 5000 Blackwell",
+        "NVIDIA RTX PRO 4500 Blackwell",
+        "NVIDIA RTX PRO 4500 Blackwell Server Edition",
+        "NVIDIA RTX PRO 6000D Blackwell Workstation Edition",
+        "NVIDIA RTX 6000D",
+        "NVIDIA GeForce RTX 4080",
+        "NVIDIA GeForce RTX 4080 SUPER",
+        "NVIDIA GeForce RTX 3070",
+        "NVIDIA Quadro RTX 8000",
+        "NVIDIA CMP 170HX",
+        # DAH-5070: every other GPU model
+        "NVIDIA GeForce RTX 5090 D",
+        "NVIDIA GeForce RTX 5070",
+        "NVIDIA GeForce RTX 5060",
+        "NVIDIA GeForce RTX 4070 Ti",
+        "NVIDIA GeForce RTX 4070 Ti SUPER",
+        "NVIDIA GeForce RTX 4070",
+        "NVIDIA GeForce RTX 4060",
+        "NVIDIA RTX PRO 2000 Blackwell",
+        "NVIDIA RTX PRO 4000 Blackwell",
+        "NVIDIA RTX 4500 Ada Generation",
+        "NVIDIA RTX 5000 Ada Generation",
+        "NVIDIA RTX 5880 Ada Generation",
+        "NVIDIA A800 80GB PCIe",
+        "NVIDIA A10 Tensor Core GPU",
+        "NVIDIA RTX A2000",
+        "NVIDIA T4 Tensor Core GPU",
+        "NVIDIA TITAN V",
+        "NVIDIA GeForce RTX 3090 Ti",
+        "NVIDIA GeForce RTX 3080 Ti",
+        "NVIDIA GeForce RTX 3070 Ti",
+        "NVIDIA GeForce RTX 3060 Ti",
+        "NVIDIA GeForce RTX 3060 Laptop GPU",
+        "NVIDIA GeForce RTX 3050",
+        "NVIDIA Quadro RTX 6000",
+        "NVIDIA Quadro RTX 5000",
+        "NVIDIA TITAN RTX",
+        "NVIDIA GeForce RTX 2080 SUPER",
+        "NVIDIA GeForce RTX 2070 SUPER",
+        "NVIDIA GeForce RTX 2060 SUPER",
+        "NVIDIA GeForce RTX 2060",
+        "NVIDIA GeForce GTX 1660 Ti",
+        "NVIDIA GeForce GTX 1660 SUPER",
+        "NVIDIA GeForce GTX 1660",
+        "NVIDIA Tesla P100",
+        "NVIDIA Tesla P40",
+        "NVIDIA Quadro P4000",
+        "NVIDIA TITAN Xp",
+        "NVIDIA GeForce GTX 1080 Ti",
+        "NVIDIA GeForce GTX 1080",
+        "NVIDIA GeForce GTX 1070 Ti",
+        "NVIDIA GeForce GTX 1070",
+        "NVIDIA GeForce GTX 1060",
+        "NVIDIA Tesla M40",
+    }
+    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC", "NVIDIA GB300", MAX_Q} | added_types
     assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
     assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
     assert RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]

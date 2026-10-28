@@ -28,6 +28,14 @@ _MANIFEST_ACCEPT = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     " application/vnd.docker.distribution.manifest.v2+json"
 )
+# Executor image only: a multi-arch executor tag pushed by buildx is an OCI index, which Docker Hub
+# does not serve to the Docker types alone. Template digests keep the Docker types the executor's
+# cache side resolves with, so the two sides of the cache check cannot diverge.
+_EXECUTOR_MANIFEST_ACCEPT = (
+    "application/vnd.oci.image.index.v1+json,"
+    " application/vnd.oci.image.manifest.v1+json, "
+    + _MANIFEST_ACCEPT
+)
 _REGISTRY_AUTH_URL = "https://auth.docker.io/token"
 _REGISTRY_API = "https://registry-1.docker.io/v2"
 # `[docker.io/][namespace/]name:tag` with Docker Hub's own charset: a namespace has no dot, so a
@@ -64,7 +72,9 @@ def _shared_config_image_refs() -> tuple[str, ...]:
     return tuple(refs)
 
 
-async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) -> str | None:
+async def fetch_registry_digest(
+    session: aiohttp.ClientSession, image_ref: str, accept: str = _MANIFEST_ACCEPT
+) -> str | None:
     """Return the registry manifest digest for ``repository:tag``, or None on any error."""
     repository, _, tag = image_ref.partition(":")
     if not repository or not tag:
@@ -86,7 +96,7 @@ async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) 
             f"{_REGISTRY_API}/{repository}/manifests/{tag}",
             headers={
                 "Authorization": f"Bearer {token}",
-                "Accept": _MANIFEST_ACCEPT,
+                "Accept": accept,
             },
         ) as manifest_response:
             manifest_response.raise_for_status()
@@ -160,4 +170,4 @@ async def fetch_executor_image_digest() -> str | None:
     ref = settings.EXECUTOR_IMAGE_REF
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        return await fetch_registry_digest(session, ref)
+        return await fetch_registry_digest(session, ref, accept=_EXECUTOR_MANIFEST_ACCEPT)

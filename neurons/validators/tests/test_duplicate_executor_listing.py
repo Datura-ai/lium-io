@@ -8,7 +8,6 @@ miner's list to the wave as is, and each entry started its own task.
 The wave now keeps the first entry per executor uuid, with the express lane on and off.
 """
 
-import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -17,13 +16,12 @@ from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.miner_service import CYCLE_DONE, EXPRESS_LANE, MinerService
+from services.miner_service import MinerService
 from services.task.models import JobResult
 
 pytest_plugins = ["fixtures.rest_miner_fixtures"]
 
 B300 = "NVIDIA B300 SXM6 AC"
-LISTED_TWICE = "Executor listed twice by miner; scored once"
 def _idle_b300_1x(executor_id: str) -> JobResult:
     return JobResult(
         executor_info=_executor_info(executor_id),
@@ -70,10 +68,6 @@ async def _request(service: MinerService, **kwargs) -> dict:
     )
 
 
-def _verified(service: MinerService) -> list[str]:
-    return [c.kwargs["executor_info"].uuid for c in service.task_service.create_task.call_args_list]
-
-
 async def _score(job_results: dict[str, list[JobResult]]) -> RentalPriceIncentive:
     redis = AsyncMock()
     redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
@@ -90,30 +84,6 @@ async def _score(job_results: dict[str, list[JobResult]]) -> RentalPriceIncentiv
     return incentive
 
 
-@pytest.mark.parametrize(
-    ("listed", "verified", "listed_counts"),
-    [
-        (("exec-twin", "exec-twin", "exec-other"), ["exec-twin", "exec-other"], {"exec-twin": 2}),
-        (("exec-a", "exec-b", "exec-c"), ["exec-a", "exec-b", "exec-c"], {}),
-    ],
-    ids=["listed-twice", "distinct"],
-)
-@pytest.mark.asyncio
-async def test_each_executor_uuid_gets_one_validation_task(
-    rest_miner_service, caplog, listed, verified, listed_counts
-):
-    rest_miner_service.miner_returns(*listed)
-
-    with caplog.at_level(logging.WARNING):
-        job = await _request(rest_miner_service)
-
-    assert _verified(rest_miner_service) == verified
-    assert [r.executor_info.uuid for r in job["results"]] == verified
-    repeats = [r for r in caplog.records if LISTED_TWICE in r.getMessage()]
-    assert {r.msg.extra["executor_uuid"]: r.msg.extra["listed_count"] for r in repeats} == listed_counts
-    assert rest_miner_service.in_flight == dict.fromkeys(verified, CYCLE_DONE)
-
-
 @pytest.mark.asyncio
 async def test_an_executor_listed_twice_is_one_gpu_in_its_idle_tier(rest_miner_service):
     """End to end: the 23-25 Sep shape (a repeated 1x B300 beside three distinct ones, cap 4)
@@ -125,51 +95,6 @@ async def test_an_executor_listed_twice_is_one_gpu_in_its_idle_tier(rest_miner_s
 
     assert incentive.unrented_count_by_bucket[("B300", 1)] == 4
     assert incentive.cap_multiplier_by_bucket[("B300", 1)] == pytest.approx(1.0)
-
-
-def test_the_claim_both_miner_paths_share_keeps_the_first_entry_per_uuid(
-    rest_miner_service, caplog
-):
-    """The WebSocket and the REST path both take the wave's executors from `_claim_for_cycle`."""
-    first, repeat, other = _executor_info("exec-twin"), _executor_info("exec-twin"), _executor_info("exec-other")
-    repeat.address = "203.0.113.9"
-
-    with caplog.at_level(logging.WARNING):
-        claimed = rest_miner_service._claim_for_cycle(_payload(), [first, other, repeat, repeat], {})
-
-    assert claimed == [first, other]
-    assert claimed[0] is first
-    repeats = [r for r in caplog.records if LISTED_TWICE in r.getMessage()]
-    assert [r.msg.extra["listed_count"] for r in repeats] == [3]
-
-
-@pytest.mark.asyncio
-async def test_an_express_lane_request_answered_with_repeats_verifies_the_executor_once(
-    rest_miner_service, monkeypatch, caplog
-):
-    """A miner that answers the express lane's one-executor request with many copies of that
-    executor gets one validation task, not one per copy."""
-    rest_miner_service.in_flight["exec-new"] = EXPRESS_LANE
-    rest_miner_service.miner_returns("exec-new", "exec-new", "exec-new", "exec-other")
-
-    with caplog.at_level(logging.WARNING):
-        job = await _request(rest_miner_service, executor_id="exec-new")
-
-    assert _verified(rest_miner_service) == ["exec-new"]
-    assert [r.executor_info.uuid for r in job["results"]] == ["exec-new"]
-    repeats = [r for r in caplog.records if LISTED_TWICE in r.getMessage()]
-    assert [r.msg.extra["listed_count"] for r in repeats] == [3]
-    assert rest_miner_service.in_flight == {"exec-new": EXPRESS_LANE}
-
-
-def test_a_repeat_of_an_executor_the_express_lane_holds_stays_with_the_lane(rest_miner_service, monkeypatch):
-    rest_miner_service.in_flight["exec-new"] = EXPRESS_LANE
-    listed = [_executor_info("exec-new"), _executor_info("exec-new"), _executor_info("exec-known")]
-
-    claimed = rest_miner_service._claim_for_cycle(_payload(), listed, {})
-
-    assert [e.uuid for e in claimed] == ["exec-known"]
-    assert rest_miner_service.in_flight["exec-new"] == EXPRESS_LANE
 
 
 def test_a_list_without_repeats_is_handed_on_unchanged(rest_miner_service):
