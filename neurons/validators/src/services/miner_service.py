@@ -724,6 +724,7 @@ class MinerService:
             # exempt the node from spot-tier or Discord exclusions.
             is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
             is_on_spot_pay_list = is_spot and executor_uuid in (rented_data.provider_spot_executor_ids or [])
+            is_in_maintenance = executor_uuid in (rented_data.maintenance_executor_ids or [])
             discord_connected_ids = rented_data.provider_discord_connected_executor_ids
             provider_discord_connected = (
                 True if discord_connected_ids is None else executor_uuid in discord_connected_ids
@@ -760,6 +761,7 @@ class MinerService:
                     is_spot=is_spot,
                     is_on_spot_pay_list=is_on_spot_pay_list,
                     provider_discord_connected=provider_discord_connected,
+                    is_in_maintenance=is_in_maintenance,
                 )
             )
 

@@ -155,6 +155,10 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
         )
+        is_in_maintenance = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.maintenance_executor_ids
+        )
         is_provider_email_held = bool(
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.provider_email_held_executor_ids
@@ -260,6 +264,7 @@ class ResultHandler:
             is_spot=is_spot,
             is_on_spot_pay_list=is_on_spot_pay_list,
             is_new_rentals_paused=is_new_rentals_paused,
+            is_in_maintenance=is_in_maintenance,
             is_provider_banned=context.is_provider_banned,
             provider_discord_connected=provider_discord_connected,
             is_provider_email_held=is_provider_email_held,

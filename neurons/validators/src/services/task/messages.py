@@ -969,6 +969,24 @@ class DuplicateExecutorMessages:
         remediation="Each physical GPU earns under one executor. Register every machine once.",
     )
 
+class ProviderMaintenanceMessages:
+    IN_WINDOW = MessageTemplate(
+        event="Node in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation="The provider scheduled maintenance on this node; it is validated as usual once the window ends.",
+    )
+    NONE = MessageTemplate(
+        event="Node not in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE_NONE",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(
         event="Collateral verified",
