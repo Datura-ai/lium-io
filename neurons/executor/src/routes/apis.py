@@ -39,6 +39,7 @@ from services.local_verify_service import (
     BusyError,
     LocalVerifyService,
     NonceCache,
+    accepted_miner_hotkeys,
     canonical_intent_message,
     check_intent_target,
     check_intent_window,
@@ -266,6 +267,12 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
         raise HTTPException(status_code=401, detail="Invalid validator signature")
 
 
+def _accepted_miner_hotkeys() -> set[str]:
+    return accepted_miner_hotkeys(
+        settings.MINER_HOTKEY_SS58_ADDRESS, settings.LIUM_POOL_HOTKEY, settings.DEFAULT_MINER_HOTKEY
+    )
+
+
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
     """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
@@ -283,7 +290,7 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             signed = False
         if not signed:
             miner_binding = "bad_signature"
-        elif payload.miner_hotkey not in settings.accepted_miner_hotkeys():
+        elif payload.miner_hotkey not in _accepted_miner_hotkeys():
             miner_binding = "mismatch"
         else:
             return
@@ -530,7 +537,7 @@ async def _admit_verify_intent(request: Request) -> VerifyIntent:
 
     refused = check_intent_window(
         intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
-    ) or check_intent_target(intent, settings.accepted_miner_hotkeys())
+    ) or check_intent_target(intent, _accepted_miner_hotkeys())
     if refused:
         logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")

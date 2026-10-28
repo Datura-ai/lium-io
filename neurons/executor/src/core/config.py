@@ -219,11 +219,5 @@ class Settings(BaseSettings):
     # No lower bound here: a bad value must never stop the executor. The service clamps it to 10 with a warning.
     NODE_HEARTBEAT_INTERVAL_SECONDS: int = Field(env="NODE_HEARTBEAT_INTERVAL_SECONDS", default=60)
 
-    def accepted_miner_hotkeys(self) -> set[str]:
-        """Miner hotkeys a validator may bind an SSH key or /verify intent to: this executor's own
-        and the pool hotkey. Never the shared portal hotkey, which every executor trusts."""
-        pool = {self.LIUM_POOL_HOTKEY} - {self.DEFAULT_MINER_HOTKEY}
-        return ({self.MINER_HOTKEY_SS58_ADDRESS} | pool) - {""}
-
 
 settings = Settings()

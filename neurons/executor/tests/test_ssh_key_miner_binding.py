@@ -17,6 +17,7 @@ from middlewares.miner import MinerMiddleware
 
 from core.config import settings
 from routes.apis import apis_router
+from services.local_verify_service import accepted_miner_hotkeys
 from services.miner_service import MinerService
 
 _SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey123456789abcdef user@host"
@@ -165,7 +166,7 @@ def test_default_miner_hotkey_refused(client, miner_kp, validator_kp, monkeypatc
     assert client.post("/upload_ssh_key", json=body).status_code == 403
 
 
-def test_empty_pool_hotkey_accepts_only_own(monkeypatch, miner_kp):
-    monkeypatch.setattr(settings, "MINER_HOTKEY_SS58_ADDRESS", miner_kp.ss58_address)
-    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", "")
-    assert settings.accepted_miner_hotkeys() == {miner_kp.ss58_address}
+def test_accepted_hotkeys_never_take_an_empty_or_portal_pool():
+    assert accepted_miner_hotkeys("5Own", "", "5Portal") == {"5Own"}
+    assert accepted_miner_hotkeys("5Own", "5Portal", "5Portal") == {"5Own"}
+    assert accepted_miner_hotkeys("5Own", "5Pool", "5Portal") == {"5Own", "5Pool"}
