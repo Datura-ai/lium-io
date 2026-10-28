@@ -287,6 +287,12 @@ class AttestationService:
         nonce: AttestationNonce | None,
     ) -> bool:
         """is_valid/quote_verified false while report_data (and nonce) match: worth one retry."""
+        # dstack verifier v0.5.11 verify_cvm maps an internal failure to HTTP 200,
+        # is_valid=false, report_data=null, reason "Internal error: ...".
+        if not verifier_payload.get("is_valid") and str(
+            verifier_payload.get("reason") or ""
+        ).startswith("Internal error:"):
+            return True
         details = verifier_payload.get("details")
         if not isinstance(details, dict):
             return False

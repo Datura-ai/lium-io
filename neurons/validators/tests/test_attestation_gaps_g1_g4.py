@@ -309,6 +309,54 @@ async def test_verify_tdx_retries_once_on_transient_reject(service, monkeypatch,
     assert len(calls) == 2 and calls[0] == calls[1]
 
 
+async def test_verify_tdx_retries_once_on_verifier_internal_error(service, monkeypatch):
+    # Arrange — shape dstack verifier v0.5.11 returns for an internal error, then success
+    good = _verifier_response()
+    executor, expected = _tdx_executor(service)
+    good["details"]["report_data"] = expected[2:] + "00" * 32
+    bad = json.loads(json.dumps(good))
+    bad["is_valid"] = False
+    bad["reason"] = "Internal error: failed to fetch collateral"
+    bad["details"]["quote_verified"] = False
+    bad["details"]["report_data"] = None
+    answers = [bad, good]
+    calls = []
+
+    async def fake_call(self, quote_json, ex):
+        calls.append(quote_json)
+        return answers.pop(0)
+
+    monkeypatch.setattr(AttestationService, "_call_verifier", fake_call)
+
+    # Act
+    await service._verify_tdx(executor)
+
+    # Assert
+    assert len(calls) == 2
+
+
+async def test_verify_tdx_no_retry_on_genuine_reject_with_no_report_data(service, monkeypatch):
+    # Arrange — quote invalid, no report_data, reason is not an internal error
+    bad = _verifier_response()
+    executor, _ = _tdx_executor(service)
+    bad["is_valid"] = False
+    bad["reason"] = "quote verification failed"
+    bad["details"]["quote_verified"] = False
+    bad["details"]["report_data"] = None
+    calls = []
+
+    async def fake_call(self, quote_json, ex):
+        calls.append(quote_json)
+        return bad
+
+    monkeypatch.setattr(AttestationService, "_call_verifier", fake_call)
+
+    # Act / Assert
+    with pytest.raises(AttestationError):
+        await service._verify_tdx(executor)
+    assert len(calls) == 1
+
+
 async def test_verify_tdx_gives_up_after_one_retry(service, monkeypatch):
     # Arrange
     bad = _verifier_response()
