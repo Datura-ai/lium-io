@@ -5123,9 +5123,10 @@ class DockerService:
             missing_gb = _cache_download_gb(volume_name)
         docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
         free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-        # review: floor only, no free-disk share; the Engy run's own volume beside the cache must still fit
-        free_after_gb: float = free_gb - missing_gb - FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE
-        if free_after_gb <= DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB:
+        # The same check as every filler cache (30% free-disk share, listing floor), the run volume beside it.
+        if _cache_download_refused(
+            free_gb, missing_gb, None, FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE
+        ):
             logger.info(
                 _m(
                     "Node cannot afford the Engy cache download",

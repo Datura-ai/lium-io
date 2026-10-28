@@ -63,17 +63,28 @@ async def test_a_free_node_downloads_into_the_cache_volume_without_a_gpu(docker_
 
 
 @pytest.mark.asyncio
-async def test_a_b300_pc_gets_the_cache_while_the_listing_floor_holds(docker_service):
-    # review: kimi-k3 (1561 GB) on about 3.3 TB free; only the listing floor applies, not the free-disk share
+async def test_a_cache_over_the_free_disk_share_is_refused_like_every_filler_cache(docker_service):
+    # Rustam 28 Oct: the 30% free-disk share holds for the helper too; kimi-k3 (1561 GB) on 3300 GB free
+    # clears the listing floor but is over the share, so no cache, exactly as an Engy run would get
     host = Host(free_gb=3300)
+    engy = ContainerCreateRequest(
+        miner_hotkey="hk",
+        executor_id="ex",
+        pod_id="pod",
+        docker_image="img:tag",
+        gpu_uuids=["g0"],
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name=_KIMI, target="/root/models")],
+    )
 
-    assert await _prefetch(docker_service, host) == Outcome.STARTED
-    assert len(host.started()) == 1
+    assert await _prefetch(docker_service, host) == Outcome.UNAFFORDABLE
+    assert host.started() == []
+    assert await docker_service.select_affordable_cache_volumes(Host(free_gb=3300), engy, {}) == []
 
 
 @pytest.mark.asyncio
 async def test_a_partial_cache_resumes_when_the_node_affords_only_what_is_missing(docker_service):
-    # 1561 GB from scratch on 1700 GB free breaks the floor; the 161 GB still missing does not
+    # 1561 GB from scratch on 1700 GB free is over the 30% share; the 161 GB still missing is not
     assert await _prefetch(docker_service, Host(free_gb=1700)) == Outcome.UNAFFORDABLE
     host = Host(volumes=[_KIMI], free_gb=1700, held_gb=1400)
 
