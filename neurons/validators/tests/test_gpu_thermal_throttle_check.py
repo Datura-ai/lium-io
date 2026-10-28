@@ -10,9 +10,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import json
+
 import pytest
-from neurons.validators.tests.helpers import build_scrape_namespace, build_state
+from neurons.validators.tests.helpers import (
+    FakeRedis,
+    build_scrape_namespace,
+    build_services,
+    build_state,
+)
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
+from services.task.checks import gpu_thermal_throttle
 from services.task.checks.gpu_thermal_throttle import GpuThermalThrottleCheck
 from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
 from services.task.messages import GpuThermalThrottleMessages as Msg
@@ -42,7 +50,7 @@ def h100(**overrides: Any) -> dict[str, Any]:
     return row
 
 
-async def run(context_factory, *rows: dict[str, Any], rented: bool = False):
+async def run(context_factory, *rows: dict[str, Any], rented: bool = False, redis=None):
     rented_data = None
     if rented:
         pod = {"pod_id": "pod-1", "container_name": "c", "gpu_count": 1}
@@ -55,7 +63,10 @@ async def run(context_factory, *rows: dict[str, Any], rented: bool = False):
             }
         )
         rented_data = RentedExecutorsResponse(executors={context_factory().executor.uuid: executor})
-    ctx = context_factory(state=build_state(gpu_details=list(rows), rented_data=rented_data))
+    ctx = context_factory(
+        state=build_state(gpu_details=list(rows), rented_data=rented_data),
+        services=build_services(redis=redis or FakeRedis()),
+    )
     return await GpuThermalThrottleCheck().run(ctx)
 
 
@@ -201,6 +212,116 @@ async def test_only_a_collapse_with_a_slowdown_bit_fails(context_factory, row):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.THROTTLED.reason
+
+
+# --------------------------------------------------------------------------------------------------
+# hold: a collapse is remembered until a busy clean reading (28 Oct, 8x H200 c63f453b)
+# --------------------------------------------------------------------------------------------------
+COLLAPSED_ROW = h100(graphics_speed=345, temperature=88, clocks_event_reasons=SW_THERMAL)
+IDLE_ROW = h100(gpu_utilization=0, graphics_speed=345, clocks_event_reasons=GPU_IDLE)
+
+
+def _hold_key(context_factory) -> str:
+    ctx = context_factory()
+    return f"{gpu_thermal_throttle.THERMAL_HOLD_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+@pytest.mark.asyncio
+async def test_a_rented_collapse_is_marked_and_only_warns(context_factory):
+    redis = FakeRedis()
+
+    result = await run(context_factory, COLLAPSED_ROW, rented=True, redis=redis)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.THROTTLED.reason
+    key = _hold_key(context_factory)
+    assert json.loads(redis.store[key])["gpus"] == ["GPU-aaaa"]
+    assert redis.ttl[key] == gpu_thermal_throttle.THERMAL_HOLD_SECONDS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_rented", [True, False])
+async def test_an_idle_cycle_after_a_collapse_is_held(context_factory, first_rented):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, rented=first_rented, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, redis=redis)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.COLLAPSED.reason
+    assert result.updates["score"] == 0.0
+    assert result.event.what_we_saw["held_from_rental"] is True
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+    assert result.event.what_we_saw["held_since"]
+
+
+@pytest.mark.asyncio
+async def test_a_held_node_under_rental_still_only_warns(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, rented=True, redis=redis)
+
+    assert result.passed is True
+    assert _hold_key(context_factory) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_busy_clean_reading_clears_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, rented=True, redis=redis)
+
+    cleared = await run(context_factory, h100(), redis=redis)
+    idle_after = await run(context_factory, IDLE_ROW, redis=redis)
+
+    assert cleared.passed is True
+    assert cleared.event.reason_code == Msg.OK.reason
+    assert redis.store == {}
+    assert idle_after.passed is True
+
+
+@pytest.mark.asyncio
+async def test_only_the_marked_gpu_that_read_clean_is_cleared(context_factory):
+    redis = FakeRedis()
+    await run(
+        context_factory,
+        {**COLLAPSED_ROW, "uuid": "GPU-a"},
+        {**COLLAPSED_ROW, "uuid": "GPU-b"},
+        rented=True,
+        redis=redis,
+    )
+
+    result = await run(
+        context_factory, h100(uuid="GPU-a"), h100(uuid="GPU-b", gpu_utilization=0), redis=redis
+    )
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-b"]
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_is_no_hold(context_factory):
+    # read fails: no hold; write fails: the collapse verdict stands; neither raises
+    redis = FakeRedis(failing=True)
+
+    idle = await run(context_factory, IDLE_ROW, redis=redis)
+    collapsed = await run(context_factory, COLLAPSED_ROW, redis=redis)
+    rented = await run(context_factory, COLLAPSED_ROW, rented=True, redis=redis)
+
+    assert idle.passed is True
+    assert idle.event.reason_code == Msg.OK.reason
+    assert collapsed.event.reason_code == Msg.COLLAPSED.reason
+    assert rented.event.reason_code == Msg.THROTTLED.reason
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_writes_no_hold(context_factory, monkeypatch):
+    monkeypatch.setattr(gpu_thermal_throttle.settings, "DRY_RUN", True)
+    redis = FakeRedis()
+
+    await run(context_factory, COLLAPSED_ROW, rented=True, redis=redis)
+
+    assert redis.store == {}
 
 
 # --------------------------------------------------------------------------------------------------
