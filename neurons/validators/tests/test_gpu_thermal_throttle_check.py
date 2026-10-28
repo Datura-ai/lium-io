@@ -300,6 +300,17 @@ async def test_only_the_marked_gpu_that_read_clean_is_cleared(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_a_replaced_marked_gpu_is_cleared(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, {**COLLAPSED_ROW, "uuid": "GPU-a"}, rented=True, redis=redis)
+
+    result = await run(context_factory, h100(uuid="GPU-new", gpu_utilization=0), redis=redis)
+
+    assert result.passed is True
+    assert await redis.get(_hold_key(context_factory)) is None
+
+
+@pytest.mark.asyncio
 async def test_a_redis_outage_is_no_hold(context_factory):
     # read fails: no hold; write fails: the collapse verdict stands; neither raises
     redis = FakeRedis(failing=True)

@@ -28,7 +28,7 @@ A collapse is remembered, so the node cannot pass on an idle card (28 Oct, 8x H2
 on every rented cycle, read idle and scored 1.0 the cycle after the renter left). Every collapse, rented or not,
 writes the collapsed UUIDs to Redis (``gpu_thermal_hold:<hotkey>:<executor uuid>``, THERMAL_HOLD_SECONDS from the
 last collapse). An unrented cycle with marked GPUs still unproven fails as a collapse does (held_from_rental). A
-marked GPU is cleared by a busy reading that is not collapsed; the reading is the scrape's, taken before the matmul,
+marked GPU is cleared by a busy reading that is not collapsed, or when the scrape no longer lists it (replaced); the reading is the scrape's, taken before the matmul,
 so on an idle node only a filler or the host's own load at scrape time clears it, otherwise the TTL does. A dry run
 writes nothing; a Redis that cannot be read is no hold.
 """
@@ -193,13 +193,16 @@ class GpuThermalThrottleCheck:
             self._log_redis_unavailable(ctx, "read")
         marked = {uuid for uuid in mark.get("gpus") or [] if isinstance(uuid, str)}
         collapsed_uuids = {f["uuid"] for f in collapsed if isinstance(f["uuid"], str)}
+        details = [detail for detail in ctx.state.gpu_details or [] if isinstance(detail, dict)]
         busy = {
             detail.get("uuid")
-            for detail in ctx.state.gpu_details or []
-            if isinstance(detail, dict)
-            and (_to_number(detail.get("gpu_utilization")) or 0) >= MIN_UTILIZATION_PCT
+            for detail in details
+            if (_to_number(detail.get("gpu_utilization")) or 0) >= MIN_UTILIZATION_PCT
         }
-        held = (marked - (busy - collapsed_uuids)) | collapsed_uuids
+        present = {detail.get("uuid") for detail in details}
+        # a marked card the scrape no longer lists was replaced (a lost card is GpuLossHoldCheck's)
+        marked_now = marked & present if present else marked
+        held = (marked_now - (busy - collapsed_uuids)) | collapsed_uuids
         since = mark.get("since") if marked else datetime.now(UTC).isoformat()
         # A dry run shares Redis with the live validator, so it leaves the live hold alone.
         if settings.DRY_RUN or (held == marked and not collapsed_uuids):
