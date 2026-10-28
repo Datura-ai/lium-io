@@ -392,6 +392,22 @@ async def test_a_fresh_create_never_parks_anything(svc, monkeypatch):
     assert svc.clean_existing_containers.await_args.kwargs["active_container_names"] == ["pod_someone_else"]
 
 
+def _hung_reset(outcome, calls: list | None = None):
+    """Stands in for reset_hung_pod_gpus the way it uses `resetting`: a hung find holds the caller's mark
+    and hands it the result before letting go; an exception escapes like an SSH error would."""
+
+    async def fake(runner, pod_gpu_uuids, *, resetting):
+        if calls is not None:
+            calls.append(pod_gpu_uuids)
+        if isinstance(outcome, Exception):
+            raise outcome
+        async with resetting() as held:
+            held.append(outcome)
+        return outcome
+
+    return fake
+
+
 @pytest.mark.parametrize(
     ("outcome", "warnings"),
     [
@@ -404,14 +420,14 @@ async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc,
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    reset = AsyncMock(side_effect=outcome) if isinstance(outcome, Exception) else AsyncMock(return_value=outcome)
-    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", reset)
+    calls: list = []
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", _hung_reset(outcome, calls))
     svc.redis_service.mark_gpu_reset_recent = AsyncMock()
 
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated) and result.warnings == warnings
-    assert reset.await_args.args[1] == ["GPU-test"]
+    assert calls == [["GPU-test"]]
     # a reset GPU drops out for a moment: the checks after the reboot must not blame the provider
     if warnings:
         svc.redis_service.mark_gpu_reset_recent.assert_awaited_once_with(
@@ -434,7 +450,7 @@ async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypa
             # the rented checks skip the node while the GPUs reset
             held.append(svc.redis_service.add_pending_pod.await_args)
             svc.redis_service.remove_pending_pod.assert_not_awaited()
-        return HungGpuResult(pod_gpu_uuids, ContainerWarningCode.HungGpuReset)
+        return HungGpuResult(pod_gpu_uuids, ContainerWarningCode.HungGpuNotResetMig)
 
     monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", fake_reset)
     svc.redis_service.remove_pending_pod.reset_mock()
@@ -447,6 +463,26 @@ async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypa
     )
 
 
+@pytest.mark.asyncio
+async def test_the_recent_reset_mark_is_written_before_the_pending_mark_goes(svc, monkeypatch):
+    # a check between the two would otherwise see neither mark and blame the provider for the reset
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    order = Mock()
+    for name in ("mark_gpu_reset_recent", "remove_pending_pod"):
+        setattr(svc.redis_service, name, AsyncMock())
+        order.attach_mock(getattr(svc.redis_service, name), name)
+    monkeypatch.setattr(
+        "services.docker_service.reset_hung_pod_gpus",
+        _hung_reset(HungGpuResult(["GPU-test"], ContainerWarningCode.HungGpuReset)),
+    )
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    names = [name for name, _, kwargs in order.mock_calls if name == "mark_gpu_reset_recent" or kwargs.get("kind")]
+    assert names == ["mark_gpu_reset_recent", "remove_pending_pod"]
+
+
 @pytest.mark.parametrize(
     "warning", [ContainerWarningCode.HungGpuReset, ContainerWarningCode.HungGpuNotResetMig]
 )
@@ -455,9 +491,7 @@ async def test_a_failed_recent_reset_mark_does_not_fail_the_reboot(svc, monkeypa
     payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
-    monkeypatch.setattr(
-        "services.docker_service.reset_hung_pod_gpus", AsyncMock(return_value=HungGpuResult(["GPU-test"], warning))
-    )
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", _hung_reset(HungGpuResult(["GPU-test"], warning)))
     svc.redis_service.mark_gpu_reset_recent = AsyncMock(side_effect=RuntimeError("redis down"))
 
     result = await _run(svc, payload)

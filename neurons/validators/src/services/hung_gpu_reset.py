@@ -94,7 +94,8 @@ async def reset_hung_pod_gpus(
     """Call with the pod's container stopped. Changes nothing unless a pod GPU is hung.
 
     `resetting` is entered once a GPU is found hung and held until the reset is over (the caller's
-    gpu_reset pending-pod mark, so the rented checks skip the node meanwhile)."""
+    gpu_reset pending-pod mark, so the rented checks skip the node meanwhile). A list it yields gets the
+    result before it exits."""
     query = await _run(runner, HUNG_GPU_QUERY_COMMAND, timeout=_QUERY_SSH_TIMEOUT_SECONDS)
     if query.exit_code == -1 and not (query.stdout or "").strip():
         # the SSH command itself failed: nothing is known about the GPUs (a hung nvidia-smi is the shell's 124)
@@ -104,8 +105,11 @@ async def reset_hung_pod_gpus(
     hung = parse_hung_pod_gpus(gpu_csv, latched, pod_gpu_uuids)
     if not hung:
         return HungGpuResult()
-    async with resetting():
-        return await _reset(runner, hung, latched, pod_gpu_uuids)
+    async with resetting() as outcome:
+        result = await _reset(runner, hung, latched, pod_gpu_uuids)
+        if outcome is not None:
+            outcome.append(result)  # the caller acts on it while still holding its mark
+    return result
 
 
 async def _reset(runner: SSHCommandRunner, hung: list[str], latched: set[str], pod_gpu_uuids: list[str]) -> HungGpuResult:

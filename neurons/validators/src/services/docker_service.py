@@ -11361,9 +11361,25 @@ class DockerService:
                 kind=GPU_RESET_PENDING_KIND,
                 gpu_uuids=payload.gpu_uuids,
             )
+            outcome: list = []
             try:
-                yield
+                yield outcome
             finally:
+                if outcome and outcome[0].warning == ContainerWarningCode.HungGpuReset:
+                    # as after a renter's Reset GPU, and before the pending mark goes: the reset cards drop out
+                    # for a moment, and the checks after the reboot must not blame the provider for it
+                    try:
+                        await self.redis_service.mark_gpu_reset_recent(
+                            payload.miner_hotkey,
+                            payload.executor_id,
+                            payload.pod_id,
+                            payload.gpu_uuids,
+                            RECENT_RENTER_GPU_RESET_SECONDS,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                        )
                 try:
                     # only this mark: the create's own pending mark for the pod stays
                     await self.redis_service.remove_pending_pod(
@@ -11391,21 +11407,6 @@ class DockerService:
                 ),
             )
         )
-        if result.warning == ContainerWarningCode.HungGpuReset:
-            # as after a renter's Reset GPU: the reset cards drop out for a moment, and the checks after the
-            # reboot must not blame the provider for it
-            try:
-                await self.redis_service.mark_gpu_reset_recent(
-                    payload.miner_hotkey,
-                    payload.executor_id,
-                    payload.pod_id,
-                    payload.gpu_uuids,
-                    RECENT_RENTER_GPU_RESET_SECONDS,
-                )
-            except Exception as exc:
-                logger.warning(
-                    _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
-                )
         return result.warning
 
     async def reset_pod_gpus(
