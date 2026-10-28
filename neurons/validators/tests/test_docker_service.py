@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -4765,6 +4766,66 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
                 with pytest.raises(Exception, match="already in use"):
                     await run
     assert events == expected_events
+    assert not registry.is_running("test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["other_create_registers_during_inspect", "pod_started_before_rm"])
+async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status_read(
+    docker_service, monkeypatch, race,
+):
+    events: list[str] = []
+    registry = docker_service_module.inflight_creates
+    async with contextlib.AsyncExitStack() as stack:
+
+        class FakeRentalClient:
+            async def run_container(self, spec):
+                events.append("run")
+                raise Exception(
+                    '409 Client Error: Conflict ("Conflict. The container name "/pod_test" '
+                    'is already in use by container "25b3b093".")'
+                )
+
+            async def container_status(self, *, container_name):
+                if race == "other_create_registers_during_inspect":
+                    # a separate create (not this task's context, which already holds the pod)
+                    registered, release = asyncio.Event(), asyncio.Event()
+
+                    async def other_create():
+                        with registry.track("test"):
+                            registered.set()
+                            await release.wait()
+
+                    other = asyncio.create_task(other_create(), context=contextvars.Context())
+
+                    async def finish_other():
+                        release.set()
+                        await other
+
+                    stack.push_async_callback(finish_other)
+                    await registered.wait()
+                return "created"
+
+            async def remove_container(self, *, container_name, force, remove_volumes):
+                events.append(f"rm {container_name} force={force}")
+                if race == "pod_started_before_rm":
+                    raise Exception("409 Conflict: cannot remove a running container")
+
+        monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+        with registry.track("test"):
+            with pytest.raises(docker_service_module._SameNameContainerKept):
+                await docker_service._run_rental_docker_create_with_port_retry(
+                    docker_client=FakeRentalClient(),
+                    ssh_client=Mock(),
+                    run_spec=ContainerRunSpec(image="img", name="pod_test"),
+                    container_name="pod_test",
+                    default_extra={},
+                    pod_id="test",
+                )
+    if race == "other_create_registers_during_inspect":
+        assert events == ["run"]
+    else:
+        assert events == ["run", "rm pod_test force=False"]
     assert not registry.is_running("test")
 
 

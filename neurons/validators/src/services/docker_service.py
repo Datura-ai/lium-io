@@ -2857,16 +2857,23 @@ class DockerService:
                     and inflight_creates.is_only_create(pod_id)
                     and f'"/{container_name}" is already in use' in str(exc)
                 ):
-                    if not await self._leftover_container_never_started(docker_client, container_name):
+                    if not (
+                        await self._leftover_container_never_started(docker_client, container_name)
+                        # another create may have registered (and started the pod) during the status read
+                        and inflight_creates.is_only_create(pod_id)
+                    ):
                         raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
-                    await self._remove_failed_rental_container_for_retry(
+                    # not forced: dockerd itself refuses the removal if the pod was started meanwhile
+                    if not await self._remove_failed_rental_container_for_retry(
                         docker_client=docker_client,
                         container_name=container_name,
                         default_extra=default_extra,
                         warning_event="OWN_LEFTOVER_CONTAINER_RM_FAILED",
-                    )
+                        force=False,
+                    ):
+                        raise _SameNameContainerKept(str(exc)) from exc
                     continue
                 if _should_repair_stale_mountpoint(
                     exc,
@@ -3087,20 +3094,23 @@ class DockerService:
         container_name: str,
         default_extra: dict,
         warning_event: str,
-    ) -> None:
+        force: bool = True,
+    ) -> bool:
+        """False when the removal failed (logged as `warning_event`)."""
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_failed_container_for_retry",
                 log_extra=default_extra,
                 call=lambda: docker_client.remove_container(
                     container_name=container_name,
-                    force=True,
+                    force=force,
                     remove_volumes=True,
                 ),
                 container_name=container_name,
-                force=True,
+                force=force,
                 remove_volumes=True,
             )
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as rm_exc:
@@ -3114,6 +3124,7 @@ class DockerService:
                     }),
                 )
             )
+            return False
 
     async def _remap_colliding_port(
         self,
