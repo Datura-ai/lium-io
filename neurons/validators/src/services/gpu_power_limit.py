@@ -90,6 +90,8 @@ STALE_CAP_GRACE_SECONDS = 30 * 60
 # Floor enforced by GpuPowerLimitCheck. Doubles as the raise trigger at rental start: a limit
 # below this can't be a legitimate miner setting (the check would zero-score it anyway).
 MIN_POWER_LIMIT_RATIO = 0.9
+# Floor a rented GPU must hold when its customer's container starts; kept apart from the check's floor.
+RENTED_MIN_POWER_LIMIT_RATIO = 0.9
 # GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
 # (-pm 1, -pl, readback), about 1.8 s on a loaded host; done one GPU after another an 8-GPU PEARL
 # node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
@@ -639,7 +641,7 @@ async def restore_tracked_gpu_power_limits(
         for gpu_uuid in read_result.missing:
             state = state_by_uuid.get(gpu_uuid)
             if state is None or state.default_watts is None or (
-                state.current_watts < MIN_POWER_LIMIT_RATIO * state.default_watts
+                state.current_watts < RENTED_MIN_POWER_LIMIT_RATIO * state.default_watts
             ):
                 raise GpuPowerRestoreStateError(f"GPU power restore record is missing and {gpu_uuid} is below its floor")
     if not read_result.records:

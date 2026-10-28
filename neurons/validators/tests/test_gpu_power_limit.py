@@ -120,6 +120,20 @@ async def test_strict_pod_restore_accepts_a_record_already_restored():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("current_watts", "accepted"), [(800, False), (899, False), (900, True)])
+async def test_strict_pod_restore_without_record_holds_the_rented_floor(current_watts, accepted):
+    # Arrange: GPU-a's record is gone; only its live limit can show it was restored.
+    redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a"]'})
+    ssh = fake_ssh(FakeRun(stdout=f"GPU-a, {current_watts}, 1000, 100, 1000\n"))
+    # Act / Assert: below the rented-start floor fails the create.
+    if accepted:
+        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == 0
+    else:
+        with pytest.raises(GpuPowerRestoreStateError):
+            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("require_complete", [True, False])
 async def test_pod_index_delete_failure_after_successful_restore(require_complete):
     # Arrange: only the final index deletion fails; the GPU record can be cleared.
