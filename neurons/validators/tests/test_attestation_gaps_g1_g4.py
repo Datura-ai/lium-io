@@ -529,6 +529,7 @@ def _score_ctx(tdx_quote, attestation_passed):
         rented_pod_resources_passed=True,
         rented_throughput_passed=True,
         gpu_attestation_identity_passed=True,
+        cc_vbios_passed=True,
         inspector_host_write_passed=True,
     )
 
