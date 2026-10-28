@@ -121,6 +121,7 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.hung_gpu_reset import reset_hung_pod_gpus
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
@@ -9075,6 +9076,24 @@ class DockerService:
                 # explicit --device entries persist the device cgroup across systemd
                 # daemon-reload (cgroup v2 + systemd cgroup driver wipe the transient
                 # nvidia hook program; HostConfig.Devices is reapplied by Docker).
+                # DAH-5301: a reboot re-creates the pod; while its old container is parked and stopped,
+                # reset a pod GPU that hung. Best-effort: the reboot goes on as before whatever happens.
+                if edit_swap.parked_name and payload.gpu_uuids and not executor_info.tdx_quote:
+                    try:
+                        hung = await reset_hung_pod_gpus(SSHCommandRunner(ssh_client, max_retries=0), list(payload.gpu_uuids))
+                        if hung.warning is not None:
+                            warnings.append(hung.warning)
+                            logger.warning(
+                                _m(
+                                    "Hung pod GPU found on reboot",
+                                    extra=get_extra_info({**default_extra, "hung": hung.hung_uuids, "result": hung.warning.value, "detail": hung.detail}),
+                                )
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            _m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)}))
+                        )
+
                 current_step = "gpu_flags"
                 gpu_config = await build_gpu_docker_config_for_executor(
                     ssh_client,

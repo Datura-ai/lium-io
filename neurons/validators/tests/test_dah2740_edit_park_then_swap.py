@@ -13,12 +13,13 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from payload_models.payloads import ContainerCreated, FailedContainerRequest
+from payload_models.payloads import ContainerCreated, ContainerWarningCode, FailedContainerRequest
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
 
 from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
 from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
+from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.prerun_host_probe import prerun_host_probe_command
 
 
@@ -55,6 +56,8 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             names = [part.split()[0].rstrip("$").strip("'") for part in cmd.split("--filter name=^")[1:]]
             present = [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
+        if cmd == HUNG_GPU_QUERY_COMMAND:  # DAH-5301: the pod's GPU is healthy
+            return _ssh_result(stdout="GPU-test, 0, 0\n--compute-apps--\n")
         if "docker stop" in cmd:
             return _ssh_result(exit_status=stop_exit, stderr="tried to kill container, but did not receive an exit event")
         if "docker inspect -f '{{.State.Running}}'" in cmd:
@@ -132,6 +135,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # DAH-5301: the one hung-GPU query while the old container is parked; a healthy GPU adds nothing
+        HUNG_GPU_QUERY_COMMAND,
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         host_key,
@@ -373,6 +378,41 @@ async def test_a_fresh_create_never_parks_anything(svc, monkeypatch):
     assert isinstance(result, ContainerCreated)
     assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
     assert svc.clean_existing_containers.await_args.kwargs["active_container_names"] == ["pod_someone_else"]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "warnings"),
+    [
+        (HungGpuResult(["GPU-test"], ContainerWarningCode.HungGpuReset), [ContainerWarningCode.HungGpuReset]),
+        (RuntimeError("ssh dropped"), []),  # best-effort: the reboot goes on
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc, monkeypatch, outcome, warnings):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    reset = AsyncMock(side_effect=outcome) if isinstance(outcome, Exception) else AsyncMock(return_value=outcome)
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", reset)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated) and result.warnings == warnings
+    assert reset.await_args.args[1] == ["GPU-test"]
+
+
+@pytest.mark.parametrize("edit", [True, False])
+@pytest.mark.asyncio
+async def test_nothing_parked_means_no_hung_gpu_check(svc, monkeypatch, edit):
+    # an edit with no container on the host, or a fresh create
+    payload = _edit_payload() if edit else _payload(active_container_names=["pod_someone_else"])
+    ssh = _ssh_recording(container_present=not edit)
+    _patch_happy(svc, monkeypatch, ssh)
+    reset = AsyncMock()
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", reset)
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    reset.assert_not_awaited()
 
 
 @pytest.mark.asyncio
