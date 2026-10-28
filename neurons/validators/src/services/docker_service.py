@@ -1177,6 +1177,10 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
+class _SameNameContainerKept(Exception):
+    """A re-sent create met the pod's own container already running (or unreadable): it is the renter's, never removed."""
+
+
 class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
     """Raised at a filler's `docker run` while a customer create runs on the same executor."""
 
@@ -2852,8 +2856,9 @@ class DockerService:
                     and pod_id is not None
                     and inflight_creates.is_only_create(pod_id)
                     and f'"/{container_name}" is already in use' in str(exc)
-                    and await self._leftover_container_never_started(docker_client, container_name)
                 ):
+                    if not await self._leftover_container_never_started(docker_client, container_name):
+                        raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
                     await self._remove_failed_rental_container_for_retry(
@@ -5420,19 +5425,23 @@ class DockerService:
         remove_volume: bool = False,
         container_id: str | None = None,
         pod_id: str | None = None,
+        keep_container: bool = False,
     ) -> bool:
         """Remove the failed container's artifacts; report whether it was already gone.
 
         ``container_id``, once the create has one, is what gets read and removed: a concurrent
         retry for the same pod can be running its own container under ``container_name``.
         Without an id, the name is removed only while no other create for ``pod_id`` is live.
+        ``keep_container`` leaves the container alone: a re-sent create met the pod already running.
 
         DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
         on missing evidence.
         """
         container_missing = False
         # without an id, the container under this name may be another live create's: leave it to that create
-        owns_container = container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
+        owns_container = not keep_container and (
+            container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
+        )
         try:
             if owns_container:
                 # DAH-2395: read the death evidence before `rm -fv` destroys it —
@@ -9570,6 +9579,7 @@ class DockerService:
                         remove_volume=created_local_volume,
                         container_id=container_id,
                         pod_id=payload.pod_id,
+                        keep_container=isinstance(docker_run_error, _SameNameContainerKept),
                     )
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.

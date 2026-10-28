@@ -4788,6 +4788,55 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", RuntimeError("inspect failed")])
+async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(docker_service, monkeypatch, status):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    ssh_commands = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
+    pod_id = str(uuid4())
+    client = docker_service.rental_docker_client_factory.client
+    client.run_error = Exception(
+        f'409 Client Error: Conflict ("Conflict. The container name "/pod_{pod_id}" '
+        'is already in use by container "25b3b093".")'
+    )
+    client.container_statuses = [status]
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    with docker_service_module.inflight_creates.track(pod_id):
+        result = await docker_service.create_container(
+            payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted",
+        )
+    assert isinstance(result, FailedContainerRequest)
+    assert not any(f"pod_{pod_id}" in str(call) for call in ssh_commands.call_args_list)
+    assert client.removed_containers == []
+
+
+@pytest.mark.asyncio
 async def test_create_container_does_not_repair_vloopback_mountpoint_twice(
     docker_service, monkeypatch,
 ):
