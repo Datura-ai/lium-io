@@ -1341,13 +1341,16 @@ async def _container_log_tail_or_empty(
         return ""
     tail = tail.strip()
     # a printed env value (e.g. an API key) must not reach the provider; redact before the cut so no half survives
-    for value in sorted({v for v in (environment or {}).values() if len(v) >= LOG_TAIL_REDACT_MIN_CHARS}, key=len, reverse=True):
-        tail = tail.replace(value, "***")
+    secret_values: set[str] = {
+        value for value in (environment or {}).values() if len(value) >= LOG_TAIL_REDACT_MIN_CHARS
+    }
+    for secret_value in sorted(secret_values, key=len, reverse=True):
+        tail = tail.replace(secret_value, "***")
     return tail[-CONTAINER_LOG_TAIL_MAX_CHARS:]
 
 
 async def _attach_filler_log_tail(
-    explained: Exception,
+    explained_failure: Exception,
     docker_client: RentalDockerSdkClient,
     *,
     container_name: str,
@@ -1355,8 +1358,8 @@ async def _attach_filler_log_tail(
     environment: dict[str, str] | None,
     log_extra: dict,
 ) -> None:
-    if isinstance(explained, ImageExitedDuringKeyInjection) and workload_kind == WorkloadKind.FILLER:
-        explained.log_tail = await _container_log_tail_or_empty(
+    if isinstance(explained_failure, ImageExitedDuringKeyInjection) and workload_kind == WorkloadKind.FILLER:
+        explained_failure.log_tail = await _container_log_tail_or_empty(
             docker_client, container_name=container_name, environment=environment, log_extra=log_extra
         )
 

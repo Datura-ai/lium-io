@@ -9,21 +9,23 @@ from services.docker_service import (
     _attach_filler_log_tail,
     _explain_add_public_keys_failure,
 )
-from services.rental_docker_sdk import ContainerStateSnapshot
+from services.rental_docker_sdk import ContainerStateSnapshot, RentalDockerSdkClient
 
 EXITED = ContainerStateSnapshot(
     status="exited", running=False, restarting=False, exit_code=1, restart_count=0, error=None, oom_killed=False
 )
 
 
-def _client(log_tail=None, log_error=None):
+def _client(log_tail: str | None = None, log_error: Exception | None = None) -> Mock:
     client = Mock()
     client.inspect_container_state = AsyncMock(return_value=EXITED)
     client.container_log_tail = AsyncMock(return_value=log_tail, side_effect=log_error)
     return client
 
 
-async def _explain(client, workload_kind, environment=None):
+async def _explain(
+    client: Mock, workload_kind: WorkloadKind, environment: dict[str, str] | None = None
+) -> Exception:
     explained = await _explain_add_public_keys_failure(
         client, container_name="c1", image="jetskipool/jetski-miner:latest", cause=RuntimeError("exec failed"), log_extra={}
     )
@@ -34,7 +36,7 @@ async def _explain(client, workload_kind, environment=None):
 
 
 @pytest.mark.asyncio
-async def test_filler_exit_at_start_carries_the_log_tail_outside_the_error():
+async def test_filler_exit_at_start_carries_the_log_tail_outside_the_error() -> None:
     explained = await _explain(_client(log_tail="error: missing --pool\n"), WorkloadKind.FILLER)
 
     assert isinstance(explained, ImageExitedDuringKeyInjection)
@@ -45,7 +47,7 @@ async def test_filler_exit_at_start_carries_the_log_tail_outside_the_error():
 
 
 @pytest.mark.asyncio
-async def test_filler_log_tail_redacts_the_job_environment():
+async def test_filler_log_tail_redacts_the_job_environment() -> None:
     client = _client(log_tail="key=sk-secret-123 pool=stratum://p:1 empty= gpus=1 of 1\n")
 
     explained = await _explain(
@@ -58,7 +60,7 @@ async def test_filler_log_tail_redacts_the_job_environment():
 
 
 @pytest.mark.asyncio
-async def test_customer_rental_exit_at_start_never_reads_the_log():
+async def test_customer_rental_exit_at_start_never_reads_the_log() -> None:
     client = _client(log_tail="renter secret output")
 
     explained = await _explain(client, WorkloadKind.CUSTOMER_RENTAL)
@@ -69,8 +71,19 @@ async def test_customer_rental_exit_at_start_never_reads_the_log():
 
 
 @pytest.mark.asyncio
-async def test_unreadable_log_keeps_the_exit_message():
+async def test_unreadable_log_keeps_the_exit_message() -> None:
     explained = await _explain(_client(log_error=RuntimeError("logs 500")), WorkloadKind.FILLER)
 
     assert isinstance(explained, ImageExitedDuringKeyInjection)
     assert explained.log_tail == ""
+
+
+@pytest.mark.asyncio
+async def test_sdk_log_tail_asks_docker_for_both_streams_and_decodes_bad_bytes() -> None:
+    api_client = Mock()
+    api_client.logs = Mock(return_value=b"bad \xff byte\n")
+
+    tail = await RentalDockerSdkClient(api_client).container_log_tail(container_name="c1", lines=20)
+
+    assert tail == "bad � byte\n"
+    api_client.logs.assert_called_once_with("c1", stdout=True, stderr=True, tail=20)

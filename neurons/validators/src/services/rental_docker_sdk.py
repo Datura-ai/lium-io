@@ -678,7 +678,7 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
 
-    async def container_log_tail(self, *, container_name: str, lines: int = 20) -> str:
+    async def container_log_tail(self, *, container_name: str, lines: int) -> str:
         """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
         try:
             raw = await _in_docker_thread(
