@@ -255,6 +255,106 @@ def test_g3_legacy_no_nonce_still_accepted(service):
     service._validate_verifier_response(response, expected, _make_executor(), nonce=None)
 
 
+# ---------------------------------------------------------------------------
+# DAH-5314 — verifier reject: reason in the error, one retry on a transient reject
+# ---------------------------------------------------------------------------
+
+
+def test_verifier_reject_error_carries_reason_and_flags(service):
+    # Arrange
+    response = _verifier_response()
+    response["is_valid"] = False
+    response["reason"] = "collateral fetch timed out"
+    expected = "0x" + response["details"]["report_data"][:64]
+
+    # Act / Assert
+    with pytest.raises(AttestationError) as exc:
+        service._validate_verifier_response(response, expected, _make_executor())
+    msg = str(exc.value)
+    assert "is_valid=False" in msg
+    assert "quote_verified=True" in msg
+    assert "report_data_match=True" in msg
+    assert "collateral fetch timed out" in msg
+
+
+def _tdx_executor(service) -> tuple[ExecutorSSHInfo, str]:
+    executor = _make_executor()
+    return executor, service._expected_report_data(executor.ssh_host_key)
+
+
+@pytest.mark.parametrize("flag", ["is_valid", "quote_verified"])
+async def test_verify_tdx_retries_once_on_transient_reject(service, monkeypatch, flag):
+    # Arrange — first answer rejects a quote that binds our report_data, second passes
+    good = _verifier_response()
+    executor, expected = _tdx_executor(service)
+    good["details"]["report_data"] = expected[2:] + "00" * 32
+    bad = json.loads(json.dumps(good))
+    if flag == "is_valid":
+        bad["is_valid"] = False
+    else:
+        bad["details"]["quote_verified"] = False
+    answers = [bad, good]
+    calls = []
+
+    async def fake_call(self, quote_json, ex):
+        calls.append(quote_json)
+        return answers.pop(0)
+
+    monkeypatch.setattr(AttestationService, "_call_verifier", fake_call)
+
+    # Act
+    await service._verify_tdx(executor)
+
+    # Assert — same quote posted twice
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+async def test_verify_tdx_gives_up_after_one_retry(service, monkeypatch):
+    # Arrange
+    bad = _verifier_response()
+    executor, expected = _tdx_executor(service)
+    bad["details"]["report_data"] = expected[2:] + "00" * 32
+    bad["is_valid"] = False
+    calls = []
+
+    async def fake_call(self, quote_json, ex):
+        calls.append(quote_json)
+        return bad
+
+    monkeypatch.setattr(AttestationService, "_call_verifier", fake_call)
+
+    # Act / Assert
+    with pytest.raises(AttestationError, match="Verifier rejected"):
+        await service._verify_tdx(executor)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("case", ["report_data", "nonce"])
+async def test_verify_tdx_no_retry_on_report_data_or_nonce_mismatch(service, monkeypatch, case):
+    # Arrange — report_data does not bind our host key, or does not echo the nonce
+    bad = _verifier_response()
+    executor, expected = _tdx_executor(service)
+    nonce = None
+    if case == "report_data":
+        bad["details"]["report_data"] = "11" * 64
+    else:
+        nonce = AttestationNonce.issue()
+        bad["details"]["report_data"] = expected[2:] + "00" * 32
+    bad["is_valid"] = False
+    calls = []
+
+    async def fake_call(self, quote_json, ex):
+        calls.append(quote_json)
+        return bad
+
+    monkeypatch.setattr(AttestationService, "_call_verifier", fake_call)
+
+    # Act / Assert
+    with pytest.raises(AttestationError):
+        await service._verify_tdx(executor, nonce=nonce)
+    assert len(calls) == 1
+
+
 async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
     # Arrange
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
