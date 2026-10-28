@@ -460,7 +460,7 @@ async def test_an_idle_node_without_sysbox_keeps_only_the_idle_reason(monkeypatc
 @pytest.mark.parametrize("is_rented", [False, True])
 async def test_a_node_in_a_maintenance_window_earns_nothing_rented_or_not(is_rented):
     result = await _incentive().calculate_executor_score(
-        _idle_flagship(gpu_count=4, is_rented=is_rented, is_in_maintenance=True)
+        _idle_full_8x(gpu_count=4, is_rented=is_rented, is_in_maintenance=True)
     )
 
     assert _codes(result)[0] == "provider_maintenance"
