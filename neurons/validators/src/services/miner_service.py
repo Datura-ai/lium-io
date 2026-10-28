@@ -2213,10 +2213,13 @@ class MinerService:
                         operation_name="SSH key submit",
                     )
                     break
-                except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
+                except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
                     is_create = isinstance(payload, ContainerCreateRequest)
                     if not is_create or time.monotonic() >= deadline:
                         raise
+                    if isinstance(e, asyncio.TimeoutError):
+                        # it may have reached the miner and run its rental hook; do not run it again
+                        ssh_request.is_rental_request = False
                     await asyncio.sleep(MINER_RESTART_RETRY_S)
 
             if status != 200 or response_data is None:
