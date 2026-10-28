@@ -121,7 +121,7 @@ from services.prerun_host_probe import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
-from services.hung_gpu_reset import reset_hung_pod_gpus
+from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.loopback_plugin_setup import loopback_plugin_setup_command
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
@@ -11345,54 +11345,56 @@ class DockerService:
                 msg=str(log_text),
             )
 
+    @contextlib.asynccontextmanager
+    async def _hold_gpu_reset_pending_mark(self, payload: ContainerCreateRequest, default_extra: dict):
+        """DAH-5301: the gpu_reset pending-pod mark, as for a renter's Reset GPU: the rented checks skip the
+        node while its GPUs reset. Yields the holder reset_hung_pod_gpus puts its result in; a GPU it reset
+        gets the recent-reset mark before the pending mark goes."""
+        await self.redis_service.add_pending_pod(
+            payload.miner_hotkey,
+            payload.executor_id,
+            payload.pod_id,
+            kind=GPU_RESET_PENDING_KIND,
+            gpu_uuids=payload.gpu_uuids,
+        )
+        reset_result_holder: list[HungGpuResult] = []
+        try:
+            yield reset_result_holder
+        finally:
+            if reset_result_holder and reset_result_holder[0].warning == ContainerWarningCode.HungGpuReset:
+                # the reset cards drop out for a moment: the checks after the reboot must not blame the provider
+                try:
+                    await self.redis_service.mark_gpu_reset_recent(
+                        payload.miner_hotkey,
+                        payload.executor_id,
+                        payload.pod_id,
+                        payload.gpu_uuids,
+                        RECENT_RENTER_GPU_RESET_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                    )
+            try:
+                # only this mark: the create's own pending mark for the pod stays
+                await self.redis_service.remove_pending_pod(
+                    payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=GPU_RESET_PENDING_KIND
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m("Hung GPU reset: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+
     async def _reset_hung_gpus_before_run(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest, default_extra: dict
     ) -> ContainerWarningCode | None:
         """DAH-5301: reset a hung pod GPU while a reboot has the pod's old container parked and stopped.
         Never raises: any error is logged and the reboot goes on as before (None)."""
-
-        @contextlib.asynccontextmanager
-        async def resetting():
-            # as for a renter's Reset GPU: the rented checks skip the node while its GPUs reset
-            await self.redis_service.add_pending_pod(
-                payload.miner_hotkey,
-                payload.executor_id,
-                payload.pod_id,
-                kind=GPU_RESET_PENDING_KIND,
-                gpu_uuids=payload.gpu_uuids,
-            )
-            outcome: list = []
-            try:
-                yield outcome
-            finally:
-                if outcome and outcome[0].warning == ContainerWarningCode.HungGpuReset:
-                    # as after a renter's Reset GPU, and before the pending mark goes: the reset cards drop out
-                    # for a moment, and the checks after the reboot must not blame the provider for it
-                    try:
-                        await self.redis_service.mark_gpu_reset_recent(
-                            payload.miner_hotkey,
-                            payload.executor_id,
-                            payload.pod_id,
-                            payload.gpu_uuids,
-                            RECENT_RENTER_GPU_RESET_SECONDS,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
-                        )
-                try:
-                    # only this mark: the create's own pending mark for the pod stays
-                    await self.redis_service.remove_pending_pod(
-                        payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=GPU_RESET_PENDING_KIND
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        _m("Hung GPU reset: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))
-                    )
-
         try:
             result = await reset_hung_pod_gpus(
-                SSHCommandRunner(ssh_client, max_retries=0), list(payload.gpu_uuids), resetting=resetting
+                SSHCommandRunner(ssh_client, max_retries=0),
+                list(payload.gpu_uuids),
+                resetting=lambda: self._hold_gpu_reset_pending_mark(payload, default_extra),
             )
         except Exception as exc:
             logger.warning(_m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)})))

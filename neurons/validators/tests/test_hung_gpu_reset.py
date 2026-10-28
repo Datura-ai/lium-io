@@ -277,3 +277,20 @@ async def test_removing_the_gpu_reset_mark_keeps_the_creates_own_mark():
     assert [item.get("kind") for item in await redis.get_pending_pods("hk", "ex")] == [None]
     await redis.remove_pending_pod("hk", "ex", "pod1")
     assert await redis.get_pending_pods("hk", "ex") == []
+
+
+@pytest.mark.parametrize("reset_exit", [0, 1])
+@pytest.mark.asyncio
+async def test_the_result_is_handed_to_the_hold_before_it_is_let_go(reset_exit):
+    host = HungHost(query=_query({U[0]: None}), reset_exit=reset_exit, cure_ok=False)
+    seen_on_exit = []
+
+    @contextlib.asynccontextmanager
+    async def hold():
+        reset_result_holder = []
+        yield reset_result_holder
+        seen_on_exit.append(list(reset_result_holder))
+
+    result = await reset_hung_pod_gpus(host, POD, resetting=hold)
+    assert seen_on_exit == [[result]]
+    assert result.warning == (W.HungGpuReset if reset_exit == 0 else W.HungGpuNotResetUnsupported)
