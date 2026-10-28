@@ -7915,6 +7915,26 @@ async def test_a_key_injection_that_fails_on_an_exiting_image_names_the_image(
 
 
 @pytest.mark.asyncio
+async def test_a_filler_that_exits_at_start_sends_its_log_tail_as_its_own_detail_field(
+    docker_service, monkeypatch
+) -> None:
+    docker_service.rental_docker_client_factory.client.container_log_tail = AsyncMock(
+        return_value="error: missing --pool\n"
+    )
+
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="exited", running=False, exit_code=1),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+    )
+
+    detail_fields = json.loads(result.detail.split(" >>> ", 1)[1])
+    assert detail_fields["container_logs_tail"] == "error: missing --pool"
+    assert "missing --pool" not in detail_fields["error"]
+
+
+@pytest.mark.asyncio
 async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_error(
     docker_service, monkeypatch
 ):

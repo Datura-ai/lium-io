@@ -678,6 +678,18 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
 
+    async def container_log_tail(self, *, container_name: str, lines: int) -> str:
+        """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
+        try:
+            raw = await _in_docker_thread(
+                self._api_client.logs, container_name, stdout=True, stderr=True, tail=lines
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK container logs failed", exc)
+            ) from exc
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
+
     async def container_image_id(self, *, container: str) -> str:
         """The image ID (`sha256:…`) the container was created from; a later tag move does not change it."""
         try:
