@@ -158,6 +158,7 @@ from services.rental_docker_sdk import (
     HOST_KILL_EXIT_CODES,
     ContainerCreateRefused,
     ContainerExecSpec,
+    ContainerNameTakenOnRetry,
     ContainerGoneBeforeExec,
     ContainerRunSpec,
     ContainerStateSnapshot,
@@ -2855,7 +2856,11 @@ class DockerService:
                     not own_leftover_removed
                     and pod_id is not None
                     and inflight_creates.is_only_create(pod_id)
-                    and f'"/{container_name}" is already in use' in str(exc)
+                    and (
+                        f'"/{container_name}" is already in use' in str(exc)
+                        # the SDK's transport retry met the same name on another image (a flattened copy)
+                        or isinstance(exc, ContainerNameTakenOnRetry)
+                    )
                 ):
                     if not (
                         await self._leftover_container_never_started(docker_client, container_name)

@@ -101,6 +101,10 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+class ContainerNameTakenOnRetry(RentalDockerOperationError):
+    """A transport retry of `run_container` found the spec's name already held by a container on another image."""
+
+
 class RentalDockerTransportDropped(RentalDockerConnectionError):
     """The SSH channel under a Docker SDK call is gone.
 
@@ -1066,7 +1070,7 @@ class RentalDockerSdkClient:
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
-        raise RentalDockerOperationError(
+        raise ContainerNameTakenOnRetry(
             "Docker SDK run container refused after a transport retry: a container named "
             f"{spec.name} already exists with image {existing_image!r}, not {spec.image!r}"
         )

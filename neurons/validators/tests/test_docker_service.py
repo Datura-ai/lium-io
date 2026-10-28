@@ -39,6 +39,7 @@ from services.docker_service import (
 )
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerNameTakenOnRetry,
     ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
@@ -4850,15 +4851,26 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", RuntimeError("inspect failed")])
-async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(docker_service, monkeypatch, status):
+@pytest.mark.parametrize("transport_retry", [False, True])
+async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(
+    docker_service, monkeypatch, status, transport_retry,
+):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     ssh_commands = AsyncMock()
     monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
     pod_id = str(uuid4())
     client = docker_service.rental_docker_client_factory.client
-    client.run_error = Exception(
-        f'409 Client Error: Conflict ("Conflict. The container name "/pod_{pod_id}" '
-        'is already in use by container "25b3b093".")'
+    client.run_error = (
+        # the SDK's transport retry met the running flattened pod under the original image's name
+        ContainerNameTakenOnRetry(
+            f"Docker SDK run container refused after a transport retry: a container named pod_{pod_id} "
+            f"already exists with image 'lium-flattened:{pod_id}', not 'daturaai/dlph:test'"
+        )
+        if transport_retry
+        else Exception(
+            f'409 Client Error: Conflict ("Conflict. The container name "/pod_{pod_id}" '
+            'is already in use by container "25b3b093".")'
+        )
     )
     client.container_statuses = [status]
     payload = ContainerCreateRequest(

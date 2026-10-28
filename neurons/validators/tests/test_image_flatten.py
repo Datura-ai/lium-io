@@ -419,13 +419,25 @@ def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_oth
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stdout, expected",
+    "stdout, copy_exit, expected",
     [
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS}\n", 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
-        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS - 1}\n", None),  # starts as is: no copy
-        ("garbage\n", None),
+        # uncached many-layer image: the sizing keeps room for the new copy
+        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", 1, 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
+        # its copy is already on the node: the flatten reuses it, so no extra room is kept
+        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", 0, None),
+        # the copy cannot be looked up: keep the room
+        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS} sha256:abc\n", RuntimeError("ssh"), 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
+        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS - 1} sha256:abc\n", 1, None),  # starts as is: no copy
+        ("garbage\n", 1, None),
     ],
 )
-async def test_flatten_copy_bytes_budgets_only_an_image_with_many_layers(stdout, expected):
-    ssh = Mock(run=AsyncMock(return_value=Mock(stdout=stdout)))
-    assert await image_flatten.flatten_copy_bytes(ssh, "sglang") == expected
+async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, copy_exit, expected):
+    async def run(command, **kwargs):
+        if "--format" in command:
+            return Mock(stdout=stdout)
+        assert "lium-flattened:abc" in command
+        if isinstance(copy_exit, Exception):
+            raise copy_exit
+        return Mock(exit_status=copy_exit)
+
+    assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") == expected

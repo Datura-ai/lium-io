@@ -239,17 +239,32 @@ FLATTEN_BUDGET_MIN_LAYERS = 30
 
 async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: str) -> int | None:
     """The disk a one-layer copy of the local `image` would take (its size plus FLATTEN_DISK_MARGIN_BYTES), for
-    the sizing to keep free; None when the image has too few layers to need one or cannot be read."""
+    the sizing to keep free; None when the image has too few layers to need one, its copy is already on the
+    node (a flatten reuses it, writing nothing), or it cannot be read."""
     try:
         result = await ssh_client.run(
-            f"/usr/bin/docker image inspect --format '{{{{.Size}}}} {{{{len .RootFS.Layers}}}}' {shlex.quote(image)}",
+            "/usr/bin/docker image inspect --format '{{.Size}} {{len .RootFS.Layers}} {{.Id}}' "
+            f"{shlex.quote(image)}",
             check=True,
             timeout=_DOCKER_READ_TIMEOUT_SECONDS,
         )
-        size, layers = (int(word) for word in str(result.stdout).split())
+        size_word, layers_word, image_id = str(result.stdout).split()
+        size, layers = int(size_word), int(layers_word)
     except Exception:
         return None
-    return size + FLATTEN_DISK_MARGIN_BYTES if layers >= FLATTEN_BUDGET_MIN_LAYERS else None
+    if layers < FLATTEN_BUDGET_MIN_LAYERS:
+        return None
+    tag = f"{FLATTENED_IMAGE_REPO}:{image_id.removeprefix('sha256:')}"
+    try:
+        copy = await ssh_client.run(
+            f"/usr/bin/docker image inspect {shlex.quote(tag)} >/dev/null 2>&1",
+            check=False,
+            timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        copy = None  # unknown: keep the room for a new copy
+    # shortcut: the copy may be removed before the flatten reuses it; the flatten's own disk check then refuses
+    return None if copy is not None and copy.exit_status == 0 else size + FLATTEN_DISK_MARGIN_BYTES
 
 
 async def flatten_image_on_host(
