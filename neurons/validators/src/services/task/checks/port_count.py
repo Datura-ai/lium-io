@@ -1,14 +1,81 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
+import redis.exceptions
+from core.config import settings
 from services.const import MIN_PORT_COUNT
 from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+
+logger = logging.getLogger(__name__)
+
+# DAH-5187 follow-up: the last count that met the floor, kept for a day, so a probe that collapses while our
+# own filler saturates the host (checkpoint download; 1-2 of 300 ports answer) keeps it instead of hiding the node.
+LAST_GOOD_PORTS_KEY_PREFIX = "port_count_last_good"
+LAST_GOOD_PORTS_TTL_SECONDS = 24 * 3600
+# near-zero: at most this share of the probed ports answered (2 of 300 is; 2 of 3 is a small range, not a collapse)
+FILLER_COLLAPSE_MAX_ANSWER_SHARE = 0.1
+_REDIS_ERRORS = (redis.exceptions.RedisError, OSError, TypeError, ValueError)
+
+
+def _last_good_key(ctx: Context) -> str:
+    return f"{LAST_GOOD_PORTS_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+def probe_collapsed(state: ContextState) -> bool:
+    """The probe tested a real sample and next to none of it answered."""
+    probed = state.probed_port_count or 0
+    return (
+        probed >= MIN_PORT_COUNT
+        and state.verified_port_count <= probed * FILLER_COLLAPSE_MAX_ANSWER_SHARE
+    )
+
+
+async def last_good_ports_under_filler(ctx: Context) -> dict[str, Any] | None:
+    """The last count that met the floor (<= 24 h old), when our own filler runs on the node and the probe collapsed.
+
+    None otherwise: no filler of ours, a probe where more than a few ports answered, no recent good count, or Redis
+    unreadable. A real port drop with no filler on the node still hides it.
+    """
+    rented_data = ctx.state.rented_data
+    if (
+        not rented_data
+        or not rented_data.get_filler_containers(ctx.executor.uuid)
+        or not probe_collapsed(ctx.state)
+    ):
+        return None
+    try:
+        kept = json.loads(await ctx.services.redis.get(_last_good_key(ctx)) or "null")
+    except _REDIS_ERRORS:
+        logger.warning("port_count_last_good read failed for %s", ctx.executor.uuid, exc_info=True)
+        return None
+    if (
+        not isinstance(kept, dict)
+        or not isinstance(kept.get("count"), int)
+        or kept["count"] < MIN_PORT_COUNT
+    ):
+        return None
+    return kept
+
+
+async def remember_good_ports(ctx: Context, port_count: int, verified_ports: list[int]) -> None:
+    # A dry run shares Redis with the live validator, so it leaves the live record alone.
+    if settings.DRY_RUN:
+        return
+    record = {"count": port_count, "ports": verified_ports, "at": datetime.now(UTC).isoformat()}
+    try:
+        await ctx.services.redis.set(
+            _last_good_key(ctx), json.dumps(record), ex=LAST_GOOD_PORTS_TTL_SECONDS
+        )
+    except _REDIS_ERRORS:
+        logger.warning("port_count_last_good write failed for %s", ctx.executor.uuid, exc_info=True)
 
 
 def port_count_below_listing_floor(state: ContextState) -> int | None:
@@ -104,6 +171,39 @@ class PortCountCheck:
             },
         )
 
+        if (
+            not is_rented
+            and port_count < MIN_PORT_COUNT
+            and (kept := await last_good_ports_under_filler(ctx))
+        ):
+            kept_ports = [p for p in kept.get("ports") or [] if isinstance(p, int)]
+            kept_state = replace(
+                updated_state,
+                specs={
+                    **updated_state.specs,
+                    "available_port_count": kept["count"],
+                    "verified_ports": kept_ports,
+                },
+            )
+            event = render_message(
+                Msg.PORT_COUNT_RECORDED,
+                ctx=ctx,
+                check_id=self.check_id,
+                severity="warning",
+                impact="Our filler is saturating the host; the last verified port count is kept",
+                what={
+                    "available_port_count": kept["count"],
+                    "kept_last_verified_count": True,
+                    "last_verified_at": kept.get("at"),
+                    "probe_answered_port_count": ctx.state.verified_port_count,
+                    "probed_port_count": ctx.state.probed_port_count,
+                    "filler_containers": rented_data.get_filler_containers(ctx.executor.uuid),
+                },
+            )
+            return CheckResult(
+                passed=True, event=event, updates={"port_count": kept["count"], "state": kept_state}
+            )
+
         if not is_rented and port_count < MIN_PORT_COUNT:
             # DAH-2991: when the shortfall is our own leftover — an orphaned rental container the
             # cleanup could not remove — say so, instead of a bare count (ticket-0287 diagnosed it by hand).
@@ -141,6 +241,7 @@ class PortCountCheck:
                 what={**port_floor_what(updated_state, port_count), "exempt_because_rented": True},
             )
         else:
+            await remember_good_ports(ctx, port_count, verified_ports)
             event = render_message(
                 Msg.PORT_COUNT_RECORDED,
                 ctx=ctx,

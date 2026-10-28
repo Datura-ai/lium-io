@@ -35,7 +35,7 @@ from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.service import ExecutorConnectivityService
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_rented_machine_check import DummyBackendClient, DummySSHClient
 
 DECLARED_RANGE = "40000-65535"
@@ -584,3 +584,67 @@ async def test_ports_held_by_our_filler_count_toward_the_floor_and_can_be_rented
     # rent path: no pod holds a port (a filler creates none), so all 4 are free to allocate
     busy_pod_ports: set[int] = set()
     assert len(set(specs["verified_ports"]) - busy_pod_ports) >= MIN_PORT_COUNT
+
+
+FILLER = "filler_11111111-2222-3333-4444-555555555555"
+
+
+def filler_run_ctx(
+    context_factory,
+    redis,
+    *,
+    verified: int,
+    probed: int = BATCH_PORT_VERIFICATION_SIZE,
+    filler=True,
+):
+    rented_data = RentedExecutorsResponse(
+        executors={}, all_filler_containers_by_executor={EXECUTOR_UUID: [FILLER]} if filler else {}
+    )
+    state = build_state(
+        verified_port_count=verified,
+        probed_port_count=probed,
+        specs={"verified_ports": list(range(40000, 40000 + verified))},
+        rented_data=rented_data,
+    )
+    return context_factory(executor=executor(), state=state, services=build_services(redis=redis))
+
+
+@pytest.mark.asyncio
+async def test_our_filler_saturating_the_host_keeps_the_last_good_count(context_factory):
+    """DAH-5187 follow-up: 8x nodes answered 1-2 of 300 ports during our ENGY_TEE checkpoint download
+    and were hidden; the count from the last good cycle (<= 24 h) is kept while our filler runs."""
+    redis = FakeRedis()
+    good, _ = await apply(filler_run_ctx(context_factory, redis, verified=300), PortCountCheck())
+    assert good.passed is True
+    assert redis.ttl[f"port_count_last_good:miner-hotkey:{EXECUTOR_UUID}"] == 24 * 3600
+
+    result, ctx = await apply(filler_run_ctx(context_factory, redis, verified=2), PortCountCheck())
+
+    assert result.passed is True
+    assert result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
+    assert result.event.what_we_saw["kept_last_verified_count"] is True
+    assert ctx.state.specs["available_port_count"] == result.updates["port_count"] == 300
+    assert ctx.state.specs["verified_ports"] == list(range(40000, 40300))
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["no_filler", "no_recent_good_count", "not_a_collapse"],
+)
+@pytest.mark.asyncio
+async def test_a_real_port_drop_still_hides_the_node(context_factory, case):
+    redis = FakeRedis()
+    if case != "no_recent_good_count":
+        await apply(filler_run_ctx(context_factory, redis, verified=300), PortCountCheck())
+    ctx = filler_run_ctx(
+        context_factory,
+        redis,
+        verified=2,
+        probed=3 if case == "not_a_collapse" else BATCH_PORT_VERIFICATION_SIZE,
+        filler=case != "no_filler",
+    )
+
+    result, _ = await apply(ctx, PortCountCheck())
+
+    assert result.passed is False
+    assert result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
