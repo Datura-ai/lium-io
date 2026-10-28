@@ -7,7 +7,7 @@ import shlex
 import statistics
 import time
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import aiohttp
 
@@ -20,6 +20,7 @@ from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 from ..messages import ContainerDownloadSpeedMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_probe import _MIN_TASK_SECONDS_LEFT
 
 logger = logging.getLogger(__name__)
 
@@ -68,47 +69,69 @@ _FETCH_SCRIPT = (
 )
 
 
-# DAH-5320 sustained phase: STREAMS parallel reads of CONTAINER_DOWNLOAD_SUSTAINED_URL for SUSTAINED_SECONDS, the
-# container's received bytes (/proc/net/dev, every interface but lo: all streams together) sampled every
-# WINDOW_SECONDS. A window counts while a stream is still running at its start, so a node that reads the whole object
-# early is not read as stalled after it. Shadow only: logged, never part of the check's result.
+# DAH-5320 sustained phase: STREAMS parallel streams read CONTAINER_DOWNLOAD_SUSTAINED_URL in CHUNK_BYTES requests
+# until SUSTAINED_SECONDS pass or the run has read CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES, so the object's size does not
+# end the read. Busybox wget refuses a 206 to a Range header, so each request is a plain GET cut at CHUNK_BYTES by
+# `head -c`: the same bytes and request count as a range read. The container's received bytes (/proc/net/dev, every
+# interface but lo: all streams together) are sampled every WINDOW_SECONDS. A window counts while a stream is still
+# running at its start, so a node that reaches the byte cap early is not read as stalled after it. Shadow only.
 SUSTAINED_STREAMS = 4
 SUSTAINED_SECONDS = 60
 WINDOW_SECONDS = 10
+CHUNK_BYTES = 32 * 1024 * 1024
 SUSTAINED_MIN_MEDIAN_MBPS = 100.0
-# a window under this is a stall; more than STALL_WINDOWS of them in a row (over 30 s) fails
+# a window under this is a stall; STALL_WINDOWS of them in a row (30 s) fail
 STALL_MBPS = 1.0
 STALL_WINDOWS = 3
-# container start plus the 60 s read
+# the NIC re-read (2 s), container start and the 60 s read
 SUSTAINED_COMMAND_TIMEOUT_SECONDS = 120
+# the backend's rented re-read before the run: one un-retried read with a 30 s timeout
+_REREAD_SECONDS = 30
 SUSTAINED_INTERVAL_SECONDS = 24 * 3600
 _SUSTAINED_REDIS_PREFIX = "container_download_sustained"
-# the executor task is cancelled at JOB_TIME_OUT - 120 (miner_service); the phase starts only while it fits before that
-_TASK_TIMEOUT_MARGIN_SECONDS = 120
 _SUSTAINED_MARKER = "lium_dls"
+# the executor task is cancelled at JOB_TIME_OUT - 120 (miner_service)
+_TASK_TIMEOUT_MARGIN_SECONDS = 120
 
 
-def sustained_script(url: str) -> str:
+def sustained_script(url: str, max_bytes: int) -> str:
     streams = " ".join(str(i) for i in range(1, SUSTAINED_STREAMS + 1))
+    requests_per_stream = max(1, max_bytes // CHUNK_BYTES // SUSTAINED_STREAMS)
+    # one stream: a chunk read whole goes on (wget dies of SIGPIPE at the cut, any exit); time up mid-chunk ends it;
+    # a short object (exit 0 under a chunk) or a wget error ends it with that error
+    stream = (
+        f"( k=0; rc=0; end=$(( $(ups) + {SUSTAINED_SECONDS} )); while [ $k -lt {requests_per_stream} ]; do "
+        "left=$(( end - $(ups) )); [ $left -gt 0 ] || break; "
+        f"n=$( {{ timeout $left wget -q -O - {shlex.quote(url)} 2>/tmp/e$i; echo $? >/tmp/w$i; }} "
+        f"| head -c {CHUNK_BYTES} | wc -c); w=$(cat /tmp/w$i); k=$((k+1)); "
+        f"[ $n -ge {CHUNK_BYTES} ] && continue; "
+        "case $w in 124|143|137) break;; 0) rc=short; break;; *) rc=$w; break;; esac; "
+        "done; echo $rc >/tmp/rc$i ) & "
+    )
     return (
-        "up() { cut -d' ' -f1 /proc/uptime; }; "
+        "up() { cut -d' ' -f1 /proc/uptime; }; ups() { cut -d. -f1 /proc/uptime; }; "
         "rx() { awk '/:/ && !/lo:/ {sub(/^[^:]*:/, \"\"); s += $1} END {print s + 0}' /proc/net/dev; }; "
         f"alive() {{ a=0; for i in {streams}; do [ -f /tmp/rc$i ] || a=$((a+1)); done; echo $a; }}; "
-        f"for i in {streams}; do ( timeout {SUSTAINED_SECONDS} wget -q -O /dev/null {shlex.quote(url)} "
-        "2>/tmp/e$i; echo $? >/tmp/rc$i ) & done; "
-        f'w=0; while :; do a=$(alive); echo "{_SUSTAINED_MARKER} t=$(up) rx=$(rx) alive=$a"; '
+        f"for i in {streams}; do {stream}done; "
+        f's0=$(ups); w=0; while :; do a=$(alive); echo "{_SUSTAINED_MARKER} t=$(up) rx=$(rx) alive=$a"; '
         f"[ $w -ge {SUSTAINED_SECONDS // WINDOW_SECONDS} ] && break; [ $a = 0 ] && break; "
-        f"w=$((w+1)); sleep {WINDOW_SECONDS}; done; wait; "
+        # a stream's exit wakes busybox sleep early, so wait for the window's end on the clock
+        f"w=$((w+1)); while [ $(ups) -lt $((s0 + w * {WINDOW_SECONDS})) ]; do sleep 1; done; done; wait; "
         f'for i in {streams}; do echo "{_SUSTAINED_MARKER}_rc s=$i rc=$(cat /tmp/rc$i 2>/dev/null) '
         f"err=$(head -c {_TAIL_CHARS} /tmp/e$i 2>/dev/null | tr '\\n' ' ')\"; done; exit 0"
     )
 
 
-def parse_sustained(stdout: str) -> tuple[list[float], list[str]]:
-    """The window readings in Mbps, and why a stream ended other than by finishing or by the time limit."""
+class SustainedReading(NamedTuple):
+    windows: list[float]
+    errors: list[str]
+
+
+def parse_sustained(stdout: str) -> SustainedReading:
+    """The window readings in Mbps, and why a stream ended other than by the time limit or the byte cap."""
     samples: list[tuple[float, int, int]] = []
     errors: list[str] = []
-    rcs = 0
+    stream_exit_lines = 0
     for line in (stdout or "").splitlines():
         if line.startswith(f"{_SUSTAINED_MARKER} "):
             tokens = dict(t.partition("=")[::2] for t in line.split()[1:])
@@ -117,23 +140,23 @@ def parse_sustained(stdout: str) -> tuple[list[float], list[str]]:
             except (KeyError, ValueError):
                 continue
         elif line.startswith(f"{_SUSTAINED_MARKER}_rc "):
-            rcs += 1
+            stream_exit_lines += 1
             head, _, err = line.partition(" err=")
             rc = dict(t.partition("=")[::2] for t in head.split()[1:]).get("rc", "")
-            if not rc.isdigit() or (int(rc) != 0 and int(rc) not in _TIMEOUT_EXITS):
+            if rc != "0":
                 errors.append(f"rc={rc or 'none'} {err.strip()}"[:_TAIL_CHARS])
-    if rcs < SUSTAINED_STREAMS:
+    if stream_exit_lines < SUSTAINED_STREAMS:
         errors.append("no_output")
     windows = [
         round((rx - prev_rx) * 8 / max(t - prev_t, 0.01) / 1e6, 1)
         for (prev_t, prev_rx, alive), (t, rx, _) in zip(samples, samples[1:], strict=False)
         if alive > 0
     ]
-    return windows, errors
+    return SustainedReading(windows, errors)
 
 
-def sustained_verdict(windows: list[float]) -> str | None:
-    """fail: median window under SUSTAINED_MIN_MEDIAN_MBPS, or a stall over 30 s; None: nothing measured."""
+def sustained_verdict(windows: list[float]) -> Literal["pass", "fail"] | None:
+    """fail: median window under SUSTAINED_MIN_MEDIAN_MBPS, or a stall of 30 s or more; None: nothing measured."""
     if not windows:
         return None
     if statistics.median(windows) < SUSTAINED_MIN_MEDIAN_MBPS:
@@ -141,7 +164,7 @@ def sustained_verdict(windows: list[float]) -> str | None:
     stalled = 0
     for mbps in windows:
         stalled = stalled + 1 if mbps < STALL_MBPS else 0
-        if stalled > STALL_WINDOWS:
+        if stalled >= STALL_WINDOWS:
             return "fail"
     return "pass"
 
@@ -315,8 +338,10 @@ class ContainerDownloadSpeedCheck:
         if rented_executor is not None and rented_executor.pods:
             return self._skipped(ctx, "rented")
         if rented_data is not None and rented_data.get_filler_containers(ctx.executor.uuid):
-            return self._skipped(ctx, "filler running")
-        result = await self._short_phase(ctx)
+            # the short phase leaves a filler node alone; the sustained one measures it unless its NIC is busy
+            result = self._skipped(ctx, "filler running")
+        else:
+            result = await self._short_phase(ctx)
         try:
             await self._sustained(ctx)
         except Exception:  # noqa: BLE001 — shadow only: nothing it hits may change the result
@@ -379,10 +404,8 @@ class ContainerDownloadSpeedCheck:
         await self._save(ctx, key, state)
         return self._verdict(ctx, state, probed=True)
 
-    async def _sustained(self, ctx: Context) -> None:
-        if not settings.CONTAINER_DOWNLOAD_SUSTAINED_ENABLED:
-            return
-        key = f"{_SUSTAINED_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    async def _sustained_is_due(self, ctx: Context, key: str) -> bool:
+        """Once a day per node, at the node's phase, and only while the checks after this one keep their time."""
         redis = ctx.services.redis
         raw = await redis.get(key)
         now = time.time()
@@ -393,37 +416,76 @@ class ContainerDownloadSpeedCheck:
                 str(now - _phase_fraction(ctx.executor.uuid) * SUSTAINED_INTERVAL_SECONDS),
                 ex=2 * SUSTAINED_INTERVAL_SECONDS,
             )
-            return
+            return False
         if now < float(raw) + SUSTAINED_INTERVAL_SECONDS:
-            return
+            return False
+        # RentalProbeCheck runs later in the cycle and starts only with its own reserve left; this phase never takes it
+        reserve = _REREAD_SECONDS + SUSTAINED_COMMAND_TIMEOUT_SECONDS + _MIN_TASK_SECONDS_LEFT
         left = settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
-        if left < SUSTAINED_COMMAND_TIMEOUT_SECONDS:
-            return  # this cycle is late; the next one reads it
-        await redis.set(key, str(now), ex=2 * SUSTAINED_INTERVAL_SECONDS)
+        return left >= reserve
+
+    async def _busy_now(self, ctx: Context) -> str | None:
+        """Why the node is not idle now (the cycle's rented state is minutes old); unknown counts as busy."""
+        try:
+            fresh = await ctx.services.backend.get_rented_executors_now()
+            if fresh is None:
+                return "rented state unknown"
+            rented_executor = fresh.executors.get(ctx.executor.uuid)
+            if rented_executor is not None and rented_executor.pods:
+                return "rented"
+            if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
+                return "rent in progress"
+        except Exception:  # noqa: BLE001 — unknown counts as busy
+            return "rented state unknown"
+        # the host NICs over 2 s, as RentedThroughputCheck reads them: a filler or the provider's own traffic
+        from .rented_throughput import _SNAPSHOT, parse_busy  # here: rented_throughput imports this module
+
+        snapshot = await ctx.runner.run(_SNAPSHOT, timeout=30, retryable=False)
+        net_mbps, _ = parse_busy(snapshot.stdout or "")
+        if net_mbps is None or net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS:
+            return f"nic busy ({net_mbps} Mbps)"
+        return None
+
+    async def _sustained(self, ctx: Context) -> None:
+        if not settings.CONTAINER_DOWNLOAD_SUSTAINED_ENABLED:
+            return
+        key = f"{_SUSTAINED_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+        if not await self._sustained_is_due(ctx, key):
+            return
+        busy = await self._busy_now(ctx)
+        if busy is not None:
+            # not stamped: the next cycle tries again
+            logger.info(
+                _m("CONTAINER_DOWNLOAD_SUSTAINED", extra=get_extra_info({**ctx.default_extra, "skipped": busy}))
+            )
+            return
+        await ctx.services.redis.set(key, str(time.time()), ex=2 * SUSTAINED_INTERVAL_SECONDS)
+        script = sustained_script(
+            settings.CONTAINER_DOWNLOAD_SUSTAINED_URL, settings.CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES
+        )
         result = await ctx.runner.run(
-            download_speed_command(
-                bool(ctx.state.sysbox_runtime), sustained_script(settings.CONTAINER_DOWNLOAD_SUSTAINED_URL)
-            ),
+            download_speed_command(bool(ctx.state.sysbox_runtime), script),
             timeout=SUSTAINED_COMMAND_TIMEOUT_SECONDS,
             retryable=False,
         )
         stdout = result.stdout or ""
-        windows, errors = parse_sustained(stdout)
+        reading = parse_sustained(stdout)
+        errors = list(reading.errors)
         network = next(
             (ln.split("=", 1)[1] for ln in stdout.splitlines() if ln.startswith(f"{MARKER}_net name=")), None
         )
         if result.error_type is not None:
             errors.append(f"{result.error_type}: {result.error_message or ''}"[:_TAIL_CHARS])
-        # a stream that failed (DNS, HTTP error, no object) is no verdict: the short phase judges reachability
-        verdict = None if errors else sustained_verdict(windows)
+        # a stream that failed (DNS, HTTP error, short object) is no verdict: the short phase judges reachability
+        verdict = None if errors else sustained_verdict(reading.windows)
         logger.info(
             _m(
                 "CONTAINER_DOWNLOAD_SUSTAINED",
                 extra=get_extra_info(
                     {
                         **ctx.default_extra,
-                        "windows_mbps": windows,
-                        "median_mbps": statistics.median(windows) if windows else None,
+                        "windows_mbps": reading.windows,
+                        "median_mbps": statistics.median(reading.windows) if reading.windows else None,
                         "shadow_verdict": verdict,
                         "errors": errors,
                         "network": network,

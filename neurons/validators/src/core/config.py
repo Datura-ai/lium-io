@@ -540,14 +540,19 @@ class Settings(BaseSettings):
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
     # DAH-5320: the 16 MiB read above is over in a second; a node can start fast and stall. Once a day per idle node
-    # ContainerDownloadSpeedCheck also reads SUSTAINED_URL (a large object on our CDN; the S3 public/ prefix behind
-    # CloudFront) on 4 streams for 60 s and logs CONTAINER_DOWNLOAD_SUSTAINED with six 10 s window readings and a
-    # shadow verdict (fail: median window under 100 Mbps, or under 1 Mbps for more than 30 s). Logged only: no score,
+    # (filler nodes too, unless the host NICs already move RENTED_THROUGHPUT_BUSY_MBPS) ContainerDownloadSpeedCheck
+    # reads SUSTAINED_URL (an object on our CDN; the S3 public/ prefix behind CloudFront) in 32 MiB requests on 4
+    # streams for 60 s, at most SUSTAINED_MAX_BYTES a run (64 requests at 2 GiB; fleet egress about $25/day), and
+    # logs CONTAINER_DOWNLOAD_SUSTAINED with six 10 s window readings and a shadow verdict (fail: median window under
+    # 100 Mbps, or under 1 Mbps for 30 s or more). Logged only: no score,
     # verification, availability or rental outcome reads it. ENFORCE_ENABLED is read by nothing yet; the follow-up
     # (two shadow fails in a row -> CONTAINER_DOWNLOAD_SLOW, score 0) turns it on.
     CONTAINER_DOWNLOAD_SUSTAINED_ENABLED: bool = Field(env="CONTAINER_DOWNLOAD_SUSTAINED_ENABLED", default=True)
     CONTAINER_DOWNLOAD_SUSTAINED_URL: str = Field(
-        env="CONTAINER_DOWNLOAD_SUSTAINED_URL", default="https://cdn.lium.io/public/speedtest/1GiB.bin"
+        env="CONTAINER_DOWNLOAD_SUSTAINED_URL", default="https://cdn.lium.io/public/speedtest/256MiB.bin"
+    )
+    CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES: int = Field(
+        env="CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES", default=2 * 1024**3, gt=0
     )
     CONTAINER_DOWNLOAD_SUSTAINED_ENFORCE_ENABLED: bool = Field(
         env="CONTAINER_DOWNLOAD_SUSTAINED_ENFORCE_ENABLED", default=False

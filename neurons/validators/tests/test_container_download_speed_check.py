@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
@@ -103,6 +103,8 @@ def flags(*, reachable=True, sustained=False):
         CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS=6.0,
         CONTAINER_DOWNLOAD_SUSTAINED_ENABLED=sustained,
         CONTAINER_DOWNLOAD_SUSTAINED_URL="https://cdn.example/public/big.bin",
+        CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES=2 * 1024**3,
+        RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         JOB_TIME_OUT=900,
     )
     clock = Clock()
@@ -343,7 +345,7 @@ async def test_a_deploy_keeps_the_open_streak_saved_under_the_uuid_alone():
 # DAH-5320 sustained phase: cumulative received bytes every 10 s, then each stream's exit
 
 
-def sustained(mbps: list[float], rcs=(143, 143, 143, 143), alive_after: int | None = None) -> str:
+def sustained(mbps: list[float], rcs=("0", "0", "0", "0"), alive_after: int | None = None) -> str:
     rx, out = 0, [f"lium_dls t=0.00 rx=0 alive={4 if mbps else 0}"]
     for i, m in enumerate(mbps, 1):
         rx += int(m * 1e6 / 8 * 10)
@@ -351,6 +353,38 @@ def sustained(mbps: list[float], rcs=(143, 143, 143, 143), alive_after: int | No
         out.append(f"lium_dls t={i * 10}.00 rx={rx} alive={alive}")
     out += [f"lium_dls_rc s={s} rc={rc} err=" for s, rc in enumerate(rcs, 1)]
     return RENTALS + "\n".join(out) + "\n"
+
+
+def nic(mbps: float) -> str:
+    """Two host NIC snapshots 2 s apart, as RentedThroughputCheck reads them."""
+    return f"lium_tp t=0.00 rx=0 tx=0 io=\nlium_tp t=2.00 rx={int(mbps * 1e6 / 8 * 2)} tx=0 io=\n"
+
+
+IDLE_NIC = nic(5)
+POD = RentedExecutorsResponse(
+    executors={
+        EXECUTOR.uuid: RentedExecutor(
+            miner_hotkey="miner-hotkey",
+            executor_ip_address=EXECUTOR.address,
+            executor_ip_port=str(EXECUTOR.port),
+            pods=[RentedPod(pod_id="p1", container_name="pod_p1")],
+        )
+    }
+)
+FILLER = RentedExecutorsResponse(executors={}, all_filler_containers_by_executor={EXECUTOR.uuid: ["filler_1"]})
+
+
+def due_ctx(clock, *answers: str, rented_data=None, fresh=None):
+    """A node whose daily sustained read is due; the backend's re-read answers `fresh` (idle by default)."""
+    ctx, runner, redis = make_ctx(*answers, rented_data=rented_data)
+    redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"] = str(clock.now - 2 * 86400)
+    redis.renting_in_progress = AsyncMock(return_value=False)
+    ctx.services.backend.get_rented_executors_now.return_value = fresh or RentedExecutorsResponse(executors={})
+    return ctx, runner, redis
+
+
+def sustained_runs(runner) -> int:
+    return sum("wget -q -O -" in c and "lium_dls" in c for c in runner.commands)
 
 
 @pytest.mark.parametrize(
@@ -362,73 +396,95 @@ def sustained(mbps: list[float], rcs=(143, 143, 143, 143), alive_after: int | No
     ],
 )
 def test_sustained_verdict_on_the_window_series(mbps, verdict):
-    windows, errors = module.parse_sustained(sustained(mbps))
-    assert errors == [] and len(windows) == 6
-    assert module.sustained_verdict(windows) == verdict
+    reading = module.parse_sustained(sustained(mbps))
+    assert reading.errors == [] and len(reading.windows) == 6
+    assert module.sustained_verdict(reading.windows) == verdict
 
 
-def test_sustained_stall_needs_more_than_30_s():
-    # the stall rule alone, as a series with fewer windows (an object read whole) can trip it under a passing median
-    assert module.sustained_verdict([500, 0.1, 0.1, 0.1, 500, 500, 500]) == "pass"
-    assert module.sustained_verdict([500, 0.1, 0.1, 0.1, 0.1, 500, 500, 500, 500, 500]) == "fail"
+def test_sustained_stall_of_30_s_fails_and_20_s_does_not():
+    assert module.sustained_verdict([500, 0.1, 0.1, 500, 500, 500]) == "pass"
+    assert module.sustained_verdict([500, 500, 0.1, 0.1, 0.1, 500, 500]) == "fail"  # exactly 30 s
 
 
-def test_sustained_object_read_whole_early_drops_the_idle_windows_and_a_stream_error_is_no_verdict():
-    windows, errors = module.parse_sustained(sustained([3000, 3000, 0, 0, 0, 0], rcs=(0, 0, 0, 0), alive_after=2))
-    assert windows == [3000.0, 3000.0] and not errors and module.sustained_verdict(windows) == "pass"
-    windows, errors = module.parse_sustained(sustained([0.0], rcs=(1, 1, 1, 1), alive_after=1))
-    assert errors and len(errors) == 4  # e.g. the object answers 403: not the node's fault
-    assert module.parse_sustained(RENTALS)[1] == ["no_output"]
+def test_sustained_byte_cap_reached_early_drops_the_idle_windows_and_a_stream_error_is_no_verdict():
+    reading = module.parse_sustained(sustained([3000, 3000, 0, 0, 0, 0], alive_after=2))
+    assert reading.windows == [3000.0, 3000.0] and not reading.errors
+    assert module.sustained_verdict(reading.windows) == "pass"
+    reading = module.parse_sustained(sustained([0.0], rcs=("1", "1", "short", "1"), alive_after=1))
+    assert len(reading.errors) == 4  # e.g. the object answers 403, or is shorter than a chunk: not the node's fault
+    assert module.parse_sustained(RENTALS).errors == ["no_output"]
+
+
+def test_sustained_script_reads_chunks_up_to_the_byte_cap():
+    script = module.sustained_script("https://cdn.example/x.bin", 2 * 1024**3)
+    # 2 GiB in 32 MiB requests over 4 streams: 16 a stream, 64 a run
+    assert f"head -c {module.CHUNK_BYTES}" in script and "[ $k -lt 16 ]" in script
+    assert "Range" not in script  # busybox wget fails on a 206
 
 
 async def test_sustained_runs_once_a_day_at_the_node_phase_and_never_changes_the_result(caplog):
     with flags(sustained=True) as clock, caplog.at_level("INFO"):
-        ctx, runner, redis = make_ctx(FAST, sustained([5, 5, 5, 5, 5, 5]), redis=FakeRedis())
+        ctx, runner, redis = make_ctx(FAST, IDLE_NIC, sustained([5, 5, 5, 5, 5, 5]))
+        redis.renting_in_progress = AsyncMock(return_value=False)
+        ctx.services.backend.get_rented_executors_now.return_value = RentedExecutorsResponse(executors={})
         check = ContainerDownloadSpeedCheck()
         key = f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"
         with patch.object(module, "_phase_fraction", lambda uuid: 1.0):
             first = await check.run(ctx)  # first sight: the short phase, sustained only due at the node's phase
         assert len(runner.commands) == 1 and key in redis.store
         res = await check.run(ctx)  # due now: the shadow fail is logged, the short phase's "not due" stands
-        assert len(runner.commands) == 2 and "wget -q -O /dev/null" in runner.commands[1]
+        assert sustained_runs(runner) == 1
         assert first.passed and res.passed and res.event.reason_code == Msg.SKIPPED.reason
-        record = next(r for r in caplog.records if "CONTAINER_DOWNLOAD_SUSTAINED" in r.getMessage())
+        record = next(r for r in caplog.records if r.getMessage() == "CONTAINER_DOWNLOAD_SUSTAINED")
         extra = record.msg.extra
         assert extra["shadow_verdict"] == "fail" and extra["windows_mbps"] == [5.0] * 6 and not extra["enforced"]
 
-        def sustained_runs() -> int:
-            return sum("wget -q -O /dev/null" in c for c in runner.commands)
-
         clock.now += 23 * 3600
         await check.run(ctx)
-        assert sustained_runs() == 1
+        assert sustained_runs(runner) == 1
         clock.now += 3600
+        runner.answers = [IDLE_NIC, sustained([400] * 6)]  # the short phase read at +23 h is not due
         await check.run(ctx)  # a day after the last one
-        assert sustained_runs() == 2
+        assert sustained_runs(runner) == 2
 
 
-async def test_sustained_skips_rented_nodes_and_a_late_cycle():
-    pod = RentedExecutorsResponse(
-        executors={
-            EXECUTOR.uuid: RentedExecutor(
-                miner_hotkey="miner-hotkey",
-                executor_ip_address=EXECUTOR.address,
-                executor_ip_port=str(EXECUTOR.port),
-                pods=[RentedPod(pod_id="p1", container_name="pod_p1")],
-            )
-        }
-    )
+async def test_sustained_measures_a_filler_node_but_not_while_its_nic_is_busy():
     with flags(sustained=True) as clock:
-        redis = FakeRedis()
-        ctx, runner, _ = make_ctx(redis=redis, rented_data=pod)
-        redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"] = str(clock.now - 2 * 86400)
+        ctx, runner, _ = due_ctx(clock, IDLE_NIC, sustained([400] * 6), rented_data=FILLER)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert sustained_runs(runner) == 1  # the short phase still leaves a filler node alone
+        assert res.passed and res.event.reason_code == Msg.SKIPPED.reason
+
+        ctx, runner, redis = due_ctx(clock, nic(900), rented_data=FILLER)
+        await ContainerDownloadSpeedCheck().run(ctx)
+        assert sustained_runs(runner) == 0 and len(runner.commands) == 1  # the NIC read only
+        # not stamped: the next cycle tries again
+        assert float(redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"]) < clock.now
+
+
+async def test_sustained_skips_a_node_rented_at_cycle_start_or_since():
+    with flags(sustained=True) as clock:
+        ctx, runner, _ = due_ctx(clock, rented_data=POD)
         await ContainerDownloadSpeedCheck().run(ctx)
         assert not runner.commands
 
-        ctx, runner, _ = make_ctx(FAST, redis=redis)
-        with patch.object(clock, "monotonic", lambda: ctx.started_at_monotonic + 700):
+        ctx, runner, _ = due_ctx(clock, FAST, fresh=POD)  # rented after the cycle's snapshot
+        await ContainerDownloadSpeedCheck().run(ctx)
+        assert len(runner.commands) == 1 and sustained_runs(runner) == 0
+
+        ctx, runner, redis = due_ctx(clock, FAST)
+        redis.renting_in_progress = AsyncMock(return_value=True)
+        await ContainerDownloadSpeedCheck().run(ctx)
+        assert sustained_runs(runner) == 0
+
+
+async def test_sustained_leaves_the_later_checks_their_time():
+    with flags(sustained=True) as clock:
+        ctx, runner, _ = due_ctx(clock, FAST)
+        # 900 - 120 - 300 = 480 s left: under the 30 s re-read, the 120 s read and the rental probe's 360 s
+        with patch.object(clock, "monotonic", lambda: ctx.started_at_monotonic + 300):
             await ContainerDownloadSpeedCheck().run(ctx)
-        assert len(runner.commands) == 1  # the short phase only: 900 - 120 - 700 s left is under 120 s
+        assert len(runner.commands) == 1 and sustained_runs(runner) == 0
 
 
 async def test_sustained_failure_never_changes_the_result():
