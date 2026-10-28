@@ -100,6 +100,7 @@ class ZeroIncentiveReason(StrEnum):
     SPOT_TIER = "spot_tier"
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
+    PROVIDER_MAINTENANCE = "provider_maintenance"
     MINER_DEFAULT_JOB = "miner_default_job"
     HOTKEY_EXCLUDED_FROM_SCORING = "hotkey_excluded_from_scoring"
     # Group B: idle but not qualified for the unrented pool
@@ -283,6 +284,18 @@ class MinerLogLine(BaseModel):
                 "nothing while paused. Resume new rentals to start earning again."
             ),
             internal_message="Executor excluded from both pools - paused for new rentals",
+        )
+
+    @staticmethod
+    def no_payout_because_provider_maintenance(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PROVIDER_MAINTENANCE,
+            message=(
+                "No subnet incentive: this executor is in a maintenance window and earns nothing "
+                "until the window ends or you click I have finished."
+            ),
+            internal_message="Executor excluded from both pools - provider maintenance window",
         )
 
     @staticmethod

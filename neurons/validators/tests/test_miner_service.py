@@ -265,6 +265,25 @@ async def test_a_create_that_keeps_timing_out_names_the_exception_type(mocker, m
 
 
 @pytest.mark.asyncio
+async def test_a_create_re_signs_when_the_restarted_miner_says_the_signature_is_too_old(mocker, miner_service):
+    # 27 Oct pod 7a6ae1fc: the submit reached the redeployed miner 17 s after signing and got 401
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    too_old = (401, {"detail": "Authentication message too old. Timestamp is outside the allowed 10-second window"})
+    miner_service._make_rest_request.side_effect = [too_old, (200, {"message_type": "AcceptSSHKeyRequest"})]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    stamps = iter(range(100))
+    mocker.patch.object(miner_service, "_generate_auth_headers", side_effect=lambda *_: {"X-Timestamp": next(stamps)})
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    create_mock.assert_awaited_once()
+    sent = [c.kwargs["headers"]["X-Timestamp"] for c in miner_service._make_rest_request.await_args_list[:2]]
+    assert sent == [0, 1]
+
+
+@pytest.mark.asyncio
 async def test_a_create_gives_up_once_the_miner_stays_unreachable_past_the_wait(mocker, miner_service):
     executor_id = str(uuid4())
     _wire_common_mocks(mocker, miner_service, executor_id)
