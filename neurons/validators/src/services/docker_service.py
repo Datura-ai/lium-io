@@ -125,6 +125,7 @@ from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
+    flatten_copy_bytes,
     flatten_image_on_host,
     flatten_lease_release_command,
     flatten_sized_mark_command,
@@ -6908,8 +6909,12 @@ class DockerService:
         host_probe: VolumeHostProbe | None = None,
         locked_df_avail_bytes: int | None = None,
         locked_df_error: Exception | None = None,
+        flatten_copy_bytes: int | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
+        still fits beside it, never below `payload.min_volume_gb`.
 
         `locked_df_avail_bytes` (wait_for_node_flatten) replaces any other free-disk measure;
         `locked_df_error` (that measure failed) takes the measurement-failure fallback below.
@@ -7002,6 +7007,10 @@ class DockerService:
                 ),
             )
         )
+        if flatten_copy_bytes is not None:
+            # the flatten keeps this grant free on top of the copy: leave the copy room before granting
+            min_slice_bytes = (payload.min_volume_gb or 0) * _FRESH_SIZING_GB_BYTES * 1.5
+            slice_candidates.append(("flatten_copy", max(df_avail_bytes - flatten_copy_bytes, min_slice_bytes, 0)))
         capped_by, slice_bytes = min(slice_candidates, key=lambda item: item[1])
 
         # -o size= requires a positive integer; floor to at least 1 GB before
@@ -9153,6 +9162,15 @@ class DockerService:
                                 log_extra=default_extra,
                             )
 
+                    flatten_copy: int | None = None
+                    if (
+                        measures_host
+                        and payload.is_sysbox
+                        and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                        and _flatten_reserved_bytes(None, None, payload.disk_share) is not None
+                    ):
+                        flatten_copy = await flatten_copy_bytes(ssh_client, payload.docker_image)
+
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
                     sizing = await self.resolve_volume_sizing(
@@ -9163,6 +9181,7 @@ class DockerService:
                         host_probe=volume_probe,
                         locked_df_avail_bytes=locked_df_avail_bytes,
                         locked_df_error=locked_df_error,
+                        flatten_copy_bytes=flatten_copy,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

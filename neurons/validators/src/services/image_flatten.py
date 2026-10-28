@@ -232,6 +232,26 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
         raise FlattenMeasureFailed(str(exc)) from exc
 
 
+# Docker switches to the relative layer paths Sysbox cannot ID-map at ~40 layers on the default data root
+# and sooner on a longer one. shortcut: a fixed count; an image under it that still fails meets the flatten's own disk check
+FLATTEN_BUDGET_MIN_LAYERS = 30
+
+
+async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: str) -> int | None:
+    """The disk a one-layer copy of the local `image` would take (its size plus FLATTEN_DISK_MARGIN_BYTES), for
+    the sizing to keep free; None when the image has too few layers to need one or cannot be read."""
+    try:
+        result = await ssh_client.run(
+            f"/usr/bin/docker image inspect --format '{{{{.Size}}}} {{{{len .RootFS.Layers}}}}' {shlex.quote(image)}",
+            check=True,
+            timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+        )
+        size, layers = (int(word) for word in str(result.stdout).split())
+    except Exception:
+        return None
+    return size + FLATTEN_DISK_MARGIN_BYTES if layers >= FLATTEN_BUDGET_MIN_LAYERS else None
+
+
 async def flatten_image_on_host(
     ssh_client: asyncssh.SSHClientConnection,
     image: str,

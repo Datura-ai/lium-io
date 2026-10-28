@@ -415,3 +415,17 @@ def test_a_flatten_refuses_once_a_create_sized_the_disk_after_it_checked_for_oth
     # read after B's mark: B is visible to A's own check for other creates, so the copy goes ahead
     mark = subprocess.run(["sh", "-c", image_flatten.flatten_sized_mark_command()], capture_output=True, text=True)
     assert subprocess.run(_flatten_script(tmp_path, sized_mark=mark.stdout.strip()), env=env).returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stdout, expected",
+    [
+        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS}\n", 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES),
+        (f"{24 * 1024**3} {image_flatten.FLATTEN_BUDGET_MIN_LAYERS - 1}\n", None),  # starts as is: no copy
+        ("garbage\n", None),
+    ],
+)
+async def test_flatten_copy_bytes_budgets_only_an_image_with_many_layers(stdout, expected):
+    ssh = Mock(run=AsyncMock(return_value=Mock(stdout=stdout)))
+    assert await image_flatten.flatten_copy_bytes(ssh, "sglang") == expected

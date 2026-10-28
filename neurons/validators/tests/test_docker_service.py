@@ -8373,6 +8373,71 @@ async def test_the_flatten_keeps_every_granted_allowance_free(
     assert client.events == ["run sglang"]
 
 
+_COPY = 24 * _GIB + image_flatten_module.FLATTEN_DISK_MARGIN_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "avail_gb, volume_limit_gb, min_volume_gb, copy_bytes, reused, capped_by, outcome",
+    [
+        # review: 200 GiB free gave 120 + 60 and the copy then needed 214; the copy is budgeted first
+        (200, None, None, _COPY, False, "flatten_copy", "flattened"),
+        (200, None, None, None, False, "pool", "no_disk"),  # no budget (few layers): the flatten guard refuses
+        (200, 500, None, _COPY, False, "flatten_copy", "flattened"),  # non-binding request cap
+        (200, 40, None, _COPY, False, "request_cap", "flattened"),  # binding request cap
+        # the minimum volume stays granted; a disk too small for it and the copy refuses the flatten
+        (100, None, 50, _COPY, False, "flatten_copy", "no_disk"),
+        (120, None, 50, _COPY, False, "flatten_copy", "flattened"),
+        # a reused or restored volume keeps the backend's limits as its reservation
+        (200, 120, None, _COPY, True, None, "no_disk"),
+        (220, 120, None, _COPY, True, None, "flattened"),
+    ],
+    ids=[
+        "review_full_node",
+        "unbudgeted",
+        "cap_nonbinding",
+        "cap_binding",
+        "min_volume_short",
+        "min_volume_fits",
+        "reused_short",
+        "reused_fits",
+    ],
+)
+async def test_fresh_sizing_leaves_room_for_the_flatten_it_admits(
+    docker_service, avail_gb, volume_limit_gb, min_volume_gb, copy_bytes, reused, capped_by, outcome
+):
+    if reused:
+        volume_gb, storage_gb = volume_limit_gb, volume_limit_gb // 2
+    else:
+        payload = _make_sizing_payload(
+            disk_share=1.0, storage_limit_gb=1, volume_limit_gb=volume_limit_gb, min_volume_gb=min_volume_gb
+        )
+        sizing = await docker_service.resolve_volume_sizing(
+            _make_sizing_ssh_client(df_avail_bytes=avail_gb * _GIB),
+            payload,
+            "tag",
+            {},
+            locked_df_avail_bytes=avail_gb * _GIB,
+            flatten_copy_bytes=copy_bytes,
+        )
+        assert sizing.capped_by == capped_by
+        assert min_volume_gb is None or sizing.volume_limit_gb >= min_volume_gb
+        volume_gb, storage_gb = sizing.volume_limit_gb, sizing.storage_limit_gb
+    client = _SysboxFailingRentalClient({"sglang"})
+    create = _create_with_flatten(
+        docker_service,
+        client,
+        _flatten_on_disk(avail_gb * _GIB, 24 * _GIB),
+        reserved_bytes=docker_service_module._flatten_reserved_bytes(storage_gb, volume_gb, 1.0),
+    )
+    if outcome == "flattened":
+        assert await create == "cid"
+        assert client.events[-1] == "run lium-flattened:abc"
+    else:
+        with pytest.raises(ImageFlattenNoDisk):
+            await create
+
+
 def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
     registry = docker_service_module._CustomerCreateRegistry()
     own, other = (Mock(miner_hotkey="hk", executor_id="ex", workload_kind=WorkloadKind.CUSTOMER_RENTAL) for _ in range(2))
