@@ -15,6 +15,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 
 from services.task.checks import container_download_speed as module
 from services.task.checks.container_download_speed import (
+    ContainerDownloadSustainedCheck,
     CAP_BYTES,
     ContainerDownloadSpeedCheck,
     download_speed_command,
@@ -424,17 +425,17 @@ def test_sustained_script_reads_chunks_up_to_the_byte_cap():
 
 async def test_sustained_runs_once_a_day_at_the_node_phase_and_never_changes_the_result(caplog):
     with flags(sustained=True) as clock, caplog.at_level("INFO"):
-        ctx, runner, redis = make_ctx(FAST, IDLE_NIC, sustained([5, 5, 5, 5, 5, 5]))
+        ctx, runner, redis = make_ctx(IDLE_NIC, sustained([5, 5, 5, 5, 5, 5]))
         redis.renting_in_progress = AsyncMock(return_value=False)
         ctx.services.backend.get_rented_executors_now.return_value = RentedExecutorsResponse(executors={})
-        check = ContainerDownloadSpeedCheck()
+        check = ContainerDownloadSustainedCheck()
         key = f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"
         with patch.object(module, "_phase_fraction", lambda uuid: 1.0):
-            first = await check.run(ctx)  # first sight: the short phase, sustained only due at the node's phase
-        assert len(runner.commands) == 1 and key in redis.store
-        res = await check.run(ctx)  # due now: the shadow fail is logged, the short phase's "not due" stands
+            first = await check.run(ctx)  # first sight: due only at the node's phase
+        assert not runner.commands and key in redis.store
+        res = await check.run(ctx)  # due now: the shadow fail is logged, the check still passes
         assert sustained_runs(runner) == 1
-        assert first.passed and res.passed and res.event.reason_code == Msg.SKIPPED.reason
+        assert first.passed and res.passed and not check.fatal
         record = next(r for r in caplog.records if r.getMessage() == "CONTAINER_DOWNLOAD_SUSTAINED")
         extra = record.msg.extra
         assert extra["shadow_verdict"] == "fail" and extra["windows_mbps"] == [5.0] * 6 and not extra["enforced"]
@@ -443,7 +444,7 @@ async def test_sustained_runs_once_a_day_at_the_node_phase_and_never_changes_the
         await check.run(ctx)
         assert sustained_runs(runner) == 1
         clock.now += 3600
-        runner.answers = [IDLE_NIC, sustained([400] * 6)]  # the short phase read at +23 h is not due
+        runner.answers = [IDLE_NIC, sustained([400] * 6)]
         await check.run(ctx)  # a day after the last one
         assert sustained_runs(runner) == 2
 
@@ -451,13 +452,14 @@ async def test_sustained_runs_once_a_day_at_the_node_phase_and_never_changes_the
 async def test_sustained_measures_a_filler_node_but_not_while_its_nic_is_busy():
     with flags(sustained=True) as clock:
         ctx, runner, _ = due_ctx(clock, IDLE_NIC, sustained([400] * 6), rented_data=FILLER)
-        res = await ContainerDownloadSpeedCheck().run(ctx)
-        assert sustained_runs(runner) == 1  # the short phase still leaves a filler node alone
-        assert res.passed and res.event.reason_code == Msg.SKIPPED.reason
+        res = await ContainerDownloadSustainedCheck().run(ctx)
+        assert sustained_runs(runner) == 1 and res.passed
 
         ctx, runner, redis = due_ctx(clock, nic(900), rented_data=FILLER)
-        await ContainerDownloadSpeedCheck().run(ctx)
+        await ContainerDownloadSustainedCheck().run(ctx)
         assert sustained_runs(runner) == 0 and len(runner.commands) == 1  # the NIC read only
+        # read first: a busy node, due every cycle, never pulls the backend's rented list
+        ctx.services.backend.get_rented_executors_now.assert_not_called()
         # not stamped: the next cycle tries again
         assert float(redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"]) < clock.now
 
@@ -465,32 +467,37 @@ async def test_sustained_measures_a_filler_node_but_not_while_its_nic_is_busy():
 async def test_sustained_skips_a_node_rented_at_cycle_start_or_since():
     with flags(sustained=True) as clock:
         ctx, runner, _ = due_ctx(clock, rented_data=POD)
-        await ContainerDownloadSpeedCheck().run(ctx)
+        await ContainerDownloadSustainedCheck().run(ctx)
         assert not runner.commands
 
-        ctx, runner, _ = due_ctx(clock, FAST, fresh=POD)  # rented after the cycle's snapshot
-        await ContainerDownloadSpeedCheck().run(ctx)
+        ctx, runner, _ = due_ctx(clock, IDLE_NIC, fresh=POD)  # rented after the cycle's snapshot
+        await ContainerDownloadSustainedCheck().run(ctx)
         assert len(runner.commands) == 1 and sustained_runs(runner) == 0
 
-        ctx, runner, redis = due_ctx(clock, FAST)
+        ctx, runner, redis = due_ctx(clock, IDLE_NIC)
         redis.renting_in_progress = AsyncMock(return_value=True)
-        await ContainerDownloadSpeedCheck().run(ctx)
+        await ContainerDownloadSustainedCheck().run(ctx)
         assert sustained_runs(runner) == 0
 
 
-async def test_sustained_leaves_the_later_checks_their_time():
+@pytest.mark.parametrize(("elapsed", "runs"), [(590, 1), (610, 0)])
+async def test_sustained_runs_only_while_its_own_reads_fit(elapsed, runs):
     with flags(sustained=True) as clock:
-        ctx, runner, _ = due_ctx(clock, FAST)
-        # 900 - 120 - 300 = 480 s left: under the 30 s re-read, the 120 s read and the rental probe's 360 s
-        with patch.object(clock, "monotonic", lambda: ctx.started_at_monotonic + 300):
-            await ContainerDownloadSpeedCheck().run(ctx)
-        assert len(runner.commands) == 1 and sustained_runs(runner) == 0
+        ctx, runner, _ = due_ctx(clock, IDLE_NIC, sustained([400] * 6))
+        # 900 - 120 - elapsed left against the 30 s NIC read, the 30 s re-read and the 120 s read
+        with patch.object(clock, "monotonic", lambda: ctx.started_at_monotonic + elapsed):
+            await ContainerDownloadSustainedCheck().run(ctx)
+        assert sustained_runs(runner) == runs
 
 
 async def test_sustained_failure_never_changes_the_result():
     with flags(sustained=True):
         redis = FakeRedis()
-        ctx, runner, _ = make_ctx(FAST, redis=redis)
+        ctx, runner, _ = make_ctx(redis=redis)
         redis.store[f"container_download_sustained:{ctx.miner_hotkey}:{EXECUTOR.uuid}"] = "not-a-number"
-        res = await ContainerDownloadSpeedCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OK.reason and len(runner.commands) == 1
+        res = await ContainerDownloadSustainedCheck().run(ctx)
+    assert res.passed and not runner.commands
+
+
+def test_sustained_default_byte_cap_is_512_mib():
+    assert type(module.settings).model_fields["CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES"].default == 512 * 1024**2

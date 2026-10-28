@@ -20,7 +20,6 @@ from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 from ..messages import ContainerDownloadSpeedMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rental_probe import _MIN_TASK_SECONDS_LEFT
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +82,12 @@ SUSTAINED_MIN_MEDIAN_MBPS = 100.0
 # a window under this is a stall; STALL_WINDOWS of them in a row (30 s) fail
 STALL_MBPS = 1.0
 STALL_WINDOWS = 3
-# the NIC re-read (2 s), container start and the 60 s read
+# container start and the 60 s read
 SUSTAINED_COMMAND_TIMEOUT_SECONDS = 120
+# the host NIC read before the run (2 s), under its own 30 s timeout
+_NIC_READ_TIMEOUT_SECONDS = 30
 # the backend's rented re-read before the run: one un-retried read with a 30 s timeout
-_REREAD_SECONDS = 30
+_RENTED_REREAD_TIMEOUT_SECONDS = 30
 SUSTAINED_INTERVAL_SECONDS = 24 * 3600
 _SUSTAINED_REDIS_PREFIX = "container_download_sustained"
 _SUSTAINED_MARKER = "lium_dls"
@@ -323,8 +324,7 @@ class ContainerDownloadSpeedCheck:
     streak was not taken on the rentals network. Idle nodes only (no pod, no filler: both would share the link), once per
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS at a per-node phase.
 
-    DAH-5320: once a day per idle node, the sustained phase (_sustained) logs CONTAINER_DOWNLOAD_SUSTAINED with a
-    shadow verdict. It never changes this check's result.
+    DAH-5320: the sustained read is ContainerDownloadSustainedCheck, last in the pipeline.
     """
 
     check_id = "executor.validate.container_download_speed"
@@ -338,15 +338,8 @@ class ContainerDownloadSpeedCheck:
         if rented_executor is not None and rented_executor.pods:
             return self._skipped(ctx, "rented")
         if rented_data is not None and rented_data.get_filler_containers(ctx.executor.uuid):
-            # the short phase leaves a filler node alone; the sustained one measures it unless its NIC is busy
-            result = self._skipped(ctx, "filler running")
-        else:
-            result = await self._short_phase(ctx)
-        try:
-            await self._sustained(ctx)
-        except Exception:  # noqa: BLE001 — shadow only: nothing it hits may change the result
-            logger.warning(_m("Container download sustained: phase failed", extra=get_extra_info(ctx.default_extra)))
-        return result
+            return self._skipped(ctx, "filler running")
+        return await self._short_phase(ctx)
 
     async def _short_phase(self, ctx: Context) -> CheckResult:
         # with the hotkey: a node copying another miner's UUID cannot write a slow streak onto the owner's
@@ -403,97 +396,6 @@ class ContainerDownloadSpeedCheck:
         )
         await self._save(ctx, key, state)
         return self._verdict(ctx, state, probed=True)
-
-    async def _sustained_is_due(self, ctx: Context, key: str) -> bool:
-        """Once a day per node, at the node's phase, and only while the checks after this one keep their time."""
-        redis = ctx.services.redis
-        raw = await redis.get(key)
-        now = time.time()
-        if raw is None:
-            # first sight: due at the node's phase within the next day, so a deploy doesn't read the fleet at once
-            await redis.set(
-                key,
-                str(now - _phase_fraction(ctx.executor.uuid) * SUSTAINED_INTERVAL_SECONDS),
-                ex=2 * SUSTAINED_INTERVAL_SECONDS,
-            )
-            return False
-        if now < float(raw) + SUSTAINED_INTERVAL_SECONDS:
-            return False
-        # RentalProbeCheck runs later in the cycle and starts only with its own reserve left; this phase never takes it
-        reserve = _REREAD_SECONDS + SUSTAINED_COMMAND_TIMEOUT_SECONDS + _MIN_TASK_SECONDS_LEFT
-        left = settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
-        return left >= reserve
-
-    async def _busy_now(self, ctx: Context) -> str | None:
-        """Why the node is not idle now (the cycle's rented state is minutes old); unknown counts as busy."""
-        try:
-            fresh = await ctx.services.backend.get_rented_executors_now()
-            if fresh is None:
-                return "rented state unknown"
-            rented_executor = fresh.executors.get(ctx.executor.uuid)
-            if rented_executor is not None and rented_executor.pods:
-                return "rented"
-            if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
-                return "rent in progress"
-        except Exception:  # noqa: BLE001 — unknown counts as busy
-            return "rented state unknown"
-        # the host NICs over 2 s, as RentedThroughputCheck reads them: a filler or the provider's own traffic
-        from .rented_throughput import _SNAPSHOT, parse_busy  # here: rented_throughput imports this module
-
-        snapshot = await ctx.runner.run(_SNAPSHOT, timeout=30, retryable=False)
-        net_mbps, _ = parse_busy(snapshot.stdout or "")
-        if net_mbps is None or net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS:
-            return f"nic busy ({net_mbps} Mbps)"
-        return None
-
-    async def _sustained(self, ctx: Context) -> None:
-        if not settings.CONTAINER_DOWNLOAD_SUSTAINED_ENABLED:
-            return
-        key = f"{_SUSTAINED_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
-        if not await self._sustained_is_due(ctx, key):
-            return
-        busy = await self._busy_now(ctx)
-        if busy is not None:
-            # not stamped: the next cycle tries again
-            logger.info(
-                _m("CONTAINER_DOWNLOAD_SUSTAINED", extra=get_extra_info({**ctx.default_extra, "skipped": busy}))
-            )
-            return
-        await ctx.services.redis.set(key, str(time.time()), ex=2 * SUSTAINED_INTERVAL_SECONDS)
-        script = sustained_script(
-            settings.CONTAINER_DOWNLOAD_SUSTAINED_URL, settings.CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES
-        )
-        result = await ctx.runner.run(
-            download_speed_command(bool(ctx.state.sysbox_runtime), script),
-            timeout=SUSTAINED_COMMAND_TIMEOUT_SECONDS,
-            retryable=False,
-        )
-        stdout = result.stdout or ""
-        reading = parse_sustained(stdout)
-        errors = list(reading.errors)
-        network = next(
-            (ln.split("=", 1)[1] for ln in stdout.splitlines() if ln.startswith(f"{MARKER}_net name=")), None
-        )
-        if result.error_type is not None:
-            errors.append(f"{result.error_type}: {result.error_message or ''}"[:_TAIL_CHARS])
-        # a stream that failed (DNS, HTTP error, short object) is no verdict: the short phase judges reachability
-        verdict = None if errors else sustained_verdict(reading.windows)
-        logger.info(
-            _m(
-                "CONTAINER_DOWNLOAD_SUSTAINED",
-                extra=get_extra_info(
-                    {
-                        **ctx.default_extra,
-                        "windows_mbps": reading.windows,
-                        "median_mbps": statistics.median(reading.windows) if reading.windows else None,
-                        "shadow_verdict": verdict,
-                        "errors": errors,
-                        "network": network,
-                        "enforced": False,
-                    }
-                ),
-            )
-        )
 
     async def _measure(self, ctx: Context) -> list[EndpointReading]:
         result = await ctx.runner.run(
@@ -565,3 +467,118 @@ class ContainerDownloadSpeedCheck:
         if last is not None:
             what["last"] = last
         return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
+
+
+class ContainerDownloadSustainedCheck:
+    """DAH-5320: once a day per idle or filler node, read CONTAINER_DOWNLOAD_SUSTAINED_URL for SUSTAINED_SECONDS and log
+    CONTAINER_DOWNLOAD_SUSTAINED with a shadow verdict. Last in the pipeline (after VerifyX, the matmul, rental
+    verification and the rental probe), so its 60 s read never takes their time. Always passes: shadow only.
+    """
+
+    check_id = "executor.validate.container_download_sustained"
+    fatal = False
+
+    async def run(self, ctx: Context) -> CheckResult:
+        rented_data = ctx.state.rented_data
+        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        if rented_executor is None or not rented_executor.pods:
+            try:
+                await self._sustained(ctx)
+            except Exception:  # noqa: BLE001 — shadow only: nothing it hits may change the result
+                logger.warning(
+                    _m("Container download sustained: phase failed", extra=get_extra_info(ctx.default_extra))
+                )
+        what = {"reason": "sustained read: shadow only, logged as CONTAINER_DOWNLOAD_SUSTAINED"}
+        return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
+
+    async def _sustained_is_due(self, ctx: Context, key: str) -> bool:
+        """Once a day per node, at the node's phase, and only while the task has time for the reads."""
+        redis = ctx.services.redis
+        raw = await redis.get(key)
+        now = time.time()
+        if raw is None:
+            # first sight: due at the node's phase within the next day, so a deploy doesn't read the fleet at once
+            await redis.set(
+                key,
+                str(now - _phase_fraction(ctx.executor.uuid) * SUSTAINED_INTERVAL_SECONDS),
+                ex=2 * SUSTAINED_INTERVAL_SECONDS,
+            )
+            return False
+        if now < float(raw) + SUSTAINED_INTERVAL_SECONDS:
+            return False
+        # last in the pipeline: only its own reads must fit before the task is cancelled
+        reserve = _NIC_READ_TIMEOUT_SECONDS + _RENTED_REREAD_TIMEOUT_SECONDS + SUSTAINED_COMMAND_TIMEOUT_SECONDS
+        left = settings.JOB_TIME_OUT - _TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
+        return left >= reserve
+
+    async def _busy_now(self, ctx: Context) -> str | None:
+        """Why the node is not idle now (the cycle's rented state is minutes old); unknown counts as busy."""
+        # the host NICs over 2 s, as RentedThroughputCheck reads them: a filler or the provider's own traffic. First,
+        # so a busy node (never stamped, so due every cycle) costs one NIC read and no backend list.
+        from .rented_throughput import _SNAPSHOT, parse_busy  # here: rented_throughput imports this module
+
+        host_nic_snapshot = await ctx.runner.run(_SNAPSHOT, timeout=_NIC_READ_TIMEOUT_SECONDS, retryable=False)
+        net_mbps, _ = parse_busy(host_nic_snapshot.stdout or "")
+        if net_mbps is None or net_mbps >= settings.RENTED_THROUGHPUT_BUSY_MBPS:
+            return f"nic busy ({net_mbps} Mbps)"
+        try:
+            fresh = await ctx.services.backend.get_rented_executors_now()
+            if fresh is None:
+                return "rented state unknown"
+            rented_executor = fresh.executors.get(ctx.executor.uuid)
+            if rented_executor is not None and rented_executor.pods:
+                return "rented"
+            if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
+                return "rent in progress"
+        except Exception:  # noqa: BLE001 — unknown counts as busy
+            return "rented state unknown"
+        return None
+
+    async def _sustained(self, ctx: Context) -> None:
+        if not settings.CONTAINER_DOWNLOAD_SUSTAINED_ENABLED:
+            return
+        key = f"{_SUSTAINED_REDIS_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+        if not await self._sustained_is_due(ctx, key):
+            return
+        busy = await self._busy_now(ctx)
+        if busy is not None:
+            # not stamped: the next cycle tries again
+            logger.info(
+                _m("CONTAINER_DOWNLOAD_SUSTAINED", extra=get_extra_info({**ctx.default_extra, "skipped": busy}))
+            )
+            return
+        await ctx.services.redis.set(key, str(time.time()), ex=2 * SUSTAINED_INTERVAL_SECONDS)
+        script = sustained_script(
+            settings.CONTAINER_DOWNLOAD_SUSTAINED_URL, settings.CONTAINER_DOWNLOAD_SUSTAINED_MAX_BYTES
+        )
+        result = await ctx.runner.run(
+            download_speed_command(bool(ctx.state.sysbox_runtime), script),
+            timeout=SUSTAINED_COMMAND_TIMEOUT_SECONDS,
+            retryable=False,
+        )
+        stdout = result.stdout or ""
+        reading = parse_sustained(stdout)
+        errors = list(reading.errors)
+        network = next(
+            (ln.split("=", 1)[1] for ln in stdout.splitlines() if ln.startswith(f"{MARKER}_net name=")), None
+        )
+        if result.error_type is not None:
+            errors.append(f"{result.error_type}: {result.error_message or ''}"[:_TAIL_CHARS])
+        # a stream that failed (DNS, HTTP error, short object) is no verdict: the short phase judges reachability
+        verdict = None if errors else sustained_verdict(reading.windows)
+        logger.info(
+            _m(
+                "CONTAINER_DOWNLOAD_SUSTAINED",
+                extra=get_extra_info(
+                    {
+                        **ctx.default_extra,
+                        "windows_mbps": reading.windows,
+                        "median_mbps": statistics.median(reading.windows) if reading.windows else None,
+                        "shadow_verdict": verdict,
+                        "errors": errors,
+                        "network": network,
+                        "enforced": False,
+                    }
+                ),
+            )
+        )

@@ -33,6 +33,7 @@ from .checks import (
     CapabilityCheck,
     CollateralStatusCheck,
     ContainerDownloadSpeedCheck,
+    ContainerDownloadSustainedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -427,6 +428,8 @@ class PipelineFactory:
                 # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and
                 # the rented/filler state every check above settled. Flag-gated, off by default.
                 RentalProbeCheck(),
+                # DAH-5320: the 60 s sustained download read, shadow only; last so it never takes the checks' time.
+                ContainerDownloadSustainedCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -543,6 +546,8 @@ class PipelineFactory:
                     ]
                 ),
                 RentalProbeCheck(),
+                # DAH-5320: the 60 s sustained download read, shadow only; last so it never takes the checks' time.
+                ContainerDownloadSustainedCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
