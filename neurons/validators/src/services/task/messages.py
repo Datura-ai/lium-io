@@ -1069,13 +1069,6 @@ class InspectorMessages:
         category="runtime",
         impact="No active customer rental on this executor",
     )
-    DISABLED = MessageTemplate(
-        event="Inspector validation disabled",
-        reason="INSPECTOR_SKIPPED_DISABLED",
-        severity="info",
-        category="runtime",
-        impact="Inspector checks are disabled",
-    )
     CLEAN = MessageTemplate(
         event="Inspector validation clean",
         reason="INSPECTOR_CLEAN",

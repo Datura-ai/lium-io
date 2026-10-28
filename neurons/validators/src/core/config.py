@@ -247,7 +247,6 @@ class Settings(BaseSettings):
     # before it (none for a never-measured node) instead of one moved by its sample. A passing
     # cycle without the recommended image cached does not seed a never-measured node; a node with
     # a stored EMA publishes its sample on every passing cycle. See verifyx_ema_hold_reason.
-    ENABLE_INSPECTOR: bool = True
     # Rented cycles in a row in which the inspector saw nothing (error, failed canary, stopped or
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.

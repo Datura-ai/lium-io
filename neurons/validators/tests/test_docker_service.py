@@ -1342,7 +1342,6 @@ async def test_delete_container_redis_failures_still_deleted(
 ):
     # Arrange: redis is down — rented-machine cleanup and the inspector lookup both raise;
     # the container is already removed, so the undeploy must still succeed (DAH-2345)
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     docker_service.redis_service.remove_rented_machine = AsyncMock(
         side_effect=Exception("redis down")
@@ -2391,7 +2390,6 @@ def _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
 
 @pytest.mark.asyncio
 async def test_create_customer_rental_starts_inspector_collector(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2521,60 +2519,6 @@ async def test_create_steps_after_reply_past_the_timeout_are_cancelled_and_close
     assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01) is True
 
 
-@pytest.mark.asyncio
-async def test_create_customer_rental_skips_inspector_collector_when_disabled(
-    docker_service,
-    monkeypatch,
-):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", False)
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    lifecycle_spy = AsyncMock()
-    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
-
-    pod_id = str(uuid4())
-    payload = ContainerCreateRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=pod_id,
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        docker_image="daturaai/dlph:test",
-        user_public_keys=["ssh-ed25519 test-key"],
-        gpu_uuids=["GPU-test"],
-        cpu_count=1,
-        memory_gb=1,
-        volume_limit_gb=2,
-        storage_limit_gb=1,
-        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
-        pod_mapping=[],
-        active_container_names=[],
-        active_volume_names=[],
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-
-    result = await docker_service.create_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    await _drain_create_steps_after_reply(payload.pod_id)
-    lifecycle_spy.assert_not_awaited()
-    inspector_step = next(
-        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START_AFTER_REPLY
-    )
-    assert inspector_step.skipped is True
-
-
 def _cvm_socket_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
     return ContainerCreateRequest(
         miner_hotkey="miner",
@@ -2690,7 +2634,6 @@ async def test_create_container_no_quote_socket_for_filler_on_cvm_node(docker_se
 
 @pytest.mark.asyncio
 async def test_create_filler_starts_inspector_collector(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2745,7 +2688,6 @@ async def test_delete_last_customer_rental_stops_inspector_collector(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2829,7 +2771,6 @@ async def test_delete_last_filler_stops_inspector_collector(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
