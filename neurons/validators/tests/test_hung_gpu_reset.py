@@ -4,10 +4,13 @@ A healthy reboot runs only the one query; a hung GPU is reset under Reset GPU's 
 `nvidia-smi -r` never touches a GPU outside the pod.
 """
 
+import contextlib
+
 import pytest
 from payload_models.payloads import ContainerWarningCode as W
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, reset_hung_pod_gpus
-from tests.test_gpu_reset import TOPO_PAIR01, TOPO_PAIR02, U, FakeHost
+from services.redis_service import GPU_RESET_PENDING_KIND
+from tests.test_gpu_reset import TOPO_PAIR01, TOPO_PAIR02, U, FakeHost, PendingRedis
 from tests.test_machine_spec_scrape_check import make_command_result
 
 POD = [U[0], U[1]]
@@ -186,3 +189,91 @@ async def test_a_gpu_missing_from_the_listing_is_refused_on_an_nvlink_host_unles
     result = await _reset(host, pod=pod)
     assert result.warning == warning
     assert bool(_resets(host)) == (warning == W.HungGpuReset)
+
+
+def test_both_nvidia_smi_calls_are_killed_if_they_ignore_the_timeout():
+    assert HUNG_GPU_QUERY_COMMAND.count("timeout -k 5 20 nvidia-smi") == 2
+
+
+FM = "nvidia-fabricmanager"
+
+
+@pytest.mark.asyncio
+async def test_a_fabric_manager_pod_owning_every_gpu_stops_fm_around_the_reset():
+    # HGX: no /dev/nvidia-nvswitch*, Fabric Manager running; the pod owns the whole node
+    host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True)
+    result = await _reset(host, pod=U)
+    assert result.warning == W.HungGpuReset
+    assert _resets(host) == [f"nvidia-smi -r -i {','.join(U)}"]
+    assert host.active_during_reset[FM] is False and host.active[FM] is True
+    stop = host.commands.index(f"nsenter -t 1 -m -- systemctl stop {FM}")
+    start = host.commands.index(f"nsenter -t 1 -m -- systemctl start {FM}")
+    assert stop < host.commands.index(_resets(host)[0]) < start
+
+
+@pytest.mark.asyncio
+async def test_fabric_manager_not_coming_back_is_not_a_reset():
+    host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True, fm_start_ok=False)
+    result = await _reset(host, pod=U)
+    assert result.warning == W.HungGpuNotResetUnsupported and "not active" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_fabric_manager_is_started_again_when_the_reset_raises():
+    host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True)
+    host.reset_raises = True
+    with pytest.raises(RuntimeError):
+        await _reset(host, pod=U)
+    assert host.active[FM] is True
+
+
+@pytest.mark.asyncio
+async def test_a_fabric_manager_node_shared_with_other_pods_is_refused():
+    host = HungHost(query=_query({U[0]: None}), fabric_manager=True)
+    result = await _reset(host)
+    assert result.warning == W.HungGpuNotResetNvlinkShared and _resets(host) == []
+    assert not any(" stop " in cmd for cmd in host.commands)
+
+
+class _Hold:
+    """Records when the caller's gpu_reset pending mark is held, against the host's commands."""
+
+    def __init__(self, host: HungHost):
+        self.host, self.entered, self.exited = host, None, None
+
+    @contextlib.asynccontextmanager
+    async def __call__(self):
+        self.entered = len(self.host.commands)
+        try:
+            yield
+        finally:
+            self.exited = len(self.host.commands)
+
+
+@pytest.mark.asyncio
+async def test_the_pending_mark_is_held_from_before_the_reset_until_it_is_done():
+    host = HungHost(query=_query({U[0]: None}), reset_exit=1)  # -r refused: the context cycle runs too
+    hold = _Hold(host)
+    assert (await reset_hung_pod_gpus(host, POD, resetting=hold)).warning == W.HungGpuReset
+    reset_at = host.commands.index(f"nvidia-smi -r -i {U[0]}")
+    assert hold.entered <= reset_at and hold.exited == len(host.commands)
+    assert host.commands[-1].startswith("CUDA_VISIBLE_DEVICES=")
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_reboot_never_takes_the_pending_mark():
+    host = HungHost()
+    hold = _Hold(host)
+    await reset_hung_pod_gpus(host, POD, resetting=hold)
+    assert hold.entered is None
+
+
+@pytest.mark.asyncio
+async def test_removing_the_gpu_reset_mark_keeps_the_creates_own_mark():
+    redis = PendingRedis()
+    await redis.add_pending_pod("hk", "ex", "pod1")
+    await redis.add_pending_pod("hk", "ex", "pod1", kind=GPU_RESET_PENDING_KIND, gpu_uuids=POD)
+    await redis.remove_pending_pod("hk", "ex", "pod1", kind=GPU_RESET_PENDING_KIND)
+    assert [item.get("kind") for item in await redis.get_pending_pods("hk", "ex")] == [None]
+    await redis.remove_pending_pod("hk", "ex", "pod1")
+    assert await redis.get_pending_pods("hk", "ex") == []

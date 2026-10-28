@@ -10,7 +10,7 @@ name, and a failure renames the old one back and starts it.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from payload_models.payloads import ContainerCreated, ContainerWarningCode, FailedContainerRequest
@@ -21,6 +21,7 @@ from core.utils import retry_ssh_command
 from services.docker_service import EDIT_PARKED_SUFFIX, DockerService, create_steps_after_reply, inflight_creates
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
+from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
 
 
@@ -83,6 +84,12 @@ async def _run(svc, payload):
     return result
 
 
+_POWER_READ = (
+    "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
+    " --format=csv,noheader,nounits"
+)
+
+
 def _docker(commands: list[str], verb: str) -> list[str]:
     return [c for c in commands if f"/usr/bin/docker {verb}" in c]
 
@@ -124,7 +131,13 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     host_key = next(cmd for cmd in ssh.commands if "pod_ssh_host_key" in cmd)
-    assert ssh.commands == [
+    # DAH-5301: the one hung-GPU query while the old container is parked (a healthy GPU adds nothing). It
+    # races the early power-floor read, so only its place against the sequential steps is pinned.
+    assert ssh.commands.count(HUNG_GPU_QUERY_COMMAND) == 1
+    hung_query = ssh.commands.index(HUNG_GPU_QUERY_COMMAND)
+    assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
+    assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
+    assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{parked}$',
         f"/usr/bin/docker rename {name} {parked}",
         f"/usr/bin/docker stop -t 10 {parked}",
@@ -136,8 +149,6 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
-        # DAH-5301: the one hung-GPU query while the old container is parked; a healthy GPU adds nothing
-        HUNG_GPU_QUERY_COMMAND,
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         host_key,
@@ -408,6 +419,32 @@ async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc,
         )
     else:
         svc.redis_service.mark_gpu_reset_recent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    svc.redis_service.mark_gpu_reset_recent = AsyncMock()
+    held = []
+
+    async def fake_reset(runner, pod_gpu_uuids, *, resetting):
+        async with resetting():
+            # the rented checks skip the node while the GPUs reset
+            held.append(svc.redis_service.add_pending_pod.await_args)
+            svc.redis_service.remove_pending_pod.assert_not_awaited()
+        return HungGpuResult(pod_gpu_uuids, ContainerWarningCode.HungGpuReset)
+
+    monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", fake_reset)
+    svc.redis_service.remove_pending_pod.reset_mock()
+
+    assert isinstance(await _run(svc, payload), ContainerCreated)
+    assert held[0].kwargs == {"kind": GPU_RESET_PENDING_KIND, "gpu_uuids": ["GPU-test"]}
+    # only the gpu_reset mark is dropped: the create's own pending mark for the pod stays until its own removal
+    assert call(payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=GPU_RESET_PENDING_KIND) in (
+        svc.redis_service.remove_pending_pod.await_args_list
+    )
 
 
 @pytest.mark.parametrize(
