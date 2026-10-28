@@ -1,3 +1,5 @@
+import logging
+
 from clients.compute_client import EVENT_REPORT_MAX_BYTES, MAX_FRAME_BYTES, fit_event_report
 from protocol.vc_protocol.validator_requests import InspectorEventRequest
 
@@ -21,9 +23,10 @@ def test_a_small_report_goes_unchanged():
     assert fit_event_report(event) is event
 
 
-def test_an_oversized_report_keeps_the_leading_findings_that_fit_one_frame():
+def test_an_oversized_report_keeps_the_leading_findings_that_fit_one_frame(caplog):
     findings = [{"i": i, "command": "é" * 2000} for i in range(10_000)]  # ~40 MB escaped
-    fitted = fit_event_report(_event(findings))
+    with caplog.at_level(logging.WARNING, logger="clients.compute_client"):
+        fitted = fit_event_report(_event(findings))
 
     size = len(fitted.model_dump_json().encode())
     kept = fitted.report["findings"]
@@ -31,6 +34,8 @@ def test_an_oversized_report_keeps_the_leading_findings_that_fit_one_frame():
     assert kept and kept == findings[: len(kept)]
     assert fitted.report["findings_omitted"] == len(findings) - len(kept)
     assert fitted.report["health"] == {"ok": True}
+    (trim,) = [r.msg.extra for r in caplog.records if "Trimmed" in r.getMessage()]
+    assert (trim["executor_id"], trim["miner_hotkey"]) == ("ex", "hk")
 
 
 def test_one_finding_bigger_than_a_frame_is_left_out_with_the_rest_counted():

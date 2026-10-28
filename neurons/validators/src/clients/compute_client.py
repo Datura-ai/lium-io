@@ -164,6 +164,17 @@ def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
             break
         kept += 1
     report = {**event.report, "findings": findings[:kept], "findings_omitted": len(findings) - kept}
+    logger.warning(
+        _m(
+            "Trimmed an event report to fit one frame",
+            extra=get_extra_info({
+                "executor_id": event.executor_id,
+                "miner_hotkey": event.miner_hotkey,
+                "findings_kept": kept,
+                "findings_omitted": len(findings) - kept,
+            }),
+        )
+    )
     return event.model_copy(update={"report": report})
 
 
@@ -624,6 +635,8 @@ class ComputeClient:
                                     extra=get_extra_info({
                                         **self.logging_extra,
                                         "message_type": type(log_to_send).__name__,
+                                        "executor_id": getattr(log_to_send, "executor_id", None),
+                                        "miner_hotkey": getattr(log_to_send, "miner_hotkey", None),
                                         "size": exc.size,
                                     }),
                                 )
