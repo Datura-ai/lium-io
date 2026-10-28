@@ -74,10 +74,16 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
-            if self._state.stage == "PREPARING" and self._restore_has_started():
+            if self._state.stage in ("PREPARING", "SCANNING") and self._restore_has_started():
                 self._state.stage = "RESTORING"
+            elif self._state.stage == "PREPARING" and payload.get("message_type") == "status":
+                # restic is running and scanning the snapshot; no file restored yet.
+                self._state.stage = "SCANNING"
             self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
+            return
+        if event_type == "rerun":
+            self._restic_failure_detail = self._diagnostic_detail = None
             return
         if event_type == "heartbeat":
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
