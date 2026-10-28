@@ -195,7 +195,7 @@ class RentalVerificationCheck:
         # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
         # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
         # rent skips `--cpus` there too) and when the count is unreadable.
-        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+        cpu_count = advertised_cpu_count(ctx) if not ctx.executor.tdx_quote else None
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
@@ -341,20 +341,16 @@ class RentalVerificationCheck:
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
 
-        Shadow (enforcement off) logs the verdict as a warning and keeps passed=True so scoring is
-        unchanged; enforcement zeroes the score. DAH-2742: unlike the GPU runtime quarantine, the
+        The verdict zeroes the score. DAH-2742: unlike the GPU runtime quarantine, the
         previous verification is kept — a host that really overstates its cores fails every cycle
         and the stale-executor sweep deactivates it without an instant flip.
         """
-        enforce = settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED
         details = response.details or {}
         stderr = details.get("docker_stderr") or response.error
         event = render_message(
             Msg.CPU_QUOTA_EXCEEDS_HOST,
             ctx=ctx,
             check_id=self.check_id,
-            severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
             what={
                 "verified": False,
                 "executor_uuid": ctx.executor.uuid,
@@ -362,20 +358,16 @@ class RentalVerificationCheck:
                 "reason_code": response.reason_code,
                 "advertised_cpu_count": advertised_cpu_count(ctx),
                 "stderr": stderr,
-                "enforced": enforce,
+                "enforced": True,
                 "details": details,
             },
         )
-        updates = (
-            {
-                "score": 0.0,
-                "job_score": 0.0,
-                "score_warning": "Advertised CPU cores exceed the host's physical cores",
-            }
-            if enforce
-            else {}
-        )
-        return CheckResult(passed=not enforce, event=event, updates=updates)
+        updates = {
+            "score": 0.0,
+            "job_score": 0.0,
+            "score_warning": "Advertised CPU cores exceed the host's physical cores",
+        }
+        return CheckResult(passed=False, event=event, updates=updates)
 
     async def _verify_every_filler_alive(
         self, ctx: Context, filler_containers: list[str]
