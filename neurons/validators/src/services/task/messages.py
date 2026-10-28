@@ -521,6 +521,17 @@ class GpuLossHoldMessages:
         "window. If you replaced the cards on purpose, remove the node in the portal and add it again: "
         "a node keeps the cards it was first verified with.",
     )
+    SET_REPLACED = MessageTemplate(
+        event="The node came back with a different set of GPUs",
+        reason="GPU_LOST",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="The new GPUs are verified and kept for this node, but it is hidden and takes no new rentals until "
+        "they read clean for the hold window (see hold_until); it scores 0 meanwhile",
+        remediation="The GPU UUIDs changed, as when a VM host gets other cards on a restart. Keep the same GPUs "
+        "passed through to this node across restarts (`nvidia-smi -L` before and after must match) and find why "
+        "the host restarted. Nothing to re-register: the node is listed again on its own after the hold window.",
+    )
     PENDING = MessageTemplate(
         event="A GPU may have dropped out; judged again next cycle",
         reason="GPU_LOST_PENDING",
@@ -722,8 +733,8 @@ class GpuFingerprintMessages:
         category="env",
         impact="Verification reset this cycle; the node keeps its ID and is checked with the new GPUs "
         "next cycle",
-        remediation="No action needed, and do not remove the node: it is listed again once the new GPUs pass "
-        "the usual checks.",
+        remediation="No action needed, and do not remove the node: it is listed again on its own once the new "
+        "GPUs pass the usual checks and read clean for the GPU loss hold window.",
     )
     # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
@@ -911,6 +922,42 @@ class SysboxRequiredMessages:
     )
 
 
+class PidHostRequiredMessages:
+    MISSING = MessageTemplate(
+        event="Executor not in the host PID namespace",
+        reason="EXECUTOR_PID_HOST_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+        ),
+    )
+    RENTED_WARNING = MessageTemplate(
+        event="Executor not in the host PID namespace",
+        reason="EXECUTOR_PID_HOST_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Warning only while the node is rented: score and incentive unchanged",
+        remediation=(
+            "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
+            "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
+            "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
+            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+        ),
+    )
+    OK = MessageTemplate(
+        event="Executor PID namespace check passed",
+        reason="EXECUTOR_PID_HOST_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class DuplicateExecutorMessages:
     DUPLICATE = MessageTemplate(
         event="Duplicate executor registration",
@@ -918,14 +965,6 @@ class DuplicateExecutorMessages:
         severity="warning",
         category="policy",
         impact="Score set to 0; verification cleared",
-        remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
-    )
-    DUPLICATE_OBSERVED = MessageTemplate(
-        event="Duplicate executor registration (observe mode)",
-        reason="EXECUTOR_DUPLICATE_OBSERVED",
-        severity="warning",
-        category="policy",
-        impact="Detected; no score impact (observe mode)",
         remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
     )
     UNIQUE = MessageTemplate(
@@ -951,6 +990,24 @@ class DuplicateExecutorMessages:
         impact="Score set to 0 for this cycle; the other executor keeps it",
         remediation="Each physical GPU earns under one executor. Register every machine once.",
     )
+
+class ProviderMaintenanceMessages:
+    IN_WINDOW = MessageTemplate(
+        event="Node in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation="The provider scheduled maintenance on this node; it is validated as usual once the window ends.",
+    )
+    NONE = MessageTemplate(
+        event="Node not in a provider maintenance window",
+        reason="PROVIDER_MAINTENANCE_NONE",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
 
 class CollateralStatusMessages:
     DEPOSITED = MessageTemplate(
@@ -1022,13 +1079,6 @@ class InspectorMessages:
         severity="info",
         category="runtime",
         impact="No active customer rental on this executor",
-    )
-    DISABLED = MessageTemplate(
-        event="Inspector validation disabled",
-        reason="INSPECTOR_SKIPPED_DISABLED",
-        severity="info",
-        category="runtime",
-        impact="Inspector checks are disabled",
     )
     CLEAN = MessageTemplate(
         event="Inspector validation clean",
@@ -1472,10 +1522,13 @@ class RegistryPullMessages:
 
 
 CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
-    "a container on this node downloads from PyPI or Hugging Face far slower than the host does, so a renter's "
-    "`pip install` or model download crawls; check the docker bridge MTU against the uplink (`ip link`; set "
-    '"mtu" in /etc/docker/daemon.json to the uplink\'s and restart docker), NAT/firewall rules and any traffic '
-    "shaping on docker traffic, then `docker run --rm alpine:3.19 wget -O /dev/null "
+    "a container on this node downloads from PyPI or Hugging Face too slowly or cannot connect, so a renter's "
+    "`pip install` or model download crawls; remove any traffic shaping or extra firewall rules added on docker "
+    "traffic (keep docker's own NAT rules); "
+    "if the uplink MTU (`ip link`) is below 1500, recreate the rentals network with it while no pod container exists, running or stopped: "
+    "`docker network rm lium-rentals` then `docker network create -d bridge -o "
+    "com.docker.network.bridge.enable_icc=false -o com.docker.network.driver.mtu=<MTU> lium-rentals`; then "
+    "`docker run --rm --network lium-rentals alpine:3.19 wget -O /dev/null "
     "https://files.pythonhosted.org/packages/9b/b4/e3c7e6fab0f77fff6194afa173d1f2342073d91b1d3b4b30b17c3fb4407a/"
     "numpy-2.1.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` on the host must finish in seconds"
 )
@@ -1955,8 +2008,8 @@ class PinnedMemoryProbeMessages:
 
 
 class NvlinkFaultMessages:
-    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED is the
-    enforced form; with NVLINK_FAULT_ENFORCEMENT_ENABLED off it renders as a warning that changes no score."""
+    """A sticky NVLink fault: NVLink multicast (NVLS) cannot bind on an all-NVLink board. PROBE_FAILED fails
+    the node until a probe passes again."""
 
     PROBE_OK = MessageTemplate(
         event="NVLink multicast probe passed",
@@ -1972,13 +2025,6 @@ class NvlinkFaultMessages:
         category="env",
         impact="Proceed",
     )
-    FILLER_SKIPPED = MessageTemplate(
-        event="NVLink multicast probe skipped for active filler",
-        reason="NVLINK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Active filler runtime preserved; the probe would compete with it on every GPU.",
-    )
     PROBE_FAILED = MessageTemplate(
         event="NVLink is faulted: multicast memory cannot be bound across the GPUs",
         reason="NVLINK_FAULT",
@@ -1989,7 +2035,8 @@ class NvlinkFaultMessages:
             "The GPUs report an uncorrectable NVLink error state: NCCL NVLink SHARP (NVLS) and other "
             "multi-GPU jobs fail. Check the host `dmesg` for NVRM Xid lines and `nvidia-smi nvlink -e`. "
             "Stop the workloads, reset the GPUs (`nvidia-smi -r`) and restart nvidia-fabricmanager, or "
-            "reboot. If the errors come back, service the board."
+            "reboot. Then restart the executor container (`docker restart executor-executor-1`) so it "
+            "sees the GPUs again. If the errors come back, service the board."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2026,6 +2073,19 @@ class RentalVerificationMessages:
         category="policy",
         impact="Validation halted",
         remediation="Check executor health with backend or review rental status",
+    )
+    # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
+    GPU_LIST_EMPTY = MessageTemplate(
+        event="Rental verification failed",
+        reason="RENTAL_NOT_VERIFIED",
+        severity="error",
+        category="policy",
+        impact="Validation halted",
+        remediation=(
+            "The executor container sees no GPU in /proc/driver/nvidia/gpus, usually after a GPU reset "
+            "(`nvidia-smi -r`) or an NVIDIA driver reload while it kept running. Restart it "
+            "(`docker restart executor-executor-1`) or reboot the host."
+        ),
     )
     GPU_RUNTIME_NVML_MISMATCH = MessageTemplate(
         event="GPU runtime health check failed",
@@ -2139,9 +2199,9 @@ class RentalVerificationMessages:
     FILLER_TRANSPORT_UNREACHABLE = MessageTemplate(
         event="SSH transport lost while verifying Lium default job",
         reason="FILLER_TRANSPORT_UNREACHABLE",
-        severity="warning",
+        severity="error",
         category="runtime",
-        impact="Filler state unknown for this cycle",
+        impact="Unrented incentive withheld: SSH was lost while checking the Lium default job",
         remediation="Ensure the executor is reachable over SSH and stays online",
     )
 

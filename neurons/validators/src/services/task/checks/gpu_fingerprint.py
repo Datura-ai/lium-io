@@ -18,9 +18,10 @@ DECISION_ANCHOR_BROKEN = "ANCHOR_BROKEN"
 
 def cards_replaced(anchor: list[str], current: list[str], rented: bool, spot: bool = False) -> bool:
     """An idle node lists as many cards as it was anchored with, but other ones: the cards were replaced. It is
-    re-anchored, as removing and re-adding the node would do, keeping its node id. Any node qualifies when none of
-    the anchored cards is left (a VM host can get other physical GPUs on a reboot); a Spot node also when only some
-    were replaced. A rented node, a missing or added card, and a partly changed set off Spot keep the anchor."""
+    re-anchored, as removing and re-adding the node would do, keeping its node id, and GpuLossHoldCheck hides it for
+    the GPU loss hold window first. Any node qualifies when none of the anchored cards is left (a VM host can get
+    other physical GPUs on a reboot); a Spot node also when only some were replaced. A rented node, a missing or
+    added card, and a partly changed set off Spot keep the anchor."""
     if rented or not anchor or len(current) != len(anchor) or set(current) == set(anchor):
         return False
     return spot or not set(anchor) & set(current)
@@ -118,7 +119,7 @@ class GpuFingerprintCheck:
             if not hard:
                 from .gpu_loss_hold import rented_pods  # gpu_loss_hold imports this module
 
-                # still a reset (score 0 this cycle); the next cycle anchors the new cards
+                # still a reset (score 0 this cycle); replaced cards become the anchor now
                 # another GPU model keeps the old `spec`, so SpecChangeCheck would fail it every cycle
                 spec, new_spec = verified.get("spec"), ctx.state.gpu_model_count
                 reanchor = cards_replaced(

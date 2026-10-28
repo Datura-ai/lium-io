@@ -1,6 +1,7 @@
 """GPU_LOST: a node whose GPU dropped out is hidden and takes no new rentals until its cards stay back (DAH-4457)."""
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,8 @@ from neurons.validators.src.services.task.checks import (
 )
 from neurons.validators.src.services.task.messages import GpuLossHoldMessages as Msg
 from neurons.validators.src.services.task.models import JobResult
+from neurons.validators.src.services.task.pipeline import CheckResult, Context, Pipeline, ValidationEvent
+from neurons.validators.src.services.task.runner import SSHCommandResult
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
@@ -61,6 +64,7 @@ def _ctx(
     pods=(4,),
     owner="miner-hotkey",
     spot=False,
+    anchor=UUIDS,
 ):
     executor = default_executor()
     specs: dict = {"gpu": {"count": count, "details": _details(listed)}}
@@ -87,7 +91,7 @@ def _ctx(
         services=build_services(redis=redis),
         state=state,
         executor=executor,
-        verified={"spec": f"{MODEL}:4", "uuids": ",".join(UUIDS)},
+        verified={"spec": f"{MODEL}:4", "uuids": ",".join(anchor)},
         config=build_context_config(gpu_model_rates={MODEL: 1.0}),
     )
 
@@ -288,9 +292,46 @@ async def test_a_scrape_that_lists_no_gpu_starts_the_hold(context_factory):
     redis = FakeRedis()
     ctx = _ctx(context_factory, redis, listed=[])
 
-    await machine_spec_scrape._report_rented_gpu_loss(ctx, {"gpu": {"count": 4, "details": []}})
+    events = await machine_spec_scrape._report_rented_gpu_loss(ctx, {"gpu": {"count": 4, "details": []}})
 
     assert json.loads(redis.store[gpu_loss_hold._key(ctx)])["held"] is True
+    assert [e.reason_code for e in events] == [AvailabilityErrorCode.GPU_LOST]
+
+
+class _ListSink:
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, event: ValidationEvent) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_a_driver_crash_scrape_hides_the_node_through_the_run_it_ends(context_factory):
+    # node 2288a966, 26 Oct 2026: NVML raised on every scrape, the run ended at the scrape, and the GPU_LOST
+    # entry the hold built never reached the backend, so the node stayed listed
+    ctx = _ctx(context_factory, FakeRedis(), listed=[], count=0, pods=())
+    driver_report = json.dumps(
+        {"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}, "gpu_scrape_error": "NVMLError(3)"}}
+    )
+    now = datetime.now(UTC)
+    scrape_run = SSHCommandResult(
+        command="scrape", command_id="c1", exit_code=1, stdout=driver_report, stderr="", duration_ms=1,
+        started_at=now, finished_at=now, success=False,
+    )
+
+    class _ScrapeCheckStub:
+        check_id = MachineSpecScrapeCheck.check_id
+        fatal = True
+
+        async def run(self, run_ctx: Context) -> CheckResult:
+            return await MachineSpecScrapeCheck()._check_result_from_scrape_run(run_ctx, scrape_run, delivery="stdin")
+
+    ok, events, _ = await Pipeline([_ScrapeCheckStub()], _ListSink()).run(ctx)
+
+    assert not ok
+    assert [e.reason_code for e in events] == [AvailabilityErrorCode.GPU_LOST, "SCRAPE_FAILED_DRIVER"]
+    assert [e.reason_code for e in availability_errors(events)] == [AvailabilityErrorCode.GPU_LOST]
 
 
 def test_gpu_lost_entries_do_not_count_toward_our_own_outage():
@@ -359,25 +400,43 @@ async def test_a_card_missing_while_the_renter_resets_it_holds_the_cycle_without
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("pods", "held"), [((), False), ((4,), True)])
-async def test_an_idle_node_whose_whole_gpu_set_was_replaced_is_not_held(context_factory, pods, held):
-    """Replaced cards are not lost ones on an idle node (GpuFingerprintCheck re-anchors them);
-    under a rental they are."""
+@pytest.mark.parametrize("pods", [(), (4,)])
+async def test_a_node_whose_whole_gpu_set_was_replaced_is_held(context_factory, pods):
+    """Replaced cards are held like lost ones (a VM host reboot, 27 Oct fcd3835d); on an idle node the cycle is not
+    fatal here, so GpuFingerprintCheck still re-anchors them, and the node stays hidden for the hold window."""
     redis = FakeRedis()
     replaced = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+    ctx = _ctx(context_factory, redis, listed=replaced, pods=pods)
 
-    result = await _cycle(context_factory, redis, listed=replaced, pods=pods)
+    result = await GpuLossHoldCheck().run(ctx)
 
-    assert _hidden(result) is held
+    assert _hidden(result) and not result.passed
+    assert redis.ttl[gpu_loss_hold._key(ctx)] == gpu_loss_hold.settings.GPU_LOSS_HOLD_SECONDS
+    if not pods:
+        assert not _fatal(result)
+        assert result.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]
+        assert result.event.event == Msg.SET_REPLACED.event
+        # next cycle: the new cards are the anchor and read clean, the node is still hidden (fatal while idle)
+        reanchored = _ctx(context_factory, redis, listed=replaced, pods=(), anchor=replaced)
+        clean = await GpuLossHoldCheck().run(reanchored)
+        assert _hidden(clean) and _fatal(clean)
+        # a second whole swap inside the hold is judged against the new anchor and starts the hold again
+        third = [f"GPU-c0c{i}-0000-0000-0000-00000000000{i}" for i in range(4)]
+        again = await GpuLossHoldCheck().run(_ctx(context_factory, redis, listed=third, pods=(), anchor=replaced))
+        assert _hidden(again) and again.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("spot", "pods", "held"), [(True, (), False), (False, (), True), (True, (4,), True)])
-async def test_a_partly_replaced_set_is_not_held_only_on_an_idle_spot_node(context_factory, spot, pods, held):
-    """One card replaced is re-anchored on an idle Spot node (GpuFingerprintCheck), so it is not a lost card there;
-    off Spot or under a rental the anchored card is still missing."""
+@pytest.mark.parametrize(("spot", "pods"), [(True, ()), (False, ()), (True, (4,))])
+async def test_a_partly_replaced_set_is_held(context_factory, spot, pods):
+    """One card replaced on an idle Spot node is re-anchored (GpuFingerprintCheck) and held like a whole-set swap,
+    not fatal here; off Spot or under a rental the anchored card is missing, a lost card."""
     partly = UUIDS[:3] + ["GPU-b0b0-0000-0000-0000-000000000000"]
 
     result = await _cycle(context_factory, FakeRedis(), listed=partly, pods=pods, spot=spot)
 
-    assert _hidden(result) is held
+    assert _hidden(result) and not result.passed
+    replaced = spot and not pods
+    assert (result.event.what_we_saw["faults"] == [gpu_loss_hold.FAULT_SET_REPLACED]) is replaced
+    if replaced:
+        assert not _fatal(result)

@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
+# An idle node back with replaced cards (a VM host reboot; on Spot also a partial swap) is re-anchored by GpuFingerprintCheck
+# but held like a lost card: 27 Oct, 8x H100 fcd3835d re-anchored 3 times in 5 h and was rented
+# between two reboots.
+FAULT_SET_REPLACED = "gpu_set_replaced"
 
 
 def _key(ctx: Context) -> str:
@@ -139,6 +143,9 @@ class GpuLossHoldCheck:
             )
             return CheckResult(passed=False, event=event)
         drop = judge_scrape(ctx, pods)
+        anchor = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
+        listed = sorted(set(_listed_uuids(gpu_details)))
+        replaced = drop is None and cards_replaced(anchor, listed, rented=bool(pods), spot=is_spot(ctx))
         key = _key(ctx)
         mark: DropMark | None = None
         try:
@@ -174,6 +181,14 @@ class GpuLossHoldCheck:
             nvml_only = drop.faults == [FAULT_NVML_ERROR]
             return self._lost(ctx, mark, what, fatal=nvml_only and not pods)
 
+        if replaced:
+            mark = DropMark(is_held=True, since=now.isoformat(), last_seen=now.isoformat())
+            await self._save(ctx, key, mark, settings.GPU_LOSS_HOLD_SECONDS)
+            # not fatal: GpuFingerprintCheck still runs and re-anchors the new cards this cycle
+            return self._lost(
+                ctx, mark, {"faults": [FAULT_SET_REPLACED]}, fatal=False, msg=Msg.SET_REPLACED
+            )
+
         if mark is None:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
@@ -186,10 +201,12 @@ class GpuLossHoldCheck:
             )
         return self._lost(ctx, mark, {"faults": []}, fatal=not pods)
 
-    def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool) -> CheckResult:
+    def _lost(
+        self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, msg=Msg.LOST
+    ) -> CheckResult:
         last_seen = datetime.fromisoformat(mark.last_seen)
         event = render_message(
-            Msg.LOST,
+            msg,
             ctx=ctx,
             check_id=self.check_id,
             what={
