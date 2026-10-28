@@ -79,6 +79,13 @@ async def reset_hung_pod_gpus(runner: SSHCommandRunner, pod_gpu_uuids: list[str]
     hung = parse_hung_pod_gpus(query.stdout or "", pod_gpu_uuids)
     if not hung:
         return HungGpuResult()
+    gpu_csv, _, apps_csv = (query.stdout or "").partition(_APPS_MARKER)
+    if set(hung) <= set(parse_wedged_gpu_uuids(gpu_csv, apps_csv)):
+        # latch only: the seconds-long context cycle first, not a reset (a healthy GPU stopped a moment
+        # ago can still read busy); -r below only when the cycle does not clear it
+        cures = await cure_wedged_gpus(runner, hung)
+        if cures and all(cure.cured for cure in cures):
+            return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"latch cleared on {hung}")
     try:
         targets = await _checked_targets(runner, hung, pod_gpu_uuids)
     except GpuResetRefused as refused:

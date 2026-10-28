@@ -65,7 +65,6 @@ async def test_a_healthy_reboot_runs_only_the_one_query():
         f"{U[0]}, [GPU is lost], [GPU is lost]",
         f"{U[0]}, ERR!, ERR!",
         None,  # missing from the output
-        f"{U[0]}, 100, 0",  # the DAH-2427 latch: busy, no memory, no process
     ],
 )
 @pytest.mark.asyncio
@@ -74,6 +73,17 @@ async def test_a_hung_pod_gpu_is_reset_alone(line):
     result = await _reset(host)
     assert _resets(host) == [f"nvidia-smi -r -i {U[0]}"]
     assert result.warning == W.HungGpuReset and result.hung_uuids == [U[0]]
+
+
+@pytest.mark.parametrize("cure_ok", [True, False])
+@pytest.mark.asyncio
+async def test_a_latched_gpu_gets_the_context_cycle_before_any_reset(cure_ok):
+    # the DAH-2427 latch (busy, no memory, no process); a just-stopped healthy GPU can look the same
+    host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0"}), cure_ok=cure_ok)
+    result = await _reset(host)
+    assert any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
+    assert _resets(host) == ([] if cure_ok else [f"nvidia-smi -r -i {U[0]}"])
+    assert result.hung_uuids == [U[0]]
 
 
 @pytest.mark.asyncio
