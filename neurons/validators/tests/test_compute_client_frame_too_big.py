@@ -57,9 +57,7 @@ async def test_messages_on_a_socket_the_backend_closed_with_1009_stay_queued():
 
     def closed(_payload):
         client.ws = None  # as run_forever does once the socket is gone
-        raise ConnectionClosedError(
-            Close(1009, "message too big"), Close(1009, "message too big"), True
-        )
+        raise ConnectionClosedError(Close(1009, "message too big"), Close(1009, "message too big"), True)
 
     ws.send.side_effect = closed
 
